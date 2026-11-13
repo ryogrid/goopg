@@ -211,7 +211,7 @@ func (o *bitmapIndexScanOp) buildSAOPBitmap(tbm *TIDBitmap, recheck bool) error 
 	// so the three ScalarArrayOp probes cannot disagree.
 	windows, err := o.ctx.saopWindows(saopProbeSpec{
 		table: o.plan.Table, index: o.plan.Index, prefix: o.plan.Keys, elems: o.plan.SAOPKeys,
-		pos: o.plan.Pos(), op: o.plan.SAOPOp,
+		pos: o.plan.Pos(), op: o.plan.SAOPOp, colQuals: o.plan.SAOPColQuals,
 	}, o.tree, o.outerSlot)
 	if err != nil {
 		return err

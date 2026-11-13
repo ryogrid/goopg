@@ -3944,7 +3944,35 @@ func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, pr
 	if p.LeadingNullTest != optimizer.IndexNullTestNone {
 		return formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder)
 	}
-	return formatIndexCondPartsPrefixed(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder...)
+	rng := formatIndexCondPartsPrefixed(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder...)
+	if ts := p.TrailingSAOP; ts != nil && len(p.Index.Columns) > 1 && rng != "" {
+		// M0148-0001c3a4 (i): the leading range, then the second column's
+		// array (and its column quals) — PG's `((thousand < 2) AND
+		// (tenthous = ANY ('{1001,3000}'::integer[])))`. The array renders
+		// as the index scan's, over the index shifted to its column.
+		shifted := *p.Index
+		shifted.Columns = p.Index.Columns[1:]
+		arr := formatIndexCondPrefixed(&optimizer.IndexScan{Table: p.Table, Index: &shifted, SAOPKeys: ts.Elems,
+			SAOPColQuals: ts.ColQuals}, reg, prefix)
+		nRange := 0
+		if p.LowKey != nil {
+			nRange++
+		}
+		if p.HighKey != nil {
+			nRange++
+		}
+		return "(" + indexCondInner(rng, nRange) + " AND " + indexCondInner(arr, 1+len(ts.ColQuals)) + ")"
+	}
+	return rng
+}
+
+// indexCondInner strips indexCondAndText's outer wrapping from a text of n
+// parts, leaving `(a)` or `(a) AND (b)` for splicing into a longer AND.
+func indexCondInner(text string, n int) string {
+	if n > 1 && len(text) >= 2 {
+		return text[1 : len(text)-1]
+	}
+	return text
 }
 
 // indexCondClause renders one index clause `col op key`. A literal key is
@@ -4010,7 +4038,21 @@ func formatBitmapSAOPIndexCond(p *optimizer.BitmapIndexScan, reg *subPlanReg, pr
 			cond = col + " " + anyOp + " ANY (" + lit + ")"
 		}
 	}
-	return indexCondAndText(append(parts, cond))
+	if len(p.SAOPColQuals) == 0 {
+		return indexCondAndText(append(parts, cond))
+	}
+	// M0148-0001c3a4 (i): the column quals merged into the array print
+	// around it in restriction order, as the index scan's renderer prints
+	// them (shared through formatIndexCondPrefixed over the index shifted to
+	// the array's column).
+	shifted := *p.Index
+	shifted.Columns = p.Index.Columns[np:]
+	arr := formatIndexCondPrefixed(&optimizer.IndexScan{Table: p.Table, Index: &shifted, SAOPKeys: p.SAOPKeys,
+		SAOPOp: p.SAOPOp, SAOPColQuals: p.SAOPColQuals}, reg, prefix)
+	if np == 0 {
+		return arr
+	}
+	return "(" + indexCondInner(indexCondAndText(parts), np) + " AND " + indexCondInner(arr, 1+len(p.SAOPColQuals)) + ")"
 }
 
 // saopOpText is a ScalarArrayOp index qual's operator: `=` for the equality

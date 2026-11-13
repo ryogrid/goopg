@@ -751,7 +751,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		if len(clauses) > saopAt+1 {
 			sel = clampSelectivity(sel * rangeIndexSelectivity(rel.baseLeaf, conjuncts, clauses[saopAt+1:]))
 		}
-		numSAScans = float64(len(clauses[saopAt].saop))
+		numSAScans = saopDescents(clauses[saopAt])
 		// M0148-0001c3a4 (i): the column quals merged into the array.
 		for _, q := range clauses[saopAt].saopColQuals {
 			sel = clampSelectivity(sel * clauseSelectivity(q.local, rel.baseLeaf))
@@ -808,7 +808,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		// qpquals = baserestrictinfo minus the index quals (costsize.c:806-820):
 		// the consumed equalities are applied by the probe, not re-checked.
 		numQualOps:       qpquals,
-		numIndexQuals:    float64(len(clauses)),
+		numIndexQuals:    indexQualCount(clauses),
 		numSAScans:       numSAScans,
 		boundSelectivity: boundSel,
 	}

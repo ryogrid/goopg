@@ -370,7 +370,20 @@ func createIndexScanPlan(p *Path) Node {
 		ioSAOPOp := parser.OpUnknown
 		var ioColQuals []SAOPColQual
 		loopClauses := p.IndexClauses
-		if at := indexClausesSAOPAt(p.IndexClauses); at >= 0 {
+		var ioTrailing *TrailingSAOP
+		if at := indexClausesSAOPAt(p.IndexClauses); at > 0 && isInequalityOp(p.IndexClauses[0].op) {
+			// M0148-0001c3a4 (i): an array on the second column behind the
+			// leading range — the range lowers as usual, the array onto
+			// TrailingSAOP.
+			c := p.IndexClauses[at]
+			if at != len(p.IndexClauses)-1 || c.indexCol != 1 || c.saopOp != parser.OpUnknown || c.local == nil ||
+				p.RequiredOuter != 0 || p.IndexSkipPrefix != 0 || !columnCovered(p.IndexOnlyCovered, p.IndexInfo.Columns[1]) {
+				panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s: the array behind the leading range must be the last clause, a covered second-column `= ANY`", p.IndexInfo.Name))
+			}
+			ioDrop[c.local] = true
+			ioTrailing = &TrailingSAOP{Elems: append([]Expr(nil), c.saop...), ColQuals: lowerSAOPColQuals(c, ioDrop)}
+			loopClauses = p.IndexClauses[:at]
+		} else if at >= 0 {
 			// M0148-0001c3a4 (i): an equality prefix ahead of the array
 			// lowers onto Keys (the bitmap SAOP carrier's shape).
 			for i, r := range p.IndexClauses[:at] {
@@ -521,6 +534,7 @@ func createIndexScanPlan(p *Path) Node {
 			ios.LowKey, ios.LowOp, ios.HighKey, ios.HighOp = ioLow, ioLowOp, ioHigh, ioHighOp
 		case ioRange:
 			ios.LowKey, ios.LowOp, ios.HighKey, ios.HighOp = ioLow, ioLowOp, ioHigh, ioHighOp
+			ios.TrailingSAOP = ioTrailing
 			ios.LeadingNullTest, ios.NullTestAfterBounds = ioNullTest, ioNullTestAfter
 			ios.ExtraNullTests = ioExtraNullTests
 			if len(ioCondOrder) > 1 {

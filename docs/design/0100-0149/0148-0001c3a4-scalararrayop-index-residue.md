@@ -1,6 +1,6 @@
 # M0148\-0001c3a4 — ScalarArrayOp and OR index\-path residue
 
-**Parent:** M0148\-0001c3a2 · **Status:** items \(a\), \(b\), \(c\) and \(h\) landed 2026\-11\-12; item \(i\) slices 1–2 landed 2026\-11\-14; items \(d\)–\(g\) and the rest of \(i\) open
+**Parent:** M0148\-0001c3a2 · **Status:** items \(a\), \(b\), \(c\) and \(h\) landed 2026\-11\-12; item \(i\) slices 1–3 landed 2026\-11\-14; items \(d\)–\(g\) and the rest of \(i\) open
 
 This item collects what M0148\-0001c3a2 \(BitmapOr paths\) left open. The items
 are listed in `.ralph/fix_plan.md` under M0148\-0001c3a4:
@@ -459,4 +459,81 @@ handled only a leading array, so the plain Index Scan kept these clauses.
 - **Prefix plus a range, index\-only:** `hundred = 42 AND unique1 < 100`
   covered by the index is still a plain Index Scan
   \(plainRestrictionBindsOnlyPrefix declines\).
-- **An array behind a leading range** is still open.
+- **An array behind a leading range:** closed by slice 3 for index\-only
+  scans.
+
+## Item \(i\) slice 3 — an array behind a leading range; descents per array
+
+PG's `thousand < 2 AND tenthous IN (1001,3000)` on `(thousand, tenthous)` is
+an Index Only Scan with `((thousand < 2) AND (tenthous = ANY (…)))`. nbtree
+turns the range column into a skip array and applies the second column's
+array to every entry it reads. goopg left the array in the Filter.
+
+### Change
+
+- **Producer:** `indexOnlyLeafClauses`' leading\-range branch also files an
+  `= ANY` array on the second column, when that column is covered and the
+  range column has no NullTest.
+- **Plan:** `IndexOnlyScan.TrailingSAOP` \(elements plus column quals,
+  constants only\). `createIndexScanPlan` lowers the range as before and
+  drops the array's conjuncts from the Filter.
+- **Executor:** `indexOnlyScanOp` checks each index entry against the array
+  \(`trailingSAOPQual`, evaluated over the row decoded from the key\)
+  before any heap fetch. Heap Fetches therefore counts only entries that
+  pass, as PG's index quals do. An undecodable key is checked on the heap
+  row instead. The output stays in index order, forward and backward.
+- **EXPLAIN:** the range text and the array text \(rendered by the index
+  scan's renderer over the index shifted to column 1\) are spliced into one
+  AND \(`indexCondInner`\).
+- **Costing — btcostestimate's skip\-array branch** \(selfuncs.c:7399\-7590\):
+  - The range column's ndistinct, scaled by the range's own selectivity,
+    becomes num\_sa\_scans.
+  - If that fraction is below DEFAULT\_RANGE\_INEQ\_SEL, the ndistinct is a
+    default, or the descents would exceed the index's pages, PG stops
+    building indexBoundQuals before the array. The array then adds no
+    descents and does not narrow numIndexTuples \(`boundSelectivity` = the
+    range alone\).
+  - Either way it narrows indexSelectivity on the heap side
+    \(genericcostestimate\), and it costs a qual op per index tuple.
+- **Three costing fixes to slices 1–2, found by the same probe:**
+  - Column quals count as index quals: `indexQualCount` for qual\_op\_cost,
+    and `indexClausesEvalOps` removes them from the qpquals.
+  - Every array multiplies num\_sa\_scans \(`saopDescents`\): two arrays
+    of 3 are 9 descents.
+  - The bitmap ScalarArrayOp carrier merges the column quals too
+    \(`BitmapIndexScan.SAOPColQuals`, applied by saopWindows, kept in the
+    Recheck Cond and printed in Index Cond\). Without this, a two\-array
+    query fell to a bitmap path that was cheaper only because it ignored the
+    second array.
+
+### Verification
+
+- **Live server against a scratch PG 18.3:**
+  - Plans: the 8 leading\-range statements \(forward, backward, column
+    quals, the bound\-counted `thousand < 500` arm\) have identical plans and
+    costs.
+  - Rows: every statement returns the same rows.
+  - The slice 1–2 probe sets now match PG on costs too, including the
+    two\-array case \(34.69\) and its forced bitmap plan.
+- **`TestIndexOnlySAOPBehindLeadingRange`:** 4 PG plans with rows, on the
+  heap\-fetch path.
+- **Regress:**
+  - create\_index 2933→2856, with no new mismatch line.
+  - join \+5 is the known row\-order flap \(a rerun gives 17626\).
+- **Gates:**
+  - units, tpch\-spotcheck, sf025 99/99;
+  - fire\-set fires=none on sf025, sf1 and TPC\-H;
+  - acceptance 24 MATCH.
+
+### Not covered
+
+- **Plain Index Scan behind a leading range:** when the index does not
+  cover the query, PG uses an Index Scan with the same Index Cond. goopg
+  keeps a bitmap or range scan with the array in the Filter, because the
+  plain scan has no trailing\-array check.
+- **Real skip descents:** the scan reads the whole leading range and checks
+  each entry. Results and order are PG's, but it does not reposition per
+  element the way nbtree does.
+- **Arrays behind a range further right:** an array on a column after the
+  second, or behind a range with a NullTest, stays in the Filter.
+

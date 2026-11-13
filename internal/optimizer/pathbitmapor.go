@@ -367,7 +367,13 @@ func bitmapSAOPOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.In
 				}
 			}
 			if usable {
-				return &indexPathClause{indexCol: pos, saop: list, saopOp: ineqOp, local: conj}, conj
+				c := &indexPathClause{indexCol: pos, saop: list, saopOp: ineqOp, local: conj}
+				if ineqOp == parser.OpUnknown {
+					// M0148-0001c3a4 (i): the column's other arrays and
+					// bounds merge into the probe, as on the plain path.
+					c.saopColQuals = saopColumnQuals(cat, tbl, colName, conj, conjuncts)
+				}
+				return c, conj
 			}
 			continue
 		}

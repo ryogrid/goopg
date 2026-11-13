@@ -27,6 +27,7 @@ package optimizer
 //     scan that drops a column the query reads returns wrong rows.
 
 import (
+	"math"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -266,6 +267,17 @@ func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, t
 			return nil, false
 		}
 		clauses, bound = rng, 1
+		// M0148-0001c3a4 (i): an `= ANY` array on the second column behind
+		// the leading range is an index qual too (PG's `((thousand < 2) AND
+		// (tenthous = ANY (…)))`); the scan checks it per entry
+		// (IndexOnlyScan.TrailingSAOP), so its column must be covered.
+		if len(idx.Columns) > 1 && !idx.DeclaredHash && len(restrictionNullTestsOnColumn(idx, 0, conjuncts)) == 0 &&
+			columnCovered(covered, idx.Columns[1]) {
+			if sa := restrictionSAOPOnColumn(cat, tbl, idx, 1, conjuncts); len(sa) > 0 && sa[0].saopOp == parser.OpUnknown {
+				clauses = append(clauses, sa...)
+				bound = 2
+			}
+		}
 	}
 	if !indexUnboundKeysNotNull(tbl, idx, bound) {
 		return nil, false
@@ -372,9 +384,43 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 	// indexclauses list implies a full index scan", pathnodes.h:1817).
 	sel, unique := 1.0, false
 	numSAScans := 0.0
+	// boundSel, when set, is btcostestimate's indexBoundQuals selectivity
+	// where it differs from sel (the trailing-array arm below).
+	boundSel := 0.0
 	saopAt := indexClausesSAOPAt(clauses)
 	isSAOP := saopAt >= 0
+	trailing := isSAOP && saopAt > 0 && isInequalityOp(clauses[0].op)
 	switch {
+	case trailing:
+		// M0148-0001c3a4 (i): btcostestimate's skip-array arm for a leading
+		// range behind which an array sits (selfuncs.c:7399-7590). The range
+		// column becomes a skip array: its ndistinct, scaled by the range's
+		// own selectivity, multiplies num_sa_scans. When that fraction is
+		// under DEFAULT_RANGE_INEQ_SEL, the ndistinct is a default, or the
+		// descents would exceed the index's pages, PG stops building
+		// indexBoundQuals there: the array then neither narrows the
+		// selectivity nor adds descents (it is still an index qual).
+		// indexSelectivity (genericcostestimate, the heap side) covers every
+		// index qual; numIndexTuples covers indexBoundQuals only
+		// (boundSelectivity).
+		rangeClauses := clauses[:saopAt]
+		frac := rangeIndexSelectivity(rel.baseLeaf, extractFilterConjuncts(rel.baseLeaf), rangeClauses)
+		c := clauses[saopAt]
+		sel = clampSelectivity(frac * clauseSelectivity(saopPricedClause(cat, tbl, idx, c), rel.baseLeaf))
+		for _, q := range c.saopColQuals {
+			sel = clampSelectivity(sel * clauseSelectivity(q.local, rel.baseLeaf))
+		}
+		boundSel = frac
+		pages, _, _ := estimateIndexGeometry(cat, idx, tbl, relTuples)
+		nd, isDefault := getVariableNumDistinct(joinVarStats{stats: columnStatsByName(tbl, idx.Columns[0]), tuples: relTuples})
+		if !isDefault && frac >= defaultRangeIneqSel {
+			nd = math.Max(math.RoundToEven(nd*frac), 1)
+			if nd <= pages {
+				numSAScans = nd
+				boundSel = sel
+				numSAScans *= saopDescents(c)
+			}
+		}
 	case isSAOP:
 		// M0148-0001c3a4 (h): scalararraysel over the array, times the
 		// equality prefix ahead of it ((i)) and the bounds on the column
@@ -388,7 +434,7 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 		if len(clauses) > saopAt+1 {
 			sel = clampSelectivity(sel * rangeIndexSelectivity(rel.baseLeaf, extractFilterConjuncts(rel.baseLeaf), clauses[saopAt+1:]))
 		}
-		numSAScans = float64(len(clauses[saopAt].saop))
+		numSAScans = saopDescents(clauses[saopAt])
 		for _, q := range clauses[saopAt].saopColQuals {
 			sel = clampSelectivity(sel * clauseSelectivity(q.local, rel.baseLeaf))
 		}
@@ -420,9 +466,10 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 		// R1 (plan-parity-fix-take2): every local conjunct not consumed as an
 		// index qual is a qpqual, as the seq rival counts them
 		// (costsize.c:806-820).
-		numQualOps:    qpquals,
-		numIndexQuals: float64(len(clauses)),
-		numSAScans:    numSAScans,
+		numQualOps:       qpquals,
+		numIndexQuals:    indexQualCount(clauses),
+		numSAScans:       numSAScans,
+		boundSelectivity: boundSel,
 	}
 	cost := costIndexScan(s.cp, in)
 	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
@@ -608,4 +655,24 @@ func coveredAvgVarBytes(tbl *catalog.Table, covered []catalog.Column) float64 {
 		}
 	}
 	return sum
+}
+
+// columnCovered reports whether name is one of an index-only scan's covered
+// columns.
+func columnCovered(covered []catalog.Column, name string) bool {
+	for _, c := range covered {
+		if c.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// isInequalityOp reports a btree range operator (`<` `<=` `>` `>=`).
+func isInequalityOp(op parser.OpCode) bool {
+	switch op {
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		return true
+	}
+	return false
 }

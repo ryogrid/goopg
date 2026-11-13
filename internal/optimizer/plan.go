@@ -1266,6 +1266,14 @@ type SAOPColQual struct {
 	BeforeArray bool
 }
 
+// TrailingSAOP is IndexOnlyScan.TrailingSAOP: the array's elements and the
+// further quals on its column (SAOPColQual). Elements and keys are planner
+// constants only, so expression walkers need not visit them.
+type TrailingSAOP struct {
+	Elems    []Expr
+	ColQuals []SAOPColQual
+}
+
 // IndexOnlyScan is a covered index scan (M0046-0004): all projected columns
 // come from the B-tree index key, so no heap fetch is needed when the
 // visibility map reports ALL_VISIBLE for the target page.
@@ -1308,6 +1316,13 @@ type IndexOnlyScan struct {
 	// SAOPOp / SAOPColQuals mirror IndexScan's fields of the same names.
 	SAOPOp       parser.OpCode
 	SAOPColQuals []SAOPColQual
+	// TrailingSAOP is an `= ANY` array on the index's second column behind
+	// a leading-column range (LowKey/HighKey), M0148-0001c3a4 (i): PG's
+	// `((thousand < 2) AND (tenthous = ANY (…)))`. The range scan checks
+	// each entry against it before any heap fetch, as nbtree applies a
+	// non-leading array key; the output stays in index order. Its column is
+	// always one of Covered.
+	TrailingSAOP *TrailingSAOP
 
 	LowKey  Expr
 	HighKey Expr
@@ -3826,6 +3841,8 @@ type BitmapIndexScan struct {
 	// inequality (`col < ANY (…)`, M0148-0001c3a4 (a)) probed as the range of
 	// the extreme element. Shared with IndexScan / IndexOnlyScan.SAOPOp.
 	SAOPOp parser.OpCode
+	// SAOPColQuals mirrors IndexScan.SAOPColQuals (M0148-0001c3a4 (i)).
+	SAOPColQuals []SAOPColQual
 	// Pred is the full index condition (for recheck). When Key/Keys
 	// cover only a prefix, Pred holds the remaining index quals.
 	Pred   []Expr

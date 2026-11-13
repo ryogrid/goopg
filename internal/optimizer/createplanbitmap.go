@@ -71,6 +71,14 @@ func createBitmapHeapScanPlan(p *Path) (Node, error) {
 				}
 				drop[c.local] = true
 				bitmapQual = append(bitmapQual, c.local)
+				// M0148-0001c3a4 (i): the column quals merged into the
+				// array are index quals too.
+				for _, q := range c.saopColQuals {
+					if q.local != nil {
+						drop[q.local] = true
+						bitmapQual = append(bitmapQual, q.local)
+					}
+				}
 			}
 		}
 	}
@@ -147,6 +155,7 @@ func createBitmapIndexScanPlan(p *Path) Node {
 		}
 		bis.SAOPKeys = append([]Expr(nil), rest[0].saop...)
 		bis.SAOPOp = rest[0].saopOp
+		bis.SAOPColQuals = lowerSAOPColQuals(rest[0], map[Expr]bool{})
 		return bis
 	}
 	sawBound := false

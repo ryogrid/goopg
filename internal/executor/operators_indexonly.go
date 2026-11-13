@@ -380,9 +380,44 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// column types, not of the row.
 	keyDecodable := o.indexKeyIsDecodable()
 
+	// M0148-0001c3a4 (i): the array on the second column behind the leading
+	// range, checked per entry like nbtree's non-leading array key.
+	trailing, err := o.trailingSAOPQual()
+	if err != nil {
+		return err
+	}
+	trailingAdmits := func(row Row) (bool, error) {
+		v, err := evalExpr(trailing, row, ctx)
+		if err != nil {
+			return false, err
+		}
+		return !v.IsNull() && v.Kind == KindBool && v.BoolValue(), nil
+	}
+
 	scanFn := func(key []byte, ptr storage.ItemPointer) (bool, error) {
+		allVisible := keyDecodable && ctx.VM != nil && ctx.VM.AllVisible(heapRel, ptr.Block)
+		if trailing != nil && (allVisible || keyDecodable) {
+			// The index qual is applied to the index entry before any heap
+			// fetch (Heap Fetches counts only entries that pass it).
+			row, err := o.decodeRowFromKey(key)
+			if err != nil {
+				return false, &ExecError{Code: "XX000", Pos: o.plan.Pos(),
+					Message: fmt.Sprintf("IOS decode: %v", err)}
+			}
+			ok, err := trailingAdmits(row)
+			if err != nil {
+				return false, err
+			}
+			if !ok {
+				return true, nil
+			}
+			if allVisible {
+				o.rows = append(o.rows, row)
+				return true, nil
+			}
+		}
 		// Fast path: ALL_VISIBLE → decode from key, zero heap reads.
-		if keyDecodable && ctx.VM != nil && ctx.VM.AllVisible(heapRel, ptr.Block) {
+		if allVisible {
 			row, err := o.decodeRowFromKey(key)
 			if err != nil {
 				return false, &ExecError{Code: "XX000", Pos: o.plan.Pos(),
@@ -471,6 +506,17 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		row, err := o.decodeRowFromHeap(tuple)
 		if err != nil {
 			return false, err
+		}
+		if trailing != nil && !keyDecodable {
+			// An undecodable key (interval's lossy span): the heap row
+			// carries the column.
+			ok, err := trailingAdmits(row)
+			if err != nil {
+				return false, err
+			}
+			if !ok {
+				return true, nil
+			}
 		}
 		o.rows = append(o.rows, row)
 		return true, nil
@@ -1305,4 +1351,42 @@ func (o *indexOnlyScanOp) lookupRangeBounds() (lo, hi []byte, ok bool, err error
 	}
 	o.rangeLoExcl, o.rangeHiExcl, o.rangeBoundsSet = loExcl, hiExcl, true
 	return lo, hi, true, nil
+}
+
+// trailingSAOPQual is IndexOnlyScan.TrailingSAOP as a predicate over the
+// scan's output row (M0148-0001c3a4 (i)): `col = ANY (elems)` AND each
+// column qual. nil when the scan has none. The planner files the array only
+// when its column is covered.
+func (o *indexOnlyScanOp) trailingSAOPQual() (optimizer.Expr, error) {
+	ts := o.plan.TrailingSAOP
+	if ts == nil {
+		return nil, nil
+	}
+	if len(o.plan.Index.Columns) < 2 {
+		return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
+			"indexOnlyScanOp: trailing ScalarArrayOp on single-column index %q", o.plan.Index.Name)}
+	}
+	col := o.plan.Index.Columns[1]
+	var ref *optimizer.ColumnRef
+	for i, sc := range o.plan.Output() {
+		if sc.Name == col {
+			ref = &optimizer.ColumnRef{Index: i, Name: col, Type: sc.Type}
+			break
+		}
+	}
+	if ref == nil {
+		return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
+			"indexOnlyScanOp: trailing ScalarArrayOp column %q is not covered by index %q", col, o.plan.Index.Name)}
+	}
+	var pred optimizer.Expr = &optimizer.InExpr{Operand: ref, List: append([]optimizer.Expr(nil), ts.Elems...)}
+	for _, q := range ts.ColQuals {
+		var qe optimizer.Expr
+		if q.Array != nil {
+			qe = &optimizer.InExpr{Operand: ref, List: append([]optimizer.Expr(nil), q.Array...)}
+		} else {
+			qe = &optimizer.BinaryOp{Op: q.Op, Left: ref, Right: q.Key}
+		}
+		pred = &optimizer.BinaryOp{Op: parser.OpAnd, Left: pred, Right: qe}
+	}
+	return pred, nil
 }

@@ -349,3 +349,38 @@ func TestIndexOnlySAOPBehindPrefix(t *testing.T) {
 		}
 	}
 }
+
+// TestIndexOnlySAOPBehindLeadingRange pins M0148-0001c3a4 (i) against PG
+// 18.3: an `= ANY` array on the second column behind a leading-column range
+// is an index qual of the Index Only Scan (IndexOnlyScan.TrailingSAOP),
+// forward and backward, with a column qual merged into it. The rows pin the
+// per-entry check: in this fixture no page is all-visible, so every entry
+// takes the decode-then-check path ahead of its heap fetch.
+func TestIndexOnlySAOPBehindLeadingRange(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "CREATE TABLE tk (thousand int NOT NULL, tenthous int NOT NULL, pad text)")
+	runSQL(t, ctx, "INSERT INTO tk SELECT g%1000, g, repeat('x', 100) FROM generate_series(0, 9999) g")
+	runSQL(t, ctx, "CREATE INDEX tk_tt ON tk (thousand, tenthous)")
+	runSQL(t, ctx, "VACUUM tk")
+	runSQL(t, ctx, "ANALYZE tk")
+	ps := optimizer.DefaultPlannerSettings()
+	ps.EnableBitmapScan = false
+	for _, c := range []struct{ q, plan, rows string }{
+		{"SELECT thousand, tenthous FROM tk WHERE thousand < 2 AND tenthous IN (1001,3000) ORDER BY thousand",
+			"Index Only Scan using tk_tt on tk\n  Index Cond: ((thousand < 2) AND (tenthous = ANY ('{1001,3000}'::integer[])))", "0|3000;1|1001"},
+		{"SELECT thousand, tenthous FROM tk WHERE thousand < 2 AND tenthous IN (1001,3000) ORDER BY thousand DESC, tenthous DESC",
+			"Index Only Scan Backward using tk_tt on tk\n  Index Cond: ((thousand < 2) AND (tenthous = ANY ('{1001,3000}'::integer[])))", "1|1001;0|3000"},
+		{"SELECT thousand, tenthous FROM tk WHERE thousand > 995 and tenthous in (998, 999, 9996, 1997) ORDER BY thousand desc",
+			"Index Only Scan Backward using tk_tt on tk\n  Index Cond: ((thousand > 995) AND (tenthous = ANY ('{998,999,9996,1997}'::integer[])))", "999|999;998|998;997|1997;996|9996"},
+		{"SELECT thousand, tenthous FROM tk WHERE thousand < 2 AND tenthous IN (1001,3000,4001) AND tenthous > 2000",
+			"Index Only Scan using tk_tt on tk\n  Index Cond: ((thousand < 2) AND (tenthous = ANY ('{1001,3000,4001}'::integer[])) AND (tenthous > 2000))", "0|3000;1|4001"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

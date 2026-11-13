@@ -227,7 +227,10 @@ func (s *searchCtx) buildBitmapIndexChild(
 		if sc, selExpr := bitmapSAOPOnColumn(s.cat, tbl, idx, n, conjuncts); sc != nil {
 			indexClauses = append(indexClauses, *sc)
 			qualSelectivity = clampSelectivity(qualSelectivity * clauseSelectivity(selExpr, leaf))
-			numSAScans = float64(len(sc.saop))
+			for _, q := range sc.saopColQuals {
+				qualSelectivity = clampSelectivity(qualSelectivity * clauseSelectivity(q.local, leaf))
+			}
+			numSAScans = saopDescents(*sc)
 			saop = true
 		}
 	}
@@ -311,7 +314,7 @@ func (s *searchCtx) buildBitmapIndexChild(
 		// always), so every local conjunct counts — not minus
 		// index-satisfied ones.
 		numQualOps:    localQualOpCount(leaf),
-		numIndexQuals: float64(len(indexClauses)),
+		numIndexQuals: indexQualCount(indexClauses),
 		numSAScans:    numSAScans,
 	}
 
