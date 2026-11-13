@@ -386,13 +386,7 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	if err != nil {
 		return err
 	}
-	trailingAdmits := func(row Row) (bool, error) {
-		v, err := evalExpr(trailing, row, ctx)
-		if err != nil {
-			return false, err
-		}
-		return !v.IsNull() && v.Kind == KindBool && v.BoolValue(), nil
-	}
+	trailingAdmits := func(row Row) (bool, error) { return predAdmits(ctx, trailing, row) }
 
 	scanFn := func(key []byte, ptr storage.ItemPointer) (bool, error) {
 		allVisible := keyDecodable && ctx.VM != nil && ctx.VM.AllVisible(heapRel, ptr.Block)
@@ -717,23 +711,7 @@ func (o *indexOnlyScanOp) Close() error {
 // decodeRowFromKey routes on that same descriptor, so the two agree on which
 // decode this predicate is judging.
 func (o *indexOnlyScanOp) indexKeyIsDecodable() bool {
-	if o.plan.Index == nil || o.ctx == nil || o.ctx.Catalog == nil {
-		return true
-	}
-	blobKey := o.ctx.pgIndexKeyDesc(o.plan.Index) == nil
-	for _, colName := range o.plan.Index.Columns {
-		col, ok := o.ctx.Catalog.LookupColumn(o.plan.Table, colName)
-		if !ok {
-			continue // the decode path reports this one itself
-		}
-		if !indexKeyColumnIsDecodable(*col) {
-			return false
-		}
-		if blobKey && !indexKeyColumnRendersHeapText(*col) {
-			return false
-		}
-	}
-	return true
+	return indexKeyDecodable(o.ctx, o.plan.Table, o.plan.Index)
 }
 
 // decodeRowFromKey extracts covered column values from a B-tree key.
@@ -1378,15 +1356,5 @@ func (o *indexOnlyScanOp) trailingSAOPQual() (optimizer.Expr, error) {
 		return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
 			"indexOnlyScanOp: trailing ScalarArrayOp column %q is not covered by index %q", col, o.plan.Index.Name)}
 	}
-	var pred optimizer.Expr = &optimizer.InExpr{Operand: ref, List: append([]optimizer.Expr(nil), ts.Elems...)}
-	for _, q := range ts.ColQuals {
-		var qe optimizer.Expr
-		if q.Array != nil {
-			qe = &optimizer.InExpr{Operand: ref, List: append([]optimizer.Expr(nil), q.Array...)}
-		} else {
-			qe = &optimizer.BinaryOp{Op: q.Op, Left: ref, Right: q.Key}
-		}
-		pred = &optimizer.BinaryOp{Op: parser.OpAnd, Left: pred, Right: qe}
-	}
-	return pred, nil
+	return trailingSAOPPred(ref, ts), nil
 }

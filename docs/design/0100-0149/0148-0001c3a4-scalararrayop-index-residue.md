@@ -1,6 +1,6 @@
 # M0148\-0001c3a4 — ScalarArrayOp and OR index\-path residue
 
-**Parent:** M0148\-0001c3a2 · **Status:** items \(a\), \(b\), \(c\) and \(h\) landed 2026\-11\-12; item \(i\) slices 1–3 landed 2026\-11\-14; items \(d\)–\(g\) and the rest of \(i\) open
+**Parent:** M0148\-0001c3a2 · **Status:** items \(a\), \(b\), \(c\) and \(h\) landed 2026\-11\-12; item \(i\) slices 1–4 landed 2026\-11\-14; items \(d\)–\(g\) and the rest of \(i\) open
 
 This item collects what M0148\-0001c3a2 \(BitmapOr paths\) left open. The items
 are listed in `.ralph/fix_plan.md` under M0148\-0001c3a4:
@@ -527,13 +527,59 @@ array to every entry it reads. goopg left the array in the Filter.
 
 ### Not covered
 
-- **Plain Index Scan behind a leading range:** when the index does not
-  cover the query, PG uses an Index Scan with the same Index Cond. goopg
-  keeps a bitmap or range scan with the array in the Filter, because the
-  plain scan has no trailing\-array check.
+- **Plain Index Scan behind a leading range:** closed by slice 4.
 - **Real skip descents:** the scan reads the whole leading range and checks
   each entry. Results and order are PG's, but it does not reposition per
   element the way nbtree does.
 - **Arrays behind a range further right:** an array on a column after the
   second, or behind a range with a NullTest, stays in the Filter.
+
+## Item \(i\) slice 4 — the plain Index Scan's trailing array
+
+When the index does not cover the query, PG uses an `Index Scan` \(or
+`Index Scan Backward`\) with the same
+`((thousand < 2) AND (tenthous = ANY (…)))`. goopg kept a bitmap or range
+scan with the array in the Filter.
+
+### Change
+
+- **Planner:**
+  - The plain producer's leading\-range branch files the trailing array
+    \(`trailingSAOPOnRange`, shared with the index\-only producer\).
+  - It is priced by the same skip\-array arm, now the shared
+    `trailingSAOPSelectivity`.
+  - `createRangeIndexScanPlan` lowers it onto `IndexScan.TrailingSAOP` and
+    drops its conjuncts from the Filter.
+  - `trailingSAOPOnRange` refuses interval key columns, whose keys cannot be
+    decoded.
+- **Executor:** `trailingKeyCheck` \(index\_trailing\_saop.go\) decodes the
+  second key column from each entry. It handles the tuple\-format
+  descriptor and the blob format. `indexScanOp.scanAppendEntry` applies the
+  check before the TID is queued for a heap fetch, so a rejected entry is
+  never fetched, as with nbtree's array keys. The same callback serves the
+  backward cursor.
+- **Siblings:**
+  - `indexScanPredicate` adds the array to the predicate it rebuilds.
+  - EXPLAIN shares the IOS splice \(`withTrailingSAOPCond`\).
+  - The index\-only scan's predicate and decodability now come from the
+    shared helpers \(`trailingSAOPPred`, `predAdmits`,
+    `indexKeyDecodable`\).
+- **A hidden fallback:** createIndexScanPlan's backward guard panicked on
+  any plain SAOP path. The panic was recovered upstream, so the backward
+  trailing path silently lost to Sort \+ forward. The trailing shape is now
+  allowed there.
+
+### Verification
+
+- **Live server against a scratch PG 18.3:** the five plain statements
+  \(forward, backward, the bound\-counted arm, a column qual, a NULL
+  element\) have identical plans, costs and rows. Only `width` differs, as
+  it already did for any `SELECT *` on this table.
+- **`TestIndexScanSAOPBehindLeadingRange`:** 3 PG plans with rows.
+- **Regress:** the 22 suites are unchanged from slice 3 \(join back at
+  17626\).
+- **Gates:**
+  - units, tpch\-spotcheck, sf025 99/99;
+  - fire\-set fires=none on sf025, sf1 and TPC\-H;
+  - acceptance 24 MATCH.
 

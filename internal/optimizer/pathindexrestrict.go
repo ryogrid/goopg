@@ -706,6 +706,12 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 			clauses = withNullTestsInConjunctOrder(clauses, nts, conjuncts)
 		}
 		isRange = true
+		// M0148-0001c3a4 (i): an `= ANY` array on the second column behind
+		// the range is an index qual too, checked per entry
+		// (IndexScan.TrailingSAOP).
+		if len(clauses) > 0 {
+			clauses = append(clauses, trailingSAOPOnRange(cat, tbl, idx, conjuncts)...)
+		}
 	}
 	// M0146-0005dg: nothing binds the leading column — an equality run on a
 	// later column still drives a btree skip scan.
@@ -737,7 +743,11 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	var sel float64
 	var unique bool
 	numSAScans := 0.0
+	boundSel := 0.0
+	trailingAt, trailing := clausesTrailingSAOP(clauses)
 	switch {
+	case trailing:
+		sel, boundSel, numSAScans = trailingSAOPSelectivity(cat, rel, tbl, idx, clauses, trailingAt, relTuples, conjuncts)
 	case isSAOP:
 		// scalararraysel over the IN (clauseSelectivity's InExpr arm), and
 		// one descent per element (btcostestimate's num_sa_scans).
@@ -783,7 +793,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	// A skip probe descends once per distinct skipped prefix
 	// (btcostestimate's num_sa_scans); a reverted estimate prices the index
 	// side over the whole index (skipScanDescents, boundSelectivity 1).
-	boundSel := 0.0
+	// (boundSel may already hold the trailing-array arm's value.)
 	if skip > 0 {
 		var boundCounted bool
 		numSAScans, boundCounted = skipScanDescents(tbl, idx, skip, relTuples, indexPages)

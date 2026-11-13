@@ -1002,6 +1002,11 @@ type IndexScan struct {
 	// another `= ANY` keeps the intersection, a bound keeps the elements it
 	// admits.
 	SAOPColQuals []SAOPColQual
+	// TrailingSAOP mirrors IndexOnlyScan.TrailingSAOP (M0148-0001c3a4 (i)):
+	// an `= ANY` array on the second index column behind a leading-column
+	// range (LowKey/HighKey), checked against each entry's key before its
+	// heap fetch.
+	TrailingSAOP *TrailingSAOP
 
 	LowKey  Expr // inclusive lower bound for range scan; nil = no lower bound
 	HighKey Expr // inclusive upper bound for range scan; nil = no upper bound

@@ -334,7 +334,10 @@ func createIndexScanPlan(p *Path) Node {
 	if p.IndexScanDir != ForwardScanDirection && !backward {
 		panic(fmt.Sprintf("createPlan: PathIndexScan with %s", p.IndexScanDir))
 	}
-	if backward && (p.IndexSkipPrefix > 0 || (!p.IndexOnly && indexClausesHaveSAOP(p.IndexClauses))) {
+	// M0148-0001c3a4 (i): a trailing array rides the plain range probe, which
+	// walks backward.
+	_, trailingSAOP := clausesTrailingSAOP(p.IndexClauses)
+	if backward && (p.IndexSkipPrefix > 0 || (!p.IndexOnly && !trailingSAOP && indexClausesHaveSAOP(p.IndexClauses))) {
 		// M0148-0001c3a3: the executor walks backward only the plain
 		// probe path (indexScanOp's nbtree.ReverseScanCursor, and
 		// indexOnlyScanOp's reversed materialisation); the producers
@@ -590,6 +593,11 @@ func createIndexScanPlan(p *Path) Node {
 	// M0145-0029 slice 4: a ScalarArrayOp path — one clause on the leading
 	// column, lowered onto SAOPKeys (the executor's multi-descent arm).
 	// M0148-0001c3a4 (b): the array may follow an equality prefix.
+	// M0148-0001c3a4 (i): an array behind a leading range is the range
+	// scan's TrailingSAOP.
+	if _, ok := clausesTrailingSAOP(p.IndexClauses); ok {
+		return createRangeIndexScanPlan(p, id, rewrap)
+	}
 	for _, ic := range p.IndexClauses {
 		if len(ic.saop) > 0 {
 			return createSAOPIndexScanPlan(p, id, rewrap)
@@ -741,10 +749,22 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 		PrivilegeCheckRoleSet: id.privilegeCheckRoleSet,
 	}
 	drop := map[Expr]bool{}
+	rangeClauses := p.IndexClauses
+	if at, ok := clausesTrailingSAOP(p.IndexClauses); ok {
+		// M0148-0001c3a4 (i): the array on the second column behind the
+		// leading range, checked per entry by the scan.
+		c := p.IndexClauses[at]
+		if at != len(p.IndexClauses)-1 || c.indexCol != 1 || c.saopOp != parser.OpUnknown || c.local == nil {
+			panic(fmt.Sprintf("createPlan: range PathIndexScan on %s: the array behind the leading range must be the last clause, a second-column `= ANY`", p.IndexInfo.Name))
+		}
+		drop[c.local] = true
+		is.TrailingSAOP = &TrailingSAOP{Elems: append([]Expr(nil), c.saop...), ColQuals: lowerSAOPColQuals(c, drop)}
+		rangeClauses = p.IndexClauses[:at]
+	}
 	// Slice 2b: equality clauses first (index columns 0..n-1, in order) form
 	// RangePrefix; every bound then sits on column n.
 	var prefix []Expr
-	for _, c := range p.IndexClauses {
+	for _, c := range rangeClauses {
 		if c.op != parser.OpUnknown || c.nullTest != IndexNullTestNone {
 			break
 		}
@@ -760,7 +780,7 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 		is.RangePrefix = prefix
 	}
 	var condOrder []IndexCondItem
-	for i, c := range p.IndexClauses[len(prefix):] {
+	for i, c := range rangeClauses[len(prefix):] {
 		if c.nullTest != IndexNullTestNone {
 			condOrder = append(condOrder, IndexCondNullTest)
 			// M0148-0001c3a: the NullTest index qual on the range column —

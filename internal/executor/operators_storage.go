@@ -4023,6 +4023,15 @@ func indexScanPredicate(ix *optimizer.IndexScan) optimizer.Expr {
 				combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: high}
 			}
 		}
+		// M0148-0001c3a4 (i): the array on the second column behind the
+		// range.
+		if ts := ix.TrailingSAOP; ts != nil && combined != nil && len(ix.Index.Columns) > 1 {
+			ref, ok := indexScanColumnRef(ix, ix.Index.Columns[1])
+			if !ok {
+				return nil
+			}
+			combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: trailingSAOPPred(ref, ts)}
+		}
 		return combined
 	}
 	// No Key/Keys/LowKey/HighKey at all — nothing to reconstruct.

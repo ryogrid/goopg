@@ -3909,7 +3909,8 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 	if p.LeadingNullTest != optimizer.IndexNullTestNone && len(p.Index.Columns) > 0 {
 		return formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder)
 	}
-	return formatIndexCondPartsPrefixed(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder...)
+	rng := formatIndexCondPartsPrefixed(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder...)
+	return withTrailingSAOPCond(rng, p.Table, p.Index, p.TrailingSAOP, p.LowKey, p.HighKey, reg, prefix)
 }
 
 // formatIndexOnlyCond is formatIndexCond for an IndexOnlyScan. The two nodes
@@ -3945,25 +3946,31 @@ func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, pr
 		return formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder)
 	}
 	rng := formatIndexCondPartsPrefixed(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder...)
-	if ts := p.TrailingSAOP; ts != nil && len(p.Index.Columns) > 1 && rng != "" {
-		// M0148-0001c3a4 (i): the leading range, then the second column's
-		// array (and its column quals) — PG's `((thousand < 2) AND
-		// (tenthous = ANY ('{1001,3000}'::integer[])))`. The array renders
-		// as the index scan's, over the index shifted to its column.
-		shifted := *p.Index
-		shifted.Columns = p.Index.Columns[1:]
-		arr := formatIndexCondPrefixed(&optimizer.IndexScan{Table: p.Table, Index: &shifted, SAOPKeys: ts.Elems,
-			SAOPColQuals: ts.ColQuals}, reg, prefix)
-		nRange := 0
-		if p.LowKey != nil {
-			nRange++
-		}
-		if p.HighKey != nil {
-			nRange++
-		}
-		return "(" + indexCondInner(rng, nRange) + " AND " + indexCondInner(arr, 1+len(ts.ColQuals)) + ")"
+	return withTrailingSAOPCond(rng, p.Table, p.Index, p.TrailingSAOP, p.LowKey, p.HighKey, reg, prefix)
+}
+
+// withTrailingSAOPCond appends a scan's TrailingSAOP to its leading-range
+// Index Cond text (M0148-0001c3a4 (i)) — PG's `((thousand < 2) AND
+// (tenthous = ANY ('{1001,3000}'::integer[])))`. The array renders as the
+// index scan's own ScalarArrayOp, over the index shifted to its column, and
+// the two texts splice into one AND. Shared by IndexScan and IndexOnlyScan.
+func withTrailingSAOPCond(rng string, tbl *catalog.Table, idx *catalog.Index, ts *optimizer.TrailingSAOP,
+	lowKey, highKey optimizer.Expr, reg *subPlanReg, prefix string) string {
+	if ts == nil || len(idx.Columns) < 2 || rng == "" {
+		return rng
 	}
-	return rng
+	shifted := *idx
+	shifted.Columns = idx.Columns[1:]
+	arr := formatIndexCondPrefixed(&optimizer.IndexScan{Table: tbl, Index: &shifted, SAOPKeys: ts.Elems,
+		SAOPColQuals: ts.ColQuals}, reg, prefix)
+	nRange := 0
+	if lowKey != nil {
+		nRange++
+	}
+	if highKey != nil {
+		nRange++
+	}
+	return "(" + indexCondInner(rng, nRange) + " AND " + indexCondInner(arr, 1+len(ts.ColQuals)) + ")"
 }
 
 // indexCondInner strips indexCondAndText's outer wrapping from a text of n

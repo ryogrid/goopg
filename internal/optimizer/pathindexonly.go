@@ -271,9 +271,8 @@ func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, t
 		// the leading range is an index qual too (PG's `((thousand < 2) AND
 		// (tenthous = ANY (…)))`); the scan checks it per entry
 		// (IndexOnlyScan.TrailingSAOP), so its column must be covered.
-		if len(idx.Columns) > 1 && !idx.DeclaredHash && len(restrictionNullTestsOnColumn(idx, 0, conjuncts)) == 0 &&
-			columnCovered(covered, idx.Columns[1]) {
-			if sa := restrictionSAOPOnColumn(cat, tbl, idx, 1, conjuncts); len(sa) > 0 && sa[0].saopOp == parser.OpUnknown {
+		if len(idx.Columns) > 1 && columnCovered(covered, idx.Columns[1]) {
+			if sa := trailingSAOPOnRange(cat, tbl, idx, conjuncts); len(sa) > 0 {
 				clauses = append(clauses, sa...)
 				bound = 2
 			}
@@ -389,38 +388,10 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 	boundSel := 0.0
 	saopAt := indexClausesSAOPAt(clauses)
 	isSAOP := saopAt >= 0
-	trailing := isSAOP && saopAt > 0 && isInequalityOp(clauses[0].op)
+	_, trailing := clausesTrailingSAOP(clauses)
 	switch {
 	case trailing:
-		// M0148-0001c3a4 (i): btcostestimate's skip-array arm for a leading
-		// range behind which an array sits (selfuncs.c:7399-7590). The range
-		// column becomes a skip array: its ndistinct, scaled by the range's
-		// own selectivity, multiplies num_sa_scans. When that fraction is
-		// under DEFAULT_RANGE_INEQ_SEL, the ndistinct is a default, or the
-		// descents would exceed the index's pages, PG stops building
-		// indexBoundQuals there: the array then neither narrows the
-		// selectivity nor adds descents (it is still an index qual).
-		// indexSelectivity (genericcostestimate, the heap side) covers every
-		// index qual; numIndexTuples covers indexBoundQuals only
-		// (boundSelectivity).
-		rangeClauses := clauses[:saopAt]
-		frac := rangeIndexSelectivity(rel.baseLeaf, extractFilterConjuncts(rel.baseLeaf), rangeClauses)
-		c := clauses[saopAt]
-		sel = clampSelectivity(frac * clauseSelectivity(saopPricedClause(cat, tbl, idx, c), rel.baseLeaf))
-		for _, q := range c.saopColQuals {
-			sel = clampSelectivity(sel * clauseSelectivity(q.local, rel.baseLeaf))
-		}
-		boundSel = frac
-		pages, _, _ := estimateIndexGeometry(cat, idx, tbl, relTuples)
-		nd, isDefault := getVariableNumDistinct(joinVarStats{stats: columnStatsByName(tbl, idx.Columns[0]), tuples: relTuples})
-		if !isDefault && frac >= defaultRangeIneqSel {
-			nd = math.Max(math.RoundToEven(nd*frac), 1)
-			if nd <= pages {
-				numSAScans = nd
-				boundSel = sel
-				numSAScans *= saopDescents(c)
-			}
-		}
+		sel, boundSel, numSAScans = trailingSAOPSelectivity(cat, rel, tbl, idx, clauses, saopAt, relTuples, extractFilterConjuncts(rel.baseLeaf))
 	case isSAOP:
 		// M0148-0001c3a4 (h): scalararraysel over the array, times the
 		// equality prefix ahead of it ((i)) and the bounds on the column
@@ -675,4 +646,65 @@ func isInequalityOp(op parser.OpCode) bool {
 		return true
 	}
 	return false
+}
+
+// trailingSAOPSelectivity prices a leading range followed by an `= ANY`
+// array on the second column (M0148-0001c3a4 (i)): btcostestimate's
+// skip-array arm (selfuncs.c:7399-7590). The range column becomes a skip
+// array, its ndistinct scaled by the range's own selectivity multiplying
+// num_sa_scans. When that fraction is under DEFAULT_RANGE_INEQ_SEL, the
+// ndistinct is a default, or the descents would exceed the index's pages,
+// PG stops building indexBoundQuals there: the array then neither narrows
+// numIndexTuples (boundSel = the range alone) nor adds descents, while it
+// still narrows indexSelectivity (sel, genericcostestimate's heap side).
+// Shared by the plain and index-only producers.
+func trailingSAOPSelectivity(cat catalog.Catalog, rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index, clauses []indexPathClause,
+	saopAt int, relTuples float64, conjuncts []Expr) (sel, boundSel, numSAScans float64) {
+	frac := rangeIndexSelectivity(rel.baseLeaf, conjuncts, clauses[:saopAt])
+	c := clauses[saopAt]
+	sel = clampSelectivity(frac * clauseSelectivity(saopPricedClause(cat, tbl, idx, c), rel.baseLeaf))
+	for _, q := range c.saopColQuals {
+		sel = clampSelectivity(sel * clauseSelectivity(q.local, rel.baseLeaf))
+	}
+	boundSel = frac
+	pages, _, _ := estimateIndexGeometry(cat, idx, tbl, relTuples)
+	nd, isDefault := getVariableNumDistinct(joinVarStats{stats: columnStatsByName(tbl, idx.Columns[0]), tuples: relTuples})
+	if !isDefault && frac >= defaultRangeIneqSel {
+		nd = math.Max(math.RoundToEven(nd*frac), 1)
+		if nd <= pages {
+			numSAScans = nd * saopDescents(c)
+			boundSel = sel
+		}
+	}
+	return sel, boundSel, numSAScans
+}
+
+// trailingSAOPOnRange is the `= ANY` array on the second column the
+// producers file behind a leading range (M0148-0001c3a4 (i)): none when the
+// range column carries a NullTest, the index is a hash, or the array is an
+// inequality one.
+func trailingSAOPOnRange(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) []indexPathClause {
+	if len(idx.Columns) < 2 || idx.DeclaredHash || len(restrictionNullTestsOnColumn(idx, 0, conjuncts)) > 0 {
+		return nil
+	}
+	// The scan decodes the two leading key columns from each entry; an
+	// interval key (a lossy comparison span) cannot be decoded.
+	for _, name := range idx.Columns[:2] {
+		col, ok := tableColumnByName(tbl, name)
+		if !ok || strings.EqualFold(col.Type.Name, "interval") {
+			return nil
+		}
+	}
+	sa := restrictionSAOPOnColumn(cat, tbl, idx, 1, conjuncts)
+	if len(sa) == 0 || sa[0].saopOp != parser.OpUnknown {
+		return nil
+	}
+	return sa
+}
+
+// clausesTrailingSAOP reports the trailing-array shape: a leading range
+// followed by the array (saopAt > 0 behind an inequality on column 0).
+func clausesTrailingSAOP(clauses []indexPathClause) (saopAt int, ok bool) {
+	at := indexClausesSAOPAt(clauses)
+	return at, at > 0 && isInequalityOp(clauses[0].op)
 }

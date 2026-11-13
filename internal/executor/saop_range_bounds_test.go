@@ -384,3 +384,38 @@ func TestIndexOnlySAOPBehindLeadingRange(t *testing.T) {
 		}
 	}
 }
+
+// TestIndexScanSAOPBehindLeadingRange is the plain Index Scan twin of
+// TestIndexOnlySAOPBehindLeadingRange (M0148-0001c3a4 (i)): a query the index
+// does not cover reads the heap, and IndexScan.TrailingSAOP is checked on each
+// entry's key before its heap fetch (trailingKeyCheck). Plans and rows are PG
+// 18.3's, forward and backward, with a column qual merged into the array.
+func TestIndexScanSAOPBehindLeadingRange(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "CREATE TABLE tk (thousand int NOT NULL, tenthous int NOT NULL, pad text)")
+	runSQL(t, ctx, "INSERT INTO tk SELECT g%1000, g, repeat('x', 100) FROM generate_series(0, 9999) g")
+	runSQL(t, ctx, "CREATE INDEX tk_tt ON tk (thousand, tenthous)")
+	runSQL(t, ctx, "VACUUM tk")
+	runSQL(t, ctx, "ANALYZE tk")
+	ps := optimizer.DefaultPlannerSettings()
+	ps.EnableBitmapScan = false
+	for _, c := range []struct{ q, plan, rows string }{
+		{"SELECT thousand, tenthous FROM tk WHERE thousand < 2 AND tenthous IN (1001,3000) AND pad IS NOT NULL",
+			"Index Scan using tk_tt on tk\n  Index Cond: ((thousand < 2) AND (tenthous = ANY ('{1001,3000}'::integer[])))\n  Filter: (pad IS NOT NULL)",
+			"0|3000;1|1001"},
+		{"SELECT thousand, tenthous FROM tk WHERE thousand < 2 AND tenthous IN (1001,3000) AND pad IS NOT NULL ORDER BY thousand DESC, tenthous DESC",
+			"Index Scan Backward using tk_tt on tk\n  Index Cond: ((thousand < 2) AND (tenthous = ANY ('{1001,3000}'::integer[])))\n  Filter: (pad IS NOT NULL)",
+			"1|1001;0|3000"},
+		{"SELECT thousand, tenthous FROM tk WHERE thousand > 995 AND tenthous IN (998,999,9996,1997) AND tenthous > 998 AND pad IS NOT NULL",
+			"Index Scan using tk_tt on tk\n  Index Cond: ((thousand > 995) AND (tenthous = ANY ('{998,999,9996,1997}'::integer[])) AND (tenthous > 998))\n  Filter: (pad IS NOT NULL)",
+			"996|9996;997|1997;999|999"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

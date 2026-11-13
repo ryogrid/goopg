@@ -334,6 +334,10 @@ type indexScanOp struct {
 	saopExcl [][2]bool
 	saopIdx  int
 	saopSeen   map[storage.ItemPointer]struct{}
+	// trailCheck applies IndexScan.TrailingSAOP to each entry's key before
+	// it is queued for a heap fetch (M0148-0001c3a4 (i)); built on the first
+	// Rescan.
+	trailCheck *trailingKeyCheck
 
 	// skip-scan state (M0146-0005v, PG18's `_bt_skiparray`): a probe that
 	// binds a NON-leading key column is executed as an outer loop over the
@@ -573,6 +577,13 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// scan's verdict (if any) is recorded before its state is reset.
 	o.finalizeIndexScanSSI()
 	o.flushKills() // C3-S3: mark pending kills before discarding them
+	if o.plan.TrailingSAOP != nil && o.trailCheck == nil {
+		c, err := newTrailingKeyCheck(o.ctx, o.plan.Table, o.plan.Index, o.plan.TrailingSAOP)
+		if err != nil {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		o.trailCheck = c
+	}
 	o.tids = o.tids[:0]
 	o.poss = o.poss[:0]
 	o.killList = o.killList[:0]
@@ -1241,9 +1252,21 @@ func (o *indexScanOp) ssiRecordIndexScanGapLock(isFullKeyProbe bool) {
 // across SAOP array elements when a dedup map is installed, and marks
 // sawTID — the deferred gap-lock oracle — on every index entry pulled
 // (a duplicate-suppressed entry still proves the probe touched the index).
-// The key argument aliases the pinned leaf and is deliberately unused.
-func (o *indexScanOp) scanAppendEntry(_ []byte, ptr storage.ItemPointer, pos nbtree.ScanPos) (bool, error) {
+// The key argument aliases the pinned leaf; only the trailing-array check
+// reads it, synchronously.
+func (o *indexScanOp) scanAppendEntry(key []byte, ptr storage.ItemPointer, pos nbtree.ScanPos) (bool, error) {
 	o.sawTID = true
+	if o.trailCheck != nil {
+		// M0148-0001c3a4 (i): the trailing array is an index qual — an
+		// entry it rejects is never fetched.
+		ok, err := o.trailCheck.admits(key)
+		if err != nil {
+			return false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		if !ok {
+			return true, nil
+		}
+	}
 	if o.saopSeen != nil {
 		if _, dup := o.saopSeen[ptr]; dup {
 			return true, nil
