@@ -12471,12 +12471,26 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Probe against PG: 5 of 7 statements identical. The 2 that differ
       predate the slice and are listed in the next bullet.
     Movement: yes — regress create\_index 3015→2933, inherit 3154→3153
-  - (i) still open: an array behind a leading range; index-only SAOP behind
-    an equality prefix (also `hundred = 42 AND unique1 IN (…) AND unique1 <
-    100`); cross-type array literals (`'{33, 44}'::bigint[]` on int4); the
-    empty array literal as an index qual.
-  - Resume: (i) — an array behind a leading range, index-only SAOP behind a
-    prefix; then (d) sub-ORs inside AND arms.
+  - 2026-11-14 (i) slice 2 LANDED: index-only SAOP behind an equality
+    prefix.
+    - indexOnlyLeafClauses files prefix + array + next-column bounds
+      (IndexOnlyScan.Keys ahead of SAOPKeys).
+    - An equality array outranks a bound on its own column
+      (prefixEqualitySAOP); the bound merges into the array.
+    - A lone array literal is priced per element. `< ANY ('{100,300}')`
+      used to be estimated at 1/3.
+    - Live-server probe against PG: costs identical on 7 variants. The only
+      plan difference left is the constant-prefix Sort (c3a5 (d)).
+    Movement: none — regress 22 suites byte-identical; the IOS shapes show
+    only in the PG probe and TestIndexOnlySAOPBehindPrefix
+  - (i) still open:
+    - an array behind a leading range;
+    - cross-type array literals (`'{33, 44}'::bigint[]` on int4);
+    - the empty array literal as an index qual;
+    - index-only width counting index-qual-only columns;
+    - an index-only prefix + range.
+  - Resume: (i) — an array behind a leading range; then (d) sub-ORs inside
+    AND arms.
 - [ ] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
   `… Backward` regress lines**.
   Kind: impl

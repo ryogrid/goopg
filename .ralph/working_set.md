@@ -1,32 +1,36 @@
-# Working Set — loop end 2026-11-14 (M0148-0001c3a4 item (i) slice 1 landed a7c0f874b)
+# Working Set — loop end 2026-11-14 (census routing-20261114a IDENTICAL; M0148-0001c3a4 item (i) slice 2 landed e00ab607e)
 
-- Anomaly: prev-loop check flagged claude_output_2026-11-14_05-00-54 (API "credit balance too low", 1 turn, harmless). The real gap was loop 2026-11-12_14-43-13: killed mid-turn with item (i) WIP uncommitted and the baton not rewritten. That WIP was resumed, verified and committed this loop.
+- Anomaly: none (prev-loop check OK).
 - Nightly triage: run 20261114-050038 items: 0. Nothing filed.
-- S9: `scripts/s9-census-due.sh` = REUSE (routing-20261112t). a7c0f874b is a code commit, so the next loop should get DUE. Capture with BASELINE_REV=bd0b8d3a8.
-- Task: M0148-0001c3a4. Done: (a), (b), (c), (h), (i) slice 1. Open: rest of (i); (d)-(g).
-- Files (i slice 1):
-  - optimizer/pathbitmapor.go saopElementsFor/castIsColumnArrayType (split array literals).
-  - pathindexrestrict.go saopColumnQuals (sorted by Pos; pinned nonRecursiveClassifier in exprwalk_inventory_test.go).
-  - pathindexclauses.go saopColQuals; pathindexonly.go selectivity; createplanindex.go lowerSAOPColQuals; plan.go SAOPColQual.
-  - executor operators_index.go saopWindows colQuals filter; operators_explain.go colQual print + NULL array elements; operators_storage.go indexScanPredicate.
-  - Test: TestSAOPArrayLiteralAndColumnQuals.
+- S9: DUE at loop start → routing-20261114a (label s9cf, BASELINE_REV=bd0b8d3a8) IDENTICAL ×3.
+  - Committed as its own analysis commit; captures deleted.
+  - e00ab607e is a code commit, so the next loop's `scripts/s9-census-due.sh` should say DUE. Capture with BASELINE_REV=4480b6790 (capture head of routing-20261114a).
+- Task: M0148-0001c3a4. Done: (a), (b), (c), (h), (i) slices 1-2. Open: (i) rest; (d)-(g).
+- Files (i slice 2):
+  - optimizer/pathindexonly.go: indexOnlyLeafClauses prefix SAOP; addOneIndexOnlyPath saopAt pricing.
+  - pathindexrestrict.go: prefixEqualitySAOP.
+  - createplanindex.go: indexClausesSAOPAt; IOS prefix lowering onto Keys.
+  - pathbitmapor.go: arrayLiteralElements. selectivity.go: InExpr arm splits a lone literal.
+  - parallel.go lateralProbeIsPartialProbe + cardinality.go isLateralIndexProbe: refuse an IOS SAOP.
+  - executor operators_indexonly.go: prefix to saopWindows. operators_explain.go: RangePrefix: p.Keys.
+  - Test: TestIndexOnlySAOPBehindPrefix.
 - Findings:
-  - Probe on a scratch PG (tmp/pg-scratch-c3a4i, stopped; script tmp/c3a4i.sql): 5/7 identical.
-  - Diff 1: `hundred = 42 AND unique1 IN (…) AND unique1 < 100`. PG plans an IOS with prefix+SAOP+bound; goopg takes the range path. Cause: IOS lacks RangePrefix.
-  - Diff 2: `= ANY('{}')` should be an index qual printed `'{}'::integer[]`.
-  - Cross-type `'{33,44}'::bigint[]` on int4 is not split (create_index residue).
-- Next step: (i) rest — IOS SAOP behind an equality prefix (createIndexScanPlan ioSAOP path + indexOnlyScanOp saopWindows prefix), then an array behind a leading range; then (d).
+  - The unit VM fixture (newVMFixture) keeps relallvisible=0, and a second VACUUM there zeroes reltuples. It overprices IOS heap fetches, so compare IOS costs on a live server (tmp/c3a4i-bin + tmp/c3a4i-data on 5533, stopped).
+  - A live server gives relallvisible=relpages and costs equal to PG.
+  - Scratch PG at tmp/pg-scratch-c3a4i (5545, still running; stop with `postgres/local_install/bin/pg_ctl -D tmp/pg-scratch-c3a4i stop`). Probe scripts: tmp/c3a4i.sql, tmp/c3a4i3.sql.
+- Next step: S9 census (DUE), then (i) rest — an array behind a leading range (`thousand < 2 AND tenthous IN (…)`, PG IOS `((thousand < 2) AND (tenthous = ANY (…)))`).
+  - That needs a range-prefix form in saopWindows (each element window inside the leading range), filed by both the plain and the IOS producer.
 - Top-residual: M0148 residues. Open children: c3a4, c3a5, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census REUSE); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261114a done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a4.
 - Gates run (all PASS):
-  - regress A/B over 22 suites vs tmp/regress-c3a4a: create_index 3015→2933; inherit −1; others identical.
-  - units (first run failed TestExprSwitchInventoryIsPinned; fixed by pinning).
+  - census s9cf IDENTICAL ×3.
+  - units.
   - tpch-spotcheck.
   - sf025 99/99.
-  - fire-set c3a4ifs fires=none on sf025 and sf1.
+  - fire-set c3a4i2fs fires=none on sf025, sf1 and TPC-H.
   - acceptance 24 MATCH.
+  - regress 22 suites byte-identical to slice 1.
   - pgbench smoke.
-  - Sweep waited out the nightly batch (05:00–06:24).
 - In-flight: none.
