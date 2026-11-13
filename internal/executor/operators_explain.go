@@ -3929,7 +3929,7 @@ func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, pr
 	// M0148-0001c3a4 (h): the index-only ScalarArrayOp probe renders exactly
 	// as the index scan's (one renderer for the one probe shape).
 	if len(p.SAOPKeys) > 0 {
-		return formatIndexCondPrefixed(&optimizer.IndexScan{Table: p.Table, Index: p.Index, SAOPKeys: p.SAOPKeys, SAOPOp: p.SAOPOp,
+		return formatIndexCondPrefixed(&optimizer.IndexScan{Table: p.Table, Index: p.Index, RangePrefix: p.Keys, SAOPKeys: p.SAOPKeys, SAOPOp: p.SAOPOp,
 			SAOPColQuals: p.SAOPColQuals, LowKey: p.LowKey, HighKey: p.HighKey, LowOp: p.LowOp, HighOp: p.HighOp}, reg, prefix)
 	}
 	// M0146-0005bt: the index-only skip probe, rendered as the index scan's

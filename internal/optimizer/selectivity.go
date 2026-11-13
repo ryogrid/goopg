@@ -106,6 +106,17 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 			}
 			return sel
 		}
+		// M0148-0001c3a4 (i): a lone array literal (`< ANY ('{100,300}')`)
+		// is priced per element, as scalararraysel deconstructs the
+		// constant array; the probe splits it the same way
+		// (saopElementsFor).
+		if len(e.List) == 1 {
+			if elems, ok := arrayLiteralElements(cr.Type, e.List); ok && len(elems) > 0 && (len(elems) != 1 || elems[0] != e.List[0]) {
+				split := *e
+				split.List = elems
+				e = &split
+			}
+		}
 		stats := columnStatsForChild(cr.Index, child)
 		sel := inListSelectivity(e, cr, stats, columnRawRowsForChild(cr.Index, child), child)
 		if e.Negated {

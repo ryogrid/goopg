@@ -635,7 +635,9 @@ func isLateralIndexProbe(n Node) bool {
 	case *IndexScan:
 		return x.Key != nil || len(x.Keys) > 0
 	case *IndexOnlyScan:
-		return x.Key != nil || len(x.Keys) > 0
+		// Keys ahead of SAOPKeys are a constant prefix, not a lateral probe
+		// (M0148-0001c3a4 (i)).
+		return len(x.SAOPKeys) == 0 && (x.Key != nil || len(x.Keys) > 0)
 	}
 	return false
 }

@@ -305,3 +305,47 @@ func TestSAOPArrayLiteralAndColumnQuals(t *testing.T) {
 		}
 	}
 }
+
+// TestIndexOnlySAOPBehindPrefix pins M0148-0001c3a4 (i) against PG 18.3: an
+// array behind an equality prefix on an Index Only Scan (IndexOnlyScan.Keys
+// ahead of SAOPKeys), with the array's own column quals, bounds on the column
+// after it, and an inequality array.
+func TestIndexOnlySAOPBehindPrefix(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "CREATE TABLE tj (unique1 int NOT NULL, hundred int NOT NULL, ten int NOT NULL, pad text)")
+	runSQL(t, ctx, "INSERT INTO tj SELECT g, g%100, g%10, repeat('x', 100) FROM generate_series(0, 9999) g")
+	runSQL(t, ctx, "CREATE INDEX tj_hu ON tj (hundred, unique1)")
+	runSQL(t, ctx, "CREATE INDEX tj_thu ON tj (ten, hundred, unique1)")
+	runSQL(t, ctx, "VACUUM tj")
+	runSQL(t, ctx, "ANALYZE tj")
+	ps := optimizer.DefaultPlannerSettings()
+	for _, c := range []struct {
+		q, plan, rows string
+		noBitmap      bool
+	}{
+		// ORDER BY would add the constant-prefix Sort M0148-0001c3a5 (d)
+		// tracks; the backward IOS waits on it too.
+		{"SELECT unique1 FROM tj WHERE hundred = 42 and unique1 IN (42, 142, 7)",
+			"Index Only Scan using tj_hu on tj\n  Index Cond: ((hundred = 42) AND (unique1 = ANY ('{42,142,7}'::integer[])))", "42;142", false},
+		{"SELECT unique1 FROM tj WHERE hundred = 42 and unique1 IN (42, 142, 7) and unique1 < 100",
+			"Index Only Scan using tj_hu on tj\n  Index Cond: ((hundred = 42) AND (unique1 = ANY ('{42,142,7}'::integer[])) AND (unique1 < 100))", "42", false},
+		{"SELECT hundred, unique1 FROM tj WHERE ten = 2 and hundred IN (42, 12, 7) and unique1 > 9800",
+			"Index Only Scan using tj_thu on tj\n  Index Cond: ((ten = 2) AND (hundred = ANY ('{42,12,7}'::integer[])) AND (unique1 > 9800))",
+			"12|9812;12|9912;42|9842;42|9942", false},
+		{"SELECT unique1 FROM tj WHERE hundred = 42 and unique1 < ANY ('{100,300}'::int[])",
+			// The fixture keeps relallvisible at 0, so its index-only
+			// heap-fetch charge loses to the bitmap PG does not pick; a
+			// live server prices both as PG does (8.65 vs 22.89).
+			"Index Only Scan using tj_hu on tj\n  Index Cond: ((hundred = 42) AND (unique1 < ANY ('{100,300}'::integer[])))", "42;142;242", true},
+	} {
+		ps := ps
+		ps.EnableBitmapScan = !c.noBitmap
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

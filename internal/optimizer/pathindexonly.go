@@ -225,8 +225,22 @@ func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, t
 	var saop []indexPathClause
 	if len(clauses) == 0 {
 		saop = restrictionLeadingSAOP(cat, tbl, idx, conjuncts)
+	} else if n := len(clauses); n < len(idx.Columns) && !idx.DeclaredHash && (prefixEqualitySAOP(cat, tbl, idx, n, conjuncts) ||
+		(len(restrictionRangeOnColumn(cat, tbl, idx, n, conjuncts)) == 0 && restrictionNullTestOnColumn(idx, n, conjuncts) == nil)) {
+		// M0148-0001c3a4 (i): an array behind the equality prefix, as the
+		// plain producer files it (addOneRestrictionIndexPath) — PG's Index
+		// Only Scan with `((hundred = 42) AND (unique1 = ANY (…)))`.
+		if sa := restrictionSAOPOnColumn(cat, tbl, idx, n, conjuncts); len(sa) > 0 {
+			clauses = append(clauses, sa...)
+			if n+1 < len(idx.Columns) && sa[0].saopOp == parser.OpUnknown {
+				clauses = append(clauses, restrictionRangeBehindPrefix(cat, tbl, idx, n+1, conjuncts)...)
+			}
+			bound = boundIndexColumns(clauses)
+		}
 	}
 	switch {
+	case indexClausesSAOPAt(clauses) > 0:
+		// The prefix-SAOP clauses above.
 	case len(saop) > 0:
 		// M0148-0001c3a4 (h): a leading-column ScalarArrayOp, bounded on the
 		// second column, in the plain producer's precedence (ahead of a
@@ -358,18 +372,24 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 	// indexclauses list implies a full index scan", pathnodes.h:1817).
 	sel, unique := 1.0, false
 	numSAScans := 0.0
-	isSAOP := len(clauses) > 0 && len(clauses[0].saop) > 0
+	saopAt := indexClausesSAOPAt(clauses)
+	isSAOP := saopAt >= 0
 	switch {
 	case isSAOP:
 		// M0148-0001c3a4 (h): scalararraysel over the array, times the
-		// second-column bounds, one descent per element — the plain
-		// producer's SAOP pricing.
-		sel = clampSelectivity(clauseSelectivity(saopPricedClause(cat, tbl, idx, clauses[0]), rel.baseLeaf))
-		if len(clauses) > 1 {
-			sel = clampSelectivity(sel * rangeIndexSelectivity(rel.baseLeaf, extractFilterConjuncts(rel.baseLeaf), clauses[1:]))
+		// equality prefix ahead of it ((i)) and the bounds on the column
+		// after it, one descent per element — the plain producer's SAOP
+		// pricing.
+		sel = clampSelectivity(clauseSelectivity(saopPricedClause(cat, tbl, idx, clauses[saopAt]), rel.baseLeaf))
+		if saopAt > 0 {
+			eqSel, _ := restrictionIndexSelectivity(tbl, idx, clauses[:saopAt], relTuples)
+			sel = clampSelectivity(sel * eqSel)
 		}
-		numSAScans = float64(len(clauses[0].saop))
-		for _, q := range clauses[0].saopColQuals {
+		if len(clauses) > saopAt+1 {
+			sel = clampSelectivity(sel * rangeIndexSelectivity(rel.baseLeaf, extractFilterConjuncts(rel.baseLeaf), clauses[saopAt+1:]))
+		}
+		numSAScans = float64(len(clauses[saopAt].saop))
+		for _, q := range clauses[saopAt].saopColQuals {
 			sel = clampSelectivity(sel * clauseSelectivity(q.local, rel.baseLeaf))
 		}
 	case hasRangeClause(clauses):

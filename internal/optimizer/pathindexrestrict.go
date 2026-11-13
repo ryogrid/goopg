@@ -656,7 +656,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	// may be followed by range bounds on the NEXT column (PG binds `b > 5`
 	// behind `a = 1` on `(a, b)`). The eq clauses become IndexScan.RangePrefix.
 	prefixRange := false
-	if n := len(clauses); n > 0 && n < len(idx.Columns) {
+	if n := len(clauses); n > 0 && n < len(idx.Columns) && !prefixEqualitySAOP(cat, tbl, idx, n, conjuncts) {
 		rng := restrictionRangeBehindPrefix(cat, tbl, idx, n, conjuncts)
 		// M0148-0001c3a slice 3: a NullTest on the column after the prefix
 		// (`a = 1 AND b IS NULL`), bounded at the prefix's NULL group.
@@ -1119,4 +1119,17 @@ func saopColumnQuals(cat catalog.Catalog, tbl *catalog.Table, colName string, pr
 	// conjuncts may arrive reordered.
 	sort.SliceStable(out, func(i, j int) bool { return out[i].local.Pos() < out[j].local.Pos() })
 	return out
+}
+
+// prefixEqualitySAOP reports an `= ANY` array on index column n behind an
+// equality prefix (M0148-0001c3a4 (i)). PG makes every btree qual on the
+// column an index qual and _bt_preprocess_keys merges the column's bounds
+// into the array, so the array, not the bounds, is the column's probe: the
+// bounds ride along as its saopColQuals.
+func prefixEqualitySAOP(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, n int, conjuncts []Expr) bool {
+	if idx.DeclaredHash || n <= 0 || n >= len(idx.Columns) {
+		return false
+	}
+	sa := restrictionSAOPOnColumn(cat, tbl, idx, n, conjuncts)
+	return len(sa) > 0 && sa[0].saopOp == parser.OpUnknown
 }

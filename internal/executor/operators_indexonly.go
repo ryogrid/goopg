@@ -257,12 +257,14 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	var saopWins []saopWindow
 	switch {
 	case len(o.plan.SAOPKeys) > 0:
-		if isHashIdx || o.plan.SkipPrefix > 0 || o.plan.Key != nil || len(o.plan.Keys) > 0 {
+		// Keys, when set, is the equality prefix ahead of the array
+		// (M0148-0001c3a4 (i)).
+		if isHashIdx || o.plan.SkipPrefix > 0 || o.plan.Key != nil || len(o.plan.Keys)+1 > len(o.plan.Index.Columns) {
 			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
 				"indexOnlyScanOp: ScalarArrayOp probe on index %q carries an incompatible probe shape", o.plan.Index.Name)}
 		}
 		wins, err := ctx.saopWindows(saopProbeSpec{
-			table: o.plan.Table, index: o.plan.Index, elems: o.plan.SAOPKeys,
+			table: o.plan.Table, index: o.plan.Index, prefix: o.plan.Keys, elems: o.plan.SAOPKeys,
 			low: o.plan.LowKey, high: o.plan.HighKey, lowOp: o.plan.LowOp, highOp: o.plan.HighOp, pos: o.plan.Pos(),
 			op: o.plan.SAOPOp, colQuals: o.plan.SAOPColQuals,
 		}, tree, o.outerSlot)

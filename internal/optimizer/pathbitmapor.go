@@ -223,6 +223,13 @@ func orInequalitySAOP(cat catalog.Catalog, tbl *catalog.Table, colName string, c
 // correctly. Without this the probe encoded the whole `{7, 8, 9}` string as
 // one integer key and failed with 22P02 (M0148-0001c3a4 (i)).
 func saopElementsFor(col catalog.Column, list []Expr) ([]Expr, bool) {
+	return arrayLiteralElements(col.Type, list)
+}
+
+// arrayLiteralElements is saopElementsFor over the operand's type; the
+// selectivity estimator calls it with a ColumnRef's type (scalararraysel
+// deconstructs the same constant array the probe does).
+func arrayLiteralElements(typ catalog.Type, list []Expr) ([]Expr, bool) {
 	if len(list) != 1 {
 		return list, true
 	}
@@ -232,7 +239,7 @@ func saopElementsFor(col catalog.Column, list []Expr) ([]Expr, bool) {
 		if !isStr || !isArrayLiteralString(sc.Value) {
 			return list, true
 		}
-		if !castIsColumnArrayType(c.TargetType, col) {
+		if !castIsColumnArrayType(c.TargetType, typ) {
 			return nil, false
 		}
 		e = sc
@@ -250,9 +257,9 @@ func saopElementsFor(col catalog.Column, list []Expr) ([]Expr, bool) {
 		return nil, false
 	}
 	intCol := false
-	switch col.Type.Name {
+	switch typ.Name {
 	case "int2", "int4", "int8", "smallint", "integer", "bigint", "int":
-		intCol = !col.Type.IsArray
+		intCol = !typ.IsArray
 	}
 	var out []Expr
 	for _, tok := range strings.Split(body, ",") {
@@ -282,7 +289,7 @@ func isArrayLiteralString(v string) bool {
 
 // castIsColumnArrayType reports whether an array cast's target is the
 // column's own type as an array (`'{…}'::int[]` on an int4 column).
-func castIsColumnArrayType(target string, col catalog.Column) bool {
+func castIsColumnArrayType(target string, typ catalog.Type) bool {
 	t := strings.ToLower(strings.TrimSpace(target))
 	if !strings.HasSuffix(t, "[]") {
 		return false
@@ -291,7 +298,7 @@ func castIsColumnArrayType(target string, col catalog.Column) bool {
 	canon := map[string]string{"int": "int4", "integer": "int4", "int4": "int4", "smallint": "int2", "int2": "int2",
 		"bigint": "int8", "int8": "int8", "text": "text"}
 	ce, ok1 := canon[elem]
-	cc, ok2 := canon[strings.ToLower(col.Type.Name)]
+	cc, ok2 := canon[strings.ToLower(typ.Name)]
 	return ok1 && ok2 && ce == cc
 }
 

@@ -1,6 +1,6 @@
 # M0148\-0001c3a4 — ScalarArrayOp and OR index\-path residue
 
-**Parent:** M0148\-0001c3a2 · **Status:** items \(a\), \(b\), \(c\) and \(h\) landed 2026\-11\-12; item \(i\) slice 1 landed 2026\-11\-14; items \(d\)–\(g\) and the rest of \(i\) open
+**Parent:** M0148\-0001c3a2 · **Status:** items \(a\), \(b\), \(c\) and \(h\) landed 2026\-11\-12; item \(i\) slices 1–2 landed 2026\-11\-14; items \(d\)–\(g\) and the rest of \(i\) open
 
 This item collects what M0148\-0001c3a2 \(BitmapOr paths\) left open. The items
 are listed in `.ralph/fix_plan.md` under M0148\-0001c3a4:
@@ -387,8 +387,76 @@ failed with 22P02.
   cross\-type opfamily operator.
 - **Empty array literal:** `= ANY ('{}')` stays a Filter, printed without
   its `::integer[]` cast. PG keeps it as an index qual that matches nothing.
-- **Array behind a prefix plus a bound on the array column:** `hundred = 42
-  AND unique1 IN (…) AND unique1 < 100` takes the range path. PG uses an
-  index\-only SAOP behind the prefix \(IndexOnlyScan has no RangePrefix\).
+- **Array behind a prefix plus a bound on the array column:** closed by
+  slice 2.
 - **Array behind a leading range** \(`thousand < 2 AND tenthous IN (…)`\):
   still open.
+
+## Item \(i\) slice 2 — index\-only ScalarArrayOp behind an equality prefix
+
+PG builds one path per index and makes it index\-only when the index covers
+the query \(build\_index\_paths\), so `hundred = 42 AND unique1 IN (…)` on
+`(hundred, unique1)` prints `Index Only Scan` with
+`((hundred = 42) AND (unique1 = ANY (…)))`. goopg's index\-only producer
+handled only a leading array, so the plain Index Scan kept these clauses.
+
+### Change
+
+- **Producer:** `indexOnlyLeafClauses` files the equality prefix, the array
+  on the next column and the bounds on the column after it, exactly as
+  `addOneRestrictionIndexPath` does. Since the plain producer asks
+  `restrictionPathIsIndexOnly`, only one of the two builds the path.
+- **An equality array outranks a bound on its column:**
+  `prefixEqualitySAOP`. With `hundred = 42 AND unique1 IN (…) AND
+  unique1 < 100`, both producers used to bind the bound \(prefix range\) and
+  leave the array in the Filter. PG makes every btree qual on the column an
+  index qual and merges the bound into the array, so the array now becomes
+  the column's probe and the bound becomes one of its `saopColQuals`
+  \(slice 1\).
+- **Costing:** `addOneIndexOnlyPath` finds the array clause by position
+  \(`indexClausesSAOPAt`\). It multiplies in the prefix's equality
+  selectivity and prices the bounds after the array, matching the plain
+  producer.
+- **Plan and executor:** the prefix lowers onto `IndexOnlyScan.Keys` ahead
+  of `SAOPKeys`, the same layout as BitmapIndexScan. `indexOnlyScanOp` hands
+  Keys to `saopWindows` as the prefix, and EXPLAIN renders the prefix as the
+  index scan's RangePrefix. `lateralProbeIsPartialProbe` and
+  `isLateralIndexProbe` no longer read those Keys as an equality probe.
+- **Selectivity of a lone array literal:** the InExpr arm of
+  `clauseSelectivity` now splits `'{100,300}'` into its elements
+  \(`arrayLiteralElements`, shared with `saopElementsFor`\), as
+  scalararraysel deconstructs the constant array. `unique1 < ANY
+  ('{100,300}')` used to get the default 1/3, which made the row estimate
+  33 where PG has 4.
+
+### Verification
+
+- **Live server against a scratch PG 18.3:**
+  - Plans: on 7 EXPLAIN variants, costs match PG to the cent \(12.89,
+    8.65, 12.90, 8.61, …\).
+  - Rows: every statement in the probe script returns the same rows.
+  - The two remaining plan differences are the constant\-prefix Sort
+    \(`ORDER BY unique1` behind `hundred = 42`, M0148\-0001c3a5 \(d\)\), which
+    also hides PG's `Index Only Scan Backward`.
+- **`TestIndexOnlySAOPBehindPrefix`:** 4 PG plans with their rows.
+  - The unit VM fixture keeps relallvisible at 0, which overprices
+    index\-only heap fetches by random\_page\_cost per row. Its inequality
+    case therefore runs with bitmap scans off.
+  - A live server does not have this problem \(relallvisible = relpages
+    after VACUUM\).
+- **Regress:** the 22 suites are byte\-identical to slice 1. The
+  create\_index prefix\-array cases select columns outside the index, so
+  they stay plain Index Scans.
+- **Gates:**
+  - units, tpch\-spotcheck, sf025 99/99;
+  - fire\-set fires=none on sf025, sf1 and TPC\-H;
+  - acceptance 24 MATCH.
+
+### Not covered
+
+- **Index\-only width:** the scan's width counts columns used only by
+  index quals \(`width=8` where PG prints 4\). PG prices the reltarget.
+- **Prefix plus a range, index\-only:** `hundred = 42 AND unique1 < 100`
+  covered by the index is still a plain Index Scan
+  \(plainRestrictionBindsOnlyPrefix declines\).
+- **An array behind a leading range** is still open.

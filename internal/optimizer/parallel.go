@@ -1556,8 +1556,8 @@ func mergeJoinIsPartialCapable(p *Join) bool {
 // Keys) with no SAOP multi-descent and no range bounds. SAOP is refused
 // because the `pidx` leaf filter is consulted only at the single-range
 // site (operators_index.go); range bounds are refused as
-// scope-minimization (Q96's probe is equality). An IndexOnlyScan has no
-// SAOP shape (promotion declines it), so only the range half applies.
+// scope-minimization (Q96's probe is equality). Both halves apply to an
+// IndexOnlyScan as well.
 //
 // The same probe-shape check guards the fused NLI's Inner
 // (NestedLoopIndexJoinIsPartialCapable, M0142-0005a): a *NestedLoopIndexJoin
@@ -1577,7 +1577,9 @@ func lateralProbeIsPartialProbe(n Node) bool {
 		if x == nil || x.Index == nil {
 			return false
 		}
-		if x.LowKey != nil || x.HighKey != nil {
+		// Since M0148-0001c3a4 (h)/(i) an IndexOnlyScan has a SAOP shape too
+		// (SAOPKeys, behind an optional equality prefix in Keys).
+		if len(x.SAOPKeys) > 0 || x.LowKey != nil || x.HighKey != nil {
 			return false
 		}
 		return x.Key != nil || len(x.Keys) > 0
