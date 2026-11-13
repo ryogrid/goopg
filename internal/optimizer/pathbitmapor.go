@@ -13,6 +13,8 @@ package optimizer
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -211,6 +213,88 @@ func orInequalitySAOP(cat catalog.Catalog, tbl *catalog.Table, colName string, c
 	return &InExpr{pos: conj.Pos(), Operand: cr, List: elems, AnyOp: op}, op, true
 }
 
+// saopElementsFor is the element list a ScalarArrayOp index qual probes:
+// list itself, or — mirroring collectInValues' single-element expansion —
+// the elements of a lone array literal (`= ANY ('{7, 8, 9}')`, or the literal
+// cast to the column's own array type), as PG's constant array is
+// (_bt_preprocess_array_keys deconstructs it). ok is false when the literal
+// cannot be taken apart here exactly (quotes, nested braces, a cast to
+// another element type): the qual then stays a Filter, which evaluates it
+// correctly. Without this the probe encoded the whole `{7, 8, 9}` string as
+// one integer key and failed with 22P02 (M0148-0001c3a4 (i)).
+func saopElementsFor(col catalog.Column, list []Expr) ([]Expr, bool) {
+	if len(list) != 1 {
+		return list, true
+	}
+	e := list[0]
+	if c, isCast := e.(*CastExpr); isCast {
+		sc, isStr := c.Operand.(*StringConst)
+		if !isStr || !isArrayLiteralString(sc.Value) {
+			return list, true
+		}
+		if !castIsColumnArrayType(c.TargetType, col) {
+			return nil, false
+		}
+		e = sc
+	}
+	sc, isStr := e.(*StringConst)
+	if !isStr || !isArrayLiteralString(sc.Value) {
+		return list, true
+	}
+	body := strings.TrimSpace(sc.Value[1 : len(sc.Value)-1])
+	if strings.ContainsAny(body, "{}\"\\") {
+		return nil, false
+	}
+	if body == "" {
+		// An empty array matches nothing; keep it as the Filter.
+		return nil, false
+	}
+	intCol := false
+	switch col.Type.Name {
+	case "int2", "int4", "int8", "smallint", "integer", "bigint", "int":
+		intCol = !col.Type.IsArray
+	}
+	var out []Expr
+	for _, tok := range strings.Split(body, ",") {
+		tok = strings.TrimSpace(tok)
+		switch {
+		case strings.EqualFold(tok, "NULL"):
+			out = append(out, &NullConst{pos: sc.pos})
+		case tok == "":
+			return nil, false
+		case intCol:
+			v, err := strconv.ParseInt(tok, 10, 64)
+			if err != nil {
+				return nil, false
+			}
+			out = append(out, &IntegerConst{pos: sc.pos, Value: v})
+		default:
+			out = append(out, &StringConst{pos: sc.pos, Value: tok})
+		}
+	}
+	return out, true
+}
+
+// isArrayLiteralString is the `{…}` shape collectInValues expands.
+func isArrayLiteralString(v string) bool {
+	return len(v) >= 2 && v[0] == '{' && v[len(v)-1] == '}'
+}
+
+// castIsColumnArrayType reports whether an array cast's target is the
+// column's own type as an array (`'{…}'::int[]` on an int4 column).
+func castIsColumnArrayType(target string, col catalog.Column) bool {
+	t := strings.ToLower(strings.TrimSpace(target))
+	if !strings.HasSuffix(t, "[]") {
+		return false
+	}
+	elem := strings.TrimSpace(strings.TrimSuffix(t, "[]"))
+	canon := map[string]string{"int": "int4", "integer": "int4", "int4": "int4", "smallint": "int2", "int2": "int2",
+		"bigint": "int8", "int8": "int8", "text": "text"}
+	ce, ok1 := canon[elem]
+	cc, ok2 := canon[strings.ToLower(col.Type.Name)]
+	return ok1 && ok2 && ce == cc
+}
+
 // saopAnyInequality reports an explicit `col op ANY (list)` with an
 // inequality operator (`id1 >= ANY (array[1,5])`).
 func saopAnyInequality(in *InExpr) (parser.OpCode, bool) {
@@ -261,8 +345,12 @@ func bitmapSAOPOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.In
 			if !ok || cr.Index < 0 || cr.Index >= len(tbl.Columns) || tbl.Columns[cr.Index].Name != colName {
 				continue
 			}
+			list, listOK := saopElementsFor(tbl.Columns[cr.Index], in.List)
+			if !listOK {
+				continue
+			}
 			usable := true
-			for _, e := range in.List {
+			for _, e := range list {
 				if _, isNull := e.(*NullConst); isNull {
 					continue
 				}
@@ -272,7 +360,7 @@ func bitmapSAOPOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.In
 				}
 			}
 			if usable {
-				return &indexPathClause{indexCol: pos, saop: in.List, saopOp: ineqOp, local: conj}, conj
+				return &indexPathClause{indexCol: pos, saop: list, saopOp: ineqOp, local: conj}, conj
 			}
 			continue
 		}

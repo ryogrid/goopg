@@ -266,3 +266,42 @@ func TestInequalitySAOP(t *testing.T) {
 		counts("unique1 <= ANY ('{NULL,NULL}'::int[])")
 	}
 }
+
+// TestSAOPArrayLiteralAndColumnQuals pins M0148-0001c3a4 (i) against PG
+// 18.3. A lone array literal (`= ANY ('{7, 8, 9}')`) is probed element by
+// element — it used to be encoded as one integer key and fail with 22P02 —
+// and NULL elements print inside the literal. A further `= ANY` or a bound
+// on the array's own column is merged into the array (_bt_preprocess_keys)
+// and printed in the same Index Cond.
+func TestSAOPArrayLiteralAndColumnQuals(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "CREATE TABLE ti (unique1 int NOT NULL, hundred int NOT NULL, pad text)")
+	runSQL(t, ctx, "INSERT INTO ti SELECT g, g%100, repeat('x', 100) FROM generate_series(0, 9999) g")
+	runSQL(t, ctx, "CREATE INDEX ti_u ON ti (unique1)")
+	runSQL(t, ctx, "VACUUM ti")
+	runSQL(t, ctx, "ANALYZE ti")
+	ps := optimizer.DefaultPlannerSettings()
+	for _, c := range []struct{ w, cond, rows string }{
+		{"unique1 IN (1, 42, 7) and unique1 = ANY('{7, 8, 9}')",
+			"((unique1 = ANY ('{1,42,7}'::integer[])) AND (unique1 = ANY ('{7,8,9}'::integer[])))", "7"},
+		{"unique1 = ANY('{NULL,NULL,NULL}')", "(unique1 = ANY ('{NULL,NULL,NULL}'::integer[]))", ""},
+		{"unique1 = ANY('{9, 3,NULL}')", "(unique1 = ANY ('{9,3,NULL}'::integer[]))", "3;9"},
+		{"unique1 = ANY('{9,3}'::int[])", "(unique1 = ANY ('{9,3}'::integer[]))", "3;9"},
+		{"unique1 IN (1, 42, 7) and unique1 >= 42", "((unique1 = ANY ('{1,42,7}'::integer[])) AND (unique1 >= 42))", "42"},
+		{"unique1 IN (1, 42, 7) and unique1 > 42", "((unique1 = ANY ('{1,42,7}'::integer[])) AND (unique1 > 42))", ""},
+		{"unique1 < 8 and unique1 IN (1, 42, 7)", "((unique1 < 8) AND (unique1 = ANY ('{1,42,7}'::integer[])))", "1;7"},
+		// Two arrays and a bound keep the order they were written in.
+		{"unique1 IN (42, 43, 7) and unique1 IN (43, 7, 8) and unique1 < 40",
+			"((unique1 = ANY ('{42,43,7}'::integer[])) AND (unique1 = ANY ('{43,7,8}'::integer[])) AND (unique1 < 40))", "7"},
+	} {
+		q := "SELECT unique1 FROM ti WHERE " + c.w + " ORDER BY 1"
+		want := "Index Only Scan using ti_u on ti\n  Index Cond: " + c.cond
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+q, ps)), "\n"); got != want {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.w, got, want)
+		}
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.w, got, c.rows)
+		}
+	}
+}

@@ -1,6 +1,6 @@
 # M0148\-0001c3a4 — ScalarArrayOp and OR index\-path residue
 
-**Parent:** M0148\-0001c3a2 · **Status:** items \(a\), \(b\), \(c\) and \(h\) landed 2026\-11\-12; items \(d\)–\(g\), \(i\) open
+**Parent:** M0148\-0001c3a2 · **Status:** items \(a\), \(b\), \(c\) and \(h\) landed 2026\-11\-12; item \(i\) slice 1 landed 2026\-11\-14; items \(d\)–\(g\) and the rest of \(i\) open
 
 This item collects what M0148\-0001c3a2 \(BitmapOr paths\) left open. The items
 are listed in `.ralph/fix_plan.md` under M0148\-0001c3a4:
@@ -12,7 +12,10 @@ are listed in `.ralph/fix_plan.md` under M0148\-0001c3a4:
 - \(e\) useful\\\_predicate arms;
 - \(f\) join OR bitmap paths;
 - \(g\) the bitmap node cost line;
-- \(h\) index\-only SAOP scans, and the bitmap SAOP carrier with bounds.
+- \(h\) index\-only SAOP scans, and the bitmap SAOP carrier with bounds;
+- \(i\) the array's own column: array literals, further arrays and bounds
+  merged into the probe; an array behind a range or behind a prefix on an
+  index\-only scan.
 
 ## Item \(c\) — a bound behind a leading ScalarArrayOp is an exact index qual
 
@@ -315,3 +318,77 @@ inequality group.
   refutes, which goopg does not.
 - **Bounds behind an inequality array:** the next column's bounds stay in
   the Filter.
+
+## Item \(i\) slice 1 — array literals and quals merged into the array
+
+PG prints every btree qual on the array's own column in the same Index Cond
+\(`((unique1 = ANY ('{1,42,7}'::integer[])) AND (unique1 >= 42))`\).
+\_bt\_preprocess\_keys merges them into the array before the scan:
+\_bt\_merge\_arrays keeps the intersection of two arrays, and
+\_bt\_compare\_array\_scankey\_args keeps the elements a bound admits. Before
+this slice goopg left those quals in the Filter.
+
+It also had a separate failure. A lone array literal \(`= ANY ('{7, 8, 9}')`\)
+became one probe key holding the whole `{7, 8, 9}` string, and the scan
+failed with 22P02.
+
+### Change
+
+- **Array literals:** `saopElementsFor` \(pathbitmapor.go\) splits a lone
+  `'{…}'` literal into its elements, and so does a cast to the column's own
+  array type. This matches collectInValues' single\-element expansion. NULL
+  elements become NullConst. A literal it cannot split exactly \(quotes,
+  nesting, empty, a cast to another element type\) is not an index qual and
+  stays a Filter. The restriction producer and the bitmap producer both use
+  it.
+- **Column quals:** `saopColumnQuals` \(pathindexrestrict.go\) collects the
+  other constant `= ANY` lists and `<` `<=` `>` `>=` bounds on the array's
+  column. Each is an `indexPathClause.saopColQuals` entry carrying its
+  conjunct, and the entries are sorted by source position, because Index
+  Cond keeps restriction order. Only equality arrays take column quals.
+  Paths multiply in each qual's selectivity \(restriction and index\-only
+  producers\).
+- **Plan:** `IndexScan.SAOPColQuals` / `IndexOnlyScan.SAOPColQuals`
+  \(`SAOPColQual`: Op/Key or Array, BeforeArray\). `lowerSAOPColQuals`
+  drops their conjuncts from the Filter in both createPlan sites.
+- **Executor:** `saopWindows` filters the sorted elements before it builds
+  any windows. It compares each element's encoded key against the qual's key
+  with the tree comparator, and flips the result on a DESC column. An array
+  qual keeps the intersection. A `NULL` bound admits nothing. Whatever
+  remains is probed as before.
+- **Sibling paths:**
+  - `indexScanPredicate` rebuilds the quals for the recheck/predicate
+    consumers.
+  - EXPLAIN prints them before or after the array \(BeforeArray\).
+  - `inListArrayConst` prints NULL elements inside the literal, and prints
+    a lone NULL as `NULL::type[]`.
+
+### Verification
+
+- **Probe against PG 18.3 \(scratch instance\):** 5 of 7 edge statements
+  give the same plan and rows:
+  - a cross\-type `> 42.5` stays a Filter, as in PG;
+  - `<=` and a commuted `42 < unique1`, on a DESC index;
+  - a text column;
+  - two arrays plus a bound, in source order.
+  The other two differ in ways that predate this slice \(see Not covered\).
+- **`TestSAOPArrayLiteralAndColumnQuals`:** 8 PG plans plus their rows.
+- **Regress:**
+  - create\_index 3015→2933 lines; its only new mismatch line is the
+    cross\-type array below.
+  - inherit −1: `IN (null, 'cd')` now prints `'{NULL,cd}'::text[]`.
+  - The other 20 of the 22 suites are unchanged.
+- **Gates:** units, tpch\-spotcheck, sf025.
+
+### Not covered
+
+- **Cross\-type arrays:** `unique1 = ANY ('{33, 44}'::bigint[])` on an int4
+  column is not split \(castIsColumnArrayType\). PG merges it through the
+  cross\-type opfamily operator.
+- **Empty array literal:** `= ANY ('{}')` stays a Filter, printed without
+  its `::integer[]` cast. PG keeps it as an index qual that matches nothing.
+- **Array behind a prefix plus a bound on the array column:** `hundred = 42
+  AND unique1 IN (…) AND unique1 < 100` takes the range path. PG uses an
+  index\-only SAOP behind the prefix \(IndexOnlyScan has no RangePrefix\).
+- **Array behind a leading range** \(`thousand < 2 AND tenthous IN (…)`\):
+  still open.

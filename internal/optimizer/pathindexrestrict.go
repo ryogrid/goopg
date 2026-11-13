@@ -28,6 +28,7 @@ package optimizer
 // range or SAOP column is not built yet — ledgered.
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -349,8 +350,12 @@ func restrictionSAOPOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catal
 		if !ok || cr.Index < 0 || cr.Index >= len(tbl.Columns) || tbl.Columns[cr.Index].Name != lead {
 			continue
 		}
+		list, listOK := saopElementsFor(tbl.Columns[cr.Index], in.List)
+		if !listOK {
+			continue
+		}
 		usable := true
-		for _, e := range in.List {
+		for _, e := range list {
 			// A NULL element matches nothing under `=` and the executor's
 			// multi-descent probe skips it (ScalarArrayOp semantics), so it
 			// does not stop the list from being an index qual — PG keeps
@@ -366,7 +371,11 @@ func restrictionSAOPOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catal
 		if !usable {
 			continue
 		}
-		return []indexPathClause{{indexCol: pos, saop: in.List, saopOp: ineqOp, local: conj}}
+		c := indexPathClause{indexCol: pos, saop: list, saopOp: ineqOp, local: conj}
+		if ineqOp == parser.OpUnknown {
+			c.saopColQuals = saopColumnQuals(cat, tbl, lead, conj, conjuncts)
+		}
+		return []indexPathClause{c}
 	}
 	// M0148-0001c3a2: an OR of equalities on the leading column is the same
 	// ScalarArrayOp probe (match_orclause_to_indexcol); the OR is its exact
@@ -743,6 +752,10 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 			sel = clampSelectivity(sel * rangeIndexSelectivity(rel.baseLeaf, conjuncts, clauses[saopAt+1:]))
 		}
 		numSAScans = float64(len(clauses[saopAt].saop))
+		// M0148-0001c3a4 (i): the column quals merged into the array.
+		for _, q := range clauses[saopAt].saopColQuals {
+			sel = clampSelectivity(sel * clauseSelectivity(q.local, rel.baseLeaf))
+		}
 	case isRange:
 		sel = rangeIndexSelectivity(rel.baseLeaf, conjuncts, clauses)
 	case prefixRange:
@@ -1032,4 +1045,78 @@ func indexKeyEqSelectivity(stats *catalog.ColumnStats, key Expr, rawRows float64
 		return varEqNonConstSelectivity(stats, rawRows)
 	}
 	return eqSelectivityForColumn(stats, key, rawRows, typeName)
+}
+
+// saopColQual is one further qual on a ScalarArrayOp probe's column
+// (optimizer.SAOPColQual's path form).
+type saopColQual struct {
+	op     parser.OpCode
+	key    Expr
+	array  []Expr
+	local  Expr
+	before bool
+}
+
+// saopColumnQuals collects the restriction's other constant quals on the
+// array's column — further `= ANY` lists and range bounds — which
+// _bt_preprocess_keys merges into the array (_bt_merge_arrays,
+// _bt_compare_array_scankey_args): PG prints them in the same Index Cond
+// (`((unique1 = ANY ('{1,42,7}')) AND (unique1 >= 42))`). before marks a
+// qual written ahead of the array, by source position (restriction order).
+func saopColumnQuals(cat catalog.Catalog, tbl *catalog.Table, colName string, primary Expr, conjuncts []Expr) []saopColQual {
+	var out []saopColQual
+	for _, conj := range conjuncts {
+		if conj == primary {
+			continue
+		}
+		before := conj.Pos() < primary.Pos()
+		switch x := conj.(type) {
+		case *InExpr:
+			if x.Subquery != nil || x.Plan != nil || len(x.List) == 0 || x.Negated || x.NotEqualAny || x.AllOp ||
+				(x.AnyOp != parser.OpUnknown && x.AnyOp != parser.OpEq) {
+				continue
+			}
+			cr, ok := x.Operand.(*ColumnRef)
+			if !ok || cr.Index < 0 || cr.Index >= len(tbl.Columns) || tbl.Columns[cr.Index].Name != colName {
+				continue
+			}
+			list, ok := saopElementsFor(tbl.Columns[cr.Index], x.List)
+			if !ok {
+				continue
+			}
+			usable := true
+			for _, e := range list {
+				if _, isNull := e.(*NullConst); isNull {
+					continue
+				}
+				if !isConstExpr(e) || !restrictionKeyUsable(cat, tbl.Columns[cr.Index], e) {
+					usable = false
+					break
+				}
+			}
+			if usable {
+				out = append(out, saopColQual{op: parser.OpEq, array: list, local: conj, before: before})
+			}
+		case *BinaryOp:
+			switch x.Op {
+			case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+			default:
+				continue
+			}
+			cr, val, colOnRight, ok := normalizeColumnIndexKey(x.Left, x.Right)
+			if !ok || cr.Index < 0 || cr.Index >= len(tbl.Columns) || tbl.Columns[cr.Index].Name != colName ||
+				!isConstExpr(val) || !restrictionKeyUsable(cat, tbl.Columns[cr.Index], val) {
+				continue
+			}
+			op := x.Op
+			if colOnRight {
+				op = swapInequalityOp(op)
+			}
+			out = append(out, saopColQual{op: op, key: val, local: conj, before: before})
+		}
+	}
+	// Index Cond lists a column's quals in restriction (source) order;
+	// conjuncts may arrive reordered.
+	sort.SliceStable(out, func(i, j int) bool { return out[i].local.Pos() < out[j].local.Pos() })
+	return out
 }

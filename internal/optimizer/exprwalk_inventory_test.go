@@ -152,6 +152,8 @@ var exprSwitchInventory = map[string]walkerRole{
 	"equiv_class.go:ecMemberIdent": nonRecursiveClassifier,
 
 	"pathindexrestrict.go:qualsRejectNull": nonRecursiveClassifier,
+	// M0148-0001c3a4 (i): sorts top-level conjuncts into array / bound quals.
+	"pathindexrestrict.go:saopColumnQuals": nonRecursiveClassifier,
 	// `joinlayout.go:remapPosMapAfterRewrite` (walkerPending, 8 of 32 arms)
 	// was deleted by C-20b: the walker mutated nothing — its posMap parameter
 	// was never read — so there was no conversion to finish, only dead weight

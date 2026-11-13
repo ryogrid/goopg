@@ -137,6 +137,10 @@ type indexPathClause struct {
 	// saopOp is the array's operator: OpUnknown for `= ANY`, or an
 	// inequality (`col < ANY (…)`, M0148-0001c3a4 (a)).
 	saopOp parser.OpCode
+	// saopColQuals are further constant quals on the array's own column,
+	// merged into the array (M0148-0001c3a4 (i)); each carries its conjunct
+	// in local so createPlan drops it from the Filter.
+	saopColQuals []saopColQual
 	// nullTest marks a `indexcol IS [NOT] NULL` index qual (M0148-0001c3a,
 	// restrictionLeadingNullTest): `key` is nil, `op` equality, `local` the
 	// NullTest conjunct. createRangeIndexScanPlan lowers it onto

@@ -3934,6 +3934,16 @@ func indexScanPredicate(ix *optimizer.IndexScan) optimizer.Expr {
 		} else {
 			combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: in}
 		}
+		// M0148-0001c3a4 (i): the column quals merged into the array.
+		for _, q := range ix.SAOPColQuals {
+			var qe optimizer.Expr
+			if q.Array != nil {
+				qe = &optimizer.InExpr{Operand: ref, List: append([]optimizer.Expr(nil), q.Array...)}
+			} else {
+				qe = &optimizer.BinaryOp{Op: q.Op, Left: ref, Right: q.Key}
+			}
+			combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: qe}
+		}
 		// M0145-0029: a SAOP probe's bounds sit on the index column after it.
 		if (ix.LowKey != nil || ix.HighKey != nil) && len(ix.Index.Columns) > np+1 {
 			ref2, ok2 := indexScanColumnRef(ix, ix.Index.Columns[np+1])

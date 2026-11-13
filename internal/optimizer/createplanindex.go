@@ -368,6 +368,7 @@ func createIndexScanPlan(p *Path) Node {
 		// bounded on the second column — IndexOnlyScan.SAOPKeys.
 		var ioSAOP []Expr
 		ioSAOPOp := parser.OpUnknown
+		var ioColQuals []SAOPColQual
 		loopClauses := p.IndexClauses
 		if indexClausesHaveSAOP(p.IndexClauses) {
 			c0 := p.IndexClauses[0]
@@ -376,6 +377,7 @@ func createIndexScanPlan(p *Path) Node {
 			}
 			ioSAOP, ioSAOPOp = c0.saop, c0.saopOp
 			ioDrop[c0.local] = true
+			ioColQuals = lowerSAOPColQuals(c0, ioDrop)
 			for i, r := range p.IndexClauses[1:] {
 				if r.indexCol != 1 || r.key == nil || len(r.saop) > 0 || r.nullTest != IndexNullTestNone {
 					panic(fmt.Sprintf("createPlan: index-only SAOP PathIndexScan on %s: clause %d is not a second-column bound", p.IndexInfo.Name, i+1))
@@ -503,7 +505,7 @@ func createIndexScanPlan(p *Path) Node {
 		switch {
 		case ioSAOP != nil:
 			ios.SAOPKeys = append([]Expr(nil), ioSAOP...)
-			ios.SAOPOp = ioSAOPOp
+			ios.SAOPOp, ios.SAOPColQuals = ioSAOPOp, ioColQuals
 			ios.LowKey, ios.LowOp, ios.HighKey, ios.HighOp = ioLow, ioLowOp, ioHigh, ioHighOp
 		case ioRange:
 			ios.LowKey, ios.LowOp, ios.HighKey, ios.HighOp = ioLow, ioLowOp, ioHigh, ioHighOp
@@ -816,6 +818,7 @@ func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) N
 	if c.local != nil {
 		drop[c.local] = true
 	}
+	colQuals := lowerSAOPColQuals(c, drop)
 	var low, high Expr
 	var lowOp, highOp parser.OpCode
 	for i, r := range p.IndexClauses[np+1:] {
@@ -851,6 +854,7 @@ func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) N
 		Index:                 p.IndexInfo,
 		SAOPKeys:              append([]Expr(nil), c.saop...),
 		SAOPOp:                c.saopOp,
+		SAOPColQuals:          colQuals,
 		RangePrefix:           prefix,
 		LowKey:                low,
 		LowOp:                 lowOp,
@@ -935,4 +939,21 @@ func indexClausesHaveSAOP(clauses []indexPathClause) bool {
 		}
 	}
 	return false
+}
+
+// lowerSAOPColQuals is a ScalarArrayOp clause's column quals as plan
+// SAOPColQuals (M0148-0001c3a4 (i)); each one's conjunct joins drop, since
+// the probe applies it.
+func lowerSAOPColQuals(c indexPathClause, drop map[Expr]bool) []SAOPColQual {
+	if len(c.saopColQuals) == 0 {
+		return nil
+	}
+	out := make([]SAOPColQual, 0, len(c.saopColQuals))
+	for _, q := range c.saopColQuals {
+		out = append(out, SAOPColQual{Op: q.op, Key: q.key, Array: q.array, BeforeArray: q.before})
+		if q.local != nil {
+			drop[q.local] = true
+		}
+	}
+	return out
 }

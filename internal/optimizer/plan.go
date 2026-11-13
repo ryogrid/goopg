@@ -996,7 +996,13 @@ type IndexScan struct {
 	// inequality (`col < ANY (…)`) — one range up to the extreme element
 	// (_bt_find_extreme_element, M0148-0001c3a4 (a)); LowKey/HighKey are
 	// then unset.
-	SAOPOp  parser.OpCode
+	SAOPOp parser.OpCode
+	// SAOPColQuals are further constant quals on the array's own column
+	// (M0148-0001c3a4 (i)), which _bt_preprocess_keys merges into the array:
+	// another `= ANY` keeps the intersection, a bound keeps the elements it
+	// admits.
+	SAOPColQuals []SAOPColQual
+
 	LowKey  Expr // inclusive lower bound for range scan; nil = no lower bound
 	HighKey Expr // inclusive upper bound for range scan; nil = no upper bound
 	// RangePrefix, when non-empty, is an EQUALITY prefix for index columns
@@ -1247,6 +1253,19 @@ type Materialize struct {
 func (n *Materialize) Pos() int       { return n.pos }
 func (n *Materialize) Output() Schema { return n.Child.Output() }
 
+// SAOPColQual is one further qual on a ScalarArrayOp probe's column: a
+// comparison `col Op Key`, or (Array set) `col = ANY (Array)`. Keys and
+// elements are planner constants only (restrictionKeyUsable over
+// isConstExpr), so expression walkers need not visit them. BeforeArray
+// prints it ahead of the probe's own array in Index Cond (restriction-list
+// order).
+type SAOPColQual struct {
+	Op          parser.OpCode
+	Key         Expr
+	Array       []Expr
+	BeforeArray bool
+}
+
 // IndexOnlyScan is a covered index scan (M0046-0004): all projected columns
 // come from the B-tree index key, so no heap fetch is needed when the
 // visibility map reports ALL_VISIBLE for the target page.
@@ -1286,8 +1305,10 @@ type IndexOnlyScan struct {
 	// Key/Keys/SkipPrefix. The elements descend sorted and de-duplicated
 	// (saopWindows, shared with indexScanOp).
 	SAOPKeys []Expr
-	// SAOPOp mirrors IndexScan.SAOPOp.
-	SAOPOp  parser.OpCode
+	// SAOPOp / SAOPColQuals mirror IndexScan's fields of the same names.
+	SAOPOp       parser.OpCode
+	SAOPColQuals []SAOPColQual
+
 	LowKey  Expr
 	HighKey Expr
 	// LowOp / HighOp mirror IndexScan's fields of the same name: the bound's

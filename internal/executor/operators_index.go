@@ -815,7 +815,7 @@ func (o *indexScanOp) rescanSAOP() error {
 	windows, err := o.ctx.saopWindows(saopProbeSpec{
 		table: o.plan.Table, index: o.plan.Index, prefix: o.plan.RangePrefix, elems: o.plan.SAOPKeys,
 		low: o.plan.LowKey, high: o.plan.HighKey, lowOp: o.plan.LowOp, highOp: o.plan.HighOp, pos: o.plan.Pos(),
-		op: o.plan.SAOPOp,
+		op: o.plan.SAOPOp, colQuals: o.plan.SAOPColQuals,
 	}, o.tree, o.outerSlot)
 	if err != nil {
 		return err
@@ -862,6 +862,9 @@ type saopProbeSpec struct {
 	// half-open ranges, i.e. the one range of the extreme element
 	// (_bt_preprocess_array_keys' _bt_find_extreme_element).
 	op parser.OpCode
+	// colQuals are further quals on the array's column, merged into the
+	// array as _bt_preprocess_keys does (M0148-0001c3a4 (i)).
+	colQuals []optimizer.SAOPColQual
 }
 
 // saopWindow is one array element's index-order window and the key parts
@@ -947,6 +950,86 @@ func (ctx *Context) saopWindows(sp saopProbeSpec, tree *nbtree.BTree, outerSlot 
 			}
 		}
 		elems = uniq
+	}
+	if len(sp.colQuals) > 0 && len(elems) > 0 {
+		// _bt_preprocess_keys merges the column's other quals into the
+		// array: another array keeps the intersection, a bound keeps the
+		// elements it admits (_bt_merge_arrays, _bt_compare_array_scankey_args).
+		if tree == nil {
+			return nil, &ExecError{Code: "XX000", Pos: sp.pos, Message: "ScalarArrayOp column quals without an index tree to compare them"}
+		}
+		reversed := rangeColumnReversed(ctx, sp.index, np)
+		qualKey := func(e optimizer.Expr) ([]byte, bool, error) {
+			v, err := evalExprSlot(e, outerSlot, ctx)
+			if err != nil || v.IsNull() {
+				return nil, false, err
+			}
+			k, encErr := ctx.indexProbeKey(sp.index, append(append(make([]indexProbeKeyPart, 0, np+1), prefixParts...), indexProbeKeyPart{col: col, val: v, pos: e.Pos()}))
+			if encErr != nil {
+				return nil, false, encErr
+			}
+			return k, true, nil
+		}
+		for _, q := range sp.colQuals {
+			var keep []saopElem
+			if q.Array != nil {
+				var keys [][]byte
+				for _, ae := range q.Array {
+					k, ok, err := qualKey(ae)
+					if err != nil {
+						return nil, err
+					}
+					if ok {
+						keys = append(keys, k)
+					}
+				}
+				for _, el := range elems {
+					for _, k := range keys {
+						if tree.CompareLowBound(el.key, k) == 0 {
+							keep = append(keep, el)
+							break
+						}
+					}
+				}
+			} else {
+				k, ok, err := qualKey(q.Key)
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					// `col op NULL` admits nothing.
+					return nil, nil
+				}
+				for _, el := range elems {
+					c := tree.CompareLowBound(el.key, k)
+					if reversed {
+						c = -c
+					}
+					var admit bool
+					switch q.Op {
+					case parser.OpLt:
+						admit = c < 0
+					case parser.OpLe:
+						admit = c <= 0
+					case parser.OpGt:
+						admit = c > 0
+					case parser.OpGe:
+						admit = c >= 0
+					case parser.OpEq:
+						admit = c == 0
+					default:
+						return nil, &ExecError{Code: "XX000", Pos: sp.pos, Message: fmt.Sprintf("ScalarArrayOp column qual with operator %v", q.Op)}
+					}
+					if admit {
+						keep = append(keep, el)
+					}
+				}
+			}
+			elems = keep
+		}
+		if len(elems) == 0 {
+			return nil, nil
+		}
 	}
 	switch sp.op {
 	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:

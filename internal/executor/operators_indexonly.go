@@ -264,7 +264,7 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		wins, err := ctx.saopWindows(saopProbeSpec{
 			table: o.plan.Table, index: o.plan.Index, elems: o.plan.SAOPKeys,
 			low: o.plan.LowKey, high: o.plan.HighKey, lowOp: o.plan.LowOp, highOp: o.plan.HighOp, pos: o.plan.Pos(),
-			op: o.plan.SAOPOp,
+			op: o.plan.SAOPOp, colQuals: o.plan.SAOPColQuals,
 		}, tree, o.outerSlot)
 		if err != nil {
 			return err

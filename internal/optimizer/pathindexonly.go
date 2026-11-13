@@ -369,6 +369,9 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 			sel = clampSelectivity(sel * rangeIndexSelectivity(rel.baseLeaf, extractFilterConjuncts(rel.baseLeaf), clauses[1:]))
 		}
 		numSAScans = float64(len(clauses[0].saop))
+		for _, q := range clauses[0].saopColQuals {
+			sel = clampSelectivity(sel * clauseSelectivity(q.local, rel.baseLeaf))
+		}
 	case hasRangeClause(clauses):
 		// M0146-0061: leading-column bounds (and M0148-0001c3a's NullTest),
 		// priced as the plain range path prices them.

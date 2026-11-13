@@ -3825,7 +3825,39 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 				break
 			}
 		}
+		// M0148-0001c3a4 (i): the column quals merged into the array, in
+		// restriction order around it.
+		colQual := func(q optimizer.SAOPColQual) string {
+			if q.Array != nil {
+				keys := make([]string, 0, len(q.Array))
+				for _, k := range q.Array {
+					keys = append(keys, formatIndexCondKey(k, reg))
+				}
+				text := prefix + arrCol + " = ANY (" + strings.Join(keys, ", ") + ")"
+				if t := indexKeyColumnType(p.Table, p.Index, np); t != nil {
+					if cast, lit, ok := inListArrayConst(*t, q.Array); ok {
+						c := prefix + arrCol
+						if cast != "" {
+							c = "(" + c + ")::" + cast
+						}
+						text = c + " = ANY (" + lit + ")"
+					}
+				}
+				return text
+			}
+			return indexCondClause(prefix+arrCol, saopOpText(q.Op), q.Key, reg, indexKeyColumnType(p.Table, p.Index, np))
+		}
+		for _, q := range p.SAOPColQuals {
+			if q.BeforeArray {
+				clauses = append(clauses, colQual(q))
+			}
+		}
 		clauses = append(clauses, cond)
+		for _, q := range p.SAOPColQuals {
+			if !q.BeforeArray {
+				clauses = append(clauses, colQual(q))
+			}
+		}
 		// M0145-0029: bounds on the column after the array (PG
 		// `Index Cond: ((a = ANY (...)) AND (b > 1))`).
 		if (p.LowKey != nil || p.HighKey != nil) && len(p.Index.Columns) > np+1 {
@@ -3898,7 +3930,7 @@ func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, pr
 	// as the index scan's (one renderer for the one probe shape).
 	if len(p.SAOPKeys) > 0 {
 		return formatIndexCondPrefixed(&optimizer.IndexScan{Table: p.Table, Index: p.Index, SAOPKeys: p.SAOPKeys, SAOPOp: p.SAOPOp,
-			LowKey: p.LowKey, HighKey: p.HighKey, LowOp: p.LowOp, HighOp: p.HighOp}, reg, prefix)
+			SAOPColQuals: p.SAOPColQuals, LowKey: p.LowKey, HighKey: p.HighKey, LowOp: p.LowOp, HighOp: p.HighOp}, reg, prefix)
 	}
 	// M0146-0005bt: the index-only skip probe, rendered as the index scan's
 	// (formatIndexCond) — only the bound quals, each under its own column.
@@ -6529,6 +6561,12 @@ func inListArrayConst(lt catalog.Type, list []optimizer.Expr) (cast, lit string,
 	elems := make([]string, len(list))
 	ints := func(wide bool) bool {
 		for i, e := range list {
+			// A NULL element is printed as NULL inside the array literal
+			// (`'{9,3,NULL}'::integer[]`, M0148-0001c3a4 (i)).
+			if _, isNull := e.(*optimizer.NullConst); isNull {
+				elems[i] = "NULL"
+				continue
+			}
 			ic, isInt := e.(*optimizer.IntegerConst)
 			if !isInt {
 				return false
@@ -6542,6 +6580,10 @@ func inListArrayConst(lt catalog.Type, list []optimizer.Expr) (cast, lit string,
 	}
 	strs := func() bool {
 		for i, e := range list {
+			if _, isNull := e.(*optimizer.NullConst); isNull {
+				elems[i] = "NULL"
+				continue
+			}
 			sc, isStr := e.(*optimizer.StringConst)
 			if !isStr {
 				return false
@@ -6634,6 +6676,12 @@ func inListArrayConst(lt catalog.Type, list []optimizer.Expr) (cast, lit string,
 		typ = "date"
 	default:
 		return "", "", false
+	}
+	if len(list) == 1 {
+		if _, isNull := list[0].(*optimizer.NullConst); isNull {
+			// `= ANY (NULL)` is a NULL array, not an array holding NULL.
+			return cast, "NULL::" + typ + "[]", true
+		}
 	}
 	body := "{" + strings.Join(elems, ",") + "}"
 	return cast, "'" + strings.ReplaceAll(body, "'", "''") + "'::" + typ + "[]", true
