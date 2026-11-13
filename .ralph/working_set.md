@@ -1,39 +1,33 @@
-# Working Set — loop end 2026-11-14 (census routing-20261114b IDENTICAL; M0148-0001c3a4 item (i) slice 3 landed 672bab1b5)
+# Working Set — loop end 2026-11-14 (census routing-20261114c IDENTICAL; M0148-0001c3a4 item (i) slice 4 landed)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: run 20261114-050038 items: 0. Nothing filed.
-- S9: DUE at loop start → routing-20261114b (label s9cg, BASELINE_REV=4480b6790) IDENTICAL ×3, committed.
-  - 672bab1b5 is a code commit, so the next loop should get DUE. Capture with BASELINE_REV=2fb532031 (capture head of routing-20261114b).
-- Task: M0148-0001c3a4. Done: (a), (b), (c), (h), (i) slices 1-3. Open: (i) rest; (d)-(g).
-- Files (i slice 3):
-  - optimizer/pathindexonly.go: leading-range branch files the trailing SAOP; addOneIndexOnlyPath trailing cost arm (boundSel); columnCovered, isInequalityOp.
-  - createplanindex.go: TrailingSAOP lowering. plan.go: TrailingSAOP, BitmapIndexScan.SAOPColQuals.
-  - qualevalcost.go: indexQualCount, saopDescents, indexClausesEvalOps (counts column quals).
-  - pathbitmap.go / pathbitmapor.go / createplanbitmap.go: bitmap column quals.
-  - executor operators_indexonly.go trailingSAOPQual + per-entry check; operators_bitmap.go colQuals; operators_explain.go IOS splice (indexCondInner) + bitmap colQual render.
-  - Test: TestIndexOnlySAOPBehindLeadingRange.
+- S9: DUE at loop start → routing-20261114c (label s9ch, BASELINE_REV=2fb532031) IDENTICAL ×3, committed.
+  - The slice-4 code commit makes the next loop's census DUE. Capture with BASELINE_REV=f92e0006b (capture head of routing-20261114c).
+- Task: M0148-0001c3a4. Done: (a), (b), (c), (h), (i) slices 1-4. Open: (i) residue; (d)-(g).
+- Files (i slice 4):
+  - executor/index_trailing_saop.go (new): trailingSAOPPred, predAdmits, indexKeyDecodable, trailingKeyCheck.
+  - operators_index.go: trailCheck in Rescan + scanAppendEntry. operators_storage.go: indexScanPredicate. operators_explain.go: withTrailingSAOPCond. operators_indexonly.go: uses the shared helpers.
+  - optimizer/pathindexonly.go: trailingSAOPSelectivity, trailingSAOPOnRange, clausesTrailingSAOP.
+  - pathindexrestrict.go: plain producer trailing branch. createplanindex.go: dispatch, lowering, backward guard. plan.go: IndexScan.TrailingSAOP.
+  - Test: TestIndexScanSAOPBehindLeadingRange.
 - Findings:
-  - The probe recipe gives cost-exact verification:
-    - a live server (tmp/c3a4i-bin + tmp/c3a4i-data, port 5533, stopped);
-    - a scratch PG (tmp/pg-scratch-c3a4i, port 5545, RUNNING; stop with `postgres/local_install/bin/pg_ctl -D tmp/pg-scratch-c3a4i stop`);
-    - scripts tmp/c3a4i4.sql (tk) and tmp/c3a4i5.sql (tj + ti).
-  - The unit VM fixture overprices IOS (relallvisible=0).
-  - Remaining diffs are ledgered: IOS/plain width; the prefix+range IOS; the cross-type Filter rows; the Sort rows=100 over the prefix-SAOP IOS; the empty array; the plain trailing array.
-- Next step: S9 census (DUE). Then (i) rest: the plain Index Scan trailing array.
-  - Mirror trailingSAOPQual in indexScanOp: decode the key or check before the heap fetch.
-  - Then the plain producer's leading-range branch files the SAOP when the IOS does not.
-  - Probe: `SELECT * FROM tk WHERE thousand < 2 AND tenthous IN (1001,3000)` → PG Index Scan 8.51.
+  - createIndexScanPlan panics are recovered upstream as a silent fallback to another plan. A backward SAOP path vanished that way, with no error. Suspect this whenever a generated path never wins (ledgered).
+  - The probe recipe (tmp/c3a4i{4,5,6}.sql; goopg on 5533 stopped; scratch PG tmp/pg-scratch-c3a4i on 5545 RUNNING) gives cost-exact PG comparisons.
+- Next step: S9 census (DUE).
+  - Then the (i) residue, smallest first: the empty array literal as an index qual (PG `= ANY ('{}'::integer[])`, an empty scan); then cross-type array literals; then index-only width.
+  - Or move to (d) sub-ORs inside AND arms if the residue proves owner-level.
 - Top-residual: M0148 residues. Open children: c3a4, c3a5, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261114b done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261114c done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a4.
 - Gates run (all PASS):
-  - census s9cg IDENTICAL ×3.
+  - census s9ch IDENTICAL ×3.
   - units.
   - tpch-spotcheck.
   - sf025 99/99.
-  - fire-set c3a4i3fs fires=none ×3.
+  - fire-set c3a4i4fs fires=none ×3.
   - acceptance 24 MATCH.
-  - regress: create_index 2933→2856; join +5 flap (rerun 17626).
+  - regress 22 suites unchanged from slice 3.
   - pgbench smoke.
 - In-flight: none.

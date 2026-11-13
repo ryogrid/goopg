@@ -12493,15 +12493,22 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Live-server probe against PG: plans, costs and rows identical on all
       new statements; the slice 1-2 two-array case now matches too.
     Movement: yes — regress create\_index 2933→2856
+  - 2026-11-14 (i) slice 4 LANDED: the plain Index Scan trailing array.
+    - IndexScan.TrailingSAOP is checked on each entry's key before the heap
+      fetch (trailingKeyCheck), forward and backward.
+    - createPlan's backward guard had been panicking (recovered upstream)
+      on this shape, silently falling back to Sort + forward.
+    - Live-server probe against PG: plans, costs and rows identical; only
+      the pre-existing width differs.
+    Movement: none — regress unchanged from slice 3; the plain shapes show
+    only in the PG probe and TestIndexScanSAOPBehindLeadingRange
   - (i) still open:
-    - a plain Index Scan with an array behind a leading range (the
-      non-covering case);
     - cross-type array literals (`'{33, 44}'::bigint[]` on int4);
     - the empty array literal as an index qual;
     - index-only width counting index-qual-only columns;
     - an index-only prefix + range.
-  - Resume: (i) — the plain Index Scan trailing array; then (d) sub-ORs
-    inside AND arms.
+  - Resume: (i) residue (cross-type and empty array literals; index-only
+    width; index-only prefix + range); then (d) sub-ORs inside AND arms.
 - [ ] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
   `… Backward` regress lines**.
   Kind: impl
