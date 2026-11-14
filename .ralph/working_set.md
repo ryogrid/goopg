@@ -1,23 +1,24 @@
-# Working Set — loop end 2026-11-15 (census REUSE; c3a10 slice 1 attempted, NOT landed — net-neutral)
+# Working Set — loop end 2026-11-15 (census REUSE; M0148-0001c3a10 slice 1 LANDED da6e70237)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: AI-20261115-011812-001 already filed. Nothing new.
-- S9: REUSE (routing-20261115d). No code landed this loop.
-- Task: M0148-0001c3a10 (index clauses on appendrel members) slice 1. Built and measured, NOT committed; patch at tmp/c3a10-slice1-appendrel-children.patch (untracked).
-  - partitionwisejoin.go addAppendRelChildPaths(cat): an Append over a restricted partitioned base rel's child paths. It uses the c3a9 child rels (bare scan) plus per-child bitmap paths; gated to one-relation problems that have a restriction.
-  - relfromjoinlist.go: the one-relation search admits an appendrel leaf with a partScheme (planJoinlistSearch's scanLeafFor gate).
-  - PlannerSettings.KeepAppendRelsWhole (row locks, DML) replaces reusing EnablePartitionwiseJoin=false for that guard.
+- S9: REUSE at loop start. da6e70237 touches internal/optimizer, so the next census is likely DUE (BASELINE_REV=1ead3cd80, the head consumed by routing-20261115d).
+- Task: M0148-0001c3a10 (index paths on appendrel members), slice 1 landed as da6e70237.
+  - A restricted single-relation partitioned table gets an Append over per-partition child paths (index + bitmap). The witness `select * from pa where b='v12'` matches PG.
+- Files:
+  - optimizer: partitionwisejoin.go (addAppendRelChildPaths, child bitmap paths); pathindexordered.go (call); relfromjoinlist.go (one-relation search admits partScheme appendrel leaves); plannersettings.go / cost_funcs.go / planner.go (KeepAppendRelsWhole);
+  - executor: explain_names.go (scopeSources registers PartitionwiseParents); partitionwise_join_test.go (TestAppendRelChildIndexPaths);
+  - design doc 0148-0001c3a10-appendrel-child-paths.md (new, indexed); inventory (inherit 720→712).
 - Findings:
-  - Single-table queries reach the base-rel producers only through planJoinlistSearch's one-relation gate (scanLeafFor). An appendrel SetOp failed it, so a partitioned table never got index paths.
-  - s.cat can be nil inside the producers; pass the problem catalog in.
-  - With the patch, the witnesses (`select * from pa where b='v12'`, + ORDER BY LIMIT) match PG exactly.
-  - Regress vs same-suite HEAD baseline: inherit 735→727, partition_join 1879→1887, partition_aggregate 584→586, join +1. Not a win, so not committed.
-  - The losses are EXPLAIN naming for the new Append inside sub-queries / semi-join sub-problems (`Sort Key: t1_4.a` for the outer `t1.a`). The partitionwise parent's bySrc entry is per-level but the map is global; dropping it broke slice-3 naming (partition_aggregate 589).
-  - Without a restriction, child ordering-only index paths undercut seq scans (aggregates p_t1).
-- Next step: make explain_names.go collect() scope a partitionwise parent's bySrc contribution to its own query level (only when no same-level entry exists?), then re-apply the patch and re-measure the same suite set against a HEAD worktree baseline.
-- Top-residual: M0148 residues. Open: c3a10 (slice 1 parked on EXPLAIN naming), c3a9 (slice 5 blocked-on P0-E30), c3a8, c3a7, c3a11 (parked), c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
+  - The sub-query naming bug came from scopeSources not seeing an Append's parent appendrels (no plan node carries them). Registering them in the scope walk fixed `t1_3.a` without touching bySrc. Dropping bySrc entries broke slice-3 naming instead.
+  - Gates kept, each tied to a measured regression: one-relation problems only (joins regress partition_join); a restriction present (ordering-only child index paths beat seq scans: aggregates p_t1); no outer-level reference (correlated sub-plan bodies).
+  - Regress runs depend on the suite set; measure A/B on the same set and update the inventory with the inventory's own set (inherit partition_join partition_aggregate).
+- Next step: run the census if DUE, then c3a10 slice 2: Merge Append / ordered children and min/max per partition (PG `Limit → Append → Index Only Scan Backward … (c = 3) AND (a IS NOT NULL)`), or lift the one-relation gate by teaching the EXPLAIN key chase about the Append in joins.
+- Top-residual: M0148 residues. Open: c3a10 (slices 2+), c3a9 (slice 5 blocked-on P0-E30; patch tmp/c3a9-slice5-outer.patch), c3a8, c3a7, c3a11 (parked), c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
   - Items 0-9: M0146-0014(channel; census REUSE); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24..E30). Then M0148 in file order → c3a10.
-- Gates run: regress A/B of the uncommitted patch (net-neutral, see above). Bookkeeping-only commit, so no code gates.
+- Gates run (all PASS):
+  - units, tpch-spotcheck, sf025 99 PASS same=99, fire-set c3a10 fires=none ×3, acceptance PASS, 17 partition isolation tests;
+  - regress same-suite A/B: inherit 735→727, others unchanged except join (one row-order line, known flapper).
 - In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped.
