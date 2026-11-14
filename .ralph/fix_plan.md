@@ -12918,6 +12918,19 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
       needed by M0148-0001c3a10), partition-bounds matching
       (partition\_bounds\_equal), and the child-join rel build;
     - then the fractional Merge Append over child joins.
+  - 2026-11-15 slice 1 LANDED: partition members in PartitionDesc \(bound\)
+    order, expanded depth-first \(partitionDescOrder,
+    collectAllPartitionLeaves\).
+    - RANGE by lower bound; LIST by smallest value, NULL-only next; HASH by
+      \(modulus, remainder\); DEFAULT last. Undecidable bound types keep
+      catalog order.
+    - Also discharges M0148-0001k1 \(c\)'s partition half.
+    - Design: docs/design/0100-0149/0148-0001c3a9-partitionwise-join.md
+      \(slice 1 plus the design of the remaining slices\).
+    Movement: yes — regress partition\_prune 6754→6384, partition\_join
+    5801→5630, inherit 3122→3076
+    - Resume: slice 2 of the design doc \(partition scheme on the
+      appendrel binding\), then child rels shared with c3a10.
 - [ ] **M0148-0001c3a10 — index clauses on appendrel members (WHERE quals
   pushed into partitions)**.
   Kind: impl
@@ -13318,7 +13331,10 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
   Member order: a partitioned table's DEFAULT partition expands first (PG:
   PartitionDesc bound order, default last), and inheritance children came
   back in a different order after a restart (InheritanceChildren reload
-  order; PG orders by inhseqno/child OID). Measure: partition_prune /
+  order; PG orders by inhseqno/child OID).
+  - 2026-11-15: the partition half of \(c\) landed with
+    M0148-0001c3a9 slice 1 \(bound order, default last, depth-first\).
+    The inheritance-children reload order is still open. Measure: partition_prune /
   partition_join / inherit regress runner HEAD vs change, and isolation
   eval-plan-qual for (a).
 - [ ] **M0148-0002 — copy.sql regress coverage closure**.

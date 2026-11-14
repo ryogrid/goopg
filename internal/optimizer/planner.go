@@ -5269,7 +5269,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 			// concurrently detach-pending at or before this statement's
 			// snapshot epoch (snapshot-relative partition visibility).
 			// Design 0118-0059 (M0118-0008).
-			leaves := collectAllPartitionLeaves(im, tbl.OID, currentPartitionDetachEpoch(cat))
+			leaves := collectAllPartitionLeaves(im, tbl, currentPartitionDetachEpoch(cat))
 			// M0148-0001c3a5 (a): one leaf in the parent's column order. PG's
 			// appendrel of one child plans the child as the rel's only member
 			// and drops the single-child Append (setrefs), so EXPLAIN shows the
@@ -5854,29 +5854,37 @@ func currentPartitionDetachEpoch(cat catalog.Catalog) uint64 {
 // the result — only their leaf descendants are. This is required for correct
 // scanning of multi-level partition hierarchies (e.g. range_parted → part_b_10_b_20
 // (partitioned) → part_c_1_100 (leaf)). M0097-0105.
-func collectAllPartitionLeaves(im *catalog.InMemory, parentOID uint32, detachEpoch uint64) []*catalog.Table {
+func collectAllPartitionLeaves(im *catalog.InMemory, root *catalog.Table, detachEpoch uint64) []*catalog.Table {
 	var leaves []*catalog.Table
 	seen := make(map[uint32]bool)
-	// VisiblePartitionChildren drops a child stamped detach-pending at or before
-	// detachEpoch at every level, so a concurrently-detached intermediate node
-	// (and all its leaves) vanishes from the scan for snapshots after the detach.
-	// Design 0118-0059 (M0118-0008).
-	queue := catalog.VisiblePartitionChildren(im.PartitionChildren(parentOID), detachEpoch)
-	for len(queue) > 0 {
-		child := queue[0]
-		queue = queue[1:]
-		if seen[child.OID] {
-			continue
+	// expand_partitioned_rtentry (inherit.c): the partitions in PartitionDesc
+	// (bound) order, each sub-partitioned child expanded in place —
+	// depth-first — so the leaves come out in the order PG's appendrel lists
+	// them (M0148-0001c3a9 slice 1, partitionDescOrder).
+	var walk func(parent *catalog.Table, oid uint32)
+	walk = func(parent *catalog.Table, oid uint32) {
+		// VisiblePartitionChildren drops a child stamped detach-pending at or
+		// before detachEpoch at every level, so a concurrently-detached
+		// intermediate node (and all its leaves) vanishes from the scan for
+		// snapshots after the detach. Design 0118-0059 (M0118-0008).
+		kids := catalog.VisiblePartitionChildren(im.PartitionChildren(oid), detachEpoch)
+		if parent != nil {
+			kids = partitionDescOrder(parent, kids)
 		}
-		seen[child.OID] = true
-		if len(child.PartitionKey) > 0 {
-			// Intermediate partitioned node: recurse into its children.
-			queue = append(queue, catalog.VisiblePartitionChildren(im.PartitionChildren(child.OID), detachEpoch)...)
-		} else {
-			// Leaf partition: include in the scan.
-			leaves = append(leaves, child)
+		for _, child := range kids {
+			if seen[child.OID] {
+				continue
+			}
+			seen[child.OID] = true
+			if len(child.PartitionKey) > 0 {
+				// Intermediate partitioned node: recurse into its children.
+				walk(child, child.OID)
+			} else {
+				leaves = append(leaves, child)
+			}
 		}
 	}
+	walk(root, root.OID)
 	return leaves
 }
 

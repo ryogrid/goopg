@@ -597,9 +597,9 @@ func TestOrderedPartitionAppend(t *testing.T) {
 	ps.EnableSort = false // the witness's table is empty; pin the arm on a populated one
 	for _, c := range []struct{ q, plan string }{
 		{"select * from range_parted order by a,b,c",
-			"Append\n  ->  Index Only Scan using range_parted1_a_b_c_idx on range_parted1 range_parted_2\n  ->  Index Only Scan using range_parted2_a_b_c_idx on range_parted2 range_parted_1"},
+			"Append\n  ->  Index Only Scan using range_parted1_a_b_c_idx on range_parted1 range_parted_1\n  ->  Index Only Scan using range_parted2_a_b_c_idx on range_parted2 range_parted_2"},
 		{"select * from range_parted order by a desc,b desc,c desc",
-			"Append\n  ->  Index Only Scan Backward using range_parted2_a_b_c_idx on range_parted2 range_parted_1\n  ->  Index Only Scan Backward using range_parted1_a_b_c_idx on range_parted1 range_parted_2"},
+			"Append\n  ->  Index Only Scan Backward using range_parted2_a_b_c_idx on range_parted2 range_parted_2\n  ->  Index Only Scan Backward using range_parted1_a_b_c_idx on range_parted1 range_parted_1"},
 	} {
 		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
 			t.Errorf("%s:\ngot:\n%s\nwant:\n%s", c.q, got, c.plan)
