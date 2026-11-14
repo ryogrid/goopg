@@ -1,7 +1,7 @@
 # M0146-0014 — census at 9394bbc7b (2026-11-14): exhausted tree=364b9e07eb0a0530cd6b8fda8e739fd58c7c52e8
 
 Trigger: `scripts/s9-census-due.sh` returned DUE (base routing-20261114h, reason=plan-relevant-change)
-— code commit `7d764e07f` (M0148-0001c3a4 item (e): partial indexes proved by predicate_implied_by over the restriction).
+— code commit `9394bbc7b` (M0148-0001c3a4 item (e): partial indexes proved by predicate_implied_by over the restriction).
 The trigger files include `internal/optimizer/pathbitmap.go`, `pathbitmapor.go`, `planner.go` and
 `internal/optimizer/createplanbitmap.go`. The census plan A/B measured `fires=none` on all three corpora.
 `git diff --quiet -- internal cmd scripts bench go.mod go.sum` held while the capture built its
