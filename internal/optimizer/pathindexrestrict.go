@@ -69,6 +69,7 @@ func (s *searchCtx) addRestrictionIndexPaths(cat catalog.Catalog) {
 		if s.hasUsefulPathkeys(rel) {
 			colExprs = mergeableColumnExprsFor(rel.Relids, s.clausesAll())
 			addQueryPathkeyColumnExprs(colExprs, s.queryPathkeys, s.relInfos[i].sourceIdx)
+			addConstEquatedColumns(colExprs, rel)
 		}
 		added := false
 		for _, idx := range cat.IndexesOnTable(tbl) {
@@ -107,6 +108,12 @@ func restrictionEqualityPrefix(cat catalog.Catalog, tbl *catalog.Table, idx *cat
 func restrictionEqualityOn(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, pos int, conjuncts []Expr) *indexPathClause {
 	colName := idx.Columns[pos]
 	for _, conj := range conjuncts {
+		// M0148-0001c3a5 (d): match_boolean_index_clause — a boolean column
+		// alone, negated, or under IS TRUE / IS FALSE is the index qual
+		// `col = true` / `col = false` (the same rows: each rejects NULL).
+		if name, val, ok := booleanIndexQual(conj); ok && name == colName {
+			return &indexPathClause{indexCol: pos, key: &BooleanConst{pos: conj.Pos(), Value: val}, local: conj}
+		}
 		bin, ok := conj.(*BinaryOp)
 		if !ok || bin.Op != parser.OpEq {
 			continue
@@ -603,7 +610,9 @@ func restrictionKeyUsable(cat catalog.Catalog, col catalog.Column, val Expr) boo
 		return false
 	}
 	if _, isBool := val.(*BooleanConst); isBool {
-		return false
+		// `b = true` on a boolean column is an index qual
+		// (M0148-0001c3a5 (d)); on any other column it is not.
+		return !col.Type.IsArray && (strings.EqualFold(col.Type.Name, "bool") || strings.EqualFold(col.Type.Name, "boolean"))
 	}
 	// M0146-0061: a numeric literal against an integer column is
 	// `(col)::numeric op const` in PG — btree integer_ops has no numeric
@@ -1198,3 +1207,36 @@ func prefixEqualitySAOP(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.In
 	sa := restrictionSAOPOnColumn(cat, tbl, idx, n, conjuncts)
 	return len(sa) > 0 && sa[0].saopOp == parser.OpUnknown
 }
+
+// booleanIndexQual is match_boolean_index_clause's shapes over a boolean
+// column: `col` and `col IS TRUE` are `col = true`, `NOT col` and `col IS
+// FALSE` are `col = false` (M0148-0001c3a5 (d)).
+func booleanIndexQual(conj Expr) (string, bool, bool) {
+	boolCol := func(e Expr) (string, bool) {
+		cr, ok := e.(*ColumnRef)
+		if !ok || cr.Name == "" || cr.Type.IsArray || !strings.EqualFold(cr.Type.Name, "bool") && !strings.EqualFold(cr.Type.Name, "boolean") {
+			return "", false
+		}
+		return cr.Name, true
+	}
+	switch x := conj.(type) {
+	case *ColumnRef:
+		if n, ok := boolCol(x); ok {
+			return n, true, true
+		}
+	case *UnaryOp:
+		if x.Op == parser.OpNot {
+			if n, ok := boolCol(x.Operand); ok {
+				return n, false, true
+			}
+		}
+	case *IsBoolExpr:
+		if !x.Negated && x.TestTrue != x.TestFalse {
+			if n, ok := boolCol(x.Operand); ok {
+				return n, x.TestTrue, true
+			}
+		}
+	}
+	return "", false, false
+}
+

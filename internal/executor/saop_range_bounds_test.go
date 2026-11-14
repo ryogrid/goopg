@@ -534,3 +534,45 @@ func TestPartialIndexPredicateProof(t *testing.T) {
 		}
 	}
 }
+
+// TestBooleanIndexQualAndConstantPrefixPathkeys pins M0148-0001c3a5 (d)
+// against PG 18.3 (create_index's boolindex queries, on 2000 analyzed rows): a boolean column alone,
+// negated, or under IS TRUE / IS FALSE is the index qual `b = true` / `b =
+// false` (match_boolean_index_clause), and with b pinned the index on (b, i)
+// delivers `ORDER BY i` in either direction (build_index_pathkeys skips the
+// constant column) — no Sort.
+func TestBooleanIndexQualAndConstantPrefixPathkeys(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	// i NOT NULL: the unit fixture's cluster keeps no NULL-keyed index
+	// entries, so a probe leaving a nullable i unbound is refused there.
+	runSQL(t, ctx, "create table boolindex (b bool, i int NOT NULL, junk float)")
+	runSQL(t, ctx, "create unique index boolindex_b_i_key on boolindex (b, i)")
+	runSQL(t, ctx, "insert into boolindex select g%2=0, g, 0 from generate_series(1,2000) g")
+	runSQL(t, ctx, "VACUUM boolindex")
+	runSQL(t, ctx, "ANALYZE boolindex")
+	ps := optimizer.DefaultPlannerSettings()
+	for _, c := range []struct{ q, plan string }{
+		{"select * from boolindex where b order by i limit 10",
+			"Limit\n  ->  Index Scan using boolindex_b_i_key on boolindex\n        Index Cond: (b = true)"},
+		{"select * from boolindex where not b order by i limit 10",
+			"Limit\n  ->  Index Scan using boolindex_b_i_key on boolindex\n        Index Cond: (b = false)"},
+		{"select * from boolindex where b is true order by i desc limit 10",
+			"Limit\n  ->  Index Scan Backward using boolindex_b_i_key on boolindex\n        Index Cond: (b = true)"},
+		{"select * from boolindex where b is false order by i desc limit 10",
+			"Limit\n  ->  Index Scan Backward using boolindex_b_i_key on boolindex\n        Index Cond: (b = false)"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+	}
+	for _, c := range []struct{ q, rows string }{
+		{"select i from boolindex where b order by i limit 5", "2;4;6;8;10"},
+		{"select i from boolindex where b is false order by i desc limit 5", "1999;1997;1995;1993;1991"},
+		{"select i from boolindex where not b order by i limit 3", "1;3;5"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

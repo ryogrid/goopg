@@ -81,6 +81,7 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 		if s.hasUsefulPathkeys(rel) {
 			colExprs = mergeableColumnExprsFor(rel.Relids, s.clausesAll())
 			addQueryPathkeyColumnExprs(colExprs, s.queryPathkeys, s.relInfos[i].sourceIdx)
+			addConstEquatedColumns(colExprs, rel)
 		}
 		added := false
 		for _, idx := range cat.IndexesOnTable(tbl) {

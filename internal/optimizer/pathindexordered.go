@@ -143,6 +143,7 @@ func (s *searchCtx) addOrderedIndexPaths(cat catalog.Catalog) {
 		if len(colExprs) == 0 {
 			continue
 		}
+		addConstEquatedColumns(colExprs, rel)
 		relTuples := float64(s.relInfos[i].baseRows)
 		if relTuples < 1 {
 			relTuples = 1

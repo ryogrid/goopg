@@ -34,7 +34,10 @@ package optimizer
 // The isolation coverage in `pathkeysindex_test.go` is now a floor, not the
 // whole story — the DS05 fixed-binary A/B moved 86 of 99 plans (09 §3.15).
 
-import "github.com/goopg/goopg/internal/catalog"
+import (
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // indexIsOrderable is PG's `index->sortopfamily == NULL` test
 // (`build_index_pathkeys`, pathkeys.c:748): an access method that does not
@@ -109,6 +112,14 @@ func buildIndexPathkeys(idx *catalog.Index, colExprs map[string]Expr, backward b
 		if !ok || e == nil {
 			break
 		}
+		if e == constIndexColumn {
+			// build_index_pathkeys: a column the restriction pins to a
+			// constant contributes a redundant pathkey (its EC holds a
+			// Const, pathkey_is_redundant) or is a boolean constant for
+			// the query (indexcol_is_bool_constant_for_query) — skipped,
+			// not a stop (M0148-0001c3a5 (d)).
+			continue
+		}
 		// `index->reverse_sort[i]` / `index->nulls_first[i]`, which goopg
 		// mirrors from pg_index.indoption in `ColDescending`/`ColNullsFirst`. An
 		// empty (or short) slice means the PG default for that column, ASC NULLS
@@ -136,3 +147,54 @@ func pathkeyExprIndex(keys []PathKey, expr Expr) int {
 	}
 	return -1
 }
+
+// constIndexColumn marks a colExprs entry for a column the rel's
+// restriction pins to one value (addConstEquatedColumns): buildIndexPathkeys
+// skips it, so `b = true ORDER BY i` is served by an index on (b, i).
+var constIndexColumn Expr = &BooleanConst{Value: true}
+
+// addConstEquatedColumns marks, in colExprs, the columns of rel the
+// restriction pins to a constant: `col = const` (an EquivalenceClass with a
+// Const — every row the rel returns has that value) and a boolean column
+// alone, negated, or under IS TRUE / IS FALSE (match_boolean_index_clause's
+// shapes, indexcol_is_bool_constant_for_query). A column already in
+// colExprs keeps its expression. M0148-0001c3a5 (d).
+func addConstEquatedColumns(colExprs map[string]Expr, rel *RelOptInfo) {
+	if colExprs == nil || rel == nil || rel.baseLeaf == nil {
+		return
+	}
+	for _, conj := range extractFilterConjuncts(rel.baseLeaf) {
+		name, ok := constEquatedColumn(conj)
+		if !ok {
+			continue
+		}
+		if _, dup := colExprs[name]; !dup {
+			colExprs[name] = constIndexColumn
+		}
+	}
+}
+
+// constEquatedColumn is the column a restriction conjunct pins to one value.
+func constEquatedColumn(conj Expr) (string, bool) {
+	// The boolean shapes are match_boolean_index_clause's (booleanIndexQual,
+	// the index-qual sibling).
+	if name, _, ok := booleanIndexQual(conj); ok {
+		return name, true
+	}
+	x, ok := conj.(*BinaryOp)
+	if !ok || x.Op != parser.OpEq {
+		return "", false
+	}
+	if cr, ok := x.Left.(*ColumnRef); ok && cr.Name != "" && isConstExpr(x.Right) {
+		if _, isNull := x.Right.(*NullConst); !isNull {
+			return cr.Name, true
+		}
+	}
+	if cr, ok := x.Right.(*ColumnRef); ok && cr.Name != "" && isConstExpr(x.Left) {
+		if _, isNull := x.Left.(*NullConst); !isNull {
+			return cr.Name, true
+		}
+	}
+	return "", false
+}
+
