@@ -278,6 +278,13 @@ func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, t
 			}
 		}
 	}
+	if len(clauses) == 0 {
+		// M0148-0001c3a4 (j): nothing binds the leading column, but a range
+		// on a later column is an index qual of PG 18's skip scan.
+		if rng, skip := restrictionSkipRange(cat, tbl, idx, conjuncts); len(rng) > 0 {
+			clauses, bound = rng, skip+1
+		}
+	}
 	if !indexUnboundKeysNotNull(tbl, idx, bound) {
 		return nil, false
 	}
@@ -408,6 +415,18 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 		numSAScans = saopDescents(clauses[saopAt])
 		for _, q := range clauses[saopAt].saopColQuals {
 			sel = clampSelectivity(sel * clauseSelectivity(q.local, rel.baseLeaf))
+		}
+	case clausesSkipRange(clauses) > 0:
+		// M0148-0001c3a4 (j): a skip scan's range on a later column —
+		// btcostestimate's skip arrays over the skipped prefix (one descent
+		// per distinct value plus one); a reverted estimate prices the index
+		// side over the whole index (boundSelectivity 1).
+		sel = rangeIndexSelectivity(rel.baseLeaf, extractFilterConjuncts(rel.baseLeaf), clauses)
+		pages, _, _ := estimateIndexGeometry(cat, idx, tbl, relTuples)
+		var boundCounted bool
+		numSAScans, boundCounted = skipScanDescents(tbl, idx, clausesSkipRange(clauses), relTuples, pages)
+		if !boundCounted {
+			boundSel = 1
 		}
 	case hasRangeClause(clauses):
 		// M0146-0061: leading-column bounds (and M0148-0001c3a's NullTest),
@@ -708,3 +727,23 @@ func clausesTrailingSAOP(clauses []indexPathClause) (saopAt int, ok bool) {
 	at := indexClausesSAOPAt(clauses)
 	return at, at > 0 && isInequalityOp(clauses[0].op)
 }
+
+// clausesSkipRange is the skip-range shape's range column (M0148-0001c3a4
+// (j)): every clause a bound on one column after the leading one. 0 when the
+// clauses are any other shape.
+func clausesSkipRange(clauses []indexPathClause) int {
+	if len(clauses) == 0 {
+		return 0
+	}
+	col := clauses[0].indexCol
+	if col < 1 {
+		return 0
+	}
+	for _, c := range clauses {
+		if c.indexCol != col || !isInequalityOp(c.op) || len(c.saop) > 0 || c.nullTest != IndexNullTestNone {
+			return 0
+		}
+	}
+	return col
+}
+

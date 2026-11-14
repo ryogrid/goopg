@@ -274,6 +274,23 @@ func (s *searchCtx) buildBitmapIndexChild(
 			qualSelectivity = rangeIndexSelectivity(leaf, conjuncts, rng)
 		}
 	}
+	// M0148-0001c3a4 (j): a range on a later column, nothing bound before
+	// it — PG 18's skip scan; constant bounds only, as bitmapLeadingRange.
+	skipCol := 0
+	if len(indexClauses) == 0 {
+		if rng, skip := restrictionSkipRange(s.cat, tbl, idx, conjuncts); len(rng) > 0 {
+			allConst := true
+			for _, c := range rng {
+				if !isConstExpr(c.key) {
+					allConst = false
+				}
+			}
+			if allConst {
+				indexClauses, skipCol = rng, skip
+				qualSelectivity = rangeIndexSelectivity(leaf, conjuncts, rng)
+			}
+		}
+	}
 
 	// PG builds a bitmap path only FROM index clauses: `get_index_paths`
 	// (indxpath.c) collects into `bitindexpaths` the paths `build_index_paths`
@@ -300,6 +317,16 @@ func (s *searchCtx) buildBitmapIndexChild(
 	indexPages, indexTuples, treeHeight := estimateIndexGeometry(s.cat, idx, tbl, relTuples)
 
 	selectivity := qualSelectivity
+	// The skip scan's descents and a reverted estimate's whole-index index
+	// side (btcostestimate's skip-array arm, as the plain skip path).
+	boundSel := 0.0
+	if skipCol > 0 {
+		var boundCounted bool
+		numSAScans, boundCounted = skipScanDescents(tbl, idx, skipCol, relTuples, indexPages)
+		if !boundCounted {
+			boundSel = 1
+		}
+	}
 	in := indexScanInputs{
 		relPages:        relPages,
 		relTuples:       relTuples,
@@ -313,9 +340,10 @@ func (s *searchCtx) buildBitmapIndexChild(
 		// "the full freight for all the scan clauses" (assume-rechecked-
 		// always), so every local conjunct counts — not minus
 		// index-satisfied ones.
-		numQualOps:    localQualOpCount(leaf),
-		numIndexQuals: indexQualCount(indexClauses),
-		numSAScans:    numSAScans,
+		numQualOps:       localQualOpCount(leaf),
+		numIndexQuals:    indexQualCount(indexClauses),
+		numSAScans:       numSAScans,
+		boundSelectivity: boundSel,
 	}
 
 	// Cost the index-access side (bitmap index scan).

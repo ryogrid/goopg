@@ -255,6 +255,8 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// per-element windows as indexScanOp's (saopWindows: sorted,
 	// de-duplicated, bounds on the second column), each drained in order.
 	var saopWins []saopWindow
+	// skipRange checks a skip-range scan's entries (M0148-0001c3a4 (j)).
+	var skipRange *trailingKeyCheck
 	switch {
 	case len(o.plan.SAOPKeys) > 0:
 		// Keys, when set, is the equality prefix ahead of the array
@@ -275,6 +277,26 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 			return nil
 		}
 		saopWins = wins
+	case o.plan.SkipPrefix > 0 && len(o.plan.Keys) == 0:
+		// M0148-0001c3a4 (j): a skip scan's range on Columns[SkipPrefix],
+		// with nothing bound before it. The whole index is read in order and
+		// each entry's key column is checked against the bounds, before any
+		// heap fetch — the entries nbtree's skip arrays would visit, without
+		// its repositioning (ledgered).
+		if isHashIdx || o.plan.Key != nil || (o.plan.LowKey == nil && o.plan.HighKey == nil) || o.plan.SkipPrefix >= len(o.plan.Index.Columns) {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
+				"indexOnlyScanOp: skip-range scan on index %q carries an incompatible probe shape", o.plan.Index.Name)}
+		}
+		c, err := newIndexColumnCheck(ctx, o.plan.Table, o.plan.Index, o.plan.SkipPrefix, func(ref *optimizer.ColumnRef) optimizer.Expr {
+			return skipRangePred(ref, o.plan.LowKey, o.plan.HighKey, o.plan.LowOp, o.plan.HighOp)
+		})
+		if err != nil {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		skipRange = c
+		// Unbounded read: the LowOp/HighOp strictness belongs to the
+		// checked column, not to these (nil) scan bounds.
+		o.rangeLoExcl, o.rangeHiExcl, o.rangeBoundsSet = false, false, true
 	case o.plan.SkipPrefix > 0:
 		sp := o.plan.SkipPrefix
 		if isHashIdx || len(o.plan.Keys) == 0 || o.plan.Key != nil || o.plan.LowKey != nil ||
@@ -389,6 +411,15 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	trailingAdmits := func(row Row) (bool, error) { return predAdmits(ctx, trailing, row) }
 
 	scanFn := func(key []byte, ptr storage.ItemPointer) (bool, error) {
+		if skipRange != nil {
+			ok, err := skipRange.admits(key)
+			if err != nil {
+				return false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+			}
+			if !ok {
+				return true, nil
+			}
+		}
 		allVisible := keyDecodable && ctx.VM != nil && ctx.VM.AllVisible(heapRel, ptr.Block)
 		if trailing != nil && (allVisible || keyDecodable) {
 			// The index qual is applied to the index entry before any heap

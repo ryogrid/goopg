@@ -64,71 +64,116 @@ func indexKeyDecodable(ctx *Context, tbl *catalog.Table, idx *catalog.Index) boo
 	return true
 }
 
-// trailingKeyCheck tests an index entry's second key column against the
-// trailing array, decoding only that column's value from the key.
+// trailingKeyCheck tests one key column of an index entry against a qual
+// (built over Row{that column's value}), decoding only the columns up to it
+// from the key. It serves IndexScan.TrailingSAOP (column 1) and a skip scan's
+// range on a later column (M0148-0001c3a4 (j)).
 type trailingKeyCheck struct {
 	ctx  *Context
-	pred optimizer.Expr // over Row{second column}
+	pred optimizer.Expr // over Row{column pos}
 	row  Row
+	pos  int
 
-	desc               *nbtree.PGIndexKeyDesc
-	cols               []*catalog.Column
-	imgs               [][]byte
-	nulls              []bool
-	vals               []Datum
-	blobCol0, blobCol1 catalog.Column
-	style              array.OutputStyle
+	desc  *nbtree.PGIndexKeyDesc
+	cols  []*catalog.Column
+	imgs  [][]byte
+	nulls []bool
+	vals  []Datum
+	blob  []catalog.Column // columns 0..pos (blob key format)
+	style array.OutputStyle
 }
 
-// newTrailingKeyCheck builds the key-level check. The planner files a
-// trailing array only over two decodable leading key columns
-// (trailingSAOPOnRange refuses interval), so an undecodable one here is a
-// planner bug.
+// newTrailingKeyCheck is the check for IndexScan.TrailingSAOP: the array (and
+// its column quals) on index column 1.
 func newTrailingKeyCheck(ctx *Context, tbl *catalog.Table, idx *catalog.Index, ts *optimizer.TrailingSAOP) (*trailingKeyCheck, error) {
 	if len(idx.Columns) < 2 {
 		return nil, fmt.Errorf("trailing ScalarArrayOp on single-column index %q", idx.Name)
 	}
-	col1, ok := ctx.Catalog.LookupColumn(tbl, idx.Columns[1])
-	if !ok {
-		return nil, fmt.Errorf("trailing ScalarArrayOp column %q not on the table", idx.Columns[1])
+	return newIndexColumnCheck(ctx, tbl, idx, 1, func(ref *optimizer.ColumnRef) optimizer.Expr { return trailingSAOPPred(ref, ts) })
+}
+
+// newIndexColumnCheck builds a check of index column pos against the qual
+// build returns over a reference to it. The planner files such quals only
+// over decodable key columns (interval is refused), so an undecodable one
+// here is a planner bug.
+func newIndexColumnCheck(ctx *Context, tbl *catalog.Table, idx *catalog.Index, pos int,
+	build func(ref *optimizer.ColumnRef) optimizer.Expr) (*trailingKeyCheck, error) {
+	if pos < 0 || pos >= len(idx.Columns) {
+		return nil, fmt.Errorf("index column %d out of range on index %q", pos, idx.Name)
 	}
-	col0, ok := ctx.Catalog.LookupColumn(tbl, idx.Columns[0])
-	if !ok {
-		return nil, fmt.Errorf("index column %q not on the table", idx.Columns[0])
+	blob := make([]catalog.Column, 0, pos+1)
+	for i := 0; i <= pos; i++ {
+		col, ok := ctx.Catalog.LookupColumn(tbl, idx.Columns[i])
+		if !ok {
+			return nil, fmt.Errorf("index column %q not on the table", idx.Columns[i])
+		}
+		if !indexKeyColumnIsDecodable(*col) {
+			return nil, fmt.Errorf("key check over an undecodable key column %q of index %q", col.Name, idx.Name)
+		}
+		blob = append(blob, *col)
 	}
-	if !indexKeyColumnIsDecodable(*col0) || !indexKeyColumnIsDecodable(*col1) {
-		return nil, fmt.Errorf("trailing ScalarArrayOp over undecodable key columns of index %q", idx.Name)
-	}
-	c := &trailingKeyCheck{ctx: ctx, row: make(Row, 1), style: arrayOutputStyle(ctx)}
-	c.pred = trailingSAOPPred(&optimizer.ColumnRef{Index: 0, Name: col1.Name, Type: col1.Type}, ts)
+	c := &trailingKeyCheck{ctx: ctx, row: make(Row, 1), pos: pos, style: arrayOutputStyle(ctx)}
+	c.pred = build(&optimizer.ColumnRef{Index: 0, Name: blob[pos].Name, Type: blob[pos].Type})
 	if desc := ctx.pgIndexKeyDesc(idx); desc != nil {
 		c.desc, c.cols = desc, pgIndexKeyColumns(idx)
 		n := desc.NKeyAtts()
 		c.imgs, c.nulls, c.vals = make([][]byte, n), make([]bool, n), make([]Datum, n)
 		return c, nil
 	}
-	c.blobCol0, c.blobCol1 = *col0, *col1
+	c.blob = blob
 	return c, nil
 }
 
-// admits reports whether the entry's second key column passes the array.
+// admits reports whether the entry's key column passes the qual.
 func (c *trailingKeyCheck) admits(key []byte) (bool, error) {
 	if c.desc != nil {
 		vals, err := pgIndexTupleKeyDatumsInto(c.desc, c.cols, key, c.imgs, c.nulls, c.vals)
 		if err != nil {
 			return false, err
 		}
-		c.row[0] = vals[1]
+		c.row[0] = vals[c.pos]
 	} else {
-		_, n, err := decodeIndexKeyColumnStyled(key, c.blobCol0, c.style)
-		if err != nil {
-			return false, err
+		off := 0
+		for i := 0; i < c.pos; i++ {
+			_, n, err := decodeIndexKeyColumnStyled(key[off:], c.blob[i], c.style)
+			if err != nil {
+				return false, err
+			}
+			off += n
 		}
-		d, _, err := decodeIndexKeyColumnStyled(key[n:], c.blobCol1, c.style)
+		d, _, err := decodeIndexKeyColumnStyled(key[off:], c.blob[c.pos], c.style)
 		if err != nil {
 			return false, err
 		}
 		c.row[0] = d
 	}
 	return predAdmits(c.ctx, c.pred, c.row)
+}
+
+// skipRangePred is `ref op key` for a skip scan's bounds on its range column
+// (LowKey/HighKey with their strictness), ANDed.
+func skipRangePred(ref *optimizer.ColumnRef, low, high optimizer.Expr, lowOp, highOp parser.OpCode) optimizer.Expr {
+	var pred optimizer.Expr
+	add := func(e optimizer.Expr) {
+		if pred == nil {
+			pred = e
+		} else {
+			pred = &optimizer.BinaryOp{Op: parser.OpAnd, Left: pred, Right: e}
+		}
+	}
+	if low != nil {
+		op := parser.OpGe
+		if lowOp == parser.OpGt {
+			op = parser.OpGt
+		}
+		add(&optimizer.BinaryOp{Op: op, Left: ref, Right: low})
+	}
+	if high != nil {
+		op := parser.OpLe
+		if highOp == parser.OpLt {
+			op = parser.OpLt
+		}
+		add(&optimizer.BinaryOp{Op: op, Left: ref, Right: high})
+	}
+	return pred
 }

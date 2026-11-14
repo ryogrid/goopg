@@ -3974,6 +3974,10 @@ func indexScanPredicate(ix *optimizer.IndexScan) optimizer.Expr {
 		// dropped them from the Filter above the scan, so a predicate without
 		// them would match (and update/delete) rows outside the probe.
 		np := len(ix.RangePrefix)
+		// M0148-0001c3a4 (j): a skip scan's bounds sit on Columns[SkipPrefix].
+		if ix.SkipPrefix > 0 && len(ix.Keys) == 0 && np == 0 {
+			np = ix.SkipPrefix
+		}
 		if np >= len(ix.Index.Columns) {
 			return nil
 		}

@@ -160,9 +160,14 @@ func createBitmapIndexScanPlan(p *Path) Node {
 	}
 	sawBound := false
 	var condOrder []IndexCondItem
+	// M0148-0001c3a4 (j): a skip scan's bounds sit on a later column.
+	rangeCol := np
+	if sc := clausesSkipRange(clauses); sc > 0 && np == 0 {
+		rangeCol, bis.SkipPrefix = sc, sc
+	}
 	for _, c := range rest {
-		if c.indexCol != np {
-			panic(fmt.Sprintf("createPlan: bitmap range clause of %s bounds index column %d, not %d", p.IndexInfo.Name, c.indexCol, np))
+		if c.indexCol != rangeCol {
+			panic(fmt.Sprintf("createPlan: bitmap range clause of %s bounds index column %d, not %d", p.IndexInfo.Name, c.indexCol, rangeCol))
 		}
 		if c.nullTest != IndexNullTestNone {
 			condOrder = append(condOrder, IndexCondNullTest)

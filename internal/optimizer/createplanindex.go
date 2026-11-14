@@ -363,6 +363,10 @@ func createIndexScanPlan(p *Path) Node {
 		var ioLow, ioHigh Expr
 		var ioLowOp, ioHighOp parser.OpCode
 		ioRange := hasRangeClause(p.IndexClauses)
+		// M0148-0001c3a4 (j): a skip scan's range on a later column — the
+		// bounds sit on Columns[ioSkipCol], which IndexOnlyScan.SkipPrefix
+		// names (no Keys).
+		ioSkipCol := clausesSkipRange(p.IndexClauses)
 		var ioNullTest IndexNullTest
 		ioNullTestAfter := false
 		var ioExtraNullTests []ExtraIndexNullTest
@@ -446,7 +450,7 @@ func createIndexScanPlan(p *Path) Node {
 				continue
 			}
 			if ioRange {
-				if c.indexCol != 0 || c.key == nil || p.RequiredOuter != 0 || p.IndexSkipPrefix != 0 {
+				if c.indexCol != ioSkipCol || c.key == nil || p.RequiredOuter != 0 || p.IndexSkipPrefix != 0 {
 					panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s: clause %d is not a leading-column bound",
 						p.IndexInfo.Name, i))
 				}
@@ -538,6 +542,7 @@ func createIndexScanPlan(p *Path) Node {
 		case ioRange:
 			ios.LowKey, ios.LowOp, ios.HighKey, ios.HighOp = ioLow, ioLowOp, ioHigh, ioHighOp
 			ios.TrailingSAOP = ioTrailing
+			ios.SkipPrefix = ioSkipCol
 			ios.LeadingNullTest, ios.NullTestAfterBounds = ioNullTest, ioNullTestAfter
 			ios.ExtraNullTests = ioExtraNullTests
 			if len(ioCondOrder) > 1 {
@@ -780,6 +785,12 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 		is.RangePrefix = prefix
 	}
 	var condOrder []IndexCondItem
+	// M0148-0001c3a4 (j): a skip scan's bounds sit on a later column,
+	// which IndexScan.SkipPrefix names (no Keys).
+	rangeCol := len(prefix)
+	if sc := clausesSkipRange(rangeClauses); sc > 0 && len(prefix) == 0 {
+		rangeCol, is.SkipPrefix = sc, sc
+	}
 	for i, c := range rangeClauses[len(prefix):] {
 		if c.nullTest != IndexNullTestNone {
 			condOrder = append(condOrder, IndexCondNullTest)
@@ -803,8 +814,8 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 			}
 			continue
 		}
-		if c.indexCol != len(prefix) || c.key == nil {
-			panic(fmt.Sprintf("createPlan: range clause %d of %s does not bound index column %d", i, p.IndexInfo.Name, len(prefix)))
+		if c.indexCol != rangeCol || c.key == nil {
+			panic(fmt.Sprintf("createPlan: range clause %d of %s does not bound index column %d", i, p.IndexInfo.Name, rangeCol))
 		}
 		switch c.op {
 		case parser.OpGt, parser.OpGe:

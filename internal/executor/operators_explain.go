@@ -3105,7 +3105,11 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			if p.LeadingNullTest != optimizer.IndexNullTestNone {
 				cond = formatBitmapNullTestIndexCond(p, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg))
 			}
-			if len(p.SAOPKeys) > 0 {
+			if s := p.SkipPrefix; s > 0 && s < len(p.Index.Columns) && (p.LowKey != nil || p.HighKey != nil) {
+				// M0148-0001c3a4 (j): a skip scan's range, under its column.
+				cond = indexCondAndText(rangeColumnCondParts(p.Table, p.Index, s, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg)+p.Index.Columns[s],
+					p.IndexCondOrder, p.LowKey, p.HighKey, p.LowOp, p.HighOp, optimizer.IndexNullTestNone, false, nil, reg))
+			} else if len(p.SAOPKeys) > 0 {
 				cond = formatBitmapSAOPIndexCond(p, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg))
 			} else if np := len(p.Keys); np > 0 && np < len(p.Index.Columns) && (p.LowKey != nil || p.HighKey != nil) {
 				// M0148-0001c3a2: bounds behind the equality Keys.
@@ -3896,6 +3900,12 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 	// procedurally generated skip array never appears in Index Cond.
 	// Rendering it through the shared body would mislabel slot i with
 	// column i's name.
+	// M0148-0001c3a4 (j): a skip scan's range on a later column prints
+	// only the bounds, under that column.
+	if s := p.SkipPrefix; s > 0 && len(p.Keys) == 0 && s < len(p.Index.Columns) && (p.LowKey != nil || p.HighKey != nil) {
+		return indexCondAndText(rangeColumnCondParts(p.Table, p.Index, s, prefix+p.Index.Columns[s], p.IndexCondOrder,
+			p.LowKey, p.HighKey, p.LowOp, p.HighOp, optimizer.IndexNullTestNone, false, nil, reg))
+	}
 	if s := p.SkipPrefix; s > 0 && len(p.Keys) > 0 && s+len(p.Keys) <= len(p.Index.Columns) {
 		parts := make([]string, len(p.Keys))
 		for i, k := range p.Keys {
@@ -3932,6 +3942,12 @@ func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, pr
 	if len(p.SAOPKeys) > 0 {
 		return formatIndexCondPrefixed(&optimizer.IndexScan{Table: p.Table, Index: p.Index, RangePrefix: p.Keys, SAOPKeys: p.SAOPKeys, SAOPOp: p.SAOPOp,
 			SAOPColQuals: p.SAOPColQuals, LowKey: p.LowKey, HighKey: p.HighKey, LowOp: p.LowOp, HighOp: p.HighOp}, reg, prefix)
+	}
+	// M0148-0001c3a4 (j): a skip scan's range on a later column prints
+	// only the bounds, under that column (`Index Cond: (tenthous < 2)`).
+	if s := p.SkipPrefix; s > 0 && len(p.Keys) == 0 && s < len(p.Index.Columns) && (p.LowKey != nil || p.HighKey != nil) {
+		return indexCondAndText(rangeColumnCondParts(p.Table, p.Index, s, prefix+p.Index.Columns[s], p.IndexCondOrder,
+			p.LowKey, p.HighKey, p.LowOp, p.HighOp, optimizer.IndexNullTestNone, false, nil, reg))
 	}
 	// M0146-0005bt: the index-only skip probe, rendered as the index scan's
 	// (formatIndexCond) — only the bound quals, each under its own column.

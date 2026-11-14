@@ -1,6 +1,6 @@
 # M0148\-0001c3a4 — ScalarArrayOp and OR index\-path residue
 
-**Parent:** M0148\-0001c3a2 · **Status:** items \(a\), \(b\), \(c\) and \(h\) landed 2026\-11\-12; item \(i\) slices 1–5, \(d\) and \(g\) landed 2026\-11\-14; items \(e\), \(f\), \(j\) and the rest of \(i\) open
+**Parent:** M0148\-0001c3a2 · **Status:** items \(a\), \(b\), \(c\) and \(h\) landed 2026\-11\-12; item \(i\) slices 1–5, \(d\), \(g\) and \(j\) landed 2026\-11\-14; items \(e\), \(f\) and the rest of \(i\) open
 
 This item collects what M0148\-0001c3a2 \(BitmapOr paths\) left open. The items
 are listed in `.ralph/fix_plan.md` under M0148\-0001c3a4:
@@ -727,4 +727,72 @@ goopg stamped the path's own figures instead, for example
 - **The Bitmap Heap Scan's width:** it is the scan's full row width
   \(`width=244` under `count(*)`\), where PG prices the reltarget. This is
   the same gap as the index\-only and plain scan widths.
+
+## Item \(j\) — skip scan with a range on a later column
+
+PG 18 makes `tenthous < 2` on `(thousand, tenthous)` an index qual. Skip
+arrays fill the unbound leading column \(nbtpreprocesskeys.c
+`_bt_skiparray`\), so the plan is `Index Cond: (tenthous < 2)` on an Index
+Only Scan, Index Scan \(Backward\) or Bitmap Index Scan.
+
+goopg's skip scan took only equality runs \(restrictionSkipRun\). Without
+this, the predicate was a Filter on a full index scan, and as a BitmapOr arm
+it had no path at all. That blocked create\_index's `BitmapAnd(hundred,
+BitmapOr(thousand = ANY, tenthous < 2))`.
+
+### Change
+
+- **Clauses:** `restrictionSkipRange` takes the first column after the
+  leading one that carries bounds, when no earlier column carries any qual.
+  The skipped columns must be ascending and NULL\-safe, and no interval
+  column may appear.
+- **Producers:**
+  - the plain producer, when there is no skip run;
+  - the index\-only producer, when nothing else binds;
+  - the bitmap producer, with constant bounds only.
+- **Costing:** each producer prices it with `skipScanDescents`
+  \(btcostestimate's skip arm\). When the estimate reverts,
+  boundSelectivity is 1 and the index side covers the whole index. For
+  tenk1 that gives 195.28 / 195.31 / 203.30, which are PG's figures.
+- **Plan:** `SkipPrefix` with no Keys, and LowKey/HighKey on
+  `Columns[SkipPrefix]`, on IndexScan, IndexOnlyScan and BitmapIndexScan
+  \(a new field there\). `clausesSkipRange` recognises the shape at
+  lowering.
+- **Executor:** all three scans read the whole index and check each entry's
+  key column with `newIndexColumnCheck`. That is the trailing\-array check
+  from slice 3, generalised to any column, with `skipRangePred` as the
+  qual. The check runs before any heap fetch, and backward reads use the
+  same callback. The bitmap scan needs no recheck.
+- **Siblings:**
+  - `indexScanPredicate` rebuilds the bounds on the right column.
+  - EXPLAIN prints them under that column for all three node types.
+  - The plain scan's equality\-skip dispatch \(rescanSkip, walkLeaf,
+    skipNextGroup\) now requires Keys \(`skipRangeScan`\).
+
+### Verification
+
+- **Live server against a scratch PG 18.3, regress tenk1:** 10 statements
+  have identical plans, costs and rows:
+  - IOS, plain, backward, two bounds;
+  - the item \(d\) BitmapAnd and BitmapOr cases \(248.78, 213.31\).
+  Only `width` differs \(ledgered\).
+- **`TestSkipScanRangeOnLaterColumn`:** 4 PG plans with rows.
+- **Regress:** create\_index 2832→2801 with no new mismatch line; join
+  \+5 is the flap.
+- **Gates:**
+  - units, tpch\-spotcheck, sf025 99/99 \(plan shapes identical\);
+  - fire\-set fires=none on sf025, sf1 and TPC\-H;
+  - acceptance 24 MATCH.
+
+### Not covered
+
+- **Real skip descents:** the scan reads the whole index rather than
+  repositioning per skipped value \(\_bt\_advance\_array\_keys\). Results
+  and order are the same. PG's own cost reverts to a whole\-index read when
+  the descents would exceed the index's pages, as they do for tenk1.
+- **Narrower shapes not taken:**
+  - a range on the skipped column itself, which feeds indexSkipQuals into
+    ndistinct;
+  - a range followed by an equality run;
+  - a skip range behind a partial skip run.
 

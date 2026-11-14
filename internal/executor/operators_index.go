@@ -577,6 +577,15 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// scan's verdict (if any) is recorded before its state is reset.
 	o.finalizeIndexScanSSI()
 	o.flushKills() // C3-S3: mark pending kills before discarding them
+	if o.skipRangeScan() && o.trailCheck == nil {
+		c, err := newIndexColumnCheck(o.ctx, o.plan.Table, o.plan.Index, o.plan.SkipPrefix, func(ref *optimizer.ColumnRef) optimizer.Expr {
+			return skipRangePred(ref, o.plan.LowKey, o.plan.HighKey, o.plan.LowOp, o.plan.HighOp)
+		})
+		if err != nil {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		o.trailCheck = c
+	}
 	if o.plan.TrailingSAOP != nil && o.trailCheck == nil {
 		c, err := newTrailingKeyCheck(o.ctx, o.plan.Table, o.plan.Index, o.plan.TrailingSAOP)
 		if err != nil {
@@ -632,13 +641,13 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// the SAOP arm on purpose: a plan carrying both shapes is a planner bug,
 	// and rescanSkip's shape check is what reports it rather than silently
 	// running the SAOP half.
-	if o.plan.Backward && (o.plan.SkipPrefix > 0 || len(o.plan.SAOPKeys) > 0 || o.pidx != nil) {
+	if o.plan.Backward && ((o.plan.SkipPrefix > 0 && !o.skipRangeScan()) || len(o.plan.SAOPKeys) > 0 || o.pidx != nil) {
 		// PG runs these backward too (array keys and skip arrays in reverse,
 		// a parallel scan's backward seize); goopg's planner does not
 		// produce them yet, so one reaching here is a planner bug.
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "backward index scan with a ScalarArrayOp, skip or parallel probe is not supported"}
 	}
-	if o.plan.SkipPrefix > 0 {
+	if o.plan.SkipPrefix > 0 && !o.skipRangeScan() {
 		return o.rescanSkip()
 	}
 
@@ -707,6 +716,10 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		if len(o.plan.Index.Columns) > 1 {
 			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, key)
 		}
+	} else if o.skipRangeScan() {
+		// M0148-0001c3a4 (j): a skip scan's range on Columns[SkipPrefix] —
+		// the whole index, each entry checked by trailCheck.
+		loBytes, hiBytes, loExcl, hiExcl = nil, nil, false, false
 	} else {
 		// Range scan: evaluate lo/hi bounds independently.
 		lo, hiB, ok, err := o.lookupRangeBounds()
@@ -1285,7 +1298,7 @@ func (o *indexScanOp) scanAppendEntry(key []byte, ptr storage.ItemPointer, pos n
 // Gather-declined blocks, high-key recovery leaves, admitted leaves with
 // no in-range items — are consumed inside the loop.
 func (o *indexScanOp) nextLeafBatch() (more bool, err error) {
-	if o.plan.SkipPrefix > 0 && o.skip.canWalk() {
+	if o.plan.SkipPrefix > 0 && !o.skipRangeScan() && o.skip.canWalk() {
 		// M0145-0008af: the skip scan's leaf walk (btree_skip.go walkLeaf),
 		// one leaf per call, matching entries appended to this batch.
 		for {
@@ -1328,7 +1341,7 @@ func (o *indexScanOp) nextLeafBatch() (more bool, err error) {
 			// never opened) — enumerate the next distinct prefix and open
 			// its bounded descent. Enumeration laziness is what keeps an
 			// early-stopping consumer from paying for groups it never read.
-			if o.plan.SkipPrefix > 0 {
+			if o.plan.SkipPrefix > 0 && !o.skipRangeScan() {
 				lo, hi, ok, err := o.skipNextGroup()
 				if err != nil {
 					return false, err
@@ -1948,3 +1961,12 @@ func appendCompositeUpperPadding(key []byte) []byte {
 	}
 	return out
 }
+
+// skipRangeScan reports PG 18's skip scan with a range on
+// Columns[SkipPrefix] and no Keys (M0148-0001c3a4 (j)): the whole index is
+// read and trailCheck admits each entry. SkipPrefix with Keys is the
+// equality skip run (rescanSkip).
+func (o *indexScanOp) skipRangeScan() bool {
+	return o.plan.SkipPrefix > 0 && len(o.plan.Keys) == 0 && (o.plan.LowKey != nil || o.plan.HighKey != nil)
+}
+

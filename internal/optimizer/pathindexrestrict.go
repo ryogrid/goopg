@@ -176,6 +176,52 @@ func restrictionSkipRun(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.In
 	return clauses, skip
 }
 
+// restrictionSkipRange is PG 18's skip scan with a RANGE on a non-leading
+// column (M0148-0001c3a4 (j)): `tenthous < 2` on (thousand, tenthous) is an
+// index qual, with a skip array over thousand (nbtpreprocesskeys.c
+// `_bt_skiparray`). It returns the first column skip (>= 1) that carries
+// bounds — only when no earlier column carries any qual this producer binds
+// (equality, range, array or NullTest) — and those bounds, each recording its
+// conjunct. The skipped prefix must be plain ascending columns and NULL-safe,
+// as restrictionSkipRun requires; the scan checks every entry's key column
+// against the bounds, so neither the skipped nor the range column may be an
+// interval (its key does not decode).
+func restrictionSkipRange(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) ([]indexPathClause, int) {
+	if !isBTreeIndex(idx) || idx.DeclaredHash || len(idx.Columns) < 2 {
+		return nil, 0
+	}
+	for pos := 0; pos < len(idx.Columns); pos++ {
+		if idx.Columns[pos] == "" {
+			return nil, 0
+		}
+		if col, ok := tableColumnByName(tbl, idx.Columns[pos]); !ok || strings.EqualFold(col.Type.Name, "interval") {
+			return nil, 0
+		}
+		if restrictionEqualityOn(cat, tbl, idx, pos, conjuncts) != nil ||
+			len(restrictionSAOPOnColumn(cat, tbl, idx, pos, conjuncts)) > 0 ||
+			restrictionNullTestOnColumn(idx, pos, conjuncts) != nil {
+			return nil, 0
+		}
+		rng := restrictionRangeOnColumnLocal(cat, tbl, idx, pos, conjuncts, true)
+		if len(rng) == 0 {
+			continue
+		}
+		if pos == 0 {
+			return nil, 0
+		}
+		for i := 0; i < pos; i++ {
+			if i < len(idx.ColDescending) && idx.ColDescending[i] {
+				return nil, 0
+			}
+		}
+		if !indexSkipNullSafe(tbl, idx, pos, 1) {
+			return nil, 0
+		}
+		return rng, pos
+	}
+	return nil, 0
+}
+
 // restrictionLeadingRange binds the index's LEADING column to the first local
 // lower bound (`col > c` / `col >= c`, either operand order) and the first
 // upper bound (`col < c` / `col <= c`) on it, returning up to two clauses with
@@ -720,6 +766,15 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		clauses, skip = restrictionSkipRun(cat, tbl, idx, conjuncts)
 		isRange = false
 	}
+	// M0148-0001c3a4 (j): no equality run either, but a range on a later
+	// column — PG 18's skip scan with skip arrays over the columns before
+	// it (IndexScan.SkipPrefix with LowKey/HighKey, no Keys).
+	skipRangeCol := 0
+	if len(clauses) == 0 {
+		if rng, sc := restrictionSkipRange(cat, tbl, idx, conjuncts); len(rng) > 0 {
+			clauses, skipRangeCol, isRange = rng, sc, true
+		}
+	}
 	if len(clauses) == 0 {
 		return false
 	}
@@ -794,9 +849,9 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	// (btcostestimate's num_sa_scans); a reverted estimate prices the index
 	// side over the whole index (skipScanDescents, boundSelectivity 1).
 	// (boundSel may already hold the trailing-array arm's value.)
-	if skip > 0 {
+	if skip > 0 || skipRangeCol > 0 {
 		var boundCounted bool
-		numSAScans, boundCounted = skipScanDescents(tbl, idx, skip, relTuples, indexPages)
+		numSAScans, boundCounted = skipScanDescents(tbl, idx, max(skip, skipRangeCol), relTuples, indexPages)
 		if !boundCounted {
 			boundSel = 1
 		}

@@ -452,3 +452,46 @@ func TestBitmapOrSubORInAndArm(t *testing.T) {
 		t.Errorf("rows %q", got)
 	}
 }
+
+// TestSkipScanRangeOnLaterColumn pins M0148-0001c3a4 (j) against PG 18.3: a
+// range on a non-leading column with nothing bound before it is an index
+// qual of PG 18's skip scan (`Index Cond: (tenthous < 2)`), on the plain,
+// index-only and bitmap paths and backward. The scan reads the whole index
+// and checks each entry's key column (trailingKeyCheck), so the rows pin
+// that check too.
+func TestSkipScanRangeOnLaterColumn(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "CREATE TABLE tk (thousand int NOT NULL, tenthous int NOT NULL, pad text)")
+	runSQL(t, ctx, "INSERT INTO tk SELECT g%1000, g, repeat('x', 100) FROM generate_series(0, 9999) g")
+	runSQL(t, ctx, "CREATE INDEX tk_tt ON tk (thousand, tenthous)")
+	runSQL(t, ctx, "VACUUM tk")
+	runSQL(t, ctx, "ANALYZE tk")
+	base := optimizer.DefaultPlannerSettings()
+	noSeq := base
+	noSeq.EnableSeqScan = false
+	noSeqBitmap := noSeq
+	noSeqBitmap.EnableBitmapScan = false
+	onlyBitmap := noSeq
+	onlyBitmap.EnableIndexScan = false
+	for _, c := range []struct {
+		q, plan, rows string
+		ps            optimizer.PlannerSettings
+	}{
+		{"SELECT thousand, tenthous FROM tk WHERE tenthous < 2",
+			"Index Only Scan using tk_tt on tk\n  Index Cond: (tenthous < 2)", "0|0;1|1", noSeqBitmap},
+		{"SELECT thousand, tenthous FROM tk WHERE tenthous < 2 AND pad IS NOT NULL ORDER BY thousand DESC, tenthous DESC",
+			"Index Scan Backward using tk_tt on tk\n  Index Cond: (tenthous < 2)\n  Filter: (pad IS NOT NULL)", "1|1;0|0", noSeqBitmap},
+		{"SELECT thousand, tenthous FROM tk WHERE tenthous > 9995 AND tenthous <= 9998 AND pad IS NOT NULL",
+			"Index Scan using tk_tt on tk\n  Index Cond: ((tenthous > 9995) AND (tenthous <= 9998))\n  Filter: (pad IS NOT NULL)", "996|9996;997|9997;998|9998", noSeqBitmap},
+		{"SELECT thousand, tenthous FROM tk WHERE tenthous < 2 AND pad IS NOT NULL",
+			"Bitmap Heap Scan on tk\n  Recheck Cond: (tenthous < 2)\n  Filter: (pad IS NOT NULL)\n  ->  Bitmap Index Scan on tk_tt\n        Index Cond: (tenthous < 2)", "0|0;1|1", onlyBitmap},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, c.ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, c.ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

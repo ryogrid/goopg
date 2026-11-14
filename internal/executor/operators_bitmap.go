@@ -154,6 +154,41 @@ func (o *bitmapIndexScanOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 		return tbm, nil
 	}
 
+	// M0148-0001c3a4 (j): a skip scan's range on Columns[SkipPrefix] — the
+	// whole index, each entry's key column checked against the bounds.
+	if o.plan.SkipPrefix > 0 {
+		c, err := newIndexColumnCheck(o.ctx, o.plan.Table, o.plan.Index, o.plan.SkipPrefix, func(ref *optimizer.ColumnRef) optimizer.Expr {
+			return skipRangePred(ref, o.plan.LowKey, o.plan.HighKey, o.plan.LowOp, o.plan.HighOp)
+		})
+		if err != nil {
+			return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		if tbm.entries == nil {
+			tbm.entries = make(map[storage.BlockNumber]*pageEntry)
+		}
+		var checkErr error
+		scanFn := func(key []byte, ptr storage.ItemPointer, _ nbtree.ScanPos) (bool, error) {
+			ok, err := c.admits(key)
+			if err != nil {
+				checkErr = err
+				return false, err
+			}
+			if ok {
+				tbm.addOne(ptr.Block, ptr.Offset, false)
+				o.lastTuples++
+			}
+			return true, nil
+		}
+		if err := o.tree.RangeScanWithPos(nil, nil, false, false, scanFn); err != nil {
+			if checkErr != nil {
+				return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: checkErr.Error()}
+			}
+			return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		tbmLossify(tbm)
+		return tbm, nil
+	}
+
 	// Compute the lo/hi key bounds (same logic as indexScanOp.Rescan).
 	loBytes, hiBytes, nullKey, err := o.lookupBounds()
 	if err != nil {
@@ -244,6 +279,10 @@ func (o *bitmapIndexScanOp) needsRecheck() bool {
 	}
 	if len(o.plan.SAOPKeys) > 0 {
 		return len(o.plan.Keys)+1 < len(o.plan.Index.Columns)
+	}
+	// M0148-0001c3a4 (j): the skip scan checks every entry exactly.
+	if o.plan.SkipPrefix > 0 {
+		return false
 	}
 	// Key covers the first N columns; if there are more index columns,
 	// the trailing conditions need recheck.

@@ -3841,6 +3841,11 @@ type BitmapIndexScan struct {
 	// Columns[len(Keys)], behind the equality Keys: one probe per element,
 	// all into the one TID bitmap (M0148-0001c3a2). Never set together with
 	// Key, LowKey/HighKey or LeadingNullTest.
+	// SkipPrefix, when non-zero, moves LowKey/HighKey onto
+	// Index.Columns[SkipPrefix]: PG 18's skip scan with a range on a later
+	// column and nothing bound before it (M0148-0001c3a4 (j)). The executor
+	// reads the whole index and checks each entry's key column.
+	SkipPrefix int
 	SAOPKeys []Expr
 	// SAOPOp is the array's operator: OpUnknown for `= ANY`, or an
 	// inequality (`col < ANY (…)`, M0148-0001c3a4 (a)) probed as the range of
