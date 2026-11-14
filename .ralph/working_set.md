@@ -1,31 +1,28 @@
-# Working Set — loop end 2026-11-14 (census REUSE; M0148-0001c3a6 (i) slice 1 LANDED 61c2f1857)
+# Working Set — loop end 2026-11-14 (census routing-20261114r IDENTICAL; M0148-0001c3a6 (i) slice 2 LANDED 0674306c7)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: items 0. Nothing filed.
-- S9: REUSE at loop start (routing-20261114q). 61c2f1857 touches the planner, so the next census is likely DUE.
-- Task: M0148-0001c3a6 item (i) slice 1, landed as 61c2f1857.
+- S9: DUE → routing-20261114r (s9cw, BASELINE_REV=c71667248) IDENTICAL ×3, committed d93cf8cbc.
+  - 0674306c7 touches the planner, so the next census is likely DUE.
+- Task: M0148-0001c3a6 item (i) slice 2, landed as 0674306c7.
   - Files:
-    - pathbitmapor.go: crossIntArrayLiteral;
-    - pathindexrestrict.go: saopColumnQuals cross-type arm, saopColQual.arrayText;
-    - plan.go: SAOPColQual.ArrayText;
-    - createplanindex.go: lowerSAOPColQuals copies ArrayText;
-    - operators_explain.go: colQual prints ArrayText;
-    - test TestCrossTypeIntegerArrayColumnQual.
-  - New design doc docs/design/0100-0149/0148-0001c3a6-c3a4-residue.md (README indexed).
+    - pathbitmapor.go: crossIntCastKey;
+    - pathindexrestrict.go: restrictionKeyUsable cross arm and negated form, isIndexKeyOperand;
+    - selectivity.go: integerCastLiteral in normalizeColumnConst/Range;
+    - pathbitmap.go: bitmapConstKey; the equality collector skips out-of-range keys;
+    - operators_explain.go: formatCrossIntLiteralOperands, indexCondClause;
+    - test TestCrossTypeIntegerLiteralIndexQual.
   - Findings:
-    - Column-qual arrays are merged into the probe keys by the executor, so out-of-range elements must be dropped from Array (an encode error otherwise). The display text is kept separately.
-    - Movement: create_index 2708→2689.
-- Next step: c3a6 (i) remaining, pick one:
-  - int2 untyped literal rendering: inListArrayConst prints integer[] where PG prints smallint[] for `s = ANY('{1,2}')`. Needs InExpr to carry literal-vs-IN-list origin.
-  - Mixed-type OR BitmapOr (create_index `tenthous = 1::int2 OR tenthous = 3::int8 OR tenthous = 42::int8` → PG BitmapOr of `(thousand = 42) AND (tenthous = '1'::smallint)` and `= ANY ('{3,42}'::bigint[])`). Grep create_index.diff for "1::int2".
-  - Then (f) join OR bitmaps when a witness appears; afterwards c3a9 / c3a10 / c3a8 / c3a7 in file order.
+    - goopg keeps `3::int8` as CastExpr(IntegerConst); PG folds it to an int8 Const. The renderer had coerced it to the column type.
+    - An observed flake: regress arrays `array_agg(nullif(ten,4))` over an ORDER BY subquery came back out of order once (not reproduced 2×). Ledgered.
+  - Movement: create_index 2689→2664, partition_prune 6755→6754.
+- Next step: c3a6 (i) group_similar_or_args — the create_index witness `thousand = 42 AND (tenthous = 1::int2 OR tenthous = 3::int8 OR tenthous = 42::int8)` should become a BitmapOr of the int2 arm and an `= ANY ('{3,42}'::bigint[])` arm (probe file tmp/mo.sql). Look at pathbitmapor.go generate_bitmap_or_paths / orEqualitySAOP.
 - Top-residual: M0148 residues. Open children: c3a6, c3a7, c3a8, c3a9, c3a10, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census REUSE this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261114r done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26). Then M0148 in file order → c3a6.
 - Gates run (all PASS):
   - units, tpch-spotcheck, sf025 same=99;
-  - fire-set c3a6i fires=none ×3; acceptance 24 MATCH;
-  - regress A/B tmp/regress-c3a6i vs tmp/regress-c3a5a6 (create_index only; join ±5 flap).
-  - Isolation family not run: no selectivity change.
+  - fire-set c3a6b fires=none ×3; acceptance 24 MATCH; TestPort_Isolation ok;
+  - regress A/B tmp/regress-c3a6i2 vs tmp/regress-c3a6i (arrays +13 was the flake; re-runs tmp/regress-arr1/2 = 3142).
 - In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped. Restarting it hits P0-E24: drop leftover partitions.
