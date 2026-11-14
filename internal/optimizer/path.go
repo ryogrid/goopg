@@ -164,6 +164,11 @@ const (
 	// carries the leaf's UNION ALL the plan rebuilds around them
 	// (paramappend.go, M0146-0049).
 	PathParamAppend
+	// PathPartitionwiseAppend is the AppendPath generate_partitionwise_join_paths
+	// (allpaths.c) builds over a partitioned join's child joins: Children are
+	// the cheapest path of each partition pair's child join, in PartitionDesc
+	// order (partitionwisejoin.go, M0148-0001c3a9).
+	PathPartitionwiseAppend
 )
 
 // Path is one way to produce a relation, with a cost and an ordering. It is kept
@@ -174,6 +179,9 @@ type Path struct {
 
 	// paramAppend is a PathParamAppend's member carrier (paramappend.go).
 	paramAppend *paramAppendInfo
+	// pwParents is a PathPartitionwiseAppend's two parent appendrels
+	// (partitionwisejoin.go).
+	pwParents []*SetOp
 	// paramSink is set, only while a nested loop lowers a parameterised join
 	// inner (createNestLoopParamJoinPlan, M0146-0049d3), on every
 	// parameterised path of that inner; createPlanNode records each

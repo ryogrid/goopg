@@ -81,6 +81,16 @@ func renumberRTIDsFlatRtableOrder(root Node, pulledViews map[Node]bool) {
 			if id := nodeRTID(n); id != 0 {
 				own = append(own, id)
 			}
+			// A partitionwise join's Append stands for its two parent
+			// appendrels (apprelids): their RTEs stay in the range table
+			// although no plan node carries them (M0148-0001c3a9).
+			if so, ok := n.(*SetOp); ok {
+				for _, par := range so.PartitionwiseParents {
+					if par != nil && par.RTID != 0 {
+						own = append(own, par.RTID)
+					}
+				}
+			}
 			subs = append(subs, NodeSubplans(n)...)
 			switch x := n.(type) {
 			case *SubqueryScan:
@@ -190,7 +200,19 @@ func renumberRTIDsFlatRtableOrder(root Node, pulledViews map[Node]bool) {
 		remap[id] = int32(i + 1)
 	}
 	next := int32(len(order) + 1)
+	parentsDone := map[*SetOp]bool{}
 	forEachPlanNodeDeep(root, func(n Node) {
+		if so, ok := n.(*SetOp); ok {
+			for _, par := range so.PartitionwiseParents {
+				if par == nil || par.RTID == 0 || parentsDone[par] {
+					continue
+				}
+				parentsDone[par] = true
+				if nw, ok := remap[par.RTID]; ok {
+					par.RTID = nw
+				}
+			}
+		}
 		f := rtidField(n)
 		if !f.IsValid() || f.Int() == 0 {
 			return

@@ -1,7 +1,7 @@
 # M0148\-0001c3a9 — partitionwise join
 
-Status: slices 1\-2 landed 2026\-11\-15 \(member order; partition scheme
-and matching\). The join itself is open. Parent: M0148\-0001c3a5.
+Status: slices 1\-3 landed 2026\-11\-15 \(member order; partition scheme
+and matching; inner partitionwise join of two base appendrels\). Parent: M0148\-0001c3a5.
 
 ## Goal
 
@@ -97,6 +97,62 @@ and matching\). The join itself is open. Parent: M0148\-0001c3a5.
 - Tests: `TestPartSchemeMatching` \(the three predicates\) and
   `TestPartSchemeStampedOnAppendrel` \(the planner stamps the scheme with
   partitions in bound order; fails with the stamp removed\).
+
+## Slice 3 — child joins \(landed\)
+
+- `tryPartitionwiseJoin` \(internal/optimizer/partitionwisejoin.go\) runs in
+  `makeJoinRel` after the whole\-rel paths, as try\_partitionwise\_join runs
+  in populate\_joinrel\_with\_paths.
+  - Conditions: `enable_partitionwise_join`, an inner join \(no
+    SpecialJoinInfo\), two base rels whose leaves are one\-level partitioned
+    appendrels with equal bounds, and an equi\-join on every key.
+- A child rel is the parent rel with its leaf swapped for member i: the same
+  relids, `baseOffset` and width, the member's own rows, and a sequential
+  scan priced on the member table.
+  - This works because a member emits the appendrel's own layout, and the
+    search's clauses address a leaf by its pre\-search offset.
+  - A restriction above the appendrel \(a Filter during the search\) is
+    pushed into a copy of the member chain with the finished\-plan pushdown's
+    own helper \(`pushFilterIntoMembers`\).
+- Each child join is sized by `sizeJoinRel` over the two child rels and gets
+  both directions of `addPaths`. Its cheapest unparameterised path becomes an
+  Append child. `PathPartitionwiseAppend` is costed as cost\_append's
+  unordered arm and competes in `add_path`.
+- Plan: a UNION ALL chain over the child join plans
+  \(`createPartitionwiseAppendPlan`).
+  - Each child join picks its own inner and outer, so each child is
+    projected into binding order \(`reorderToLayout`\). Every child, and the
+    Append, then emits one row shape.
+  - The chain records its two parent appendrels
+    \(`SetOp.PartitionwiseParents`, PG's apprelids):
+    - EXPLAIN registers the parents' names before the members', so children
+      print `t1_1`, `t2_1`;
+    - a column above the Append deparses with its parent's name;
+    - `renumberRTIDsFlatRtableOrder` re\-stamps the parents' RTIDs, which no
+      plan node carries.
+  - SetOp embeds `searchedTree`, because the Append can be the search root.
+- Row\-locking SELECTs and UPDATE / DELETE / MERGE switch partitionwise join
+  off. Their EPQ recheck reads a restriction kept on the Append
+  \(`planTakesRowMarksOrModifies`\).
+- Verification:
+  - partition\_join's first and third witnesses match PG 18.3 plan for plan;
+  - a value probe \(ORDER BY on the inner relation, filtered sides, an
+    md5 over all joined rows\) is identical to PG;
+  - `TestPartitionwiseJoin` fails with the hook removed;
+  - regress mismatch: partition\_join 1990→1882, partition\_aggregate
+    587→584.
+
+### Not covered by slice 3
+
+- Child rels carry only a sequential scan. PG's child rels get index,
+  bitmap and partial paths, so its second witness merge\-joins an Index Scan
+  per partition.
+- Child joinrel sizing reads the parent's column statistics. PG reads each
+  child's \(52 vs PG 84 rows on prt1 ⋈ prt2's first pair\).
+- Member scans are priced at 0 pages where PG's ANALYZE sets them to 1
+  \(pre\-existing; it also affects the whole\-rel Append\).
+- Outer, semi and anti joins; N\-way joins \(a child join joined again\);
+  partition\_bounds\_merge; partitionwise join under row locks and DML.
 
 ## Remaining slices \(design\)
 

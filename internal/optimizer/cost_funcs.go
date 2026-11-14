@@ -84,6 +84,8 @@ type costParams struct {
 	// (planner.c). M0146-0005bp.
 	enableIncrementalSort bool
 	enableMemoize bool
+	// enablePartitionwiseJoin is PlannerSettings.EnablePartitionwiseJoin.
+	enablePartitionwiseJoin bool
 	// enableMaterial is `enable_material`, a GENERATION gate in PG: the
 	// matpath is never created when it is off (joinpath.c:1897, :2135 —
 	// unlike the counted toggles above, the producer skips, and cost_material
@@ -160,6 +162,7 @@ func defaultCostParams() costParams {
 		enableBitmapScan: true,
 		enableGatherMerge: true,
 		enableMemoize:   true,
+		enablePartitionwiseJoin: true,
 		enableMaterial:  true,
 		geqo:            GeqoEnabled(),
 		geqoThreshold:   GeqoThreshold(),

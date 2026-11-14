@@ -3528,6 +3528,9 @@ type SetOp struct {
 	// left-deep UNION ALL chain can reach that link's SETOP rel
 	// (setopbranchrel.go).
 	setOpBranchTag
+	// searchedTree: a partitionwise join's Append (M0148-0001c3a9) can be
+	// the root the PG-shaped search returns (searchedtree.go).
+	searchedTree
 	pos   int
 	Left  Node
 	Right Node
@@ -3589,6 +3592,11 @@ type SetOp struct {
 	// partitions when this chain is a one-level partitioned table's
 	// appendrel (M0148-0001c3a9 slice 2, partscheme.go); nil otherwise.
 	partScheme *partScheme
+	// PartitionwiseParents, on the Append of a partitionwise join's child
+	// joins, are the two partitioned appendrels the join replaced — PG's
+	// Append apprelids, the parent RTEs EXPLAIN names before the children
+	// and deparses the Append's columns with (M0148-0001c3a9).
+	PartitionwiseParents []*SetOp
 	// Op is the set-operation kind (UNION / INTERSECT / EXCEPT).
 	// The zero value (parser.SetOpUnion) keeps the implicit
 	// partition/inheritance UNION ALL construction sites working

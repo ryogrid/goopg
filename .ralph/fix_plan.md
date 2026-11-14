@@ -1400,6 +1400,16 @@ heuristic stays live.)
     RegressWedgeProbe\); TestPort\_RegressSuite \+ RegressWedgeProbe PASS\.
   Movement: none — test\-only \(harness port allocation\)\.
 
+- [ ] **M\-NIGHTLY\-race\-parallel\-hash\-cancel — race/internal/executor: TestParallelHashPathModelWinner failed "parallel hash join: build abandoned \(parallel group cancelled\)"** \(AI\-20261115\-011812\-001; repro: `go test \-race \-timeout 45m \./internal/executor/`; evidence: ci/logs/20261115\-011812/race/go\-test\.log\)\.
+  Kind: impl
+  Parent: none
+  - Filed 2026\-11\-15 by the loop \(nightly triage\)\. New tonight; the units lane passed the same package\.
+  - The subtest `SELECT f\.fid, d\.dname FROM pq\_fact f JOIN pq\_dim d ON f\.fk = d\.dk WHERE f\.amt >= 0` opened a
+    parallel hash join whose shared build was cancelled \(parallel\_hash\_shared\_test\.go:324\), under the race
+    detector with the host loaded \(load average ~16 during the batch\)\.
+  - Resume: rerun under `\-race` in a quiet host; if it reproduces, trace who cancels the parallel group before the
+    build finishes \(a worker error or a timeout firing early under race slowdown\)\.
+
 - [ ] **P0\-E25 — after a server restart, columns of user\-defined types \(enum, composite, domain\) reload as `text`**
   \(filed 2026\-11\-04 by the loop, found while probing M0148\-0001j2; S2 — wrong results and unvalidated data\)\.
   Kind: impl
@@ -12942,6 +12952,18 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
       makeJoinRel. Column refs are positional by source and name, and a
       member's output layout equals the appendrel's, so a child problem
       can reuse the parent's clauses with the leaves swapped.
+  - 2026-11-15 slice 3 LANDED: inner partitionwise join of two base
+    appendrels \(tryPartitionwiseJoin at makeJoinRel, child rels with
+    member leaves, PathPartitionwiseAppend, EXPLAIN parent naming via
+    SetOp.PartitionwiseParents\).
+    - Off for row-locking SELECTs and DML \(EPQ reads the Append Filter\).
+    - enable\_partitionwise\_join now reaches the planner
+      \(PlannerSettings.EnablePartitionwiseJoin, dispatch.go\).
+    Movement: yes — regress partition\_join 1990→1882, partition\_aggregate
+    587→584
+    - Resume: child rels with index / bitmap paths \(the second witness
+      merge-joins Index Scans\); child statistics for child joinrel sizing;
+      outer / semi / anti joins; N-way.
 - [ ] **M0148-0001c3a10 — index clauses on appendrel members (WHERE quals
   pushed into partitions)**.
   Kind: impl

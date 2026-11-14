@@ -258,7 +258,7 @@ func relPartScheme(rel *RelOptInfo) *partScheme {
 	if rel == nil {
 		return nil
 	}
-	if so, ok := rel.baseLeaf.(*SetOp); ok {
+	if so, _ := appendRelLeaf(rel); so != nil {
 		return so.partScheme
 	}
 	return nil

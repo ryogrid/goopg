@@ -1906,6 +1906,7 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readBool("enable_mergejoin", &ps.EnableMergeJoin)
 	readBool("enable_nestloop", &ps.EnableNestLoop)
 	readBool("enable_memoize", &ps.EnableMemoize)
+	readBool("enable_partitionwise_join", &ps.EnablePartitionwiseJoin)
 	readBool("enable_hashagg", &ps.EnableHashAgg)
 	readBool("enable_presorted_aggregate", &ps.EnablePresortedAggregate)
 	readBool("enable_group_by_reordering", &ps.EnableGroupByReordering)
@@ -2041,6 +2042,7 @@ func plannerCacheFingerprint(ps optimizer.PlannerSettings, disableSeqScan, disab
 		float(ps.GeqoSelectionBias),
 		float(ps.GeqoSeed),
 		bit(ps.EnableMemoize),
+		bit(ps.EnablePartitionwiseJoin),
 		float(ps.HashMemMultiplier),
 		// C-19g's remainder: the parallel block. It used to be excluded
 		// because `MaybeAddGather` ran post-cache and nothing parallel could

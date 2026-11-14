@@ -1351,7 +1351,9 @@ func resolveKeySourceDepth(expr optimizer.Expr, node optimizer.Node, reg *subPla
 			// parent's refname (`Group Key: t1.a` over `Seq Scan on t1
 			// t1_1`). Decline, so the key is named at its own level where
 			// the Append claims the source (M0148-0001k).
-			if n.RTID != 0 && n.AppendRelName != "" && !n.IsUnionAllAppendRel() {
+			// A partitionwise join's Append likewise: its Vars are the two
+			// parent RTEs' (apprelids), named at this level (M0148-0001c3a9).
+			if (n.RTID != 0 && n.AppendRelName != "" && !n.IsUnionAllAppendRel()) || len(n.PartitionwiseParents) > 0 {
 				return nil, false
 			}
 			col, ok := cur.(*optimizer.ColumnRef)

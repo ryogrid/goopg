@@ -1857,6 +1857,14 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// once came from the goroutine-unsafe package global `planParent`
 		// (now the per-statement planState.parent, P0-E8).
 		ctx.settings = plannerSet
+		// M0148-0001c3a9: a row-locking query keeps its appendrels whole.
+		// The finished plan's EPQ recheck reads a restriction above the
+		// appendrel's scan chain (planTakesRowMarksOrModifies keeps it on
+		// the Append), which a partitionwise child join would move into
+		// its member; ledgered.
+		if len(s.Locking) > 0 {
+			ctx.settings.EnablePartitionwiseJoin = false
+		}
 		// A-01(ii) cut 2: the statement's rtableScope, stamped DIRECTLY
 		// like the fields above. Sublink planners without the pointer
 		// at hand read it back via rtableScopeFrom's parent walk.
@@ -15738,6 +15746,9 @@ func applyUpdateAssign(a parser.UpdateAssign, tbl *catalog.Table, set []Expr, ct
 }
 
 func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
+	// M0148-0001c3a9: modifying plans keep appendrels whole (see
+	// planSelectWithSettings' row-lock guard).
+	ps.EnablePartitionwiseJoin = false
 	// A-01(ii) cut 2 (F5): the WITH list, the FROM list, the target
 	// scan, and every SET / WHERE / RETURNING sublink allocate from
 	// the statement scope.
@@ -15940,6 +15951,9 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog, ps PlannerSettings, s
 }
 
 func planDelete(s *parser.DeleteStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
+	// M0148-0001c3a9: modifying plans keep appendrels whole (see
+	// planSelectWithSettings' row-lock guard).
+	ps.EnablePartitionwiseJoin = false
 	// A-01(ii) cut 2 (F5): same scope treatment as planUpdate (see it for
 	// the target-scan note).
 	restore, dmlPlans, err := preplanWithClause(s.With, nil, cat, ps, scope)
@@ -16113,6 +16127,9 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog, ps PlannerSettings, s
 // planMerge converts a MERGE INTO statement into a Merge plan node.
 // M0096-0010.
 func planMerge(s *parser.MergeStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
+	// M0148-0001c3a9: modifying plans keep appendrels whole (see
+	// planSelectWithSettings' row-lock guard).
+	ps.EnablePartitionwiseJoin = false
 	// A leading WITH (M0146-0085): its CTEs are visible to the USING source,
 	// ON and WHEN clauses; data-modifying ones run first, as for DELETE.
 	restore, dmlPlans, err := preplanWithClause(s.With, nil, cat, ps, scope)

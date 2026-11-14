@@ -154,6 +154,12 @@ type PlannerSettings struct {
 	// other and now travels with the rest.
 	EnableMemoize bool
 
+	// EnablePartitionwiseJoin is `enable_partitionwise_join`: whether the
+	// search builds partition-by-partition joins (try_partitionwise_join,
+	// M0148-0001c3a9). goopg's GUC default is on (owner-gated, see GUC
+	// defaults); PG's is off.
+	EnablePartitionwiseJoin bool
+
 	// HashMemMultiplier is `hash_mem_multiplier`. A hash build's budget is
 	// `work_mem * hash_mem_multiplier` (get_hash_memory_limit,
 	// nodeHash.c:3622), NOT work_mem alone — take2 P2-03. Zero means "use the
@@ -264,6 +270,7 @@ func DefaultPlannerSettings() PlannerSettings {
 		EnableBitmapScan: true,
 		EnableGatherMerge: true,
 		EnableMemoize:   true,
+		EnablePartitionwiseJoin: true,
 		EnableMaterial:  true,
 
 		EnableHashAgg:            HashAggEnabled(),
@@ -331,6 +338,7 @@ func (ps PlannerSettings) costParams() costParams {
 		enableBitmapScan: ps.EnableBitmapScan,
 		enableGatherMerge: ps.EnableGatherMerge,
 		enableMemoize:   ps.EnableMemoize,
+		enablePartitionwiseJoin: ps.EnablePartitionwiseJoin,
 		enableMaterial:  ps.EnableMaterial,
 		geqo:            ps.Geqo,
 		geqoThreshold:   ps.GeqoThreshold,
