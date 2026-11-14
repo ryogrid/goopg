@@ -12580,6 +12580,16 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Resume (i): the int2 untyped-literal rendering (`smallint[]`); the
       primary cross-type probe; mixed-type OR bitmap arms (create\_index's
       `tenthous = 1::int2 OR … 3::int8` BitmapOr).
+  - 2026-11-14 (i) slice 2 LANDED: explicitly cast integer literals of
+    another width (`int4col = 3::int8`, `-3::int8`, `1::int2`) are index
+    quals, plain and bitmap.
+    - They print as their own Const and are estimated from the column's
+      statistics.
+    Movement: yes — regress create\_index 2689→2664, partition\_prune
+    6755→6754
+    - Resume (i): group\_similar\_or\_args (per-type `= ANY` OR arms); an
+      out-of-range equality key as an empty-result probe; the int2
+      untyped-literal rendering.
 - [x] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
   `… Backward` regress lines**.
   Kind: impl

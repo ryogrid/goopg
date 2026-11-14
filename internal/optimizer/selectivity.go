@@ -1141,7 +1141,47 @@ func normalizeColumnConst(l, r Expr) (*ColumnRef, Expr, bool) {
 	if cr, ok := r.(*ColumnRef); ok && isConstExpr(l) {
 		return cr, l, true
 	}
+	if cr, ok := l.(*ColumnRef); ok {
+		if ic, isInt := integerCastLiteral(r); isInt {
+			return cr, ic, true
+		}
+	}
+	if cr, ok := r.(*ColumnRef); ok {
+		if ic, isInt := integerCastLiteral(l); isInt {
+			return cr, ic, true
+		}
+	}
 	return nil, nil, false
+}
+
+// integerCastLiteral reads an explicit cast of an integer literal to an
+// integer type — `3::int8`, `-3::int8` (-(3::int8)), `1::int2` — as the
+// integer Const eval_const_expressions folds it to (M0148-0001c3a6 (i)), so
+// the selectivity code reads statistics through it as PG does.
+func integerCastLiteral(e Expr) (*IntegerConst, bool) {
+	neg := false
+	if u, ok := e.(*UnaryOp); ok && u.Op == parser.OpUnaryNeg {
+		neg, e = true, u.Operand
+	}
+	c, ok := e.(*CastExpr)
+	if !ok || !c.Explicit || c.Typmod != 0 {
+		return nil, false
+	}
+	ic, isInt := c.Operand.(*IntegerConst)
+	if !isInt {
+		return nil, false
+	}
+	switch strings.ToLower(c.TargetType) {
+	case "int2", "smallint", "int4", "int", "integer", "int8", "bigint":
+	default:
+		return nil, false
+	}
+	v := ic.Value
+	if neg {
+		v = -v
+	}
+	wide := strings.EqualFold(c.TargetType, "int8") || strings.EqualFold(c.TargetType, "bigint")
+	return &IntegerConst{pos: ic.pos, Value: v, Wide: wide}, true
 }
 
 // normalizeColumnConstRange is the same shape recogniser as
@@ -1153,6 +1193,16 @@ func normalizeColumnConstRange(l, r Expr) (*ColumnRef, Expr, bool, bool) {
 	}
 	if cr, ok := r.(*ColumnRef); ok && isConstExpr(l) {
 		return cr, l, true, true
+	}
+	if cr, ok := l.(*ColumnRef); ok {
+		if ic, isInt := integerCastLiteral(r); isInt {
+			return cr, ic, false, true
+		}
+	}
+	if cr, ok := r.(*ColumnRef); ok {
+		if ic, isInt := integerCastLiteral(l); isInt {
+			return cr, ic, true, true
+		}
 	}
 	return nil, nil, false, false
 }

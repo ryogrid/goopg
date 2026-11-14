@@ -243,7 +243,7 @@ func (s *searchCtx) buildBitmapIndexChild(
 	if n := len(indexClauses); !saop && n > 0 && n < len(idx.Columns) {
 		var rng []indexPathClause
 		for _, c := range restrictionRangeBehindPrefix(s.cat, tbl, idx, n, conjuncts) {
-			if isConstExpr(c.key) {
+			if bitmapConstKey(c.key) {
 				rng = append(rng, c)
 			}
 		}
@@ -281,7 +281,7 @@ func (s *searchCtx) buildBitmapIndexChild(
 		if rng, skip := restrictionSkipRange(s.cat, tbl, idx, conjuncts); len(rng) > 0 {
 			allConst := true
 			for _, c := range rng {
-				if !isConstExpr(c.key) {
+				if !bitmapConstKey(c.key) {
 					allConst = false
 				}
 			}
@@ -474,6 +474,11 @@ func matchBitmapIndexQuals(
 				// is the heap scan's recheck rather than a Filter beside it
 				// (createBitmapHeapScanPlan).
 				local = conj
+			} else if _, isIntCast := integerCastLiteral(val); isIntCast && !restrictionKeyUsable(cat, tbl.Columns[cr.Index], val) {
+				// M0148-0001c3a6 (i): an integer Const outside the column
+				// type's range cannot be encoded into the column's key (PG's
+				// cross-type compare finds no match); it stays a Filter.
+				continue
 			} else if restrictionKeyUsable(cat, tbl.Columns[cr.Index], val) {
 				// M0148-0001c3a1: a literal key the btree encoder takes
 				// exactly (restrictionKeyUsable — the plain restriction
@@ -523,7 +528,7 @@ func matchBitmapIndexQuals(
 func bitmapLeadingRange(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) []indexPathClause {
 	var out []indexPathClause
 	for _, c := range restrictionLeadingRange(cat, tbl, idx, conjuncts) {
-		if isConstExpr(c.key) {
+		if bitmapConstKey(c.key) {
 			out = append(out, c)
 		}
 	}
@@ -943,4 +948,15 @@ func boundOuterKeys(bound map[string]paramIndexClause) []Expr {
 		out = append(out, c.outerKey)
 	}
 	return out
+}
+
+// bitmapConstKey is a bound the bitmap producers take: a literal, or an
+// explicitly cast integer literal (`tenthous > 5000::int8`, a Const of the
+// cast's type in PG, M0148-0001c3a6 (i)).
+func bitmapConstKey(e Expr) bool {
+	if isConstExpr(e) {
+		return true
+	}
+	_, ok := integerCastLiteral(e)
+	return ok
 }

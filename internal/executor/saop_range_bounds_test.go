@@ -780,3 +780,42 @@ func TestCrossTypeIntegerArrayColumnQual(t *testing.T) {
 		}
 	}
 }
+
+// M0148-0001c3a6 (i): an explicitly cast integer literal against an integer
+// column of another width meets integer_ops' cross-type operator, so it is
+// an index qual (plain and bitmap), keeps its own type in EXPLAIN
+// (`'3'::bigint`, `'-3'::bigint`, `'1'::smallint`) and is estimated from the
+// column's statistics like the Const PG folds it to. Plans from PG 18.3.
+func TestCrossTypeIntegerLiteralIndexQual(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "create table mo (thousand int NOT NULL, tenthous int NOT NULL, pad text)")
+	runSQL(t, ctx, "create index mo_tt on mo (thousand, tenthous)")
+	runSQL(t, ctx, "insert into mo select g % 1000, g, 'x' from generate_series(0, 9999) g")
+	runSQL(t, ctx, "VACUUM mo")
+	runSQL(t, ctx, "ANALYZE mo")
+	ps := optimizer.DefaultPlannerSettings()
+	for _, c := range []struct{ q, plan string }{
+		{"select * from mo where thousand = 42 and tenthous = 3::int8",
+			"Index Scan using mo_tt on mo\n  Index Cond: ((thousand = 42) AND (tenthous = '3'::bigint))"},
+		{"select * from mo where thousand = 42 and tenthous = -3::int8",
+			"Index Scan using mo_tt on mo\n  Index Cond: ((thousand = 42) AND (tenthous = '-3'::bigint))"},
+		{"select * from mo where thousand = 42 and tenthous > 5000::int8",
+			"Bitmap Heap Scan on mo\n  Recheck Cond: ((thousand = 42) AND (tenthous > '5000'::bigint))\n  ->  Bitmap Index Scan on mo_tt\n        Index Cond: ((thousand = 42) AND (tenthous > '5000'::bigint))"},
+		{"select * from mo where tenthous = 1::int2 or pad = 'y'",
+			"Seq Scan on mo\n  Filter: ((tenthous = '1'::smallint) OR (pad = 'y'::text))"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+	}
+	for _, c := range []struct{ q, rows string }{
+		{"select tenthous from mo where thousand = 42 and tenthous = 3042::int8", "3042"},
+		{"select count(*) from mo where thousand = 42 and tenthous > 5000::int8", "5"},
+		{"select count(*) from mo where thousand = 42 and tenthous = 9999999999::int8", "0"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

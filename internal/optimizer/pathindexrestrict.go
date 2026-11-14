@@ -598,7 +598,27 @@ func restrictionKeyUsable(cat catalog.Catalog, col catalog.Column, val Expr) boo
 	// already produce the column's own type, since the probe encodes the
 	// key's Datum against the column with no further coercion (M0146-0060).
 	if c, isCast := val.(*CastExpr); isCast {
-		return isConstantPlanExpr(c) && castTargetIsColumnType(c, col)
+		if isConstantPlanExpr(c) && castTargetIsColumnType(c, col) {
+			return true
+		}
+		// M0148-0001c3a6 (i): `int4col = 3::int8` meets integer_ops'
+		// cross-type operator (int48eq), an index qual in PG; the probe
+		// encodes the value against the column, so it must fit.
+		_, ok := crossIntCastKey(c, col.Type)
+		return ok
+	}
+	// `-3::int8` is -(3::int8), a Const '-3'::bigint after
+	// eval_const_expressions.
+	if u, isNeg := val.(*UnaryOp); isNeg && u.Op == parser.OpUnaryNeg {
+		if c, isCast := u.Operand.(*CastExpr); isCast {
+			if ic, isInt := c.Operand.(*IntegerConst); isInt {
+				neg := *c
+				neg.Operand = &IntegerConst{Value: -ic.Value}
+				if _, ok := crossIntCastKey(&neg, col.Type); ok {
+					return true
+				}
+			}
+		}
 	}
 	if t, isOuter := outerParamKeyType(val); isOuter {
 		// The probe encodes the key's runtime Datum against the column's
@@ -1091,6 +1111,10 @@ func isIndexKeyOperand(e Expr) bool {
 		return true
 	}
 	if c, isCast := e.(*CastExpr); isCast && isConstantPlanExpr(c) {
+		return true
+	}
+	// `-3::int8` (M0148-0001c3a6 (i)): restrictionKeyUsable decides.
+	if _, isIntCast := integerCastLiteral(e); isIntCast {
 		return true
 	}
 	_, isOuter := outerParamKeyType(e)

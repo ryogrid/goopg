@@ -4076,6 +4076,14 @@ func indexCondInner(text string, n int) string {
 // carries the relabel too: `((v)::text = 'v42'::text)` (M0148-0001c3a2).
 // A non-literal key keeps the plain rendering, its own type unknown here.
 func indexCondClause(col, op string, k optimizer.Expr, reg *subPlanReg, t *catalog.Type) string {
+	// M0148-0001c3a6 (i): a cross-type integer Const keeps its own type
+	// (`(tenthous = '3'::bigint)`), as in a Filter.
+	if t != nil && !t.IsArray {
+		if _, r, ok := formatCrossIntLiteralOperands(&optimizer.BinaryOp{Op: parser.OpEq,
+			Left: &optimizer.ColumnRef{Name: col, Type: *t}, Right: k}, reg, false); ok {
+			return col + " " + op + " " + r
+		}
+	}
 	if t != nil && !t.IsArray {
 		if lit, ok := coercibleLiteral(k); ok {
 			if otherCast, text, ok := coerceLiteralText(lit, *t); ok && otherCast != "" {
@@ -6124,6 +6132,13 @@ func formatCoercedLiteralOperands(x *optimizer.BinaryOp, reg *subPlanReg, qualif
 	default:
 		return "", "", false
 	}
+	// M0148-0001c3a6 (i): an explicitly cast integer literal against an
+	// integer-family operand meets a cross-type operator of integer_ops
+	// (int48eq, int24lt, int48pl, …), so no coercion applies and the Const
+	// keeps its own type: `(tenthous = '3'::bigint)`, `(a = '1'::smallint)`.
+	if l, r, ok := formatCrossIntLiteralOperands(x, reg, qualify); ok {
+		return l, r, true
+	}
 	lit, litLeft := coercibleLiteral(x.Left)
 	other := x.Right
 	if !litLeft {
@@ -6152,6 +6167,74 @@ func formatCoercedLiteralOperands(x *optimizer.BinaryOp, reg *subPlanReg, qualif
 	if otherText != "" {
 		o = "(" + o + ")::" + otherText
 	}
+	if litLeft {
+		return litText, o, true
+	}
+	return o, litText, true
+}
+
+// formatCrossIntLiteralOperands renders `operand op CAST(int literal AS
+// T)` (either side) where T and the operand's type are both integer types
+// and differ: the literal is a Const of T, printed as get_const_expr does.
+func formatCrossIntLiteralOperands(x *optimizer.BinaryOp, reg *subPlanReg, qualify bool) (string, string, bool) {
+	intFam := func(name string) string {
+		switch strings.ToLower(name) {
+		case "int2", "smallint":
+			return "int2"
+		case "int4", "int", "integer":
+			return "int4"
+		case "int8", "bigint":
+			return "int8"
+		}
+		return ""
+	}
+	castLit := func(e optimizer.Expr) (*optimizer.CastExpr, string, bool) {
+		// `-3::int8` is -(3::int8), which eval_const_expressions folds to
+		// the Const '-3'::bigint.
+		if u, isNeg := e.(*optimizer.UnaryOp); isNeg && u.Op == parser.OpUnaryNeg {
+			if c, ok := u.Operand.(*optimizer.CastExpr); ok {
+				if ic, isInt := c.Operand.(*optimizer.IntegerConst); isInt {
+					neg := *c
+					neg.Operand = &optimizer.IntegerConst{Value: -ic.Value}
+					e = &neg
+				}
+			}
+		}
+		c, ok := e.(*optimizer.CastExpr)
+		if !ok || !c.Explicit || c.Typmod != 0 {
+			return nil, "", false
+		}
+		if _, isInt := c.Operand.(*optimizer.IntegerConst); !isInt {
+			return nil, "", false
+		}
+		f := intFam(c.TargetType)
+		return c, f, f != ""
+	}
+	c, fam, litLeft := castLit(x.Left)
+	other := x.Right
+	if !litLeft {
+		var ok bool
+		if c, fam, ok = castLit(x.Right); !ok {
+			return "", "", false
+		}
+		other = x.Left
+	}
+	t, ok := optimizer.ExprResultType(other)
+	if !ok || t.IsArray {
+		return "", "", false
+	}
+	if of := intFam(t.Name); of == "" || of == fam {
+		return "", "", false
+	}
+	typ, ok := castTypeName(c.TargetType, 0)
+	if !ok {
+		return "", "", false
+	}
+	litText, ok := castLiteralConstText(c.Operand, strings.ToLower(c.TargetType), 0, typ)
+	if !ok {
+		return "", "", false
+	}
+	o := formatExprQual(other, reg, qualify)
 	if litLeft {
 		return litText, o, true
 	}

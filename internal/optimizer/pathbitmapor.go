@@ -349,6 +349,37 @@ func crossIntArrayLiteral(col catalog.Type, list []Expr) ([]Expr, string, bool) 
 	return probe, "'{" + strings.Join(texts, ",") + "}'::" + display[elem] + "[]", true
 }
 
+// crossIntCastKey is the value of an explicit cast of an integer literal to
+// an integer type other than the integer column's (`3::int8` against int4),
+// when the value fits the column's type; false otherwise.
+func crossIntCastKey(c *CastExpr, col catalog.Type) (int64, bool) {
+	if c == nil || !c.Explicit || c.Typmod != 0 || col.IsArray {
+		return 0, false
+	}
+	ic, isInt := c.Operand.(*IntegerConst)
+	if !isInt {
+		return 0, false
+	}
+	canon := map[string]string{"int": "int4", "integer": "int4", "int4": "int4", "smallint": "int2", "int2": "int2",
+		"bigint": "int8", "int8": "int8"}
+	to, ok1 := canon[strings.ToLower(c.TargetType)]
+	colT, ok2 := canon[strings.ToLower(col.Name)]
+	if !ok1 || !ok2 || to == colT {
+		return 0, false
+	}
+	lo, hi := int64(math.MinInt64), int64(math.MaxInt64)
+	switch colT {
+	case "int2":
+		lo, hi = math.MinInt16, math.MaxInt16
+	case "int4":
+		lo, hi = math.MinInt32, math.MaxInt32
+	}
+	if ic.Value < lo || ic.Value > hi {
+		return 0, false
+	}
+	return ic.Value, true
+}
+
 func castIsColumnArrayType(target string, typ catalog.Type) bool {
 	t := strings.ToLower(strings.TrimSpace(target))
 	if !strings.HasSuffix(t, "[]") {
