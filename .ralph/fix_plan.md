@@ -12502,9 +12502,16 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
       the pre-existing width differs.
     Movement: none — regress unchanged from slice 3; the plain shapes show
     only in the PG probe and TestIndexScanSAOPBehindLeadingRange
+  - 2026-11-14 (i) slice 5 LANDED: the empty array literal as a merged
+    column qual.
+    - Selectivity 0; prints `'{}'::integer[]`.
+    - A lone empty array is still a Filter (no zero-element probe shape).
+    Movement: none — regress unchanged (arrays byte-identical to HEAD);
+    the shapes show only in the PG probe and
+    TestSAOPArrayLiteralAndColumnQuals
   - (i) still open:
+    - a lone empty array as the probe;
     - cross-type array literals (`'{33, 44}'::bigint[]` on int4);
-    - the empty array literal as an index qual;
     - index-only width counting index-qual-only columns;
     - an index-only prefix + range.
   - Resume: (i) residue (cross-type and empty array literals; index-only

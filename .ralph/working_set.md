@@ -1,33 +1,36 @@
-# Working Set — loop end 2026-11-14 (census routing-20261114c IDENTICAL; M0148-0001c3a4 item (i) slice 4 landed)
+# Working Set — loop end 2026-11-14 (census routing-20261114d IDENTICAL; M0148-0001c3a4 item (i) slice 5 landed 3225c80ab)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: run 20261114-050038 items: 0. Nothing filed.
-- S9: DUE at loop start → routing-20261114c (label s9ch, BASELINE_REV=2fb532031) IDENTICAL ×3, committed.
-  - The slice-4 code commit makes the next loop's census DUE. Capture with BASELINE_REV=f92e0006b (capture head of routing-20261114c).
-- Task: M0148-0001c3a4. Done: (a), (b), (c), (h), (i) slices 1-4. Open: (i) residue; (d)-(g).
-- Files (i slice 4):
-  - executor/index_trailing_saop.go (new): trailingSAOPPred, predAdmits, indexKeyDecodable, trailingKeyCheck.
-  - operators_index.go: trailCheck in Rescan + scanAppendEntry. operators_storage.go: indexScanPredicate. operators_explain.go: withTrailingSAOPCond. operators_indexonly.go: uses the shared helpers.
-  - optimizer/pathindexonly.go: trailingSAOPSelectivity, trailingSAOPOnRange, clausesTrailingSAOP.
-  - pathindexrestrict.go: plain producer trailing branch. createplanindex.go: dispatch, lowering, backward guard. plan.go: IndexScan.TrailingSAOP.
-  - Test: TestIndexScanSAOPBehindLeadingRange.
+- S9: DUE at loop start → routing-20261114d (label s9ci, BASELINE_REV=f92e0006b) IDENTICAL ×3, committed.
+  - 3225c80ab is a code commit, so the next loop should get DUE. Capture with BASELINE_REV=592657b89 (capture head of routing-20261114d).
+- Task: M0148-0001c3a4. Done: (a), (b), (c), (h), (i) slices 1-5.
+  - Open (i) residue: a lone empty array as the probe; cross-type array literals; index-only width; index-only prefix + range.
+  - Then (d)-(g).
+- Files (i slice 5):
+  - optimizer/pathbitmapor.go: arrayLiteralElements returns an empty list for '{}'; bitmapSAOPOnColumn refuses an empty list.
+  - pathindexrestrict.go: restrictionSAOPOnColumn refuses an empty list.
+  - selectivity.go: InExpr split admits an empty list.
+  - executor/operators_explain.go: inListArrayConst prints an empty list.
+  - Test: case added to TestSAOPArrayLiteralAndColumnQuals.
 - Findings:
-  - createIndexScanPlan panics are recovered upstream as a silent fallback to another plan. A backward SAOP path vanished that way, with no error. Suspect this whenever a generated path never wins (ledgered).
-  - The probe recipe (tmp/c3a4i{4,5,6}.sql; goopg on 5533 stopped; scratch PG tmp/pg-scratch-c3a4i on 5545 RUNNING) gives cost-exact PG comparisons.
-- Next step: S9 census (DUE).
-  - Then the (i) residue, smallest first: the empty array literal as an index qual (PG `= ANY ('{}'::integer[])`, an empty scan); then cross-type array literals; then index-only width.
-  - Or move to (d) sub-ORs inside AND arms if the residue proves owner-level.
+  - The regress suites have no empty-array or cross-type-array cases except create_index's bigint[] one. Slices 4-5 move no regress line, and their value is PG-probe parity only.
+  - A HEAD regress baseline for a newly added suite: build HEAD in a throwaway worktree (tmp/c3a4i-headbin), start it on 5534, run `pg-regress-runner.sh --port 5534`.
+  - Probe recipe: tmp/c3a4i{4,5,6,7}.sql; goopg 5533 stopped; scratch PG tmp/pg-scratch-c3a4i on 5545 RUNNING.
+- Next step: S9 census (DUE). Then decide between the (i) residue and (d) sub-ORs inside AND arms.
+  - Recommend (d): the remaining (i) items are low-value or need a zero-element or cross-type probe shape.
+  - Or the cross-type create_index case (`'{33, 44}'::bigint[]` on int4: in-range ints only, printed `::bigint[]`), which moves create_index.
 - Top-residual: M0148 residues. Open children: c3a4, c3a5, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261114c done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261114d done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a4.
 - Gates run (all PASS):
-  - census s9ch IDENTICAL ×3.
+  - census s9ci IDENTICAL ×3.
   - units.
   - tpch-spotcheck.
   - sf025 99/99.
-  - fire-set c3a4i4fs fires=none ×3.
+  - fire-set c3a4i5fs fires=none ×3.
   - acceptance 24 MATCH.
-  - regress 22 suites unchanged from slice 3.
+  - regress: 22 suites unchanged; arrays identical to HEAD.
   - pgbench smoke.
 - In-flight: none.
