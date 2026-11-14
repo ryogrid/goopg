@@ -1,22 +1,30 @@
-# Working Set — loop end 2026-11-14 (census routing-20261114k IDENTICAL; c3a5 (a)-(c) analysed, (c) blocked → new M0148-0001c3a7)
+# Working Set — loop end 2026-11-14 (c3a5 (a) slice 1 LANDED c5546dffd: partition-ordered plain Append)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: run 20261114-050038 items: 0. Nothing filed.
-- S9: DUE at loop start → routing-20261114k (label s9cp, BASELINE_REV=13ed065fb) IDENTICAL ×3, committed.
-  - This loop made no code commit, so the next census should be REUSE.
-- Task: M0148-0001c3a5 (c3a3 residue). (d) done. This loop: analysis of (a)-(c), no code.
-  - (c) BLOCKED on new M0148-0001c3a7: pg_proc plans as `Result` + One-Time Filter, with no pg_index entries and no index paths. All 5 row-comparison witnesses are pg_proc queries.
-  - (a)/(b): partition children are pre-built SetOp UNION ALL members (isInheritanceAppendRel), mostly Seq Scans.
-    - No per-child ordered index paths exist, so the ordered Append (partitions_are_ordered) and Merge Append cannot form.
-    - Per-child min/max does not form either: buildMinMaxAppendRelMerge exists but is not elected for parted_minmax.
-    - mcrparted also needs pruning on the expression key abs(b).
-- Files: .ralph/fix_plan.md (c3a5 analysis bullets; new M0148-0001c3a7), .ralph/deferral_ledger.md (row).
-- Next step: pick by file order. c3a5 (a) is next: per-member ordered index paths + an ordered Append for inheritance appendrels (orderedappend.go addOrderedAppendPaths; appendrel_pushdown.go members).
-  - Probe on the regress range_parted: `select * from range_parted order by a,b,c` → PG Append of 2 Index Only Scans.
-  - (c3a6 / c3a7 are lower in file order.)
+- S9: REUSE at loop start (routing-20261114k). This loop committed planner code, so the next census is likely DUE.
+- Task: M0148-0001c3a5 item (a) slice 1, landed as c5546dffd.
+  - New internal/optimizer/orderedpartitionappend.go: addOrderedPartitionAppendPaths, called in upperordered.go createOrderedPaths after addOrderedAppendPaths.
+  - It rebuilds the inheritance SetOp chain with per-member Index (Only) Scans in bound order (reversed + Backward for DESC), costed with cost_append's presorted arm (startup = SUM of child startups).
+  - Admission: single-level RANGE parent (catalog wrapper Unwrap → LookupTableByOID), integer bounds, no default, plain ascending btree member indexes, ORDER BY led by the partition key.
+  - Test: TestOrderedPartitionAppend (internal/executor/saop_range_bounds_test.go); mutation-checked.
+  - Movement: regress inherit 3153→3118; missing Backward lines 9→7.
+- Residues (ledgered):
+  - empty goopg btree is 2 pages vs PG's 1 (+4.0 per child with costs on);
+  - alias numbering follows attach order (collectAllPartitionLeaves);
+  - Append width 16 vs 12.
+- Files: orderedpartitionappend.go, upperordered.go, saop_range_bounds_test.go, design doc c3a5 (213 lines), fix_plan bullet, ledger row.
+- Next step: c3a5 (a) slice 2.
+  - mcrparted (6 Backward lines): member index `(a, abs(b), c)` has an expression column, which orderedMemberIndex rejects (Columns[i]==""). It also needs pruning on abs(b). Probe the regress inherit mcrparted block on the scratch PG first.
+  - Or parted_minmax (1 line): per-child Limit + IOS Backward; buildMinMaxAppendRelMerge is not elected.
+  - Then (b) fractional partitionwise join.
 - Top-residual: M0148 residues. Open children: c3a5, c3a6, c3a7, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
-- Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261114k done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
-  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a5.
-- Gates run: census s9cp IDENTICAL ×3 (no code change this loop).
-- In-flight: none. Scratch PG (5545) RUNNING; goopg probe server (5533) stopped.
+- Skip-rationale (bypassed items 0-9; item 10 selected): unchanged from the previous loop.
+  - Items 0-9: channel / owner-held [!] / blocked-on M0145-0003.
+  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner. Then M0148 in file order → c3a5.
+- Gates run (all PASS):
+  - units, tpch-spotcheck, sf025 sweep;
+  - fire-set (label c3a5a) fires=none on sf025, sf1 and TPC-H;
+  - acceptance 24 MATCH;
+  - regress A/B (tmp/regress-c3a5a1 vs tmp/regress-c3a5d6): only inherit moved; join ±5 is the known flap.
+- In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped by the regress run; data in tmp/c3a4i-data, binary in tmp/c3a4i-bin.
