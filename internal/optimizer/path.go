@@ -182,6 +182,9 @@ type Path struct {
 	// pwParents is a PathPartitionwiseAppend's two parent appendrels
 	// (partitionwisejoin.go).
 	pwParents []*SetOp
+	// pwFills, per child join, are the parent-layout columns the child's
+	// bare scans do not emit (tableoid) and the constant each takes.
+	pwFills []map[int]Expr
 	// paramSink is set, only while a nested loop lowers a parameterised join
 	// inner (createNestLoopParamJoinPlan, M0146-0049d3), on every
 	// parameterised path of that inner; createPlanNode records each

@@ -1,7 +1,8 @@
 # M0148\-0001c3a9 — partitionwise join
 
-Status: slices 1\-3 landed 2026\-11\-15 \(member order; partition scheme
-and matching; inner partitionwise join of two base appendrels\). Parent: M0148\-0001c3a5.
+Status: slices 1\-4 landed 2026\-11\-15 \(member order; partition scheme
+and matching; inner partitionwise join of two base appendrels; child index
+paths and a wrong\-result fix\). Parent: M0148\-0001c3a5.
 
 ## Goal
 
@@ -141,6 +142,52 @@ and matching; inner partitionwise join of two base appendrels\). Parent: M0148\-
   - `TestPartitionwiseJoin` fails with the hook removed;
   - regress mismatch: partition\_join 1990→1882, partition\_aggregate
     587→584.
+
+## Slice 4 — child index paths; one row shape \(landed\)
+
+- A member whose only projection is the tableoid wrapper is planned on its
+  bare `[Filter →] scan`, as PG plans a child rel on the child table.
+  - Every base\-rel producer then applies unchanged: restriction and ordered
+    index paths, and the parameterised index probes a nested loop binds per
+    partition \(`Index Cond: (b = t1_1.a)`\) — `addChildIndexPaths`.
+  - The tableoid column the bare scan does not carry is filled with the
+    partition's OID constant above the child join \(`Path.pwFills`\).
+- **Wrong\-result fix \(found in slice 3\):**
+  - Child joins can publish different column subsets — one narrowed
+    differently from another, e.g. a Nested Loop beside Hash Joins.
+    `reorderToLayout` returned a child of the wrong width unchanged, so the
+    Append mixed row shapes.
+  - partition\_join's "Join with pruned partitions" query returned
+    `0 | 0300 | 0 | 0300` instead of PG's `300 | 0300 | 300 | 0300`.
+  - Now every child plan is built first. The Append's layout is the
+    coordinates every child provides \(plus filled tableoids\), and each
+    child is projected to exactly that; a column some child dropped is not
+    needed above the join.
+- Correction to the slice\-4 attempt notes: the `cost=0.00..1.25` member
+  Seq Scans are an EXPLAIN display artefact of a scan under the tableoid
+  Project \(its legacy node estimate\). The search's own child and member
+  costs already read relpages \(2.25\). Child index paths lost on cost, not on
+  a stats gap.
+- Verification:
+  - `TestPartitionwiseJoin` now builds PG's indexes. It pins the wrong\-result
+    query \(fails on slice 3 with `0|0300|0|0300`\) and the per\-partition
+    parameterised probes.
+  - Values probe \(incl. `tableoid::regclass` per partition pair\) is
+    identical to PG.
+  - Regress partition\_join mismatch 1882→1879, against a same\-suite HEAD
+    baseline where nothing else moved.
+
+### Not covered by slice 4
+
+- No index\-only arm on child rels \(PG uses per\-partition Index Only Scans
+  under enable\_seqscan off\).
+- No bitmap paths on child rels.
+- Remapped members \(column order differs from the parent's\) keep the
+  Project leaf and a sequential scan only.
+- Plan\-time pruning \(PG joins only the surviving partition pair for
+  `t1.a < 10`\) belongs to M0148\-0001k1 \(b\).
+- The member Seq Scan EXPLAIN cost display under the tableoid Project
+  \(1.25 vs 2.25\).
 
 ### Not covered by slice 3
 

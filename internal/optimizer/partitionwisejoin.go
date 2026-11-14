@@ -3,6 +3,8 @@ package optimizer
 import (
 	"math/bits"
 	"sort"
+
+	"github.com/goopg/goopg/internal/catalog"
 )
 
 // Partitionwise join (M0148-0001c3a9 slice 3).
@@ -56,12 +58,21 @@ func (s *searchCtx) tryPartitionwiseJoin(joinrel, rel1, rel2 *RelOptInfo, clause
 		return nil
 	}
 	children := make([]*Path, 0, len(m1))
+	fills := make([]map[int]Expr, 0, len(m1))
 	for i := range m1 {
-		c1 := s.appendChildRel(rel1, m1[i], f1, so1.Output(), s.relInfos[i1], ps1, i)
-		c2 := s.appendChildRel(rel2, m2[i], f2, so2.Output(), s.relInfos[i2], ps2, i)
+		c1, fill1 := s.appendChildRel(rel1, m1[i], f1, so1.Output(), s.relInfos[i1], ps1, i)
+		c2, fill2 := s.appendChildRel(rel2, m2[i], f2, so2.Output(), s.relInfos[i2], ps2, i)
 		if c1 == nil || c2 == nil {
 			return nil
 		}
+		fill := map[int]Expr{}
+		for k, v := range fill1 {
+			fill[k] = v
+		}
+		for k, v := range fill2 {
+			fill[k] = v
+		}
+		fills = append(fills, fill)
 		rows, width := s.builder.sizeJoinRel(c1, c2, clauses, nil)
 		if !(rows >= 1) {
 			rows = 1
@@ -92,6 +103,7 @@ func (s *searchCtx) tryPartitionwiseJoin(joinrel, rel1, rel2 *RelOptInfo, clause
 	}
 	pa := newPartitionwiseAppendPath(joinrel, children, s.cp)
 	pa.pwParents = []*SetOp{so1, so2}
+	pa.pwFills = fills
 	addPath(joinrel, pa, "partitionwise-join")
 	return nil
 }
@@ -111,9 +123,9 @@ func (s *searchCtx) baseRelIndex(rel *RelOptInfo) (int, bool) {
 // appendChildRel is the child rel of partition i: parent's relids, offset and
 // width, the member leaf, and that leaf's rows and sequential-scan cost
 // (set_append_rel_size / set_rel_pathlist on the child).
-func (s *searchCtx) appendChildRel(parent *RelOptInfo, member Node, restrict *Filter, out Schema, pinfo baseRelInfo, ps *partScheme, i int) *RelOptInfo {
+func (s *searchCtx) appendChildRel(parent *RelOptInfo, member Node, restrict *Filter, out Schema, pinfo baseRelInfo, ps *partScheme, i int) (*RelOptInfo, map[int]Expr) {
 	if _, isScan := leafBaseScan(memberScanRoot(member)).(*SeqScan); !isScan {
-		return nil
+		return nil, nil
 	}
 	if restrict != nil && restrict.Predicate != nil {
 		// The parent's restriction, given to the child as its own
@@ -125,7 +137,7 @@ func (s *searchCtx) appendChildRel(parent *RelOptInfo, member Node, restrict *Fi
 		member = cloneMemberChain(member)
 		m, ok := appendRelMemberOf(member)
 		if !ok {
-			return nil
+			return nil, nil
 		}
 		f := &Filter{pos: restrict.pos, Child: member, Predicate: restrict.Predicate, LeafLocal: restrict.LeafLocal}
 		pushFilterIntoMembers(f, out, []appendRelMember{m})
@@ -134,6 +146,18 @@ func (s *searchCtx) appendChildRel(parent *RelOptInfo, member Node, restrict *Fi
 		}
 	}
 	tbl := ps.parts[i]
+	// A member whose only projection is the tableoid wrapper is planned on
+	// its bare `[Filter →] scan`, as PG plans a child rel on the child
+	// table itself: every base-rel scan producer (index, parameterised
+	// index) then applies unchanged, and the tableoid column — the one
+	// output the scan does not carry — is filled with the partition's OID
+	// above the child join (createPartitionwiseAppendPlan).
+	var fill map[int]Expr
+	if top, ok := member.(*Project); ok && isTableoidWrapper(top) {
+		scanOut := top.Child.Output()
+		fill = map[int]Expr{parent.baseOffset + len(scanOut): top.Targets[len(scanOut)]}
+		member = top.Child
+	}
 	rows := float64(EstimateRows(member))
 	if !(rows >= 1) {
 		rows = 1
@@ -157,8 +181,90 @@ func (s *searchCtx) appendChildRel(parent *RelOptInfo, member Node, restrict *Fi
 	p.Cost = costSeqscan(s.cp, pages, tuples, qualOps)
 	p.DisabledNodes = prebuiltLeafDisabledNodes(s.cp, memberScanRoot(member))
 	addPath(rel, p, "partitionwise-join.child")
+	if fill != nil {
+		rel.NCols = len(member.Output())
+		s.addChildIndexPaths(rel, tbl)
+	}
 	setCheapest(rel)
-	return rel
+	return rel, fill
+}
+
+// addChildIndexPaths runs the base-rel index producers over a child rel
+// whose leaf is the partition's bare scan (create_index_paths on the child
+// in set_append_rel_pathlist): the restriction and ordered index paths, and
+// the parameterised index paths a nested loop over the child join binds
+// (PG's partition_join plans are full of `Index Cond: (a = t1_1.a)` inner
+// probes per partition). The index-only arm is not run: its coverage test
+// reads the statement-wide needed-column set (ledgered).
+func (s *searchCtx) addChildIndexPaths(rel *RelOptInfo, tbl *catalog.Table) {
+	if s.cat == nil || tbl == nil {
+		return
+	}
+	if _, _, ok := scanLeafFor(rel.baseLeaf); !ok {
+		return
+	}
+	relTuples := float64(tableRows(tbl))
+	if relTuples < 1 {
+		relTuples = 1
+	}
+	relPages := baseRelPages(tbl, relTuples)
+	totalPages := s.totalTablePages()
+	conjuncts := extractFilterConjuncts(rel.baseLeaf)
+	var colExprs map[string]Expr
+	if s.hasUsefulPathkeys(rel) {
+		colExprs = mergeableColumnExprsFor(rel.Relids, s.clausesAll())
+		if i, ok := s.baseRelIndex2(rel.Relids); ok {
+			addQueryPathkeyColumnExprs(colExprs, s.queryPathkeys, s.relInfos[i].sourceIdx)
+		}
+		addConstEquatedColumns(colExprs, rel)
+	}
+	var cands []paramIndexClause
+	if s.clauses != nil {
+		cands = indexableJoinClausesFor(rel.Relids, s.clauses.all)
+	}
+	saved := s.neededColsKnown
+	s.neededColsKnown = false
+	defer func() { s.neededColsKnown = saved }()
+	for _, idx := range s.cat.IndexesOnTable(tbl) {
+		if !idx.HasStorage() {
+			continue
+		}
+		if len(conjuncts) > 0 {
+			s.addOneRestrictionIndexPath(s.cat, rel, tbl, idx, conjuncts, colExprs, relPages, relTuples, totalPages)
+		}
+		if len(colExprs) > 0 {
+			s.addOneOrderedIndexPath(rel, tbl, idx, colExprs, relPages, relTuples, totalPages)
+		}
+	}
+	for _, req := range consideredParameterizations(cands) {
+		s.addOneParameterizedIndexPath(rel, tbl, s.cat, cands, req, relPages, relTuples, totalPages)
+	}
+}
+
+// baseRelIndex2 is the search position of the base rel with relids.
+func (s *searchCtx) baseRelIndex2(relids RelSet) (int, bool) {
+	if bits.OnesCount32(uint32(relids)) != 1 {
+		return 0, false
+	}
+	i := bits.TrailingZeros32(uint32(relids))
+	return i, i < len(s.relInfos)
+}
+
+// isTableoidWrapper reports whether p is wrapWithTableoid's Project: its
+// child's columns in order, then one constant.
+func isTableoidWrapper(p *Project) bool {
+	in := p.Child.Output()
+	if len(p.Targets) != len(in)+1 {
+		return false
+	}
+	for i := range in {
+		cr, ok := p.Targets[i].(*ColumnRef)
+		if !ok || cr.Index != i {
+			return false
+		}
+	}
+	_, ok := p.Targets[len(in)].(*IntegerConst)
+	return ok
 }
 
 // memberScanRoot peels an appendrel member's projections (the tableoid
@@ -224,18 +330,47 @@ func newPartitionwiseAppendPath(joinrel *RelOptInfo, children []*Path, cp costPa
 // the UNION ALL chain goopg's appendrels use. Every child join emits the
 // parent join's layout, so the first child's layout is the Append's.
 func createPartitionwiseAppendPlan(p *Path) (Node, outputLayout) {
-	var root Node
-	var lay outputLayout
+	// Every child join is planned first: each elects its own inner and
+	// outer and may narrow its output to what the parent needs, so the
+	// children can publish different column subsets in different orders.
+	// The Append's layout is the coordinates EVERY child provides (a
+	// column some child dropped is not needed above the join — narrowing
+	// only drops unneeded columns) plus the tableoid columns a bare child
+	// scan fills, in binding order, as PG's child join target lists follow
+	// the parent joinrel's. Each child is then projected to exactly that.
+	nodes := make([]Node, len(p.Children))
+	lays := make([]outputLayout, len(p.Children))
+	count := map[int]int{}
 	for i, c := range p.Children {
-		n, l := createPlanNode(c)
-		if i == 0 {
-			// The Append emits the child joins in binding order — the
-			// parent RTEs' columns in range-table order, as PG's child
-			// join target lists follow the parent joinrel's.
-			lay = append(outputLayout(nil), l...)
-			sort.Ints(lay)
+		nodes[i], lays[i] = createPlanNode(c)
+		seen := map[int]bool{}
+		for _, coord := range lays[i] {
+			seen[coord] = true
 		}
-		n = reorderToLayout(n, l, lay)
+		if i < len(p.pwFills) {
+			for coord := range p.pwFills[i] {
+				seen[coord] = true
+			}
+		}
+		for coord := range seen {
+			count[coord]++
+		}
+	}
+	var lay outputLayout
+	for coord, n := range count {
+		if n == len(p.Children) {
+			lay = append(lay, coord)
+		}
+	}
+	sort.Ints(lay)
+	schemaFor := p.pwFillSchema()
+	var root Node
+	for i, n := range nodes {
+		var fill map[int]Expr
+		if i < len(p.pwFills) {
+			fill = p.pwFills[i]
+		}
+		n = reorderToLayout(n, lays[i], lay, fill, schemaFor)
 		if root == nil {
 			root = n
 			continue
@@ -256,32 +391,39 @@ func createPartitionwiseAppendPlan(p *Path) (Node, outputLayout) {
 // child whose layout differs. A layout that is not a permutation of want
 // cannot happen for one relset (same relids, same needed columns); it is
 // returned unchanged.
-func reorderToLayout(n Node, have, want outputLayout) Node {
-	if len(have) != len(want) {
-		return n
-	}
-	same := true
-	for i := range have {
-		if have[i] != want[i] {
-			same = false
-			break
+func reorderToLayout(n Node, have, want outputLayout, fill map[int]Expr, fillSchema map[int]SchemaColumn) Node {
+	if len(have) == len(want) && len(fill) == 0 {
+		same := true
+		for i := range have {
+			if have[i] != want[i] {
+				same = false
+				break
+			}
 		}
-	}
-	if same {
-		return n
+		if same {
+			return n
+		}
 	}
 	at := have.bindingIndex()
 	out := n.Output()
 	targets := make([]Expr, len(want))
 	schema := make(Schema, len(want))
 	for j, coord := range want {
-		i, ok := at[coord]
-		if !ok || i >= len(out) {
-			return n
+		if i, ok := at[coord]; ok && i < len(out) {
+			col := out[i]
+			targets[j] = &ColumnRef{Index: i, Name: col.Name, Type: col.Type, SourceTableIdx: col.SourceTableIdx}
+			schema[j] = col
+			continue
 		}
-		col := out[i]
-		targets[j] = &ColumnRef{Index: i, Name: col.Name, Type: col.Type, SourceTableIdx: col.SourceTableIdx}
-		schema[j] = col
+		e, ok := fill[coord]
+		sc, sok := fillSchema[coord]
+		if !ok || !sok {
+			// Cannot happen for one relset (same relids, same columns):
+			// the plan would be malformed, so fail loudly.
+			panic("partitionwise join: child join lacks a column of the parent join's layout")
+		}
+		targets[j] = e
+		schema[j] = sc
 	}
 	return &Project{Child: n, Targets: targets, schema: schema}
 }
@@ -311,4 +453,24 @@ func cloneMemberChain(n Node) Node {
 	cp := *p
 	cp.Child = cloneMemberChain(p.Child)
 	return &cp
+}
+
+// pwFillSchema is the output column for each filled (tableoid) coordinate,
+// taken from the parent appendrels' own schemas.
+func (p *Path) pwFillSchema() map[int]SchemaColumn {
+	out := map[int]SchemaColumn{}
+	if p.Rel == nil {
+		return out
+	}
+	for _, rel := range p.Rel.baseMembers() {
+		so, _ := appendRelLeaf(rel)
+		if so == nil {
+			continue
+		}
+		pout := so.Output()
+		for j, c := range pout {
+			out[rel.baseOffset+j] = c
+		}
+	}
+	return out
 }

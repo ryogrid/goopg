@@ -22,12 +22,18 @@ func TestPartitionwiseJoin(t *testing.T) {
 		"CREATE TABLE prt1_p3 PARTITION OF prt1 FOR VALUES FROM (500) TO (600)",
 		"CREATE TABLE prt1_p2 PARTITION OF prt1 FOR VALUES FROM (250) TO (500)",
 		"INSERT INTO prt1 SELECT i, i % 25, to_char(i, 'FM0000') FROM generate_series(0, 599) i WHERE i % 2 = 0",
+		"CREATE INDEX iprt1_p1_a on prt1_p1(a)",
+		"CREATE INDEX iprt1_p2_a on prt1_p2(a)",
+		"CREATE INDEX iprt1_p3_a on prt1_p3(a)",
 		"ANALYZE prt1",
 		"CREATE TABLE prt2 (a int, b int, c varchar) PARTITION BY RANGE(b)",
 		"CREATE TABLE prt2_p1 PARTITION OF prt2 FOR VALUES FROM (0) TO (250)",
 		"CREATE TABLE prt2_p2 PARTITION OF prt2 FOR VALUES FROM (250) TO (500)",
 		"CREATE TABLE prt2_p3 PARTITION OF prt2 FOR VALUES FROM (500) TO (600)",
 		"INSERT INTO prt2 SELECT i % 25, i, to_char(i, 'FM0000') FROM generate_series(0, 599) i WHERE i % 3 = 0",
+		"CREATE INDEX iprt2_p1_b on prt2_p1(b)",
+		"CREATE INDEX iprt2_p2_b on prt2_p2(b)",
+		"CREATE INDEX iprt2_p3_b on prt2_p3(b)",
 		"ANALYZE prt2",
 	} {
 		runSQL(t, ctx, s)
@@ -58,6 +64,25 @@ func TestPartitionwiseJoin(t *testing.T) {
 		if on != offRows || on == "" {
 			t.Errorf("%s: partitionwise rows %q, whole-rel rows %q", rq, on, offRows)
 		}
+	}
+	// Child joins that publish different column subsets (a Nested Loop
+	// beside Hash Joins, narrowed differently) must still feed the Append
+	// one row shape: the slice-3 build returned `0|0300|0|0300` here (PG
+	// partition_join, "Join with pruned partitions from joining relations").
+	pq := "SELECT t1.a, t1.c, t2.b, t2.c FROM prt1 t1, prt2 t2 WHERE t1.a = t2.b AND t1.a < 450 AND t2.b > 250 AND t1.b = 0 ORDER BY t1.a, t2.b"
+	if got := strings.Join(renderRows(runSQLWith(t, ctx, pq, ps)), ";"); got != "300|0300|300|0300" {
+		t.Errorf("%s: rows %q, want 300|0300|300|0300 (PG 18.3)", pq, got)
+	}
+	// Slice 4: a child rel is the partition's own scan, so it gets the
+	// partition's index paths — here the parameterised probe a nested loop
+	// binds per partition (PG plans the same probes; PG also prunes the
+	// partitions `t1.a < 10` excludes, which goopg does not yet).
+	sq := "SELECT t1.a, t2.c FROM prt1 t1, prt2 t2 WHERE t1.a = t2.b AND t1.a < 10"
+	if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+sq, ps)), "\n"); !strings.Contains(got, "Index Scan using iprt2_p1_b on prt2_p1 t2_1\n              Index Cond: (b = t1_1.a)") {
+		t.Errorf("%s: no per-partition parameterised index probe:\n%s", sq, got)
+	}
+	if got := strings.Join(renderRows(runSQLWith(t, ctx, sq+" ORDER BY 1", ps)), ";"); got != "0|0000;6|0006" {
+		t.Errorf("%s: rows %q, want 0|0000;6|0006 (PG 18.3)", sq, got)
 	}
 	if got := strings.Join(renderRows(runSQLWith(t, ctx, "SELECT count(*), sum(t1.a), sum(t2.a) FROM prt1 t1, prt2 t2 WHERE t1.a = t2.b", ps)), ";"); got != "100|29700|1200" {
 		t.Errorf("partitionwise aggregate %q, want 100|29700|1200 (PG 18.3)", got)

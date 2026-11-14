@@ -12990,6 +12990,20 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Also seen: with enable\_seqscan off PG plans per-partition Index Only
       Scans; child rels have no index-only arm \(scratch rels carry no
       needed-column set\).
+    - CORRECTION 2026-11-15 \(next loop\): the 0-page diagnosis above was
+      wrong. The search's child costs read relpages \(2.25\); `1.25` is only
+      EXPLAIN's legacy display of a Seq Scan under the tableoid Project.
+  - 2026-11-15 slice 4 LANDED: child rels on the bare partition scan.
+    - Restriction, ordered and parameterised index paths come from the
+      base-rel producers \(addChildIndexPaths\); tableoid is filled with the
+      partition OID above each child join \(Path.pwFills\).
+    - Fixed a slice-3 wrong result: child joins with different output
+      widths were appended unprojected \(partition\_join "Join with pruned
+      partitions" returned `0|0300|0|0300`, PG `300|0300|300|0300`\). The
+      Append layout is now the coordinates every child provides.
+    Movement: yes — regress partition\_join 1882→1879
+    - Resume: index-only and bitmap child paths; remapped members; outer /
+      semi / anti; N-way.
 - [ ] **M0148-0001c3a10 — index clauses on appendrel members (WHERE quals
   pushed into partitions)**.
   Kind: impl
