@@ -5350,6 +5350,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 					if top.AppendRelName == "" {
 						top.AppendRelName = strings.ToLower(tbl.Name)
 					}
+					top.partScheme = newPartScheme(tbl, leaves)
 				}
 				if root != nil {
 					b.tableOidColIdx = len(b.table.Columns)

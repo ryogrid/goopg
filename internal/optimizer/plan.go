@@ -3585,6 +3585,10 @@ type SetOp struct {
 	// node nameless, as every other construction site does.
 	RTID          int32
 	AppendRelName string
+	// partScheme is the partitioned parent's scheme and PartitionDesc-ordered
+	// partitions when this chain is a one-level partitioned table's
+	// appendrel (M0148-0001c3a9 slice 2, partscheme.go); nil otherwise.
+	partScheme *partScheme
 	// Op is the set-operation kind (UNION / INTERSECT / EXCEPT).
 	// The zero value (parser.SetOpUnion) keeps the implicit
 	// partition/inheritance UNION ALL construction sites working

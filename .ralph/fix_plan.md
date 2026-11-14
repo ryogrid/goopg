@@ -12931,6 +12931,17 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     5801→5630, inherit 3122→3076
     - Resume: slice 2 of the design doc \(partition scheme on the
       appendrel binding\), then child rels shared with c3a10.
+  - 2026-11-15 slice 2 LANDED: partScheme on the appendrel's SetOp, plus
+    the matching predicates \(samePartitionScheme, partitionBoundsEqual,
+    partkeyEquiJoined\) in internal/optimizer/partscheme.go.
+    - Scope: one-level, plain-column keys; nothing in the search consults
+      them yet.
+    Movement: none — instrument artefact — groundwork only; plans are
+    unchanged until the child-join slice uses it
+    - Resume: design slice 3-4 — child rels and per-pair child joins at
+      makeJoinRel. Column refs are positional by source and name, and a
+      member's output layout equals the appendrel's, so a child problem
+      can reuse the parent's clauses with the leaves swapped.
 - [ ] **M0148-0001c3a10 — index clauses on appendrel members (WHERE quals
   pushed into partitions)**.
   Kind: impl

@@ -1,7 +1,7 @@
 # M0148\-0001c3a9 — partitionwise join
 
-Status: slice 1 landed 2026\-11\-15 \(partition member order\). The join
-itself is open. Parent: M0148\-0001c3a5.
+Status: slices 1\-2 landed 2026\-11\-15 \(member order; partition scheme
+and matching\). The join itself is open. Parent: M0148\-0001c3a5.
 
 ## Goal
 
@@ -71,6 +71,32 @@ itself is open. Parent: M0148\-0001c3a5.
 - Bound types other than those listed keep catalog order.
 - The executor's DML / tuple\-routing paths enumerate partitions on their
   own and are untouched.
+
+## Slice 2 — partition scheme and matching \(landed\)
+
+- `partScheme` \(internal/optimizer/partscheme.go\) is goopg's view of PG's
+  RelOptInfo `part_scheme` / `boundinfo` / `part_rels`:
+  - the partitioned parent;
+  - its partitions in PartitionDesc order, one per appendrel member;
+  - the key columns' positions in the appendrel output.
+- The planner stamps it on the appendrel's top SetOp \(`SetOp.partScheme`\)
+  when it expands a partitioned table. `relPartScheme` reads it back off a
+  search rel's leaf.
+  - Scope: one\-level tables keyed by plain columns. A sub\-partitioned or
+    expression\-keyed table carries no scheme.
+- The partitionwise\-join preconditions, as PG states them:
+
+  | goopg | PG |
+  |---|---|
+  | `samePartitionScheme` | find\_partition\_scheme identity: strategy, key count, key type, opclass, collation |
+  | `partitionBoundsEqual` | partition\_bounds\_equal: same partition count, equal bounds pairwise \(range edges, list value sets with NULL, hash modulus / remainder, default\) |
+  | `partkeyEquiJoined` | have\_partkey\_equi\_join: an equi\-join clause per key position, matched by source FROM item and column name |
+
+- Nothing in the search consults them yet. Plans are unchanged
+  \(Movement none\).
+- Tests: `TestPartSchemeMatching` \(the three predicates\) and
+  `TestPartSchemeStampedOnAppendrel` \(the planner stamps the scheme with
+  partitions in bound order; fails with the stamp removed\).
 
 ## Remaining slices \(design\)
 
