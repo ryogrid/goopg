@@ -13144,6 +13144,18 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Resume: multi-relation problems \(EXPLAIN key chase and parameterised
       quals over the Append\); Merge Append over ordered children; min/max
       per partition; index-only child paths.
+  - 2026-11-15 slice 2 LANDED: an index-only probe behind an
+    equality-bound prefix carries the index ordering \(and its backward
+    twin\), as the plain restriction path already did
+    \(pathindexonly.go addOneIndexOnlyPath\).
+    - Plain-table `where c = 3 order by a [desc] limit 1` now matches PG's
+      `Index Only Scan [Backward]`; TestIndexOnlyEqualityPrefixOrdering.
+    Movement: none — instrument artefact — no regress case or corpus query
+    has this shape on a non-partitioned table; the probe plans are PG 18.3's
+    \(TestIndexOnlyEqualityPrefixOrdering\)
+    - Resume: the partitioned min/max needs child rels to run the
+      index-only producer \(their needed-column set\) and an ordered Append
+      over them \(partitions\_are\_ordered, backward for DESC\).
 - [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
   (NULL-keyed entries)**.
   Kind: impl

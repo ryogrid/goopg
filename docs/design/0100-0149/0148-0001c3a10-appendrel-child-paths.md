@@ -1,6 +1,6 @@
 # M0148\-0001c3a10 — index paths on appendrel members
 
-Status: slice 1 landed 2026\-11\-15. Parent: M0148\-0001c3a5.
+Status: slices 1\-2 landed 2026\-11\-15. Parent: M0148\-0001c3a5.
 
 ## Problem
 
@@ -51,6 +51,29 @@ Status: slice 1 landed 2026\-11\-15. Parent: M0148\-0001c3a5.
 - Regress vs a same\-suite HEAD baseline: inherit 735→727 \(inventory set:
   720→712\). partition\_join, partition\_aggregate, aggregates and the rest
   are unchanged; join moved by one row\-order line \(known flapper\).
+
+## Slice 2 — index\-only ordering behind an equality prefix \(landed\)
+
+- The per\-partition min / max PG plans \(`Limit → Append → Index Only Scan
+  Backward … Index Cond: ((c = 3) AND (a IS NOT NULL))`\) needs, first, the
+  same plan on a plain table. goopg already had it for the plain Index Scan
+  but not for the index\-only scan.
+  - `select * … where c = 3 order by a desc limit 1` planned PG's
+    `Index Scan Backward`.
+  - `select a …` \(covered, so index\-only\) sorted a bitmap scan instead.
+- Cause: `addOneIndexOnlyPath` gave the probe an ordering only for range or
+  array clauses \(and the full\-index shape\). PG's build\_index\_paths
+  computes one useful\_pathkeys per index whatever the clause kinds, and an
+  index whose leading columns are equated to constants delivers its next
+  column in order.
+- Fix: the index\-only probe carries the ordering whenever there are clauses,
+  as `addOneRestrictionIndexPath` already did; its backward twin follows.
+- `TestIndexOnlyEqualityPrefixOrdering` pins PG 18.3's two plans and fails
+  without the fix. The fixture uses NOT NULL key columns: an in\-process
+  cluster without NULL\-keyed index entries declines index paths over
+  nullable key columns.
+- No regress case moved \(same\-suite A/B identical\); TPC\-H / TPC\-DS plans
+  unchanged.
 
 ## Not covered
 

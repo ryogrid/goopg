@@ -129,3 +129,41 @@ func TestAppendRelChildIndexPaths(t *testing.T) {
 		}
 	}
 }
+
+// TestIndexOnlyEqualityPrefixOrdering pins M0148-0001c3a10 slice 2: an
+// index-only probe whose leading column is equated to a constant delivers
+// the next column in order, so `WHERE c = 3 ORDER BY a [DESC] LIMIT 1` over
+// an (c, a) index is a bare Index Only Scan [Backward] (build_index_paths'
+// useful_pathkeys do not depend on the clause kinds). Plans are PG 18.3's.
+func TestIndexOnlyEqualityPrefixOrdering(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	for _, s := range []string{
+		"create table pb (a int NOT NULL, b text, c int NOT NULL)",
+		"create index pb_c_a_idx on pb (c, a)",
+		"insert into pb select i, 'v' || (i % 1000), i % 7 from generate_series(0, 9999) i",
+		"vacuum pb",
+		"analyze pb",
+	} {
+		runSQL(t, ctx, s)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	for _, c := range []struct{ q, plan string }{
+		{"select a from pb where c = 3 order by a limit 1",
+			"Limit\n  ->  Index Only Scan using pb_c_a_idx on pb\n        Index Cond: (c = 3)"},
+		{"select a from pb where c = 3 order by a desc limit 1",
+			"Limit\n  ->  Index Only Scan Backward using pb_c_a_idx on pb\n        Index Cond: (c = 3)"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+	}
+	for _, c := range []struct{ q, rows string }{
+		{"select a from pb where c = 3 order by a limit 1", "3"},
+		{"select a from pb where c = 3 order by a desc limit 1", "9999"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

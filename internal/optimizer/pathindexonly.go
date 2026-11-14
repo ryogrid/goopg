@@ -521,7 +521,13 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 	// carries the index's ordering (addOneRestrictionIndexPath), so it carries
 	// it too — PG's build_index_paths computes one useful_pathkeys for the
 	// index whether the path is index-only or not.
-	if (hasRangeClause(clauses) || isSAOP) && len(colExprs) > 0 && indexIsOrderable(idx) {
+	// M0148-0001c3a10: and so does an equality probe — build_index_paths'
+	// useful_pathkeys do not depend on the clause kinds, and an index whose
+	// leading columns are equated to constants delivers its next column in
+	// order (`WHERE c = 3 ORDER BY a` over (c, a): PG's `Index Only Scan
+	// [Backward] … Index Cond: (c = 3)`), exactly as the plain restriction
+	// path already carries it (addOneRestrictionIndexPath).
+	if len(clauses) > 0 && len(colExprs) > 0 && indexIsOrderable(idx) {
 		// M0148-0001c3a4 (h): a SAOP probe delivers index order too (its
 		// elements descend sorted).
 		serial.Pathkeys, _ = indexPathOrdering(idx, colExprs, false)
