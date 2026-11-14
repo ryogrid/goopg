@@ -13156,6 +13156,17 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Resume: the partitioned min/max needs child rels to run the
       index-only producer \(their needed-column set\) and an ordered Append
       over them \(partitions\_are\_ordered, backward for DESC\).
+  - 2026-11-15 slice 3 LANDED: index-only child paths
+    \(addChildIndexOnlyPaths\) and the ordered Append over partition child
+    rels \(addOrderedAppendRelChildPath, partitions\_are\_ordered\).
+    - Per-partition min/max and ORDER BY … LIMIT now plan PG's Append of
+      Index Only Scan \[Backward\]; TestOrderedAppendRelChildPaths.
+    Movement: none — instrument artefact — inherit's parted\_minmax has one
+    partition and already matched; no regress or corpus query has the
+    multi-partition shape; the probe plans are PG 18.3's
+    \(TestOrderedAppendRelChildPaths\)
+    - Resume: indexOnlyLeafClauses with an equality prefix plus a trailing
+      NullTest \(nullable min/max column\); Merge Append; joins.
 - [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
   (NULL-keyed entries)**.
   Kind: impl

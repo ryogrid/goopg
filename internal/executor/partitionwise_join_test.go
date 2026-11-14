@@ -167,3 +167,49 @@ func TestIndexOnlyEqualityPrefixOrdering(t *testing.T) {
 		}
 	}
 }
+
+// TestOrderedAppendRelChildPaths pins M0148-0001c3a10 slice 3: a RANGE
+// partitioned table without a default partition, ordered on its partition
+// key, plans an Append of per-partition ordered index-only scans in bound
+// order — reversed and Backward for DESC — and min/max rides it as PG's
+// build_minmax_path does. Plans and values are PG 18.3's.
+func TestOrderedAppendRelChildPaths(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	for _, s := range []string{
+		"create table pq (a int NOT NULL, b text, c int NOT NULL) partition by range (a)",
+		"create table pq_1 partition of pq for values from (0) to (5000)",
+		"create table pq_2 partition of pq for values from (5000) to (10000)",
+		"create index on pq (c, a)",
+		"insert into pq select i, 'v' || (i % 1000), i % 7 from generate_series(0, 9999) i",
+		"vacuum pq_1", "vacuum pq_2",
+		"analyze pq",
+	} {
+		runSQL(t, ctx, s)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	back := "  ->  Append\n        ->  Index Only Scan Backward using pq_2_c_a_idx on pq_2\n              Index Cond: (c = 3)\n" +
+		"        ->  Index Only Scan Backward using pq_1_c_a_idx on pq_1\n              Index Cond: (c = 3)"
+	for _, c := range []struct{ q, plan string }{
+		{"select a from pq where c = 3 order by a desc limit 1", "Limit\n" + back},
+		{"select a from pq where c = 3 order by a limit 2",
+			"Limit\n  ->  Append\n        ->  Index Only Scan using pq_1_c_a_idx on pq_1\n              Index Cond: (c = 3)\n" +
+				"        ->  Index Only Scan using pq_2_c_a_idx on pq_2\n              Index Cond: (c = 3)"},
+		{"select max(a) from pq where c = 3", "Result\n  InitPlan 1\n    ->  Limit\n          ->  Append\n" +
+			"                ->  Index Only Scan Backward using pq_2_c_a_idx on pq_2\n                      Index Cond: (c = 3)\n" +
+			"                ->  Index Only Scan Backward using pq_1_c_a_idx on pq_1\n                      Index Cond: (c = 3)"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+	}
+	for _, c := range []struct{ q, rows string }{
+		{"select max(a), min(a) from pq where c = 3", "9999|3"},
+		{"select a from pq where c = 3 order by a desc limit 3", "9999;9992;9985"},
+		{"select a from pq where c = 3 order by a limit 3", "3;10;17"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

@@ -3,6 +3,7 @@ package optimizer
 import (
 	"math/bits"
 	"sort"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 )
@@ -222,6 +223,13 @@ func (s *searchCtx) addChildIndexPaths(rel *RelOptInfo, tbl *catalog.Table) {
 	if s.clauses != nil {
 		cands = indexableJoinClausesFor(rel.Relids, s.clauses.all)
 	}
+	// The index-only arm (check_index_only on the child): the parent's
+	// needed columns, read under the member's alias, against the child
+	// table — a partition carries the parent's column names. Run before the
+	// other producers turn the statement-wide set off below.
+	if s.neededColsKnown && !indexOnlyHardDisabled(s.cat) {
+		s.addChildIndexOnlyPaths(rel, tbl, colExprs, relPages, relTuples, totalPages)
+	}
 	saved := s.neededColsKnown
 	s.neededColsKnown = false
 	defer func() { s.neededColsKnown = saved }()
@@ -315,6 +323,7 @@ func (s *searchCtx) addAppendRelChildPaths(cat catalog.Catalog) {
 			continue
 		}
 		children := make([]*Path, 0, len(members))
+		childRels := make([]*RelOptInfo, 0, len(members))
 		fills := make([]map[int]Expr, 0, len(members))
 		ok := true
 		for j, m := range members {
@@ -329,6 +338,7 @@ func (s *searchCtx) addAppendRelChildPaths(cat catalog.Catalog) {
 				break
 			}
 			children = append(children, best)
+			childRels = append(childRels, c)
 			fills = append(fills, fill)
 		}
 		if !ok {
@@ -338,8 +348,80 @@ func (s *searchCtx) addAppendRelChildPaths(cat catalog.Catalog) {
 		pa.pwParents = []*SetOp{so}
 		pa.pwFills = fills
 		addPath(rel, pa, "appendrel-children")
+		s.addOrderedAppendRelChildPath(rel, so, ps, childRels, fills)
 		setCheapest(rel)
 	}
+}
+
+// addOrderedAppendRelChildPath is generate_orderedappend_paths' plain-Append
+// arm for partitions_are_ordered (allpaths.c / partbounds.c): a RANGE
+// partitioned table without a default partition whose partition key leads
+// the query's ordering delivers that ordering through an Append of child
+// paths each sorted the same way — in bound order, or reversed (each child
+// scanned backward) for a descending key. Each child contributes its
+// cheapest-total path that satisfies the query pathkeys; a child with no such
+// path declines the whole Append, as PG would need a Merge Append or a Sort
+// there (M0148-0001c3a10 slice 3). This is what PG's per-partition min / max
+// rides: `Limit -> Append -> Index Only Scan Backward … (c = 3)`.
+func (s *searchCtx) addOrderedAppendRelChildPath(rel *RelOptInfo, so *SetOp, ps *partScheme, childRels []*RelOptInfo, fills []map[int]Expr) {
+	qk := s.queryPathkeys
+	if len(qk) == 0 || !strings.EqualFold(ps.parent.PartitionMethod, "RANGE") || len(ps.keyPos) == 0 {
+		return
+	}
+	for _, part := range ps.parts {
+		if b, ok := ownPartitionBound(part); !ok || b.IsDefault {
+			return
+		}
+	}
+	// The leading query key must be the partition key's (first) column.
+	cr, isCol := qk[0].Expr.(*ColumnRef)
+	keyCol := ps.parent.Columns[ps.keyPos[0]].Name
+	if !isCol || !strings.EqualFold(cr.Name, keyCol) {
+		return
+	}
+	if out := so.Output(); len(out) > 0 && cr.SourceTableIdx != appendRelLeafSource(out) {
+		return
+	}
+	backward := !qk[0].SortAsc
+	ordered := make([]*Path, len(childRels))
+	for j, c := range childRels {
+		var best *Path
+		for _, p := range c.Pathlist {
+			if p == nil || p.RequiredOuter != 0 || !pathkeysContainedIn(p.Pathkeys, qk) {
+				continue
+			}
+			if best == nil || p.DisabledNodes < best.DisabledNodes ||
+				(p.DisabledNodes == best.DisabledNodes && p.Cost.Total < best.Cost.Total) {
+				best = p
+			}
+		}
+		if best == nil {
+			return
+		}
+		ordered[j] = best
+	}
+	ofills := append([]map[int]Expr(nil), fills...)
+	if backward {
+		for a, b := 0, len(ordered)-1; a < b; a, b = a+1, b-1 {
+			ordered[a], ordered[b] = ordered[b], ordered[a]
+			ofills[a], ofills[b] = ofills[b], ofills[a]
+		}
+	}
+	pa := newPartitionwiseAppendPath(rel, ordered, s.cp)
+	pa.pwParents = []*SetOp{so}
+	pa.pwFills = ofills
+	pa.Pathkeys = qk
+	addPath(rel, pa, "appendrel-children.ordered")
+}
+
+// appendRelLeafSource is the binding id an appendrel's output columns carry.
+func appendRelLeafSource(out Schema) int16 {
+	for _, c := range out {
+		if c.SourceTableIdx != 0 {
+			return c.SourceTableIdx
+		}
+	}
+	return 0
 }
 
 // baseRelIndex2 is the search position of the base rel with relids.
@@ -578,4 +660,37 @@ func (p *Path) pwFillSchema() map[int]SchemaColumn {
 		}
 	}
 	return out
+}
+
+// addChildIndexOnlyPaths is addIndexOnlyPaths' per-rel body for a partition
+// child rel (M0148-0001c3a10 slice 3).
+func (s *searchCtx) addChildIndexOnlyPaths(rel *RelOptInfo, tbl *catalog.Table, colExprs map[string]Expr, relPages int64, relTuples, totalPages float64) {
+	bare := scanLeafIsBare(rel.baseLeaf)
+	var conjuncts []Expr
+	if !bare {
+		conjuncts = extractFilterConjuncts(rel.baseLeaf)
+		if len(conjuncts) == 0 {
+			return
+		}
+	}
+	needed := s.neededColumnsOfRel(rel, tbl)
+	if len(needed) == 0 {
+		return
+	}
+	for _, idx := range s.cat.IndexesOnTable(tbl) {
+		if !idx.HasStorage() {
+			continue
+		}
+		var clauses []indexPathClause
+		if !bare {
+			var ok bool
+			clauses, ok = s.indexOnlyLeafClauses(s.cat, rel, tbl, idx, needed, conjuncts)
+			if !ok {
+				continue
+			}
+		} else if !indexUnboundKeysNotNull(tbl, idx, 0) {
+			continue
+		}
+		s.addOneIndexOnlyPath(s.cat, rel, tbl, idx, needed, clauses, colExprs, relPages, relTuples, totalPages)
+	}
 }

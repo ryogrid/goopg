@@ -1,6 +1,6 @@
 # M0148\-0001c3a10 — index paths on appendrel members
 
-Status: slices 1\-2 landed 2026\-11\-15. Parent: M0148\-0001c3a5.
+Status: slices 1\-3 landed 2026\-11\-15. Parent: M0148\-0001c3a5.
 
 ## Problem
 
@@ -74,6 +74,36 @@ Status: slices 1\-2 landed 2026\-11\-15. Parent: M0148\-0001c3a5.
   nullable key columns.
 - No regress case moved \(same\-suite A/B identical\); TPC\-H / TPC\-DS plans
   unchanged.
+
+## Slice 3 — index\-only child paths and the ordered Append \(landed\)
+
+- `addChildIndexOnlyPaths` runs the index\-only producer on each partition
+  child rel. A child reads the parent's needed columns under the member's
+  alias, and a partition carries the parent's column names.
+- `addOrderedAppendRelChildPath` is generate\_orderedappend\_paths' plain
+  Append arm for partitions\_are\_ordered:
+  - it applies to a RANGE partitioned table without a default partition
+    whose partition key leads the query's ordering;
+  - each child contributes its cheapest path that satisfies the query
+    pathkeys, children in bound order, reversed \(and Backward\) for DESC;
+  - a child with no such path declines the Append \(PG would need a Merge
+    Append or a Sort there\).
+- PG's per\-partition min / max rides it: `Result → InitPlan → Limit →
+  Append → Index Only Scan Backward … Index Cond: (c = 3)`.
+- `TestOrderedAppendRelChildPaths` pins PG 18.3's three plans \(ASC, DESC,
+  max\) and their values; all three fail without the ordered Append.
+- Regress: unchanged \(inherit's `parted_minmax` witness has one partition
+  and already matched\); TPC\-H / TPC\-DS unchanged.
+
+### Not covered by slice 3
+
+- With a nullable ordering column, min/max adds `a IS NOT NULL` and the
+  child's index\-only producer declines `(c = 3) AND (a IS NOT NULL)`
+  \(`indexOnlyLeafClauses` has no equality\-prefix \+ NullTest shape\). The
+  child then uses `Index Scan Backward` where PG uses `Index Only Scan
+  Backward`.
+- Merge Append \(a default partition, a non\-leading partition key,
+  LIST / HASH\).
 
 ## Not covered
 
