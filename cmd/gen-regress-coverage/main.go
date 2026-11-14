@@ -346,8 +346,62 @@ func main() {
 		} else if strings.TrimSpace(c.ExpectedPath) == "" {
 			rationale = "No matching expected file found; needs expectation mapping."
 		}
-		fmt.Fprintf(f, "| %s | `%s` | `%s` | %s | %s | %s |\n", c.Name, c.SQLPath, c.ExpectedPath, status, mismatch, rationale)
+		fmt.Fprintf(f, "| %s | %s | %s | %s | %s | %s |\n",
+			mdCell(c.Name), mdCode(c.SQLPath), mdCode(c.ExpectedPath),
+			mdCell(status), mdCell(mismatch), mdCell(rationale))
 	}
+}
+
+// mdCellEscaper backslash-escapes every character that GitHub-flavoured
+// Markdown gives inline meaning inside a table cell, so CSV text renders
+// literally: `|` (cell separator), `\` (escape), backtick (code span),
+// `*` `_` (emphasis), `~` (strikethrough), `[` `]` (links), `<` `>` (raw
+// HTML / autolinks), `&` (entity references), and GitHub's `@user` mention
+// and `#123` issue-reference autolinks. GitHub links those on the rendered
+// text, so neither `\@` nor `&#64;` stops them; an empty `<span></span>`
+// after the sigil splits the text node and renders identically. Other
+// block-level markers (`-`,
+// `1.`) are inert inside a cell and stay as-is.
+var mdCellEscaper = strings.NewReplacer(
+	`\`, `\\`, "`", "\\`", `|`, `\|`, `*`, `\*`, `_`, `\_`, `~`, `\~`,
+	`[`, `\[`, `]`, `\]`, `<`, `\<`, `>`, `\>`, `&`, `\&`, `@`, `@<span></span>`, `#`, `#<span></span>`,
+)
+
+// mdFlatten folds line breaks into spaces: a raw newline ends a table row.
+func mdFlatten(s string) string {
+	return strings.Join(strings.Fields(strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(s)), " ")
+}
+
+// mdCell renders s as literal text in a GFM table cell.
+func mdCell(s string) string {
+	return mdCellEscaper.Replace(mdFlatten(s))
+}
+
+// mdCode renders s as a code span in a GFM table cell. Inside a code span
+// only `|` needs escaping (GFM splits cells before parsing inlines); the
+// fence is widened past the longest backtick run in s.
+func mdCode(s string) string {
+	s = mdFlatten(s)
+	if s == "" {
+		return ""
+	}
+	longest, run := 0, 0
+	for _, r := range s {
+		if r == '`' {
+			run++
+			if run > longest {
+				longest = run
+			}
+		} else {
+			run = 0
+		}
+	}
+	fence := strings.Repeat("`", longest+1)
+	body := strings.ReplaceAll(s, "|", `\|`)
+	if strings.HasPrefix(body, "`") || strings.HasSuffix(body, "`") {
+		body = " " + body + " "
+	}
+	return fence + body + fence
 }
 
 func fail(where string, err error) {
