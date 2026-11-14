@@ -12644,6 +12644,44 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     9→7
     - Resume (a): mcrparted needs an expression index column (`abs(b)`)
       and pruning on it; parted\_minmax needs per-child min/max. Then (b).
+  - 2026-11-14 (a) slice 2 LANDED: PG index column names and expression
+    ORDER BY keys in the partition arm.
+    - parser.FigureIndexColname (FigureColnameInternal) names expression
+      index columns at all four naming sites and in the index's
+      pg\_attribute rows. `abs(b)` gives `t_abs_idx` and attname `abs`;
+      goopg gave `t__idx` / `t_expr_idx` and `pg_expression_1`.
+    - addOrderedPartitionAppendPaths matches expression keys against
+      PartitionKeyExprs and ColExprs (keyMatchesTableColumn).
+      - Not reachable end to end yet: indexUnboundKeysNotNull refuses
+        expression key columns, because blob-format expression indexes
+        store no NULL-keyed entries.
+      - mcrparted is now blocked on M0148-0001c3a8.
+    Movement: yes — regress create\_index 2727→2708 (inherit unchanged at
+    3118)
+    - Resume (a): parted\_minmax per-child min/max (1 line); then (b).
+      mcrparted's 6 lines resume once M0148-0001c3a8 lands.
+- [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
+  (NULL-keyed entries)**.
+  Kind: impl
+  Parent: M0148-0001c3a5
+  Found 2026-11-14 by c3a5 (a) slice 2.
+  - buildPGIndexKeyDesc (internal/executor/pgindex\_keydesc.go) refuses an
+    expression key ("key N is an expression"), so expression indexes keep
+    the blob format.
+    - The blob format stores no NULL-keyed entries.
+    - catalog.IndexHasNullKeyedEntries is therefore false, and
+      indexUnboundKeysNotNull refuses any unbound expression column.
+  - PG stores every heap row in an expression index, NULL results
+    included. Its full ordered scans (the mcrparted ordered Append and
+    Merge Append, ORDER BY expr via index) return every row.
+  - Blocks regress inherit's 6 mcrparted `Index Scan Backward using
+    mcrparted*_a_abs_c_idx` lines and the forward / Merge Append forms.
+  - Resume:
+    - give the key descriptor an expression column, typed from
+      exprType of ColExprs[i] (the pg\_attribute text fallback in
+      buildUserPGAttributeRowsForIndex is the same missing typer);
+    - build / insert / decode the computed key image;
+    - re-run the arm on the mcrparted witness.
 - [ ] **M0148-0001c3a7 — system catalogs plan as a bare `Result`: no
   heap or index scan paths**.
   Kind: impl

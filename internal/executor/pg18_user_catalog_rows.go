@@ -1176,7 +1176,7 @@ func setPGAttributeCol(row Row, name string, d Datum) {
 // attacl/attoptions/attfdwoptions/attmissingval/attstattarget NULL — because
 // an index attribute carries none of the heap column's constraints.
 //
-// An EXPRESSION key column (Columns[i] == "") is named `pg_expression_<attnum>`
+// An EXPRESSION key column (Columns[i] == "") is named by FigureIndexColname (ChooseIndexColumnNames)
 // exactly as upstream does, but its type is emitted as the parent column-less
 // `text` fallback: goopg has no expression type resolver reachable from here.
 // That divergence is ledgered, not silently absorbed.
@@ -1188,18 +1188,23 @@ func buildUserPGAttributeRowsForIndex(cat catalog.Catalog, idx *catalog.Index) (
 	names = append(names, idx.Columns...)
 	names = append(names, idx.IncludeColumns...)
 
+	// ConstructTupleDescriptor names every index attribute from
+	// ChooseIndexColumnNames over all key and INCLUDE columns: a plain
+	// column's name, an expression's FigureIndexColname ("expr" when it has
+	// none), each conflict suffixed 1, 2, … (`(abs(a), abs(b))` is abs, abs1).
+	chosen := pgDeduplicateColNames(append(indexNameColumnsPtr(idx.Columns, idx.ColExprs), idx.IncludeColumns...))
+
 	rows := make([]Row, 0, len(names))
 	attnames := make([]string, 0, len(names))
 	for i, colName := range names {
 		attnum := int16(i + 1)
-		attname := colName
+		attname := chosen[i]
 		var src catalog.Column
 		if col, ok := cat.LookupColumn(idx.Table, colName); ok && colName != "" {
 			src = *col
 		} else {
 			// Expression key column (or a column that vanished from the
-			// parent): upstream names it pg_expression_<attnum>.
-			attname = fmt.Sprintf("pg_expression_%d", attnum)
+			// parent): no heap column to copy from.
 			src = catalog.Column{Name: attname, Type: catalog.Type{Name: "text"}}
 		}
 		row := buildUserPGAttributeRow(cat, idx.Table, src)

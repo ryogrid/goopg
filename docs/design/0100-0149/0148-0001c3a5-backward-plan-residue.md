@@ -211,3 +211,61 @@ presorted arm\).
   - LIST partitions;
   - multi\-level hierarchies;
   - non\-integer bounds.
+
+## Item (a) slice 2 — expression keys and index column names
+
+PG reference: parse\_target.c FigureIndexColname /
+FigureColnameInternal, parse\_utilcmd.c transformIndexStmt \(sets
+indexcolname\), indexcmds.c ChooseIndexColumnNames, index.c
+ConstructTupleDescriptor.
+
+### Index column names
+
+- **The gap:** goopg named an expression index column `expr` in a clone
+  \(partition child, ATTACH, LIKE\) and the empty string in a top\-level
+  CREATE INDEX, giving `fz__idx`. Its pg\_attribute row was named
+  `pg_expression_N`, a name PG never uses.
+- **PG:** transformIndexStmt gives every expression column
+  FigureIndexColname's name \(`abs(b)` → `abs`, `1::integer` → `int4`,
+  CASE → `case`\). ChooseIndexColumnNames falls back to `expr` and
+  suffixes conflicts \(`abs`, `abs1`\). Both the generated index name and
+  the index's attribute names come from that list.
+- **The fix:**
+  - new `parser.FigureIndexColname` ports FigureColnameInternal over
+    goopg's raw AST, including the grammar's SystemTypeName mapping for
+    keyword types;
+  - executor `indexNameColumns` feeds it to all four naming sites;
+  - buildUserPGAttributeRowsForIndex names the attributes from the same
+    deduplicated list, INCLUDE columns included.
+- **Verification:** on the scratch PG, index names and attnames are
+  identical for `abs(b)`, `(a+b)`, `lower(a::text)`, `(abs(a), abs(b))
+  include (c)`, `(a, a)` and LIKE INCLUDING INDEXES. regress
+  create\_index 2727→2708 \(`concur_heap_expr_idx`, the `textcat` column\).
+
+### Expression ORDER BY keys in the partition arm
+
+- addOrderedPartitionAppendPaths now carries each ORDER BY key as an
+  expression:
+  - substituteProjectTargets maps it through the top Project and each
+    member's Project chain;
+  - exprOverSchema bounds it, as a walkExprRefs callback.
+- A key matches a partition key column, or an index column, when it is
+  the plain column. When the catalog stores an expression there
+  \(PartitionKeyExprs, ColExprs\), the key must instead equal that
+  expression resolved against the member \(keyMatchesTableColumn,
+  exprEqual\).
+- **Not yet reachable end to end:** indexUnboundKeysNotNull refuses an
+  expression key column. Expression index keys keep the blob format
+  \(buildPGIndexKeyDesc refuses them\), which stores no NULL\-keyed
+  entries, so a full ordered scan would lose rows whose expression is
+  NULL. The mcrparted witness therefore still plans Sort \+ Append.
+  New task M0148\-0001c3a8 covers tuple\-format expression keys.
+- **Test:** TestKeyMatchesTableColumnExpression pins the matching;
+  TestOrderedPartitionAppend still covers the column path.
+
+### Gates
+
+- units, tpch\-spotcheck, sf025;
+- fire\-set fires=none on sf025, sf1 and TPC\-H;
+- acceptance 24 MATCH;
+- regress A/B: only create\_index moved.

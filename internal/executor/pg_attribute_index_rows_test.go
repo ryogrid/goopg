@@ -108,8 +108,9 @@ func TestBuildUserPGAttributeRowsForIndexMatchesPG(t *testing.T) {
 
 // TestBuildUserPGAttributeRowsForIndexNamesExpressionKeys pins the
 // expression-key naming half of the same blocker: upstream
-// ConstructTupleDescriptor names an expressional index column
-// `pg_expression_<attnum>` (there is no heap column to take a name from).
+// ConstructTupleDescriptor names an expressional index column by
+// ChooseIndexColumnNames — FigureIndexColname, so `lower(val)` is `lower`
+// (PG 18.3: pg_attribute.attname of such an index column).
 // The attribute's TYPE is the documented `text` fallback — goopg has no
 // expression type resolver reachable from the row builder — which is why the
 // deferral ledger carries a row for expression-index type fidelity.
@@ -131,7 +132,7 @@ func TestBuildUserPGAttributeRowsForIndexNamesExpressionKeys(t *testing.T) {
 	if len(rows) != 1 || len(names) != 1 {
 		t.Fatalf("rows=%d names=%v, want 1 expression attribute", len(rows), names)
 	}
-	if names[0] != "pg_expression_1" {
-		t.Errorf("expression attname = %q, want pg_expression_1", names[0])
+	if names[0] != "lower" {
+		t.Errorf("expression attname = %q, want lower", names[0])
 	}
 }

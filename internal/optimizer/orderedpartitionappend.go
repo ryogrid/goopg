@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // M0148-0001c3a5 (a): generate_orderedappend_paths' partitions_are_ordered
@@ -79,30 +80,23 @@ func addOrderedPartitionAppendPaths(ordered *RelOptInfo, input Node, sortPathkey
 		}
 	}
 
-	// ORDER BY keys as the SetOp's output positions (through a top Project
-	// that only re-orders or drops columns).
+	// ORDER BY keys as expressions over the SetOp's output (through a top
+	// Project, adjust_appendrel_attrs' direction).
 	headOut := head.Output()
-	keyPos := make([]int, len(sortPathkeys))
+	keys := make([]Expr, len(sortPathkeys))
 	for i, pk := range sortPathkeys {
-		cr, isCol := pk.Expr.(*ColumnRef)
-		if !isCol {
-			return
-		}
-		pos := cr.Index
+		e := pk.Expr
 		if top != nil {
-			if pos < 0 || pos >= len(top.Targets) {
+			te, ok := substituteProjectTargets(e, top.Targets)
+			if !ok {
 				return
 			}
-			tc, isTC := top.Targets[pos].(*ColumnRef)
-			if !isTC {
-				return
-			}
-			pos = tc.Index
+			e = te
 		}
-		if pos < 0 || pos >= len(headOut) {
+		if !exprOverSchema(e, len(headOut)) {
 			return
 		}
-		keyPos[i] = pos
+		keys[i] = e
 	}
 	// One direction for every key: ASC NULLS LAST is the partitions' and a
 	// default btree index's forward order; DESC NULLS FIRST is backward.
@@ -113,35 +107,38 @@ func addOrderedPartitionAppendPaths(ordered *RelOptInfo, input Node, sortPathkey
 		}
 	}
 
-	// Per member: the base column each key names, and an index supplying
-	// them in order.
+	// Per member: each key over the member's own columns, and an index
+	// supplying them in order.
 	type memberPlan struct {
 		member partitionMember
-		cols   []string
 		idx    *catalog.Index
 	}
 	plans := make([]memberPlan, 0, len(members))
 	for _, m := range members {
-		cols := make([]string, len(keyPos))
-		for i, p := range keyPos {
-			name, ok := memberBaseColumn(m.root, p)
+		mkeys := make([]Expr, len(keys))
+		for i, k := range keys {
+			mk, ok := memberKeyExpr(m.root, k)
 			if !ok {
 				return
 			}
-			cols[i] = name
+			mkeys[i] = mk
 		}
 		// build_partition_pathkeys: the ORDER BY must lead with the partition
 		// key (a prefix either way round).
-		for i := 0; i < len(cols) && i < len(parent.PartitionKey); i++ {
-			if !strings.EqualFold(cols[i], parent.PartitionKey[i]) {
+		for i := 0; i < len(mkeys) && i < len(parent.PartitionKey); i++ {
+			var pe *parser.Expr
+			if i < len(parent.PartitionKeyExprs) && parent.PartitionKeyExprs[i] != nil {
+				pe = &parent.PartitionKeyExprs[i]
+			}
+			if !keyMatchesTableColumn(cat, m.scan.Table, mkeys[i], parent.PartitionKey[i], pe) {
 				return
 			}
 		}
-		idx := orderedMemberIndex(cat, m.scan.Table, cols)
+		idx := orderedMemberIndex(cat, m.scan.Table, mkeys)
 		if idx == nil {
 			return
 		}
-		plans = append(plans, memberPlan{member: m, cols: cols, idx: idx})
+		plans = append(plans, memberPlan{member: m, idx: idx})
 	}
 
 	// partitions_are_ordered: RANGE with no default partition; the members
@@ -213,31 +210,75 @@ func memberSeqScan(n Node) *SeqScan {
 	return nil
 }
 
-// memberBaseColumn follows output position pos of a member's Project chain
-// down to the SeqScan's column name; false when some Project computes it.
-func memberBaseColumn(n Node, pos int) (string, bool) {
+// exprOverSchema reports whether every column e references lies within an
+// n-column input and e reaches no outer scope or subplan.
+func exprOverSchema(e Expr, n int) bool {
+	bad := false
+	if !walkExprRefs(e, scopeVeto, exprVisitor{Visit: func(x Expr) bool {
+		switch r := x.(type) {
+		case *OuterColumnRef:
+			bad = true
+		case *ColumnRef:
+			if r.Index < 0 || r.Index >= n {
+				bad = true
+			}
+		}
+		return true
+	}}) {
+		return false
+	}
+	return !bad
+}
+
+// memberKeyExpr rewrites e, over a member's output, into an expression over
+// the SeqScan the member's Project chain ends at; false when it cannot.
+func memberKeyExpr(n Node, e Expr) (Expr, bool) {
 	for depth := 0; depth < 8 && n != nil; depth++ {
 		switch x := n.(type) {
 		case *Project:
-			if pos < 0 || pos >= len(x.Targets) {
-				return "", false
-			}
-			cr, ok := x.Targets[pos].(*ColumnRef)
+			te, ok := substituteProjectTargets(e, x.Targets)
 			if !ok {
-				return "", false
+				return nil, false
 			}
-			pos, n = cr.Index, x.Child
+			e, n = te, x.Child
 		case *SeqScan:
-			out := x.Output()
-			if pos < 0 || pos >= len(out) {
-				return "", false
+			if !exprOverSchema(e, len(x.Output())) {
+				return nil, false
 			}
-			return out[pos].Name, true
+			return e, true
 		default:
-			return "", false
+			return nil, false
 		}
 	}
-	return "", false
+	return nil, false
+}
+
+// keyMatchesTableColumn reports whether key (over tbl's columns) is the
+// plain column name, or — when expr is non-nil — that expression resolved
+// against tbl.
+func keyMatchesTableColumn(cat catalog.Catalog, tbl *catalog.Table, key Expr, name string, expr *parser.Expr) bool {
+	if expr == nil || *expr == nil {
+		if name == "" {
+			return false
+		}
+		cr, ok := key.(*ColumnRef)
+		if !ok {
+			return false
+		}
+		for i, c := range tbl.Columns {
+			if strings.EqualFold(c.Name, name) {
+				return cr.Index == i
+			}
+		}
+		return false
+	}
+	rc := singleBindingContext(tbl, "", DefaultPlannerSettings())
+	rc.cat = cat
+	resolved, err := resolveExpr(*expr, rc)
+	if err != nil || resolved == nil {
+		return false
+	}
+	return exprEqual(key, resolved)
 }
 
 // replaceMemberLeaf copies a member's Project chain over a new leaf.
@@ -303,16 +344,24 @@ func partitionParentOf(cat catalog.Catalog, child *catalog.Table) *catalog.Table
 	return t
 }
 
-// orderedMemberIndex is a plain ascending btree index on tbl led by cols, in
-// order; nil when there is none.
-func orderedMemberIndex(cat catalog.Catalog, tbl *catalog.Table, cols []string) *catalog.Index {
+// orderedMemberIndex is a plain ascending btree index on tbl whose leading
+// columns (or expression columns) are keys, in order; nil when there is none.
+func orderedMemberIndex(cat catalog.Catalog, tbl *catalog.Table, keys []Expr) *catalog.Index {
 	for _, ix := range cat.IndexesOnTable(tbl) {
-		if !ix.HasStorage() || ix.HasPredicate || !isBTreeIndex(ix) || ix.DeclaredHash || len(ix.Columns) < len(cols) {
+		if !ix.HasStorage() || ix.HasPredicate || !isBTreeIndex(ix) || ix.DeclaredHash || len(ix.Columns) < len(keys) {
 			continue
 		}
 		ok := true
-		for i, c := range cols {
-			if ix.Columns[i] == "" || !strings.EqualFold(ix.Columns[i], c) ||
+		for i, k := range keys {
+			var ce *parser.Expr
+			if ix.Columns[i] == "" {
+				if i >= len(ix.ColExprs) || ix.ColExprs[i] == nil {
+					ok = false
+					break
+				}
+				ce = ix.ColExprs[i]
+			}
+			if !keyMatchesTableColumn(cat, tbl, k, ix.Columns[i], ce) ||
 				(i < len(ix.ColDescending) && ix.ColDescending[i]) || (i < len(ix.ColNullsFirst) && ix.ColNullsFirst[i]) {
 				ok = false
 				break
@@ -377,7 +426,15 @@ func orderedMemberScan(cat catalog.Catalog, cp costParams, seq *SeqScan, idx *ca
 	relPages := baseRelPages(tbl, relTuples)
 	indexPages, indexTuples, treeHeight := estimateIndexGeometry(cat, idx, tbl, relTuples)
 	covers := true
+	for _, ic := range idx.Columns {
+		if ic == "" {
+			covers = false // an expression column: the heap supplies the row
+		}
+	}
 	for _, c := range tbl.Columns {
+		if !covers {
+			break
+		}
 		found := false
 		for _, ic := range idx.Columns {
 			if strings.EqualFold(ic, c.Name) {

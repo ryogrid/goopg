@@ -4911,15 +4911,8 @@ afterExistsCheck:
 	// PostgreSQL copies all non-partial non-PK non-exclusion indexes; non-unique
 	// ones get auto-generated names with the "_idx" suffix. M0097-0023.
 	for _, idx := range likeNonUniqueIndexes {
-		// For expression columns (Columns[i]==""), use "expr" as the name part.
-		nameCols := make([]string, len(idx.Columns))
-		for i, c := range idx.Columns {
-			if c == "" {
-				nameCols[i] = "expr"
-			} else {
-				nameCols[i] = c
-			}
-		}
+		// Expression columns take FigureIndexColname's name (ChooseIndexColumnNames).
+		nameCols := indexNameColumnsPtr(idx.Columns, idx.ColExprs)
 		var colExprs []parser.Expr
 		if idx.ColExprs != nil {
 			colExprs = make([]parser.Expr, len(idx.ColExprs))
@@ -6201,15 +6194,9 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		if parentIdx.Method != "btree" || parentIdx.Primary || parentIdx.Unique {
 			continue
 		}
-		// Replace empty column names (expression cols) with "expr" for naming.
-		nameCols := make([]string, len(parentIdx.Columns))
-		for i, col := range parentIdx.Columns {
-			if col == "" {
-				nameCols[i] = "expr"
-			} else {
-				nameCols[i] = col
-			}
-		}
+		// Expression columns take FigureIndexColname's name, the parent
+		// index's attribute name (generateClonedIndexStmt's indexcolname).
+		nameCols := indexNameColumnsPtr(parentIdx.Columns, parentIdx.ColExprs)
 		childIdxName := parser.ObjectName{
 			Schema: s.Name.Schema,
 			Name:   o.autoIndexNameWithIncludes(tbl, nameCols, nil, "idx"),
@@ -8494,7 +8481,7 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	}
 	name := s.Name
 	if name == "" {
-		name = o.autoIndexNameWithIncludes(tbl, s.Columns, s.IncludeColumns, "idx")
+		name = o.autoIndexNameWithIncludes(tbl, indexNameColumns(s.Columns, s.ColExprs), s.IncludeColumns, "idx")
 	}
 	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
 	if _, exists := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); exists {
@@ -8785,14 +8772,7 @@ func (o *ddlOp) createPartitionChildIndexes(s *parser.CreateIndexStmt, parentTbl
 	// Naming mirrors the attach-time inheritance path: expression columns (empty
 	// name) contribute "expr" so two expression indexes on one child dedup to
 	// `_expr_idx` / `_expr_idx1`.
-	nameCols := make([]string, len(s.Columns))
-	for i, col := range s.Columns {
-		if col == "" {
-			nameCols[i] = "expr"
-		} else {
-			nameCols[i] = col
-		}
-	}
+	nameCols := indexNameColumns(s.Columns, s.ColExprs)
 	// Same M0122-0006-follow-up rationale as execCreateIndex's own call site:
 	// build every index property BEFORE createBTreeIndex so its CREATE INDEX
 	// WAL record captures the real values, not a post-call assignment's
@@ -17044,6 +17024,38 @@ func pgDeduplicateColNames(cols []string) []string {
 		result = append(result, cur)
 	}
 	return result
+}
+
+// indexNameColumns is ChooseIndexColumnNames' preliminary names: a plain
+// column's name, an expression column's FigureIndexColname
+// (transformIndexStmt's indexcolname), or "expr" when that has none.
+// pgDeduplicateColNames applies the conflict suffixes.
+func indexNameColumns(cols []string, exprs []parser.Expr) []string {
+	out := make([]string, len(cols))
+	for i, c := range cols {
+		out[i] = c
+		if c != "" {
+			continue
+		}
+		out[i] = "expr"
+		if i < len(exprs) && exprs[i] != nil {
+			if name := parser.FigureIndexColname(exprs[i]); name != "" {
+				out[i] = name
+			}
+		}
+	}
+	return out
+}
+
+// indexNameColumnsPtr is indexNameColumns over catalog.Index.ColExprs.
+func indexNameColumnsPtr(cols []string, exprs []*parser.Expr) []string {
+	flat := make([]parser.Expr, len(exprs))
+	for i, e := range exprs {
+		if e != nil {
+			flat[i] = *e
+		}
+	}
+	return indexNameColumns(cols, flat)
 }
 
 func (o *ddlOp) autoIndexName(tbl *catalog.Table, columns []string, suffix string) string {

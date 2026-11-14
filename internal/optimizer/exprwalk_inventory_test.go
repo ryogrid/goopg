@@ -156,6 +156,7 @@ var exprSwitchInventory = map[string]walkerRole{
 	"pathindexrestrict.go:saopColumnQuals": nonRecursiveClassifier,
 	// M0148-0001c3a5 (d): matches a top-level conjunct's boolean shape.
 	"pathindexrestrict.go:booleanIndexQual": nonRecursiveClassifier,
+	"orderedpartitionappend.go:exprOverSchema": nonRecursiveClassifier, // the per-node callback of a walkExprRefs(scopeVeto) driver
 	// `joinlayout.go:remapPosMapAfterRewrite` (walkerPending, 8 of 32 arms)
 	// was deleted by C-20b: the walker mutated nothing — its posMap parameter
 	// was never read — so there was no conversion to finish, only dead weight
