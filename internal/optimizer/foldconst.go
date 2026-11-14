@@ -554,6 +554,9 @@ func tryFoldBinaryOp(pos int, op parser.OpCode, l, r Expr) Expr {
 	if folded := tryFoldTemporalBinaryOp(pos, op, l, r); folded != nil {
 		return folded
 	}
+	if folded := simplifyBooleanEquality(pos, op, l, r); folded != nil {
+		return folded
+	}
 	// Boolean short-circuit for AND/OR regardless of the other operand's type.
 	switch op {
 	case parser.OpAnd:
@@ -667,6 +670,12 @@ func tryFoldUnaryOp(pos int, op parser.OpCode, operand Expr) Expr {
 	case parser.OpNot:
 		if bc, ok := operand.(*BooleanConst); ok {
 			return &BooleanConst{pos: pos, Value: !bc.Value}
+		}
+		// negate_clause (eval_const_expressions' NOT arm): NOT (NOT x) is x
+		// in three-valued logic too; reached once simplifyBooleanEquality
+		// turns `NOT a = false` into NOT (NOT a) (M0148-0001c3a5 (d)).
+		if inner, ok := operand.(*UnaryOp); ok && inner.Op == parser.OpNot {
+			return inner.Operand
 		}
 	case parser.OpUnaryNeg:
 		if ic, ok := operand.(*IntegerConst); ok {
@@ -1344,3 +1353,34 @@ func exprIsArrayTyped(e Expr) bool {
 	name := strings.ToLower(t.Name)
 	return t.IsArray || strings.HasSuffix(name, "]") || strings.HasPrefix(name, "_")
 }
+
+// simplifyBooleanEquality is eval_const_expressions'
+// simplify_boolean_equality (clauses.c) over a boolean column: `b = true`
+// and `b <> false` become `b`, `b = false` and `b <> true` become `NOT b`
+// (either operand order). The forms agree on every input, NULL included.
+// PG prints the simplified clause (`Filter: b`) and prices it with
+// boolvarsel (M0148-0001c3a5 (d)). Only a bare boolean column is taken:
+// that is the shape whose type is known here without type inference.
+func simplifyBooleanEquality(pos int, op parser.OpCode, l, r Expr) Expr {
+	if op != parser.OpEq && op != parser.OpNe {
+		return nil
+	}
+	isBoolCol := func(e Expr) bool {
+		cr, ok := e.(*ColumnRef)
+		return ok && !cr.Type.IsArray && (strings.EqualFold(cr.Type.Name, "bool") || strings.EqualFold(cr.Type.Name, "boolean"))
+	}
+	var col Expr
+	var val bool
+	if c, ok := r.(*BooleanConst); ok && isBoolCol(l) {
+		col, val = l, c.Value
+	} else if c, ok := l.(*BooleanConst); ok && isBoolCol(r) {
+		col, val = r, c.Value
+	} else {
+		return nil
+	}
+	if (op == parser.OpEq) == val {
+		return col
+	}
+	return &UnaryOp{pos: pos, Op: parser.OpNot, Operand: col}
+}
+

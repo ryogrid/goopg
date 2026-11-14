@@ -75,6 +75,12 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 		// `IS NULL` had no arm at all and fell through to the generic default
 		// below, so the statistic was never read for its own predicate.
 		return nullTestSelectivity(e, child)
+	case *ColumnRef:
+		// boolvarsel (selfuncs.c): a bare boolean column as a qual
+		// (M0148-0001c3a5 (d)).
+		if !e.Type.IsArray && (strings.EqualFold(e.Type.Name, "bool") || strings.EqualFold(e.Type.Name, "boolean")) {
+			return boolVarSelectivity(e, child)
+		}
 	case *IsBoolExpr:
 		// booltestsel (selfuncs.c:1545) — take2 P1-14b. IS TRUE/FALSE had
 		// no arm at all and fell through to the generic default, so a
@@ -1443,13 +1449,12 @@ const (
 // FALSE mass is whatever remains. Without MCV data the null fraction still
 // answers UNKNOWN, and TRUE/FALSE split the non-null mass 50/50.
 //
-// Two deliberate deviations, both recorded: (1) with NO statistics at all
-// the estimator declines to the pre-existing generic default rather than
-// following PG's recurse-into-the-argument rule — goopg has no bare-boolean
-// estimator for that recursion to land on, so PG's rule has no honest
-// target here; (2) a non-column operand likewise keeps the old default, as
-// does an MCV[0] whose rendered form is not recognisably boolean (which
-// falls through to the no-MCV rule).
+// With NO statistics (or a non-column operand) it follows PG's rule: IS
+// [NOT] UNKNOWN take DEFAULT_UNK_SEL / DEFAULT_NOT_UNK_SEL, IS TRUE / IS NOT
+// FALSE recurse into the argument's clause selectivity (boolvarsel's 0.5 for
+// a bare column, M0148-0001c3a5 (d)), IS FALSE / IS NOT TRUE its
+// complement. An MCV[0] whose rendered form is not recognisably boolean
+// falls through to the no-MCV rule.
 func boolTestSelectivity(e *IsBoolExpr, child Node) float64 {
 	est, _ := boolTestSelectivityInner(e, child)
 	return est
@@ -1495,12 +1500,26 @@ func isFalseMCVValue(v string) bool {
 
 func boolTestSelectivityInner(e *IsBoolExpr, child Node) (float64, bool) {
 	cr, ok := e.Operand.(*ColumnRef)
-	if !ok {
-		return defaultGenericSelectivity, false
+	var cs *catalog.ColumnStats
+	if ok {
+		cs = columnStatsForChild(cr.Index, child)
 	}
-	cs := columnStatsForChild(cr.Index, child)
 	if cs == nil {
-		return defaultGenericSelectivity, false
+		// booltestsel without statistics (M0148-0001c3a5 (d)): IS
+		// [NOT] UNKNOWN take the fixed defaults; IS TRUE / IS NOT FALSE
+		// are the argument's own clause selectivity (boolvarsel's 0.5 for a
+		// bare column), IS FALSE / IS NOT TRUE its complement.
+		switch boolTestKind(e) {
+		// A default, not a statistic: reported unreliable.
+		case "unknown":
+			return defaultUnknownSel, false
+		case "notunknown":
+			return 1 - defaultUnknownSel, false
+		case "true", "notfalse":
+			return clampProbability(clauseSelectivity(e.Operand, child)), false
+		default:
+			return clampProbability(1 - clauseSelectivity(e.Operand, child)), false
+		}
 	}
 	freqNull := cs.NullFrac
 	if freqNull < 0 {
@@ -1591,3 +1610,19 @@ func nullTestSelectivity(e *IsNullExpr, child Node) float64 {
 	}
 	return freqNull
 }
+
+// defaultUnknownSel is DEFAULT_UNK_SEL (selfuncs.h): `x IS UNKNOWN` without
+// statistics.
+const defaultUnknownSel = 0.005
+
+// boolVarSelectivity is boolvarsel (selfuncs.c): with statistics a boolean
+// column V is V = true (var_eq_const, the TRUE mass booltestsel's IS TRUE
+// reads off the MCV / null fraction); without them the default is 0.5.
+func boolVarSelectivity(cr *ColumnRef, child Node) float64 {
+	if columnStatsForChild(cr.Index, child) == nil {
+		return 0.5
+	}
+	sel, _ := boolTestSelectivityInner(&IsBoolExpr{pos: cr.pos, Operand: cr, TestTrue: true}, child)
+	return sel
+}
+

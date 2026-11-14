@@ -2872,7 +2872,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// "Filter")` BEFORE `Workers Planned`. Dropping it hid an executed
 		// qual (TPC-H Q20's `ps_availqty > (SubPlan 1)`) that JSON showed.
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 		// PG emits `Workers Planned:` in PLAIN EXPLAIN — it is a plan-time
 		// property. `Workers Launched:` is execution-time and belongs to the
@@ -2882,7 +2882,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 	case *optimizer.GatherMerge:
 		// The same qual line as Gather (explain.c's T_GatherMerge arm).
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 		// PG prints Workers Planned for Gather Merge and, unlike Sort, does NOT
 		// print the merge keys (explain.c has no show_sort_keys call in the
@@ -2922,7 +2922,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 					f = r
 				}
 			}
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(f, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(f, reg, qualify))})
 		}
 	case *optimizer.WindowAgg:
 		// M0146-0005cg: PG 18's `Window: w1 AS (PARTITION BY … ORDER BY …
@@ -2945,7 +2945,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			}
 		}
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 	case *optimizer.SetOp:
 		// M0141-S2b-4c: PG's Merge Append prints its `Sort Key:` (explain.c
@@ -2972,7 +2972,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// Keep the default arm's attached-Filter line (a qual goopg leaves
 		// above a set operation must not vanish from the plan text).
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 	case *optimizer.Distinct:
 		// M0141-S2b-4d: the hashed DISTINCT's `Group Key:` (explain.c
@@ -3030,7 +3030,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			*rows = append(*rows, Row{NewStringDatum(indent + "Group Key: " + strings.Join(parts, ", "))})
 		}
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 	case *optimizer.DistinctOn:
 		// M0146-0005dk: the hashed unique-ify Agg prints its uniq exprs as
@@ -3088,7 +3088,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			}
 		}
 		if filt != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(filt, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(filt, reg, qualify))})
 		}
 	case *optimizer.BitmapIndexScan:
 		// R49 Slice A: the NLI-bitmap probe binds Key/Keys per outer row
@@ -3148,7 +3148,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 				rc = &optimizer.BinaryOp{Op: parser.OpAnd, Left: rc, Right: q}
 			}
 			rc = qualifyForeignColumns(rc, p, reg)
-			*rows = append(*rows, Row{NewStringDatum(indent + "Recheck Cond: " + wrapParen(formatExprQual(rc, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Recheck Cond: " + qualText(rc, reg, qualify))})
 		}
 		filt := attachedFilter
 		if cond != nil {
@@ -3161,7 +3161,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			}
 		}
 		if filt != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(filt, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(filt, reg, qualify))})
 		}
 	case *optimizer.IndexOnlyScan:
 		// S6 min/max rewrite: the IOS's residual `col IS NOT NULL` qual is
@@ -3177,7 +3177,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			condParts = append(condParts, bound)
 		}
 		if p.Cond != nil {
-			condParts = append(condParts, wrapParen(formatExprQual(p.Cond, reg, qualify)))
+			condParts = append(condParts, qualText(p.Cond, reg, qualify))
 		}
 		if len(condParts) > 0 {
 			cond := strings.Join(condParts, " AND ")
@@ -3190,7 +3190,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// guard keeps one) is upstream's `show_scan_qual` line and was simply
 		// missing here, so a Filter that DOES run went unrendered.
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 	case *optimizer.Join:
 		// M0127-P2.1: render the join's equi-key list, upstream's
@@ -3233,7 +3233,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 					*rows = append(*rows, Row{NewStringDatum(indent + "Join Filter: " + jf)})
 				}
 			} else if join != nil {
-				*rows = append(*rows, Row{NewStringDatum(indent + "Join Filter: " + wrapParen(formatExprQual(join, reg, qualify)))})
+				*rows = append(*rows, Row{NewStringDatum(indent + "Join Filter: " + qualText(join, reg, qualify))})
 			}
 		})
 		if attachedFilter != nil {
@@ -3254,11 +3254,11 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		}
 		if residual != nil {
 			reg.withJoinRow(p, func() {
-				*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(residual, reg, qualify)))})
+				*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(residual, reg, qualify))})
 			})
 		}
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 	case *optimizer.Memoize:
 		// Upstream shape: `Cache Key: t.a, t.b` under the Memoize node.
@@ -3296,7 +3296,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			*rows = append(*rows, Row{NewStringDatum(indent + "Sampling: " + formatTableSample(p.TableSample, reg, qualify))})
 		}
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 	case *optimizer.GenerateSeries, *optimizer.GenerateSubscripts, *optimizer.FromUnnest, *optimizer.UserSrfScan:
 		// M0134-0001 P2 S2: the verbose-only `Function Call:` deparse
@@ -3312,7 +3312,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			}
 		}
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 	case *optimizer.Aggregate:
 		// S5 (0134-0001 P2): PG's show_agg_keys prints a `Group Key:` line
@@ -3506,7 +3506,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			// the S18 wrap (a qual is general-expression position, and
 			// PG prints the FuncCall bare there).
 			filt := expandAggOutputRefsInFilter(attachedFilter, p)
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(filt, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(filt, reg, qualify))})
 		}
 	case *optimizer.Values:
 		// M0146-0109: a WHERE over a one-row VALUES / FROM-less SELECT is a
@@ -3521,7 +3521,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 				}
 				*rows = append(*rows, Row{NewStringDatum(indent + "One-Time Filter: " + otf)})
 			} else {
-				*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+				*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 			}
 		}
 	default:
@@ -3531,7 +3531,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// Aggregate). Matches PG's behaviour of rendering Filter on
 		// the node it most directly applies to.
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 	}
 }
@@ -3777,7 +3777,7 @@ func formatJoinFilter(p *optimizer.Join, reg *subPlanReg, qualify bool) string {
 	if isLiteralOneTimeFilterConst(residual) {
 		return formatExprQual(residual, reg, qualify)
 	}
-	return wrapParen(formatExprQual(residual, reg, qualify))
+	return qualText(residual, reg, qualify)
 }
 
 // formatIndexCond renders the equality / range condition of an
@@ -4454,6 +4454,16 @@ func isLiteralOneTimeFilterConst(e optimizer.Expr) bool {
 }
 
 // wrapParen wraps s in parentheses unless it already is parenthesised.
+// qualText renders a plan qual as show_qual prints it: a bare column (a
+// boolean Var qual, `Filter: a`) carries no parentheses; any other
+// expression is wrapped (wrapParen). M0148-0001c3a5 (d).
+func qualText(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
+	if _, isCol := e.(*optimizer.ColumnRef); isCol {
+		return formatExprQual(e, reg, qualify)
+	}
+	return wrapParen(formatExprQual(e, reg, qualify))
+}
+
 func wrapParen(s string) string {
 	if strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
 		// Heuristic: avoid double-wrap when the whole expression
@@ -7774,7 +7784,7 @@ func planToJSONNamed(n optimizer.Node, opts parser.ExplainOptions, reg *subPlanR
 		if explainIsScanNode(n) {
 			fqual = reg.names().qualifyScan()
 		}
-		obj["Filter"] = wrapParen(formatExprQual(filter, reg, fqual))
+		obj["Filter"] = qualText(filter, reg, fqual)
 	}
 	if opts.Verbose {
 		if cols := explainOutputNames(n, reg); len(cols) > 0 {

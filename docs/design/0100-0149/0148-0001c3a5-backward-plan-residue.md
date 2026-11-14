@@ -1,7 +1,7 @@
 # M0148\-0001c3a5 — the plans behind the last `… Backward` regress lines
 
-**Parent:** M0148\-0001c3a3 · **Status:** item \(d\) landed 2026\-11\-14
-\(except `b = true` simplification\); items \(a\)–\(c\) open
+**Parent:** M0148\-0001c3a3 · **Status:** item \(d\) landed 2026\-11\-14 \(two
+slices\); items \(a\)–\(c\) open
 
 Backward scans landed in M0148\-0001c3a3
 \([0148\-0001c3a3\-backward\-index\-scans.md](0148-0001c3a3-backward-index-scans.md)\).
@@ -72,7 +72,7 @@ two reasons:
   - fire\\-set fires=none on sf025, sf1 and TPC\\-H;
   - acceptance 24 MATCH.
 
-### Not covered
+### Not covered \(closed by slice 2 below\)
 
 - **`b = true` written out:** PG's eval\_const\_expressions rewrites it to
   `b` \(simplify\_boolean\_equality; the Filter prints `b`\). The column then
@@ -83,3 +83,55 @@ two reasons:
   IS FALSE get goopg's 1/3 default. PG uses boolvarsel / booltestsel: 0.5
   without statistics, var\_eq\_const with them. Rows show 667 against PG's
   1000.
+
+## Item \(d\) slice 2 — boolean equality simplification and boolean selectivity
+
+`WHERE b = true ORDER BY i DESC LIMIT 10` still planned bitmap \+ Sort,
+because goopg priced `b = true` at the equality default \(0.005\). PG's
+eval\_const\_expressions rewrites it to `b` \(simplify\_boolean\_equality\),
+and boolvarsel prices that at 0.5 without statistics, so the Index Scan
+Backward wins.
+
+### Change
+
+- **simplifyBooleanEquality** \(foldconst.go\), over a boolean column in
+  either operand order:
+  - `b = true` and `b <> false` become `b`;
+  - `b = false` and `b <> true` become `NOT b`.
+  The forms agree on every input, NULL included.
+- **Double negation:** tryFoldUnaryOp folds `NOT (NOT x)` to `x`, as
+  negate\_clause does. This handles `NOT a = false`, which PG prints as
+  `Filter: a`.
+- **boolvarsel:** clauseSelectivity gives a bare boolean column 0.5
+  without statistics. With statistics it gives the TRUE mass booltestsel's
+  IS TRUE reads.
+- **booltestsel without statistics:**
+  - IS \[NOT\] UNKNOWN take DEFAULT\_UNK\_SEL and its complement;
+  - IS TRUE / IS NOT FALSE recurse into the argument's selectivity;
+  - IS FALSE / IS NOT TRUE take its complement.
+  These no\-statistics estimates are reported unreliable. The old 1/3 has
+  no PG source.
+- **EXPLAIN:** a bare\-column qual prints without parentheses \(`Filter: b`,
+  show\_qual's deparse; `qualText` in place of `wrapParen` at all 21
+  qual sites\).
+
+### Verification
+
+- **create\_index:** 2750→2727; every boolindex hunk is gone.
+- **partition\_prune:** 6783→6778. `boolpart` filters now print `NOT a` /
+  `a` as PG does.
+- **inherit / subselect:** only qual text changes, toward PG's form.
+- **TestBoolTestSelectivityDefaults:** pins boolvarsel's 0.5,
+  DEFAULT\_UNK\_SEL and the constant recursion.
+- **Gates:**
+  - units, tpch\-spotcheck, sf025 99/99 \(plan shapes identical\);
+  - fire\-set fires=none on sf025, sf1 and TPC\-H;
+  - acceptance 24 MATCH;
+  - the TestPort\_Isolation family \(a selectivity change\): ok.
+
+### Not covered
+
+- **Non\-column operands:** `simplifyBooleanEquality` takes only a bare
+  boolean column. PG simplifies any boolean expression compared with a
+  boolean Const, which needs the expression's type.
+

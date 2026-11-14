@@ -333,21 +333,29 @@ func TestBoolTestSelectivityNoMCV(t *testing.T) {
 	}
 }
 
-// No statistics, non-column operand: the pre-existing default, and the
-// WithSource twin reports it unreliable — except the shape+stats arm,
-// which is reliable.
+// No statistics: booltestsel recurses into the argument (M0148-0001c3a5
+// (d)) — boolvarsel's 0.5 for a bare boolean column, 1.0 for the constant
+// TRUE, DEFAULT_UNK_SEL for IS UNKNOWN — and the WithSource twin reports
+// the default unreliable; only the shape+stats arm is reliable.
 func TestBoolTestSelectivityDefaults(t *testing.T) {
 	bare := makeStatsTable(nil, []catalog.Column{{Name: "b", Type: catalog.Type{Name: "bool"}, Ordinal: 0}})
-	expr := &IsBoolExpr{Operand: &ColumnRef{Index: 0, Name: "b"}, TestTrue: true}
-	if got := clauseSelectivity(expr, &SeqScan{Table: bare}); got != defaultGenericSelectivity {
-		t.Errorf("no-stats IS TRUE = %v, want default %v", got, defaultGenericSelectivity)
+	col := &ColumnRef{Index: 0, Name: "b", Type: catalog.Type{Name: "bool"}}
+	expr := &IsBoolExpr{Operand: col, TestTrue: true}
+	if got := clauseSelectivity(expr, &SeqScan{Table: bare}); got != 0.5 {
+		t.Errorf("no-stats IS TRUE = %v, want boolvarsel's 0.5", got)
+	}
+	if got := clauseSelectivity(col, &SeqScan{Table: bare}); got != 0.5 {
+		t.Errorf("no-stats bare boolean = %v, want boolvarsel's 0.5", got)
+	}
+	if got := clauseSelectivity(&IsBoolExpr{Operand: col}, &SeqScan{Table: bare}); got != defaultUnknownSel {
+		t.Errorf("no-stats IS UNKNOWN = %v, want DEFAULT_UNK_SEL %v", got, defaultUnknownSel)
 	}
 	if est := clauseSelectivityWithSource(expr, &SeqScan{Table: bare}); est.reliable {
 		t.Errorf("no-stats IS TRUE marked reliable: %+v", est)
 	}
 	noncol := &IsBoolExpr{Operand: &BooleanConst{Value: true}, TestTrue: true}
-	if got := clauseSelectivity(noncol, &SeqScan{Table: bare}); got != defaultGenericSelectivity {
-		t.Errorf("non-column IS TRUE = %v, want default %v", got, defaultGenericSelectivity)
+	if got := clauseSelectivity(noncol, &SeqScan{Table: bare}); got != 1 {
+		t.Errorf("non-column TRUE IS TRUE = %v, want 1", got)
 	}
 }
 
