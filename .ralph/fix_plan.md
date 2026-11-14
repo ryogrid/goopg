@@ -12554,7 +12554,7 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - (f) has no witness: no regress expected output and no TPC-H/TPC-DS
       plan has a parameterized BitmapOr, and join.out's 8 BitmapOr plans
       already match.
-- [ ] **M0148-0001c3a6 — c3a4 residue: join OR bitmap paths and the
+- [x] **M0148-0001c3a6 — c3a4 residue: join OR bitmap paths and the
   array-literal / index-only leftovers**.
   Kind: impl
   Parent: M0148-0001c3a4
@@ -12614,6 +12614,68 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     Movement: yes — regress create\_index 2535→2500
     - Resume (i): an equality behind the array on the next column
       (multi-column prefix); the earlier leftovers.
+  - 2026-11-14 CLOSED. (i) landed in 5 slices (create\_index 2708→2500).
+    The remaining items have no regress or corpus witness, or belong to
+    another mechanism:
+    - (f) join OR bitmaps and every (i) leftover → M0148-0001c3a11
+      (parking item, no witness);
+    - row-comparison index quals with a non-catalog witness (create\_index
+      `ROW(thousand, tenthous) > ROW(NULL::integer, 5)`) →
+      M0148-0001c3a12;
+    - constant-NULL row elimination (create\_index `(thousand, tenthous)
+      in ((1,1001), (null,null))`) → M0148-0001c3a13.
+    Movement: none — instrument artefact — close-out bookkeeping; the
+    slices' own movement is recorded above
+- [ ] **M0148-0001c3a11 — c3a6 residue with no witness: join OR bitmaps and
+  array / bound leftovers**.
+  Kind: impl
+  Parent: M0148-0001c3a6
+  Parked 2026-11-14; take an item when a regress or corpus witness appears.
+  Ledgered in the M0148-0001c3a6 rows.
+  - (f) generate\_bitmap\_or\_paths over join OR clauses (parameterized
+    BitmapOr arms).
+  - A cross-type literal as the primary probe array.
+  - An untyped `'{1,2}'` on an int2 column printing `smallint[]`.
+  - An out-of-range equality key as an empty probe.
+  - Redundant bounds on bitmap scans, behind an array, beside a leading
+    NullTest; non-integer redundant bounds.
+  - An equality behind the array on the next column.
+  - A lone `= ANY ('{}')` probe; index-only width from the reltarget.
+- [ ] **M0148-0001c3a12 — row-comparison index quals
+  (match\_rowcompare\_to\_indexcol)**.
+  Kind: impl
+  Parent: M0148-0001c3a6
+  Found 2026-11-14.
+  - Witness: create\_index `(thousand, tenthous) > (NULL, 5)` → PG `Index
+    Scan … Index Cond: (ROW(thousand, tenthous) > ROW(NULL::integer,
+    5))`; goopg `Seq Scan … Filter: (ROW(thousand, tenthous) > ROW(NULL,
+    5))`.
+    - It also names the NULL Const's type (`NULL::integer`).
+  - btree\_index's 5 pg\_proc lines (c3a5 (c)) need this too, plus
+    M0148-0001c3a7.
+  - Resume:
+    - indxpath.c match\_rowcompare\_to\_indexcol / expand\_indexqual\_
+      rowcompare: a RowExpr comparison whose leading columns are the
+      index's leading columns becomes an index qual;
+    - executor: a lexicographic row bound on the index (nbtree treats it
+      as an SK\_ROW\_HEADER scan key);
+    - EXPLAIN: `ROW(…) > ROW(…)` with typed Consts.
+- [ ] **M0148-0001c3a13 — constant-NULL row elimination in a row IN list**.
+  Kind: impl
+  Parent: M0148-0001c3a6
+  Found 2026-11-14.
+  - Witness: create\_index `(thousand, tenthous) in ((1,1001),
+    (null,null))` → PG `Index Scan … Index Cond: ((thousand = 1) AND
+    (tenthous = 1001))`; goopg `Seq Scan … Filter: (ROW(thousand,
+    tenthous) = ANY (ROW(1, 1001), ROW(NULL, NULL)))`.
+  - PG:
+    - transformAExprIn expands a row IN list into an OR of per-column
+      AND equalities (make\_row\_comparison\_op);
+    - eval\_const\_expressions folds the all-NULL AND to NULL;
+    - canonicalize\_qual / find\_duplicate\_ors drops a NULL or FALSE OR
+      arm in WHERE context (is\_check = false).
+  - Resume: expand RowExpr IN lists in the resolver (or a planner
+    pre-pass), then drop constant NULL OR arms in qual context.
 - [x] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
   `… Backward` regress lines**.
   Kind: impl
