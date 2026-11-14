@@ -422,3 +422,33 @@ func TestIndexScanSAOPBehindLeadingRange(t *testing.T) {
 		}
 	}
 }
+
+// TestBitmapOrSubORInAndArm pins M0148-0001c3a4 (d) against PG 18.3: a
+// sub-OR inside an AND arm of a BitmapOr no longer drops the whole BitmapOr.
+// build_paths_for_OR keeps it among the arm's clauses, where
+// match_orclause_to_indexcol takes it as a ScalarArrayOp behind the arm's
+// equality prefix.
+func TestBitmapOrSubORInAndArm(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "CREATE TABLE tk (thousand int NOT NULL, tenthous int NOT NULL, pad text)")
+	runSQL(t, ctx, "INSERT INTO tk SELECT g%1000, g, repeat('x', 100) FROM generate_series(0, 9999) g")
+	runSQL(t, ctx, "CREATE INDEX tk_tt ON tk (thousand, tenthous)")
+	runSQL(t, ctx, "VACUUM tk")
+	runSQL(t, ctx, "ANALYZE tk")
+	ps := optimizer.DefaultPlannerSettings()
+	q := "SELECT thousand, tenthous FROM tk WHERE thousand = 42 AND (tenthous = 1042 OR tenthous = 3) OR thousand = 41"
+	want := "Bitmap Heap Scan on tk\n" +
+		"  Recheck Cond: (((thousand = 42) AND ((tenthous = 1042) OR (tenthous = 3))) OR (thousand = 41))\n" +
+		"  ->  BitmapOr\n" +
+		"        ->  Bitmap Index Scan on tk_tt\n" +
+		"              Index Cond: ((thousand = 42) AND (tenthous = ANY ('{1042,3}'::integer[])))\n" +
+		"        ->  Bitmap Index Scan on tk_tt\n" +
+		"              Index Cond: (thousand = 41)"
+	if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+q, ps)), "\n"); got != want {
+		t.Errorf("got:\n%s\nwant (PG 18.3):\n%s", got, want)
+	}
+	if got := strings.Join(renderRows(runSQLWith(t, ctx, q+" ORDER BY 1, 2", ps)), ";"); got != "41|41;41|1041;41|2041;41|3041;41|4041;41|5041;41|6041;41|7041;41|8041;41|9041;42|1042" {
+		t.Errorf("rows %q", got)
+	}
+}

@@ -1,6 +1,6 @@
 # M0148\-0001c3a4 — ScalarArrayOp and OR index\-path residue
 
-**Parent:** M0148\-0001c3a2 · **Status:** items \(a\), \(b\), \(c\) and \(h\) landed 2026\-11\-12; item \(i\) slices 1–5 landed 2026\-11\-14; items \(d\)–\(g\) and the rest of \(i\) open
+**Parent:** M0148\-0001c3a2 · **Status:** items \(a\), \(b\), \(c\) and \(h\) landed 2026\-11\-12; item \(i\) slices 1–5 and item \(d\) landed 2026\-11\-14; items \(e\)–\(g\), \(j\) and the rest of \(i\) open
 
 This item collects what M0148\-0001c3a2 \(BitmapOr paths\) left open. The items
 are listed in `.ralph/fix_plan.md` under M0148\-0001c3a4:
@@ -626,4 +626,59 @@ On its own it is a probe with no elements.
   PG uses an Index \(Only\) Scan with `Index Cond: (unique1 = ANY
   ('{}'::integer[]))` at 4.30. goopg needs a zero\-element probe shape
   first.
+
+## Item \(d\) — sub\-ORs inside AND arms
+
+PG's generate\_bitmap\_or\_paths treats a sub\-OR inside an AND arm of the
+OR in two ways:
+
+- **In build\_paths\_for\_OR:** the sub\-OR stays one of the arm's
+  clauses. match\_orclause\_to\_indexcol may take it as a ScalarArrayOp, as
+  in `((thousand = 42) AND (tenthous = ANY ('{1,3}')))`.
+- **By recursion:** the function recurses over the arm's items \("Recurse in
+  case there are sub\-ORs"\), offering each sub\-OR's own BitmapOr to
+  choose\_bitmap\_and.
+
+goopg's `bitmapOrArmPath` refused any arm holding a sub\-OR, which dropped
+the whole BitmapOr \(`thousand = 42 AND (tenthous = 1 OR tenthous = 3) OR
+thousand = 41` became an Index Only Scan with a Filter\).
+
+### Change
+
+- `bitmapOrPathsFor(clauses, otherClauses)` is generate\_bitmap\_or\_paths
+  proper. It returns BitmapOr paths, with all\_clauses as each arm's
+  context. `bitmapOrHeapPaths` wraps its result for the leaf's conjuncts.
+- `bitmapOrArmPath` keeps a sub\-OR among the arm's clauses
+  \(`bitmapSAOPOnColumn` already matches an OR of equalities on a column\).
+- For an AND arm, it recurses through `bitmapOrPathsFor` over the arm's
+  items and appends the BitmapOr candidates to choose\_bitmap\_and's list.
+
+### Verification
+
+- **Live server against a scratch PG 18.3, regress tenk1:** the first case
+  matches PG plan for plan and cost for cost \(48.05\). Only the
+  bitmap\-node startup and width differ, which is item \(g\).
+- **`TestBitmapOrSubORInAndArm`:** the PG plan on a fixture table, with
+  rows.
+- **Regress:**
+  - create\_index 2856→2832.
+  - Its one new mismatch line is a weaker Recheck Cond for `hundred = 42 AND
+    (thousand = 42 OR thousand = 99 OR tenthous < 2) OR thousand = 41`. It
+    was a Seq Scan before, so this is a shape improvement \(see Not
+    covered\).
+- **Gates:**
+  - units, tpch\-spotcheck, sf025 99/99;
+  - fire\-set fires=none on sf025, sf1 and TPC\-H;
+  - acceptance 24 MATCH.
+
+### Not covered — item \(j\)
+
+- PG 18 serves `tenthous < 2` from `(thousand, tenthous)` with a skip scan
+  over the leading column and a range on the second. This is a bitmap index
+  scan at 195.28, and an Index Only Scan too.
+- goopg's skip scan takes only equality runs \(restrictionSkipRun\), so that
+  arm has no index path.
+- As a result, PG's `BitmapAnd(hundred, BitmapOr(thousand = ANY, tenthous <
+  2))` cannot form. goopg keeps the `hundred = 42` arm alone, which is
+  correct, with the full OR in the Filter.
 

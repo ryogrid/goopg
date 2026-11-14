@@ -399,22 +399,41 @@ func (s *searchCtx) bitmapOrHeapPaths(
 	relPages int64, relTuples, T, totalPages float64, maxEntries int,
 	leaf Node,
 ) []*Path {
-	conjuncts := extractFilterConjuncts(leaf)
 	var out []*Path
-	for _, conj := range conjuncts {
-		if bin, ok := conj.(*BinaryOp); !ok || bin.Op != parser.OpOr {
+	for _, orPath := range s.bitmapOrPathsFor(rel, tbl, indexes, relPages, relTuples, T, totalPages, maxEntries, leaf, extractFilterConjuncts(leaf), nil) {
+		out = append(out, s.bitmapHeapPathOver(rel, tbl, orPath, relTuples, T, totalPages, maxEntries, leaf))
+	}
+	return out
+}
+
+// bitmapOrPathsFor is generate_bitmap_or_paths(clauses, other_clauses): one
+// BitmapOr path per OR clause of clauses whose every arm an index can serve,
+// with all_clauses (clauses plus other_clauses) as each arm's context. The
+// restriction call passes the leaf's conjuncts; an AND arm recurses with its
+// own items (M0148-0001c3a4 (d), "Recurse in case there are sub-ORs").
+func (s *searchCtx) bitmapOrPathsFor(
+	rel *RelOptInfo, tbl *catalog.Table, indexes []*catalog.Index,
+	relPages int64, relTuples, T, totalPages float64, maxEntries int,
+	leaf Node, clauses, otherClauses []Expr,
+) []*Path {
+	all := make([]Expr, 0, len(clauses)+len(otherClauses))
+	all = append(all, clauses...)
+	all = append(all, otherClauses...)
+	var out []*Path
+	for _, conj := range clauses {
+		if bin, ok := conj.(*BinaryOp); !ok || bin.Op != parser.OpOr || bin.Nested {
 			continue
 		}
 		arms, ok := groupSimilarOrArgs(tbl, indexes, flattenExprOr(conj))
 		if !ok {
 			continue
 		}
-		// The other restriction clauses, without this OR: as an index
-		// clause of an arm it would only repeat the arms (PG removes the
-		// rinfo from inner_other_clauses once it is grouped; ungrouped, an
-		// OR over several columns matches no index column anyway).
-		others := make([]Expr, 0, len(conjuncts)-1)
-		for _, c := range conjuncts {
+		// The other clauses, without this OR: as an index clause of an arm
+		// it would only repeat the arms (PG removes the rinfo from
+		// inner_other_clauses once it is grouped; ungrouped, an OR over
+		// several columns matches no index column anyway).
+		others := make([]Expr, 0, len(all)-1)
+		for _, c := range all {
 			if c != conj {
 				others = append(others, c)
 			}
@@ -454,7 +473,7 @@ func (s *searchCtx) bitmapOrHeapPaths(
 			// create_bitmap_or_path (pathnode.c): `rel->consider_parallel`.
 			ParallelSafe: rel.ParallelSafeForPath(),
 		}
-		out = append(out, s.bitmapHeapPathOver(rel, tbl, orPath, relTuples, T, totalPages, maxEntries, leaf))
+		out = append(out, orPath)
 	}
 	return out
 }
@@ -531,12 +550,10 @@ func (s *searchCtx) bitmapOrArmPath(
 	armClauses := flattenExprAnd(arm)
 	inArm := make(map[Expr]bool, len(armClauses))
 	for _, c := range armClauses {
-		// A sub-OR inside an AND arm needs the recursive
-		// generate_bitmap_or_paths call (deferred); a Nested group is one
-		// ScalarArrayOp clause (bitmapSAOPOnColumn).
-		if b, ok := c.(*BinaryOp); ok && b.Op == parser.OpOr && !b.Nested {
-			return nil
-		}
+		// M0148-0001c3a4 (d): a sub-OR inside an AND arm stays one of the
+		// arm's clauses — match_orclause_to_indexcol may take it as a
+		// ScalarArrayOp (bitmapSAOPOnColumn) — and the recursive
+		// generate_bitmap_or_paths call below offers its own BitmapOr.
 		inArm[c] = true
 	}
 	// all_clauses: the arm's clauses first, so an arm clause wins its index
@@ -570,6 +587,11 @@ func (s *searchCtx) bitmapOrArmPath(
 		_, child.Rows = computeBitmapPages(child.Rows, relTuples, T,
 			indexPagesForPath(s.cat, child, tbl, relTuples), totalPages, s.cp.effectiveCacheSize, maxEntries)
 		indlist = append(indlist, child)
+	}
+	// generate_bitmap_or_paths' AND-arm recursion: the sub-ORs among the
+	// arm's items, each a BitmapOr candidate for choose_bitmap_and.
+	if len(armClauses) > 1 {
+		indlist = append(indlist, s.bitmapOrPathsFor(rel, tbl, indexes, relPages, relTuples, T, totalPages, maxEntries, leaf, armClauses, conjuncts)...)
 	}
 	if len(indlist) == 0 {
 		return nil
