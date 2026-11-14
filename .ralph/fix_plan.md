@@ -12964,6 +12964,32 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Resume: child rels with index / bitmap paths \(the second witness
       merge-joins Index Scans\); child statistics for child joinrel sizing;
       outer / semi / anti joins; N-way.
+  - 2026-11-15 slice 4 attempt — NOT landed; prerequisite found:
+    - Child index paths were built \(scratch rel over the member's bare scan;
+      restriction + ordered producers; lifted under the tableoid Project as
+      PathMemberProject\) and generated as expected \(Index Scans at cost
+      ~14 per partition\), but never won. regress partition\_join was
+      byte-identical, so the code was not committed. The patch is kept at
+      tmp/c3a9-slice4-child-index.patch \(tmp is not tracked; rebuild from
+      the description if lost\).
+    - Prerequisite: partition member seq scans are priced with 0 pages
+      \(`Seq Scan on prt1_p1 … cost=0.00..1.25` vs PG `2.25`; also in the
+      whole-rel Append\), so every member index path loses.
+      - Not ANALYZE: pg\_class shows relpages 1 / reltuples 125, and a
+        direct `ANALYZE prt1_p1` in the same session leaves the cost
+        unchanged.
+      - Member rows come from the block-count fallback
+        \(relSizeFallbackRows\), i.e. the leaf catalog.Table carries no
+        Stats. collectAllPartitionLeaves reads leaves from the InMemory
+        catalog \(im.PartitionChildren\), not through the session catalog
+        the top-level table is resolved with.
+      - Resume: resolve each leaf through the statement's catalog \(the same
+        lookup planScanRangeVar uses for tbl\) so it carries its Stats, then
+        check baseRelPages / the member SeqScan cost reach relpages 1; then
+        re-apply the patch and re-measure.
+    - Also seen: with enable\_seqscan off PG plans per-partition Index Only
+      Scans; child rels have no index-only arm \(scratch rels carry no
+      needed-column set\).
 - [ ] **M0148-0001c3a10 — index clauses on appendrel members (WHERE quals
   pushed into partitions)**.
   Kind: impl

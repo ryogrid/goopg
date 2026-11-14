@@ -1,31 +1,24 @@
-# Working Set — loop end 2026-11-15 (census routing-20261115b IDENTICAL; M0148-0001c3a9 slice 3 LANDED 9eadb3412)
+# Working Set — loop end 2026-11-15 (census routing-20261115c IDENTICAL; c3a9 slice 4 attempted, NOT landed — prerequisite found)
 
 - Anomaly: none (prev-loop check OK).
-- Nightly triage: run 20261115-011812 filed AI-20261115-011812-001 (race TestParallelHashPathModelWinner, "build abandoned (parallel group cancelled)") as M-NIGHTLY-race-parallel-hash-cancel (fix_plan, before P0-E25).
-- S9: DUE → routing-20261115b (s9df, BASELINE_REV=6083698be) IDENTICAL ×3, committed acb47da4a.
-  - 9eadb3412 touches the planner, so the next census is likely DUE (BASELINE_REV=f73e420b9, the head consumed by routing-20261115b).
-- Task: M0148-0001c3a9 (partitionwise join), slice 3 landed as 9eadb3412: inner partitionwise join of two base one-level appendrels.
-- Files:
-  - optimizer: partitionwisejoin.go (new: tryPartitionwiseJoin, appendChildRel, newPartitionwiseAppendPath, createPartitionwiseAppendPlan, reorderToLayout);
-  - joinsearchlevel.go (hook after addPaths); createplan.go (arm); path.go (PathPartitionwiseAppend, pwParents);
-  - plan.go (SetOp.PartitionwiseParents, SetOp embeds searchedTree); appendrel_pushdown.go (pushFilterIntoMembers, appendRelMemberOf split out);
-  - rtid_flat_order.go (parent RTIDs renumbered); plannersettings.go / cost_funcs.go / postmaster/dispatch.go (enable_partitionwise_join plumbing);
-  - planner.go (off for row-locking SELECT and UPDATE/DELETE/MERGE);
-  - executor: explain_names.go (parents claim names; parent column deparse via appendRelSourceIdx); operators_explain.go (key chase declines at a partitionwise Append);
-  - test: partitionwise_join_test.go.
-- Findings:
-  - Child joins pick their own outer/inner, so the Append's children are projected to ascending binding order (reorderToLayout). Without that, upper nodes named columns by the first child's order.
-  - Parent appendrels aren't in the plan, so renumberRTIDsFlatRtableOrder must re-stamp them, or their RTIDs collide with the members'.
-  - goopg ANALYZE stats are per-connection, so probes must run setup and EXPLAIN in one psql session. P0-E24 leftovers need an explicit DROP of the partitions after a restart.
-  - The gates refuse to run (sf025, acceptance) while ci/batch/run-nightly.sh is alive, including its log-push tail. Wait for that PID.
-- Next step: run the census if DUE, then c3a9 slice 4. Give child rels the base-rel index / bitmap path producers (partition_join's second witness merge-joins an Index Scan per partition), and size child joins from the child tables' stats.
+- Nightly triage: AI-20261115-011812-001 already filed (M-NIGHTLY-race-parallel-hash-cancel). Nothing new.
+- S9: DUE → routing-20261115c (s9dg, BASELINE_REV=f73e420b9) IDENTICAL ×3, committed f31132957.
+  - No code landed after it; the next census should be NOT DUE unless a peer commits plan code.
+- Task: M0148-0001c3a9 slice 4 (child index paths).
+  - Built and probed, NOT committed. Patch saved at tmp/c3a9-slice4-child-index.patch (applies to 9eadb3412's partitionwisejoin.go / path.go / createplan.go).
+  - Design: a scratch rel over the member's bare `[Filter→]SeqScan`; addOneRestrictionIndexPath + addOneOrderedIndexPath; each index / bitmap path lifted under the member's tableoid Project as PathMemberProject (plan arm re-applies a copy of the Project).
+  - Paths were generated (Index Scans ~14 per partition) but never won; regress partition_join was byte-identical.
+- Findings (recorded in fix_plan c3a9 and the ledger):
+  - Partition member seq scans cost 0 pages (`prt1_p1 … 0.00..1.25`; PG `2.25`), also in the whole-rel Append.
+  - pg_class has relpages 1, and a direct `ANALYZE prt1_p1` in the same session does not change it.
+  - Member rows come from relSizeFallbackRows, so the leaf catalog.Table has no Stats. collectAllPartitionLeaves reads leaves via im.PartitionChildren (raw InMemory), not the statement catalog planScanRangeVar resolves `tbl` with.
+  - PG prunes partitions at plan time for `t1.a < 10` (only the p1 pair survives); goopg doesn't (k1 (b)).
+  - With enable_seqscan off PG uses per-partition Index Only Scans; scratch rels have no index-only arm.
+- Next step: fix the leaf Stats gap. Resolve each partition leaf through the statement catalog so Stats/relpages ride along. Probe `explain select * from prt1` until member scans cost 2.25 like PG, then re-apply the saved patch and re-measure partition_join.
+  - The member-cost fix moves every partition plan's costs: run the regress partition suites, update the inventory, and run the fire-set gate.
 - Top-residual: M0148 residues. Open: c3a9 (slices 4-6), c3a10, c3a8, c3a7, c3a11 (parked), c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261115b done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
-  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26, E27; the new race item is a test-only correctness item). Then M0148 in file order → c3a9.
-- Gates run (all PASS):
-  - units: initdb hit the 10 m cap twice under nightly-batch load; it passed at 324 s once the host was quiet;
-  - tpch-spotcheck; sf025 99 PASS same=99 (after the batch); fire-set c3a9c fires=none ×3; acceptance PASS;
-  - 17 dedicated partition isolation tests;
-  - regress: partition_join mismatch 1990→1882, partition_aggregate 587→584 (inventory updated in the commit).
-- In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped.
+  - Items 0-9: M0146-0014(channel; census routing-20261115c done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26, E27). Then M0148 in file order → c3a9.
+- Gates run: census s9dg IDENTICAL. Regress A/B of the uncommitted slice 4: partition_join byte-identical; inherit 735→720 in UNION ALL index-only hunks unrelated to the change (likely run-to-run noise; not claimed). No code commit, so no code gates.
+- In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped (tmp/c3a4i-data; P0-E24: drop leftover partitions after a restart).
