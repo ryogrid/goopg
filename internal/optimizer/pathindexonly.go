@@ -753,7 +753,7 @@ func trailingColumnQuals(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.I
 		}
 		cr, val, colOnRight, ok := normalizeColumnIndexKey(bin.Left, bin.Right)
 		if !ok || cr.Index < 0 || cr.Index >= len(tbl.Columns) || tbl.Columns[cr.Index].Name != colName ||
-			!isConstExpr(val) || !restrictionKeyUsable(cat, tbl.Columns[cr.Index], val) {
+			!bitmapConstKey(val) || !restrictionKeyUsable(cat, tbl.Columns[cr.Index], val) {
 			continue
 		}
 		op := bin.Op

@@ -589,7 +589,18 @@ const (
 	IndexCondLow IndexCondItem = iota + 1
 	IndexCondHigh
 	IndexCondNullTest
+	// IndexCondExtraBound is the next of the scan's ExtraBounds.
+	IndexCondExtraBound
 )
+
+// ExtraIndexBound is a further bound on a range scan's column that the
+// probe's LowKey/HighKey already implies — PG prints every bound in Index
+// Cond (`((unique1 < 3) AND (unique1 < '-1'::bigint))`) and
+// _bt_preprocess_keys keeps the tightest (M0148-0001c3a6 (i)). Display only.
+type ExtraIndexBound struct {
+	Op  parser.OpCode
+	Key Expr
+}
 
 // NullTestsContradict reports whether a scan's NullTest index quals ask for
 // both a NULL and a non-NULL key on their column — the qual
@@ -1043,6 +1054,9 @@ type IndexScan struct {
 	// ExtraNullTests are the column's further NullTest index quals
 	// (ExtraIndexNullTest, M0148-0001c3a2).
 	ExtraNullTests []ExtraIndexNullTest
+	// ExtraBounds are the range column's further bounds, implied by
+	// LowKey/HighKey and printed in Index Cond (ExtraIndexBound).
+	ExtraBounds []ExtraIndexBound
 	// IndexCondOrder is the range column's clauses in restriction-list
 	// order (IndexCondItem).
 	IndexCondOrder []IndexCondItem
@@ -1358,6 +1372,7 @@ type IndexOnlyScan struct {
 	LeadingNullTest     IndexNullTest
 	NullTestAfterBounds bool
 	ExtraNullTests      []ExtraIndexNullTest
+	ExtraBounds         []ExtraIndexBound
 	IndexCondOrder      []IndexCondItem
 	// Cond is an additional filter evaluated per index row (S6 min/max
 	// rewrite: the `col IS NOT NULL` qual). IndexOnlyScan's primary probe

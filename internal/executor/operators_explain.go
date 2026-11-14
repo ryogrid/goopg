@@ -3925,8 +3925,8 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 		nt := formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder)
 		return withTrailingSAOPCond(nt, nullTestCondParts(p.ExtraNullTests, p.LowKey, p.HighKey), p.Table, p.Index, p.TrailingSAOP, reg, prefix)
 	}
-	rng := formatIndexCondPartsPrefixed(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder...)
-	return withTrailingSAOPCond(rng, boundCount(p.LowKey, p.HighKey), p.Table, p.Index, p.TrailingSAOP, reg, prefix)
+	rng, nRange := rangeCondWithExtraBounds(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, p.ExtraBounds, reg, prefix, p.IndexCondOrder)
+	return withTrailingSAOPCond(rng, nRange, p.Table, p.Index, p.TrailingSAOP, reg, prefix)
 }
 
 // formatIndexOnlyCond is formatIndexCond for an IndexOnlyScan. The two nodes
@@ -4009,8 +4009,8 @@ func formatIndexOnlyCondRelabeled(p *optimizer.IndexOnlyScan, reg *subPlanReg, p
 		nt := formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder)
 		return withTrailingSAOPCond(nt, nullTestCondParts(p.ExtraNullTests, p.LowKey, p.HighKey), p.Table, p.Index, p.TrailingSAOP, reg, prefix)
 	}
-	rng := formatIndexCondPartsPrefixed(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder...)
-	return withTrailingSAOPCond(rng, boundCount(p.LowKey, p.HighKey), p.Table, p.Index, p.TrailingSAOP, reg, prefix)
+	rng, nRange := rangeCondWithExtraBounds(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, p.ExtraBounds, reg, prefix, p.IndexCondOrder)
+	return withTrailingSAOPCond(rng, nRange, p.Table, p.Index, p.TrailingSAOP, reg, prefix)
 }
 
 // withTrailingSAOPCond appends a scan's TrailingSAOP to its leading-range
@@ -9810,4 +9810,42 @@ func sameTypeIntCastList(list []optimizer.Expr) (string, []string, bool) {
 		vals = append(vals, strconv.FormatInt(ic.Value, 10))
 	}
 	return typ, vals, true
+}
+
+// rangeCondWithExtraBounds is formatIndexCondPartsPrefixed for a leading-
+// column range scan that also carries ExtraBounds (M0148-0001c3a6 (i)): every
+// bound in restriction order — `((unique1 < 3) AND (unique1 < '-1'::bigint))`.
+// It returns the text and its clause count.
+func rangeCondWithExtraBounds(tbl *catalog.Table, idx *catalog.Index, keys []optimizer.Expr, key, lowKey, highKey optimizer.Expr,
+	lowOp, highOp parser.OpCode, extras []optimizer.ExtraIndexBound, reg *subPlanReg, prefix string, order []optimizer.IndexCondItem) (string, int) {
+	if len(extras) == 0 || len(keys) > 0 || key != nil || len(idx.Columns) == 0 {
+		return formatIndexCondPartsPrefixed(tbl, idx, keys, key, lowKey, highKey, lowOp, highOp, reg, prefix, order...), boundCount(lowKey, highKey)
+	}
+	col := prefix + idx.Columns[0]
+	var base []optimizer.IndexCondItem
+	for _, it := range order {
+		if it != optimizer.IndexCondExtraBound {
+			base = append(base, it)
+		}
+	}
+	baseParts := rangeColumnCondParts(tbl, idx, 0, col, base, lowKey, highKey, lowOp, highOp,
+		optimizer.IndexNullTestNone, false, nil, reg)
+	var parts []string
+	bi, ei := 0, 0
+	for _, it := range order {
+		if it == optimizer.IndexCondExtraBound {
+			if ei < len(extras) {
+				x := extras[ei]
+				parts = append(parts, indexCondClause(col, saopOpText(x.Op), x.Key, reg, indexKeyColumnType(tbl, idx, 0)))
+				ei++
+			}
+			continue
+		}
+		if bi < len(baseParts) {
+			parts = append(parts, baseParts[bi])
+			bi++
+		}
+	}
+	parts = append(parts, baseParts[bi:]...)
+	return indexCondAndText(parts), len(parts)
 }

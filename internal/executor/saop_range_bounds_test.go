@@ -828,3 +828,42 @@ func TestCrossTypeIntegerLiteralIndexQual(t *testing.T) {
 		}
 	}
 }
+
+// M0148-0001c3a6 (i): PG makes every bound on the range column an index
+// clause and keeps the tightest at run time (_bt_preprocess_keys); goopg
+// probes the tightest and prints the rest (ExtraBounds) in restriction
+// order. A cross-type bound also merges behind an array. Regress
+// create_index's witnesses on PG 18.3.
+func TestRedundantRangeBoundsInIndexCond(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "create table rb (unique1 int NOT NULL, thousand int NOT NULL, tenthous int NOT NULL)")
+	runSQL(t, ctx, "create unique index rb_u on rb (unique1)")
+	runSQL(t, ctx, "create index rb_tt on rb (thousand, tenthous)")
+	runSQL(t, ctx, "insert into rb select g, g % 1000, g from generate_series(0, 9999) g")
+	runSQL(t, ctx, "VACUUM rb")
+	runSQL(t, ctx, "ANALYZE rb")
+	ps := optimizer.DefaultPlannerSettings()
+	for _, c := range []struct{ q, plan string }{
+		{"SELECT unique1 FROM rb WHERE unique1 < 3 and unique1 < (-1)::bigint",
+			"Index Only Scan using rb_u on rb\n  Index Cond: ((unique1 < 3) AND (unique1 < '-1'::bigint))"},
+		{"SELECT unique1 FROM rb WHERE unique1 IN (1, 42, 7) and unique1 < (-1)::bigint",
+			"Index Only Scan using rb_u on rb\n  Index Cond: ((unique1 = ANY ('{1,42,7}'::integer[])) AND (unique1 < '-1'::bigint))"},
+		{"SELECT * FROM rb WHERE unique1 > 5 and unique1 > 9990 and unique1 < 9995",
+			"Index Scan using rb_u on rb\n  Index Cond: ((unique1 > 5) AND (unique1 > 9990) AND (unique1 < 9995))"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+	}
+	for _, c := range []struct{ q, rows string }{
+		{"SELECT unique1 FROM rb WHERE unique1 < 3 and unique1 < (-1)::bigint", ""},
+		{"SELECT unique1 FROM rb WHERE unique1 < 3 and unique1 <= 1", "0;1"},
+		{"SELECT thousand, tenthous FROM rb WHERE thousand > -1 and thousand >= 0 AND tenthous = 3000 ORDER BY thousand", "0|3000"},
+		{"SELECT unique1 FROM rb WHERE unique1 > 5 and unique1 > 9990 and unique1 < 9995 order by 1", "9991;9992;9993;9994"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

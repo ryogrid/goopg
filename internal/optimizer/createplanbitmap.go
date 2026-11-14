@@ -195,6 +195,9 @@ func createBitmapIndexScanPlan(p *Path) Node {
 		if c.key == nil || len(c.saop) > 0 {
 			panic(fmt.Sprintf("createPlan: bitmap range clause of %s has no bound", p.IndexInfo.Name))
 		}
+		if c.redundantBound {
+			continue // the bitmap producers drop these; defensive
+		}
 		switch c.op {
 		case parser.OpGt, parser.OpGe:
 			if bis.LowKey != nil {

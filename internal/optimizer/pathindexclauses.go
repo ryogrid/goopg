@@ -152,6 +152,10 @@ type indexPathClause struct {
 	// The first comparison sits in op/key/local, the rest in saopColQuals;
 	// saop stays empty. Lowered onto TrailingSAOP with no Elems.
 	trailingQuals bool
+	// redundantBound marks a range bound the clause list's tighter bound of
+	// the same direction implies (restrictionRangeOnColumnLocal): an index
+	// clause PG prints, not a probe bound (ExtraIndexBound).
+	redundantBound bool
 }
 
 // indexPathClauses is `build_index_paths`' `index_clauses` accumulation

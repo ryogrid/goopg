@@ -12598,6 +12598,16 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Resume (i): an out-of-range equality key as an empty-result probe;
       the int2 untyped-literal rendering; the primary cross-type array
       probe. Then (f) when a witness appears.
+  - 2026-11-14 (i) slice 4 LANDED: every range bound is an index clause
+    (tightestIntBound + ExtraBounds).
+    - The tightest integer bound per direction is probed; the others print
+      in Index Cond in restriction order.
+    - Cast integer bounds merge behind an array and behind a leading
+      range.
+    Movement: yes — regress create\_index 2637→2535
+    - Resume (i): redundant bounds on bitmap scans and behind an array;
+      non-integer comparable bounds (text, numeric); out-of-range equality
+      probe; int2 literal rendering; primary cross-type array probe.
 - [x] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
   `… Backward` regress lines**.
   Kind: impl

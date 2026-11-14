@@ -370,6 +370,7 @@ func createIndexScanPlan(p *Path) Node {
 		var ioNullTest IndexNullTest
 		ioNullTestAfter := false
 		var ioExtraNullTests []ExtraIndexNullTest
+		var ioExtraBounds []ExtraIndexBound
 		var ioCondOrder []IndexCondItem
 		// M0148-0001c3a4 (h): a leading-column ScalarArrayOp, optionally
 		// bounded on the second column — IndexOnlyScan.SAOPKeys.
@@ -410,6 +411,9 @@ func createIndexScanPlan(p *Path) Node {
 			for i, r := range p.IndexClauses[at+1:] {
 				if r.indexCol != at+1 || r.key == nil || len(r.saop) > 0 || r.nullTest != IndexNullTestNone {
 					panic(fmt.Sprintf("createPlan: index-only SAOP PathIndexScan on %s: clause %d is not a bound on the column after the array", p.IndexInfo.Name, at+1+i))
+				}
+				if r.redundantBound {
+					continue // implied by the tighter bound; its conjunct stays a Filter
 				}
 				switch r.op {
 				case parser.OpGt, parser.OpGe:
@@ -453,6 +457,14 @@ func createIndexScanPlan(p *Path) Node {
 				if c.indexCol != ioSkipCol || c.key == nil || p.RequiredOuter != 0 || p.IndexSkipPrefix != 0 {
 					panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s: clause %d is not a leading-column bound",
 						p.IndexInfo.Name, i))
+				}
+				if c.redundantBound {
+					ioExtraBounds = append(ioExtraBounds, ExtraIndexBound{Op: c.op, Key: c.key})
+					ioCondOrder = append(ioCondOrder, IndexCondExtraBound)
+					if c.local != nil {
+						ioDrop[c.local] = true
+					}
+					continue
 				}
 				switch c.op {
 				case parser.OpGt, parser.OpGe:
@@ -545,6 +557,7 @@ func createIndexScanPlan(p *Path) Node {
 			ios.SkipPrefix = ioSkipCol
 			ios.LeadingNullTest, ios.NullTestAfterBounds = ioNullTest, ioNullTestAfter
 			ios.ExtraNullTests = ioExtraNullTests
+			ios.ExtraBounds = ioExtraBounds
 			if len(ioCondOrder) > 1 {
 				ios.IndexCondOrder = ioCondOrder
 			}
@@ -817,6 +830,14 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 		if c.indexCol != rangeCol || c.key == nil {
 			panic(fmt.Sprintf("createPlan: range clause %d of %s does not bound index column %d", i, p.IndexInfo.Name, rangeCol))
 		}
+		if c.redundantBound {
+			is.ExtraBounds = append(is.ExtraBounds, ExtraIndexBound{Op: c.op, Key: c.key})
+			condOrder = append(condOrder, IndexCondExtraBound)
+			if c.local != nil {
+				drop[c.local] = true
+			}
+			continue
+		}
 		switch c.op {
 		case parser.OpGt, parser.OpGe:
 			if is.LowKey != nil {
@@ -887,6 +908,9 @@ func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) N
 		}
 		if r.indexCol != np+1 || r.key == nil || len(r.saop) > 0 {
 			panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s: clause %d is not a bound on the column after the array", p.IndexInfo.Name, np+1+i))
+		}
+		if r.redundantBound {
+			continue // implied by the tighter bound; its conjunct stays a Filter
 		}
 		switch r.op {
 		case parser.OpGt, parser.OpGe:

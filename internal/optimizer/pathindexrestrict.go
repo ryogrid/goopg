@@ -276,6 +276,7 @@ func restrictionRangeOnColumnLocal(cat catalog.Catalog, tbl *catalog.Table, idx 
 	}
 	lead := idx.Columns[pos]
 	var lo, hi *indexPathClause
+	var los, his []*indexPathClause
 	for _, conj := range conjuncts {
 		bin, ok := conj.(*BinaryOp)
 		if !ok {
@@ -309,10 +310,26 @@ func restrictionRangeOnColumnLocal(cat catalog.Catalog, tbl *catalog.Table, idx 
 			if lo == nil {
 				lo = c
 			}
+			los = append(los, c)
 		default:
 			if hi == nil {
 				hi = c
 			}
+			his = append(his, c)
+		}
+	}
+	// M0148-0001c3a6 (i): PG makes every bound an index clause and
+	// _bt_preprocess_keys keeps the tightest per direction. When all of a
+	// direction's bounds are comparable integer Consts, the tightest drives
+	// the probe and the rest are redundant clauses (printed, implied).
+	// Otherwise the first stays the probe and the rest stay Filters.
+	var extra []indexPathClause
+	if withLocal {
+		if t, rest, ok := tightestIntBound(los, true); ok {
+			lo, extra = t, append(extra, rest...)
+		}
+		if t, rest, ok := tightestIntBound(his, false); ok {
+			hi, extra = t, append(extra, rest...)
 		}
 	}
 	var out []indexPathClause
@@ -321,6 +338,13 @@ func restrictionRangeOnColumnLocal(cat catalog.Catalog, tbl *catalog.Table, idx 
 	}
 	if hi != nil {
 		out = append(out, *hi)
+	}
+	if len(extra) > 0 {
+		out = append(out, extra...)
+		sort.SliceStable(out, func(i, j int) bool {
+			return conjunctPrecedes(clauseSource(out[i], conjuncts), clauseSource(out[j], conjuncts), conjuncts)
+		})
+		return out
 	}
 	// M0148-0001c3a2: one column's clauses in restriction-list order, as
 	// PG's match_clauses_to_index files them (`((a < 50) AND (a > 10))`).
@@ -1214,7 +1238,7 @@ func saopColumnQuals(cat catalog.Catalog, tbl *catalog.Table, colName string, pr
 			}
 			cr, val, colOnRight, ok := normalizeColumnIndexKey(x.Left, x.Right)
 			if !ok || cr.Index < 0 || cr.Index >= len(tbl.Columns) || tbl.Columns[cr.Index].Name != colName ||
-				!isConstExpr(val) || !restrictionKeyUsable(cat, tbl.Columns[cr.Index], val) {
+				!bitmapConstKey(val) || !restrictionKeyUsable(cat, tbl.Columns[cr.Index], val) {
 				continue
 			}
 			op := x.Op
@@ -1275,3 +1299,49 @@ func booleanIndexQual(conj Expr) (string, bool, bool) {
 	return "", false, false
 }
 
+
+// tightestIntBound picks the tightest of one direction's bounds (lower:
+// the largest value, `>` over `>=` on a tie; upper: the smallest, `<` over
+// `<=`) when there are several and every key is an integer Const; the
+// others come back flagged redundantBound.
+func tightestIntBound(bounds []*indexPathClause, lower bool) (*indexPathClause, []indexPathClause, bool) {
+	if len(bounds) < 2 {
+		return nil, nil, false
+	}
+	val := func(c *indexPathClause) (int64, bool) {
+		if ic, ok := c.key.(*IntegerConst); ok {
+			return ic.Value, true
+		}
+		if ic, ok := integerCastLiteral(c.key); ok {
+			return ic.Value, true
+		}
+		return 0, false
+	}
+	best := -1
+	var bv int64
+	for i, c := range bounds {
+		v, ok := val(c)
+		if !ok {
+			return nil, nil, false
+		}
+		strict := c.op == parser.OpGt || c.op == parser.OpLt
+		if best < 0 {
+			best, bv = i, v
+			continue
+		}
+		bstrict := bounds[best].op == parser.OpGt || bounds[best].op == parser.OpLt
+		tighter := (lower && v > bv) || (!lower && v < bv) || (v == bv && strict && !bstrict)
+		if tighter {
+			best, bv = i, v
+		}
+	}
+	var rest []indexPathClause
+	for i, c := range bounds {
+		if i != best {
+			r := *c
+			r.redundantBound = true
+			rest = append(rest, r)
+		}
+	}
+	return bounds[best], rest, true
+}

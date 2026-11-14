@@ -243,7 +243,7 @@ func (s *searchCtx) buildBitmapIndexChild(
 	if n := len(indexClauses); !saop && n > 0 && n < len(idx.Columns) {
 		var rng []indexPathClause
 		for _, c := range restrictionRangeBehindPrefix(s.cat, tbl, idx, n, conjuncts) {
-			if bitmapConstKey(c.key) {
+			if bitmapConstKey(c.key) && !c.redundantBound {
 				rng = append(rng, c)
 			}
 		}
@@ -281,7 +281,7 @@ func (s *searchCtx) buildBitmapIndexChild(
 		if rng, skip := restrictionSkipRange(s.cat, tbl, idx, conjuncts); len(rng) > 0 {
 			allConst := true
 			for _, c := range rng {
-				if !bitmapConstKey(c.key) {
+				if !bitmapConstKey(c.key) || c.redundantBound {
 					allConst = false
 				}
 			}
@@ -528,7 +528,7 @@ func matchBitmapIndexQuals(
 func bitmapLeadingRange(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) []indexPathClause {
 	var out []indexPathClause
 	for _, c := range restrictionLeadingRange(cat, tbl, idx, conjuncts) {
-		if bitmapConstKey(c.key) {
+		if bitmapConstKey(c.key) && !c.redundantBound {
 			out = append(out, c)
 		}
 	}
