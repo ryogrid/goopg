@@ -1,35 +1,30 @@
-# Working Set — loop end 2026-11-14 (census REUSE; M0148-0001c3a12 slice 1 LANDED b19957da3)
+# Working Set — loop end 2026-11-14 (census routing-20261114w IDENTICAL; M0148-0001c3a12 slice 2 LANDED 2e9e4f5d6; P0-E27 FILED)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: items 0. Nothing filed.
-- S9: REUSE at loop start (routing-20261114v). b19957da3 touches the planner and executor, so the next census is likely DUE.
-- Task: M0148-0001c3a12 (row-comparison index quals) slice 1, landed as b19957da3.
+- S9: DUE → routing-20261114w (s9db, BASELINE_REV=a7fd3bccf) IDENTICAL ×3, committed ef950c223.
+  - 2e9e4f5d6 touches the planner and executor, so the next census is likely DUE.
+- Task: M0148-0001c3a12 slice 2, landed as 2e9e4f5d6.
   - Files:
-    - pathindexrestrict.go: restrictionRowCompare, withRowCompareInConjunctOrder, rangeIndexSelectivity arm;
-    - pathindexonly.go: IOS producer + plainRestrictionBindsOnlyPrefix;
-    - pathindexclauses.go: rowCompare flag;
-    - plan.go: RowCompare/RowCompareLow, IndexCondRowCompare;
-    - createplanindex.go: lowering;
-    - selectivity.go: NULL const → 0;
-    - executor index_trailing_saop.go (multi-column trailingKeyCheck, newIndexRowCheck), operators_index.go, operators_indexonly.go;
-    - operators_explain.go: rangeCondWithRowCompare, rowCompareCondText;
-    - test TestRowCompareIndexQual.
-  - New design doc docs/design/0100-0149/0148-0001c3a12-row-compare-index-quals.md (indexed).
-  - Findings:
-    - PG prefers the BITMAP form for most row-compare witnesses (`Bitmap Heap Scan … Recheck Cond: (ROW(…) > ROW(…))`). goopg has no bitmap row compare yet, so it picks the Index Scan; rows are correct.
-    - Probe files: tmp/rc.sql (plans), tmp/rc3.sql (rows, identical to PG).
-  - Movement: create_index 2500→2483.
-- Next step: c3a12 slice 2 — the bitmap form.
-  - pathbitmap.go matchBitmapIndexQuals / leading range: file the rowCompare clause.
-  - Lower it onto BitmapIndexScan (new RowCompare field); the operators_storage.go bitmap combined predicate (~3930) gets the row check.
-  - The recheck list holds the comparison.
-  - Probe tmp/rc.sql on scratch PG 5545 vs goopg 5533.
+    - plan.go: BitmapIndexScan.RowCompare/RowCompareLow;
+    - pathbitmap.go: producer;
+    - createplanbitmap.go: lowering;
+    - operators_bitmap.go: per-entry row check;
+    - operators_storage.go: indexScanPredicate ANDs RowCompare (DML / FOR UPDATE reconstruction);
+    - operators_explain.go: bitmap Index Cond;
+    - TestRowCompareIndexQual extended with the bitmap plans.
+  - Movement: none (bitmap witnesses are not in the diffed regress suites).
+  - S2 FOUND and FILED: P0-E27 (fix_plan ~line 1445, escalation block).
+    - Parallel partial aggregation over an ORDER BY subquery (Gather, not Gather Merge) returns array_agg out of order.
+    - Repro: tk 10000 rows; parallel GUCs forced; `select md5(array_agg(ten)::text) from (select ten from tk where unique1 < 15000 order by unique1) ss` → digest differs from PG.
+    - This explains the regress arrays +13 flake (twice this session). It awaits owner placement; the loop continues with the banner.
+- Next step: c3a12 leftovers (DML index path for row compares; prefix / DESC / truncated rows) have no regress witness, so consider closing c3a12 with a transfer to c3a11 (parking) and moving to M0148-0001c3a13 (constant-NULL row elimination; create_index witness, probe file tmp/rc.sql last query).
 - Top-residual: M0148 residues. Open children: c3a7, c3a8, c3a9, c3a10, c3a11 (parked), c3a12, c3a13, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census REUSE this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
-  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26). Then M0148 in file order → c3a12.
+  - Items 0-9: M0146-0014(channel; census routing-20261114w done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26, E27 new). Then M0148 in file order → c3a12.
 - Gates run (all PASS):
   - units, tpch-spotcheck, sf025 same=99;
-  - fire-set c3a12 fires=none ×3; acceptance 24 MATCH; TestPort_Isolation ok;
-  - regress A/B tmp/regress-c3a12 vs tmp/regress-c3a6i5.
+  - fire-set c3a12b fires=none ×3; acceptance 24 MATCH;
+  - regress A/B tmp/regress-c3a12b (arrays +13 = P0-E27 flake; join ±5 flap).
 - In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped. Restarting it hits P0-E24: drop leftover partitions.
