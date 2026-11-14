@@ -185,6 +185,11 @@ type Path struct {
 	// pwFills, per child join, are the parent-layout columns the child's
 	// bare scans do not emit (tableoid) and the constant each takes.
 	pwFills []map[int]Expr
+	// pwMerge makes a PathPartitionwiseAppend a Merge Append over its
+	// children in Pathkeys order (M0148-0001c3a10 slice 5,
+	// addMergeAppendRelChildPaths); children that do not deliver the
+	// ordering are PathSort paths.
+	pwMerge bool
 	// paramSink is set, only while a nested loop lowers a parameterised join
 	// inner (createNestLoopParamJoinPlan, M0146-0049d3), on every
 	// parameterised path of that inner; createPlanNode records each

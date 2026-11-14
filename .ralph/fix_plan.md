@@ -13179,6 +13179,18 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     shape; the probe plans are PG 18.3's \(TestIndexOnlyPrefixNullTest\)
     - Resume: Merge Append over ordered children \(default partition, LIST,
       non-leading key\); multi-relation problems \(joins\).
+  - 2026-11-15 slice 5 LANDED: Merge Append over partition child rels
+    when the partitions are not ordered on the leading query key
+    \(addMergeAppendRelChildPaths: per-child startup / total / fractional
+    picks, Sort children, orderings from childOrderingPrefixes\). The
+    lowering arm moved to createplanpartitionwise.go.
+    - Default-partition, LIST and non-leading-key witnesses match PG 18.3
+      in plan, cost and values; TestMergeAppendRelChildPaths.
+    Movement: yes — regress inherit 712→692 \(inventory re-measured on this
+    build; same-suite A/B 727→707\); join 2836→2837 is the row-order flap
+    - Resume: plain Append for non-interleaved LIST partitions
+      \(partitions\_are\_ordered\); sorted children under the ordered plain
+      Append; multi-relation problems \(joins\).
 - [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
   (NULL-keyed entries)**.
   Kind: impl

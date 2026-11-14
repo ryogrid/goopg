@@ -262,3 +262,64 @@ func TestIndexOnlyPrefixNullTest(t *testing.T) {
 		}
 	}
 }
+
+// TestMergeAppendRelChildPaths is M0148-0001c3a10 slice 5: when the
+// partitions are not ordered on the query's leading key (a default partition,
+// LIST partitioning), generate_orderedappend_paths files a Merge Append of the
+// children's ordered paths — PG 18.3's plans below, min/max included.
+func TestMergeAppendRelChildPaths(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	for _, s := range []string{
+		"create table qd (a int NOT NULL, b text NOT NULL, c int NOT NULL) partition by range (a)",
+		"create table qd_1 partition of qd for values from (0) to (5000)",
+		"create table qd_2 partition of qd for values from (5000) to (10000)",
+		"create table qd_def partition of qd default",
+		"create index on qd (c, a)",
+		"insert into qd select i, 'v' || (i % 1000), i % 7 from generate_series(0, 11999) i",
+		"vacuum qd_1", "vacuum qd_2", "vacuum qd_def",
+		"analyze qd",
+		"create table ql (a int NOT NULL, b text NOT NULL, c int NOT NULL) partition by list (c)",
+		"create table ql_1 partition of ql for values in (0, 1, 2, 3)",
+		"create table ql_2 partition of ql for values in (4, 5, 6)",
+		"create index on ql (b, a)",
+		"insert into ql select i, 'v' || (i % 1000), i % 7 from generate_series(0, 9999) i",
+		"vacuum ql_1", "vacuum ql_2",
+		"analyze ql",
+	} {
+		runSQL(t, ctx, s)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	qdChildren := func(back string, indent string) string {
+		return indent + "->  Index Only Scan" + back + " using qd_1_c_a_idx on qd_1\n" + indent + "      Index Cond: (c = 3)\n" +
+			indent + "->  Index Only Scan" + back + " using qd_2_c_a_idx on qd_2\n" + indent + "      Index Cond: (c = 3)\n" +
+			indent + "->  Index Only Scan" + back + " using qd_def_c_a_idx on qd_def qd_3\n" + indent + "      Index Cond: (c = 3)"
+	}
+	for _, c := range []struct{ q, plan string }{
+		{"select a from qd where c = 3 order by a limit 2",
+			"Limit\n  ->  Merge Append\n        Sort Key: qd.a\n" + qdChildren("", "        ")},
+		{"select a from qd where c = 3 order by a desc limit 2",
+			"Limit\n  ->  Merge Append\n        Sort Key: qd.a DESC\n" + qdChildren(" Backward", "        ")},
+		{"select max(a) from qd where c = 3",
+			"Result\n  InitPlan 1\n    ->  Limit\n          ->  Merge Append\n                Sort Key: qd.a DESC\n" + qdChildren(" Backward", "                ")},
+		{"select a from ql where b = 'v12' order by a limit 2",
+			"Limit\n  ->  Merge Append\n        Sort Key: ql.a\n" +
+				"        ->  Index Only Scan using ql_1_b_a_idx on ql_1\n              Index Cond: (b = 'v12'::text)\n" +
+				"        ->  Index Only Scan using ql_2_b_a_idx on ql_2\n              Index Cond: (b = 'v12'::text)"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+	}
+	for _, c := range []struct{ q, rows string }{
+		{"select a from qd where c = 3 order by a limit 2", "3;10"},
+		{"select a from qd where c = 3 order by a desc limit 2", "11994;11987"},
+		{"select max(a), min(a) from qd where c = 3", "11994|3"},
+		{"select a from ql where b = 'v12' order by a limit 2", "12;1012"},
+		{"select a from ql where b = 'v12' order by a desc limit 3", "9012;8012;7012"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

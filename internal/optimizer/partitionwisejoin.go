@@ -2,7 +2,6 @@ package optimizer
 
 import (
 	"math/bits"
-	"sort"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -365,21 +364,25 @@ func (s *searchCtx) addAppendRelChildPaths(cat catalog.Catalog) {
 // rides: `Limit -> Append -> Index Only Scan Backward … (c = 3)`.
 func (s *searchCtx) addOrderedAppendRelChildPath(rel *RelOptInfo, so *SetOp, ps *partScheme, childRels []*RelOptInfo, fills []map[int]Expr) {
 	qk := s.queryPathkeys
-	if len(qk) == 0 || !strings.EqualFold(ps.parent.PartitionMethod, "RANGE") || len(ps.keyPos) == 0 {
+	if len(qk) == 0 || len(ps.keyPos) == 0 {
 		return
 	}
-	for _, part := range ps.parts {
-		if b, ok := ownPartitionBound(part); !ok || b.IsDefault {
+	// Every query key must be a plain column of this appendrel: the child
+	// rels' paths order by those columns only.
+	src := appendRelLeafSource(so.Output())
+	for _, pk := range qk {
+		c, ok := pk.Expr.(*ColumnRef)
+		if !ok || c.SourceTableIdx != src {
 			return
 		}
 	}
-	// The leading query key must be the partition key's (first) column.
-	cr, isCol := qk[0].Expr.(*ColumnRef)
-	keyCol := ps.parent.Columns[ps.keyPos[0]].Name
-	if !isCol || !strings.EqualFold(cr.Name, keyCol) {
-		return
-	}
-	if out := so.Output(); len(out) > 0 && cr.SourceTableIdx != appendRelLeafSource(out) {
+	if !rangePartitionsOrderedOn(ps, qk[0].Expr.(*ColumnRef)) {
+		// Not partitions_are_ordered on the leading key: the ordering is a
+		// Merge Append of the children (slice 5), for every useful ordering
+		// a child delivers.
+		for _, keys := range childOrderingPrefixes(childRels, qk) {
+			s.addMergeAppendRelChildPaths(rel, so, childRels, fills, keys)
+		}
 		return
 	}
 	backward := !qk[0].SortAsc
@@ -412,6 +415,159 @@ func (s *searchCtx) addOrderedAppendRelChildPath(rel *RelOptInfo, so *SetOp, ps 
 	pa.pwFills = ofills
 	pa.Pathkeys = qk
 	addPath(rel, pa, "appendrel-children.ordered")
+}
+
+// rangePartitionsOrderedOn is partitions_are_ordered plus
+// build_partition_pathkeys' leading-key test for the shapes goopg recognises:
+// a RANGE partitioned table with no default partition whose (first)
+// partition key column is col.
+func rangePartitionsOrderedOn(ps *partScheme, col *ColumnRef) bool {
+	if !strings.EqualFold(ps.parent.PartitionMethod, "RANGE") {
+		return false
+	}
+	for _, part := range ps.parts {
+		if b, ok := ownPartitionBound(part); !ok || b.IsDefault {
+			return false
+		}
+	}
+	return strings.EqualFold(col.Name, ps.parent.Columns[ps.keyPos[0]].Name)
+}
+
+// addMergeAppendRelChildPaths is generate_orderedappend_paths' Merge Append
+// arm (allpaths.c) for the query ordering qk over a partitioned table's child
+// rels when the partitions are not ordered on it (a default partition, LIST,
+// a non-leading partition key). Per child it takes the cheapest-startup and
+// cheapest-total paths delivering qk — or, when the child has none, its
+// cheapest-total path, sorted (create_merge_append_path) — and under a LIMIT
+// the cheapest fractional one too; it files the startup Merge Append, the
+// total one when they differ, and the fractional one. As all_child_pathkeys
+// only proposes orderings some child delivers, it declines when no child
+// does. M0148-0001c3a10 slice 5.
+func (s *searchCtx) addMergeAppendRelChildPaths(rel *RelOptInfo, so *SetOp, childRels []*RelOptInfo, fills []map[int]Expr, qk []PathKey) {
+	n := len(childRels)
+	startup, total := make([]*Path, n), make([]*Path, n)
+	var fractional []*Path
+	if s.tupleFraction > 0 {
+		fractional = make([]*Path, n)
+	}
+	anyOrdered, neq := false, false
+	for j, c := range childRels {
+		st := getCheapestPathForPathkeys(c.Pathlist, qk, startupCost)
+		tt := getCheapestPathForPathkeys(c.Pathlist, qk, totalCost)
+		if st == nil || tt == nil {
+			st = cheapestUnparameterized(c)
+			tt = st
+		} else {
+			anyOrdered = true
+		}
+		if st == nil {
+			return
+		}
+		if fractional != nil {
+			f := s.tupleFraction
+			if f >= 1 && tt.Rows > 0 {
+				f /= tt.Rows
+			}
+			fr := cheapestFractionalPathForPathkeys(c.Pathlist, qk, f)
+			if fr == nil {
+				fr = tt
+			}
+			fractional[j] = fr
+		}
+		if st != tt {
+			neq = true
+		}
+		startup[j], total[j] = st, tt
+	}
+	if !anyOrdered {
+		return
+	}
+	addPath(rel, s.mergeAppendRelChildPath(rel, so, startup, fills, qk), "appendrel-children.merge")
+	if neq {
+		addPath(rel, s.mergeAppendRelChildPath(rel, so, total, fills, qk), "appendrel-children.merge")
+	}
+	if fractional != nil {
+		addPath(rel, s.mergeAppendRelChildPath(rel, so, fractional, fills, qk), "appendrel-children.merge")
+	}
+}
+
+// mergeAppendRelChildPath is create_merge_append_path over subs: a child not
+// already in qk order gets a Sort, bounded by the query's LIMIT as the rel is
+// the whole query (pathnode->limit_tuples), and cost_merge_append prices the
+// merge over the children's startup and total costs.
+func (s *searchCtx) mergeAppendRelChildPath(rel *RelOptInfo, so *SetOp, subs []*Path, fills []map[int]Expr, qk []PathKey) *Path {
+	limit := -1.0
+	if s.tupleFraction >= 1 {
+		limit = s.tupleFraction
+	}
+	children := make([]*Path, len(subs))
+	var st, tt, rows float64
+	disabled := 0
+	for j, p := range subs {
+		if !pathkeysContainedIn(p.Pathkeys, qk) {
+			p = sortPathForBounded(p, qk, s.cp, limit)
+		}
+		children[j] = p
+		st += p.Cost.Startup
+		tt += p.Cost.Total
+		rows += p.Rows
+		disabled += p.DisabledNodes
+	}
+	pa := newPartitionwiseAppendPath(rel, children, s.cp)
+	pa.Cost = mergeAppendCost(s.cp, len(children), rows, st, tt)
+	pa.DisabledNodes = disabled
+	pa.Pathkeys = qk
+	pa.pwMerge = true
+	pa.pwParents = []*SetOp{so}
+	pa.pwFills = append([]map[int]Expr(nil), fills...)
+	return pa
+}
+
+// childOrderingPrefixes is all_child_pathkeys (add_paths_to_append_rel,
+// allpaths.c) cut to what the one-relation query can use: each distinct
+// leading part of qk some child's unparameterised path delivers. A Merge
+// Append on a strict prefix leaves the rest of the ORDER BY to an Incremental
+// Sort above it (PG's `Presorted Key: pm.a` over `Merge Append`).
+func childOrderingPrefixes(childRels []*RelOptInfo, qk []PathKey) [][]PathKey {
+	seen := make([]bool, len(qk)+1)
+	for _, c := range childRels {
+		for _, p := range c.Pathlist {
+			if p == nil || p.RequiredOuter != 0 {
+				continue
+			}
+			n := 0
+			for n < len(p.Pathkeys) && n < len(qk) && pathKeyEqual(p.Pathkeys[n], qk[n]) {
+				n++
+			}
+			seen[n] = true
+		}
+	}
+	var out [][]PathKey
+	for n := len(qk); n > 0; n-- {
+		if seen[n] {
+			out = append(out, qk[:n])
+		}
+	}
+	return out
+}
+
+// cheapestFractionalPathForPathkeys is
+// get_cheapest_fractional_path_for_pathkeys (pathkeys.c): the unparameterised
+// path delivering keys that is cheapest to fetch fraction of its rows from.
+func cheapestFractionalPathForPathkeys(paths []*Path, keys []PathKey, fraction float64) *Path {
+	var best *Path
+	for _, p := range paths {
+		if p == nil || p.RequiredOuter != 0 {
+			continue
+		}
+		if best != nil && compareFractionalPathCosts(best, p, fraction) <= 0 {
+			continue
+		}
+		if pathkeysContainedInRel(p.Rel, p.Pathkeys, keys) {
+			best = p
+		}
+	}
+	return best
 }
 
 // appendRelLeafSource is the binding id an appendrel's output columns carry.
@@ -507,63 +663,6 @@ func newPartitionwiseAppendPath(joinrel *RelOptInfo, children []*Path, cp costPa
 	p.Cost.Total = total + cp.cpuTupleCost*appendCPUCostMultiplier*rows
 	p.DisabledNodes = disabled
 	return p
-}
-
-// createPartitionwiseAppendPlan is the Append over the child join plans, as
-// the UNION ALL chain goopg's appendrels use. Every child join emits the
-// parent join's layout, so the first child's layout is the Append's.
-func createPartitionwiseAppendPlan(p *Path) (Node, outputLayout) {
-	// Every child join is planned first: each elects its own inner and
-	// outer and may narrow its output to what the parent needs, so the
-	// children can publish different column subsets in different orders.
-	// The Append's layout is the coordinates EVERY child provides (a
-	// column some child dropped is not needed above the join — narrowing
-	// only drops unneeded columns) plus the tableoid columns a bare child
-	// scan fills, in binding order, as PG's child join target lists follow
-	// the parent joinrel's. Each child is then projected to exactly that.
-	nodes := make([]Node, len(p.Children))
-	lays := make([]outputLayout, len(p.Children))
-	count := map[int]int{}
-	for i, c := range p.Children {
-		nodes[i], lays[i] = createPlanNode(c)
-		seen := map[int]bool{}
-		for _, coord := range lays[i] {
-			seen[coord] = true
-		}
-		if i < len(p.pwFills) {
-			for coord := range p.pwFills[i] {
-				seen[coord] = true
-			}
-		}
-		for coord := range seen {
-			count[coord]++
-		}
-	}
-	var lay outputLayout
-	for coord, n := range count {
-		if n == len(p.Children) {
-			lay = append(lay, coord)
-		}
-	}
-	sort.Ints(lay)
-	schemaFor := p.pwFillSchema()
-	var root Node
-	for i, n := range nodes {
-		var fill map[int]Expr
-		if i < len(p.pwFills) {
-			fill = p.pwFills[i]
-		}
-		n = reorderToLayout(n, lays[i], lay, fill, schemaFor)
-		if root == nil {
-			root = n
-			continue
-		}
-		root = &SetOp{Left: root, Right: n, All: true}
-	}
-	if so, ok := root.(*SetOp); ok {
-		so.PartitionwiseParents = p.pwParents
-	}
-	return root, lay
 }
 
 // reorderToLayout makes a child join emit want's column order. Each child

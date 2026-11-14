@@ -137,12 +137,59 @@ Status: slices 1\-3 landed 2026\-11\-15. Parent: M0148\-0001c3a5.
   both runs; the standalone `join` gives 2685 twice\). TPC\-H and TPC\-DS
   are unchanged.
 
+## Slice 5 — Merge Append over the partitions' ordered paths \(landed\)
+
+- When the partitions are not ordered on the query's leading key, the child
+  rels now give the ordering through a Merge Append. That covers a default
+  partition, LIST partitioning and a non\-leading partition key.
+  - The new function is `addMergeAppendRelChildPaths` \(partitionwisejoin.go\),
+    PG's generate\_orderedappend\_paths Merge Append arm.
+  - The ordered RANGE case keeps slice 3's plain Append
+    \(`rangePartitionsOrderedOn`\).
+- Orderings \(`childOrderingPrefixes`\): each leading part of the query
+  ordering that some child's unparameterised path delivers. This is
+  all\_child\_pathkeys cut to what a one\-relation query can use. A strict
+  prefix leaves the rest of the ORDER BY to an Incremental Sort above the
+  merge \(`Presorted Key: pm.a`\).
+- Child selection, per child, matching PG:
+  - the cheapest\-startup and the cheapest\-total path that deliver the
+    ordering;
+  - when no path delivers it, the cheapest\-total path under a Sort. The
+    Sort is bounded by the LIMIT, because the rel is the whole query
+    \(create\_merge\_append\_path's limit\_tuples\);
+  - under a LIMIT, also the cheapest fractional path
+    \(`cheapestFractionalPathForPathkeys`\).
+- Paths filed: the startup Merge Append; the total one when the two differ;
+  and the fractional one. All are priced by `mergeAppendCost`
+  \(cost\_merge\_append\).
+- The path is a `PathPartitionwiseAppend` with `pwMerge`. Its lowering
+  \(moved to createplanpartitionwise.go, inside the lowering walk\) puts
+  `MergeKeys`, translated against the Append's layout, on every link of the
+  UNION ALL chain. That is goopg's existing Merge Append operator.
+- Witnesses: `select a from pd where c = 3 order by a limit 2` with a default
+  partition, its DESC and min/max forms, the LIST and non\-leading\-key
+  tables, a child without an ordered index \(Sort child\), and `order by
+  a, b` \(Incremental Sort\).
+  - These match PG 18.3 in plan and values; costs match exactly.
+  - `TestMergeAppendRelChildPaths` pins four plans and five value checks.
+- Regress: inherit 727→707 \(standalone 712→692\). The mclparted /
+  mcrparted `Merge Append` plans now match PG, apart from plan\-time
+  pruning. join 2836→2837 is the known row\-order flap.
+
+### Not covered by slice 5
+
+- LIST partitions that partitions\_are\_ordered accepts \(no interleaving,
+  no default\) still take the Merge Append, where PG uses a plain Append.
+- The ordered plain Append still declines when a child has no ordered path,
+  where PG appends the child under a Sort.
+- A trailing ORDER BY key pinned to a constant \(`order by a desc, b` with
+  `b = 'v12'`\) is not dropped from the query pathkeys. PG drops it, so its
+  index path delivers the ordering. This also happens on plain tables.
+
 ## Not covered
 
 - Multi\-relation problems: inside a join the Append's columns still reach
   EXPLAIN key chases and parameterised quals that are not yet taught about
   it \(partition\_join regressed when allowed\).
-- Ordered children under a Merge Append \(a default partition, a
-  non\-leading partition key, LIST / HASH\).
 - Sub\-partitioned and expression\-keyed tables
   \(no partition scheme\); plan\-time pruning \(M0148\-0001k1 \(b\)\).
