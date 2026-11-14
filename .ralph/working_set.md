@@ -1,35 +1,36 @@
-# Working Set — loop end 2026-11-14 (census routing-20261114i IDENTICAL; c3a4 closed → c3a6; M0148-0001c3a5 item (d) landed 691fa2a27)
+# Working Set — loop end 2026-11-14 (census routing-20261114j IDENTICAL; M0148-0001c3a5 item (d) slice 2 landed 7321485a7)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: run 20261114-050038 items: 0. Nothing filed.
-- S9: DUE at loop start → routing-20261114i (label s9cn, BASELINE_REV=f7e010c4b) IDENTICAL ×3, committed (+ a commit-hash correction).
-  - 691fa2a27 is a code commit, so the next loop should get DUE. Capture with BASELINE_REV=73eb342b2 (capture head of routing-20261114i); expect IDENTICAL.
-- M0148-0001c3a4 closed [x].
-  - (f) has no witness (no regress / corpus parameterized BitmapOr).
-  - (f) and the (i) residue moved to the new M0148-0001c3a6.
-- Task: M0148-0001c3a5 (c3a3 residue). (d) landed; open: the (d) residue (`b = true` simplification + boolean selectivity), (a) ordered Append over partitions, (b) fractional partitionwise join, (c) row-comparison index quals.
-- Files (d):
-  - optimizer/pathindexrestrict.go: booleanIndexQual, restrictionEqualityOn, restrictionKeyUsable.
-  - pathkeysindex.go: addConstEquatedColumns, constEquatedColumn, constIndexColumn; buildIndexPathkeys skip.
-  - pathindexonly.go / pathindexordered.go: wiring.
-  - exprwalk_inventory_test.go: pin booleanIndexQual.
-  - Test: TestBooleanIndexQualAndConstantPrefixPathkeys.
-  - Design doc: docs/design/0100-0149/0148-0001c3a5-backward-plan-residue.md (new, indexed).
+- S9: DUE at loop start → routing-20261114j (label s9co, BASELINE_REV=73eb342b2) IDENTICAL ×3, committed.
+  - 7321485a7 is a code commit, so the next loop should get DUE. Capture with BASELINE_REV=13ed065fb (capture head of routing-20261114j).
+  - Expect IDENTICAL (fire-set fires=none ×3). The bare-column qual paren change shows only where a bool Var is a qual.
+- Task: M0148-0001c3a5 (c3a3 residue). (d) done (slices 1-2). Open: (c) row-comparison index quals, (a) ordered Append over partitions + min/max, (b) fractional partitionwise join.
+- Files (d slice 2):
+  - optimizer/foldconst.go: simplifyBooleanEquality; NOT NOT fold.
+  - selectivity.go: ColumnRef bool arm, boolVarSelectivity, booltest no-stats branch, defaultUnknownSel.
+  - selectivity_test.go: TestBoolTestSelectivityDefaults updated to PG semantics.
+  - executor/operators_explain.go: qualText (21 sites).
+  - Design doc: docs/design/0100-0149/0148-0001c3a5-backward-plan-residue.md (slice 2 section).
 - Findings:
-  - The unit fixture cluster keeps no NULL-keyed index entries: a probe leaving a nullable key column unbound is refused there (looks like a cost loss). Use NOT NULL columns in fixture tests.
-  - PG's simplify_boolean_equality (`b = true` → `b`) and boolvarsel's 0.5 are what make the `b = true ... order by i desc` case pick the Index Scan Backward.
-- Next step: S9 census (DUE). Then the c3a5 (d) residue: fold `boolcol = true/false` (foldconst.go) and port boolvarsel / booltestsel in clauseSelectivity; or (c) row-comparison index quals.
+  - Selectivity changes need the TestPort_Isolation family (memory). It ran (~9 min) and passed.
+  - goopg printed `Filter: (b)` for any bare boolean qual. PG prints `Filter: b`. Now fixed everywhere.
+- Next step: S9 census (DUE). Then c3a5 (c): row-comparison index quals.
+  - Case: btree_index `(proname, pronamespace) > ('abs', 0)` → `Index Cond: (ROW(proname, pronamespace) > ROW('abs'::name, '0'::oid))` on pg_proc.
+  - PG mechanism: indxpath.c match_rowcompare_to_indexcol / expand_indexqual_rowcompare.
+  - Or (a).
 - Top-residual: M0148 residues. Open children: c3a5, c3a6, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261114i done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261114j done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a5.
 - Gates run (all PASS):
-  - census s9cn IDENTICAL ×3.
-  - units (first run caught an unpinned booleanIndexQual; pinned).
+  - census s9co IDENTICAL ×3.
+  - units.
   - tpch-spotcheck.
   - sf025 99/99.
-  - fire-set c3a5dfs fires=none ×3.
+  - fire-set c3a5efs fires=none ×3.
   - acceptance 24 MATCH.
-  - regress create_index 2801→2750.
+  - TestPort_Isolation family ok.
+  - regress: create_index 2750→2727, partition_prune 6783→6778.
   - pgbench smoke.
 - In-flight: none. Scratch PG (5545) RUNNING; goopg probe server (5533) stopped.

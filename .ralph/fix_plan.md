@@ -12601,12 +12601,14 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
       restriction pins (build\_index\_pathkeys' redundant pathkeys).
     - Design: docs/design/0100-0149/0148-0001c3a5-backward-plan-residue.md.
     Movement: yes — regress create\_index 2801→2750
-  - (d) still open: `b = true` written out. PG simplifies it to `b`
-    (simplify\_boolean\_equality) and prices it with boolvarsel (0.5);
-    goopg prices it with the 0.005 equality default, so a bitmap + Sort
-    wins. Boolean selectivity is 1/3 vs PG's 0.5 / var\_eq\_const.
-  - Resume: (d) residue (simplify\_boolean\_equality in foldconst +
-    boolvarsel / booltestsel), then (a).
+  - 2026-11-14 (d) slice 2 LANDED: `b = true` → `b` and `NOT NOT x` → `x`
+    (simplify\_boolean\_equality, negate\_clause).
+    - boolvarsel / booltestsel without statistics.
+    - A bare-column qual prints `Filter: b`.
+    - The isolation family passes.
+    Movement: yes — regress create\_index 2750→2727, partition\_prune
+    6783→6778
+  - Resume: (c) row-comparison index quals, then (a).
 - [x] **M0148-0001c3c — DROP VIEW / DROP INDEX / RENAME after a restart
   fail "does not exist"**.
   Kind: impl
