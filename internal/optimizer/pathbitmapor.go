@@ -157,8 +157,15 @@ func orEqualitySAOP(cat catalog.Catalog, tbl *catalog.Table, colName string, con
 			return nil, false
 		}
 		c, val, _, ok := normalizeColumnIndexKey(ab.Left, ab.Right)
+		// M0148-0001c3a6 (i): a cross-type integer Const (`3::int8`) is a
+		// key too; group_similar_or_args has already kept one type per OR.
 		if !ok || c.Index < 0 || c.Index >= len(tbl.Columns) || tbl.Columns[c.Index].Name != colName ||
-			!isConstExpr(val) || !restrictionKeyUsable(cat, tbl.Columns[c.Index], val) {
+			!bitmapConstKey(val) || !restrictionKeyUsable(cat, tbl.Columns[c.Index], val) {
+			return nil, false
+		}
+		// match_orclause_to_indexcol: every constant of one type (one
+		// operator) — `1::int2 OR 3::int8` is not one array.
+		if len(elems) > 0 && keyTypeTag(val) != keyTypeTag(elems[0]) {
 			return nil, false
 		}
 		cr = c

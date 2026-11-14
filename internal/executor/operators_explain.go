@@ -6788,6 +6788,12 @@ func inListArrayConst(lt catalog.Type, list []optimizer.Expr) (cast, lit string,
 	if lt.IsArray {
 		return "", "", false
 	}
+	// M0148-0001c3a6 (i): an OR of `col = 3::int8` arms converted to an array
+	// (match_orclause_to_indexcol) is an array of the Consts' own type,
+	// `'{3,42}'::bigint[]`, compared by the cross-type operator.
+	if t, vals, ok := sameTypeIntCastList(list); ok {
+		return "", "'{" + strings.Join(vals, ",") + "}'::" + t + "[]", true
+	}
 	elems := make([]string, len(list))
 	ints := func(wide bool) bool {
 		for i, e := range list {
@@ -9775,4 +9781,33 @@ func explainAggProjectionOutput(n optimizer.Node, reg *subPlanReg, qualify bool)
 		}
 	}
 	return out, true
+}
+
+// sameTypeIntCastList reports a list of explicit casts of integer literals,
+// all to one integer type, with the type's display name and the values.
+func sameTypeIntCastList(list []optimizer.Expr) (string, []string, bool) {
+	if len(list) == 0 {
+		return "", nil, false
+	}
+	display := map[string]string{"int2": "smallint", "smallint": "smallint", "int4": "integer", "int": "integer",
+		"integer": "integer", "int8": "bigint", "bigint": "bigint"}
+	typ := ""
+	vals := make([]string, 0, len(list))
+	for _, e := range list {
+		c, ok := e.(*optimizer.CastExpr)
+		if !ok || !c.Explicit || c.Typmod != 0 {
+			return "", nil, false
+		}
+		ic, isInt := c.Operand.(*optimizer.IntegerConst)
+		if !isInt {
+			return "", nil, false
+		}
+		t, known := display[strings.ToLower(c.TargetType)]
+		if !known || (typ != "" && t != typ) {
+			return "", nil, false
+		}
+		typ = t
+		vals = append(vals, strconv.FormatInt(ic.Value, 10))
+	}
+	return typ, vals, true
 }

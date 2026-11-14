@@ -12590,6 +12590,14 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Resume (i): group\_similar\_or\_args (per-type `= ANY` OR arms); an
       out-of-range equality key as an empty-result probe; the int2
       untyped-literal rendering.
+  - 2026-11-14 (i) slice 3 LANDED: an OR group of one cast integer type
+    becomes `= ANY ('{3,42}'::bigint[])` (orEqualitySAOP admits cast
+    Consts and requires one constant type).
+    - The create\_index mixed-type BitmapOr witness is identical to PG.
+    Movement: yes — regress create\_index 2664→2637
+    - Resume (i): an out-of-range equality key as an empty-result probe;
+      the int2 untyped-literal rendering; the primary cross-type array
+      probe. Then (f) when a witness appears.
 - [x] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
   `… Backward` regress lines**.
   Kind: impl

@@ -804,6 +804,14 @@ func TestCrossTypeIntegerLiteralIndexQual(t *testing.T) {
 			"Bitmap Heap Scan on mo\n  Recheck Cond: ((thousand = 42) AND (tenthous > '5000'::bigint))\n  ->  Bitmap Index Scan on mo_tt\n        Index Cond: ((thousand = 42) AND (tenthous > '5000'::bigint))"},
 		{"select * from mo where tenthous = 1::int2 or pad = 'y'",
 			"Seq Scan on mo\n  Filter: ((tenthous = '1'::smallint) OR (pad = 'y'::text))"},
+		// group_similar_or_args + match_orclause_to_indexcol: one array per
+		// constant type (regress create_index's tenk1 witness).
+		{"select * from mo where thousand = 42 and (tenthous = 1::int2 or tenthous = 3::int8 or tenthous = 42::int8)",
+			"Bitmap Heap Scan on mo\n" +
+				"  Recheck Cond: (((thousand = 42) AND (tenthous = '1'::smallint)) OR ((thousand = 42) AND ((tenthous = '3'::bigint) OR (tenthous = '42'::bigint))))\n" +
+				"  Filter: ((tenthous = '1'::smallint) OR (tenthous = '3'::bigint) OR (tenthous = '42'::bigint))\n" +
+				"  ->  BitmapOr\n        ->  Bitmap Index Scan on mo_tt\n              Index Cond: ((thousand = 42) AND (tenthous = '1'::smallint))\n" +
+				"        ->  Bitmap Index Scan on mo_tt\n              Index Cond: ((thousand = 42) AND (tenthous = ANY ('{3,42}'::bigint[])))"},
 	} {
 		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
 			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
@@ -813,6 +821,7 @@ func TestCrossTypeIntegerLiteralIndexQual(t *testing.T) {
 		{"select tenthous from mo where thousand = 42 and tenthous = 3042::int8", "3042"},
 		{"select count(*) from mo where thousand = 42 and tenthous > 5000::int8", "5"},
 		{"select count(*) from mo where thousand = 42 and tenthous = 9999999999::int8", "0"},
+		{"select tenthous from mo where thousand = 42 and (tenthous = 1::int2 or tenthous = 3042::int8 or tenthous = 5042::int8) order by 1", "3042;5042"},
 	} {
 		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
 			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
