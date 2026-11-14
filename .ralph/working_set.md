@@ -1,31 +1,30 @@
-# Working Set — loop end 2026-11-14 (census routing-20261114t IDENTICAL; M0148-0001c3a6 (i) slice 4 LANDED 081b8fea0)
+# Working Set — loop end 2026-11-14 (census routing-20261114u IDENTICAL; M0148-0001c3a6 (i) slice 5 LANDED 6c603dd22)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: items 0. Nothing filed.
-- S9: DUE → routing-20261114t (s9cy, BASELINE_REV=4c13945ea) IDENTICAL ×3, committed f2446d48d.
-  - 081b8fea0 touches the planner, so the next census is likely DUE.
-- Task: M0148-0001c3a6 item (i) slice 4, landed as 081b8fea0.
+- S9: DUE → routing-20261114u (s9cz, BASELINE_REV=f3f880c38) IDENTICAL ×3, committed 0f17474f0.
+  - 6c603dd22 touches the planner, so the next census is likely DUE.
+- Task: M0148-0001c3a6 item (i) slice 5, landed as 6c603dd22.
   - Files:
-    - pathindexrestrict.go: tightestIntBound, redundant clauses in restrictionRangeOnColumnLocal, saopColumnQuals cast bounds;
-    - pathindexonly.go: trailingColumnQuals cast bounds;
-    - pathindexclauses.go: redundantBound;
-    - plan.go: ExtraIndexBound, IndexCondExtraBound, IndexScan/IOS.ExtraBounds;
-    - createplanindex.go and createplanbitmap.go: lowering / skips;
-    - pathbitmap.go: drops redundant clauses;
-    - operators_explain.go: rangeCondWithExtraBounds;
-    - test TestRedundantRangeBoundsInIndexCond.
+    - pathindexrestrict.go: saopColumnQuals OpEq + EC ordering, equalityMergedIntoLeadingSAOP;
+    - pathindexonly.go and pathbitmap.go: call the helper;
+    - test TestEqualityMergedIntoLeadingArray.
   - Findings:
-    - Test data matters again: PG plans Seq Scan + Sort for `thousand > -1 and thousand >= 0 and tenthous = 3000` on the 10k-row fixture, so that case was replaced with the triple unique1 bound, which PG indexes.
-  - Movement: create_index 2637→2535.
-- Next step: c3a6 (i) leftovers.
-  - Check regress diffs for witnesses: redundant bounds on bitmap scans or behind arrays (grep create_index.diff for `Recheck Cond:.*AND.*<` pairs on one column), non-integer redundant bounds, out-of-range equality probe, int2 literal rendering.
-  - If no witness remains, close (i) and look at (f) join OR bitmaps; otherwise go to c3a9 / c3a10 / c3a8 / c3a7 in file order.
+    - PG prints `col = const` after the array even when written first: the EquivalenceClass equality is regenerated last.
+  - Movement: create_index 2535→2500.
+- Next step: remaining create_index Index Cond witnesses (`grep -n "^-  *Index Cond" tmp/regress-c3a6i5/create_index.diff`). Candidates:
+  - multi-column `thousand IN … AND thousand = 42 AND tenthous = 42` (equality behind the array);
+  - `tenthous = ANY (ARRAY[1, (InitPlan 1).col1, 42])` (a non-const array element);
+  - `(f1 >= 'WA') AND (f1 <= 'ZZZ') AND (id < 1000) AND (f1 ~<~ 'YX')` (text pattern ops);
+  - ROW comparisons (row-compare index quals — c3a5 (c) blocked on c3a7, but this one is tenk1, not pg_proc!);
+  - gist / gin operator classes (out of scope).
+  - The ROW one (`ROW(thousand, tenthous) > ROW(NULL::integer, 5)`, create_index) may be the next counted move. Check whether it is (i)-scope or belongs to a new task.
 - Top-residual: M0148 residues. Open children: c3a6, c3a7, c3a8, c3a9, c3a10, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261114t done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261114u done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26). Then M0148 in file order → c3a6.
 - Gates run (all PASS):
   - units, tpch-spotcheck, sf025 same=99;
-  - fire-set c3a6d fires=none ×3; acceptance 24 MATCH; TestPort_Isolation ok (652s);
-  - regress A/B tmp/regress-c3a6i4 vs tmp/regress-c3a6i3.
+  - fire-set c3a6e fires=none ×3; acceptance 24 MATCH; TestPort_Isolation ok;
+  - regress A/B tmp/regress-c3a6i5 vs tmp/regress-c3a6i4.
 - In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped. Restarting it hits P0-E24: drop leftover partitions.
