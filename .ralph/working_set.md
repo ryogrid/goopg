@@ -1,32 +1,35 @@
-# Working Set — loop end 2026-11-14 (census routing-20261114h IDENTICAL; M0148-0001c3a4 item (e) landed 9394bbc7b)
+# Working Set — loop end 2026-11-14 (census routing-20261114i IDENTICAL; c3a4 closed → c3a6; M0148-0001c3a5 item (d) landed 691fa2a27)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: run 20261114-050038 items: 0. Nothing filed.
-- S9: DUE at loop start → routing-20261114h (label s9cm, BASELINE_REV=3ab65d690) IDENTICAL ×3, committed.
-  - 9394bbc7b is a code commit, so the next loop should get DUE. Capture with BASELINE_REV=f7e010c4b (capture head of routing-20261114h); expect IDENTICAL (fire-set fires=none ×3).
-- Task: M0148-0001c3a4. Done: (a)-(e), (g), (h), (i) slices 1-5, (j). Open: (f) join OR bitmap paths; the low-value (i) residue.
-- Files (e):
-  - optimizer/pathbitmap.go: partialPredicateProvenBy → predicateImpliedBy.
-  - pathbitmapor.go: operatorPredicateProof + btreeImplication + nameComparison; arm subqual site.
-  - partial_index_implied_quals.go, planner.go: prover sites.
-  - createplanbitmap.go: Recheck predicate order + implied skip.
-  - Test: TestPartialIndexPredicateProof.
+- S9: DUE at loop start → routing-20261114i (label s9cn, BASELINE_REV=f7e010c4b) IDENTICAL ×3, committed (+ a commit-hash correction).
+  - 691fa2a27 is a code commit, so the next loop should get DUE. Capture with BASELINE_REV=73eb342b2 (capture head of routing-20261114i); expect IDENTICAL.
+- M0148-0001c3a4 closed [x].
+  - (f) has no witness (no regress / corpus parameterized BitmapOr).
+  - (f) and the (i) residue moved to the new M0148-0001c3a6.
+- Task: M0148-0001c3a5 (c3a3 residue). (d) landed; open: the (d) residue (`b = true` simplification + boolean selectivity), (a) ordered Append over partitions, (b) fractional partitionwise join, (c) row-comparison index quals.
+- Files (d):
+  - optimizer/pathindexrestrict.go: booleanIndexQual, restrictionEqualityOn, restrictionKeyUsable.
+  - pathkeysindex.go: addConstEquatedColumns, constEquatedColumn, constIndexColumn; buildIndexPathkeys skip.
+  - pathindexonly.go / pathindexordered.go: wiring.
+  - exprwalk_inventory_test.go: pin booleanIndexQual.
+  - Test: TestBooleanIndexQualAndConstantPrefixPathkeys.
+  - Design doc: docs/design/0100-0149/0148-0001c3a5-backward-plan-residue.md (new, indexed).
 - Findings:
-  - Design doc split under D3 (800 lines): part 2 = docs/design/0100-0149/0148-0001c3a4-scalararrayop-index-residue-part2.md, indexed. Append c3a4 sections THERE.
-  - Regress run order matters: select needs create_index first, which creates onek2's partial indexes. A select-first run reverts every partial-index plan.
-  - select's remaining diff: the IOS over a proven partial index (M0148-0001c3b item 1, next in file order after c3a5); `Index Searches` in EXPLAIN ANALYZE; list_parted One-Time Filter.
-- Next step: S9 census (DUE). Then (f) join OR bitmap paths (bitjoinpaths); or, if (f) proves large, close c3a4 to its (f)+(i) residue and move to M0148-0001c3a5 (d) (boolean index quals / constant-prefix Sort).
-- Top-residual: M0148 residues. Open children: c3a4, c3a5, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
+  - The unit fixture cluster keeps no NULL-keyed index entries: a probe leaving a nullable key column unbound is refused there (looks like a cost loss). Use NOT NULL columns in fixture tests.
+  - PG's simplify_boolean_equality (`b = true` → `b`) and boolvarsel's 0.5 are what make the `b = true ... order by i desc` case pick the Index Scan Backward.
+- Next step: S9 census (DUE). Then the c3a5 (d) residue: fold `boolcol = true/false` (foldconst.go) and port boolvarsel / booltestsel in clauseSelectivity; or (c) row-comparison index quals.
+- Top-residual: M0148 residues. Open children: c3a5, c3a6, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261114h done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
-  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a4.
+  - Items 0-9: M0146-0014(channel; census routing-20261114i done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a5.
 - Gates run (all PASS):
-  - census s9cm IDENTICAL ×3.
-  - units.
+  - census s9cn IDENTICAL ×3.
+  - units (first run caught an unpinned booleanIndexQual; pinned).
   - tpch-spotcheck.
   - sf025 99/99.
-  - fire-set c3a4efs fires=none ×3.
+  - fire-set c3a5dfs fires=none ×3.
   - acceptance 24 MATCH.
-  - regress: select 256→45; join (j2_id1_idx now used, as PG does); rowsecurity pointer noise.
+  - regress create_index 2801→2750.
   - pgbench smoke.
 - In-flight: none. Scratch PG (5545) RUNNING; goopg probe server (5533) stopped.

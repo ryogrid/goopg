@@ -12394,7 +12394,7 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
   - The 21 PG `… Backward` lines left are other features, filed as
     M0148-0001c3a5.
   Movement: yes — regress create\_index 3143→3137, join 17655→17626
-- [ ] **M0148-0001c3a4 — c3a2 residue: inequality OR groups, OR→SAOP
+- [x] **M0148-0001c3a4 — c3a2 residue: inequality OR groups, OR→SAOP
   behind a prefix on plain paths, SAOP + range, sub-ORs in AND arms,
   useful\_predicate, join OR bitmap paths, bitmap node cost line**.
   Kind: impl
@@ -12549,9 +12549,27 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - The Recheck Cond lists the index quals before the predicate.
     - Probe against PG: 4 plans identical.
     Movement: yes — regress select 256→45
-  - Resume: (f) join OR bitmap paths; the
-    (i) residue (a lone empty array, cross-type literals, index-only width,
-    index-only prefix + range) is low-value.
+  - 2026-11-14 CLOSED: (a)-(e), (g), (h), (i) slices 1-5, (j) landed.
+    - (f) and the (i) residue move to M0148-0001c3a6.
+    - (f) has no witness: no regress expected output and no TPC-H/TPC-DS
+      plan has a parameterized BitmapOr, and join.out's 8 BitmapOr plans
+      already match.
+- [ ] **M0148-0001c3a6 — c3a4 residue: join OR bitmap paths and the
+  array-literal / index-only leftovers**.
+  Kind: impl
+  Parent: M0148-0001c3a4
+  No regress or corpus witness today; ledgered 2026-11-14
+  (.ralph/deferral\_ledger.md, M0148-0001c3a4 rows).
+  - (f) generate\_bitmap\_or\_paths over join OR clauses (indxpath.c
+    bitjoinpaths / consider\_index\_join\_outer\_rels with OR clauses):
+    parameterized BitmapOr arms.
+  - (i) residue:
+    - a lone `= ANY ('{}')` as the probe (zero-element probe shape);
+    - cross-type array literals (`'{33,44}'::bigint[]` on int4);
+    - index-only scan width from the reltarget;
+    - an index-only prefix + range.
+  - Resume: (i) cross-type literals (moves one create\_index line); (f)
+    when a witness appears.
 - [ ] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
   `… Backward` regress lines**.
   Kind: impl
@@ -12575,8 +12593,20 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     TRUE`, `b IS FALSE` → `Index Cond: (b = true)`,
     match\_boolean\_index\_clause) and equality-prefix pathkeys
     (`b = true ORDER BY i`).
-  - Resume: (d) — match\_boolean\_index\_clause in the restriction
-    producer, then the prefix pathkeys; then (a).
+  - 2026-11-14 (d) LANDED: boolean index quals and constant-column
+    pathkeys.
+    - booleanIndexQual matches `b`, `NOT b`, `b IS TRUE` and `b IS FALSE`
+      as `b = true/false` (match\_boolean\_index\_clause).
+    - addConstEquatedColumns makes buildIndexPathkeys skip a column the
+      restriction pins (build\_index\_pathkeys' redundant pathkeys).
+    - Design: docs/design/0100-0149/0148-0001c3a5-backward-plan-residue.md.
+    Movement: yes — regress create\_index 2801→2750
+  - (d) still open: `b = true` written out. PG simplifies it to `b`
+    (simplify\_boolean\_equality) and prices it with boolvarsel (0.5);
+    goopg prices it with the 0.005 equality default, so a bitmap + Sort
+    wins. Boolean selectivity is 1/3 vs PG's 0.5 / var\_eq\_const.
+  - Resume: (d) residue (simplify\_boolean\_equality in foldconst +
+    boolvarsel / booltestsel), then (a).
 - [x] **M0148-0001c3c — DROP VIEW / DROP INDEX / RENAME after a restart
   fail "does not exist"**.
   Kind: impl
