@@ -354,9 +354,9 @@ func TestSAOPNumSAScansCost(t *testing.T) {
 
 	// The shared index side feeds the bitmap cost too: the same descent
 	// scaling applies there (rule #2 — sibling paths price together).
-	bmBase := costBitmapIndexScan(cp, base, 1)
+	bmBase, _ := costBitmapIndexScan(cp, base, 1)
 	in.numSAScans = 10
-	bmMulti := costBitmapIndexScan(cp, in, 1)
+	bmMulti, _ := costBitmapIndexScan(cp, in, 1)
 	if want := bmBase.Total + 9*descent - onePage + mlPages(10); math.Abs(bmMulti.Total-want) > 1e-9 {
 		t.Fatalf("bitmap SAOP total = %v, want bitmap base + 9 descents + ML(10) pages - 1 page = %v", bmMulti.Total, want)
 	}

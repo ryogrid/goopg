@@ -109,14 +109,29 @@ func stampPlanCost(n Node, p *Path) {
 			}
 		}
 	}
-	setter.setPlanCost(PlanCost{
+	pc := PlanCost{
 		StartupCost: p.Cost.Startup,
 		TotalCost:   p.Cost.Total,
 		PlanRows:    p.Rows,
 		PlanWidth:   TupleWidth(n.Output()),
 		PerWorker:   p.ParallelWorkers > 0,
 		Disabled:    disabled,
-	})
+	}
+	// create_bitmap_subplan (createplan.c): a bitmap tree node returns a
+	// bitmap, not tuples — plan_width is 0 ("meaningless") on Bitmap Index
+	// Scan, BitmapAnd and BitmapOr, and a Bitmap Index Scan's startup_cost
+	// is 0.0 (M0148-0001c3a4 (g)).
+	switch p.Kind {
+	case PathBitmapIndexScan:
+		pc.StartupCost, pc.PlanWidth = 0, 0
+		// plan->total_cost = ipath->indextotalcost.
+		if p.BitmapIndexAMTotal > 0 {
+			pc.TotalCost = p.BitmapIndexAMTotal
+		}
+	case PathBitmapAnd, PathBitmapOr:
+		pc.PlanWidth = 0
+	}
+	setter.setPlanCost(pc)
 }
 
 // pathSelfDisabled is plan_is_disabled over the path a node was built from:

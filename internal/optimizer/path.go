@@ -548,6 +548,12 @@ type Path struct {
 	// it (M0148-0001c3a2). Zero on every other path.
 	IndexPathTotalCost float64
 
+	// BitmapIndexAMTotal is a Bitmap Index Scan leaf's indextotalcost alone
+	// (Cost.Total less cost_bitmap_tree_node's 0.1 * cpu_operator_cost *
+	// rows): the total its plan node prints (create_bitmap_subplan,
+	// M0148-0001c3a4 (g)). Zero on every other path.
+	BitmapIndexAMTotal float64
+
 	// PartialPredicate is the resolved planner expression for a partial
 	// index's WHERE predicate (PG's indpred). It is nil when the index is not
 	// partial and nil when the prover has proven the predicate is implied by

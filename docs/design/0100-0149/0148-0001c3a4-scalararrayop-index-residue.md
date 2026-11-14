@@ -1,6 +1,6 @@
 # M0148\-0001c3a4 — ScalarArrayOp and OR index\-path residue
 
-**Parent:** M0148\-0001c3a2 · **Status:** items \(a\), \(b\), \(c\) and \(h\) landed 2026\-11\-12; item \(i\) slices 1–5 and item \(d\) landed 2026\-11\-14; items \(e\)–\(g\), \(j\) and the rest of \(i\) open
+**Parent:** M0148\-0001c3a2 · **Status:** items \(a\), \(b\), \(c\) and \(h\) landed 2026\-11\-12; item \(i\) slices 1–5, \(d\) and \(g\) landed 2026\-11\-14; items \(e\), \(f\), \(j\) and the rest of \(i\) open
 
 This item collects what M0148\-0001c3a2 \(BitmapOr paths\) left open. The items
 are listed in `.ralph/fix_plan.md` under M0148\-0001c3a4:
@@ -681,4 +681,50 @@ thousand = 41` became an Index Only Scan with a Filter\).
 - As a result, PG's `BitmapAnd(hundred, BitmapOr(thousand = ANY, tenthous <
   2))` cannot form. goopg keeps the `hundred = 42` arm alone, which is
   correct, with the full OR in the Filter.
+
+## Item \(g\) — the bitmap node cost line
+
+A bitmap tree node returns a bitmap, not tuples. create\_bitmap\_subplan
+therefore sets:
+
+- `plan_width = 0` on every Bitmap Index Scan, BitmapAnd and BitmapOr;
+- a Bitmap Index Scan's `startup_cost = 0.0`;
+- its `total_cost = ipath->indextotalcost`, without cost\_bitmap\_tree\_node's
+  `0.1 * cpu_operator_cost * rows`, which the parent's cost carries.
+
+goopg stamped the path's own figures instead, for example
+`(cost=0.29..5.06 rows=100 width=244)` where PG prints
+`(cost=0.00..5.04 rows=100 width=0)`.
+
+### Change
+
+- `costBitmapIndexScan` also returns indextotalcost alone. The two bitmap
+  producers store it on `Path.BitmapIndexAMTotal`.
+- `stampPlanCost` gives a Bitmap Index Scan startup 0, width 0 and that
+  total, and gives BitmapAnd / BitmapOr width 0.
+- Planning is untouched: paths keep their costs, and only the stamped plan
+  cost changes.
+
+### Verification
+
+- **Regress tenk1 probe against a scratch PG 18.3:** every bitmap node line
+  matches, apart from the shapes that wait on \(j\).
+- **TPC\-DS SF0.25:** the plan A/B fired on the 7 queries with a Bitmap
+  Index Scan \(Q3 Q32 Q53 Q54 Q55 Q63 Q92\), all on the cost line alone.
+  - Their values pass.
+  - 6 of the 7 Bitmap Index Scan lines now equal PG's text.
+- **Gates:**
+  - units, tpch\-spotcheck, sf025 99/99;
+  - fire\-set PASS on sf025, sf1 and TPC\-H;
+  - acceptance 24 MATCH;
+  - regress unchanged \(COSTS OFF\).
+
+### Not covered
+
+- **A parameterized Bitmap Index Scan's indextotalcost:** on TPC\-DS Q53,
+  goopg's is 4.75 where PG's is 4.64. PG's amcostestimate pro\-rates by
+  loop\_count inside indextotalcost.
+- **The Bitmap Heap Scan's width:** it is the scan's full row width
+  \(`width=244` under `count(*)`\), where PG prices the reltarget. This is
+  the same gap as the index\-only and plain scan widths.
 

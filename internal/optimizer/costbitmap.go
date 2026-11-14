@@ -41,12 +41,16 @@ import (
 // manipulation charge PG does (3000 tuples against the rel's 30 rows on
 // `hundred = 42 AND unique2 < 3000`) and a BitmapAnd never beat its
 // cheapest input (M0148-0001c3a2).
-func costBitmapIndexScan(cp costParams, in indexScanInputs, pathRows float64) Cost {
+//
+// amTotal is indextotalcost alone: the Bitmap Index Scan plan node's total
+// (create_bitmap_subplan, M0148-0001c3a4 (g)) — the tree-node charge belongs
+// to the parent that costs it.
+func costBitmapIndexScan(cp costParams, in indexScanInputs, pathRows float64) (c Cost, amTotal float64) {
 	idxStartup, idxTotal := btreeIndexAMCost(cp, in)
 	return Cost{
 		Startup: idxStartup,
 		Total:   idxTotal + 0.1*cp.cpuOperatorCost*pathRows,
-	}
+	}, idxTotal
 }
 
 // costBitmapHeapScan costs a complete BitmapHeapScan: index access (startup) plus

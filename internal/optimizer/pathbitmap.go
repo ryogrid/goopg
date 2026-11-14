@@ -319,10 +319,11 @@ func (s *searchCtx) buildBitmapIndexChild(
 	}
 
 	// Cost the index-access side (bitmap index scan).
-	idxCost := costBitmapIndexScan(s.cp, in, rel.Rows)
+	idxCost, amTotal := costBitmapIndexScan(s.cp, in, rel.Rows)
 
 	return &Path{
 		Kind:               PathBitmapIndexScan,
+		BitmapIndexAMTotal: amTotal,
 		Rel:                rel,
 		Rows:               clampRowEst(selectivity * relTuples),
 		Cost:               idxCost,
@@ -847,7 +848,7 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 	// The probe's path rows are its parameterised row count (ppi_rows) —
 	// cost_bitmap_tree_node's per-row charge (costBitmapIndexScan).
 	paramRows := clampRowEst(parameterizedBaserelRows(rel, nil, sel, false) * s.movableNonEquiJoinSelectivity(rel, req))
-	idxCost := costBitmapIndexScan(s.cp, indexScanInputs{
+	idxCost, amTotal := costBitmapIndexScan(s.cp, indexScanInputs{
 		relPages: relPages, relTuples: relTuples, indexPages: indexPages,
 		indexTuples: indexTuples, treeHeight: treeHeight, selectivity: sel,
 		correlation: indexCorrelationFor(idx, leadingKeyStats(idx, tbl)), totalTablePages: totalPages,
@@ -860,7 +861,7 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 	pagesFetched, tuplesFetched := computeBitmapPagesLooped(tuplesFetched, relTuples, T, indexPages, totalPages,
 		s.cp.effectiveCacheSize, maxEntries, s.loopCountForKeys(rel, req, boundOuterKeys(bound)))
 	child := &Path{
-		Kind: PathBitmapIndexScan, Rel: rel, Rows: tuplesFetched, Cost: idxCost,
+		Kind: PathBitmapIndexScan, Rel: rel, Rows: tuplesFetched, Cost: idxCost, BitmapIndexAMTotal: amTotal,
 		BitmapSelectivity: sel, IndexInfo: idx, IndexScanDir: NoMovementScanDirection,
 		IndexClauses: clauses, RequiredOuter: req,
 		ParallelSafe: rel.ParallelSafeForPath(),
