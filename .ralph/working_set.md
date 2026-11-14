@@ -1,30 +1,29 @@
-# Working Set — loop end 2026-11-14 (census routing-20261114w IDENTICAL; M0148-0001c3a12 slice 2 LANDED 2e9e4f5d6; P0-E27 FILED)
+# Working Set — loop end 2026-11-14 (census routing-20261114x IDENTICAL; M0148-0001c3a13 LANDED 16fdb9bcf; c3a12 closed into c3a11)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: items 0. Nothing filed.
-- S9: DUE → routing-20261114w (s9db, BASELINE_REV=a7fd3bccf) IDENTICAL ×3, committed ef950c223.
-  - 2e9e4f5d6 touches the planner and executor, so the next census is likely DUE.
-- Task: M0148-0001c3a12 slice 2, landed as 2e9e4f5d6.
-  - Files:
-    - plan.go: BitmapIndexScan.RowCompare/RowCompareLow;
-    - pathbitmap.go: producer;
-    - createplanbitmap.go: lowering;
-    - operators_bitmap.go: per-entry row check;
-    - operators_storage.go: indexScanPredicate ANDs RowCompare (DML / FOR UPDATE reconstruction);
-    - operators_explain.go: bitmap Index Cond;
-    - TestRowCompareIndexQual extended with the bitmap plans.
-  - Movement: none (bitmap witnesses are not in the diffed regress suites).
-  - S2 FOUND and FILED: P0-E27 (fix_plan ~line 1445, escalation block).
-    - Parallel partial aggregation over an ORDER BY subquery (Gather, not Gather Merge) returns array_agg out of order.
-    - Repro: tk 10000 rows; parallel GUCs forced; `select md5(array_agg(ten)::text) from (select ten from tk where unique1 < 15000 order by unique1) ss` → digest differs from PG.
-    - This explains the regress arrays +13 flake (twice this session). It awaits owner placement; the loop continues with the banner.
-- Next step: c3a12 leftovers (DML index path for row compares; prefix / DESC / truncated rows) have no regress witness, so consider closing c3a12 with a transfer to c3a11 (parking) and moving to M0148-0001c3a13 (constant-NULL row elimination; create_index witness, probe file tmp/rc.sql last query).
-- Top-residual: M0148 residues. Open children: c3a7, c3a8, c3a9, c3a10, c3a11 (parked), c3a12, c3a13, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
+- S9: DUE → routing-20261114x (s9dc, BASELINE_REV=704f8f798) IDENTICAL ×3, committed 0ac4f682a.
+  - 16fdb9bcf touches planner.go and operators_explain.go, so the next census is likely DUE (BASELINE_REV=38b072965, the head consumed by routing-20261114x).
+- Task: M0148-0001c3a13 (row IN list expansion) landed as 16fdb9bcf.
+  - c3a12 closed in the same commit; its leftovers (DML path, prefix / DESC / truncated) moved to c3a11 with a ledger row.
+- Files:
+  - internal/optimizer/planner.go: rowInListAsBooleanTree, rowConstructorElems; oneElementInAsComparison defers rows to it;
+  - internal/executor/operators_explain.go: a NULL AND / OR arm prints `NULL::boolean`;
+  - internal/executor/saop_range_bounds_test.go: TestRowInListExpandsToComparisons (fails 6 ways with the expansion disabled);
+  - design doc docs/design/0100-0149/0148-0001c3a13-row-in-list-expansion.md (indexed).
+- Key symbols: rowInListAsBooleanTree, rowConstructorElems, reduceQualConstArms (existing), formatExprQual AND/OR arm.
+- Findings:
+  - The old InExpr row evaluator was two-valued, a wrong result: `(1,3) IN ((1,2),(NULL,NULL))` gave false, PG gives NULL. The expansion fixes it; recorded in the commit and fix_plan, not filed separately.
+  - The explicit `ROW(a,b)` parses as a FuncCall named row, not parser.RowExpr.
+  - Ledgered leftovers: a mixed row / scalar list (PG 42883); FROM-less EXPLAIN VERBOSE never prints Result `Output:`.
+  - The regress A/B suite run showed btree_index +83 and a create_index point_tbl 2-rows hunk. Both vanished on solo reruns (437 and 2466), so they are suite-interaction flakes.
+- Next step: run the census if DUE, then take M0148-0001c3a9 (partitionwise join), the next open M0148 task in file order after c3a11 (parked).
+- Top-residual: M0148 residues. Open: c3a9, c3a10, c3a8, c3a7, c3a11 (parked), c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261114w done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
-  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26, E27 new). Then M0148 in file order → c3a12.
+  - Items 0-9: M0146-0014(channel; census routing-20261114x done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26, E27). Then M0148 in file order.
 - Gates run (all PASS):
-  - units, tpch-spotcheck, sf025 same=99;
-  - fire-set c3a12b fires=none ×3; acceptance 24 MATCH;
-  - regress A/B tmp/regress-c3a12b (arrays +13 = P0-E27 flake; join ±5 flap).
+  - units, tpch-spotcheck, sf025 99 PASS same=99;
+  - fire-set c3a13 fires=none ×3; acceptance arm PASS;
+  - regress A/B tmp/regress-c3a13 (create_index 2483→2466; select_distinct 202→196 unrelated; arrays −13 = P0-E27 flake).
 - In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped. Restarting it hits P0-E24: drop leftover partitions.
