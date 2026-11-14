@@ -743,6 +743,9 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		return false
 	}
 	clauses := restrictionEqualityPrefix(cat, tbl, idx, conjuncts)
+	if equalityMergedIntoLeadingSAOP(cat, tbl, idx, conjuncts, clauses) {
+		clauses = nil
+	}
 	// A `USING hash` index (goopg builds it on a btree, DeclaredHash) answers
 	// equality only: PG's hash AM has no ordering, so no range or skip qual,
 	// and amsearcharray is false, so no ScalarArrayOp qual (hashhandler,
@@ -1231,8 +1234,11 @@ func saopColumnQuals(cat catalog.Catalog, tbl *catalog.Table, colName string, pr
 				out = append(out, saopColQual{op: parser.OpEq, array: list, arrayText: arrayText, local: conj, before: before})
 			}
 		case *BinaryOp:
+			// M0148-0001c3a6 (i): `col = const` beside the array merges too
+			// (_bt_compare_array_scankey_args keeps the matching element):
+			// `((unique1 = ANY ('{1,42,7}'::integer[])) AND (unique1 = 1))`.
 			switch x.Op {
-			case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+			case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe, parser.OpEq:
 			default:
 				continue
 			}
@@ -1245,12 +1251,25 @@ func saopColumnQuals(cat catalog.Catalog, tbl *catalog.Table, colName string, pr
 			if colOnRight {
 				op = swapInequalityOp(op)
 			}
+			// A `col = const` is an EquivalenceClass member; PG regenerates
+			// it after the other quals (generate_base_implied_equalities),
+			// so it prints after the array whatever its source position.
+			if op == parser.OpEq {
+				before = false
+			}
 			out = append(out, saopColQual{op: op, key: val, local: conj, before: before})
 		}
 	}
 	// Index Cond lists a column's quals in restriction (source) order;
 	// conjuncts may arrive reordered.
-	sort.SliceStable(out, func(i, j int) bool { return out[i].local.Pos() < out[j].local.Pos() })
+	// EquivalenceClass equalities come after every other qual.
+	sort.SliceStable(out, func(i, j int) bool {
+		ei, ej := out[i].op == parser.OpEq && out[i].array == nil, out[j].op == parser.OpEq && out[j].array == nil
+		if ei != ej {
+			return !ei
+		}
+		return out[i].local.Pos() < out[j].local.Pos()
+	})
 	return out
 }
 
@@ -1344,4 +1363,25 @@ func tightestIntBound(bounds []*indexPathClause, lower bool) (*indexPathClause, 
 		}
 	}
 	return bounds[best], rest, true
+}
+
+// equalityMergedIntoLeadingSAOP reports a one-column equality prefix whose
+// equality the leading `= ANY` array merges as a column qual: PG's single
+// path for the index carries both clauses (build_index_paths), the array
+// the probe and the equality merged into it (_bt_preprocess_keys), and
+// prints both — so the array path is the one to file (M0148-0001c3a6 (i)).
+func equalityMergedIntoLeadingSAOP(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr, prefix []indexPathClause) bool {
+	if len(prefix) != 1 || idx.DeclaredHash || prefix[0].local == nil {
+		return false
+	}
+	sa := restrictionLeadingSAOP(cat, tbl, idx, conjuncts)
+	if len(sa) == 0 || sa[0].saopOp != parser.OpUnknown {
+		return false
+	}
+	for _, q := range sa[0].saopColQuals {
+		if q.local == prefix[0].local {
+			return true
+		}
+	}
+	return false
 }

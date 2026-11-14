@@ -216,6 +216,11 @@ func (s *searchCtx) buildBitmapIndexChild(
 		return nil
 	}
 	indexClauses, qualSelectivity := matchBitmapIndexQuals(s.cat, idx, tbl, conjuncts, id)
+	// M0148-0001c3a6 (i): an equality the leading array merges belongs to
+	// the array's clause set (one path per index in PG).
+	if equalityMergedIntoLeadingSAOP(s.cat, tbl, idx, conjuncts, indexClauses) {
+		indexClauses, qualSelectivity = nil, 1
+	}
 	// M0148-0001c3a2: a ScalarArrayOp qual — `col IN (…)`, or an OR of
 	// equalities on one column (match_orclause_to_indexcol) — on the column
 	// after the equality prefix (the leading column when there is none):

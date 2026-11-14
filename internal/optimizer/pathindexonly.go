@@ -224,6 +224,9 @@ func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, t
 		return nil, false
 	}
 	clauses := restrictionEqualityPrefix(cat, tbl, idx, conjuncts)
+	if equalityMergedIntoLeadingSAOP(cat, tbl, idx, conjuncts, clauses) {
+		clauses = nil
+	}
 	bound := len(clauses)
 	var saop []indexPathClause
 	if len(clauses) == 0 {

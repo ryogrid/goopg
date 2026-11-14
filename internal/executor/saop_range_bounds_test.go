@@ -867,3 +867,37 @@ func TestRedundantRangeBoundsInIndexCond(t *testing.T) {
 		}
 	}
 }
+
+// M0148-0001c3a6 (i): `col IN (…) AND col = const` is one index clause set
+// in PG — the array probes, the equality merges into it (_bt_preprocess_keys)
+// and prints after it (an EquivalenceClass clause regenerates last), on
+// plain, index-only and bitmap paths alike. Regress create_index, PG 18.3.
+func TestEqualityMergedIntoLeadingArray(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "create table eqa (unique1 int NOT NULL, pad text)")
+	runSQL(t, ctx, "create unique index eqa_u on eqa (unique1)")
+	runSQL(t, ctx, "insert into eqa select g, 'x' from generate_series(0, 9999) g")
+	runSQL(t, ctx, "VACUUM eqa")
+	runSQL(t, ctx, "ANALYZE eqa")
+	ps := optimizer.DefaultPlannerSettings()
+	for _, c := range []struct{ q, plan string }{
+		{"SELECT unique1 FROM eqa WHERE unique1 IN (1, 42, 7) and unique1 = 1",
+			"Index Only Scan using eqa_u on eqa\n  Index Cond: ((unique1 = ANY ('{1,42,7}'::integer[])) AND (unique1 = 1))"},
+		{"SELECT unique1 FROM eqa WHERE unique1 = 7 and unique1 IN (1, 42, 7)",
+			"Index Only Scan using eqa_u on eqa\n  Index Cond: ((unique1 = ANY ('{1,42,7}'::integer[])) AND (unique1 = 7))"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+	}
+	for _, c := range []struct{ q, rows string }{
+		{"SELECT unique1 FROM eqa WHERE unique1 IN (1, 42, 7) and unique1 = 1", "1"},
+		{"SELECT unique1 FROM eqa WHERE unique1 IN (1, 42, 7) and unique1 = 12345", ""},
+		{"SELECT unique1, pad FROM eqa WHERE unique1 IN (1, 42, 7) and unique1 = 42", "42|x"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

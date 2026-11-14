@@ -12608,6 +12608,12 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Resume (i): redundant bounds on bitmap scans and behind an array;
       non-integer comparable bounds (text, numeric); out-of-range equality
       probe; int2 literal rendering; primary cross-type array probe.
+  - 2026-11-14 (i) slice 5 LANDED: `col IN (…) AND col = const` is the
+    array path with the equality merged and printed after it, on plain,
+    index-only and bitmap producers (equalityMergedIntoLeadingSAOP).
+    Movement: yes — regress create\_index 2535→2500
+    - Resume (i): an equality behind the array on the next column
+      (multi-column prefix); the earlier leftovers.
 - [x] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
   `… Backward` regress lines**.
   Kind: impl
