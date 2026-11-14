@@ -27,6 +27,7 @@ package optimizer
 //     scan that drops a column the query reads returns wrong rows.
 
 import (
+	"sort"
 	"math"
 	"strings"
 
@@ -396,10 +397,10 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 	boundSel := 0.0
 	saopAt := indexClausesSAOPAt(clauses)
 	isSAOP := saopAt >= 0
-	_, trailing := clausesTrailingSAOP(clauses)
+	trailingAt, trailing := clausesTrailingSAOP(clauses)
 	switch {
 	case trailing:
-		sel, boundSel, numSAScans = trailingSAOPSelectivity(cat, rel, tbl, idx, clauses, saopAt, relTuples, extractFilterConjuncts(rel.baseLeaf))
+		sel, boundSel, numSAScans = trailingSAOPSelectivity(cat, rel, tbl, idx, clauses, trailingAt, relTuples, extractFilterConjuncts(rel.baseLeaf))
 	case isSAOP:
 		// M0148-0001c3a4 (h): scalararraysel over the array, times the
 		// equality prefix ahead of it ((i)) and the bounds on the column
@@ -704,9 +705,10 @@ func trailingSAOPSelectivity(cat catalog.Catalog, rel *RelOptInfo, tbl *catalog.
 // range column carries a NullTest, the index is a hash, or the array is an
 // inequality one.
 func trailingSAOPOnRange(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) []indexPathClause {
-	if len(idx.Columns) < 2 || idx.DeclaredHash || len(restrictionNullTestsOnColumn(idx, 0, conjuncts)) > 0 {
+	if len(idx.Columns) < 2 || idx.DeclaredHash {
 		return nil
 	}
+	nullLead := len(restrictionNullTestsOnColumn(idx, 0, conjuncts)) > 0
 	// The scan decodes the two leading key columns from each entry; an
 	// interval key (a lossy comparison span) cannot be decoded.
 	for _, name := range idx.Columns[:2] {
@@ -716,17 +718,82 @@ func trailingSAOPOnRange(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.I
 		}
 	}
 	sa := restrictionSAOPOnColumn(cat, tbl, idx, 1, conjuncts)
-	if len(sa) == 0 || sa[0].saopOp != parser.OpUnknown {
+	if len(sa) > 0 {
+		if nullLead || sa[0].saopOp != parser.OpUnknown {
+			return nil
+		}
+		return sa
+	}
+	// M0148-0001c3a5 (a): no array — the column's plain comparisons are
+	// index quals all the same, checked per entry like the array.
+	if tc := trailingColumnQuals(cat, tbl, idx, conjuncts); tc != nil {
+		return []indexPathClause{*tc}
+	}
+	return nil
+}
+
+// trailingColumnQuals is the plain constant comparisons (`=` `<` `<=` `>`
+// `>=`) on index column 1, in restriction order, as one trailingQuals
+// clause; nil when there are none.
+func trailingColumnQuals(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) *indexPathClause {
+	colName := idx.Columns[1]
+	if colName == "" {
 		return nil
 	}
-	return sa
+	var quals []saopColQual
+	for _, conj := range conjuncts {
+		bin, ok := conj.(*BinaryOp)
+		if !ok {
+			continue
+		}
+		switch bin.Op {
+		case parser.OpEq, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		default:
+			continue
+		}
+		cr, val, colOnRight, ok := normalizeColumnIndexKey(bin.Left, bin.Right)
+		if !ok || cr.Index < 0 || cr.Index >= len(tbl.Columns) || tbl.Columns[cr.Index].Name != colName ||
+			!isConstExpr(val) || !restrictionKeyUsable(cat, tbl.Columns[cr.Index], val) {
+			continue
+		}
+		op := bin.Op
+		if colOnRight {
+			op = swapInequalityOp(op)
+		}
+		quals = append(quals, saopColQual{op: op, key: val, local: conj})
+	}
+	if len(quals) == 0 {
+		return nil
+	}
+	sort.SliceStable(quals, func(i, j int) bool { return quals[i].local.Pos() < quals[j].local.Pos() })
+	return &indexPathClause{indexCol: 1, op: quals[0].op, key: quals[0].key, local: quals[0].local,
+		saopColQuals: quals[1:], trailingQuals: true}
 }
 
 // clausesTrailingSAOP reports the trailing-array shape: a leading range
 // followed by the array (saopAt > 0 behind an inequality on column 0).
 func clausesTrailingSAOP(clauses []indexPathClause) (saopAt int, ok bool) {
 	at := indexClausesSAOPAt(clauses)
-	return at, at > 0 && isInequalityOp(clauses[0].op)
+	if at < 0 {
+		// M0148-0001c3a5 (a): plain comparisons on column 1 (trailingQuals).
+		for i, c := range clauses {
+			if c.trailingQuals {
+				at = i
+				break
+			}
+		}
+	}
+	return at, at > 0 && (isInequalityOp(clauses[0].op) || clauses[0].nullTest != IndexNullTestNone)
+}
+
+// trailingClauseColQuals is a trailing clause's column quals as lowered:
+// a trailingQuals clause's own first comparison ahead of the rest.
+func trailingClauseColQuals(c indexPathClause, drop map[Expr]bool) []SAOPColQual {
+	rest := lowerSAOPColQuals(c, drop)
+	if !c.trailingQuals {
+		return rest
+	}
+	return append([]SAOPColQual{{Op: c.op, Key: c.key}}, rest...)
 }
 
 // clausesSkipRange is the skip-range shape's range column (M0148-0001c3a4

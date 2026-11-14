@@ -333,3 +333,67 @@ it can.
     parted_minmax`\);
   - a multi\-member one needs the per\-InitPlan ordered Append of member
     IOSs.
+
+## Item (a) slice 4 — plain comparisons on the second index column
+
+PG reference: indxpath.c match\_clause\_to\_indexcol, which makes every
+qual on any index column an index qual; selfuncs.c btcostestimate's skip
+arm; nbtree checks the non\-leading key on every entry it reads.
+
+### Shape
+
+- An index clause list `((a > 90) AND (b = 5))` or `((a IS NOT NULL)
+  AND (b > 11))`: a leading range or NullTest, then plain comparisons on
+  column 1. goopg had carried only the `= ANY` form there
+  \(TrailingSAOP, c3a4 \(i\)\); a plain comparison stayed a Filter.
+- **Path:** new `trailingColumnQuals` collects the `=` `<` `<=` `>` `>=`
+  constant comparisons on column 1 into one `indexPathClause` with
+  `trailingQuals` set. The first comparison sits in op / key / local and
+  the rest in saopColQuals. trailingSAOPOnRange returns it when column 1
+  has no array. A leading NullTest admits it, while still refusing an
+  array.
+- **clausesTrailingSAOP:** finds either clause kind, behind a leading
+  inequality or NullTest.
+- **Plan:** both lowering sites \(IndexScan, IndexOnlyScan\) build
+  `TrailingSAOP{Elems: nil, ColQuals: …}`; trailingClauseColQuals
+  restores the first comparison ahead of the rest.
+- **Executor:** trailingSAOPPred is the column quals alone when Elems is
+  empty. The per\-entry key check is unchanged.
+- **EXPLAIN:** withTrailingSAOPCond now takes the leading part count and
+  also wraps the NullTest renderer, which had returned early.
+- **Cost:** trailingSAOPSelectivity unchanged \(one descent per skip
+  value, saopDescents = 1 with no array\). The IOS producer had passed
+  the SAOP position instead of the trailing position \(a −1 slice
+  panic\); fixed.
+
+### Verification
+
+- **Scratch PG:** 5000\-row probe with NULLs in both columns. Plans and
+  costs are identical, e.g. `0.28..96.96` for `a IS NOT NULL AND b = 5
+  ORDER BY a LIMIT 1`. Row digests are identical for every shape,
+  including DESC.
+- **TestTrailingColumnQualsBehindLeadingBound:** pins 3 plans and 4 row
+  results; all 3 plans fail without the collector.
+- **Regress create\_index:** two hunks move toward PG \(`tenthous = 3000`
+  joins the Index Cond\). The count is unchanged, because PG keeps the
+  column's second redundant bound in Index Cond and goopg keeps one.
+- **Gates:**
+  - units, tpch\-spotcheck, sf025 same=99;
+  - fire\-set fires=none on sf025, sf1 and TPC\-H;
+  - acceptance 24 MATCH;
+  - TestPort\_Isolation family ok \(it needs `-timeout` above the 10m
+    default\).
+
+### Not covered
+
+- **Bitmap form:** BitmapIndexScan still keeps the column\-1 comparisons
+  as Filter and Recheck. PG: `Recheck Cond: ((a > 90) AND (b = 5))`.
+- **min/max:** rewriteMinMaxAggregates is a rule\-based builder. Its IOS
+  arm admits a WHERE only over the aggregated column
+  \(wherePredSafeForIOS\), so `min(a) … where b = 5` falls back to Sort
+  \+ Seq Scan. PG's build\_minmax\_path plans the subquery through the
+  path search.
+- **Redundant bounds:** a second bound on the leading column \(`thousand >
+  -1 AND thousand >= 0`\) — PG lists both in Index Cond; goopg keeps one
+  and filters the other.
+- **Later columns:** quals on column 2 and beyond.

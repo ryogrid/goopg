@@ -17,14 +17,23 @@ import (
 )
 
 // trailingSAOPPred is `ref = ANY (Elems)` AND each column qual, over ref.
+// With no Elems (M0148-0001c3a5 (a): plain comparisons on the column, no
+// array) it is the column quals alone.
 func trailingSAOPPred(ref *optimizer.ColumnRef, ts *optimizer.TrailingSAOP) optimizer.Expr {
-	var pred optimizer.Expr = &optimizer.InExpr{Operand: ref, List: append([]optimizer.Expr(nil), ts.Elems...)}
+	var pred optimizer.Expr
+	if len(ts.Elems) > 0 {
+		pred = &optimizer.InExpr{Operand: ref, List: append([]optimizer.Expr(nil), ts.Elems...)}
+	}
 	for _, q := range ts.ColQuals {
 		var qe optimizer.Expr
 		if q.Array != nil {
 			qe = &optimizer.InExpr{Operand: ref, List: append([]optimizer.Expr(nil), q.Array...)}
 		} else {
 			qe = &optimizer.BinaryOp{Op: q.Op, Left: ref, Right: q.Key}
+		}
+		if pred == nil {
+			pred = qe
+			continue
 		}
 		pred = &optimizer.BinaryOp{Op: parser.OpAnd, Left: pred, Right: qe}
 	}

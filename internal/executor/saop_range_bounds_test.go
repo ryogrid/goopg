@@ -639,3 +639,40 @@ func TestOrderedFullScanYieldsToIndexClausePath(t *testing.T) {
 		t.Errorf("%s: rows %q", q, rows)
 	}
 }
+
+// M0148-0001c3a5 (a): plain comparisons on the second index column behind a
+// leading range or NullTest are index quals, checked per entry (TrailingSAOP
+// with no Elems) — PG 18.3's `Index Cond: ((a IS NOT NULL) AND (b = 5))`.
+// Plans and rows were taken from PG on the same data.
+func TestTrailingColumnQualsBehindLeadingBound(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "create table tq (a int, b int, c int)")
+	runSQL(t, ctx, "create index tqi on tq (a, b)")
+	runSQL(t, ctx, "insert into tq select case when g % 50 = 0 then null else g % 97 end, case when g % 41 = 0 then null else g % 13 end, g from generate_series(1, 5000) g")
+	runSQL(t, ctx, "VACUUM tq")
+	runSQL(t, ctx, "ANALYZE tq")
+	ps := optimizer.DefaultPlannerSettings()
+	for _, c := range []struct{ q, plan string }{
+		{"select a from tq where a > 90 and b = 5 order by a limit 3",
+			"Limit\n  ->  Index Only Scan using tqi on tq\n        Index Cond: ((a > 90) AND (b = 5))"},
+		{"select * from tq where a is not null and b = 5 order by a limit 3",
+			"Limit\n  ->  Index Scan using tqi on tq\n        Index Cond: ((a IS NOT NULL) AND (b = 5))"},
+		{"select a, b from tq where a is not null and b > 11 order by a desc limit 3",
+			"Limit\n  ->  Index Only Scan Backward using tqi on tq\n        Index Cond: ((a IS NOT NULL) AND (b > 11))"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+	}
+	for _, c := range []struct{ q, rows string }{
+		{"select count(*), sum(c) from tq where a > 90 and b = 5", "23|56470"},
+		{"select a, c from tq where a is not null and b = 5 order by a, c limit 3", "0|291;0|1552;0|2813"},
+		{"select a, b from tq where a is not null and b > 11 order by a desc, b desc limit 3", "96|12;96|12;96|12"},
+		{"select count(*), sum(c) from tq where a < 3 and b >= 4 and b < 6", "24|59388"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

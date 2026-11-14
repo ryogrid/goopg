@@ -146,6 +146,12 @@ type indexPathClause struct {
 	// NullTest conjunct. createRangeIndexScanPlan lowers it onto
 	// IndexScan.LeadingNullTest.
 	nullTest IndexNullTest
+	// trailingQuals marks the plain comparisons on index column 1 behind a
+	// leading range or NullTest (M0148-0001c3a5 (a)): PG 18 makes every
+	// qual on a later index column an index qual — `((a > 0) AND (b = 5))`.
+	// The first comparison sits in op/key/local, the rest in saopColQuals;
+	// saop stays empty. Lowered onto TrailingSAOP with no Elems.
+	trailingQuals bool
 }
 
 // indexPathClauses is `build_index_paths`' `index_clauses` accumulation

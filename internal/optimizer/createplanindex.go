@@ -378,7 +378,7 @@ func createIndexScanPlan(p *Path) Node {
 		var ioColQuals []SAOPColQual
 		loopClauses := p.IndexClauses
 		var ioTrailing *TrailingSAOP
-		if at := indexClausesSAOPAt(p.IndexClauses); at > 0 && isInequalityOp(p.IndexClauses[0].op) {
+		if at, ok := clausesTrailingSAOP(p.IndexClauses); ok {
 			// M0148-0001c3a4 (i): an array on the second column behind the
 			// leading range — the range lowers as usual, the array onto
 			// TrailingSAOP.
@@ -388,7 +388,7 @@ func createIndexScanPlan(p *Path) Node {
 				panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s: the array behind the leading range must be the last clause, a covered second-column `= ANY`", p.IndexInfo.Name))
 			}
 			ioDrop[c.local] = true
-			ioTrailing = &TrailingSAOP{Elems: append([]Expr(nil), c.saop...), ColQuals: lowerSAOPColQuals(c, ioDrop)}
+			ioTrailing = &TrailingSAOP{Elems: append([]Expr(nil), c.saop...), ColQuals: trailingClauseColQuals(c, ioDrop)}
 			loopClauses = p.IndexClauses[:at]
 		} else if at >= 0 {
 			// M0148-0001c3a4 (i): an equality prefix ahead of the array
@@ -763,7 +763,7 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 			panic(fmt.Sprintf("createPlan: range PathIndexScan on %s: the array behind the leading range must be the last clause, a second-column `= ANY`", p.IndexInfo.Name))
 		}
 		drop[c.local] = true
-		is.TrailingSAOP = &TrailingSAOP{Elems: append([]Expr(nil), c.saop...), ColQuals: lowerSAOPColQuals(c, drop)}
+		is.TrailingSAOP = &TrailingSAOP{Elems: append([]Expr(nil), c.saop...), ColQuals: trailingClauseColQuals(c, drop)}
 		rangeClauses = p.IndexClauses[:at]
 	}
 	// Slice 2b: equality clauses first (index columns 0..n-1, in order) form

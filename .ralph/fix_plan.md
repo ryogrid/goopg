@@ -12676,6 +12676,21 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
         normalizeColumnIndexKey;
       - the one-member appendrel alias;
       - multi-member min/max over an ordered Append.
+  - 2026-11-14 (a) slice 4 LANDED: plain comparisons on index column 1
+    behind a leading range or NullTest are index quals (trailingColumnQuals
+    → TrailingSAOP with no Elems) on Index Scan and Index Only Scan, with
+    plans, costs and rows identical to PG on a NULL-bearing probe.
+    Movement: none — instrument artefact — regress create\_index count
+    unchanged at 2708; two hunks now carry `tenthous = …` in Index Cond
+    (they still differ in a second redundant leading bound)
+    - Resume (a) parted\_minmax, in order:
+      - rewriteMinMaxAggregates: plan the min/max subquery through the
+        path search (build\_minmax\_path) instead of the rule-based IOS
+        arm, whose wherePredSafeForIOS refuses `b = 5`;
+      - the varchar relabel;
+      - the one-member appendrel alias;
+      - multi-member min/max.
+    - Bitmap trailing quals and redundant leading bounds are ledgered.
 - [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
   (NULL-keyed entries)**.
   Kind: impl

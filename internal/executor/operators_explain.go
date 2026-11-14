@@ -3917,10 +3917,11 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 	// beside its range bounds, in restriction-list order —
 	// `Index Cond: ((x IS NOT NULL) AND (x < 5))`.
 	if p.LeadingNullTest != optimizer.IndexNullTestNone && len(p.Index.Columns) > 0 {
-		return formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder)
+		nt := formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder)
+		return withTrailingSAOPCond(nt, nullTestCondParts(p.ExtraNullTests, p.LowKey, p.HighKey), p.Table, p.Index, p.TrailingSAOP, reg, prefix)
 	}
 	rng := formatIndexCondPartsPrefixed(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder...)
-	return withTrailingSAOPCond(rng, p.Table, p.Index, p.TrailingSAOP, p.LowKey, p.HighKey, reg, prefix)
+	return withTrailingSAOPCond(rng, boundCount(p.LowKey, p.HighKey), p.Table, p.Index, p.TrailingSAOP, reg, prefix)
 }
 
 // formatIndexOnlyCond is formatIndexCond for an IndexOnlyScan. The two nodes
@@ -3959,10 +3960,11 @@ func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, pr
 		return indexCondAndText(parts)
 	}
 	if p.LeadingNullTest != optimizer.IndexNullTestNone {
-		return formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder)
+		nt := formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder)
+		return withTrailingSAOPCond(nt, nullTestCondParts(p.ExtraNullTests, p.LowKey, p.HighKey), p.Table, p.Index, p.TrailingSAOP, reg, prefix)
 	}
 	rng := formatIndexCondPartsPrefixed(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder...)
-	return withTrailingSAOPCond(rng, p.Table, p.Index, p.TrailingSAOP, p.LowKey, p.HighKey, reg, prefix)
+	return withTrailingSAOPCond(rng, boundCount(p.LowKey, p.HighKey), p.Table, p.Index, p.TrailingSAOP, reg, prefix)
 }
 
 // withTrailingSAOPCond appends a scan's TrailingSAOP to its leading-range
@@ -3970,23 +3972,46 @@ func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, pr
 // (tenthous = ANY ('{1001,3000}'::integer[])))`. The array renders as the
 // index scan's own ScalarArrayOp, over the index shifted to its column, and
 // the two texts splice into one AND. Shared by IndexScan and IndexOnlyScan.
-func withTrailingSAOPCond(rng string, tbl *catalog.Table, idx *catalog.Index, ts *optimizer.TrailingSAOP,
-	lowKey, highKey optimizer.Expr, reg *subPlanReg, prefix string) string {
+func withTrailingSAOPCond(rng string, nRange int, tbl *catalog.Table, idx *catalog.Index, ts *optimizer.TrailingSAOP,
+	reg *subPlanReg, prefix string) string {
 	if ts == nil || len(idx.Columns) < 2 || rng == "" {
 		return rng
 	}
-	shifted := *idx
-	shifted.Columns = idx.Columns[1:]
-	arr := formatIndexCondPrefixed(&optimizer.IndexScan{Table: tbl, Index: &shifted, SAOPKeys: ts.Elems,
-		SAOPColQuals: ts.ColQuals}, reg, prefix)
-	nRange := 0
+	var arr string
+	nArr := 1 + len(ts.ColQuals)
+	if len(ts.Elems) == 0 {
+		// M0148-0001c3a5 (a): plain comparisons on the column, no array —
+		// `((a IS NOT NULL) AND (b = 5))`.
+		parts := make([]string, 0, len(ts.ColQuals))
+		for _, q := range ts.ColQuals {
+			parts = append(parts, indexCondClause(prefix+idx.Columns[1], saopOpText(q.Op), q.Key, reg, indexKeyColumnType(tbl, idx, 1)))
+		}
+		arr, nArr = indexCondAndText(parts), len(parts)
+	} else {
+		shifted := *idx
+		shifted.Columns = idx.Columns[1:]
+		arr = formatIndexCondPrefixed(&optimizer.IndexScan{Table: tbl, Index: &shifted, SAOPKeys: ts.Elems,
+			SAOPColQuals: ts.ColQuals}, reg, prefix)
+	}
+	return "(" + indexCondInner(rng, nRange) + " AND " + indexCondInner(arr, nArr) + ")"
+}
+
+// boundCount is how many of a range's two bounds are set.
+func boundCount(lowKey, highKey optimizer.Expr) int {
+	n := 0
 	if lowKey != nil {
-		nRange++
+		n++
 	}
 	if highKey != nil {
-		nRange++
+		n++
 	}
-	return "(" + indexCondInner(rng, nRange) + " AND " + indexCondInner(arr, 1+len(ts.ColQuals)) + ")"
+	return n
+}
+
+// nullTestCondParts is how many clauses formatNullTestIndexCond prints: the
+// leading NullTest, its extra NullTests and the column's bounds.
+func nullTestCondParts(extras []optimizer.ExtraIndexNullTest, lowKey, highKey optimizer.Expr) int {
+	return 1 + len(extras) + boundCount(lowKey, highKey)
 }
 
 // indexCondInner strips indexCondAndText's outer wrapping from a text of n
