@@ -86,6 +86,8 @@ type costParams struct {
 	enableMemoize bool
 	// enablePartitionwiseJoin is PlannerSettings.EnablePartitionwiseJoin.
 	enablePartitionwiseJoin bool
+	// keepAppendRelsWhole is PlannerSettings.KeepAppendRelsWhole.
+	keepAppendRelsWhole bool
 	// enableMaterial is `enable_material`, a GENERATION gate in PG: the
 	// matpath is never created when it is off (joinpath.c:1897, :2135 —
 	// unlike the counted toggles above, the producer skips, and cost_material

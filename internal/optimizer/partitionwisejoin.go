@@ -239,6 +239,107 @@ func (s *searchCtx) addChildIndexPaths(rel *RelOptInfo, tbl *catalog.Table) {
 	for _, req := range consideredParameterizations(cands) {
 		s.addOneParameterizedIndexPath(rel, tbl, s.cat, cands, req, relPages, relTuples, totalPages)
 	}
+	// create_index_paths' bitmap half: one bitmap heap path per usable index
+	// over the child's own restriction (M0148-0001c3a10).
+	if len(conjuncts) > 0 {
+		T := float64(relPages)
+		if T < 1 {
+			T = 1
+		}
+		maxEntries := bitmapMaxEntries(s.cp.workMem)
+		for _, idx := range s.cat.IndexesOnTable(tbl) {
+			if !idx.HasStorage() {
+				continue
+			}
+			if p := s.buildOneBitmapPath(rel, tbl, idx, relPages, relTuples, T, totalPages, maxEntries, rel.baseLeaf); p != nil {
+				addPath(rel, p, "appendrel-child.bitmap")
+			}
+		}
+	}
+}
+
+// addAppendRelChildPaths is set_append_rel_pathlist for a partitioned base
+// rel (M0148-0001c3a10): every partition is planned as a child rel of its
+// own — its bare scan, the parent's restriction moved onto it, and every
+// index, parameterised index and bitmap path its indexes allow — and the
+// appendrel gains an Append over the cheapest path of each child
+// (add_paths_to_append_rel's cheapest-total arm). It competes in add_path
+// with the pre-built UNION ALL of member seq scans, so a selective
+// restriction now reaches the partitions' indexes:
+// `Append -> Bitmap Heap Scan on pa_1 … Index Cond: (b = 'v12'::text)`.
+// Statements that keep appendrels whole (row locks, DML) are skipped, and so
+// is any problem with more than one relation (see the scope note below).
+func (s *searchCtx) addAppendRelChildPaths(cat catalog.Catalog) {
+	if s == nil || cat == nil || s.cp.keepAppendRelsWhole {
+		return
+	}
+	// Scope (slice 1 of c3a10): a one-relation problem — the partitioned
+	// table is the whole FROM list. Inside a join the Append's columns reach
+	// EXPLAIN's key chase and parameterised quals through paths not yet
+	// taught about it (regress partition_join regressed there); ledgered.
+	if s.nrels != 1 {
+		return
+	}
+	if s.cat == nil {
+		// The child producers read s.cat; the base-rel producer pass hands
+		// the problem's catalog in, which a search built without the trace
+		// context may not have stamped on s.
+		s.cat = cat
+	}
+	for i, rel := range s.levelRels(1) {
+		if i >= len(s.relInfos) {
+			break
+		}
+		ps := relPartScheme(rel)
+		if ps == nil {
+			continue
+		}
+		so, f := appendRelLeaf(rel)
+		// Only an appendrel with a restriction: the slice is the WHERE quals
+		// reaching the partitions' indexes. Without one, the children's
+		// ordering-only index paths can undercut a seq scan on goopg's cost
+		// model where PG keeps the seq scan (regress aggregates' p_t1);
+		// ordered child paths belong with Merge Append (ledgered).
+		if f == nil || f.Predicate == nil {
+			continue
+		}
+		// A correlated restriction (a sublink body's qual reading the outer
+		// row) stays on the appendrel: PG plans those statements as semi /
+		// anti joins, and per-member copies of a SubPlan's parameterised
+		// qual only multiply the divergence (regress partition_join).
+		if exprHasOuterRef(f.Predicate) {
+			continue
+		}
+		members := unionAllMembers(so)
+		if len(members) != len(ps.parts) {
+			continue
+		}
+		children := make([]*Path, 0, len(members))
+		fills := make([]map[int]Expr, 0, len(members))
+		ok := true
+		for j, m := range members {
+			c, fill := s.appendChildRel(rel, m, f, so.Output(), s.relInfos[i], ps, j)
+			if c == nil {
+				ok = false
+				break
+			}
+			best := cheapestUnparameterized(c)
+			if best == nil {
+				ok = false
+				break
+			}
+			children = append(children, best)
+			fills = append(fills, fill)
+		}
+		if !ok {
+			continue
+		}
+		pa := newPartitionwiseAppendPath(rel, children, s.cp)
+		pa.pwParents = []*SetOp{so}
+		pa.pwFills = fills
+		addPath(rel, pa, "appendrel-children")
+		setCheapest(rel)
+	}
 }
 
 // baseRelIndex2 is the search position of the base rel with relids.
@@ -434,8 +535,12 @@ func appendRelLeaf(rel *RelOptInfo) (*SetOp, *Filter) {
 	if rel == nil {
 		return nil, nil
 	}
+	return appendRelLeafNode(rel.baseLeaf)
+}
+
+// appendRelLeafNode is appendRelLeaf over a leaf node.
+func appendRelLeafNode(n Node) (*SetOp, *Filter) {
 	var f *Filter
-	n := rel.baseLeaf
 	if x, ok := n.(*Filter); ok {
 		f, n = x, x.Child
 	}

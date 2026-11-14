@@ -160,6 +160,14 @@ type PlannerSettings struct {
 	// defaults); PG's is off.
 	EnablePartitionwiseJoin bool
 
+	// KeepAppendRelsWhole is set by the planner (never by a GUC) for a
+	// row-locking SELECT and for UPDATE / DELETE / MERGE: their EPQ recheck
+	// reads a restriction kept above the appendrel's scan chain
+	// (planTakesRowMarksOrModifies), so no path may move it into a member —
+	// neither a partitionwise join nor a per-member child scan
+	// (M0148-0001c3a9 / c3a10).
+	KeepAppendRelsWhole bool
+
 	// HashMemMultiplier is `hash_mem_multiplier`. A hash build's budget is
 	// `work_mem * hash_mem_multiplier` (get_hash_memory_limit,
 	// nodeHash.c:3622), NOT work_mem alone — take2 P2-03. Zero means "use the
@@ -338,7 +346,8 @@ func (ps PlannerSettings) costParams() costParams {
 		enableBitmapScan: ps.EnableBitmapScan,
 		enableGatherMerge: ps.EnableGatherMerge,
 		enableMemoize:   ps.EnableMemoize,
-		enablePartitionwiseJoin: ps.EnablePartitionwiseJoin,
+		enablePartitionwiseJoin: ps.EnablePartitionwiseJoin && !ps.KeepAppendRelsWhole,
+		keepAppendRelsWhole:     ps.KeepAppendRelsWhole,
 		enableMaterial:  ps.EnableMaterial,
 		geqo:            ps.Geqo,
 		geqoThreshold:   ps.GeqoThreshold,

@@ -341,6 +341,23 @@ func (nm *explainNames) scopeSources(n optimizer.Node) map[int16]int32 {
 				}
 			}
 		}
+		// A partitionwise / child-path Append stands for parent appendrels
+		// no plan node carries; they bind their sources in this scope as the
+		// parent SetOp would (M0148-0001c3a10).
+		if so, ok := x.(*optimizer.SetOp); ok {
+			for _, par := range so.PartitionwiseParents {
+				if rtid, ok := explainNodeRTID(par); ok {
+					if src := appendRelSourceIdx(par); src != 0 {
+						if _, claimed := m[src]; !claimed {
+							m[src] = rtid
+						}
+						if !belowSetOp {
+							all[src] = append(all[src], rtid)
+						}
+					}
+				}
+			}
+		}
 		if !top && explainLevelBoundary(x) {
 			return
 		}

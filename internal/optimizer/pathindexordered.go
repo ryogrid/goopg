@@ -73,6 +73,9 @@ func (s *searchCtx) addBaseRelIndexPaths(cat catalog.Catalog) {
 	// flattened UNION ALL leaf, built from member probes the base-rel
 	// producers above price (paramappend.go).
 	s.addParameterizedAppendPaths(cat)
+	// M0148-0001c3a10: a partitioned base rel's Append over its partitions'
+	// own cheapest paths (set_append_rel_pathlist), index paths included.
+	s.addAppendRelChildPaths(cat)
 	// M0134-0187: `create_index_path(..., indexonly=true)` for every index
 	// covering what the statement reads from the relation — generated here
 	// because it competes in the same rel's pathlist as the rest.

@@ -88,3 +88,44 @@ func TestPartitionwiseJoin(t *testing.T) {
 		t.Errorf("partitionwise aggregate %q, want 100|29700|1200 (PG 18.3)", got)
 	}
 }
+
+// TestAppendRelChildIndexPaths pins M0148-0001c3a10 slice 1: a partitioned
+// table read alone with a selective WHERE plans each partition as its own
+// child rel, so the partitions' indexes serve the restriction
+// (set_append_rel_pathlist). Plans and values are PG 18.3's.
+func TestAppendRelChildIndexPaths(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	for _, s := range []string{
+		"create table pa (a int, b text, c int) partition by range (a)",
+		"create table pa_1 partition of pa for values from (0) to (5000)",
+		"create table pa_2 partition of pa for values from (5000) to (10000)",
+		"insert into pa select i, 'v' || (i % 1000), i % 7 from generate_series(0, 9999) i",
+		"create index on pa (b)",
+		"create index on pa (c, a)",
+		"analyze pa",
+	} {
+		runSQL(t, ctx, s)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	bitmap := "->  Bitmap Heap Scan on pa_1\n        Recheck Cond: (b = 'v12'::text)\n        ->  Bitmap Index Scan on pa_1_b_idx\n              Index Cond: (b = 'v12'::text)\n" +
+		"  ->  Bitmap Heap Scan on pa_2\n        Recheck Cond: (b = 'v12'::text)\n        ->  Bitmap Index Scan on pa_2_b_idx\n              Index Cond: (b = 'v12'::text)"
+	for _, c := range []struct{ q, plan string }{
+		{"select * from pa where b = 'v12'", "Append\n  " + bitmap},
+		{"select * from pa where b = 'v12' order by a limit 3",
+			"Limit\n  ->  Sort\n        Sort Key: pa.a\n        ->  Append\n              " + strings.ReplaceAll(bitmap, "\n", "\n            ")},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+	}
+	for _, c := range []struct{ q, rows string }{
+		{"select count(*), sum(a) from pa where b = 'v12'", "10|45120"},
+		{"select a, b, tableoid::regclass from pa where b = 'v12' order by a limit 3", "12|v12|pa_1;1012|v12|pa_1;2012|v12|pa_1"},
+		{"select max(a) from pa where c = 3", "9999"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q (PG 18.3)", c.q, got, c.rows)
+		}
+	}
+}

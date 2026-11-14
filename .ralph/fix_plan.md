@@ -13133,6 +13133,17 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Resume: make explain\_names.go register a partitionwise parent's
       binding id only within its own query level \(level-scoped bySrc\),
       then re-apply the patch and re-measure.
+  - 2026-11-15 slice 1 LANDED \(next loop\): the parked patch plus the
+    EXPLAIN scope fix \(scopeSources registers an Append's parent
+    appendrels\) and two more gates \(no correlated restriction; one-relation
+    problems with a restriction only\).
+    - Witnesses `select * from pa where b = 'v12'` \(+ ORDER BY LIMIT\) match
+      PG; TestAppendRelChildIndexPaths pins them.
+    - Design: docs/design/0100-0149/0148-0001c3a10-appendrel-child-paths.md.
+    Movement: yes — regress inherit 720→712
+    - Resume: multi-relation problems \(EXPLAIN key chase and parameterised
+      quals over the Append\); Merge Append over ordered children; min/max
+      per partition; index-only child paths.
 - [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
   (NULL-keyed entries)**.
   Kind: impl

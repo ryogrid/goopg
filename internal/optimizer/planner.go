@@ -1863,7 +1863,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// the Append), which a partitionwise child join would move into
 		// its member; ledgered.
 		if len(s.Locking) > 0 {
-			ctx.settings.EnablePartitionwiseJoin = false
+			ctx.settings.KeepAppendRelsWhole = true
 		}
 		// A-01(ii) cut 2: the statement's rtableScope, stamped DIRECTLY
 		// like the fields above. Sublink planners without the pointer
@@ -15748,7 +15748,7 @@ func applyUpdateAssign(a parser.UpdateAssign, tbl *catalog.Table, set []Expr, ct
 func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
 	// M0148-0001c3a9: modifying plans keep appendrels whole (see
 	// planSelectWithSettings' row-lock guard).
-	ps.EnablePartitionwiseJoin = false
+	ps.KeepAppendRelsWhole = true
 	// A-01(ii) cut 2 (F5): the WITH list, the FROM list, the target
 	// scan, and every SET / WHERE / RETURNING sublink allocate from
 	// the statement scope.
@@ -15953,7 +15953,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog, ps PlannerSettings, s
 func planDelete(s *parser.DeleteStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
 	// M0148-0001c3a9: modifying plans keep appendrels whole (see
 	// planSelectWithSettings' row-lock guard).
-	ps.EnablePartitionwiseJoin = false
+	ps.KeepAppendRelsWhole = true
 	// A-01(ii) cut 2 (F5): same scope treatment as planUpdate (see it for
 	// the target-scan note).
 	restore, dmlPlans, err := preplanWithClause(s.With, nil, cat, ps, scope)
@@ -16129,7 +16129,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog, ps PlannerSettings, s
 func planMerge(s *parser.MergeStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
 	// M0148-0001c3a9: modifying plans keep appendrels whole (see
 	// planSelectWithSettings' row-lock guard).
-	ps.EnablePartitionwiseJoin = false
+	ps.KeepAppendRelsWhole = true
 	// A leading WITH (M0146-0085): its CTEs are visible to the USING source,
 	// ON and WHEN clauses; data-modifying ones run first, as for DELETE.
 	restore, dmlPlans, err := preplanWithClause(s.With, nil, cat, ps, scope)
