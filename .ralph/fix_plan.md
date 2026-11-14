@@ -12542,7 +12542,14 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Probe against PG: plans, costs and rows identical on 10 statements
       (widths aside).
     Movement: yes — regress create\_index 2832→2801
-  - Resume: (e) useful\_predicate or (f) join OR bitmap paths; the
+  - 2026-11-14 (e) LANDED: partial-index predOK through
+    predicate\_implied\_by.
+    - predicateImpliedBy now serves all four prover sites.
+    - `name` constants are compared bytewise.
+    - The Recheck Cond lists the index quals before the predicate.
+    - Probe against PG: 4 plans identical.
+    Movement: yes — regress select 256→45
+  - Resume: (f) join OR bitmap paths; the
     (i) residue (a lone empty array, cross-type literals, index-only width,
     index-only prefix + range) is low-value.
 - [ ] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21

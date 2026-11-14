@@ -1,34 +1,32 @@
-# Working Set — loop end 2026-11-14 (census routing-20261114g CHANGED→new BASE; M0148-0001c3a4 item (j) landed 7d764e07f)
+# Working Set — loop end 2026-11-14 (census routing-20261114h IDENTICAL; M0148-0001c3a4 item (e) landed 9394bbc7b)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: run 20261114-050038 items: 0. Nothing filed.
-- S9: DUE at loop start → routing-20261114g (label s9cl, BASELINE_REV=5bf6e720f).
-  - CHANGED on bitmap cost lines only (item (g)). CATEGORIES-EXCL-MATCH 0 everywhere. The full capture is committed as the new BASE for all three corpora.
-  - 7d764e07f is a code commit, so the next loop should get DUE. Capture with BASELINE_REV=3ab65d690 (capture head of routing-20261114g); expect IDENTICAL (fire-set fires=none ×3).
-- Task: M0148-0001c3a4. Done: (a), (b), (c), (d), (g), (h), (i) slices 1-5, (j). Open: (e) useful_predicate, (f) join OR bitmap paths, (i) low-value residue.
-- Files (j):
-  - optimizer/pathindexrestrict.go: restrictionSkipRange; plain producer + cost.
-  - pathindexonly.go: IOS producer + cost; clausesSkipRange.
-  - pathbitmap.go / createplanbitmap.go: bitmap producer, cost, lowering.
-  - createplanindex.go: IOS / plain lowering. plan.go: BitmapIndexScan.SkipPrefix.
-  - executor index_trailing_saop.go: newIndexColumnCheck, skipRangePred.
-  - operators_index.go: skipRangeScan dispatch. operators_indexonly.go / operators_bitmap.go: skip-range branches. operators_storage.go: indexScanPredicate. operators_explain.go: renders on all three nodes.
-  - Test: TestSkipScanRangeOnLaterColumn.
+- S9: DUE at loop start → routing-20261114h (label s9cm, BASELINE_REV=3ab65d690) IDENTICAL ×3, committed.
+  - 9394bbc7b is a code commit, so the next loop should get DUE. Capture with BASELINE_REV=f7e010c4b (capture head of routing-20261114h); expect IDENTICAL (fire-set fires=none ×3).
+- Task: M0148-0001c3a4. Done: (a)-(e), (g), (h), (i) slices 1-5, (j). Open: (f) join OR bitmap paths; the low-value (i) residue.
+- Files (e):
+  - optimizer/pathbitmap.go: partialPredicateProvenBy → predicateImpliedBy.
+  - pathbitmapor.go: operatorPredicateProof + btreeImplication + nameComparison; arm subqual site.
+  - partial_index_implied_quals.go, planner.go: prover sites.
+  - createplanbitmap.go: Recheck predicate order + implied skip.
+  - Test: TestPartialIndexPredicateProof.
 - Findings:
-  - PG's skip-arm cost reverts to a whole-index read on tenk1 (1001 descents > index pages), so goopg's whole-read executor is cost-faithful there.
-  - The probe recipe is the regress tenk1 in both engines (tmp/c3a4d-setup.sql); the scratch PG on 5545 is RUNNING, the goopg probe server (5533) stopped. Probe scripts: tmp/c3a4j.sql, tmp/c3a4d.sql.
-- Next step: S9 census (DUE). Then (e) useful_predicate (a partial index proved by an OR arm alone, select.sql onek2_u2_prtl cases) or (f).
+  - Design doc split under D3 (800 lines): part 2 = docs/design/0100-0149/0148-0001c3a4-scalararrayop-index-residue-part2.md, indexed. Append c3a4 sections THERE.
+  - Regress run order matters: select needs create_index first, which creates onek2's partial indexes. A select-first run reverts every partial-index plan.
+  - select's remaining diff: the IOS over a proven partial index (M0148-0001c3b item 1, next in file order after c3a5); `Index Searches` in EXPLAIN ANALYZE; list_parted One-Time Filter.
+- Next step: S9 census (DUE). Then (f) join OR bitmap paths (bitjoinpaths); or, if (f) proves large, close c3a4 to its (f)+(i) residue and move to M0148-0001c3a5 (d) (boolean index quals / constant-prefix Sort).
 - Top-residual: M0148 residues. Open children: c3a4, c3a5, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261114g done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261114h done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a4.
 - Gates run (all PASS):
-  - census s9cl CHANGED (bitmap cost lines), new BASE.
+  - census s9cm IDENTICAL ×3.
   - units.
   - tpch-spotcheck.
-  - sf025 99/99 (plan shapes identical).
-  - fire-set c3a4jfs fires=none ×3.
+  - sf025 99/99.
+  - fire-set c3a4efs fires=none ×3.
   - acceptance 24 MATCH.
-  - regress: create_index 2832→2801, no new mismatch.
+  - regress: select 256→45; join (j2_id1_idx now used, as PG does); rowsecurity pointer noise.
   - pgbench smoke.
-- In-flight: none.
+- In-flight: none. Scratch PG (5545) RUNNING; goopg probe server (5533) stopped.
