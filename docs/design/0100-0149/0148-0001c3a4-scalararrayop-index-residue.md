@@ -1,6 +1,6 @@
 # M0148\-0001c3a4 — ScalarArrayOp and OR index\-path residue
 
-**Parent:** M0148\-0001c3a2 · **Status:** items \(a\), \(b\), \(c\) and \(h\) landed 2026\-11\-12; item \(i\) slices 1–4 landed 2026\-11\-14; items \(d\)–\(g\) and the rest of \(i\) open
+**Parent:** M0148\-0001c3a2 · **Status:** items \(a\), \(b\), \(c\) and \(h\) landed 2026\-11\-12; item \(i\) slices 1–5 landed 2026\-11\-14; items \(d\)–\(g\) and the rest of \(i\) open
 
 This item collects what M0148\-0001c3a2 \(BitmapOr paths\) left open. The items
 are listed in `.ralph/fix_plan.md` under M0148\-0001c3a4:
@@ -385,8 +385,8 @@ failed with 22P02.
 - **Cross\-type arrays:** `unique1 = ANY ('{33, 44}'::bigint[])` on an int4
   column is not split \(castIsColumnArrayType\). PG merges it through the
   cross\-type opfamily operator.
-- **Empty array literal:** `= ANY ('{}')` stays a Filter, printed without
-  its `::integer[]` cast. PG keeps it as an index qual that matches nothing.
+- **Empty array literal:** slice 5 makes it an index qual when it merges
+  into another array. A lone one is still a Filter.
 - **Array behind a prefix plus a bound on the array column:** closed by
   slice 2.
 - **Array behind a leading range** \(`thousand < 2 AND tenthous IN (…)`\):
@@ -582,4 +582,48 @@ scan with the array in the Filter.
   - units, tpch\-spotcheck, sf025 99/99;
   - fire\-set fires=none on sf025, sf1 and TPC\-H;
   - acceptance 24 MATCH.
+
+## Item \(i\) slice 5 — the empty array literal
+
+PG makes `= ANY ('{}')` an index qual like any other array. Merged into
+another array, it leaves the intersection empty:
+`((unique1 = ANY ('{42,43,7}'::integer[])) AND (unique1 = ANY ('{}'::integer[])))`.
+On its own it is a probe with no elements.
+
+### Change
+
+- `arrayLiteralElements` returns an empty, non\-nil element list for
+  `'{}'`. Before, it refused the literal, so the qual stayed in the Filter.
+- **Primary array:** the producers \(`restrictionSAOPOnColumn`,
+  `bitmapSAOPOnColumn`\) still refuse an empty list, because goopg's probe
+  shapes read "no elements" as "no array".
+- **Column quals:** a merged column qual \(`saopColumnQuals`\) takes it.
+  `saopWindows` then keeps no element, and the scan reads nothing. This works
+  on the plain, index\-only, bitmap and trailing\-array paths.
+- **Selectivity:** the InExpr estimator splits the empty literal too, so it
+  prices 0, as scalararraysel's merge over no elements does. Rows then clamp
+  to 1, as PG's do.
+- **EXPLAIN:** `inListArrayConst` prints an empty list as `'{}'::type[]`.
+  Before, it declined, and the text came out as the invalid `= ANY ()`.
+
+### Verification
+
+- **Live server against a scratch PG 18.3:** the empty\-array statements
+  have identical plans, costs and rows on the index\-only, plain and
+  trailing\-array paths. The slice\-1 probe set's residue went from 21 to
+  16 diff lines.
+- **`TestSAOPArrayLiteralAndColumnQuals`:** the PG plan, with no rows.
+- **Regress:** the 22 suites are unchanged from slice 4, and `arrays` is
+  byte\-identical to HEAD \(run against a HEAD build\).
+- **Gates:**
+  - units, tpch\-spotcheck, sf025 99/99;
+  - fire\-set fires=none on sf025, sf1 and TPC\-H;
+  - acceptance 24 MATCH.
+
+### Not covered
+
+- **A lone empty array:** `unique1 = ANY ('{}')` alone is still a Filter.
+  PG uses an Index \(Only\) Scan with `Index Cond: (unique1 = ANY
+  ('{}'::integer[]))` at 4.30. goopg needs a zero\-element probe shape
+  first.
 

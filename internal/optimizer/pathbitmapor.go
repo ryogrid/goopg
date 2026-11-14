@@ -253,8 +253,10 @@ func arrayLiteralElements(typ catalog.Type, list []Expr) ([]Expr, bool) {
 		return nil, false
 	}
 	if body == "" {
-		// An empty array matches nothing; keep it as the Filter.
-		return nil, false
+		// An empty array matches nothing. The primary-array producers keep
+		// it a Filter (a zero-element probe has no shape here); a column
+		// qual or the selectivity estimator takes it as is.
+		return []Expr{}, true
 	}
 	intCol := false
 	switch typ.Name {
@@ -353,7 +355,7 @@ func bitmapSAOPOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.In
 				continue
 			}
 			list, listOK := saopElementsFor(tbl.Columns[cr.Index], in.List)
-			if !listOK {
+			if !listOK || len(list) == 0 {
 				continue
 			}
 			usable := true

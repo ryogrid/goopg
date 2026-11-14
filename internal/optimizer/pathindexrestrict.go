@@ -351,7 +351,7 @@ func restrictionSAOPOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catal
 			continue
 		}
 		list, listOK := saopElementsFor(tbl.Columns[cr.Index], in.List)
-		if !listOK {
+		if !listOK || len(list) == 0 {
 			continue
 		}
 		usable := true

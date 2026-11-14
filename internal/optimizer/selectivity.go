@@ -111,7 +111,9 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 		// constant array; the probe splits it the same way
 		// (saopElementsFor).
 		if len(e.List) == 1 {
-			if elems, ok := arrayLiteralElements(cr.Type, e.List); ok && len(elems) > 0 && (len(elems) != 1 || elems[0] != e.List[0]) {
+			// An empty literal (`'{}'`) prices 0, as scalararraysel's merge
+			// over no elements does (M0148-0001c3a4 (i)).
+			if elems, ok := arrayLiteralElements(cr.Type, e.List); ok && (len(elems) != 1 || elems[0] != e.List[0]) {
 				split := *e
 				split.List = elems
 				e = &split

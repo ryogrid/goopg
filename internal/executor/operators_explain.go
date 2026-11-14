@@ -6604,7 +6604,8 @@ func quoteLiteral(v string) string {
 // not model (a NULL or non-literal element, an unmodelled type), and the
 // caller keeps its element-list rendering.
 func inListArrayConst(lt catalog.Type, list []optimizer.Expr) (cast, lit string, ok bool) {
-	if lt.IsArray || len(list) == 0 {
+	// An empty list prints `'{}'::type[]` (M0148-0001c3a4 (i)).
+	if lt.IsArray {
 		return "", "", false
 	}
 	elems := make([]string, len(list))

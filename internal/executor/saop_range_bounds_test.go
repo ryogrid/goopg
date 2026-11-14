@@ -291,6 +291,9 @@ func TestSAOPArrayLiteralAndColumnQuals(t *testing.T) {
 		{"unique1 IN (1, 42, 7) and unique1 >= 42", "((unique1 = ANY ('{1,42,7}'::integer[])) AND (unique1 >= 42))", "42"},
 		{"unique1 IN (1, 42, 7) and unique1 > 42", "((unique1 = ANY ('{1,42,7}'::integer[])) AND (unique1 > 42))", ""},
 		{"unique1 < 8 and unique1 IN (1, 42, 7)", "((unique1 < 8) AND (unique1 = ANY ('{1,42,7}'::integer[])))", "1;7"},
+		// An empty array merged into the probe admits nothing.
+		{"unique1 IN (1, 42, 7) and unique1 = ANY('{}')",
+			"((unique1 = ANY ('{1,42,7}'::integer[])) AND (unique1 = ANY ('{}'::integer[])))", ""},
 		// Two arrays and a bound keep the order they were written in.
 		{"unique1 IN (42, 43, 7) and unique1 IN (43, 7, 8) and unique1 < 40",
 			"((unique1 = ANY ('{42,43,7}'::integer[])) AND (unique1 = ANY ('{43,7,8}'::integer[])) AND (unique1 < 40))", "7"},
