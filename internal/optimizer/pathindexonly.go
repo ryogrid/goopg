@@ -268,10 +268,20 @@ func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, t
 		if nts := restrictionNullTestsOnColumn(idx, 0, conjuncts); len(nts) > 0 && len(clauses) == 0 {
 			rng = withNullTestsInConjunctOrder(rng, nts, conjuncts)
 		}
+		// M0148-0001c3a12: a row comparison over the leading columns.
+		rc := restrictionRowCompare(cat, tbl, idx, conjuncts, rng)
+		if rc != nil {
+			rng = withRowCompareInConjunctOrder(rng, *rc, conjuncts)
+		}
 		if len(clauses) > 0 || len(rng) == 0 {
 			return nil, false
 		}
+		// bound stays 1 with a row comparison too: a later column decides
+		// only on a tie, so a NULL there still needs its entry stored.
 		clauses, bound = rng, 1
+		if rc != nil {
+			break
+		}
 		// M0148-0001c3a4 (i): an `= ANY` array on the second column behind
 		// the leading range is an index qual too (PG's `((thousand < 2) AND
 		// (tenthous = ANY (…)))`); the scan checks it per entry
@@ -332,7 +342,7 @@ func plainRestrictionBindsOnlyPrefix(cat catalog.Catalog, tbl *catalog.Table, id
 			(idx.DeclaredHash || len(restrictionSAOPOnColumn(cat, tbl, idx, n, conjuncts)) == 0))
 	}
 	if len(restrictionLeadingSAOP(cat, tbl, idx, conjuncts)) > 0 || len(restrictionLeadingRange(cat, tbl, idx, conjuncts)) > 0 ||
-		restrictionLeadingNullTest(idx, conjuncts) != nil {
+		restrictionLeadingNullTest(idx, conjuncts) != nil || restrictionRowCompare(cat, tbl, idx, conjuncts, nil) != nil {
 		return false
 	}
 	skipClauses, _ := restrictionSkipRun(cat, tbl, idx, conjuncts)

@@ -284,6 +284,14 @@ func rowCompareSelectivity(op parser.OpCode, left, right Expr, child Node) (floa
 	if !ok {
 		return 0, false
 	}
+	// eqsel / scalarineqsel: a NULL constant matches nothing (selfuncs.c
+	// `if (constisnull) return 0.0`) — `(a, b) > (NULL, 5)` (M0148-0001c3a12).
+	if _, isNull := r.(*NullConst); isNull && op != parser.OpNe {
+		return 0, true
+	}
+	if _, isNull := l.(*NullConst); isNull && op != parser.OpNe {
+		return 0, true
+	}
 	switch op {
 	case parser.OpEq:
 		return eqOpSelectivity(l, r, child), true

@@ -586,6 +586,13 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		}
 		o.trailCheck = c
 	}
+	if o.plan.RowCompare != nil && o.trailCheck == nil {
+		c, err := newIndexRowCheck(o.ctx, o.plan.Table, o.plan.Index, o.plan.RowCompare)
+		if err != nil {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		o.trailCheck = c
+	}
 	if o.plan.TrailingSAOP != nil && o.trailCheck == nil {
 		c, err := newTrailingKeyCheck(o.ctx, o.plan.Table, o.plan.Index, o.plan.TrailingSAOP)
 		if err != nil {

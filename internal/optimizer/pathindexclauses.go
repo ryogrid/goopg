@@ -156,6 +156,12 @@ type indexPathClause struct {
 	// the same direction implies (restrictionRangeOnColumnLocal): an index
 	// clause PG prints, not a probe bound (ExtraIndexBound).
 	redundantBound bool
+	// rowCompare marks the leading-column bound derived from a row
+	// comparison `(c0, c1, …) op (v0, v1, …)` over the index's leading
+	// columns (match_rowcompare_to_indexcol, M0148-0001c3a12): op / key are
+	// the lossy bound on c0, local the comparison, which the scan checks
+	// exactly per entry (IndexScan.RowCompare).
+	rowCompare bool
 }
 
 // indexPathClauses is `build_index_paths`' `index_clauses` accumulation

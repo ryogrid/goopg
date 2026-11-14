@@ -90,6 +90,8 @@ type trailingKeyCheck struct {
 	vals  []Datum
 	blob  []catalog.Column // columns 0..pos (blob key format)
 	style array.OutputStyle
+	// multi > 0: a row check over key columns 0..multi-1 (newIndexRowCheck).
+	multi int
 }
 
 // newTrailingKeyCheck is the check for IndexScan.TrailingSAOP: the array (and
@@ -133,20 +135,28 @@ func newIndexColumnCheck(ctx *Context, tbl *catalog.Table, idx *catalog.Index, p
 	return c, nil
 }
 
-// admits reports whether the entry's key column passes the qual.
+// admits reports whether the entry's key column passes the qual. A row
+// check (multi > 0) fills row[0..multi-1] with the leading key columns.
 func (c *trailingKeyCheck) admits(key []byte) (bool, error) {
 	if c.desc != nil {
 		vals, err := pgIndexTupleKeyDatumsInto(c.desc, c.cols, key, c.imgs, c.nulls, c.vals)
 		if err != nil {
 			return false, err
 		}
-		c.row[0] = vals[c.pos]
+		if c.multi > 0 {
+			copy(c.row, vals[:c.multi])
+		} else {
+			c.row[0] = vals[c.pos]
+		}
 	} else {
 		off := 0
 		for i := 0; i < c.pos; i++ {
-			_, n, err := decodeIndexKeyColumnStyled(key[off:], c.blob[i], c.style)
+			d, n, err := decodeIndexKeyColumnStyled(key[off:], c.blob[i], c.style)
 			if err != nil {
 				return false, err
+			}
+			if c.multi > 0 {
+				c.row[i] = d
 			}
 			off += n
 		}
@@ -154,9 +164,57 @@ func (c *trailingKeyCheck) admits(key []byte) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		c.row[0] = d
+		if c.multi > 0 {
+			c.row[c.pos] = d
+		} else {
+			c.row[0] = d
+		}
 	}
 	return predAdmits(c.ctx, c.pred, c.row)
+}
+
+// newIndexRowCheck is the per-entry check of IndexScan.RowCompare
+// (M0148-0001c3a12): the comparison over the index's leading columns,
+// evaluated on each entry's decoded key — nbtree's SK_ROW_HEADER key.
+func newIndexRowCheck(ctx *Context, tbl *catalog.Table, idx *catalog.Index, rc *optimizer.BinaryOp) (*trailingKeyCheck, error) {
+	pred, n, err := rowComparePredOverIndex(idx, rc)
+	if err != nil {
+		return nil, err
+	}
+	c, err := newIndexColumnCheck(ctx, tbl, idx, n-1, func(*optimizer.ColumnRef) optimizer.Expr { return pred })
+	if err != nil {
+		return nil, err
+	}
+	c.multi = n
+	c.row = make(Row, n)
+	return c, nil
+}
+
+// rowComparePredOverIndex rewrites a row comparison's column references to
+// their index-column positions (Row{c0, …, ck}), and returns the number of
+// leading columns it reads.
+func rowComparePredOverIndex(idx *catalog.Index, rc *optimizer.BinaryOp) (optimizer.Expr, int, error) {
+	n := 0
+	pos := make(map[string]int, len(idx.Columns))
+	for i, c := range idx.Columns {
+		pos[c] = i
+	}
+	bad := false
+	pred, ok := optimizer.CloneExprReplacingColumnRefs(rc, func(cr *optimizer.ColumnRef) optimizer.Expr {
+		i, found := pos[cr.Name]
+		if !found {
+			bad = true
+			return nil
+		}
+		if i+1 > n {
+			n = i + 1
+		}
+		return &optimizer.ColumnRef{Index: i, Name: cr.Name, Type: cr.Type}
+	})
+	if !ok || bad || n == 0 {
+		return nil, 0, fmt.Errorf("row comparison over columns outside index %q", idx.Name)
+	}
+	return pred, n, nil
 }
 
 // skipRangePred is `ref op key` for a skip scan's bounds on its range column

@@ -12660,6 +12660,16 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - executor: a lexicographic row bound on the index (nbtree treats it
       as an SK\_ROW\_HEADER scan key);
     - EXPLAIN: `ROW(…) > ROW(…)` with typed Consts.
+  - 2026-11-14 slice 1 LANDED: a row comparison over the index's leading
+    columns is an index qual on Index Scan / Index Only Scan.
+    - The lossy leading bound is probed and the comparison checked per
+      entry (newIndexRowCheck); EXPLAIN prints `ROW(…) op ROW(NULL::integer,
+      …)`.
+    - A NULL constant estimates 0 rows.
+    - Design: docs/design/0100-0149/0148-0001c3a12-row-compare-index-quals.md.
+    Movement: yes — regress create\_index 2500→2483
+    - Resume: the bitmap form (BitmapIndexScan RowCompare + Recheck Cond);
+      prefix / DESC / truncated rows; btree\_index waits on c3a7.
 - [ ] **M0148-0001c3a13 — constant-NULL row elimination in a row IN list**.
   Kind: impl
   Parent: M0148-0001c3a6

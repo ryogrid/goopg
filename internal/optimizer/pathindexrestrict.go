@@ -482,6 +482,11 @@ func restrictionSAOPOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catal
 func rangeIndexSelectivity(leaf Node, conjuncts []Expr, clauses []indexPathClause) float64 {
 	var quals []Expr
 	for _, c := range clauses {
+		if c.rowCompare && c.local != nil {
+			// rowcomparesel over the comparison (M0148-0001c3a12).
+			quals = append(quals, c.local)
+			continue
+		}
 		if c.nullTest != IndexNullTestNone {
 			// The NullTest conjunct itself (nulltestsel through
 			// clauseSelectivity), M0148-0001c3a.
@@ -808,10 +813,15 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 			clauses = withNullTestsInConjunctOrder(clauses, nts, conjuncts)
 		}
 		isRange = true
-		// M0148-0001c3a4 (i): an `= ANY` array on the second column behind
-		// the range is an index qual too, checked per entry
-		// (IndexScan.TrailingSAOP).
-		if len(clauses) > 0 {
+		// M0148-0001c3a12: a row comparison over the leading columns bounds
+		// the leading column and is checked per entry; it takes the scan's
+		// one entry check, so no trailing array beside it.
+		if rc := restrictionRowCompare(cat, tbl, idx, conjuncts, clauses); rc != nil {
+			clauses = withRowCompareInConjunctOrder(clauses, *rc, conjuncts)
+		} else if len(clauses) > 0 {
+			// M0148-0001c3a4 (i): an `= ANY` array on the second column
+			// behind the range is an index qual too, checked per entry
+			// (IndexScan.TrailingSAOP).
 			clauses = append(clauses, trailingSAOPOnRange(cat, tbl, idx, conjuncts)...)
 		}
 	}
@@ -1384,4 +1394,92 @@ func equalityMergedIntoLeadingSAOP(cat catalog.Catalog, tbl *catalog.Table, idx 
 		}
 	}
 	return false
+}
+
+// restrictionRowCompare is match_rowcompare_to_indexcol (indxpath.c) for a
+// restriction conjunct `(c0, …, ck) op (v0, …, vk)`: the left row's
+// columns are the index's leading columns in order, the right row's
+// elements constants (NULL included), op an inequality. The clause bounds
+// c0 (op's direction, inclusive — the lossy part nbtree's SK_ROW_HEADER key
+// starts the scan at) and carries the comparison for the per-entry check.
+// A row on the right is commuted. nil when no conjunct qualifies, or when
+// the column already has a bound of that direction (one probe bound per
+// direction).
+func restrictionRowCompare(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr, have []indexPathClause) *indexPathClause {
+	if idx.DeclaredHash || len(idx.Columns) < 2 {
+		return nil
+	}
+	for _, conj := range conjuncts {
+		bin, ok := conj.(*BinaryOp)
+		if !ok {
+			continue
+		}
+		op := bin.Op
+		switch op {
+		case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		default:
+			continue
+		}
+		lr, lok := bin.Left.(*RowExpr)
+		rr, rok := bin.Right.(*RowExpr)
+		if !lok || !rok {
+			continue
+		}
+		if _, colsRight := rr.Elems[0].(*ColumnRef); colsRight {
+			lr, rr, op = rr, lr, swapInequalityOp(op)
+		}
+		n := len(lr.Elems)
+		if n < 2 || n != len(rr.Elems) || n > len(idx.Columns) {
+			continue
+		}
+		match := true
+		for i := 0; i < n; i++ {
+			cr, isCol := lr.Elems[i].(*ColumnRef)
+			if !isCol || cr.Index < 0 || cr.Index >= len(tbl.Columns) || tbl.Columns[cr.Index].Name != idx.Columns[i] {
+				match = false
+				break
+			}
+			v := rr.Elems[i]
+			if _, isNull := v.(*NullConst); isNull {
+				continue
+			}
+			if !bitmapConstKey(v) || !restrictionKeyUsable(cat, tbl.Columns[cr.Index], v) {
+				match = false
+				break
+			}
+			// Every column ascending: a DESC column reverses the row order
+			// the lossy bound and the entry check assume.
+			if i < len(idx.ColDescending) && idx.ColDescending[i] {
+				match = false
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+		bound := parser.OpGe
+		if op == parser.OpLt || op == parser.OpLe {
+			bound = parser.OpLe
+		}
+		for _, h := range have {
+			if h.indexCol == 0 && ((bound == parser.OpGe) == (h.op == parser.OpGt || h.op == parser.OpGe)) {
+				match = false
+			}
+		}
+		if !match {
+			continue
+		}
+		return &indexPathClause{indexCol: 0, op: bound, key: rr.Elems[0], local: conj, rowCompare: true}
+	}
+	return nil
+}
+
+// withRowCompareInConjunctOrder places the row-comparison clause among the
+// leading column's clauses in restriction-list order.
+func withRowCompareInConjunctOrder(rng []indexPathClause, rc indexPathClause, conjuncts []Expr) []indexPathClause {
+	out := append(append([]indexPathClause(nil), rng...), rc)
+	sort.SliceStable(out, func(i, j int) bool {
+		return conjunctPrecedes(clauseSource(out[i], conjuncts), clauseSource(out[j], conjuncts), conjuncts)
+	})
+	return out
 }

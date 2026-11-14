@@ -1367,6 +1367,25 @@ func (o *indexOnlyScanOp) lookupRangeBounds() (lo, hi []byte, ok bool, err error
 // column qual. nil when the scan has none. The planner files the array only
 // when its column is covered.
 func (o *indexOnlyScanOp) trailingSAOPQual() (optimizer.Expr, error) {
+	if rc := o.plan.RowCompare; rc != nil {
+		// M0148-0001c3a12: the row comparison over the covered columns.
+		out := o.plan.Output()
+		bad := false
+		pred, ok := optimizer.CloneExprReplacingColumnRefs(rc, func(cr *optimizer.ColumnRef) optimizer.Expr {
+			for i, sc := range out {
+				if sc.Name == cr.Name {
+					return &optimizer.ColumnRef{Index: i, Name: cr.Name, Type: sc.Type}
+				}
+			}
+			bad = true
+			return nil
+		})
+		if !ok || bad {
+			return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
+				"indexOnlyScanOp: row comparison column not covered by index %q", o.plan.Index.Name)}
+		}
+		return pred, nil
+	}
 	ts := o.plan.TrailingSAOP
 	if ts == nil {
 		return nil, nil

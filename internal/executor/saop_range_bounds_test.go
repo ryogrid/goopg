@@ -901,3 +901,35 @@ func TestEqualityMergedIntoLeadingArray(t *testing.T) {
 		}
 	}
 }
+
+// M0148-0001c3a12: a row comparison over an index's leading columns is an
+// index qual (match_rowcompare_to_indexcol): the scan starts at the lossy
+// leading-column bound and checks the comparison on each entry, printing it
+// whole with a NULL labelled by its column's type. A NULL leading constant
+// matches nothing (selectivity 0). Plans and rows from PG 18.3.
+func TestRowCompareIndexQual(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "create table rc (thousand int NOT NULL, tenthous int NOT NULL, pad text)")
+	runSQL(t, ctx, "create index rc_tt on rc (thousand, tenthous)")
+	runSQL(t, ctx, "insert into rc select g % 1000, g, 'x' from generate_series(0, 9999) g")
+	runSQL(t, ctx, "VACUUM rc")
+	runSQL(t, ctx, "ANALYZE rc")
+	ps := optimizer.DefaultPlannerSettings()
+	q := "SELECT * FROM rc WHERE (thousand, tenthous) > (NULL, 5)"
+	want := "Index Scan using rc_tt on rc\n  Index Cond: (ROW(thousand, tenthous) > ROW(NULL::integer, 5))"
+	if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+q, ps)), "\n"); got != want {
+		t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", q, got, want)
+	}
+	ps.EnableBitmapScan = false // goopg has no bitmap row comparison yet (ledgered)
+	for _, c := range []struct{ q, rows string }{
+		{q, ""},
+		{"SELECT count(*), sum(tenthous) FROM rc WHERE (thousand, tenthous) > (998, 5000)", "15|94980"},
+		{"SELECT count(*) FROM rc WHERE (thousand, tenthous) >= (997, 2000) and thousand < 999", "18"},
+		{"SELECT thousand, tenthous FROM rc WHERE (1, 3000) > (thousand, tenthous) order by 1, 2 limit 3", "0|0;0|1000;0|2000"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

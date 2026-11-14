@@ -371,6 +371,8 @@ func createIndexScanPlan(p *Path) Node {
 		ioNullTestAfter := false
 		var ioExtraNullTests []ExtraIndexNullTest
 		var ioExtraBounds []ExtraIndexBound
+		var ioRowCompare *BinaryOp
+		ioRowCompareLow := false
 		var ioCondOrder []IndexCondItem
 		// M0148-0001c3a4 (h): a leading-column ScalarArrayOp, optionally
 		// bounded on the second column — IndexOnlyScan.SAOPKeys.
@@ -466,6 +468,21 @@ func createIndexScanPlan(p *Path) Node {
 					}
 					continue
 				}
+				if c.rowCompare {
+					bin, ok := c.local.(*BinaryOp)
+					if !ok || ioSkipCol != 0 || ioTrailing != nil {
+						panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries a malformed row comparison", p.IndexInfo.Name))
+					}
+					if c.op == parser.OpGe {
+						ioLow, ioLowOp, ioRowCompareLow = c.key, c.op, true
+					} else {
+						ioHigh, ioHighOp = c.key, c.op
+					}
+					ioRowCompare = bin
+					ioCondOrder = append(ioCondOrder, IndexCondRowCompare)
+					ioDrop[c.local] = true
+					continue
+				}
 				switch c.op {
 				case parser.OpGt, parser.OpGe:
 					if ioLow != nil {
@@ -558,6 +575,7 @@ func createIndexScanPlan(p *Path) Node {
 			ios.LeadingNullTest, ios.NullTestAfterBounds = ioNullTest, ioNullTestAfter
 			ios.ExtraNullTests = ioExtraNullTests
 			ios.ExtraBounds = ioExtraBounds
+			ios.RowCompare, ios.RowCompareLow = ioRowCompare, ioRowCompareLow
 			if len(ioCondOrder) > 1 {
 				ios.IndexCondOrder = ioCondOrder
 			}
@@ -836,6 +854,29 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 			if c.local != nil {
 				drop[c.local] = true
 			}
+			continue
+		}
+		if c.rowCompare {
+			// M0148-0001c3a12: the comparison's lossy leading bound, the
+			// comparison itself checked per entry and printed whole.
+			bin, ok := c.local.(*BinaryOp)
+			if !ok || rangeCol != 0 || is.TrailingSAOP != nil {
+				panic(fmt.Sprintf("createPlan: range PathIndexScan on %s carries a malformed row comparison", p.IndexInfo.Name))
+			}
+			if c.op == parser.OpGe {
+				if is.LowKey != nil {
+					panic(fmt.Sprintf("createPlan: range PathIndexScan on %s carries two lower bounds", p.IndexInfo.Name))
+				}
+				is.LowKey, is.LowOp, is.RowCompareLow = c.key, c.op, true
+			} else {
+				if is.HighKey != nil {
+					panic(fmt.Sprintf("createPlan: range PathIndexScan on %s carries two upper bounds", p.IndexInfo.Name))
+				}
+				is.HighKey, is.HighOp = c.key, c.op
+			}
+			is.RowCompare = bin
+			condOrder = append(condOrder, IndexCondRowCompare)
+			drop[c.local] = true
 			continue
 		}
 		switch c.op {

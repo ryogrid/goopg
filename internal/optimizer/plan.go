@@ -591,6 +591,8 @@ const (
 	IndexCondNullTest
 	// IndexCondExtraBound is the next of the scan's ExtraBounds.
 	IndexCondExtraBound
+	// IndexCondRowCompare is the scan's RowCompare.
+	IndexCondRowCompare
 )
 
 // ExtraIndexBound is a further bound on a range scan's column that the
@@ -1057,6 +1059,12 @@ type IndexScan struct {
 	// ExtraBounds are the range column's further bounds, implied by
 	// LowKey/HighKey and printed in Index Cond (ExtraIndexBound).
 	ExtraBounds []ExtraIndexBound
+	// RowCompare is a row comparison over the index's leading columns
+	// (M0148-0001c3a12): LowKey (RowCompareLow) or HighKey holds its lossy
+	// bound on the leading column, the scan checks the comparison on each
+	// entry, and Index Cond prints it whole.
+	RowCompare    *BinaryOp
+	RowCompareLow bool
 	// IndexCondOrder is the range column's clauses in restriction-list
 	// order (IndexCondItem).
 	IndexCondOrder []IndexCondItem
@@ -1373,6 +1381,8 @@ type IndexOnlyScan struct {
 	NullTestAfterBounds bool
 	ExtraNullTests      []ExtraIndexNullTest
 	ExtraBounds         []ExtraIndexBound
+	RowCompare          *BinaryOp
+	RowCompareLow       bool
 	IndexCondOrder      []IndexCondItem
 	// Cond is an additional filter evaluated per index row (S6 min/max
 	// rewrite: the `col IS NOT NULL` qual). IndexOnlyScan's primary probe

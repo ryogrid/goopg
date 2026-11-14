@@ -3925,6 +3925,9 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 		nt := formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder)
 		return withTrailingSAOPCond(nt, nullTestCondParts(p.ExtraNullTests, p.LowKey, p.HighKey), p.Table, p.Index, p.TrailingSAOP, reg, prefix)
 	}
+	if p.RowCompare != nil && len(p.Keys) == 0 && p.Key == nil {
+		return rangeCondWithRowCompare(p.Table, p.Index, p.LowKey, p.HighKey, p.LowOp, p.HighOp, p.RowCompare, p.RowCompareLow, reg, prefix, p.IndexCondOrder)
+	}
 	rng, nRange := rangeCondWithExtraBounds(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, p.ExtraBounds, reg, prefix, p.IndexCondOrder)
 	return withTrailingSAOPCond(rng, nRange, p.Table, p.Index, p.TrailingSAOP, reg, prefix)
 }
@@ -4008,6 +4011,9 @@ func formatIndexOnlyCondRelabeled(p *optimizer.IndexOnlyScan, reg *subPlanReg, p
 	if p.LeadingNullTest != optimizer.IndexNullTestNone {
 		nt := formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder)
 		return withTrailingSAOPCond(nt, nullTestCondParts(p.ExtraNullTests, p.LowKey, p.HighKey), p.Table, p.Index, p.TrailingSAOP, reg, prefix)
+	}
+	if p.RowCompare != nil && len(p.Keys) == 0 && p.Key == nil {
+		return rangeCondWithRowCompare(p.Table, p.Index, p.LowKey, p.HighKey, p.LowOp, p.HighOp, p.RowCompare, p.RowCompareLow, reg, prefix, p.IndexCondOrder)
 	}
 	rng, nRange := rangeCondWithExtraBounds(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, p.ExtraBounds, reg, prefix, p.IndexCondOrder)
 	return withTrailingSAOPCond(rng, nRange, p.Table, p.Index, p.TrailingSAOP, reg, prefix)
@@ -9848,4 +9854,84 @@ func rangeCondWithExtraBounds(tbl *catalog.Table, idx *catalog.Index, keys []opt
 	}
 	parts = append(parts, baseParts[bi:]...)
 	return indexCondAndText(parts), len(parts)
+}
+
+// rangeCondWithRowCompare renders a range scan carrying a row comparison
+// (M0148-0001c3a12): the comparison whole — `ROW(thousand, tenthous) >
+// ROW(NULL::integer, 5)`, index columns on the left as
+// expand_indexqual_rowcompare commutes it, a NULL labelled with its
+// column's type — beside the column's other bound, in restriction order.
+func rangeCondWithRowCompare(tbl *catalog.Table, idx *catalog.Index, lowKey, highKey optimizer.Expr, lowOp, highOp parser.OpCode,
+	rc *optimizer.BinaryOp, rowLow bool, reg *subPlanReg, prefix string, order []optimizer.IndexCondItem) string {
+	rowText := rowCompareCondText(tbl, idx, rc, reg, prefix)
+	if rowLow {
+		lowKey = nil
+	} else {
+		highKey = nil
+	}
+	var base []optimizer.IndexCondItem
+	for _, it := range order {
+		if it != optimizer.IndexCondRowCompare {
+			base = append(base, it)
+		}
+	}
+	var baseParts []string
+	if lowKey != nil || highKey != nil {
+		baseParts = rangeColumnCondParts(tbl, idx, 0, prefix+idx.Columns[0], base, lowKey, highKey, lowOp, highOp,
+			optimizer.IndexNullTestNone, false, nil, reg)
+	}
+	if len(order) == 0 {
+		return indexCondAndText(append([]string{rowText}, baseParts...))
+	}
+	var parts []string
+	bi := 0
+	for _, it := range order {
+		if it == optimizer.IndexCondRowCompare {
+			parts = append(parts, rowText)
+			continue
+		}
+		if bi < len(baseParts) {
+			parts = append(parts, baseParts[bi])
+			bi++
+		}
+	}
+	parts = append(parts, baseParts[bi:]...)
+	return indexCondAndText(parts)
+}
+
+// rowCompareCondText is a row comparison as an index qual's text.
+func rowCompareCondText(tbl *catalog.Table, idx *catalog.Index, rc *optimizer.BinaryOp, reg *subPlanReg, prefix string) string {
+	lr, _ := rc.Left.(*optimizer.RowExpr)
+	rr, _ := rc.Right.(*optimizer.RowExpr)
+	op := rc.Op
+	if lr == nil || rr == nil {
+		return formatExprQual(rc, reg, false)
+	}
+	if _, colsRight := rr.Elems[0].(*optimizer.ColumnRef); colsRight {
+		lr, rr = rr, lr
+		switch op {
+		case parser.OpLt:
+			op = parser.OpGt
+		case parser.OpLe:
+			op = parser.OpGe
+		case parser.OpGt:
+			op = parser.OpLt
+		case parser.OpGe:
+			op = parser.OpLe
+		}
+	}
+	cols := make([]string, len(lr.Elems))
+	vals := make([]string, len(rr.Elems))
+	for i := range lr.Elems {
+		cols[i] = prefix + idx.Columns[i]
+		t := indexKeyColumnType(tbl, idx, i)
+		if _, isNull := rr.Elems[i].(*optimizer.NullConst); isNull && t != nil {
+			if name, ok := castTypeName(t.Name, 0); ok {
+				vals[i] = "NULL::" + name
+				continue
+			}
+		}
+		vals[i] = formatIndexCondKeyTyped(rr.Elems[i], reg, t)
+	}
+	return "ROW(" + strings.Join(cols, ", ") + ") " + saopOpText(op) + " ROW(" + strings.Join(vals, ", ") + ")"
 }
