@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -155,6 +156,32 @@ var excludedCases = map[string]string{
 type specMeta struct {
 	status    string
 	rationale string
+	// mismatch / expected are the optional mismatch_lines / expected_lines
+	// columns (blank when absent or unmeasured).
+	mismatch string
+	expected string
+}
+
+// mismatchCounts returns the parsed mismatch/expected pair and whether both
+// are present and valid.
+func (m specMeta) mismatchCounts() (int, int, bool) {
+	if m.mismatch == "" || m.expected == "" {
+		return 0, 0, false
+	}
+	mm, err1 := strconv.Atoi(m.mismatch)
+	ee, err2 := strconv.Atoi(m.expected)
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return mm, ee, true
+}
+
+// pct formats m*100/e with one decimal ("0.0" when e == 0).
+func pct(m, e int) string {
+	if e == 0 {
+		return "0.0"
+	}
+	return strconv.FormatFloat(float64(m)*100/float64(e), 'f', 1, 64)
 }
 
 // loadCSV parses the inventory CSV and returns a map of item_path → specMeta
@@ -185,6 +212,8 @@ func loadCSV(csvPath string) (map[string]specMeta, error) {
 	itemPathIdx := colIndex("item_path")
 	statusIdx := colIndex("status")
 	rationaleIdx := colIndex("rationale")
+	mismatchIdx := colIndex("mismatch_lines")
+	expectedIdx := colIndex("expected_lines")
 
 	if itemPathIdx < 0 || statusIdx < 0 {
 		return nil, fmt.Errorf("csv missing required columns (item_path, status)")
@@ -208,6 +237,12 @@ func loadCSV(csvPath string) (map[string]specMeta, error) {
 		meta := specMeta{status: rec[statusIdx]}
 		if rationaleIdx >= 0 && rationaleIdx < len(rec) {
 			meta.rationale = rec[rationaleIdx]
+		}
+		if mismatchIdx >= 0 && mismatchIdx < len(rec) {
+			meta.mismatch = strings.TrimSpace(rec[mismatchIdx])
+		}
+		if expectedIdx >= 0 && expectedIdx < len(rec) {
+			meta.expected = strings.TrimSpace(rec[expectedIdx])
 		}
 		out[rec[itemPathIdx]] = meta
 	}
@@ -247,6 +282,7 @@ func main() {
 
 	excludedCount := 0
 	passCount := 0
+	failedCount, measuredCount, sumMismatch, sumExpected := 0, 0, 0, 0
 	for _, c := range cases {
 		if meta, ok := inventory[c.SQLPath]; ok {
 			switch meta.status {
@@ -254,6 +290,13 @@ func main() {
 				excludedCount++
 			case "pass":
 				passCount++
+			case "failed":
+				failedCount++
+				if m, e, ok := meta.mismatchCounts(); ok {
+					measuredCount++
+					sumMismatch += m
+					sumExpected += e
+				}
 			}
 		} else if _, ok := excludedCases[c.Name]; ok {
 			excludedCount++
@@ -266,20 +309,33 @@ func main() {
 	fmt.Fprintf(f, "Generated at: %s\n\n", time.Now().Format(time.RFC3339))
 	fmt.Fprintf(f, "Total discovered SQL cases: **%d** (%d excluded, %d pass, %d not-tried/failed)\n\n",
 		len(cases), excludedCount, passCount, len(cases)-excludedCount-passCount)
+	fmt.Fprintf(f, "Failed cases: **%d** (%d measured; %d / %d expected lines mismatched, %s%%)\n\n",
+		failedCount, measuredCount, sumMismatch, sumExpected, pct(sumMismatch, sumExpected))
 	fmt.Fprintln(f, "Status policy for this phase:")
 	fmt.Fprintln(f, "- `not-tried`: case has not yet been executed against goopg.")
-	fmt.Fprintln(f, "- `failed`: case has been run but output does not match expected.")
+	fmt.Fprintln(f, "- `failed`: case has been run but output does not match expected. The `mismatch / total` column")
+	fmt.Fprintln(f, "  shows its size: mismatch = expected-side `-` lines of the unified diff between the normalised")
+	fmt.Fprintln(f, "  expected `.out` and goopg's output; total = line count of the normalised expected `.out`")
+	fmt.Fprintln(f, "  (`-` = not yet measured). Refreshed by `scripts/pg-regress-runner.sh --update-inventory <cases>`")
+	fmt.Fprintln(f, "  (inventory columns `mismatch_lines` / `expected_lines`, written by `cmd/regress-mismatch-update`).")
 	fmt.Fprintln(f, "- `pass`: case output matches pg_regress expected file.")
 	fmt.Fprintln(f, "- `excluded`: permanently out of scope for goopg v0 (see rationale).")
 	fmt.Fprintln(f)
-	fmt.Fprintln(f, "| name | sql_path | expected_path | status | rationale |")
-	fmt.Fprintln(f, "| ---- | -------- | ------------- | ------ | --------- |")
+	fmt.Fprintln(f, "| name | sql_path | expected_path | status | mismatch / total | rationale |")
+	fmt.Fprintln(f, "| ---- | -------- | ------------- | ------ | ---------------- | --------- |")
 	for _, c := range cases {
 		status := "not-tried"
 		rationale := "Migration target; execution parity not yet attempted."
+		mismatch := ""
 		if meta, ok := inventory[c.SQLPath]; ok {
 			if meta.status != "" {
 				status = meta.status
+			}
+			if meta.status == "failed" {
+				mismatch = "-"
+				if m, e, ok := meta.mismatchCounts(); ok {
+					mismatch = fmt.Sprintf("%d / %d (%s%%)", m, e, pct(m, e))
+				}
 			}
 			if meta.rationale != "" {
 				rationale = meta.rationale
@@ -290,7 +346,7 @@ func main() {
 		} else if strings.TrimSpace(c.ExpectedPath) == "" {
 			rationale = "No matching expected file found; needs expectation mapping."
 		}
-		fmt.Fprintf(f, "| %s | `%s` | `%s` | %s | %s |\n", c.Name, c.SQLPath, c.ExpectedPath, status, rationale)
+		fmt.Fprintf(f, "| %s | `%s` | `%s` | %s | %s | %s |\n", c.Name, c.SQLPath, c.ExpectedPath, status, mismatch, rationale)
 	}
 }
 

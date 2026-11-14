@@ -21,7 +21,7 @@ inventory CSV:
 ## Schema
 
 ```
-id, suite_id, kind, item_path, status, pass_required, deferred_to, rationale
+id, suite_id, kind, item_path, status, pass_required, deferred_to, rationale, mismatch_lines, expected_lines
 ```
 
 | column | meaning |
@@ -34,6 +34,14 @@ id, suite_id, kind, item_path, status, pass_required, deferred_to, rationale
 | `pass_required` | `yes` = part of the must-pass set; `no` otherwise |
 | `deferred_to` | milestone/task reference for `defer` rows, `-` otherwise |
 | `rationale` | human rationale; a `port` row must name its `TestPort_*`/`TestE2E_*` func |
+| `mismatch_lines` | `failed` `regress-sql` rows only: expected-side `-` lines of the unified diff between the normalised expected `.out` and goopg's normalised output (expected lines goopg did not reproduce); blank = not measured |
+| `expected_lines` | `failed` `regress-sql` rows only: line count of the normalised expected `.out` (the denominator) |
+
+The two count columns are machine-written — never hand-edit them. Refresh with
+`scripts/pg-regress-runner.sh --update-inventory --case-timeout 300 <case>...`
+(runs the cases, writes the counts through `cmd/regress-mismatch-update`, and
+regenerates `upstream-regress-coverage.md`). TIMEOUT/ERROR cases keep their old
+value.
 
 ### One row per logical regress case
 

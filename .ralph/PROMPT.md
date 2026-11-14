@@ -283,6 +283,18 @@ When performing cleanup, refactoring, or restructuring tasks:
 - lock/wal/replication/concurrency changes: run relevant unit tests plus race/concurrency-focused coverage
 - Ralph loop state consistency (every loop): run `make ralph-state-guard` immediately before the final status block
 - Include executed gates in the status RECOMMENDATION line (for auditability)
+- **Regress mismatch lines are recorded, not just quoted** (added 2026-11-15,
+  owner). Every `failed` regress case carries `mismatch_lines` /
+  `expected_lines` in `docs/test-port/postgres-oracle-target-inventory.csv`,
+  rendered as `mismatch / total` in `docs/test-port/upstream-regress-coverage.md`.
+  When a task's result is a reduction of regress mismatch lines (or the loop
+  ran `scripts/pg-regress-runner.sh` on `failed` cases and the numbers moved),
+  re-measure the affected cases on the build being committed with
+  `scripts/pg-regress-runner.sh --update-inventory --case-timeout 300 <cases>`
+  and commit the CSV and the regenerated coverage doc in the SAME commit as the
+  fix; quote `case M→M'` in the fix_plan Movement line. Never hand-edit the
+  numbers. mismatch = expected-side `-` lines of the normalised unified diff;
+  the runner's `diff: N lines` figure (context included) is NOT the metric.
 - **Long-running pre-commit gate failures:** if a pre-commit gate (e.g.
   `scripts/ralph-precommit-test.sh`, `scripts/tpch-spotcheck.sh`) fails and the
   fix drags on across multiple turns, do NOT accumulate uncommitted WIP — but

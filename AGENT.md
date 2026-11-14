@@ -169,6 +169,9 @@ a specific feature area:
 scripts/pg-regress-runner.sh                   # default ~40 quick type tests
 scripts/pg-regress-runner.sh --all             # all 232 upstream tests (slow)
 scripts/pg-regress-runner.sh -v int4 float8    # specific tests, show diff on fail
+scripts/pg-regress-runner.sh --update-inventory --case-timeout 300 int4 float8
+#   ↑ also records mismatch/expected lines of `failed` cases in the inventory
+#     CSV and regenerates upstream-regress-coverage.md (docs/test-port/README.md)
 # Reports parity % and writes diffs to tmp/regress-diffs/.
 # Re-run after any SQL surface change; rising pass rate = converging PG compat.
 
