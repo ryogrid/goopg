@@ -12608,7 +12608,46 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - The isolation family passes.
     Movement: yes — regress create\_index 2750→2727, partition\_prune
     6783→6778
-  - Resume: (c) row-comparison index quals, then (a).
+  - 2026-11-14 analysis of (a)-(c); no code change.
+    - (c) is BLOCKED on M0148-0001c3a7. All 5 btree\_index witnesses scan
+      pg\_proc, which goopg plans as a bare `Result` + One-Time Filter. It
+      has no pg\_index entries and no heap/index scan paths, so no index
+      qual of any kind can appear there. Row-comparison quals on user
+      tables would move no instrument.
+    - (a) and (b) need the partitioned appendrel's members planned as
+      their own rels.
+      - Partition children arrive as pre-built SetOp UNION ALL members
+        (isInheritanceAppendRel), mostly Seq Scans.
+      - So there are no per-child ordered index paths for
+        generate\_orderedappend\_paths to choose from.
+      - Neither the partitions\_are\_ordered plain Append (range\_parted)
+        nor the Merge Append can form, and neither can the per-child
+        `Limit` + `Index Only Scan [Backward]` for min/max
+        (buildMinMaxAppendRelMerge exists but is not elected for
+        parted\_minmax).
+      - mcrparted's lines also need partition pruning over an expression
+        key `abs(b)`.
+    - Resume: (a) — give inheritance members child-rel index paths (a
+      per-member addOrderedIndexPaths over the member's leaf) and an
+      ordered-Append path in addOrderedAppendPaths when the partition
+      bounds are ordered (partitions\_are\_ordered).
+- [ ] **M0148-0001c3a7 — system catalogs plan as a bare `Result`: no
+  heap or index scan paths**.
+  Kind: impl
+  Parent: M0148-0001c3a5
+  Found 2026-11-14 by c3a5 (c).
+  - `select proname from pg_proc where proname = 'abs'` plans as `Result`
+    / `One-Time Filter: (proname = 'abs'::text)`. PG plans an Index (Only)
+    Scan using pg\_proc\_proname\_args\_nsp\_index.
+  - pg\_index lists no index on pg\_proc, and joins against pg\_proc
+    materialise a Result.
+  - Blocks btree\_index's 5 row-comparison lines (c3a5 (c)) and any
+    catalog-scan plan parity.
+  - Resume: find where catalog relations are lowered to Result
+    (virtual-catalog scan producer), give them a SeqScan path over their
+    rows, and decide whether the bootstrap catalog indexes
+    (pg\_proc\_oid\_index, pg\_proc\_proname\_args\_nsp\_index) are to be
+    materialised.
 - [x] **M0148-0001c3c — DROP VIEW / DROP INDEX / RENAME after a restart
   fail "does not exist"**.
   Kind: impl
