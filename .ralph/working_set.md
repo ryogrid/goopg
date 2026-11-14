@@ -1,29 +1,30 @@
-# Working Set — loop end 2026-11-14 (census routing-20261114x IDENTICAL; M0148-0001c3a13 LANDED 16fdb9bcf; c3a12 closed into c3a11)
+# Working Set — loop end 2026-11-15 (census routing-20261114y IDENTICAL; M0148-0001c3a9 slice 1 LANDED 7b02fea41)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: items 0. Nothing filed.
-- S9: DUE → routing-20261114x (s9dc, BASELINE_REV=704f8f798) IDENTICAL ×3, committed 0ac4f682a.
-  - 16fdb9bcf touches planner.go and operators_explain.go, so the next census is likely DUE (BASELINE_REV=38b072965, the head consumed by routing-20261114x).
-- Task: M0148-0001c3a13 (row IN list expansion) landed as 16fdb9bcf.
-  - c3a12 closed in the same commit; its leftovers (DML path, prefix / DESC / truncated) moved to c3a11 with a ledger row.
+- S9: DUE → routing-20261114y (s9dd, BASELINE_REV=38b072965) IDENTICAL ×3, committed 3a6e4c017.
+  - 7b02fea41 touches internal/optimizer (planner.go, partitiondesc.go), so the next census is likely DUE (BASELINE_REV=073b218c6, the head consumed by routing-20261114y).
+- Task: M0148-0001c3a9 (partitionwise join), slice 1 landed as 7b02fea41: partition members in PartitionDesc (bound) order, depth-first.
+  - Also discharges the partition half of M0148-0001k1 (c).
 - Files:
-  - internal/optimizer/planner.go: rowInListAsBooleanTree, rowConstructorElems; oneElementInAsComparison defers rows to it;
-  - internal/executor/operators_explain.go: a NULL AND / OR arm prints `NULL::boolean`;
-  - internal/executor/saop_range_bounds_test.go: TestRowInListExpandsToComparisons (fails 6 ways with the expansion disabled);
-  - design doc docs/design/0100-0149/0148-0001c3a13-row-in-list-expansion.md (indexed).
-- Key symbols: rowInListAsBooleanTree, rowConstructorElems, reduceQualConstArms (existing), formatExprQual AND/OR arm.
+  - internal/optimizer/partitiondesc.go: new — partitionDescOrder, ownPartitionBound, compareBoundValue;
+  - internal/optimizer/planner.go: collectAllPartitionLeaves now walks depth-first and takes the root *catalog.Table;
+  - tests: partitiondesc_test.go (optimizer), executor partition_desc_order_test.go; TestOrderedPartitionAppend's alias numbers now follow PG's inherit.out;
+  - design doc docs/design/0100-0149/0148-0001c3a9-partitionwise-join.md: slice 1 plus design slices 2-6.
+- Key symbols: partitionDescOrder, collectAllPartitionLeaves, paramAppendPathFor (model for per-member rels).
 - Findings:
-  - The old InExpr row evaluator was two-valued, a wrong result: `(1,3) IN ((1,2),(NULL,NULL))` gave false, PG gives NULL. The expansion fixes it; recorded in the commit and fix_plan, not filed separately.
-  - The explicit `ROW(a,b)` parses as a FuncCall named row, not parser.RowExpr.
-  - Ledgered leftovers: a mixed row / scalar list (PG 42883); FROM-less EXPLAIN VERBOSE never prints Result `Output:`.
-  - The regress A/B suite run showed btree_index +83 and a create_index point_tbl 2-rows hunk. Both vanished on solo reruns (437 and 2466), so they are suite-interaction flakes.
-- Next step: run the census if DUE, then take M0148-0001c3a9 (partitionwise join), the next open M0148 task in file order after c3a11 (parked).
-- Top-residual: M0148 residues. Open: c3a9, c3a10, c3a8, c3a7, c3a11 (parked), c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
+  - A sub-partitioned child's PartitionBounds also lists its own children's bounds (DDL appends each child's bound to its parent). Pick the entry whose ChildName names the table.
+  - goopg's enable_partitionwise_join defaults to on (verified with SHOW); nothing consumes it yet.
+  - PG numbers member aliases with intermediate partitioned RTEs included (pagg_tab_ml_p3_s1 is pagg_tab_ml_5). Ledgered.
+  - The isolation suite subtests report a mismatch as SKIP. Use the dedicated TestPort_Isolation* strict tests (all 17 partition specs PASS).
+  - internal/postmaster failed once, then passed on rerun (untouched by this change).
+- Next step: run the census if DUE, then c3a9 slice 2 per the design doc. Put the partition scheme (parent, key, ordered leaves) on the appendrel binding the search sees, then child rels shared with c3a10.
+- Top-residual: M0148 residues. Open: c3a9 (slices 2-6), c3a10, c3a8, c3a7, c3a11 (parked), c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261114x done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
-  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26, E27). Then M0148 in file order.
+  - Items 0-9: M0146-0014(channel; census routing-20261114y done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26, E27). Then M0148 in file order → c3a9.
 - Gates run (all PASS):
-  - units, tpch-spotcheck, sf025 99 PASS same=99;
-  - fire-set c3a13 fires=none ×3; acceptance arm PASS;
-  - regress A/B tmp/regress-c3a13 (create_index 2483→2466; select_distinct 202→196 unrelated; arrays −13 = P0-E27 flake).
+  - units (after re-pinning TestOrderedPartitionAppend), tpch-spotcheck, sf025 99 PASS same=99;
+  - fire-set c3a9a fires=none ×3; acceptance arm PASS; 17 dedicated partition isolation tests;
+  - regress A/B vs a same-suite HEAD worktree baseline: partition_prune 6754→6384, partition_join 5801→5630, inherit 3122→3076, partition_aggregate +6 (realignment only).
 - In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped. Restarting it hits P0-E24: drop leftover partitions.
