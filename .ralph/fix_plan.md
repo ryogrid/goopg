@@ -13106,6 +13106,33 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
       rels), and run the restriction / index-only producers over it;
     - accept Filter members in addOrderedPartitionAppendPaths;
     - let min/max members>0 take planMinMaxSubqueryViaSearch.
+  - 2026-11-15 slice 1 attempt — NOT landed \(net-neutral on the regress
+    instrument; patch at tmp/c3a10-slice1-appendrel-children.patch,
+    untracked\):
+    - What it does: addAppendRelChildPaths gives a partitioned base rel
+      with a restriction an Append over its partitions' cheapest child paths
+      \(the c3a9 child rels on the bare scan, plus bitmap paths\); the
+      one-relation search admits partitioned appendrel leaves
+      \(relfromjoinlist.go\); PlannerSettings.KeepAppendRelsWhole replaces
+      the row-lock / DML reuse of EnablePartitionwiseJoin.
+    - Witnesses: `select * from pa where b = 'v12'` and the same with ORDER
+      BY … LIMIT now match PG \(Append of per-partition Bitmap Heap Scans\).
+    - Regress vs a same-suite HEAD baseline: inherit 735→727, but
+      partition\_join 1879→1887, partition\_aggregate 584→586, join
+      2836→2837.
+      - The losses are EXPLAIN naming when the new Append sits inside a
+        sub-query or semi-join sub-problem: `Sort Key: t1_4.a` for the outer
+        `t1.a` \(the inner parent's binding id captures the outer level's
+        bySrc lookup in explain\_names.go\), `Filter: (prt1_1.b = 0)`.
+      - Dropping the parent's binding id from bySrc fixed that case but
+        broke slice-3 naming elsewhere \(partition\_aggregate 589\).
+    - Also seen: without a restriction, child ordering-only index paths
+      undercut seq scans \(aggregates p\_t1\), so the patch gates on a
+      restriction; multi-relation problems were excluded after the
+      partition\_join sort-key regression.
+    - Resume: make explain\_names.go register a partitionwise parent's
+      binding id only within its own query level \(level-scoped bySrc\),
+      then re-apply the patch and re-measure.
 - [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
   (NULL-keyed entries)**.
   Kind: impl
