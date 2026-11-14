@@ -213,3 +213,52 @@ func TestOrderedAppendRelChildPaths(t *testing.T) {
 		}
 	}
 }
+
+// TestIndexOnlyPrefixNullTest is M0148-0001c3a10 slice 4: build_minmax_path's
+// `a IS NOT NULL` over a nullable ordering column behind an equality prefix is
+// an index qual of the index-only scan — PG 18.3's `Index Cond: ((c = 3) AND
+// (a IS NOT NULL))`, per partition under the ordered Append and on a plain
+// table, with the NULL-keyed rows skipped.
+func TestIndexOnlyPrefixNullTest(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	for _, s := range []string{
+		"create table pn (a int, b text, c int NOT NULL) partition by range (a)",
+		"create table pn_1 partition of pn for values from (0) to (5000)",
+		"create table pn_2 partition of pn for values from (5000) to (10000)",
+		"create index on pn (c, a)",
+		"insert into pn select i, 'v' || (i % 1000), i % 7 from generate_series(0, 9999) i",
+		"vacuum pn_1", "vacuum pn_2",
+		"analyze pn",
+		"create table pnb (a int, b text, c int NOT NULL)",
+		"create index on pnb (c, a)",
+		"insert into pnb select i, 'v' || (i % 1000), i % 7 from generate_series(0, 9999) i",
+		"insert into pnb values (NULL, 'x', 3), (NULL, 'y', 3), (NULL, 'z', 4)",
+		"vacuum pnb",
+		"analyze pnb",
+	} {
+		runSQL(t, ctx, s)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	for _, c := range []struct{ q, plan string }{
+		{"select max(a) from pn where c = 3", "Result\n  InitPlan 1\n    ->  Limit\n          ->  Append\n" +
+			"                ->  Index Only Scan Backward using pn_2_c_a_idx on pn_2\n                      Index Cond: ((c = 3) AND (a IS NOT NULL))\n" +
+			"                ->  Index Only Scan Backward using pn_1_c_a_idx on pn_1\n                      Index Cond: ((c = 3) AND (a IS NOT NULL))"},
+		{"select max(a) from pnb where c = 3", "Result\n  InitPlan 1\n    ->  Limit\n" +
+			"          ->  Index Only Scan Backward using pnb_c_a_idx on pnb\n                Index Cond: ((c = 3) AND (a IS NOT NULL))"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+	}
+	for _, c := range []struct{ q, rows string }{
+		{"select max(a) from pn where c = 3", "9999"},
+		{"select max(a), min(a) from pnb where c = 3", "9999|3"},
+		{"select min(a) from pnb where c = 4", "4"},
+		{"select count(*) from pnb where c = 3 and a is not null", "1429"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

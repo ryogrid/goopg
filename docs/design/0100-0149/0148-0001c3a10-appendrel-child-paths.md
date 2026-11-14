@@ -105,13 +105,44 @@ Status: slices 1\-3 landed 2026\-11\-15. Parent: M0148\-0001c3a5.
 - Merge Append \(a default partition, a non\-leading partition key,
   LIST / HASH\).
 
+## Slice 4 — an equality prefix plus a trailing NullTest, index\-only \(landed\)
+
+- `indexOnlyLeafClauses` \(pathindexonly.go\) admits PG's index\-qual
+  shape `(c = 3) AND (a IS NOT NULL)` over `(c, a)`. That is an equality
+  prefix followed by a NullTest on the next index column, with no range or
+  array on that column. The plain producer already filed this shape
+  \(`restrictionNullTestOnColumn`\).
+  - `IS NOT NULL` counts the column as bound for the NULL\-key rule
+    \(`indexUnboundKeysNotNull`\), because it excludes the column's
+    NULL\-keyed entries.
+  - `IS NULL` leaves the column unbound, so it still needs an index that
+    stores NULL\-keyed entries.
+- In the IOS lowering \(createplanindex.go\):
+  - the prefix becomes `Keys` / `Key`;
+  - the NullTest becomes `IndexOnlyScan.Cond`. That is the per\-entry check
+    the min/max builder already used, and EXPLAIN prints it after the keys
+    in `Index Cond`. Its column is re\-pointed at the covered output column.
+- Cost: unchanged arm. `hasRangeClause` sees the NullTest, so
+  `rangeIndexSelectivity` prices equality × `nulltestsel`, as the plain
+  path does.
+- PG's nullable min/max now matches, both per partition under the ordered
+  Append and on a plain table: `Result → InitPlan → Limit → [Append →] Index
+  Only Scan Backward … Index Cond: ((c = 3) AND (a IS NOT NULL))`.
+  - `TestIndexOnlyPrefixNullTest` pins both plans and their values, with
+    NULL\-keyed rows present.
+  - The live probe \(`tmp/c3a10s2.sql` plus the NULL\-row values,
+    including the `IS NULL` count\) matches scratch PG 18.3 byte for byte.
+- Regress: same\-suite A/B unchanged apart from `join` 2837→2836. That line
+  is the known Hash Right Join unmatched\-row order flap \(the same plan in
+  both runs; the standalone `join` gives 2685 twice\). TPC\-H and TPC\-DS
+  are unchanged.
+
 ## Not covered
 
 - Multi\-relation problems: inside a join the Append's columns still reach
   EXPLAIN key chases and parameterised quals that are not yet taught about
   it \(partition\_join regressed when allowed\).
-- Ordered children under a Merge Append, and min / max per partition \(PG:
-  `Limit → Append → Index Only Scan Backward … Index Cond: ((c = 3) AND (a
-  IS NOT NULL))`\).
-- Index\-only child paths; sub\-partitioned and expression\-keyed tables
+- Ordered children under a Merge Append \(a default partition, a
+  non\-leading partition key, LIST / HASH\).
+- Sub\-partitioned and expression\-keyed tables
   \(no partition scheme\); plan\-time pruning \(M0148\-0001k1 \(b\)\).

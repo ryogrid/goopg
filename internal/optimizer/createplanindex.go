@@ -67,6 +67,7 @@ package optimizer
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -437,6 +438,32 @@ func createIndexScanPlan(p *Path) Node {
 			}
 			loopClauses = nil
 		}
+		// M0148-0001c3a10 slice 4: an equality prefix followed by one
+		// NullTest on the next column (indexOnlyLeafClauses) — the prefix
+		// lowers onto Keys, the NullTest onto Cond (a per-entry check the
+		// executor already applies, printed in Index Cond after the keys).
+		var ioPrefixNullCond Expr
+		if n := len(loopClauses); n >= 2 && ioTrailing == nil && ioSAOP == nil && p.RequiredOuter == 0 && p.IndexSkipPrefix == 0 {
+			last := loopClauses[n-1]
+			shape := last.nullTest != IndexNullTestNone && last.indexCol == n-1 && last.local != nil
+			for i, r := range loopClauses[:n-1] {
+				if r.indexCol != i || r.key == nil || r.op != parser.OpUnknown || r.nullTest != IndexNullTestNone || len(r.saop) > 0 {
+					shape = false
+				}
+			}
+			if shape {
+				for _, r := range loopClauses[:n-1] {
+					ioKeys = append(ioKeys, r.key)
+					if r.local != nil {
+						ioDrop[r.local] = true
+					}
+				}
+				ioPrefixNullCond = last.local
+				ioDrop[last.local] = true
+				loopClauses = nil
+				ioRange = false
+			}
+		}
 		for i, c := range loopClauses {
 			if ioRange && c.nullTest != IndexNullTestNone {
 				ioCondOrder = append(ioCondOrder, IndexCondNullTest)
@@ -557,6 +584,22 @@ func createIndexScanPlan(p *Path) Node {
 			Backward:              backward,
 			PrivilegeCheckRole:    id.privilegeCheckRole,
 			PrivilegeCheckRoleSet: id.privilegeCheckRoleSet,
+		}
+		if ioPrefixNullCond != nil {
+			// Cond reads the scan's output row: re-point the NullTest's
+			// column at the covered column of the same name.
+			cond, ok := CloneExprReplacingColumnRefs(ioPrefixNullCond, func(cr *ColumnRef) Expr {
+				for i, sc := range schema {
+					if strings.EqualFold(sc.Name, cr.Name) {
+						return &ColumnRef{pos: cr.pos, Index: i, Name: sc.Name, Type: sc.Type, SourceTableIdx: sc.SourceTableIdx}
+					}
+				}
+				return nil
+			})
+			if !ok || cond == nil {
+				panic(fmt.Sprintf("createPlan: index-only scan on %s: NullTest column not covered", p.IndexInfo.Name))
+			}
+			ios.Cond = cond
 		}
 		// Key vs Keys as on the plain scan below; the executor pads a short
 		// prefix (operators_indexonly.go lookupKeys).

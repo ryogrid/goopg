@@ -13167,6 +13167,18 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     \(TestOrderedAppendRelChildPaths\)
     - Resume: indexOnlyLeafClauses with an equality prefix plus a trailing
       NullTest \(nullable min/max column\); Merge Append; joins.
+  - 2026-11-15 slice 4 LANDED: indexOnlyLeafClauses takes an equality
+    prefix plus a NullTest on the next index column; the IOS lowering puts
+    the prefix on Keys and the NullTest on IndexOnlyScan.Cond.
+    - Nullable `max(a) where c = 3` now plans PG's `Index Only Scan
+      Backward … Index Cond: ((c = 3) AND (a IS NOT NULL))`, per partition
+      and on a plain table; TestIndexOnlyPrefixNullTest.
+    Movement: none — instrument artefact — the same-suite regress A/B moved
+    only join 2837→2836, the Hash Right Join row-order flap \(the same plan
+    in both runs; standalone join 2685 twice\); no corpus query has the
+    shape; the probe plans are PG 18.3's \(TestIndexOnlyPrefixNullTest\)
+    - Resume: Merge Append over ordered children \(default partition, LIST,
+      non-leading key\); multi-relation problems \(joins\).
 - [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
   (NULL-keyed entries)**.
   Kind: impl

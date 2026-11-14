@@ -228,6 +228,22 @@ func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, t
 		clauses = nil
 	}
 	bound := len(clauses)
+	// M0148-0001c3a10 slice 4: a NullTest on the column behind the equality
+	// prefix — build_minmax_path's `a IS NOT NULL` under `WHERE c = 3` over
+	// (c, a), PG's `Index Cond: ((c = 3) AND (a IS NOT NULL))`. The prefix
+	// lowers onto Keys and the NullTest onto IndexOnlyScan.Cond, checked per
+	// entry (createplanindex.go). IS NOT NULL also excludes the column's
+	// NULL-keyed entries, so the column counts as bound for the NULL-key rule.
+	if n := len(clauses); n > 0 && n < len(idx.Columns) && columnCovered(covered, idx.Columns[n]) &&
+		len(restrictionRangeOnColumn(cat, tbl, idx, n, conjuncts)) == 0 &&
+		(idx.DeclaredHash || len(restrictionSAOPOnColumn(cat, tbl, idx, n, conjuncts)) == 0) {
+		if nt := restrictionNullTestOnColumn(idx, n, conjuncts); nt != nil {
+			clauses = append(clauses, *nt)
+			if nt.nullTest == IndexNullTestIsNotNull {
+				bound = n + 1
+			}
+		}
+	}
 	var saop []indexPathClause
 	if len(clauses) == 0 {
 		saop = restrictionLeadingSAOP(cat, tbl, idx, conjuncts)
