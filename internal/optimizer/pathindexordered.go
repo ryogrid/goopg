@@ -200,6 +200,16 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 	if !indexUnboundKeysNotNull(tbl, idx, 0) {
 		return false
 	}
+	// build_index_paths builds ONE path per index from every restriction
+	// clause match_restriction_clauses_to_index finds; there is no
+	// full-scan twin that leaves a matchable clause as a Filter. When the
+	// index binds a local clause, the restriction / index-only producers
+	// file that path (with these pathkeys) — `Index Only Scan … Index Cond:
+	// (a IS NOT NULL)` — and an extra Filter-only full scan here could
+	// out-cost it (M0148-0001c3a5 (a), the parted_minmax witness).
+	if indexBindsLocalRestriction(s.cat, tbl, idx, extractFilterConjuncts(rel.baseLeaf)) {
+		return false
+	}
 
 	// Steps 2 and 2b of `build_index_paths`, fused — see the note below on why
 	// the fusion is exact rather than a shortcut. The scan direction those keys
@@ -509,4 +519,18 @@ func (s *searchCtx) usefulBackwardIndexPathkeys(rel *RelOptInfo, idx *catalog.In
 		return nil
 	}
 	return truncateUselessPathkeys(s.pathkeyUsefulnessFor(rel.Relids), keys)
+}
+
+// indexBindsLocalRestriction reports whether the restriction producers bind
+// at least one of the leaf's local conjuncts as an index clause of idx:
+// an equality prefix, or a leading ScalarArrayOp, range or NullTest, or a
+// skip run (plainRestrictionBindsOnlyPrefix with no prefix).
+func indexBindsLocalRestriction(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) bool {
+	if len(conjuncts) == 0 {
+		return false
+	}
+	if len(restrictionEqualityPrefix(cat, tbl, idx, conjuncts)) > 0 {
+		return true
+	}
+	return !plainRestrictionBindsOnlyPrefix(cat, tbl, idx, conjuncts, 0)
 }

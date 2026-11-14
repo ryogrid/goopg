@@ -12660,6 +12660,22 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     3118)
     - Resume (a): parted\_minmax per-child min/max (1 line); then (b).
       mcrparted's 6 lines resume once M0148-0001c3a8 lands.
+  - 2026-11-14 (a) slice 3 LANDED: the ordered full-scan producer no
+    longer files a Filter-only twin of an index that binds a local clause
+    (build\_index\_paths' one-path-per-index; indexBindsLocalRestriction).
+    - `where a is not null order by a limit 1` and `a >= -100 …` now plan
+      PG's `Index Only Scan … Index Cond:`.
+    Movement: none — instrument artefact — no regress case or corpus query
+    has a near-total leading index clause under ORDER BY; probe-verified
+    against PG and pinned by TestOrderedFullScanYieldsToIndexClausePath
+    - Resume (a) parted\_minmax, in order:
+      - trailing-column index quals behind a leading range or NullTest
+        (`((a IS NOT NULL) AND (b = 5))`): TrailingSAOP with ColQuals
+        only, on all three scan nodes;
+      - binary-compatible relabel (`(b)::text`) seen through in
+        normalizeColumnIndexKey;
+      - the one-member appendrel alias;
+      - multi-member min/max over an ordered Append.
 - [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
   (NULL-keyed entries)**.
   Kind: impl

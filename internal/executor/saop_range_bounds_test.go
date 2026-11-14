@@ -614,3 +614,28 @@ func TestOrderedPartitionAppend(t *testing.T) {
 		}
 	}
 }
+
+// M0148-0001c3a5 (a): build_index_paths files ONE path per index carrying
+// every restriction clause it matches, so a clause the index can bind is
+// never left as the Filter of a full ordered scan of that index. The
+// ordered full-scan producer (index.ordered) declines such an index; the
+// index-only path with the clause in Index Cond wins, as on PG 18.3.
+func TestOrderedFullScanYieldsToIndexClausePath(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "create table ofs (a int NOT NULL, b int NOT NULL, pad text)")
+	runSQL(t, ctx, "create index ofs_a_b on ofs (a, b)")
+	runSQL(t, ctx, "insert into ofs select g, g % 7, 'x' from generate_series(1,5000) g")
+	runSQL(t, ctx, "VACUUM ofs")
+	runSQL(t, ctx, "ANALYZE ofs")
+	ps := optimizer.DefaultPlannerSettings()
+	q := "select a from ofs where a >= -100 order by a limit 3"
+	want := "Limit\n  ->  Index Only Scan using ofs_a_b on ofs\n        Index Cond: (a >= '-100'::integer)"
+	got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+q, ps)), "\n")
+	if got != want {
+		t.Errorf("%s:\ngot:\n%s\nwant:\n%s", q, got, want)
+	}
+	if rows := strings.Join(renderRows(runSQLWith(t, ctx, q, ps)), ";"); rows != "1;2;3" {
+		t.Errorf("%s: rows %q", q, rows)
+	}
+}

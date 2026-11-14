@@ -269,3 +269,67 @@ ConstructTupleDescriptor.
 - fire\-set fires=none on sf025, sf1 and TPC\-H;
 - acceptance 24 MATCH;
 - regress A/B: only create\_index moved.
+
+## Item (a) slice 3 — no Filter\-only full ordered scan of a qualified index
+
+PG reference: indxpath.c create\_index\_paths → build\_index\_paths, which
+builds ONE path per index from every clause
+match\_restriction\_clauses\_to\_index found, and makes it index\-only when
+it can.
+
+### The gap
+
+- goopg's `index.ordered` producer \(addOneOrderedIndexPath\) filed a full
+  ordered scan of every orderable index and kept every local qual as a
+  Filter, even when the index could bind one of them.
+- When the bindable clause is barely selective \(`a IS NOT NULL`, `a >=
+  -100`\), that Filter\-only twin out\-costed the index\-only path that
+  carries the clause in Index Cond. goopg then planned `Index Scan …
+  Filter: (a IS NOT NULL)` where PG plans `Index Only Scan … Index Cond:
+  (a IS NOT NULL)`.
+- This is the plain\-table half of the parted\_minmax witness.
+
+### The fix
+
+- indexBindsLocalRestriction: an equality prefix, or anything
+  plainRestrictionBindsOnlyPrefix\(n=0\) reports — a leading
+  ScalarArrayOp, range or NullTest, or a skip run.
+- When it holds, the ordered full\-scan producer declines that index. The
+  restriction and index\-only producers file the clause\-carrying path,
+  with the same pathkeys.
+
+### Verification
+
+- **Scratch PG probes:** `select a from t where a is not null order by a
+  limit 1` and `select min(a) from t` match PG.
+- **TestOrderedFullScanYieldsToIndexClausePath:** pins PG's plan for
+  `a >= -100 … order by a limit 3`. It fails with the decline removed.
+- **Regress A/B:** every suite unchanged; the rowsecurity lines differ
+  only in pointer addresses.
+- **Gates:**
+  - units, tpch\-spotcheck, sf025 \(PLAN\-SHAPE same=99\);
+  - fire\-set fires=none on sf025, sf1 and TPC\-H;
+  - acceptance 24 MATCH.
+
+### Still missing for parted\_minmax
+
+- **Trailing\-column index quals:** a qual on a later index column behind
+  a leading range or NullTest — `((a IS NOT NULL) AND (b = 5))`, `((a >
+  0) AND (b = 5))` — stays a Filter. PG 18 makes every qual on any index
+  column an index qual. goopg carries only the `= ANY` form
+  \(TrailingSAOP\).
+  - The natural generalisation: TrailingSAOP with no Elems and only
+    ColQuals, across IndexScan, IndexOnlyScan and BitmapIndexScan.
+  - btcostestimate's indexBoundQuals stop at the first non\-equality
+    column, so the trailing qual narrows indexSelectivity, not the
+    descent.
+- **Binary\-compatible relabel:** the witness's `b varchar(16)` compares
+  as `(b)::text = '12345'::text`. PG's match\_index\_to\_operand strips the
+  RelabelType, so the qual binds the index column and prints as `b =
+  '12345'::text`. goopg's normalizeColumnIndexKey sees a CastExpr and
+  declines.
+- **Partitioned min/max:**
+  - a one\-member appendrel loses its parent alias \(`parted_minmax1
+    parted_minmax`\);
+  - a multi\-member one needs the per\-InitPlan ordered Append of member
+    IOSs.
