@@ -1,30 +1,21 @@
-# Working Set — loop end 2026-11-14 (census routing-20261114u IDENTICAL; M0148-0001c3a6 (i) slice 5 LANDED 6c603dd22)
+# Working Set — loop end 2026-11-14 (census routing-20261114v IDENTICAL; M0148-0001c3a6 CLOSED ce47fa7e4)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: items 0. Nothing filed.
-- S9: DUE → routing-20261114u (s9cz, BASELINE_REV=f3f880c38) IDENTICAL ×3, committed 0f17474f0.
-  - 6c603dd22 touches the planner, so the next census is likely DUE.
-- Task: M0148-0001c3a6 item (i) slice 5, landed as 6c603dd22.
-  - Files:
-    - pathindexrestrict.go: saopColumnQuals OpEq + EC ordering, equalityMergedIntoLeadingSAOP;
-    - pathindexonly.go and pathbitmap.go: call the helper;
-    - test TestEqualityMergedIntoLeadingArray.
-  - Findings:
-    - PG prints `col = const` after the array even when written first: the EquivalenceClass equality is regenerated last.
-  - Movement: create_index 2535→2500.
-- Next step: remaining create_index Index Cond witnesses (`grep -n "^-  *Index Cond" tmp/regress-c3a6i5/create_index.diff`). Candidates:
-  - multi-column `thousand IN … AND thousand = 42 AND tenthous = 42` (equality behind the array);
-  - `tenthous = ANY (ARRAY[1, (InitPlan 1).col1, 42])` (a non-const array element);
-  - `(f1 >= 'WA') AND (f1 <= 'ZZZ') AND (id < 1000) AND (f1 ~<~ 'YX')` (text pattern ops);
-  - ROW comparisons (row-compare index quals — c3a5 (c) blocked on c3a7, but this one is tenk1, not pg_proc!);
-  - gist / gin operator classes (out of scope).
-  - The ROW one (`ROW(thousand, tenthous) > ROW(NULL::integer, 5)`, create_index) may be the next counted move. Check whether it is (i)-scope or belongs to a new task.
-- Top-residual: M0148 residues. Open children: c3a6, c3a7, c3a8, c3a9, c3a10, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
+- S9: DUE → routing-20261114v (s9da, BASELINE_REV=9fde11c1f) IDENTICAL ×3, committed 6c1286b3d.
+  - ce47fa7e4 changes trackers only, so the next census should be REUSE.
+- Task: M0148-0001c3a6 closed (ce47fa7e4).
+  - (i) landed in 5 slices: create_index 2708→2500.
+  - Residue filed right after c3a6 in fix_plan:
+    - M0148-0001c3a11: parking item, no witness. (f) join OR bitmaps plus the (i) leftovers. Not selectable until a witness appears.
+    - M0148-0001c3a12: row-comparison index quals. Witness: create_index `(thousand, tenthous) > (NULL, 5)` → PG `Index Scan … Index Cond: (ROW(thousand, tenthous) > ROW(NULL::integer, 5))`. The btree_index pg_proc lines also need c3a7.
+    - M0148-0001c3a13: constant-NULL row elimination. Witness: create_index `(thousand, tenthous) in ((1,1001),(null,null))` → PG Index Cond `((thousand = 1) AND (tenthous = 1001))`. PG expands the row IN in transformAExprIn and drops NULL OR arms in canonicalize_qual (find_duplicate_ors, is_check=false).
+- Next step: by file order after c3a11 (parked), take M0148-0001c3a12 (row compare) or c3a13 (NULL-row elimination).
+  - c3a13 is probably the smaller slice: expand a RowExpr IN list, fold all-NULL ANDs, drop NULL OR arms in WHERE.
+  - Probe both on scratch PG 5545 vs goopg 5533 first.
+- Top-residual: M0148 residues. Open children: c3a7, c3a8, c3a9, c3a10, c3a11 (parked), c3a12, c3a13, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261114u done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
-  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26). Then M0148 in file order → c3a6.
-- Gates run (all PASS):
-  - units, tpch-spotcheck, sf025 same=99;
-  - fire-set c3a6e fires=none ×3; acceptance 24 MATCH; TestPort_Isolation ok;
-  - regress A/B tmp/regress-c3a6i5 vs tmp/regress-c3a6i4.
+  - Items 0-9: M0146-0014(channel; census routing-20261114v done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26). Then M0148 in file order.
+- Gates run: census s9da IDENTICAL ×3; commit-hook pgbench smoke PASS. No code change this loop.
 - In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped. Restarting it hits P0-E24: drop leftover partitions.
