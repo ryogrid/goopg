@@ -135,3 +135,79 @@ Backward wins.
   boolean column. PG simplifies any boolean expression compared with a
   boolean Const, which needs the expression's type.
 
+
+## Item (a) slice 1 — partition\-ordered plain Append
+
+PG reference: allpaths.c generate\_orderedappend\_paths \(the
+partitions\_are\_ordered arm\), pathkeys.c build\_partition\_pathkeys,
+partbounds.c partitions\_are\_ordered, costsize.c cost\_append \(the
+presorted arm\).
+
+### Shape
+
+- goopg has no child RelOptInfos for a partitioned table. The appendrel
+  reaches the ORDERED upper rel as the inheritance SetOp chain, whose
+  members are `Project → SeqScan` leaves.
+- `addOrderedPartitionAppendPaths` \(new orderedpartitionappend.go\),
+  called from createOrderedPaths after addOrderedAppendPaths, rebuilds
+  that chain:
+  - each member's SeqScan becomes an Index Only Scan \(the index covers
+    every column, so the member Projects keep their positions\) or an
+    Index Scan;
+  - the members are re\-sequenced by lower bound, reversed for DESC, and
+    each scan runs Backward;
+  - the result is filed on the ORDERED rel with the sort pathkeys, so
+    add\_path weighs it against Sort \+ Append.
+
+### Admission \(each guard declines\)
+
+- RANGE parent \(found through PartitionParentOID; the statement catalog
+  wrapper is unwrapped to reach LookupTableByOID\), single level, no
+  default partition.
+- Integer lower bounds; MINVALUE / MAXVALUE honoured.
+- The ORDER BY is plain columns through column\-only Projects, leads with
+  the partition key, and is all ASC NULLS LAST or all DESC NULLS FIRST.
+- Every member has a plain ascending btree index led by the ORDER BY
+  columns, with no predicate and no expression column, and no Filter on
+  the member scan.
+
+### Cost
+
+- Each child is cost\_index at selectivity 1.
+- The Append follows cost\_append's presorted arm: startup is the SUM of
+  the child startups, total is the sum of totals plus
+  cpu\_tuple\_cost × APPEND\_CPU\_COST\_MULTIPLIER × rows.
+
+### Verification
+
+- **inherit:** 3153→3118. Both range\_parted plans now match PG with
+  costs off; the missing `Backward` lines drop from 9 to 7.
+- **Scratch PG probe** \(3 partitions attached out of bound order,
+  MINVALUE / MAXVALUE, 3000 rows\):
+  - plans match PG apart from alias numbering;
+  - ASC and DESC row digests are identical to PG;
+  - LIMIT and tableoid output are identical to PG.
+- **TestOrderedPartitionAppend** pins both directions and rows. It fails
+  with the call removed.
+- **Gates:**
+  - units, tpch\-spotcheck, sf025;
+  - fire\-set fires=none on sf025, sf1 and TPC\-H;
+  - acceptance 24 MATCH.
+
+### Not covered
+
+- **Empty\-btree size:** with costs on, each child scan costs 4.0 more
+  than PG's. goopg's empty btree is 2 pages \(16384 bytes\) where PG's is
+  the metapage alone \(8192\), so index pages read 2 against PG's 1.
+- **Alias numbering:** collectAllPartitionLeaves expands the leaves in
+  registration order, so aliases follow attach order where PG's follow
+  bound order. This also affects plain Seq Scan Appends.
+- **Append width:** the Append reports width 16 where PG reports 12.
+  This predates the slice; the unordered Append shows it too.
+- **Still missing:**
+  - mcrparted \(expression index column `abs(b)`, 6 lines\);
+  - parted\_minmax per\-child min/max \(1 line\);
+  - Merge Append over child index paths;
+  - LIST partitions;
+  - multi\-level hierarchies;
+  - non\-integer bounds.

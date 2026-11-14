@@ -12631,6 +12631,19 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
       per-member addOrderedIndexPaths over the member's leaf) and an
       ordered-Append path in addOrderedAppendPaths when the partition
       bounds are ordered (partitions\_are\_ordered).
+  - 2026-11-14 (a) slice 1 LANDED: the partition-ordered plain Append
+    (partitions\_are\_ordered arm).
+    - addOrderedPartitionAppendPaths (orderedpartitionappend.go) rebuilds
+      the inheritance SetOp chain with per-member Index (Only) Scans in
+      bound order, reversed and Backward for DESC.
+    - Admits a single-level RANGE parent with integer bounds and no
+      default partition, plain member indexes, and an ORDER BY led by
+      the partition key.
+    - range\_parted matches PG in both directions.
+    Movement: yes — regress inherit 3153→3118, missing `Backward` lines
+    9→7
+    - Resume (a): mcrparted needs an expression index column (`abs(b)`)
+      and pruning on it; parted\_minmax needs per-child min/max. Then (b).
 - [ ] **M0148-0001c3a7 — system catalogs plan as a bare `Result`: no
   heap or index scan paths**.
   Kind: impl

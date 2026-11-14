@@ -144,6 +144,7 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 
 	addOrderedPaths(ordered, seed, input, pathkeysForSortKeys(keys), cp, limitTuples)
 	addOrderedAppendPaths(ordered, input, pathkeysForSortKeys(keys), cp, limitTuples)
+	addOrderedPartitionAppendPaths(ordered, input, pathkeysForSortKeys(keys), cp, u.catalog())
 	// M0140-0006b-2: the upper-rel Gather reader. No-op today (no producer
 	// files partial paths on the ORDERED rel), wired so a future one does
 	// not repeat 0006b's "producer with no reader" trap.

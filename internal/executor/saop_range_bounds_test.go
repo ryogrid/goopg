@@ -576,3 +576,41 @@ func TestBooleanIndexQualAndConstantPrefixPathkeys(t *testing.T) {
 		}
 	}
 }
+
+// M0148-0001c3a5 (a): a range-partitioned table delivers its partition
+// key's order through a plain Append of per-partition ordered scans
+// (generate_orderedappend_paths' partitions_are_ordered arm) — the regress
+// inherit range_parted witness. The partitions are attached out of bound
+// order so the Append must re-sequence them; DESC reverses them and scans
+// each index backward.
+func TestOrderedPartitionAppend(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "create table range_parted (a int NOT NULL, b int NOT NULL, c int NOT NULL) partition by range(a, b)")
+	runSQL(t, ctx, "create table range_parted2 partition of range_parted for values from (10,10) to (20,20)")
+	runSQL(t, ctx, "create table range_parted1 partition of range_parted for values from (0,0) to (10,10)")
+	runSQL(t, ctx, "create index on range_parted (a,b,c)")
+	runSQL(t, ctx, "insert into range_parted select g%20, g%10, g from generate_series(1,400) g where (g%20, g%10) >= (0,0) and (g%20 < 10 or (g%20, g%10) >= (10,10))")
+	runSQL(t, ctx, "VACUUM range_parted1")
+	runSQL(t, ctx, "VACUUM range_parted2")
+	ps := optimizer.DefaultPlannerSettings()
+	ps.EnableSort = false // the witness's table is empty; pin the arm on a populated one
+	for _, c := range []struct{ q, plan string }{
+		{"select * from range_parted order by a,b,c",
+			"Append\n  ->  Index Only Scan using range_parted1_a_b_c_idx on range_parted1 range_parted_2\n  ->  Index Only Scan using range_parted2_a_b_c_idx on range_parted2 range_parted_1"},
+		{"select * from range_parted order by a desc,b desc,c desc",
+			"Append\n  ->  Index Only Scan Backward using range_parted2_a_b_c_idx on range_parted2 range_parted_1\n  ->  Index Only Scan Backward using range_parted1_a_b_c_idx on range_parted1 range_parted_2"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant:\n%s", c.q, got, c.plan)
+		}
+	}
+	for _, c := range []struct{ q, rows string }{
+		{"select a,b,c from range_parted order by a,b,c limit 3", "0|0|20;0|0|40;0|0|60"},
+		{"select a,b,c from range_parted order by a desc,b desc,c desc limit 3", "19|9|399;19|9|379;19|9|359"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}
