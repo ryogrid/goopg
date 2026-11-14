@@ -771,6 +771,10 @@ type rangeBinding struct {
 	// `tableoid` reference instead — correct for non-partitioned
 	// base relations. M0100-0005y.
 	tableOidColIdx int
+	// singleLeafOID is the one leaf partition a partitioned table's scan
+	// collapsed to (M0148-0001c3a5 (a)): `tableoid` is that leaf's OID,
+	// not the parent's. Zero otherwise.
+	singleLeafOID uint32
 	// appendrel marks a binding whose subquery passed the
 	// is_simple_union_all port (jointreeappendrel.go): a non-LATERAL
 	// FROM-clause `(... UNION ALL ...) alias` on the jointree pipeline.
@@ -5266,6 +5270,26 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 			// snapshot epoch (snapshot-relative partition visibility).
 			// Design 0118-0059 (M0118-0008).
 			leaves := collectAllPartitionLeaves(im, tbl.OID, currentPartitionDetachEpoch(cat))
+			// M0148-0001c3a5 (a): one leaf in the parent's column order. PG's
+			// appendrel of one child plans the child as the rel's only member
+			// and drops the single-child Append (setrefs), so EXPLAIN shows the
+			// child scan under the parent's refname (`Seq Scan on
+			// parted_minmax1 parted_minmax`) with every path the child has.
+			// goopg returns the bare leaf scan — a search leaf, unlike the
+			// tableoid Project the union wrapping adds — and resolves
+			// `tableoid` to the leaf through the binding.
+			if len(leaves) == 1 && columnsInSameOrder(leaves[0].Columns, tbl.Columns) && len(leaves[0].Columns) == len(tbl.Columns) {
+				leaf := leaves[0]
+				alias := rv.Alias
+				if alias == "" {
+					alias = strings.ToLower(tbl.Name)
+				}
+				leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: alias, schema: tableSchemaWithSource(leaf, sourceIdx), LockParentOID: tbl.OID, TableSample: tsSpec, RTID: rtid,
+					EstRelRows: stage1RelSizeRows(cat, leaf), SmallDim: smallDimensionTag(cat, leaf), UniqueKeys: uniqueKeyColumnSets(cat, leaf)}
+				b.singleLeafOID = leaf.OID
+				ctx.schema = leafScan.Output()
+				return leafScan, b, nil
+			}
 			if len(leaves) > 0 {
 				// Build a UNION ALL of SeqScans over all leaf partitions.
 				// Per-leaf wrap with a Project that adds `tableoid`
@@ -12790,12 +12814,12 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	if !ok || tbl.View != nil || tbl.IsMatView {
 		return nil, false, nil
 	}
-	// Partitioned parents store no rows (planIndexScanFromWhere:8316): the
-	// single-leaf inner scan would be wrong, and the partitioned appendrel
-	// is not built here (ledgered).
-	if len(tbl.PartitionKey) > 0 {
-		return nil, false, nil
-	}
+	// Partitioned parents store no rows (planIndexScanFromWhere:8316), so
+	// the rule arms' fresh scans over tbl would be wrong. The subquery
+	// planned by the path search expands the appendrel itself
+	// (M0148-0001c3a5 (a)): a partitioned parent takes only that route
+	// (searchOnly).
+	searchOnly := len(tbl.PartitionKey) > 0
 	// M0148-0001c slice (c2): a plain `FROM parent` over an inheritance tree
 	// is an appendrel (expand_inherited_rtentry). planagg.c:121-137 accepts
 	// it — the RTE is still one RTE_RELATION — and build_minmax_path's
@@ -12803,7 +12827,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	// index paths (generate_orderedappend_paths). `FROM ONLY parent`
 	// (rte->inh = false) stays the plain single-relation shape.
 	var members []*catalog.Table
-	if im := inMemoryCat(cat); im != nil && !rv.Only {
+	if im := inMemoryCat(cat); im != nil && !rv.Only && !searchOnly {
 		members = collectInheritanceDescendants(im, tbl.OID, currentTempOwner(cat))
 	}
 	refname := rv.Alias
@@ -12850,7 +12874,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		if !isCall {
 			return nil, false, nil
 		}
-		init, sc, ok, berr := buildMinMaxInitPlan(s, cat, ctx, tbl, members, refname, fc, &t)
+		init, sc, ok, berr := buildMinMaxInitPlan(s, cat, ctx, tbl, members, refname, fc, &t, searchOnly)
 		if berr != nil {
 			return nil, false, berr
 		}
@@ -12948,7 +12972,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 // members non-empty marks tbl as an inheritance parent whose appendrel the
 // subquery scans (slice (c2)); refname is the parent RTE's alias name the
 // member scans print under (`minmaxtest minmaxtest_1`).
-func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolveContext, tbl *catalog.Table, members []*catalog.Table, refname string, fc *parser.FuncCall, t *parser.ResTarget) (Expr, SchemaColumn, bool, error) {
+func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolveContext, tbl *catalog.Table, members []*catalog.Table, refname string, fc *parser.FuncCall, t *parser.ResTarget, searchOnly bool) (Expr, SchemaColumn, bool, error) {
 	// min → forward IOS (isMax=false); max → Backward IOS (isMax=true).
 	if fc.Name.Schema != "" {
 		return nil, SchemaColumn{}, false, nil
@@ -13029,7 +13053,22 @@ func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolve
 		}
 	}
 
-	if isColumn {
+	if searchOnly {
+		// A partitioned parent (M0148-0001c3a5 (a)): only the subquery the
+		// path search plans over the appendrel, presorted, or no rewrite.
+		if !isColumn || correlated {
+			return nil, SchemaColumn{}, false, nil
+		}
+		colType = argCR.Type
+		if col, ok := cat.LookupColumn(tbl, argCR.Name); ok {
+			colType = col.Type
+		}
+		planned, presorted, ok := planMinMaxSubqueryViaSearch(s, ctx, cat, fc.Args[0], isMax)
+		if !ok || !presorted {
+			return nil, SchemaColumn{}, false, nil
+		}
+		inner = planned
+	} else if isColumn {
 		// Column-arg branch (min/max over a column): the index-driven scan
 		// shapes. The const-arg else-branch below needs no index at all.
 		colType = argCR.Type
@@ -19425,6 +19464,9 @@ func resolveTableoidForBinding(b rangeBinding, level, pos int) Expr {
 			return &ColumnRef{pos: pos, Index: idx, Name: "tableoid", Type: catalog.Type{Name: "oid"}, SourceTableIdx: b.sourceIdx}
 		}
 		return &OuterColumnRef{pos: pos, Level: level, Index: idx, Name: "tableoid", Type: catalog.Type{Name: "oid"}, SourceTableIdx: b.sourceIdx}
+	}
+	if b.singleLeafOID != 0 {
+		return &TableOidExpr{pos: pos, TableOID: b.singleLeafOID}
 	}
 	return &TableOidExpr{pos: pos, TableOID: b.table.OID}
 }

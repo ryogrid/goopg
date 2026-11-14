@@ -713,3 +713,35 @@ func TestMinMaxSubqueryPlannedBySearch(t *testing.T) {
 		t.Errorf("min/max rows %q, want 0|96", got)
 	}
 }
+
+// M0148-0001c3a5 (a): a partitioned table with one leaf plans that leaf as
+// its appendrel's only member — under the parent's refname, with the
+// leaf's own index paths — and min/max over it is build_minmax_path's
+// subquery planned by the search (regress inherit's parted_minmax, PG 18.3).
+func TestSinglePartitionAppendRelMember(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "create table parted_minmax (a int, b varchar(16)) partition by range (a)")
+	runSQL(t, ctx, "create table parted_minmax1 partition of parted_minmax for values from (1) to (3000)")
+	runSQL(t, ctx, "create index parted_minmax1i on parted_minmax1 (a, b)")
+	runSQL(t, ctx, "insert into parted_minmax select g, 'k' || (g % 7) from generate_series(1, 2000) g")
+	runSQL(t, ctx, "VACUUM parted_minmax1")
+	runSQL(t, ctx, "ANALYZE parted_minmax1")
+	ps := optimizer.DefaultPlannerSettings()
+	want := "Result\n  InitPlan 1\n    ->  Limit\n          ->  Index Only Scan using parted_minmax1i on parted_minmax1 parted_minmax\n" +
+		"                Index Cond: ((a IS NOT NULL) AND (b = 'k3'::text))\n  InitPlan 2\n    ->  Limit\n" +
+		"          ->  Index Only Scan Backward using parted_minmax1i on parted_minmax1 parted_minmax_1\n" +
+		"                Index Cond: ((a IS NOT NULL) AND (b = 'k3'::text))"
+	q := "select min(a), max(a) from parted_minmax where b = 'k3'"
+	if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+q, ps)), "\n"); got != want {
+		t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", q, got, want)
+	}
+	for _, c := range []struct{ q, rows string }{
+		{q, "3|1998"},
+		{"select tableoid::regclass, a from parted_minmax where a = 3", "parted_minmax1|3"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

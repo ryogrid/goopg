@@ -470,3 +470,64 @@ Sort\).
   `where a > 0 order by a limit 1` plans `Sort → Index Scan … Index
   Cond: (a >= 0) Filter: (a > 0)` where PG plans `Index Only Scan …
   Index Cond: (a > 0)`.
+
+## Item (a) slice 6 — a one\-leaf partitioned table is its member's rel
+
+PG reference: inherit.c expand\_partitioned\_rtentry \(the appendrel of
+one child\), setrefs.c set\_append\_references \(a single\-child Append is
+removed, so the child scan is printed under the parent's refname\),
+allpaths.c set\_append\_rel\_size \(the appendrel's size is its members'\).
+
+### The gap
+
+- planScanRangeVar wrapped the one leaf in the tableoid Project, as for
+  any fan\-out. The search does not treat a Project as a base leaf, so
+  the member got no index paths at all — `where a > 0 order by a limit
+  1` planned a Sort.
+- The scan printed without the parent alias \(`Seq Scan on
+  parted_minmax1` where PG prints `parted_minmax1 parted_minmax`\).
+- rewriteMinMaxAggregates refused every partitioned parent.
+
+### The fix
+
+- **The bare leaf scan:** one leaf in the parent's column order returns
+  the leaf SeqScan itself, aliased with the parent's refname. The
+  binding records `singleLeafOID`, so `tableoid` resolves to the leaf's
+  OID through resolveTableoidForBinding.
+- **estimateBaseRelInfo:** takes the member's table \(its indexes\) and
+  sizes the rel as appendRelMemberRows sizes each member \(the scan's
+  estimate\_rel\_size\).
+- **min/max:** a partitioned parent now takes only the search route
+  \(searchOnly\). The subquery planned over the appendrel becomes the
+  InitPlan when presorted; otherwise the Aggregate stands. The rule
+  arms, which read the storage\-less parent, are skipped.
+
+### Verification
+
+- **Scratch PG:** plans, `tableoid`, UPDATE / DELETE / INSERT through the
+  parent and TABLESAMPLE all match.
+- **TestSinglePartitionAppendRelMember:** pins the min/max InitPlans on
+  data where PG 18.3 picks them \(a skip\-scan Aggregate wins on lower
+  ndistinct, as on PG\) and the leaf `tableoid`. It fails with the
+  collapse disabled.
+- **Regress:**
+  - inherit 3118→3094 — the parted\_minmax witness is now identical;
+    missing `Backward` lines 7→6, all of them mcrparted, which is
+    blocked on M0148\-0001c3a8;
+  - partition\_prune 6772→6755.
+- **Gates:**
+  - units, tpch\-spotcheck, sf025 same=99;
+  - fire\-set fires=none on sf025, sf1 and TPC\-H;
+  - acceptance 24 MATCH;
+  - TestPort\_Isolation ok.
+
+### Not covered
+
+- **Leaf column order:** a leaf whose columns differ in order from the
+  parent's keeps the remap Project \(not a search leaf\).
+- **Self\-join:** a merge self\-join picks Index Scan where PG picks
+  Index Only Scan. This happens on plain tables too and predates this
+  slice.
+- **Multi\-member WHERE:** a multi\-member appendrel with a WHERE still
+  lacks per\-member index clauses, so its min/max declines to the
+  Aggregate where PG builds `Limit → Append` of member IOSs.

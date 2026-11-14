@@ -1084,6 +1084,17 @@ func estimateBaseRelInfo(binding rangeBinding, scan Node, local Expr) baseRelInf
 		hasLocalFilter: local != nil,
 		appendrel:      binding.appendrel,
 	}
+	// M0148-0001c3a5 (a): a partitioned table collapsed to its one leaf
+	// (planScanRangeVar) is that leaf's rel — its indexes, its size —
+	// as PG plans an appendrel's only member.
+	singleLeaf := false
+	if binding.singleLeafOID != 0 {
+		if leaf := singleLeafScanTable(scan, binding.singleLeafOID); leaf != nil {
+			binding.table = leaf
+			info.table = leaf
+			singleLeaf = true
+		}
+	}
 	// M0125-0043: the small-dimension answer lives on the leaf scan now.
 	// `smallDimensionSide` keeps the catalog-hint reading for the bindings
 	// the bushy DP hands us with no scan of their own.
@@ -1099,6 +1110,15 @@ func estimateBaseRelInfo(binding rangeBinding, scan Node, local Expr) baseRelInf
 		// empty inheritance parent or a storage-less partitioned one.
 		if fanOutAppendRel(binding.table, scan) {
 			info.baseRows = appendRelMemberRows(scan.(*SetOp))
+		}
+		// The one member is sized as set_append_rel_size sizes each member
+		// (appendRelMemberRows: the scan's own estimate_rel_size).
+		if singleLeaf {
+			if r := EstimateRows(scan); r >= 1 {
+				info.baseRows = r
+			} else {
+				info.baseRows = 1
+			}
 		}
 	}
 	info.filteredRows = applyLocalFilterSelectivity(info.baseRows, binding, scan, local)
@@ -2942,4 +2962,23 @@ func setOpArmGroups(arm Node, rows int64) int64 {
 		return 1
 	}
 	return g
+}
+
+// singleLeafScanTable is the leaf partition table the scan (under any
+// Filters) reads, when its OID is oid; nil otherwise.
+func singleLeafScanTable(scan Node, oid uint32) *catalog.Table {
+	for depth := 0; depth < 8 && scan != nil; depth++ {
+		switch x := scan.(type) {
+		case *Filter:
+			scan = x.Child
+		case *SeqScan:
+			if x.Table != nil && x.Table.OID == oid {
+				return x.Table
+			}
+			return nil
+		default:
+			return nil
+		}
+	}
+	return nil
 }

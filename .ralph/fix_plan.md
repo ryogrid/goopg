@@ -12707,6 +12707,19 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
       - then per-member index clauses for addOrderedPartitionAppendPaths
         (members with quals), and min/max over appendrel members through
         the search.
+  - 2026-11-14 (a) slice 6 LANDED: a one-leaf partitioned table plans its
+    leaf as the appendrel's only member.
+    - The bare leaf scan carries the parent's refname and is a search
+      leaf, with the leaf's indexes and member sizing.
+    - `tableoid` comes from the binding (singleLeafOID).
+    - min/max over a partitioned parent goes through the search only.
+    Movement: yes — regress inherit 3118→3094 (parted\_minmax identical),
+    partition\_prune 6772→6755
+    - Resume (a): the remaining 6 inherit `Backward` lines are mcrparted,
+      blocked on M0148-0001c3a8.
+    - Open residue: per-member index clauses for multi-member appendrels
+      with a WHERE (addOrderedPartitionAppendPaths refuses Filter members).
+    - Then (b) fractional partitionwise join.
 - [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
   (NULL-keyed entries)**.
   Kind: impl
