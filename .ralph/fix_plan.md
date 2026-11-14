@@ -12514,8 +12514,23 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - cross-type array literals (`'{33, 44}'::bigint[]` on int4);
     - index-only width counting index-qual-only columns;
     - an index-only prefix + range.
-  - Resume: (i) residue (cross-type and empty array literals; index-only
-    width; index-only prefix + range); then (d) sub-ORs inside AND arms.
+  - 2026-11-14 (d) LANDED: sub-ORs inside AND arms.
+    - bitmapOrArmPath keeps a sub-OR as an arm clause
+      (match\_orclause\_to\_indexcol → SAOP).
+    - bitmapOrPathsFor is generate\_bitmap\_or\_paths with the AND-arm
+      recursion.
+    - Probe against PG (regress tenk1): plan and cost identical, except the
+      (g) cost line.
+    Movement: yes — regress create\_index 2856→2832
+  - (j) new, from (d): skip scan with a range on a non-leading column (PG
+    18 `tenthous < 2` on (thousand, tenthous): a skip array on thousand plus
+    the range, as Index Only Scan and Bitmap Index Scan, cost 195.28).
+    - restrictionSkipRun takes only equality runs.
+    - Blocks PG's `BitmapAnd(hundred, BitmapOr(thousand = ANY, tenthous <
+      2))` in create\_index.
+  - Resume: (j) skip scan with a range qual, or (e) useful\_predicate; the
+    (i) residue (a lone empty array, cross-type literals, index-only width,
+    index-only prefix + range) is low-value.
 - [ ] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
   `… Backward` regress lines**.
   Kind: impl
