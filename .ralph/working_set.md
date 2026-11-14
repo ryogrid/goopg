@@ -1,28 +1,30 @@
-# Working Set — loop end 2026-11-14 (census routing-20261114r IDENTICAL; M0148-0001c3a6 (i) slice 2 LANDED 0674306c7)
+# Working Set — loop end 2026-11-14 (census routing-20261114s IDENTICAL; M0148-0001c3a6 (i) slice 3 LANDED 9b99f3b68)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: items 0. Nothing filed.
-- S9: DUE → routing-20261114r (s9cw, BASELINE_REV=c71667248) IDENTICAL ×3, committed d93cf8cbc.
-  - 0674306c7 touches the planner, so the next census is likely DUE.
-- Task: M0148-0001c3a6 item (i) slice 2, landed as 0674306c7.
+- S9: DUE → routing-20261114s (s9cx, BASELINE_REV=0e930b554) IDENTICAL ×3, committed 2b622fb38.
+  - 9b99f3b68 touches the planner, so the next census is likely DUE.
+- Task: M0148-0001c3a6 item (i) slice 3, landed as 9b99f3b68.
   - Files:
-    - pathbitmapor.go: crossIntCastKey;
-    - pathindexrestrict.go: restrictionKeyUsable cross arm and negated form, isIndexKeyOperand;
-    - selectivity.go: integerCastLiteral in normalizeColumnConst/Range;
-    - pathbitmap.go: bitmapConstKey; the equality collector skips out-of-range keys;
-    - operators_explain.go: formatCrossIntLiteralOperands, indexCondClause;
-    - test TestCrossTypeIntegerLiteralIndexQual.
+    - pathbitmapor.go: orEqualitySAOP admits cast int Consts and requires one keyTypeTag;
+    - operators_explain.go: inListArrayConst → sameTypeIntCastList;
+    - TestCrossTypeIntegerLiteralIndexQual extended.
   - Findings:
-    - goopg keeps `3::int8` as CastExpr(IntegerConst); PG folds it to an int8 Const. The renderer had coerced it to the column type.
-    - An observed flake: regress arrays `array_agg(nullif(ten,4))` over an ORDER BY subquery came back out of order once (not reproduced 2×). Ledgered.
-  - Movement: create_index 2689→2664, partition_prune 6755→6754.
-- Next step: c3a6 (i) group_similar_or_args — the create_index witness `thousand = 42 AND (tenthous = 1::int2 OR tenthous = 3::int8 OR tenthous = 42::int8)` should become a BitmapOr of the int2 arm and an `= ANY ('{3,42}'::bigint[])` arm (probe file tmp/mo.sql). Look at pathbitmapor.go generate_bitmap_or_paths / orEqualitySAOP.
+    - groupSimilarOrArgs already grouped by cast type; only the SAOP conversion refused cast Consts.
+    - Without the one-type check, the plain producer built a mixed-type array.
+  - Movement: create_index 2664→2637. arrays is back at 3142, confirming last loop's +13 was the flake (still ledgered).
+- Next step: c3a6 (i) leftovers, all small and witness-light:
+  - out-of-range equality key → empty probe;
+  - int2 untyped-literal rendering (`smallint[]`);
+  - primary cross-type array probe.
+  - Check create_index.diff / partition_prune.diff for a regress witness of any of them before choosing. If none has one, close c3a6 (i) with ledger transfers and move to (f) or the next task in file order (c3a9 / c3a10 / c3a8 / c3a7).
 - Top-residual: M0148 residues. Open children: c3a6, c3a7, c3a8, c3a9, c3a10, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261114r done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261114s done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26). Then M0148 in file order → c3a6.
 - Gates run (all PASS):
   - units, tpch-spotcheck, sf025 same=99;
-  - fire-set c3a6b fires=none ×3; acceptance 24 MATCH; TestPort_Isolation ok;
-  - regress A/B tmp/regress-c3a6i2 vs tmp/regress-c3a6i (arrays +13 was the flake; re-runs tmp/regress-arr1/2 = 3142).
+  - fire-set c3a6c fires=none ×3; acceptance 24 MATCH;
+  - regress A/B tmp/regress-c3a6i3 vs tmp/regress-c3a6i2.
+  - Isolation family not run: no selectivity change.
 - In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped. Restarting it hits P0-E24: drop leftover partitions.
