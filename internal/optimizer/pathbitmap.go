@@ -917,18 +917,23 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 	}
 }
 
-// partialPredicateProvenBy reports whether some restriction conjunct proves a
+// partialPredicateProvenBy reports whether the restriction conjuncts prove a
 // partial index's predicate — PG's `predOK` (`check_index_predicates`,
-// indxpath.c) at the narrow `provePartialIndexPredicate` fidelity. An unproven
-// partial index may not be scanned at all: its missing entries are rows the
-// query can still return.
+// indxpath.c): predicate_implied_by(indpred, the restriction list), the
+// conjuncts taken together as one AND. predicateImpliedBy is the
+// predicate_implied_by_recurse port (AND/OR rules, equal(), btree operator
+// inference), so `unique1 = 0` proves `unique1 < 20 OR unique1 > 980`
+// (M0148-0001c3a4 (e)). An unproven partial index may not be scanned at
+// all: its missing entries are rows the query can still return.
 func partialPredicateProvenBy(predicate Expr, conjuncts []Expr) bool {
-	for _, c := range conjuncts {
-		if provePartialIndexPredicate(predicate, c) {
-			return true
-		}
+	if predicate == nil || len(conjuncts) == 0 {
+		return false
 	}
-	return false
+	var clause Expr = conjuncts[0]
+	for _, c := range conjuncts[1:] {
+		clause = &BinaryOp{Op: parser.OpAnd, Left: clause, Right: c}
+	}
+	return predicateImpliedBy(clause, predicate)
 }
 
 // boundOuterKeys lists the outer values of a bitmap probe's bound clauses.

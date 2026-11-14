@@ -14064,7 +14064,7 @@ func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string
 			if err != nil || resolvedPred == nil {
 				continue
 			}
-			if !provePartialIndexPredicate(resolvedPred, queryClause) {
+			if !predicateImpliedBy(queryClause, resolvedPred) {
 				continue
 			}
 		}

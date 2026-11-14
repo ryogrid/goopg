@@ -84,7 +84,9 @@ func partialIndexFilterResidue(f *Filter) (kept Expr, changed bool) {
 	}
 	var rest []Expr
 	for _, c := range splitAnd(f.Predicate) {
-		if provePartialIndexPredicate(c, pred) {
+		// predicate_implied_by(list_make1(clause), indexpred) — the full
+		// prover (M0148-0001c3a4 (e)).
+		if predicateImpliedBy(pred, c) {
 			changed = true
 			continue
 		}

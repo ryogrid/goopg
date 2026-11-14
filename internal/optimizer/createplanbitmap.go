@@ -53,9 +53,6 @@ func createBitmapHeapScanPlan(p *Path) (Node, error) {
 	// every heap tuple — the safety net for lossy bitmap pages, and the
 	// correct filter when the predicate-implication prover is absent.
 	partialPreds := collectBitmapPartialPredicates(p.Children[0])
-	if len(partialPreds) > 0 {
-		bitmapQual = append(bitmapQual, partialPreds...)
-	}
 
 	// A restriction probe's index quals came out of the leaf's own Filter:
 	// they are the recheck list, and the reinstated Filter drops them (PG's
@@ -81,6 +78,22 @@ func createBitmapHeapScanPlan(p *Path) (Node, error) {
 				}
 			}
 		}
+	}
+
+	// create_bitmap_subplan appends the index predicate after the index
+	// quals, and only when they do not already imply it
+	// (predicate_implied_by(indpred, subqual), M0148-0001c3a4 (e)).
+	for _, pp := range partialPreds {
+		if len(bitmapQual) > 0 {
+			var quals Expr = bitmapQual[0]
+			for _, q := range bitmapQual[1:] {
+				quals = &BinaryOp{Op: parser.OpAnd, Left: quals, Right: q}
+			}
+			if predicateImpliedBy(quals, pp) {
+				continue
+			}
+		}
+		bitmapQual = append(bitmapQual, pp)
 	}
 
 	bhs := &BitmapHeapScan{

@@ -635,7 +635,7 @@ func bitmapArmSubqual(p *Path) ([]Expr, bool) {
 		if p.PartialPredicate != nil {
 			implied := false
 			for _, q := range qual {
-				if provePartialIndexPredicate(p.PartialPredicate, q) {
+				if predicateImpliedBy(q, p.PartialPredicate) {
 					implied = true
 					break
 				}
@@ -846,27 +846,91 @@ func predicateImpliedBy(clause, predicate Expr) bool {
 // integer literal constants are compared, so the proof is sound by
 // construction.
 func operatorPredicateProof(clause, predicate Expr) bool {
-	cc, op1, c1, ok := intComparison(clause)
-	if !ok {
+	var op1, op2 parser.OpCode
+	var cmp int
+	if cc, o1, c1, ok := intComparison(clause); ok {
+		pc, o2, c2, ok := intComparison(predicate)
+		if !ok || cc.Index != pc.Index || cc.Name != pc.Name {
+			return false
+		}
+		op1, op2 = o1, o2
+		switch {
+		case c1 < c2:
+			cmp = -1
+		case c1 > c2:
+			cmp = 1
+		}
+	} else if cc, o1, s1, ok := nameComparison(clause); ok {
+		// M0148-0001c3a4 (e): a `name` column always compares under the "C"
+		// collation (pg_type typcollation C_COLLATION_OID), so its constants
+		// order bytewise — `stringu1 = 'ATAAAA'` implies `stringu1 < 'B'`.
+		pc, o2, s2, ok := nameComparison(predicate)
+		if !ok || cc.Index != pc.Index || cc.Name != pc.Name {
+			return false
+		}
+		op1, op2 = o1, o2
+		cmp = strings.Compare(s1, s2)
+	} else {
 		return false
 	}
-	pc, op2, c2, ok := intComparison(predicate)
-	if !ok || cc.Index != pc.Index || cc.Name != pc.Name {
-		return false
-	}
+	return btreeImplication(op1, op2, cmp)
+}
+
+// btreeImplication is BT_implic_table for `x op1 c1` implies `x op2 c2`,
+// given cmp = sign(c1 - c2) under the column's ordering.
+func btreeImplication(op1, op2 parser.OpCode, cmp int) bool {
 	switch op2 {
 	case parser.OpLt:
-		return (op1 == parser.OpLt && c1 <= c2) || ((op1 == parser.OpLe || op1 == parser.OpEq) && c1 < c2)
+		return (op1 == parser.OpLt && cmp <= 0) || ((op1 == parser.OpLe || op1 == parser.OpEq) && cmp < 0)
 	case parser.OpLe:
-		return (op1 == parser.OpLt || op1 == parser.OpLe || op1 == parser.OpEq) && c1 <= c2
+		return (op1 == parser.OpLt || op1 == parser.OpLe || op1 == parser.OpEq) && cmp <= 0
 	case parser.OpGt:
-		return (op1 == parser.OpGt && c1 >= c2) || ((op1 == parser.OpGe || op1 == parser.OpEq) && c1 > c2)
+		return (op1 == parser.OpGt && cmp >= 0) || ((op1 == parser.OpGe || op1 == parser.OpEq) && cmp > 0)
 	case parser.OpGe:
-		return (op1 == parser.OpGt || op1 == parser.OpGe || op1 == parser.OpEq) && c1 >= c2
+		return (op1 == parser.OpGt || op1 == parser.OpGe || op1 == parser.OpEq) && cmp >= 0
 	case parser.OpEq:
-		return op1 == parser.OpEq && c1 == c2
+		return op1 == parser.OpEq && cmp == 0
 	}
 	return false
+}
+
+// nameComparison reads `col op 'literal'` (either side, the literal bare or
+// cast to name), normalised to column-first, for a `name` column.
+func nameComparison(e Expr) (*ColumnRef, parser.OpCode, string, bool) {
+	b, ok := e.(*BinaryOp)
+	if !ok {
+		return nil, parser.OpUnknown, "", false
+	}
+	switch b.Op {
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe, parser.OpEq:
+	default:
+		return nil, parser.OpUnknown, "", false
+	}
+	lit := func(x Expr) (string, bool) {
+		if c, isCast := x.(*CastExpr); isCast {
+			if !strings.EqualFold(strings.TrimSpace(c.TargetType), "name") {
+				return "", false
+			}
+			x = c.Operand
+		}
+		sc, isStr := x.(*StringConst)
+		if !isStr {
+			return "", false
+		}
+		return sc.Value, true
+	}
+	nameCol := func(cr *ColumnRef) bool { return cr.Type.Name == "name" && !cr.Type.IsArray }
+	if cr, isCol := b.Left.(*ColumnRef); isCol && nameCol(cr) {
+		if v, ok := lit(b.Right); ok {
+			return cr, b.Op, v, true
+		}
+	}
+	if cr, isCol := b.Right.(*ColumnRef); isCol && nameCol(cr) {
+		if v, ok := lit(b.Left); ok {
+			return cr, swapInequalityOp(b.Op), v, true
+		}
+	}
+	return nil, parser.OpUnknown, "", false
 }
 
 // intComparison reads `col op intconst` (either side), normalised to

@@ -495,3 +495,42 @@ func TestSkipScanRangeOnLaterColumn(t *testing.T) {
 		}
 	}
 }
+
+// TestPartialIndexPredicateProof pins M0148-0001c3a4 (e) against PG 18.3: a
+// partial index is usable when predicate_implied_by proves its predicate from
+// the restriction (or a BitmapOr arm) as a whole — an OR predicate by
+// operator inference (`unique1 = 0` ⇒ `unique1 < 20 OR unique1 > 980`), a
+// `name` predicate bytewise (its collation is always C), and a qual the
+// predicate implies leaves the Filter.
+func TestPartialIndexPredicateProof(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "CREATE TABLE ok2 (unique1 int, unique2 int, s1 name)")
+	runSQL(t, ctx, "INSERT INTO ok2 SELECT g, (g*7)%1000, chr(65+(g%26))||'AAA' FROM generate_series(0, 999) g")
+	runSQL(t, ctx, "CREATE INDEX ok2_u1_prtl ON ok2 (unique1) WHERE unique1 < 20 OR unique1 > 980")
+	runSQL(t, ctx, "CREATE INDEX ok2_u2_prtl ON ok2 (unique2) WHERE s1 < 'B'")
+	runSQL(t, ctx, "VACUUM ok2")
+	runSQL(t, ctx, "ANALYZE ok2")
+	ps := optimizer.DefaultPlannerSettings()
+	for _, c := range []struct{ q, plan, rows string }{
+		{"SELECT unique1 FROM ok2 WHERE unique2 = 11 AND s1 < 'B'",
+			"Index Scan using ok2_u2_prtl on ok2\n  Index Cond: (unique2 = 11)", ""},
+		{"SELECT unique1 FROM ok2 WHERE unique2 = 11 AND s1 = 'AAAA'",
+			"Index Scan using ok2_u2_prtl on ok2\n  Index Cond: (unique2 = 11)\n  Filter: (s1 = 'AAAA'::name)", ""},
+		{"SELECT unique1, unique2 FROM ok2 WHERE (unique2 = 11 AND s1 < 'B') OR unique1 = 0",
+			"Bitmap Heap Scan on ok2\n  Recheck Cond: (((unique2 = 11) AND (s1 < 'B'::name)) OR (unique1 = 0))\n  ->  BitmapOr\n" +
+				"        ->  Bitmap Index Scan on ok2_u2_prtl\n              Index Cond: (unique2 = 11)\n" +
+				"        ->  Bitmap Index Scan on ok2_u1_prtl\n              Index Cond: (unique1 = 0)", "0|0"},
+		{"SELECT unique1, unique2 FROM ok2 WHERE (unique2 = 11 OR unique1 = 0) AND s1 < 'B'",
+			"Bitmap Heap Scan on ok2\n  Recheck Cond: (((unique2 = 11) AND (s1 < 'B'::name)) OR (unique1 = 0))\n  Filter: (s1 < 'B'::name)\n  ->  BitmapOr\n" +
+				"        ->  Bitmap Index Scan on ok2_u2_prtl\n              Index Cond: (unique2 = 11)\n" +
+				"        ->  Bitmap Index Scan on ok2_u1_prtl\n              Index Cond: (unique1 = 0)", "0|0"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}
