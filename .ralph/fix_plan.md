@@ -12664,7 +12664,11 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     NullTest; non-integer redundant bounds.
   - An equality behind the array on the next column.
   - A lone `= ANY ('{}')` probe; index-only width from the reltarget.
-- [ ] **M0148-0001c3a12 — row-comparison index quals
+  - From M0148-0001c3a12 \(closed 2026-11-14\):
+    - UPDATE / DELETE planning never takes a row-comparison index path;
+    - a row comparison behind an equality prefix, over DESC columns, or
+      one PG truncates to the index columns.
+- [x] **M0148-0001c3a12 — row-comparison index quals
   (match\_rowcompare\_to\_indexcol)**.
   Kind: impl
   Parent: M0148-0001c3a6
@@ -12703,7 +12707,10 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     (TestRowCompareIndexQual)
     - Resume: DML index paths for row comparisons; prefix / DESC /
       truncated rows; btree\_index waits on c3a7.
-- [ ] **M0148-0001c3a13 — constant-NULL row elimination in a row IN list**.
+  - 2026-11-14 CLOSED: the leftovers have no regress or corpus witness, so
+    they moved to M0148-0001c3a11 \(ledger row 2026-11-14\). btree\_index's
+    pg\_proc lines stay with M0148-0001c3a7.
+- [x] **M0148-0001c3a13 — constant-NULL row elimination in a row IN list**.
   Kind: impl
   Parent: M0148-0001c3a6
   Found 2026-11-14.
@@ -12719,6 +12726,16 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
       arm in WHERE context (is\_check = false).
   - Resume: expand RowExpr IN lists in the resolver (or a planner
     pre-pass), then drop constant NULL OR arms in qual context.
+  - 2026-11-14 LANDED: planInExpr expands a row IN list
+    \(rowInListAsBooleanTree\); the existing FoldConstants and
+    reduceQualConstArms drop the NULL item.
+    - Both `(a, b)` and `ROW(a, b)` qualify; a width mismatch is 42601.
+    - Also fixes wrong values: a NULL item now gives NULL, not false
+      \(NOT IN: NULL, not true\).
+    - EXPLAIN prints a NULL AND / OR arm as `NULL::boolean`.
+    - Design: docs/design/0100-0149/0148-0001c3a13-row-in-list-expansion.md.
+    - Leftovers ledgered \(mixed row / scalar list; Result Output line\).
+    Movement: yes — regress create\_index 2483→2466
 - [x] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
   `… Backward` regress lines**.
   Kind: impl

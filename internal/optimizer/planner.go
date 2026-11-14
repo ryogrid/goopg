@@ -18011,6 +18011,11 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 	if cmp, ok := oneElementInAsComparison(x); ok {
 		return resolveExpr(cmp, ctx)
 	}
+	if tree, ok, err := rowInListAsBooleanTree(x); err != nil {
+		return nil, err
+	} else if ok {
+		return resolveExpr(tree, ctx)
+	}
 	// Row constructor IN (VALUES ...): expand to OR(AND(a=v1,b=v1b), ...) at plan time.
 	// M0097-0020.
 	if rowExpr, ok := x.Operand.(*parser.RowExpr); ok && x.Subquery != nil && len(x.Subquery.ValuesRows) > 0 {
@@ -18092,18 +18097,18 @@ func checkAnyAllArrayOperand(x *parser.InExpr, list []Expr) error {
 //
 // Only the IN (val_list) syntax qualifies: `= ANY (ARRAY[c])` desugars to the
 // same parser shape but is PG's AEXPR_OP_ANY, which stays an array
-// comparison (parser.InExpr.Quantified). A row operand or row item keeps the
-// IN form: PG builds make_row_comparison_op there, which goopg's `=` on rows
-// does not reproduce (ledgered).
+// comparison (parser.InExpr.Quantified). A row operand or row item is left
+// to rowInListAsBooleanTree: PG builds make_row_comparison_op there, which
+// goopg's `=` on rows does not reproduce.
 func oneElementInAsComparison(x *parser.InExpr) (parser.Expr, bool) {
 	if x == nil || x.Subquery != nil || x.Quantified || x.AnyOp != 0 || x.AllOp ||
 		x.NotEqualAny || len(x.List) != 1 {
 		return nil, false
 	}
-	if _, row := x.Operand.(*parser.RowExpr); row {
+	if _, row := rowConstructorElems(x.Operand); row {
 		return nil, false
 	}
-	if _, row := x.List[0].(*parser.RowExpr); row {
+	if _, row := rowConstructorElems(x.List[0]); row {
 		return nil, false
 	}
 	op := parser.OpEq
@@ -18111,6 +18116,104 @@ func oneElementInAsComparison(x *parser.InExpr) (parser.Expr, bool) {
 		op = parser.OpNe
 	}
 	return parser.NewBinaryOp(x.Pos(), op, x.Operand, x.List[0]), true
+}
+
+// rowInListAsBooleanTree is transformAExprIn's (parse_expr.c) "hard way"
+// for a row operand: `ROW(a, b) IN (ROW(1, 2), ROW(3, 4))`. The common type
+// of row items is RECORD, for which transformAExprIn never builds a
+// ScalarArrayOpExpr, so every list item becomes make_row_comparison_op of
+// the IN's operator and the items are combined with OR (`=`, IN) or AND
+// (`<>`, NOT IN), in list order:
+//
+//	(a, b) IN ((1, 2), (3, 4))      →  (a = 1 AND b = 2) OR (a = 3 AND b = 4)
+//	(a, b) NOT IN ((1, 2), (3, 4))  →  (a <> 1 OR b <> 2) AND (a <> 3 OR b <> 4)
+//
+// make_row_comparison_op (parse_expr.c) ANDs the per-column `=` and ORs the
+// per-column `<>`; one column is the bare comparison. The expansion is what
+// gives a NULL item PG's three-valued result — `(1, 3) IN ((1, 2), (NULL,
+// NULL))` is NULL, not false — and what lets FoldConstants and
+// reduceQualConstArms drop a constant-NULL item from a qual
+// (find_duplicate_ors), so `(thousand, tenthous) IN ((1, 1001), (NULL,
+// NULL))` is the index qual `thousand = 1 AND tenthous = 1001`
+// (M0148-0001c3a13).
+//
+// Only the IN (val_list) syntax qualifies (AEXPR_IN); every item must be a
+// row constructor, else the IN keeps its existing form. A nested row
+// element keeps the existing form too (make_op over rows is not
+// reproduced). A width mismatch is PG's 42601.
+func rowInListAsBooleanTree(x *parser.InExpr) (parser.Expr, bool, error) {
+	if x == nil || x.Subquery != nil || x.Quantified || x.AnyOp != 0 || x.AllOp ||
+		x.NotEqualAny || len(x.List) == 0 {
+		return nil, false, nil
+	}
+	lelems, ok := rowConstructorElems(x.Operand)
+	if !ok || len(lelems) == 0 {
+		return nil, false, nil
+	}
+	nested := func(es []parser.Expr) bool {
+		for _, e := range es {
+			if _, r := rowConstructorElems(e); r {
+				return true
+			}
+		}
+		return false
+	}
+	if nested(lelems) {
+		return nil, false, nil
+	}
+	items := make([][]parser.Expr, len(x.List))
+	for i, it := range x.List {
+		r, ok := rowConstructorElems(it)
+		if !ok || nested(r) {
+			return nil, false, nil
+		}
+		items[i] = r
+	}
+	colOp, combine := parser.OpEq, parser.OpAnd
+	itemOp := parser.OpOr
+	if x.Negated {
+		colOp, combine, itemOp = parser.OpNe, parser.OpOr, parser.OpAnd
+	}
+	pos := x.Pos()
+	var out parser.Expr
+	for _, r := range items {
+		if len(r) != len(lelems) {
+			return nil, false, &PlanError{Pos: pos, Code: "42601",
+				Message: "unequal number of entries in row expressions"}
+		}
+		var cmp parser.Expr
+		for j, l := range lelems {
+			c := parser.NewBinaryOp(pos, colOp, l, r[j])
+			if cmp == nil {
+				cmp = c
+			} else {
+				cmp = parser.NewBinaryOp(pos, combine, cmp, c)
+			}
+		}
+		if out == nil {
+			out = cmp
+		} else {
+			out = parser.NewBinaryOp(pos, itemOp, out, cmp)
+		}
+	}
+	return out, true, nil
+}
+
+// rowConstructorElems returns the fields of a row constructor: the implicit
+// `(a, b)` (parser.RowExpr) or the explicit `ROW(a, b)`, which the grammar
+// builds as a plain call named row (pg_grammar.y implicit_row note).
+func rowConstructorElems(e parser.Expr) ([]parser.Expr, bool) {
+	switch x := e.(type) {
+	case *parser.RowExpr:
+		return x.Elems, true
+	case *parser.FuncCall:
+		if x.Name.Schema == "" && strings.EqualFold(x.Name.Name, "row") && !x.Star &&
+			!x.Distinct && x.Over == nil && x.Filter == nil && len(x.OrderBy) == 0 &&
+			len(x.WithinGroup) == 0 {
+			return x.Args, true
+		}
+	}
+	return nil, false
 }
 
 // planExistsExpr plans the inner subquery and wraps in an

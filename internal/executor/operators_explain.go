@@ -5566,6 +5566,13 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 			// `(((a) AND (b)) AND (c))`.
 			var parts []string
 			for _, arm := range flattenBoolArms(x, x.Op, nil) {
+				// An AND / OR input is boolean, so a NULL arm is a
+				// boolean Const: get_const_expr prints `NULL::boolean`
+				// (`(a = 1) OR NULL::boolean`, M0148-0001c3a13).
+				if _, isNull := arm.(*optimizer.NullConst); isNull {
+					parts = append(parts, "NULL::boolean")
+					continue
+				}
 				parts = append(parts, formatExprQual(arm, reg, qualify))
 			}
 			return "(" + strings.Join(parts, " "+x.Op.String()+" ") + ")"

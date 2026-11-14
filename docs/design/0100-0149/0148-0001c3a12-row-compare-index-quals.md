@@ -124,3 +124,9 @@ Parent: M0148\-0001c3a6. PG reference:
   path at all \(Seq Scan even with enable\_seqscan off\).
 - **Prefix, DESC and truncation:** a row comparison behind an equality
   prefix, over DESC columns, or one that PG truncates to the index columns.
+
+## Closed 2026\-11\-14
+
+- No regress or corpus witness remains for the two "Not covered" items
+  above. Both were moved to the parking task M0148\-0001c3a11 \(deferral
+  ledger row of 2026\-11\-14\).

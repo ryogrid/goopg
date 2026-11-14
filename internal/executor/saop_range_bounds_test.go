@@ -945,3 +945,46 @@ func TestRowCompareIndexQual(t *testing.T) {
 		}
 	}
 }
+
+// TestRowInListExpandsToComparisons pins transformAExprIn's row form
+// (M0148-0001c3a13): `(a, b) IN ((1, 2), (3, 4))` is an OR of per-column
+// AND equalities (NOT IN: an AND of per-column OR inequalities), so a
+// constant-NULL item folds away in a qual and the rest becomes an index
+// qual, and a NULL item gives PG's three-valued result instead of false.
+// Plans and values are PG 18.3's.
+func TestRowInListExpandsToComparisons(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "create table rc (thousand int NOT NULL, tenthous int NOT NULL, pad text)")
+	runSQL(t, ctx, "create index rc_tt on rc (thousand, tenthous)")
+	runSQL(t, ctx, "insert into rc select g % 1000, g, 'x' from generate_series(0, 9999) g")
+	runSQL(t, ctx, "VACUUM rc")
+	runSQL(t, ctx, "ANALYZE rc")
+	ps := optimizer.DefaultPlannerSettings()
+	for _, c := range []struct{ q, plan string }{
+		{"SELECT * FROM rc WHERE (thousand, tenthous) in ((1,1001),(null,null))",
+			"Index Scan using rc_tt on rc\n  Index Cond: ((thousand = 1) AND (tenthous = 1001))"},
+		{"SELECT * FROM rc WHERE (thousand, tenthous) in ((1,null),(2,2002))",
+			"Index Scan using rc_tt on rc\n  Index Cond: ((thousand = 2) AND (tenthous = 2002))"},
+		{"SELECT * FROM rc WHERE (thousand, tenthous) in ((1,1001),(2,2002))",
+			"Bitmap Heap Scan on rc\n  Recheck Cond: (((thousand = 1) AND (tenthous = 1001)) OR ((thousand = 2) AND (tenthous = 2002)))\n" +
+				"  ->  BitmapOr\n        ->  Bitmap Index Scan on rc_tt\n              Index Cond: ((thousand = 1) AND (tenthous = 1001))\n" +
+				"        ->  Bitmap Index Scan on rc_tt\n              Index Cond: ((thousand = 2) AND (tenthous = 2002))"},
+		{"SELECT * FROM rc WHERE (thousand, tenthous) not in ((1,1001),(null,null))",
+			"Result\n  One-Time Filter: false"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+	}
+	for _, c := range []struct{ q, rows string }{
+		{"SELECT count(*) FROM rc WHERE (thousand, tenthous) not in ((1,1001),(2,2002)) and thousand < 3", "28"},
+		{"SELECT (thousand, tenthous) in ((1,1001),(null,null)), (thousand, tenthous) not in ((1,1001),(null,null)) " +
+			"FROM rc WHERE thousand = 1 ORDER BY tenthous LIMIT 2", "NULL|NULL;t|f"},
+		{"SELECT ROW(1,2) in (ROW(1,3), row(null,2)), ROW(1,2) not in (ROW(1,3), row(null,2)), row(1,3) not in (row(1,2))", "NULL|NULL|t"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}
