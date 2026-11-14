@@ -1,30 +1,22 @@
-# Working Set — loop end 2026-11-14 (census routing-20261114p IDENTICAL; c3a5 (a) slice 6 LANDED a6725a9d1)
+# Working Set — loop end 2026-11-14 (census routing-20261114q IDENTICAL; M0148-0001c3a5 CLOSED fe060c35b)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: items 0. Nothing filed.
-- S9: DUE → routing-20261114p (s9cu, BASELINE_REV=e8aa979d6) IDENTICAL ×3, committed 41246adec.
-  - a6725a9d1 touches the planner, so the next census is likely DUE.
-- Task: M0148-0001c3a5 item (a) slice 6, landed as a6725a9d1.
-  - Files:
-    - planner.go: single-leaf collapse in planScanRangeVar, rangeBinding.singleLeafOID, resolveTableoidForBinding, min/max searchOnly route for partitioned parents;
-    - cardinality.go: estimateBaseRelInfo takes the member table and size, singleLeafScanTable;
-    - test TestSinglePartitionAppendRelMember.
+- S9: DUE → routing-20261114q (s9cv, BASELINE_REV=2d2aee32a) IDENTICAL ×3, committed 4ba0fca08.
+  - fe060c35b changes trackers only, so the next census should be REUSE.
+- Task: M0148-0001c3a5 closed (fe060c35b).
   - Findings:
-    - The parted_minmax witness is now identical to PG.
-    - The remaining 6 inherit `Backward` lines are all mcrparted, blocked on M0148-0001c3a8 (expression-key tuple format).
-    - Test data matters: on low-ndistinct `a`, PG picks a skip-scan Aggregate over the min/max InitPlans. The test uses `a = g` with 2000 rows, where PG picks the InitPlans.
-  - Movement: inherit 3118→3094, partition_prune 6772→6755.
-- Open residues (ledgered):
-  - multi-member appendrels with a WHERE need per-member index clauses (orderedpartitionappend.go memberSeqScan refuses Filter members);
-  - a single leaf with a different column order keeps the remap Project;
-  - a merge self-join picks Index Scan where PG picks IOS (plain tables too).
-- Next step: c3a5 (a) is down to blocked mcrparted plus the residues above. Per the fix_plan Resume line: per-member index clauses for multi-member appendrels with a WHERE; or move on to (b) fractional partitionwise join (regress partition_join fract_t, 4 Backward lines). Prefer (b) if the per-member work looks larger than one slice.
-- Top-residual: M0148 residues. Open children: c3a5, c3a6, c3a7, c3a8, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
+    - (b) needs partitionwise join, which goopg lacks entirely (pathparam.go says so). Filed M0148-0001c3a9.
+    - The (a) per-member index clauses residue needs base RelOptInfos for appendrel members. Filed M0148-0001c3a10.
+    - mcrparted → c3a8; (c) → c3a7.
+  - Files: .ralph/fix_plan.md (c3a5 [x] + close bullet; new c3a9, c3a10 after c3a5), .ralph/deferral_ledger.md (close row), docs/design/0100-0149/0148-0001c3a5-backward-plan-residue.md (close-out section).
+- Next step: select by file order.
+  - M0148-0001c3a6 (line ~12557, BEFORE c3a5; no blocker) is next.
+  - Its stated resume: (i) cross-type array literals (`'{33,44}'::bigint[]` on an int4 column) as an index qual — "moves one create_index line". Probe that create_index line on scratch PG 5545 vs goopg 5533 first.
+  - Then c3a9 / c3a10 / c3a8 / c3a7 / c3b … in file order.
+- Top-residual: M0148 residues. Open children: c3a6, c3a7, c3a8, c3a9, c3a10, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261114p done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
-  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26). Then M0148 in file order → c3a5.
-- Gates run (all PASS):
-  - units, tpch-spotcheck, sf025 same=99;
-  - fire-set c3a5a6 fires=none ×3; acceptance 24 MATCH; TestPort_Isolation ok (574s);
-  - regress A/B tmp/regress-c3a5a6 vs tmp/regress-c3a5a5.
+  - Items 0-9: M0146-0014(channel; census routing-20261114q done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26). Then M0148 in file order.
+- Gates run: census s9cv IDENTICAL ×3; commit hook pgbench smoke PASS. No code change this loop, so no other gate was needed.
 - In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped. Restarting it hits P0-E24: drop leftover partitions.
