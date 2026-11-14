@@ -12535,7 +12535,14 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
       line only; 6 of 7 now equal PG's text.
     Movement: none — regress COSTS OFF; plan-capture cost lines moved toward
     PG (7 sf025 queries)
-  - Resume: (j) skip scan with a range qual, or (e) useful\_predicate; the
+  - 2026-11-14 (j) LANDED: skip scan with a range on a later column.
+    - Plain, index-only and bitmap paths; whole-index read with a per-entry
+      key check.
+    - Completes (d)'s create\_index BitmapAnd.
+    - Probe against PG: plans, costs and rows identical on 10 statements
+      (widths aside).
+    Movement: yes — regress create\_index 2832→2801
+  - Resume: (e) useful\_predicate or (f) join OR bitmap paths; the
     (i) residue (a lone empty array, cross-type literals, index-only width,
     index-only prefix + range) is low-value.
 - [ ] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
