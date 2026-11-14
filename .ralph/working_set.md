@@ -1,30 +1,32 @@
-# Working Set — loop end 2026-11-15 (census routing-20261114y IDENTICAL; M0148-0001c3a9 slice 1 LANDED 7b02fea41)
+# Working Set — loop end 2026-11-15 (census routing-20261115a IDENTICAL; M0148-0001c3a9 slice 2 LANDED f83a848ab)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: items 0. Nothing filed.
-- S9: DUE → routing-20261114y (s9dd, BASELINE_REV=38b072965) IDENTICAL ×3, committed 3a6e4c017.
-  - 7b02fea41 touches internal/optimizer (planner.go, partitiondesc.go), so the next census is likely DUE (BASELINE_REV=073b218c6, the head consumed by routing-20261114y).
-- Task: M0148-0001c3a9 (partitionwise join), slice 1 landed as 7b02fea41: partition members in PartitionDesc (bound) order, depth-first.
-  - Also discharges the partition half of M0148-0001k1 (c).
+- S9: DUE → routing-20261115a (s9de, BASELINE_REV=073b218c6) IDENTICAL ×3, committed 85a556ad3.
+  - f83a848ab touches internal/optimizer (plan.go, planner.go, partscheme.go), so the next census is likely DUE (BASELINE_REV=6083698be, the head consumed by routing-20261115a).
+- Owner commit a2db05f01 landed mid-loop. New rule (PROMPT.md, testing guidelines): when regress mismatch lines move, re-measure with `scripts/pg-regress-runner.sh --update-inventory --case-timeout 300 <cases>`. Commit the CSV and the coverage doc in the same commit, and quote `case M→M'` in Movement.
+  - The metric is the expected-side `-` lines, NOT the runner's `diff: N lines`.
+- Task: M0148-0001c3a9 (partitionwise join), slice 2 landed as f83a848ab.
+  - partScheme is stamped on a one-level, plain-column-keyed partitioned appendrel's SetOp.
+  - Matching predicates: samePartitionScheme, partitionBoundsEqual, partkeyEquiJoined.
+  - Nothing consumes them yet; plans unchanged.
 - Files:
-  - internal/optimizer/partitiondesc.go: new — partitionDescOrder, ownPartitionBound, compareBoundValue;
-  - internal/optimizer/planner.go: collectAllPartitionLeaves now walks depth-first and takes the root *catalog.Table;
-  - tests: partitiondesc_test.go (optimizer), executor partition_desc_order_test.go; TestOrderedPartitionAppend's alias numbers now follow PG's inherit.out;
-  - design doc docs/design/0100-0149/0148-0001c3a9-partitionwise-join.md: slice 1 plus design slices 2-6.
-- Key symbols: partitionDescOrder, collectAllPartitionLeaves, paramAppendPathFor (model for per-member rels).
-- Findings:
-  - A sub-partitioned child's PartitionBounds also lists its own children's bounds (DDL appends each child's bound to its parent). Pick the entry whose ChildName names the table.
-  - goopg's enable_partitionwise_join defaults to on (verified with SHOW); nothing consumes it yet.
-  - PG numbers member aliases with intermediate partitioned RTEs included (pagg_tab_ml_p3_s1 is pagg_tab_ml_5). Ledgered.
-  - The isolation suite subtests report a mismatch as SKIP. Use the dedicated TestPort_Isolation* strict tests (all 17 partition specs PASS).
-  - internal/postmaster failed once, then passed on rerun (untouched by this change).
-- Next step: run the census if DUE, then c3a9 slice 2 per the design doc. Put the partition scheme (parent, key, ordered leaves) on the appendrel binding the search sees, then child rels shared with c3a10.
-- Top-residual: M0148 residues. Open: c3a9 (slices 2-6), c3a10, c3a8, c3a7, c3a11 (parked), c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
+  - internal/optimizer/partscheme.go (+_test.go);
+  - plan.go: SetOp.partScheme; planner.go: the stamp beside AppendRelName;
+  - design doc 0148-0001c3a9-partitionwise-join.md: slice 2 section.
+- Key symbols: partScheme, newPartScheme, relPartScheme, samePartitionScheme, partitionBoundsEqual, partkeyEquiJoined, makeJoinRel (joinsearchlevel.go:571), addPathsToJoinrel (joinpaths.go:344), paramAppendPathFor (model for per-member rels).
+- Findings for slice 3:
+  - Join-clause ColumnRefs are matched by SourceTableIdx + name. A member's output layout equals the appendrel's (parent columns + tableoid).
+  - So a child problem can reuse the parent's clauses with each appendrel leaf swapped for member i.
+  - RelSet is a uint32 bitmask over one problem's base rels; a child join likely needs its own small searchCtx (buildInitialRels + joinSearch) or a direct addPathsToJoinrel over two member RelOptInfos.
+- Next step: run the census if DUE, then c3a9 slice 3. At makeJoinRel for {A,B} with matching schemes and a partition-key equi-join, build per-pair member RelOptInfos (like paramAppendPathFor's member rels), run addPathsToJoinrel per pair, and add an Append path over the cheapest child joins. Witness: partition_join's first query (prt1 ⋈ prt2 on a = b).
+- Top-residual: M0148 residues. Open: c3a9 (slices 3-6), c3a10, c3a8, c3a7, c3a11 (parked), c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261114y done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261115a done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26, E27). Then M0148 in file order → c3a9.
 - Gates run (all PASS):
-  - units (after re-pinning TestOrderedPartitionAppend), tpch-spotcheck, sf025 99 PASS same=99;
-  - fire-set c3a9a fires=none ×3; acceptance arm PASS; 17 dedicated partition isolation tests;
-  - regress A/B vs a same-suite HEAD worktree baseline: partition_prune 6754→6384, partition_join 5801→5630, inherit 3122→3076, partition_aggregate +6 (realignment only).
-- In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped. Restarting it hits P0-E24: drop leftover partitions.
+  - units: initdb hit the 10 m package cap once under load; it passed alone in 524 s and at 347 s on the gate rerun;
+  - tpch-spotcheck and sf025 (99 PASS, same=99), each re-run after the owner's commit changed the code tree;
+  - fire-set c3a9b fires=none ×3; acceptance PASS;
+  - regress partition suites identical to slice 1.
+- In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped. The owner also uses :5533 for backfills; check the listener before using it.
