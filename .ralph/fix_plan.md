@@ -1452,6 +1452,65 @@ heuristic stays live.)
     and RelOID, before the user\-table reload. Then advance the OID counter and prove with a two\-restart test
     that covers field access, a new column, DROP TYPE and pg\_proc OIDs.
   - Expected instrument: Movement: none — correctness fix — no plan instrument.
+- [ ] **P0\-E30 — `(A JOIN B) LEFT JOIN C … WHERE <qual on A>` returns A's columns in B's place**
+  \(filed 2026\-11\-15 by the loop, found while probing M0148\-0001c3a9 slice 5; S2 — wrong results\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-15 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Pre\-existing on plain tables; it also blocks M0148\-0001c3a9 slice 5, whose
+    > plans reach this shape \(the executor TestSortKeyChaseKeepsTheKeysRelation fixture\)\.
+  - Repro on plain tables: `create table r1 (a int, b int, c varchar); create table r2 (like r1); create table r3
+    (a int, b int, c int); insert into r1 select i, i % 25, to_char(i, 'FM0000') from generate_series(0, 599) i
+    where i % 2 = 0; insert into r2 select i % 25, i, to_char(i, 'FM0000') from generate_series(0, 599) i where
+    i % 3 = 0; insert into r3 select i, i, i % 25 from generate_series(0, 599, 2) i; analyze r1; analyze r2;
+    analyze r3; select t1.a, t1.c, t2.b, t2.c from (r1 t1 join r2 t2 on t1.a = t2.b) left join r3 t3 on (t1.a =
+    (t3.a + t3.b)/2) where t1.b = 0 order by 1;`
+    - PG 18.3: `150 | 0150 | 150 | 0150` \(…\)\.
+    - goopg: `150 | 0150 | 0 | 0150` — t2.b holds t1.b \(the filtered 0\)\.
+    - goopg's plan keeps the WHERE qual on the outer join \(`Hash Left Join … Filter: (t1.b = 0)`\) and prints the
+      join clause as `Hash Cond: (t1.a = ((t2.a + t2.b) / 2))` — t3's columns named t2: the coordinates of the
+      upper join's inputs are off by one relation\.
+  - PG pushes `t1.b = 0` to t1's scan \(a restriction on the non\-nullable side is a base restriction\)\.
+  - Suggested first step: the M0146\-0224 pushed\-down qual path \(joinrel.pricedPushedDown / s.pushedDown\) and
+    the createPlan layout of the outer join that carries it; compare with the same query minus the WHERE clause\.
+
+- [ ] **P0\-E29 — `(A LEFT JOIN B) FULL JOIN C … WHERE coalesce(a, 0) …` returns B columns that do not exist in B**
+  \(filed 2026\-11\-15 by the loop, found while probing M0148\-0001c3a9 slice 5; S2 — wrong results\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-15 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Pre\-existing: identical with enable\_partitionwise\_join on or off, and on plain
+    > \(non\-partitioned\) copies of the tables\.
+  - Repro \(regress partition\_join's `plt1_adv` / `plt2_adv` / `plt3_adv` data, copied into plain tables q1 / q2 /
+    q3\): `SELECT … FROM (q1 t1 LEFT JOIN q2 t2 ON (t1.c = t2.c)) FULL JOIN q3 t3 ON (t1.c = t3.c) WHERE
+    coalesce(t1.a, 0) % 5 != 3 AND coalesce(t1.a, 0) % 5 != 4`\.
+    - Both return 55 rows, but the md5 of the rows differs: PG `cb4cd9c1…`, goopg `d6bec509…`\.
+    - goopg prints `0 | 0000 | 0 | 0000 | |` and `1 | 0001 | 1 | 0001 | 1 | 0001`, where PG prints
+      `0 | 0000 | | | |` and `1 | 0001 | | | 1 | 0001`: t2's columns carry t1's values for t1 rows with no B match
+      \(q2 has no c = '0000' or '0001' rows\)\. A plain `t1 LEFT JOIN t2` alone is correct\.
+  - Suggested first step: EXPLAIN \(VERBOSE\) the query and check the FULL JOIN's output mapping of the nested left
+    join's nullable side — it looks like a column\-position mix\-up between t1 and t2 above the left join
+    \(the WHERE clause over the FULL JOIN is not strict for t1, so reduce\_outer\_joins keeps both joins\)\.
+
+- [ ] **P0\-E28 — a whole\-row reference to the NULL\-extended side of an outer join is a row of NULLs, not NULL**
+  \(filed 2026\-11\-15 by the loop, found while probing M0148\-0001c3a9 slice 5; S2 — wrong results\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-15 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Pre\-existing \(identical with enable\_partitionwise\_join off\)\.
+  - Repro: `create temp table wa(a int, b text); create temp table wb(a int, b text); insert into wa values
+    (1,'x'),(2,'y'); insert into wb values (1,'z'); select wa.a, wb, wb is distinct from null,
+    coalesce(wb::text,'<null>') from wa left join wb on wa.a = wb.a order by 1;`
+    - PG 18.3, row 2: `wb` NULL, `is distinct from null` false, coalesce `<null>`.
+    - goopg, row 2: `(,)`, true, `(,)`.
+  - Also regress partition\_join `SELECT t1, t2 FROM prt1 t1 LEFT JOIN prt2 t2 …` prints `(,,)` for the
+    unmatched rows.
+  - PG: a whole\-row Var of a nullable rel is nulled by the outer join \(varnullingrels; the join's NULL
+    extension produces a NULL datum for the whole\-row column, not a composite of NULLs\)\.
+  - Suggested first step: find where goopg builds the whole\-row value \(row constructor over the scan's
+    columns, evaluated above the join\) and make a NULL\-extended side yield NULL — evaluate it at the scan
+    and let the join null\-extend the datum, as PG does\.
+
 - [ ] **P0\-E27 — an aggregate over an ORDER BY subquery is split into parallel partial aggregates, losing the order:
   `array_agg` returns elements out of order** \(filed 2026\-11\-14 by the loop, found while chasing a regress
   arrays flake during M0148\-0001c3a12; S2 — wrong results\)\.
@@ -13004,6 +13063,28 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     Movement: yes — regress partition\_join 1882→1879
     - Resume: index-only and bitmap child paths; remapped members; outer /
       semi / anti; N-way.
+  - 2026-11-15 slice 5 attempt — NOT landed \(reverted before commit\):
+    LEFT / FULL / SEMI / ANTI partitionwise joins, each child join keeping
+    the parent's SpecialJoinInfo.
+    - It matched PG on the 2-way LEFT JOIN witness and moved regress
+      partition\_join 1879→1852 and partition\_aggregate 584→581, but it
+      returned WRONG ROWS when the partitionwise left join feeds another
+      join. The patch is kept at tmp/c3a9-slice5-outer.patch \(untracked\).
+      - Repro \(executor TestSortKeyChaseKeepsTheKeysRelation's fixture\):
+        `SELECT t1.a, t1.c, t2.b, t2.c, t3.a + t3.b, t3.c FROM (prt1 t1
+        LEFT JOIN prt2 t2 ON t1.a = t2.b) LEFT JOIN prt1_e t3 ON (t1.a =
+        (t3.a + t3.b)/2) WHERE t1.b = 0 ORDER BY …`.
+      - goopg with the patch: every row has `t2.b = 0` and `t2.c = t1.c`;
+        PG has NULLs for unmatched rows and the real values otherwise.
+      - ROOT CAUSE IS PRE-EXISTING, not the slice: the same wrong rows come
+        from plain tables and with partitionwise join off whenever the plan
+        keeps `Filter: (t1.b = 0)` on the upper outer join — filed as
+        P0-E30 \(S2\). The slice only changed costs so that shape wins.
+    - Found and filed P0-E28 and P0-E29 \(S2, pre-existing, escalation
+      blocks\).
+    - Resume: blocked on P0-E30 \(the patch makes an existing executor
+      test reach P0-E30's plan shape\). Once P0-E30 is fixed, re-apply the
+      patch, re-run the repro and the 2-way witness, and land.
 - [ ] **M0148-0001c3a10 — index clauses on appendrel members (WHERE quals
   pushed into partitions)**.
   Kind: impl

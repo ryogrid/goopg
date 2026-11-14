@@ -1,26 +1,20 @@
-# Working Set — loop end 2026-11-15 (census REUSE; M0148-0001c3a9 slice 4 LANDED 0d3dc635d incl. a slice-3 wrong-result fix)
+# Working Set — loop end 2026-11-15 (census routing-20261115d IDENTICAL; c3a9 slice 5 attempted, reverted; P0-E28/E29/E30 filed)
 
 - Anomaly: none (prev-loop check OK).
-- Nightly triage: AI-20261115-011812-001 already filed (M-NIGHTLY-race-parallel-hash-cancel). Nothing new.
-- S9: census REUSE (routing-20261115c) at loop start.
-  - 0d3dc635d touches internal/optimizer, so the next census is likely DUE (BASELINE_REV=30ef7ad0e, the head consumed by routing-20261115c).
-- Task: M0148-0001c3a9 (partitionwise join), slice 4 landed as 0d3dc635d.
-  - Child rels use the member's bare `[Filter→]SeqScan` (tableoid-wrapper-only members); addChildIndexPaths runs the restriction, ordered and parameterised index producers on them.
-  - tableoid is filled with the partition OID above each child join (Path.pwFills / pwFillSchema).
-- WRONG-RESULT FIX inside the slice (bug introduced by slice 3, 9eadb3412):
-  - Child joins with different output widths (a Nested Loop beside Hash Joins, narrowed differently) were appended unprojected; partition_join returned `0|0300|0|0300`, PG `300|0300|300|0300`.
-  - createPartitionwiseAppendPlan now builds all child plans first and uses the coordinates every child provides. TestPartitionwiseJoin pins it (fails on 9eadb3412).
-- Files: internal/optimizer/partitionwisejoin.go, path.go (pwFills); internal/executor/partitionwise_join_test.go (PG's indexes, wrong-result query, child-probe check); design doc slice 4; inventory CSV + coverage doc.
-- Findings:
-  - Last loop's "member scans priced at 0 pages" diagnosis was WRONG (corrected in fix_plan + ledger). The search's child costs read relpages (2.25); 1.25 is EXPLAIN's legacy display of a Seq Scan under the tableoid Project.
-  - Most of PG's per-partition index scans in partition_join are parameterised NL inners or outer joins; the remaining gaps there are outer/semi/anti partitionwise joins, plan-time pruning (k1 (b)), and EC handling of partially-redundant clauses.
-- Next step: run the census if DUE, then c3a9 slice 5: outer joins (LEFT / FULL / SEMI / ANTI via sjinfo; PG try_partitionwise_join's jointype rules) — most of partition_join's remaining hunks are Left Joins.
-- Top-residual: M0148 residues. Open: c3a9 (slices 5-6), c3a10, c3a8, c3a7, c3a11 (parked), c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
+- Nightly triage: AI-20261115-011812-001 already filed. Nothing new.
+- S9: DUE → routing-20261115d (s9dh, BASELINE_REV=30ef7ad0e) IDENTICAL ×3, committed b37c40505. No code landed after it.
+- Task: M0148-0001c3a9 slice 5 (LEFT / FULL / SEMI / ANTI partitionwise joins).
+  - NOT landed; patch at tmp/c3a9-slice5-outer.patch (untracked; describes the allowed sjinfo types, passing sjinfo to sizeJoinRel/addPaths, and skipping the inner tableoid fill for SEMI/ANTI).
+  - With the patch: partition_join 1879→1852, partition_aggregate 584→581, and the 2-way LEFT JOIN witness matches PG.
+  - But executor TestSortKeyChaseKeepsTheKeysRelation failed: its fixture's plan now reaches a shape with WRONG ROWS.
+- Findings — three S2 defects filed with escalation blocks (fix_plan, before P0-E27), all pre-existing (reproduce with partitionwise join off):
+  - P0-E30: `(A JOIN B) LEFT JOIN C … WHERE <qual on A>` returns A's columns in B's place on plain tables. The plan keeps `Filter: (t1.b = 0)` on the outer join and prints t3 as t2. Root cause of the slice-5 failure.
+  - P0-E29: `(A LEFT JOIN B) FULL JOIN C … WHERE coalesce(a,0)…` fills B's columns with A's values (plain tables too). Possibly the same mislayout.
+  - P0-E28: a whole-row reference to a NULL-extended rel is `(,,)`, not NULL.
+- Next step: P0-E30 blocks slice 5 and is S2 (owner placement). Per the banner, continue with the next selectable M0148 task in file order: c3a10 (index clauses on appendrel members). Re-apply the slice-5 patch only after P0-E30 is fixed.
+- Top-residual: M0148 residues. Open: c3a9 (slice 5 blocked-on P0-E30; slice 6 N-way), c3a10, c3a8, c3a7, c3a11 (parked), c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census REUSE this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
-  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26, E27). Then M0148 in file order → c3a9.
-- Gates run (all PASS):
-  - units, tpch-spotcheck, sf025 99 PASS same=99, fire-set c3a9i fires=none ×3, acceptance PASS, 17 partition isolation tests;
-  - regress same-suite HEAD baseline: only partition_join moved, 1882→1879 (inventory updated).
-  - Cross-suite runs differ by suite set (select/join/union shift); compare only same-suite runs.
+  - Items 0-9: M0146-0014(channel; census routing-20261115d done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24..E30). Then M0148 in file order.
+- Gates run: census s9dh IDENTICAL. Slice-5 trial: units FAILED (TestSortKeyChaseKeepsTheKeysRelation → P0-E30); spotcheck and sf025 PASS on the trial build. Reverted, so no code gates on the committed state (bookkeeping only).
 - In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped.
