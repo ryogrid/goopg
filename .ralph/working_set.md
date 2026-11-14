@@ -1,30 +1,30 @@
-# Working Set — loop end 2026-11-14 (census routing-20261114e IDENTICAL; M0148-0001c3a4 item (d) landed 9dab2bf03)
+# Working Set — loop end 2026-11-14 (census routing-20261114f IDENTICAL; M0148-0001c3a4 item (g) landed 23d395051)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: run 20261114-050038 items: 0. Nothing filed.
-- S9: DUE at loop start → routing-20261114e (label s9cj, BASELINE_REV=592657b89) IDENTICAL ×3, committed.
-  - 9dab2bf03 is a code commit, so the next loop should get DUE. Capture with BASELINE_REV=8f01083bd (capture head of routing-20261114e).
-- Task: M0148-0001c3a4. Done: (a), (b), (c), (d), (h), (i) slices 1-5.
-  - Open: (e) useful_predicate, (f) join OR bitmap paths, (g) bitmap node cost line, (j) skip scan with a range qual (new), (i) low-value residue.
-- Files (d): optimizer/pathbitmapor.go (bitmapOrPathsFor, bitmapOrArmPath recursion). Test: TestBitmapOrSubORInAndArm.
+- S9: DUE at loop start → routing-20261114f (label s9ck, BASELINE_REV=8f01083bd) IDENTICAL ×3, committed.
+  - 23d395051 changes EXPLAIN cost lines on bitmap nodes, so the next census should be DUE and CHANGED for cost text.
+    - Expected: TPC-DS sf025 Q3 Q32 Q53 Q54 Q55 Q63 Q92, plus the sf1 equivalents; TPC-H Q2 Q11 Q17 Q20 Q21.
+  - Treat that as a cost-line-only move: shapes and values are unchanged (fire-set PASS ×3, acceptance 24 MATCH).
+  - Follow S9's CHANGED handling (pg-plan-parity-diff, verify no category regresses) and capture with BASELINE_REV=5bf6e720f.
+- Task: M0148-0001c3a4. Done: (a), (b), (c), (d), (g), (h), (i) slices 1-5. Open: (e) useful_predicate, (f) join OR bitmap paths, (j) skip scan with a range qual, (i) low-value residue.
+- Files (g): optimizer/plancost.go (stampPlanCost bitmap rule), costbitmap.go (costBitmapIndexScan returns amTotal), pathbitmap.go (both producers), path.go (BitmapIndexAMTotal), 3 test call sites.
 - Findings:
-  - A cost probe on the real regress table works: tmp/c3a4d-setup.sql loads tenk1 (tenk.data) into both the scratch PG (5545, RUNNING) and a goopg live server (tmp/c3a4i-bin + tmp/c3a4i-data on 5533, stopped). tmp/c3a4d.sql holds the queries.
-  - (j): goopg's skip scan (restrictionSkipRun) takes only equality runs. PG 18 serves `tenthous < 2` on (thousand, tenthous) with a skip array on thousand plus the range (IOS / bitmap at 195.28).
-  - (g) is the bitmap-node cost line: startup 0.29 and width 244 where PG prints 0.00 and width 0. It shows on every BitmapOr plan, so it is cheap and widely visible.
-- Next step: S9 census (DUE).
-  - Then (g), the bitmap-node EXPLAIN cost line: Bitmap Index Scan / BitmapOr / BitmapAnd startup 0.00 and width 0, as in PG's cost_bitmap_* / create_bitmap_subplan.
-  - Or (j) if (g) turns out to be cost-model-wide.
+  - PG's Bitmap Index Scan total is indextotalcost (no 0.1*op*rows term).
+  - A parameterized probe's indextotalcost still differs (Q53: 4.75 vs PG 4.64; loop_count proration). Ledgered.
+  - Scan width (heap/IOS/plain) is the full row width, not the reltarget. Visible on every scan; a cost-model-wide input, ledgered.
+- Next step: S9 census (DUE; expect CHANGED on cost text only, see above). Then (j) skip scan with a range qual on a non-leading column (restrictionSkipRun + btree_skip.go + btcostestimate skip arm), or (e) useful_predicate.
 - Top-residual: M0148 residues. Open children: c3a4, c3a5, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261114e done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261114f done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a4.
 - Gates run (all PASS):
-  - census s9cj IDENTICAL ×3.
+  - census s9ck IDENTICAL ×3.
   - units.
   - tpch-spotcheck.
-  - sf025 99/99.
-  - fire-set c3a4dfs fires=none ×3.
+  - sf025 99/99 (PLAN-SHAPE changed=7: cost line only).
+  - fire-set c3a4gfs PASS ×3 (fired queries all PASS).
   - acceptance 24 MATCH.
-  - regress: create_index 2856→2832; one new mismatch line, a weaker recheck awaiting (j).
+  - regress unchanged.
   - pgbench smoke.
-- In-flight: none.
+- In-flight: none. Scratch PG tmp/pg-scratch-c3a4i (5545) RUNNING with tenk1/ti/tj/tk; goopg probe server (5533) stopped.

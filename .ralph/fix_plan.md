@@ -12528,6 +12528,13 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - restrictionSkipRun takes only equality runs.
     - Blocks PG's `BitmapAnd(hundred, BitmapOr(thousand = ANY, tenthous <
       2))` in create\_index.
+  - 2026-11-14 (g) LANDED: the bitmap node cost line.
+    - A Bitmap Index Scan prints startup 0 and indextotalcost
+      (Path.BitmapIndexAMTotal); bitmap nodes print width 0.
+    - TPC-DS sf025: 7 queries' Bitmap Index Scan lines changed on the cost
+      line only; 6 of 7 now equal PG's text.
+    Movement: none — regress COSTS OFF; plan-capture cost lines moved toward
+    PG (7 sf025 queries)
   - Resume: (j) skip scan with a range qual, or (e) useful\_predicate; the
     (i) residue (a lone empty array, cross-type literals, index-only width,
     index-only prefix + range) is low-value.
