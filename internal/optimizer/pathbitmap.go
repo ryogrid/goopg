@@ -274,6 +274,10 @@ func (s *searchCtx) buildBitmapIndexChild(
 		if nts := restrictionNullTestsOnColumn(idx, 0, conjuncts); len(nts) > 0 {
 			rng = withNullTestsInConjunctOrder(rng, nts, conjuncts)
 		}
+		// M0148-0001c3a12: a row comparison over the leading columns.
+		if rc := restrictionRowCompare(s.cat, tbl, idx, conjuncts, rng); rc != nil {
+			rng = withRowCompareInConjunctOrder(rng, *rc, conjuncts)
+		}
 		if len(rng) > 0 {
 			indexClauses = rng
 			qualSelectivity = rangeIndexSelectivity(leaf, conjuncts, rng)

@@ -1442,6 +1442,29 @@ heuristic stays live.)
     and RelOID, before the user\-table reload. Then advance the OID counter and prove with a two\-restart test
     that covers field access, a new column, DROP TYPE and pg\_proc OIDs.
   - Expected instrument: Movement: none — correctness fix — no plan instrument.
+- [ ] **P0\-E27 — an aggregate over an ORDER BY subquery is split into parallel partial aggregates, losing the order:
+  `array_agg` returns elements out of order** \(filed 2026\-11\-14 by the loop, found while chasing a regress
+  arrays flake during M0148\-0001c3a12; S2 — wrong results\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-14 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Pre\-existing; nondeterministic in the regress run \(arrays \+13 lines twice this
+    > session: `{0,1,7,2,3,…}`, `{…,1,2,3,NULL,0}`\), because the plan depends on the parallel settings and the
+    > worker interleaving\.
+  - Repro on a fresh cluster: `create table tk (unique1 int, ten int)` with 10000 rows and an index on unique1;
+    `set max_parallel_workers_per_gather=4; set parallel_setup_cost=0; set parallel_tuple_cost=0;
+    set min_parallel_table_scan_size=0; set min_parallel_index_scan_size=0;`
+    `select md5(array_agg(ten)::text) from (select ten from tk where unique1 < 15000 order by unique1) ss`:
+    - goopg plans `Finalize Aggregate → Gather → Partial Aggregate → Parallel Index Scan` and its digest differs
+      from PG's;
+    - PG plans `Aggregate → Gather Merge → Sort → Parallel Seq Scan`, keeping the order.
+  - Cause \(not yet read\): the partial\-aggregation arm accepts an aggregate whose input carries required
+    pathkeys from a subquery ORDER BY. An order\-sensitive aggregate's input order must be preserved — PG keeps
+    it with Gather Merge and never splits it across workers.
+  - First step: in the partial\-aggregation path builder, decline when the aggregate input's pathkeys come from a
+    subquery sortClause and the aggregate is order\-sensitive \(array\_agg, string\_agg, json\_agg, …\), and file
+    the Gather Merge \+ Sort path. Then test with the repro and the regress arrays queries under forced parallelism.
+  - Expected instrument: Movement: none — correctness fix — no plan instrument.
 
 
 - [x] **`DROP TABLE IF EXISTS` of a missing relation routes through the TRUNCATE executor and creates 0\-byte relfilenode files** \(filed 2026\-10\-31 by the loop diagnosing AI\-20261031\-002109\-005\)
@@ -12670,6 +12693,16 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     Movement: yes — regress create\_index 2500→2483
     - Resume: the bitmap form (BitmapIndexScan RowCompare + Recheck Cond);
       prefix / DESC / truncated rows; btree\_index waits on c3a7.
+  - 2026-11-14 slice 2 LANDED: the bitmap form.
+    - BitmapIndexScan.RowCompare, a per-entry check and PG's Recheck Cond.
+    - indexScanPredicate (DML / FOR UPDATE reconstruction) includes the
+      comparison.
+    - Found and filed P0-E27 (S2, wrong results).
+    Movement: none — instrument artefact — the bitmap witnesses are not in
+    the diffed regress suites; the probe plans are identical to PG 18.3
+    (TestRowCompareIndexQual)
+    - Resume: DML index paths for row comparisons; prefix / DESC /
+      truncated rows; btree\_index waits on c3a7.
 - [ ] **M0148-0001c3a13 — constant-NULL row elimination in a row IN list**.
   Kind: impl
   Parent: M0148-0001c3a6

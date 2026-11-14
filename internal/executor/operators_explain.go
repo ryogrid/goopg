@@ -3116,6 +3116,11 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 				cond = formatPrefixRangeIndexCond(p.Table, p.Index, p.Keys, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests,
 					p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg), p.IndexCondOrder)
 			}
+			if p.RowCompare != nil && len(p.Keys) == 0 && p.Key == nil && p.SkipPrefix == 0 {
+				// M0148-0001c3a12: the row comparison whole.
+				cond = rangeCondWithRowCompare(p.Table, p.Index, p.LowKey, p.HighKey, p.LowOp, p.HighOp, p.RowCompare, p.RowCompareLow,
+					reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg), p.IndexCondOrder)
+			}
 			if cond != "" {
 				*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + cond)})
 			}

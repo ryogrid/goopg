@@ -3865,6 +3865,8 @@ type BitmapIndexScan struct {
 	LeadingNullTest     IndexNullTest
 	NullTestAfterBounds bool
 	ExtraNullTests      []ExtraIndexNullTest
+	RowCompare          *BinaryOp // M0148-0001c3a12, as IndexScan.RowCompare
+	RowCompareLow       bool
 	IndexCondOrder      []IndexCondItem
 	// SAOPKeys is a ScalarArrayOp equality index qual (`col = ANY (…)`,
 	// match_saopclause_to_indexcol / match_orclause_to_indexcol) on

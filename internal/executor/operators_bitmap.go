@@ -214,7 +214,28 @@ func (o *bitmapIndexScanOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 	if tbm.entries == nil {
 		tbm.entries = make(map[storage.BlockNumber]*pageEntry)
 	}
-	scanFn := func(_ []byte, ptr storage.ItemPointer, _ nbtree.ScanPos) (bool, error) {
+	// M0148-0001c3a12: a row comparison's bound is lossy; each entry is
+	// checked against the comparison itself.
+	var rowCheck *trailingKeyCheck
+	if o.plan.RowCompare != nil {
+		c, err := newIndexRowCheck(o.ctx, o.plan.Table, o.plan.Index, o.plan.RowCompare)
+		if err != nil {
+			return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		rowCheck = c
+	}
+	var checkErr error
+	scanFn := func(key []byte, ptr storage.ItemPointer, _ nbtree.ScanPos) (bool, error) {
+		if rowCheck != nil {
+			ok, err := rowCheck.admits(key)
+			if err != nil {
+				checkErr = err
+				return false, err
+			}
+			if !ok {
+				return true, nil
+			}
+		}
 		if recheck {
 			tbm.recheckAny = true
 		}
@@ -223,6 +244,9 @@ func (o *bitmapIndexScanOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 		return true, nil
 	}
 	if err := o.tree.RangeScanWithPos(loBytes, hiBytes, o.rangeLoExcl, o.rangeHiExcl, scanFn); err != nil {
+		if checkErr != nil {
+			return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: checkErr.Error()}
+		}
 		return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 

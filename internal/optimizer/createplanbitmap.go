@@ -198,6 +198,29 @@ func createBitmapIndexScanPlan(p *Path) Node {
 		if c.redundantBound {
 			continue // the bitmap producers drop these; defensive
 		}
+		if c.rowCompare {
+			// M0148-0001c3a12: the lossy leading bound; the scan checks the
+			// comparison on each entry.
+			bin, ok := c.local.(*BinaryOp)
+			if !ok || rangeCol != 0 {
+				panic(fmt.Sprintf("createPlan: bitmap range probe of %s carries a malformed row comparison", p.IndexInfo.Name))
+			}
+			if c.op == parser.OpGe {
+				if bis.LowKey != nil {
+					panic(fmt.Sprintf("createPlan: bitmap range probe of %s carries two lower bounds", p.IndexInfo.Name))
+				}
+				bis.LowKey, bis.LowOp, bis.RowCompareLow = c.key, c.op, true
+			} else {
+				if bis.HighKey != nil {
+					panic(fmt.Sprintf("createPlan: bitmap range probe of %s carries two upper bounds", p.IndexInfo.Name))
+				}
+				bis.HighKey, bis.HighOp = c.key, c.op
+			}
+			bis.RowCompare = bin
+			condOrder = append(condOrder, IndexCondRowCompare)
+			sawBound = true
+			continue
+		}
 		switch c.op {
 		case parser.OpGt, parser.OpGe:
 			if bis.LowKey != nil {

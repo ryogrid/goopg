@@ -75,3 +75,52 @@ Parent: M0148\-0001c3a6. PG reference:
   columns \(expand\_indexqual\_rowcompare\) and rechecks the rest.
 - **btree\_index's pg\_proc witnesses:** these also need
   M0148\-0001c3a7 \(catalog scans\).
+
+## Slice 2 — the bitmap form, and DML reconstruction
+
+### The fix
+
+- **Bitmap path:** the bitmap producer files the rowCompare clause beside
+  the leading range \(restrictionRowCompare in its leading\-range arm\). The
+  lowering sets BitmapIndexScan.RowCompare / RowCompareLow and the
+  IndexCondRowCompare order item. The bitmap index scan checks each entry
+  with newIndexRowCheck before adding its TID.
+- **Recheck:** the comparison is the clause's local, so it joins the
+  recheck list. EXPLAIN prints PG's `Recheck Cond: (ROW(…) > ROW(…))` and
+  the same Index Cond.
+- **DML reconstruction:** indexScanPredicate, which UPDATE / DELETE / FOR
+  UPDATE use to rebuild an index scan's qual, now ANDs the row comparison
+  onto the lossy bound. Without it, a fallback would have matched every
+  row the bound admits.
+
+### Verification
+
+- **Scratch PG:** `(thousand, tenthous) > (998, 5000)` and `(…) >= (997,
+  2000) AND thousand < 999` plans are identical \(bitmap heap total cost
+  31.70 vs PG's 31.72\). Rows are identical on NULL\-bearing data, and under
+  forced index plans for DML and FOR UPDATE.
+- **TestRowCompareIndexQual:** now also pins the two bitmap plans; they
+  fail with the bitmap producer disabled.
+- **Regress:** no counted change \(these bitmap shapes are not in the
+  diffed suites\). An arrays \+13 in the A/B was traced to a pre\-existing
+  wrong\-result flake, filed as P0\-E27 \(below\).
+- **Gates:**
+  - units, tpch\-spotcheck, sf025 same=99;
+  - fire\-set fires=none on sf025, sf1 and TPC\-H;
+  - acceptance 24 MATCH.
+
+### Found while verifying \(P0\-E27\)
+
+- goopg splits an aggregate over an ORDER BY subquery into parallel
+  partial aggregates — `Finalize Aggregate → Gather → Partial Aggregate` —
+  where PG keeps the order with `Gather Merge → Sort`.
+- `array_agg` therefore returns elements out of order, nondeterministically.
+  This is the regress arrays flake seen twice this session. It is filed
+  with an S2 escalation.
+
+### Not covered
+
+- **DML:** UPDATE / DELETE planning does not take the row\-comparison index
+  path at all \(Seq Scan even with enable\_seqscan off\).
+- **Prefix, DESC and truncation:** a row comparison behind an equality
+  prefix, over DESC columns, or one that PG truncates to the index columns.

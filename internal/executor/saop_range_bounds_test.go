@@ -921,7 +921,19 @@ func TestRowCompareIndexQual(t *testing.T) {
 	if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+q, ps)), "\n"); got != want {
 		t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", q, got, want)
 	}
-	ps.EnableBitmapScan = false // goopg has no bitmap row comparison yet (ledgered)
+	// Slice 2: the bitmap form, which PG prefers for wider ranges.
+	for _, c := range []struct{ q, plan string }{
+		{"SELECT * FROM rc WHERE (thousand, tenthous) > (998, 5000)",
+			"Bitmap Heap Scan on rc\n  Recheck Cond: (ROW(thousand, tenthous) > ROW(998, 5000))\n  ->  Bitmap Index Scan on rc_tt\n" +
+				"        Index Cond: (ROW(thousand, tenthous) > ROW(998, 5000))"},
+		{"SELECT * FROM rc WHERE (thousand, tenthous) >= (997, 2000) and thousand < 999",
+			"Bitmap Heap Scan on rc\n  Recheck Cond: ((ROW(thousand, tenthous) >= ROW(997, 2000)) AND (thousand < 999))\n  ->  Bitmap Index Scan on rc_tt\n" +
+				"        Index Cond: ((ROW(thousand, tenthous) >= ROW(997, 2000)) AND (thousand < 999))"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+	}
 	for _, c := range []struct{ q, rows string }{
 		{q, ""},
 		{"SELECT count(*), sum(tenthous) FROM rc WHERE (thousand, tenthous) > (998, 5000)", "15|94980"},

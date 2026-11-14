@@ -4036,6 +4036,23 @@ func indexScanPredicate(ix *optimizer.IndexScan) optimizer.Expr {
 			}
 			combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: trailingSAOPPred(ref, ts)}
 		}
+		// M0148-0001c3a12: the bound above is the row comparison's lossy
+		// leading-column bound; the comparison itself makes it exact.
+		if rc := ix.RowCompare; rc != nil && combined != nil {
+			bad := false
+			pred, ok := optimizer.CloneExprReplacingColumnRefs(rc, func(cr *optimizer.ColumnRef) optimizer.Expr {
+				ref, found := indexScanColumnRef(ix, cr.Name)
+				if !found {
+					bad = true
+					return nil
+				}
+				return ref
+			})
+			if !ok || bad {
+				return nil
+			}
+			combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: pred}
+		}
 		return combined
 	}
 	// No Key/Keys/LowKey/HighKey at all — nothing to reconstruct.
