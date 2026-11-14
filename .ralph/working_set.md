@@ -1,27 +1,31 @@
-# Working Set — loop end 2026-11-14 (census routing-20261114l IDENTICAL; c3a5 (a) slice 2 LANDED d52570530)
+# Working Set — loop end 2026-11-14 (census routing-20261114m IDENTICAL; c3a5 (a) slice 3 LANDED 0386dbc61)
 
 - Anomaly: none (prev-loop check OK).
-- Nightly triage: run 20261114-050038 items: 0. Nothing filed.
-- S9: DUE at loop start → routing-20261114l (label s9cq, BASELINE_REV=3c1c7a34c) IDENTICAL ×3, committed 1a2c7eb9f.
-  - This loop committed planner and executor code (d52570530), so the next census is likely DUE.
-- Task: M0148-0001c3a5 item (a) slice 2, landed as d52570530.
-  - Files: internal/parser/figurecolname.go (new: FigureIndexColname, systemTypeColname), operators_ddl.go (indexNameColumns / indexNameColumnsPtr at 4 sites), pg18_user_catalog_rows.go (index attnames from the deduplicated list), orderedpartitionappend.go (expression keys), plus 3 tests and the inventory pin.
-  - Key symbols: FigureIndexColname, indexNameColumns, keyMatchesTableColumn, memberKeyExpr, exprOverSchema.
-  - Findings:
-    - Expression index names and attnames now match PG (pg_expression_N was never a PG name).
-    - The expression ORDER BY arm is correct but cannot fire: expression indexes are blob format with no NULL-keyed entries, so indexUnboundKeysNotNull refuses them. Filed M0148-0001c3a8.
-    - P0-E24 (partitioned parent lost at restart) bit the probes. Drop leftover partitions after a probe-server restart.
-  - Movement: create_index 2727→2708; inherit unchanged at 3118.
-- Next step: c3a5 (a) parted_minmax (1 inherit Backward line): per-child Limit + Index Only Scan Backward for min/max over a partitioned table.
-  - buildMinMaxAppendRelMerge (planner.go ~13394) exists but is not elected. Probe the regress inherit parted_minmax block on scratch PG 5545 vs goopg 5533 first.
-  - Then (b) fractional partitionwise join. c3a8 / c3a7 are lower in file order.
+- Nightly triage: items 0. Nothing filed.
+- S9: DUE → routing-20261114m (s9cr, BASELINE_REV=e4787ad9e) IDENTICAL ×3, committed eb7c89d53.
+  - 0386dbc61 touches the planner, so the next census is likely DUE.
+- Task: M0148-0001c3a5 item (a) slice 3, landed as 0386dbc61.
+  - Files: internal/optimizer/pathindexordered.go (decline + indexBindsLocalRestriction), internal/executor/saop_range_bounds_test.go (TestOrderedFullScanYieldsToIndexClausePath).
+  - Findings: the parted_minmax witness needs four things. Slice 3 delivered (0) below; (1)-(4) remain.
+    - (0) DONE: no Filter-only twin of an index that binds a local clause.
+    - (1) Trailing-column index quals behind a leading range or NullTest: `((a IS NOT NULL) AND (b = 5))` and `((a > 0) AND (b = 5))`.
+      - PG 18 binds them; goopg keeps them as Filter, except the `= ANY` TrailingSAOP.
+      - Plan: TrailingSAOP with ColQuals and no Elems on IndexScan, IndexOnlyScan and BitmapIndexScan.
+      - Touch points: pathindexonly.go trailingSAOPOnRange / trailingSAOPSelectivity, pathindexrestrict.go saopColumnQuals, executor index_trailing_saop.go trailingSAOPPred (nil Elems), EXPLAIN.
+    - (2) The varchar→text relabel `(b)::text` is not seen through by normalizeColumnIndexKey. PG prints `b = '12345'::text` in Index Cond.
+    - (3) A one-member partition appendrel loses the parent alias (`parted_minmax1 parted_minmax`).
+    - (4) Multi-member min/max needs a per-InitPlan ordered Append of member IOSs.
+  - Movement: none (probe-verified; regress unchanged). The two earlier c3a5 slices moved regress, so the S4 lineage budget is fine.
+- Next step: c3a5 (a) item (1), trailing-column quals. Probe on scratch PG 5545 vs goopg 5533 with `create table pmm (a int, b int)` / index (a,b):
+  - `where a > 0 and b = 5`
+  - `where a is not null and b > 5 order by a limit 1`
+  - the bitmap form.
 - Top-residual: M0148 residues. Open children: c3a5, c3a6, c3a7, c3a8, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261114l done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261114m done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26). Then M0148 in file order → c3a5.
 - Gates run (all PASS):
-  - units (one inventory-pin failure was fixed and re-run green);
-  - tpch-spotcheck ×2 and sf025 ×2 (re-run for the stamp after staging the inventory pin);
-  - fire-set c3a5a2 fires=none ×3; acceptance 24 MATCH;
-  - regress A/B tmp/regress-c3a5a2 vs tmp/regress-c3a5a1: only create_index moved.
-- In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped; data in tmp/c3a4i-data, binary in tmp/c3a4i-bin.
+  - units, tpch-spotcheck, sf025 (same=99);
+  - fire-set c3a5a3 fires=none ×3; acceptance 24 MATCH;
+  - regress A/B tmp/regress-c3a5a3 vs tmp/regress-c3a5a2 (unchanged; rowsecurity pointer noise).
+- In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped. Restarting it hits P0-E24: drop leftover partitions after a restart.
