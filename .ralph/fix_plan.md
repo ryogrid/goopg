@@ -12570,7 +12570,7 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - an index-only prefix + range.
   - Resume: (i) cross-type literals (moves one create\_index line); (f)
     when a witness appears.
-- [ ] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
+- [x] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
   `… Backward` regress lines**.
   Kind: impl
   Parent: M0148-0001c3a3
@@ -12720,6 +12720,59 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Open residue: per-member index clauses for multi-member appendrels
       with a WHERE (addOrderedPartitionAppendPaths refuses Filter members).
     - Then (b) fractional partitionwise join.
+  - 2026-11-14 CLOSED. (d) landed; (a) landed in 6 slices (range\_parted and
+    parted\_minmax now identical to PG). Every remaining line has its own
+    task:
+    - (a) mcrparted's 6 `Backward` lines → M0148-0001c3a8 (expression
+      index keys hold no NULL-keyed entries);
+    - (a) per-member index clauses for multi-member appendrels with a
+      WHERE → M0148-0001c3a10;
+    - (b) partition\_join fract\_t's 4 lines → M0148-0001c3a9 (goopg has
+      no partitionwise join at all — pathparam.go);
+    - (c) btree\_index's 5 lines → M0148-0001c3a7.
+    Movement: none — instrument artefact — close-out bookkeeping; the
+    slices' own movement is recorded above
+- [ ] **M0148-0001c3a9 — partitionwise join (enable\_partitionwise\_join)**.
+  Kind: impl
+  Parent: M0148-0001c3a5
+  Found 2026-11-14 by c3a5 (b).
+  - PG's try\_partitionwise\_join (joinrels.c) joins matching partitions
+    pairwise when both sides are partitioned on the join key with
+    equal bounds. generate\_partitionwise\_join\_paths then appends the
+    child joins.
+  - goopg's search joins the two appendrels as wholes: `Hash Left Join`
+    over two `Append`s, where PG has a `Merge Append` of per-partition
+    `Merge Left Join` / `Nested Loop Left Join`s.
+  - The witness is partition\_join's fract\_t: 4 `Backward` lines, and
+    the per-partition joins throughout that suite.
+  - goopg's GUC already defaults partitionwise on (owner-gated, see GUC
+    defaults), but nothing consumes it.
+  - Resume:
+    - design doc first: child RelOptInfos for appendrel members (also
+      needed by M0148-0001c3a10), partition-bounds matching
+      (partition\_bounds\_equal), and the child-join rel build;
+    - then the fractional Merge Append over child joins.
+- [ ] **M0148-0001c3a10 — index clauses on appendrel members (WHERE quals
+  pushed into partitions)**.
+  Kind: impl
+  Parent: M0148-0001c3a5
+  Found 2026-11-14 by c3a5 (a) slices 1/5/6.
+  - Inheritance / partition members reach the search as pre-built
+    `Project → Filter → SeqScan` leaves of a UNION ALL chain, with no
+    RelOptInfo of their own. A member's pushed-down quals are therefore
+    never index clauses.
+    - PG: `Limit → Append → Index Only Scan … Index Cond: ((a IS NOT
+      NULL) AND (b = '12345'::text))` for min/max and for ORDER BY …
+      LIMIT over a partitioned table with a WHERE.
+    - goopg: Sort over Seq Scan + Filter members, or the plain Aggregate.
+  - addOrderedPartitionAppendPaths (orderedpartitionappend.go
+    memberSeqScan) refuses Filter members for this reason.
+  - Resume:
+    - give each member a base RelOptInfo built like a search leaf
+      (paramappend.go paramAppendPathFor already builds per-member
+      rels), and run the restriction / index-only producers over it;
+    - accept Filter members in addOrderedPartitionAppendPaths;
+    - let min/max members>0 take planMinMaxSubqueryViaSearch.
 - [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
   (NULL-keyed entries)**.
   Kind: impl

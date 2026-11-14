@@ -531,3 +531,24 @@ allpaths.c set\_append\_rel\_size \(the appendrel's size is its members'\).
 - **Multi\-member WHERE:** a multi\-member appendrel with a WHERE still
   lacks per\-member index clauses, so its min/max declines to the
   Aggregate where PG builds `Limit → Append` of member IOSs.
+
+## Close\-out \(2026\-11\-14\)
+
+- **Done:**
+  - \(d\);
+  - \(a\) for range\_parted \(both directions\) and parted\_minmax, both
+    identical to PG.
+- **Transferred, each to its own task:**
+  - **\(a\) mcrparted** → M0148\-0001c3a8: expression index keys need the
+    tuple key format to hold NULL\-keyed entries.
+  - **\(a\) per\-member index clauses** for partitioned tables with a WHERE
+    → M0148\-0001c3a10: appendrel members need base RelOptInfos.
+  - **\(b\) fract\_t** → M0148\-0001c3a9: goopg has no partitionwise join.
+    try\_partitionwise\_join and generate\_partitionwise\_join\_paths have
+    no counterpart; the search joins two appendrels whole.
+  - **\(c\)** → M0148\-0001c3a7: catalog relations plan as a bare Result.
+- **Measured over the six \(a\) slices:**
+  - inherit 3153→3094;
+  - create\_index 2727→2708;
+  - subselect 2462→2443;
+  - partition\_prune 6778→6755.
