@@ -676,3 +676,40 @@ func TestTrailingColumnQualsBehindLeadingBound(t *testing.T) {
 		}
 	}
 }
+
+// M0148-0001c3a5 (a): build_minmax_path plans the min/max subquery through
+// the path search, so a WHERE over another index column still gets PG's
+// index-only InitPlans; an Index Only Scan prints a varchar key column
+// bare (its index attribute is text_ops' text), where an Index Scan
+// prints the relabel. Plans and rows from PG 18.3 on the same data.
+func TestMinMaxSubqueryPlannedBySearch(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "create table tq (a int, b int, c int)")
+	runSQL(t, ctx, "create index tqi on tq (a, b)")
+	runSQL(t, ctx, "insert into tq select case when g % 50 = 0 then null else g % 97 end, case when g % 41 = 0 then null else g % 13 end, g from generate_series(1, 5000) g")
+	runSQL(t, ctx, "create table vr (a int, v varchar(16), w text)")
+	runSQL(t, ctx, "create index vr_v on vr (v)")
+	runSQL(t, ctx, "insert into vr select g, 'v'||g, 'x' from generate_series(1,3000) g")
+	runSQL(t, ctx, "VACUUM tq")
+	runSQL(t, ctx, "ANALYZE tq")
+	runSQL(t, ctx, "VACUUM vr")
+	runSQL(t, ctx, "ANALYZE vr")
+	ps := optimizer.DefaultPlannerSettings()
+	for _, c := range []struct{ q, plan string }{
+		{"select min(a), max(a) from tq where b = 5",
+			"Result\n  InitPlan 1\n    ->  Limit\n          ->  Index Only Scan using tqi on tq\n                Index Cond: ((a IS NOT NULL) AND (b = 5))\n" +
+				"  InitPlan 2\n    ->  Limit\n          ->  Index Only Scan Backward using tqi on tq tq_1\n                Index Cond: ((a IS NOT NULL) AND (b = 5))"},
+		{"select v from vr where v = 'v42'",
+			"Index Only Scan using vr_v on vr\n  Index Cond: (v = 'v42'::text)"},
+		{"select * from vr where v = 'v42'",
+			"Index Scan using vr_v on vr\n  Index Cond: ((v)::text = 'v42'::text)"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+	}
+	if got := strings.Join(renderRows(runSQLWith(t, ctx, "select min(a), max(a) from tq where b = 5", ps)), ";"); got != "0|96" {
+		t.Errorf("min/max rows %q, want 0|96", got)
+	}
+}

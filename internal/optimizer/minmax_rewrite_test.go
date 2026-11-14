@@ -398,46 +398,10 @@ func TestRewriteMinMaxAggFilteredNonCoveredFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	_, _, _, child := digMinMaxInner(t, plan)
-	if _, ok := child.(*IndexOnlyScan); ok {
-		t.Fatalf("qual on non-covered column y rewrote to IndexOnlyScan; must stay SeqScan fallback")
-	}
-	proj, ok := child.(*Project)
-	if !ok {
-		t.Fatalf("Limit child is %T, want *Project (SeqScan fallback)", child)
-	}
-	sort, ok := proj.Child.(*Sort)
-	if !ok {
-		t.Fatalf("Project child is %T, want *Sort", proj.Child)
-	}
-	f, ok := sort.Child.(*Filter)
-	if !ok {
-		t.Fatalf("Sort child is %T, want *Filter", sort.Child)
-	}
-	if _, ok := f.Child.(*SeqScan); !ok {
-		t.Fatalf("Filter child is %T, want *SeqScan", f.Child)
-	}
-	// Predicate = andExpr(wherePred, isNotNull): left is `y = 3` with y at its
-	// TABLE position (Index 1); right is `x IS NOT NULL` at x's table position
-	// (Index 0).
-	pred, ok := f.Predicate.(*BinaryOp)
-	if !ok || pred.Op != parser.OpAnd {
-		t.Fatalf("Filter predicate = %#v, want AND of qual + is-null", f.Predicate)
-	}
-	eq, ok := pred.Left.(*BinaryOp)
-	if !ok || eq.Op != parser.OpEq {
-		t.Fatalf("Filter predicate left = %#v, want `y = 3`", pred.Left)
-	}
-	if cr, ok := eq.Left.(*ColumnRef); !ok || cr.Name != "y" || cr.Index != 1 {
-		t.Fatalf("Filter predicate left operand = %#v, want ColumnRef(y) at table index 1", eq.Left)
-	}
-	rn, ok := pred.Right.(*IsNullExpr)
-	if !ok || !rn.Negated {
-		t.Fatalf("Filter predicate right = %#v, want `x IS NOT NULL`", pred.Right)
-	}
-	if cr, ok := rn.Operand.(*ColumnRef); !ok || cr.Name != "x" || cr.Index != 0 {
-		t.Fatalf("Filter predicate right operand = %#v, want ColumnRef(x) at table index 0", rn.Operand)
-	}
+	// M0148-0001c3a5 (a): the subquery is planned by the path search; with
+	// no presorted path build_minmax_path builds nothing and the plain
+	// Aggregate stands — never a Limit over a Sort.
+	assertMinMaxNoSortFallback(t, plan)
 }
 
 // TestRewriteMinMaxAggFilteredNonLeadingColumnIOS — S6 Slice 3b acceptance (d):
@@ -655,25 +619,10 @@ func TestRewriteMinMaxAggCompositePrefixRangeReject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	_, _, _, child := digMinMaxInner(t, plan)
-	proj, ok := child.(*Project)
-	if !ok {
-		t.Fatalf("Limit child is %T, want *Project (SeqScan fallback)", child)
-	}
-	if _, ok := proj.Child.(*IndexOnlyScan); ok {
-		t.Fatalf("range conjunct `y < 500` rewrote to IndexOnlyScan; must stay SeqScan fallback")
-	}
-	sort, ok := proj.Child.(*Sort)
-	if !ok {
-		t.Fatalf("Project child is %T, want *Sort (SeqScan fallback)", proj.Child)
-	}
-	f, ok := sort.Child.(*Filter)
-	if !ok {
-		t.Fatalf("Sort child is %T, want *Filter", sort.Child)
-	}
-	if _, ok := f.Child.(*SeqScan); !ok {
-		t.Fatalf("Filter child is %T, want *SeqScan", f.Child)
-	}
+	// M0148-0001c3a5 (a): the subquery is planned by the path search; with
+	// no presorted path build_minmax_path builds nothing and the plain
+	// Aggregate stands — never a Limit over a Sort.
+	assertMinMaxNoSortFallback(t, plan)
 }
 
 // TestRewriteMinMaxAggCompositePrefixDuplicateEqualityFallback — S6 Slice 3c
@@ -689,41 +638,10 @@ func TestRewriteMinMaxAggCompositePrefixDuplicateEqualityFallback(t *testing.T) 
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	_, _, _, child := digMinMaxInner(t, plan)
-	proj, ok := child.(*Project)
-	if !ok {
-		t.Fatalf("Limit child is %T, want *Project (SeqScan fallback)", child)
-	}
-	if _, ok := proj.Child.(*IndexOnlyScan); ok {
-		t.Fatalf("duplicate same-column equality rewrote to IndexOnlyScan; must stay SeqScan fallback")
-	}
-	sort, ok := proj.Child.(*Sort)
-	if !ok {
-		t.Fatalf("Project child is %T, want *Sort (SeqScan fallback)", proj.Child)
-	}
-	f, ok := sort.Child.(*Filter)
-	if !ok {
-		t.Fatalf("Sort child is %T, want *Filter", sort.Child)
-	}
-	if _, ok := f.Child.(*SeqScan); !ok {
-		t.Fatalf("Filter child is %T, want *SeqScan", f.Child)
-	}
-	// The fallback's Filter predicate must carry BOTH equality conjuncts
-	// (andExpr(wherePred, isNotNull): left is the AND of x=33 AND x=44).
-	pred, ok := f.Predicate.(*BinaryOp)
-	if !ok || pred.Op != parser.OpAnd {
-		t.Fatalf("Filter predicate = %#v, want AND of full qual + is-null", f.Predicate)
-	}
-	both, ok := pred.Left.(*BinaryOp)
-	if !ok || both.Op != parser.OpAnd {
-		t.Fatalf("Filter predicate left = %#v, want `x = 33 AND x = 44`", pred.Left)
-	}
-	if eq, ok := both.Left.(*BinaryOp); !ok || eq.Op != parser.OpEq {
-		t.Fatalf("Filter predicate left-left = %#v, want `x = 33`", both.Left)
-	}
-	if eq, ok := both.Right.(*BinaryOp); !ok || eq.Op != parser.OpEq {
-		t.Fatalf("Filter predicate left-right = %#v, want `x = 44`", both.Right)
-	}
+	// M0148-0001c3a5 (a): the subquery is planned by the path search; with
+	// no presorted path build_minmax_path builds nothing and the plain
+	// Aggregate stands — never a Limit over a Sort.
+	assertMinMaxNoSortFallback(t, plan)
 }
 
 // assertMinMaxDeclined checks that preprocess_minmax_aggregates' rewrite did
@@ -754,5 +672,22 @@ func assertMinMaxDeclined(t *testing.T, plan Node) {
 	walk(plan)
 	if !found {
 		t.Fatalf("plan has no Aggregate; PG keeps the plain aggregate here")
+	}
+}
+
+// assertMinMaxNoSortFallback: either the rewrite declined (planagg.c builds
+// no MinMaxAgg path without a presorted one) or its InitPlan body reads a
+// presorted path under the Limit (M0148-0001c3a5 (a)).
+func assertMinMaxNoSortFallback(t *testing.T, plan Node) {
+	t.Helper()
+	res, ok := plan.(*Result)
+	if !ok {
+		assertMinMaxDeclined(t, plan)
+		return
+	}
+	for _, tg := range res.Targets {
+		if sq, ok := tg.(*SubqueryExpr); ok && !minmaxPlanPresorted(sq.Plan) {
+			t.Fatalf("min/max InitPlan body is not presorted (a Sort fallback): %T", sq.Plan)
+		}
 	}
 }

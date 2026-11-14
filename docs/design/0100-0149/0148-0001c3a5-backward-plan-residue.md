@@ -397,3 +397,76 @@ arm; nbtree checks the non\-leading key on every entry it reads.
   -1 AND thousand >= 0`\) — PG lists both in Index Cond; goopg keeps one
   and filters the other.
 - **Later columns:** quals on column 2 and beyond.
+
+## Item (a) slice 5 — the min/max subquery planned by the path search
+
+PG reference: planagg.c preprocess\_minmax\_aggregates →
+build\_minmax\_path, which plans `SELECT col … WHERE col IS NOT NULL AND
+<quals> ORDER BY col LIMIT 1` through query\_planner and takes only a
+presorted path \(get\_cheapest\_fractional\_path\_for\_pathkeys, no explicit
+Sort\).
+
+### The gap
+
+- buildMinMaxInitPlan is rule\-based. Its index\-only arm admits a WHERE
+  only over the aggregated column \(wherePredSafeForIOS\), and its
+  composite arm only an equality prefix.
+- Anything else fell to a hand\-built `Limit → Sort → Filter → Seq Scan`
+  body. PG never builds that: it has a presorted path, or it keeps the
+  plain Aggregate.
+- That fallback also lost an outer reference nested in a WHERE sublink
+  \(subselect: `ERROR: outer column ref aid/idx=1 out of range`\).
+
+### The fix
+
+- For a non\-correlated single\-relation min/max, the step before that
+  fallback calls planMinMaxSubqueryViaSearch:
+  - it builds the build\_minmax\_path query as a parser.SelectStmt, with
+    the NullTest ahead of the WHERE and `ORDER BY col [DESC]` with the
+    default null ordering;
+  - it plans that through planSelectWithParent as a scalar sublink body
+    under the min/max query's scope.
+- **Presorted body** \(minmaxPlanPresorted: the Limit reads no Sort or
+  IncrementalSort\): it becomes the InitPlan.
+- **Body needs a Sort:** the rewrite declines and the Aggregate stands.
+- **Planning fails:** the old fallback remains.
+- **EXPLAIN:** an Index Only Scan prints a binary\-compatible key column
+  bare, as PG does — the IOS qual reads the index tuple, whose attribute
+  carries the opclass input type. `(v = 'v42'::text)`, where an Index
+  Scan prints `((v)::text = 'v42'::text)`. indexOnlyCondDropRelabel
+  removes the relabel the shared renderer adds.
+
+### Verification
+
+- **Scratch PG:** `min(a), max(a) … where b = 5` over `(a, b)` gives PG's
+  two IOS InitPlans with identical costs \(`0.28..96.96`\) and rows. Only
+  the Limit / IOS width differs \(the known unnarrowed\-width gap\).
+- **TestMinMaxSubqueryPlannedBySearch:** pins that plan and the varchar
+  IOS / Index Scan Index Cond texts; both arms fail under mutation.
+- **minmax\_rewrite\_test.go:** three tests that pinned the Sort fallback
+  now assert assertMinMaxNoSortFallback — declined, or a presorted body.
+- **Regress:**
+  - subselect 2462→2443 \(the nested\-sublink case now returns PG's
+    rows\);
+  - partition\_prune 6778→6772 \(`ma_test` min/max is PG's `Index Scan
+    using ma_test_p2_b_idx … Index Cond: (b IS NOT NULL)`\);
+  - aggregates still PASS.
+- **Gates:**
+  - units, tpch\-spotcheck, sf025 same=99;
+  - fire\-set fires=none on sf025, sf1 and TPC\-H;
+  - acceptance 24 MATCH;
+  - TestPort\_Isolation ok.
+
+### Not covered
+
+- **Appendrel members and correlated WHERE:** these keep the rule arms.
+- **The partitioned witness:** for a multi\-member partitioned table with
+  a WHERE, the member scans carry a Filter that
+  addOrderedPartitionAppendPaths refuses, so PG's `Limit → Append` of
+  member IOSs with Index Cond is not built.
+- **One\-member appendrel:** it collapses to the bare child scan, so the
+  parent alias is lost \(`Seq Scan on parted_minmax1` where PG prints
+  `parted_minmax1 parted_minmax`\). It is not a search leaf either:
+  `where a > 0 order by a limit 1` plans `Sort → Index Scan … Index
+  Cond: (a >= 0) Filter: (a > 0)` where PG plans `Index Only Scan …
+  Index Cond: (a > 0)`.

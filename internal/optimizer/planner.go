@@ -13288,6 +13288,24 @@ func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolve
 				schema: Schema{{Name: argCR.Name, Type: colType, SourceTableIdx: 1}}}
 			inner = &Limit{pos: pos, Child: proj, Limit: &IntegerConst{pos: pos, Value: 1}}
 		}
+		if inner == nil && !correlated && len(members) == 0 {
+			// M0148-0001c3a5 (a): build_minmax_path plans the subquery
+			// through query_planner — every index path the search knows,
+			// not only the rule arms above (whose IOS arm admits a WHERE
+			// over the agg column alone). `min(a) … WHERE b = 5` over
+			// (a, b) is then PG's `Index Only Scan … Index Cond: ((a IS
+			// NOT NULL) AND (b = 5))`. The Sort fallback below stays for
+			// a body the search declines.
+			planned, presorted, ok := planMinMaxSubqueryViaSearch(s, ctx, cat, fc.Args[0], isMax)
+			if ok && !presorted {
+				// No presorted path: build_minmax_path returns false and
+				// the plain Aggregate stands (planagg.c:443-448).
+				return nil, SchemaColumn{}, false, nil
+			}
+			if ok {
+				inner = planned
+			}
+		}
 		if inner == nil {
 			// SeqScan fallback: no qualifying index — neither the leading-column
 			// findBTreeIndexForColumn (which matches only when idx.Columns[0] is the
@@ -13364,6 +13382,69 @@ func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolve
 // order and Backward reverses it, so a DESC column flips the flag: `max(x)`
 // over `(x desc)` is a FORWARD scan. (Before M0148-0001c (c2) the flag was
 // isMax alone, and `max(x)` over a DESC index returned the minimum.)
+// planMinMaxSubqueryViaSearch is build_minmax_path's subquery planned by the
+// path search: `SELECT <arg> FROM <from> WHERE <arg> IS NOT NULL [AND
+// <where>] ORDER BY <arg> [DESC] LIMIT 1` (planagg.c:362-420: the NullTest
+// lcons'd ahead of the jointree quals; fetch_agg_sort_op's `<` for min
+// with NULLS LAST, `>` for max with NULLS FIRST), as a scalar sublink body
+// under the min/max query's own scope. presorted reports a Limit over a
+// presorted path (minmaxPlanPresorted); ok is false when planning fails —
+// the caller's rule-built fallback then stands.
+func planMinMaxSubqueryViaSearch(s *parser.SelectStmt, ctx *resolveContext, cat catalog.Catalog, arg parser.Expr, isMax bool) (plan Node, presorted, ok bool) {
+	if s == nil || ctx == nil || cat == nil || arg == nil {
+		return nil, false, false
+	}
+	where := parser.Expr(&parser.IsNullExpr{Operand: arg, Negated: true})
+	if s.Where != nil {
+		where = &parser.BinaryOp{Op: parser.OpAnd, Left: where, Right: s.Where}
+	}
+	sub := &parser.SelectStmt{
+		With:      s.With,
+		Targets:   []parser.ResTarget{{Expr: arg}},
+		From:      s.From,
+		FromExprs: s.FromExprs,
+		Where:     where,
+		OrderBy:   []parser.SortBy{{Expr: arg, Desc: isMax}},
+		Limit:     &parser.IntegerConst{Value: 1},
+	}
+	ps := ctx.settings
+	ps.scalarSublinkBody = true
+	n, err := planSelectWithParent(sub, cat, ctx, ps, rtableScopeFrom(ctx))
+	if err != nil || n == nil || len(n.Output()) != 1 {
+		return nil, false, false
+	}
+	return n, minmaxPlanPresorted(n), true
+}
+
+// minmaxPlanPresorted reports whether the planned min/max subquery reads a
+// presorted path under its Limit: build_minmax_path takes only
+// get_cheapest_fractional_path_for_pathkeys over the final rel's pathlist,
+// with no explicit Sort (planagg.c:443-448). A body whose Limit sits on a
+// Sort is not one PG would build: the min/max rewrite declines.
+func minmaxPlanPresorted(n Node) bool {
+	for depth := 0; depth < 8; depth++ {
+		switch x := n.(type) {
+		case *Project:
+			n = x.Child
+		case *Limit:
+			c := x.Child
+			for {
+				pr, ok := c.(*Project)
+				if !ok {
+					break
+				}
+				c = pr.Child
+			}
+			_, sorted := c.(*Sort)
+			_, incr := c.(*IncrementalSort)
+			return !sorted && !incr
+		default:
+			return false
+		}
+	}
+	return false
+}
+
 func minmaxScanBackward(idx *catalog.Index, k int, isMax bool) bool {
 	desc := k < len(idx.ColDescending) && idx.ColDescending[k]
 	return isMax != desc

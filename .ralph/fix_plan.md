@@ -12691,6 +12691,22 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
       - the one-member appendrel alias;
       - multi-member min/max.
     - Bitmap trailing quals and redundant leading bounds are ledgered.
+  - 2026-11-14 (a) slice 5 LANDED: the min/max subquery is planned by
+    the path search (build\_minmax\_path).
+    - planMinMaxSubqueryViaSearch replaces the Sort fallback for a
+      non-correlated single relation; a body with no presorted path
+      declines to the Aggregate, as in PG.
+    - An Index Only Scan prints a varchar key column bare
+      (indexOnlyCondDropRelabel).
+    Movement: yes — regress subselect 2462→2443, partition\_prune
+    6778→6772 (aggregates still PASS)
+    - Resume (a) parted\_minmax:
+      - the one-member appendrel collapse: keep the parent alias and plan
+        the child as a search leaf (its `a > 0 ORDER BY a LIMIT 1` is
+        Sort over `Index Cond: (a >= 0) Filter: (a > 0)`);
+      - then per-member index clauses for addOrderedPartitionAppendPaths
+        (members with quals), and min/max over appendrel members through
+        the search.
 - [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
   (NULL-keyed entries)**.
   Kind: impl

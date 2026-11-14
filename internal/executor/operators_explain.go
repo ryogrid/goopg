@@ -3933,11 +3933,52 @@ func formatIndexOnlyCond(p *optimizer.IndexOnlyScan, reg *subPlanReg) string {
 	return formatIndexOnlyCondPrefixed(p, reg, "")
 }
 
-// formatIndexOnlyCondPrefixed — see formatIndexCondPrefixed.
+// formatIndexOnlyCondPrefixed — see formatIndexCondPrefixed. An index-only
+// scan's quals read the index tuple, whose key attributes carry the operator
+// class's input type (a varchar key column is a text attribute of
+// varchar's text_ops index), so PG prints the key column bare where an
+// Index Scan prints the binary-compatible relabel: `(v = 'v42'::text)`
+// against `((v)::text = 'v42'::text)` (M0148-0001c3a5 (a), the parted_minmax
+// witness). indexOnlyCondDropRelabel removes the relabel the shared
+// renderer adds.
 func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, prefix string) string {
 	if p == nil || p.Index == nil {
 		return ""
 	}
+	return indexOnlyCondDropRelabel(formatIndexOnlyCondRelabeled(p, reg, prefix), p.Index, prefix)
+}
+
+// indexOnlyCondDropRelabel rewrites `(<col>)::<type> ` to `<col> ` for each
+// key column of idx in an Index Cond text.
+func indexOnlyCondDropRelabel(cond string, idx *catalog.Index, prefix string) string {
+	if !strings.Contains(cond, ")::") {
+		return cond
+	}
+	for _, c := range idx.Columns {
+		if c == "" {
+			continue
+		}
+		col := prefix + c // the renderer's own spelling (indexCondClause)
+		open := "(" + col + ")::"
+		for {
+			i := strings.Index(cond, open)
+			if i < 0 {
+				break
+			}
+			rest := cond[i+len(open):]
+			j := strings.IndexByte(rest, ' ')
+			if j < 0 {
+				break
+			}
+			cond = cond[:i] + col + rest[j:]
+		}
+	}
+	return cond
+}
+
+// formatIndexOnlyCondRelabeled is the shared renderer's text for an
+// IndexOnlyScan, relabels included.
+func formatIndexOnlyCondRelabeled(p *optimizer.IndexOnlyScan, reg *subPlanReg, prefix string) string {
 	// M0148-0001c3a4 (h): the index-only ScalarArrayOp probe renders exactly
 	// as the index scan's (one renderer for the one probe shape).
 	if len(p.SAOPKeys) > 0 {
