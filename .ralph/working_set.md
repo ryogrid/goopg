@@ -1,22 +1,31 @@
-# Working Set — loop end 2026-11-14 (census routing-20261114q IDENTICAL; M0148-0001c3a5 CLOSED fe060c35b)
+# Working Set — loop end 2026-11-14 (census REUSE; M0148-0001c3a6 (i) slice 1 LANDED 61c2f1857)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: items 0. Nothing filed.
-- S9: DUE → routing-20261114q (s9cv, BASELINE_REV=2d2aee32a) IDENTICAL ×3, committed 4ba0fca08.
-  - fe060c35b changes trackers only, so the next census should be REUSE.
-- Task: M0148-0001c3a5 closed (fe060c35b).
+- S9: REUSE at loop start (routing-20261114q). 61c2f1857 touches the planner, so the next census is likely DUE.
+- Task: M0148-0001c3a6 item (i) slice 1, landed as 61c2f1857.
+  - Files:
+    - pathbitmapor.go: crossIntArrayLiteral;
+    - pathindexrestrict.go: saopColumnQuals cross-type arm, saopColQual.arrayText;
+    - plan.go: SAOPColQual.ArrayText;
+    - createplanindex.go: lowerSAOPColQuals copies ArrayText;
+    - operators_explain.go: colQual prints ArrayText;
+    - test TestCrossTypeIntegerArrayColumnQual.
+  - New design doc docs/design/0100-0149/0148-0001c3a6-c3a4-residue.md (README indexed).
   - Findings:
-    - (b) needs partitionwise join, which goopg lacks entirely (pathparam.go says so). Filed M0148-0001c3a9.
-    - The (a) per-member index clauses residue needs base RelOptInfos for appendrel members. Filed M0148-0001c3a10.
-    - mcrparted → c3a8; (c) → c3a7.
-  - Files: .ralph/fix_plan.md (c3a5 [x] + close bullet; new c3a9, c3a10 after c3a5), .ralph/deferral_ledger.md (close row), docs/design/0100-0149/0148-0001c3a5-backward-plan-residue.md (close-out section).
-- Next step: select by file order.
-  - M0148-0001c3a6 (line ~12557, BEFORE c3a5; no blocker) is next.
-  - Its stated resume: (i) cross-type array literals (`'{33,44}'::bigint[]` on an int4 column) as an index qual — "moves one create_index line". Probe that create_index line on scratch PG 5545 vs goopg 5533 first.
-  - Then c3a9 / c3a10 / c3a8 / c3a7 / c3b … in file order.
+    - Column-qual arrays are merged into the probe keys by the executor, so out-of-range elements must be dropped from Array (an encode error otherwise). The display text is kept separately.
+    - Movement: create_index 2708→2689.
+- Next step: c3a6 (i) remaining, pick one:
+  - int2 untyped literal rendering: inListArrayConst prints integer[] where PG prints smallint[] for `s = ANY('{1,2}')`. Needs InExpr to carry literal-vs-IN-list origin.
+  - Mixed-type OR BitmapOr (create_index `tenthous = 1::int2 OR tenthous = 3::int8 OR tenthous = 42::int8` → PG BitmapOr of `(thousand = 42) AND (tenthous = '1'::smallint)` and `= ANY ('{3,42}'::bigint[])`). Grep create_index.diff for "1::int2".
+  - Then (f) join OR bitmaps when a witness appears; afterwards c3a9 / c3a10 / c3a8 / c3a7 in file order.
 - Top-residual: M0148 residues. Open children: c3a6, c3a7, c3a8, c3a9, c3a10, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261114q done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
-  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26). Then M0148 in file order.
-- Gates run: census s9cv IDENTICAL ×3; commit hook pgbench smoke PASS. No code change this loop, so no other gate was needed.
+  - Items 0-9: M0146-0014(channel; census REUSE this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26). Then M0148 in file order → c3a6.
+- Gates run (all PASS):
+  - units, tpch-spotcheck, sf025 same=99;
+  - fire-set c3a6i fires=none ×3; acceptance 24 MATCH;
+  - regress A/B tmp/regress-c3a6i vs tmp/regress-c3a5a6 (create_index only; join ±5 flap).
+  - Isolation family not run: no selectivity change.
 - In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped. Restarting it hits P0-E24: drop leftover partitions.
