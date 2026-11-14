@@ -745,3 +745,38 @@ func TestSinglePartitionAppendRelMember(t *testing.T) {
 		}
 	}
 }
+
+// M0148-0001c3a6 (i): `int4col = ANY ('{…}'::bigint[])` merges into the
+// index probe through the integer btree family's cross-type `=`, printed
+// as its own Const; an element outside int4's range matches nothing and
+// stays in the printed literal (regress create_index's
+// `unique1 = ANY('{33, 44}'::bigint[])`, PG 18.3).
+func TestCrossTypeIntegerArrayColumnQual(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "create table xt2 (unique1 int NOT NULL)")
+	runSQL(t, ctx, "create unique index xt2_u on xt2 (unique1)")
+	runSQL(t, ctx, "insert into xt2 select g from generate_series(1, 3000) g")
+	runSQL(t, ctx, "VACUUM xt2")
+	runSQL(t, ctx, "ANALYZE xt2")
+	ps := optimizer.DefaultPlannerSettings()
+	for _, c := range []struct{ q, plan string }{
+		{"SELECT unique1 FROM xt2 WHERE unique1 = ANY('{7, 14, 22}') and unique1 = ANY('{33, 44}'::bigint[])",
+			"Index Only Scan using xt2_u on xt2\n  Index Cond: ((unique1 = ANY ('{7,14,22}'::integer[])) AND (unique1 = ANY ('{33,44}'::bigint[])))"},
+		{"SELECT unique1 FROM xt2 WHERE unique1 = ANY('{7, 14, 33}') and unique1 = ANY('{33, 4400000000}'::bigint[])",
+			"Index Only Scan using xt2_u on xt2\n  Index Cond: ((unique1 = ANY ('{7,14,33}'::integer[])) AND (unique1 = ANY ('{33,4400000000}'::bigint[])))"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+	}
+	for _, c := range []struct{ q, rows string }{
+		{"SELECT unique1 FROM xt2 WHERE unique1 = ANY('{7, 14, 33}') and unique1 = ANY('{33, 4400000000}'::bigint[])", "33"},
+		{"SELECT unique1 FROM xt2 WHERE unique1 = ANY('{7, 14, 33}') and unique1 = ANY('{4400000000}'::bigint[])", ""},
+		{"SELECT unique1 FROM xt2 WHERE unique1 = ANY('{7, 14, 33}') and unique1 = ANY('{14,7}'::int8[]) order by 1", "7;14"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

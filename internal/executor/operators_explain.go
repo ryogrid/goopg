@@ -3832,6 +3832,11 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 		// M0148-0001c3a4 (i): the column quals merged into the array, in
 		// restriction order around it.
 		colQual := func(q optimizer.SAOPColQual) string {
+			if q.ArrayText != "" {
+				// M0148-0001c3a6 (i): a cross-type literal prints as its
+				// own Const — `(unique1 = ANY ('{33,44}'::bigint[]))`.
+				return prefix + arrCol + " = ANY (" + q.ArrayText + ")"
+			}
 			if q.Array != nil {
 				keys := make([]string, 0, len(q.Array))
 				for _, k := range q.Array {

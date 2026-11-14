@@ -1269,6 +1269,11 @@ type SAOPColQual struct {
 	Key         Expr
 	Array       []Expr
 	BeforeArray bool
+	// ArrayText is a cross-type array literal as EXPLAIN prints its Const
+	// (`'{33,44}'::bigint[]` on an int4 column, M0148-0001c3a6 (i)); Array
+	// then holds only the elements inside the column type's range, the
+	// ones the scan can probe. "" for the column's own type.
+	ArrayText string
 }
 
 // TrailingSAOP is IndexOnlyScan.TrailingSAOP: the array's elements and the

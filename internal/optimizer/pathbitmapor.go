@@ -12,6 +12,7 @@ package optimizer
 // docs/design/0100-0149/0148-0001c3a2-bitmap-or-paths.md.
 
 import (
+	"math"
 	"fmt"
 	"strconv"
 	"strings"
@@ -291,6 +292,63 @@ func isArrayLiteralString(v string) bool {
 
 // castIsColumnArrayType reports whether an array cast's target is the
 // column's own type as an array (`'{…}'::int[]` on an int4 column).
+// crossIntArrayLiteral is `= ANY ('{…}'::T[])` with T another integer type
+// than the integer column's: PG's integer_ops btree family holds the
+// cross-type `=` (int24eq, int48eq, …), so the array is an index qual. It
+// returns the elements the scan can probe — those inside the column
+// type's range; one outside matches no key, as PG's exact cross-type
+// comparison finds — and the literal's display text `'{33,4400000000}'::
+// bigint[]`. false when an element is NULL or not an integer.
+func crossIntArrayLiteral(col catalog.Type, list []Expr) ([]Expr, string, bool) {
+	if len(list) != 1 || col.IsArray {
+		return nil, "", false
+	}
+	c, isCast := list[0].(*CastExpr)
+	if !isCast {
+		return nil, "", false
+	}
+	sc, isStr := c.Operand.(*StringConst)
+	if !isStr || !isArrayLiteralString(sc.Value) {
+		return nil, "", false
+	}
+	t := strings.ToLower(strings.TrimSpace(c.TargetType))
+	if !strings.HasSuffix(t, "[]") {
+		return nil, "", false
+	}
+	canon := map[string]string{"int": "int4", "integer": "int4", "int4": "int4", "smallint": "int2", "int2": "int2",
+		"bigint": "int8", "int8": "int8"}
+	display := map[string]string{"int2": "smallint", "int4": "integer", "int8": "bigint"}
+	elem, ok1 := canon[strings.TrimSpace(strings.TrimSuffix(t, "[]"))]
+	colT, ok2 := canon[strings.ToLower(col.Name)]
+	if !ok1 || !ok2 || elem == colT {
+		return nil, "", false
+	}
+	elems, ok := arrayLiteralElements(catalog.Type{Name: "int8"}, []Expr{sc})
+	if !ok || len(elems) == 0 {
+		return nil, "", false
+	}
+	lo, hi := int64(math.MinInt64), int64(math.MaxInt64)
+	switch colT {
+	case "int2":
+		lo, hi = math.MinInt16, math.MaxInt16
+	case "int4":
+		lo, hi = math.MinInt32, math.MaxInt32
+	}
+	texts := make([]string, 0, len(elems))
+	probe := make([]Expr, 0, len(elems))
+	for _, e := range elems {
+		ic, isInt := e.(*IntegerConst)
+		if !isInt {
+			return nil, "", false
+		}
+		texts = append(texts, strconv.FormatInt(ic.Value, 10))
+		if ic.Value >= lo && ic.Value <= hi {
+			probe = append(probe, ic)
+		}
+	}
+	return probe, "'{" + strings.Join(texts, ",") + "}'::" + display[elem] + "[]", true
+}
+
 func castIsColumnArrayType(target string, typ catalog.Type) bool {
 	t := strings.ToLower(strings.TrimSpace(target))
 	if !strings.HasSuffix(t, "[]") {

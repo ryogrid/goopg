@@ -1018,7 +1018,7 @@ func lowerSAOPColQuals(c indexPathClause, drop map[Expr]bool) []SAOPColQual {
 	}
 	out := make([]SAOPColQual, 0, len(c.saopColQuals))
 	for _, q := range c.saopColQuals {
-		out = append(out, SAOPColQual{Op: q.op, Key: q.key, Array: q.array, BeforeArray: q.before})
+		out = append(out, SAOPColQual{Op: q.op, Key: q.key, Array: q.array, BeforeArray: q.before, ArrayText: q.arrayText})
 		if q.local != nil {
 			drop[q.local] = true
 		}

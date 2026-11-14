@@ -12570,6 +12570,16 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - an index-only prefix + range.
   - Resume: (i) cross-type literals (moves one create\_index line); (f)
     when a witness appears.
+  - 2026-11-14 (i) slice 1 LANDED: cross-type integer array literals
+    (`int4col = ANY ('{33,44}'::bigint[])`) merge into the index probe
+    as column quals (crossIntArrayLiteral).
+    - Out-of-range elements are dropped from the probe and kept in the
+      printed Const.
+    - Design: docs/design/0100-0149/0148-0001c3a6-c3a4-residue.md.
+    Movement: yes — regress create\_index 2708→2689
+    - Resume (i): the int2 untyped-literal rendering (`smallint[]`); the
+      primary cross-type probe; mixed-type OR bitmap arms (create\_index's
+      `tenthous = 1::int2 OR … 3::int8` BitmapOr).
 - [x] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
   `… Backward` regress lines**.
   Kind: impl

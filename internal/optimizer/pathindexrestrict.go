@@ -1127,6 +1127,9 @@ type saopColQual struct {
 	op     parser.OpCode
 	key    Expr
 	array  []Expr
+	// arrayText is a cross-type array literal's EXPLAIN text
+	// (SAOPColQual.ArrayText), "" when the literal is the column's type.
+	arrayText string
 	local  Expr
 	before bool
 }
@@ -1155,8 +1158,16 @@ func saopColumnQuals(cat catalog.Catalog, tbl *catalog.Table, colName string, pr
 				continue
 			}
 			list, ok := saopElementsFor(tbl.Columns[cr.Index], x.List)
+			arrayText := ""
 			if !ok {
-				continue
+				// M0148-0001c3a6 (i): `int4col = ANY ('{33,44}'::bigint[])`
+				// is an index qual through the integer btree family's
+				// cross-type `=` (int48eq); the elements narrow to the
+				// column's type when every one fits.
+				list, arrayText, ok = crossIntArrayLiteral(tbl.Columns[cr.Index].Type, x.List)
+				if !ok {
+					continue
+				}
 			}
 			usable := true
 			for _, e := range list {
@@ -1169,7 +1180,7 @@ func saopColumnQuals(cat catalog.Catalog, tbl *catalog.Table, colName string, pr
 				}
 			}
 			if usable {
-				out = append(out, saopColQual{op: parser.OpEq, array: list, local: conj, before: before})
+				out = append(out, saopColQual{op: parser.OpEq, array: list, arrayText: arrayText, local: conj, before: before})
 			}
 		case *BinaryOp:
 			switch x.Op {
