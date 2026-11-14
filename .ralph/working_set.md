@@ -1,24 +1,26 @@
-# Working Set — loop end 2026-11-15 (census routing-20261115c IDENTICAL; c3a9 slice 4 attempted, NOT landed — prerequisite found)
+# Working Set — loop end 2026-11-15 (census REUSE; M0148-0001c3a9 slice 4 LANDED 0d3dc635d incl. a slice-3 wrong-result fix)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: AI-20261115-011812-001 already filed (M-NIGHTLY-race-parallel-hash-cancel). Nothing new.
-- S9: DUE → routing-20261115c (s9dg, BASELINE_REV=f73e420b9) IDENTICAL ×3, committed f31132957.
-  - No code landed after it; the next census should be NOT DUE unless a peer commits plan code.
-- Task: M0148-0001c3a9 slice 4 (child index paths).
-  - Built and probed, NOT committed. Patch saved at tmp/c3a9-slice4-child-index.patch (applies to 9eadb3412's partitionwisejoin.go / path.go / createplan.go).
-  - Design: a scratch rel over the member's bare `[Filter→]SeqScan`; addOneRestrictionIndexPath + addOneOrderedIndexPath; each index / bitmap path lifted under the member's tableoid Project as PathMemberProject (plan arm re-applies a copy of the Project).
-  - Paths were generated (Index Scans ~14 per partition) but never won; regress partition_join was byte-identical.
-- Findings (recorded in fix_plan c3a9 and the ledger):
-  - Partition member seq scans cost 0 pages (`prt1_p1 … 0.00..1.25`; PG `2.25`), also in the whole-rel Append.
-  - pg_class has relpages 1, and a direct `ANALYZE prt1_p1` in the same session does not change it.
-  - Member rows come from relSizeFallbackRows, so the leaf catalog.Table has no Stats. collectAllPartitionLeaves reads leaves via im.PartitionChildren (raw InMemory), not the statement catalog planScanRangeVar resolves `tbl` with.
-  - PG prunes partitions at plan time for `t1.a < 10` (only the p1 pair survives); goopg doesn't (k1 (b)).
-  - With enable_seqscan off PG uses per-partition Index Only Scans; scratch rels have no index-only arm.
-- Next step: fix the leaf Stats gap. Resolve each partition leaf through the statement catalog so Stats/relpages ride along. Probe `explain select * from prt1` until member scans cost 2.25 like PG, then re-apply the saved patch and re-measure partition_join.
-  - The member-cost fix moves every partition plan's costs: run the regress partition suites, update the inventory, and run the fire-set gate.
-- Top-residual: M0148 residues. Open: c3a9 (slices 4-6), c3a10, c3a8, c3a7, c3a11 (parked), c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
+- S9: census REUSE (routing-20261115c) at loop start.
+  - 0d3dc635d touches internal/optimizer, so the next census is likely DUE (BASELINE_REV=30ef7ad0e, the head consumed by routing-20261115c).
+- Task: M0148-0001c3a9 (partitionwise join), slice 4 landed as 0d3dc635d.
+  - Child rels use the member's bare `[Filter→]SeqScan` (tableoid-wrapper-only members); addChildIndexPaths runs the restriction, ordered and parameterised index producers on them.
+  - tableoid is filled with the partition OID above each child join (Path.pwFills / pwFillSchema).
+- WRONG-RESULT FIX inside the slice (bug introduced by slice 3, 9eadb3412):
+  - Child joins with different output widths (a Nested Loop beside Hash Joins, narrowed differently) were appended unprojected; partition_join returned `0|0300|0|0300`, PG `300|0300|300|0300`.
+  - createPartitionwiseAppendPlan now builds all child plans first and uses the coordinates every child provides. TestPartitionwiseJoin pins it (fails on 9eadb3412).
+- Files: internal/optimizer/partitionwisejoin.go, path.go (pwFills); internal/executor/partitionwise_join_test.go (PG's indexes, wrong-result query, child-probe check); design doc slice 4; inventory CSV + coverage doc.
+- Findings:
+  - Last loop's "member scans priced at 0 pages" diagnosis was WRONG (corrected in fix_plan + ledger). The search's child costs read relpages (2.25); 1.25 is EXPLAIN's legacy display of a Seq Scan under the tableoid Project.
+  - Most of PG's per-partition index scans in partition_join are parameterised NL inners or outer joins; the remaining gaps there are outer/semi/anti partitionwise joins, plan-time pruning (k1 (b)), and EC handling of partially-redundant clauses.
+- Next step: run the census if DUE, then c3a9 slice 5: outer joins (LEFT / FULL / SEMI / ANTI via sjinfo; PG try_partitionwise_join's jointype rules) — most of partition_join's remaining hunks are Left Joins.
+- Top-residual: M0148 residues. Open: c3a9 (slices 5-6), c3a10, c3a8, c3a7, c3a11 (parked), c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261115c done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census REUSE this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24, E25, E26, E27). Then M0148 in file order → c3a9.
-- Gates run: census s9dg IDENTICAL. Regress A/B of the uncommitted slice 4: partition_join byte-identical; inherit 735→720 in UNION ALL index-only hunks unrelated to the change (likely run-to-run noise; not claimed). No code commit, so no code gates.
-- In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped (tmp/c3a4i-data; P0-E24: drop leftover partitions after a restart).
+- Gates run (all PASS):
+  - units, tpch-spotcheck, sf025 99 PASS same=99, fire-set c3a9i fires=none ×3, acceptance PASS, 17 partition isolation tests;
+  - regress same-suite HEAD baseline: only partition_join moved, 1882→1879 (inventory updated).
+  - Cross-suite runs differ by suite set (select/join/union shift); compare only same-suite runs.
+- In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped.
