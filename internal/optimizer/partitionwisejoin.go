@@ -2,6 +2,7 @@ package optimizer
 
 import (
 	"math/bits"
+	"sort"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -471,11 +472,13 @@ func (s *searchCtx) addAppendRelChildPaths(cat catalog.Catalog) {
 // there (M0148-0001c3a10 slice 3). This is what PG's per-partition min / max
 // rides: `Limit -> Append -> Index Only Scan Backward … (c = 3)`.
 //
-// For an unrestricted appendrel (slice 6) only the Merge Append arm runs: the
-// partitions-ordered plain Append over full index scans is
-// addOrderedPartitionAppendPaths' (orderedpartitionappend.go), which already
-// files PG's Index Only Scans there; a child rel's full index-only scan
-// carries no ordering yet (ledgered).
+// An unrestricted appendrel (slice 6) takes only the Merge Append arm when its
+// partitions are RANGE-ordered (the plain Append there is
+// addOrderedPartitionAppendPaths', orderedpartitionappend.go) and treats LIST
+// partitions as unordered: the plain Append over ordered LIST children beats
+// the appendrel's HashAggregate input on goopg's display cost of the
+// members' Append (twice PG's cost_append; regress aggregates' p_t1),
+// ledgered (slice 8).
 func (s *searchCtx) addOrderedAppendRelChildPath(rel *RelOptInfo, so *SetOp, ps *partScheme, childRels []*RelOptInfo, fills []map[int]Expr, unrestricted bool) {
 	qk := s.queryPathkeys
 	if len(qk) == 0 || len(ps.keyPos) == 0 {
@@ -490,7 +493,8 @@ func (s *searchCtx) addOrderedAppendRelChildPath(rel *RelOptInfo, so *SetOp, ps 
 			return
 		}
 	}
-	if !rangePartitionsOrderedOn(ps, qk[0].Expr.(*ColumnRef)) {
+	isList := strings.EqualFold(ps.parent.PartitionMethod, "LIST")
+	if !rangePartitionsOrderedOn(ps, qk[0].Expr.(*ColumnRef)) || (unrestricted && isList) {
 		// Not partitions_are_ordered on the leading key: the ordering is a
 		// Merge Append of the children (slice 5), for every useful ordering
 		// a child delivers.
@@ -534,20 +538,90 @@ func (s *searchCtx) addOrderedAppendRelChildPath(rel *RelOptInfo, so *SetOp, ps 
 	addPath(rel, pa, "appendrel-children.ordered")
 }
 
-// rangePartitionsOrderedOn is partitions_are_ordered plus
+// rangePartitionsOrderedOn is partitions_are_ordered (partbounds.c) plus
 // build_partition_pathkeys' leading-key test for the shapes goopg recognises:
-// a RANGE partitioned table with no default partition whose (first)
+// a RANGE table without a default partition, or a LIST table without
+// interleaved partitions (listPartitionsOrdered, slice 8), whose (first)
 // partition key column is col.
 func rangePartitionsOrderedOn(ps *partScheme, col *ColumnRef) bool {
-	if !strings.EqualFold(ps.parent.PartitionMethod, "RANGE") {
+	if !strings.EqualFold(col.Name, ps.parent.Columns[ps.keyPos[0]].Name) {
 		return false
 	}
 	for _, part := range ps.parts {
 		if b, ok := ownPartitionBound(part); !ok || b.IsDefault {
+			// partitions_are_ordered: a live default partition is
+			// interleaved with everything (RANGE and LIST alike).
 			return false
 		}
 	}
-	return strings.EqualFold(col.Name, ps.parent.Columns[ps.keyPos[0]].Name)
+	switch {
+	case strings.EqualFold(ps.parent.PartitionMethod, "RANGE"):
+		return true
+	case strings.EqualFold(ps.parent.PartitionMethod, "LIST"):
+		return listPartitionsOrdered(ps)
+	}
+	return false
+}
+
+// listPartitionsOrdered is create_list_bounds' interleaved_parts test
+// (partbounds.c) as partitions_are_ordered reads it: with every non-NULL
+// value of every partition sorted, the partitions' positions must never step
+// back (a partition whose values straddle another's is interleaved), and the
+// partition accepting NULL may hold nothing else (NULLs sort after every
+// value, so it must be the NULL-only last partition). Positions are
+// ps.parts' (PartitionDesc order) — the order the plain Append emits — so the
+// test verifies exactly the order it licenses. A value that cannot be
+// compared declines (M0148-0001c3a10 slice 8).
+func listPartitionsOrdered(ps *partScheme) bool {
+	type datum struct {
+		raw  string
+		part int
+	}
+	kind := partitionKeyBoundKind(ps.parent, 0)
+	var vals []datum
+	nullPart := -1
+	for j, part := range ps.parts {
+		b, ok := ownPartitionBound(part)
+		if !ok {
+			return false
+		}
+		for i, raw := range b.InValues {
+			if listValueIsNull(b, i, raw) {
+				nullPart = j
+				continue
+			}
+			vals = append(vals, datum{raw: raw, part: j})
+		}
+	}
+	if nullPart >= 0 {
+		if nullPart != len(ps.parts)-1 {
+			return false
+		}
+		for _, v := range vals {
+			if v.part == nullPart {
+				return false
+			}
+		}
+	}
+	var cmpErr bool
+	sort.SliceStable(vals, func(a, b int) bool {
+		c, ok := compareBoundValue(kind, vals[a].raw, vals[b].raw)
+		if !ok {
+			cmpErr = true
+		}
+		return c < 0
+	})
+	if cmpErr {
+		return false
+	}
+	last := -1
+	for _, v := range vals {
+		if v.part < last {
+			return false
+		}
+		last = v.part
+	}
+	return true
 }
 
 // addMergeAppendRelChildPaths is generate_orderedappend_paths' Merge Append

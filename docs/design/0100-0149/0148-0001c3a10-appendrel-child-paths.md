@@ -268,6 +268,36 @@ Status: slices 1\-3 landed 2026\-11\-15. Parent: M0148\-0001c3a5.
   index path. This happens on plain tables too \(`select … from ud_1 order
   by a limit 5`\); PG sorts a seq scan.
 
+## Slice 8 — LIST partitions\_are\_ordered \(landed\)
+
+- `listPartitionsOrdered` \(partitionwisejoin.go\) implements
+  create\_list\_bounds' interleaved\_parts test as partitions\_are\_ordered
+  reads it.
+  - With every non\-NULL value sorted by the key type, the partitions'
+    positions never step back.
+  - The NULL\-accepting partition holds only NULL and is last.
+  - There is no default partition.
+  - Positions are `ps.parts`, the order the plain Append emits, so the test
+    checks exactly the order it licenses. An uncomparable value declines.
+- `rangePartitionsOrderedOn` accepts such a LIST table. A restricted ORDER
+  BY on its key then plans PG's plain Append in partition order, reversed
+  and Backward for DESC, instead of a Merge Append.
+  `TestListOrderedAppendRelChildPaths` pins it.
+- Scope: unrestricted LIST tables keep slice 6's Merge Append.
+  - Letting them take the plain Append regressed regress aggregates' p\_t1
+    \(99→103\). The ordered child Append beat the appendrel's HashAggregate
+    input because goopg's display cost of the members' Append is about
+    twice PG's cost\_append.
+  - That cost: the legacy display cost charges `cpu_tuple_cost` per row at
+    every UNION ALL link and every tableoid Project, and member seq scans
+    without stats have 0 pages instead of estimate\_rel\_size's 10.
+  - Fixing the seed path cost alone does not help: the grouping stage
+    prices its input from the finished node's display cost
+    \(`upperInputPathCost`\).
+- Regress: unchanged in the same\-suite A/B \(no regress case has a
+  restricted ordered LIST query\). With the unrestricted arm enabled,
+  inherit 679→677 but aggregates 99→103, so it was not taken.
+
 ## Not covered
 
 - Multi\-relation problems: inside a join the Append's columns still reach

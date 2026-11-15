@@ -458,3 +458,48 @@ func TestStarMergeAppendIndexOnlyChildren(t *testing.T) {
 		}
 	}
 }
+
+// TestListOrderedAppendRelChildPaths is M0148-0001c3a10 slice 8: a LIST
+// table whose partitions do not interleave is partitions_are_ordered
+// (partbounds.c), so a restricted ORDER BY on its key plans PG 18.3's plain
+// Append in partition order (reversed and Backward for DESC), not a Merge
+// Append.
+func TestListOrderedAppendRelChildPaths(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	for _, s := range []string{
+		"create table lq (a int NOT NULL, b text NOT NULL) partition by list (a)",
+		"create table lq_1 partition of lq for values in (1, 2)",
+		"create table lq_2 partition of lq for values in (3)",
+		"create table lq_56 partition of lq for values in (5, 6)",
+		"create index on lq (a)",
+		"insert into lq select 1 + (i % 6), 'v' || i from generate_series(1, 6000) i where 1 + (i % 6) <> 4",
+		"vacuum lq_1", "vacuum lq_2", "vacuum lq_56",
+		"analyze lq",
+	} {
+		runSQL(t, ctx, s)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	child := func(back, name, rel string) string {
+		return "        ->  Index Only Scan" + back + " using " + name + "_a_idx on " + rel + "\n              Index Cond: (a > 1)"
+	}
+	for _, c := range []struct{ q, plan string }{
+		{"select a from lq where a > 1 order by a limit 3", "Limit\n  ->  Append\n" +
+			child("", "lq_1", "lq_1") + "\n" + child("", "lq_2", "lq_2") + "\n" + child("", "lq_56", "lq_56 lq_3")},
+		{"select a from lq where a > 1 order by a desc limit 3", "Limit\n  ->  Append\n" +
+			child(" Backward", "lq_56", "lq_56 lq_3") + "\n" + child(" Backward", "lq_2", "lq_2") + "\n" + child(" Backward", "lq_1", "lq_1")},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+	}
+	for _, c := range []struct{ q, rows string }{
+		{"select a from lq where a > 1 order by a limit 3", "2;2;2"},
+		{"select a from lq where a > 1 order by a desc limit 3", "6;6;6"},
+		{"select count(*), sum(a) from (select a from lq where a > 1 order by a) s", "4000|16000"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

@@ -13219,6 +13219,20 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Resume: LIST partitions\_are\_ordered \(plain Append\); boolean
       index-only clause then restricted child sizing \(bool\_rp\);
       disabled-node choice under LIMIT; joins.
+  - 2026-11-15 slice 8 LANDED: listPartitionsOrdered \(create\_list\_bounds'
+    interleaved\_parts\); restricted ordered LIST queries plan PG's plain
+    Append \(TestListOrderedAppendRelChildPaths\).
+    Movement: none — instrument artefact — no regress case has a restricted
+    ordered LIST query \(same-suite A/B identical\); the probe plans are PG
+    18.3's \(TestListOrderedAppendRelChildPaths\)
+    - Unrestricted LIST stays Merge Append. Enabling it moved inherit
+      679→677 but aggregates 99→103 \(p\_t1: goopg prices the members'
+      Append at 148 where PG's cost\_append gives 75.5, so the HashAggregate
+      lost\).
+    - Resume: the UNION ALL appendrel display cost \(plancost.go
+      default arm: per-link and tableoid-Project cpu\_tuple\_cost; member
+      seq-scan pages without the 10-page floor\), then enable the
+      unrestricted LIST arm.
 - [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
   (NULL-keyed entries)**.
   Kind: impl
