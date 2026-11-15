@@ -11379,6 +11379,39 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/recovery/t/034_create_database.pl` — WAL replay of `CREATE DATABASE … STRATEGY WAL_LOG` after template DDL.
   Likely prerequisites \(verify at start\): PG-format `XLOG_DBASE_CREATE_WAL_LOG` emission and replay \(`dbcommands.c`\), immediate-stop crash recovery; first test also files the Go `Cluster.pm`-equivalent harness child \(goopg and PG nodes behind one API\).
+  - 2026-11-15 STARTED \(design docs/design/0100-0149/0149-0001-create-database-wal-log.md\).
+    - Baseline: all-goopg A1/A2 pass \(2/2\). goopg's WAL already carries
+      PG's `Database CREATE_WAL_LOG` sequence \(pg\_waldump\);
+      pg\_controldata reads pg\_control.
+    - Mixed \(PG 18.3 cold start on the crashed goopg copy\): A2 passes, A1
+      fails — `FATAL: could not open file "base/1/pg_filenode.map"`.
+    Movement: none — tap 034\_create\_database baseline 3/4 recorded \(no
+    TestPort func yet\)
+- [ ] **M0149-0001a — template1 carries the full PG per-database catalog image, including `base/1/pg_filenode.map`**
+  Kind: impl
+  Parent: M0149-0001
+  - PG: initdb's bootstrap writes `base/1` as the complete template1
+    \(`bootstrap.c`; `relmapper.c` `write_relmap_file` per database\). PG's
+    base/1 holds 300 files; goopg's holds 138 and no `pg_filenode.map`.
+  - goopg: `internal/initdb/initdb.go` — base/5 "additionally carries
+    pg\_filenode.map and the per-database placeholder files"
+    \(refreshTemplate0Image's comment\); base/1 never gets them.
+  - Verification: a fresh `goopg init` has `base/1/pg_filenode.map`; PG
+    18.3 `postgres` started on a goopg directory connects to `template1`;
+    034's A1 returns 1 in the mixed run; the initdb and template unit tests
+    stay green.
+- [ ] **M0149-0001b — Go `Cluster.pm`-equivalent harness for single-node ports \(goopg and PG 18.3 nodes behind one API\)**
+  Kind: impl
+  Parent: M0149-0001
+  - Methods 034 needs: `init`, `start`, `stop('immediate')`, per-database
+    `safe_psql`, and the C3 copy-and-cold-start cross-check \(copy a stopped
+    goopg data directory, start PG 18.3 `postgres` on it, run the same
+    assertions\); later tests add methods as their children.
+  - Build on `internal/testutil/cluster` \(goopg\) and
+    `internal/testutil/pgcluster` \(PG\); precedent
+    `e2e_pg_crashstart_on_goopgdata_test.go`.
+  - Verification: TestPort\_Recovery034CreateDatabase runs all-goopg and the
+    PG cold-start variant through the one API.
 - [ ] **M0149-0002 — port recovery/t/036_truncated_dropped.pl**
   Kind: impl
   Parent: none
