@@ -1518,6 +1518,23 @@ heuristic stays live.)
     and RelOID, before the user\-table reload. Then advance the OID counter and prove with a two\-restart test
     that covers field access, a new column, DROP TYPE and pg\_proc OIDs.
   - Expected instrument: Movement: none — correctness fix — no plan instrument.
+- [ ] **P0\-E33 — a goopg standby of a PG 18\.3 primary writes the primary's template1 WAL into its own postgres catalogs**
+  \(filed 2026\-11\-15 by the loop, found while designing M0149\-0001a1 S3; S2 — corrupts a shared resource on the
+  standby\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-15 \(S2, standby catalog corruption\) — OWNER PLACEMENT NEEDED\.** Filed, not selected
+    > by itself: the fix is M0149\-0001a1 S3 \(the current item\-10 task\), which closes this when it lands\.
+  - Mechanism \(read from code, not yet reproduced\): PG 18\.3 WAL for template1 names `1663/1/<rel>`\. goopg redo
+    decodes DBOid 1 and the Pool's `storage.StorageDBOid` \(S1, `1 → 5`\) writes the block into `base/5`, the
+    postgres catalogs\. Before S1 it went to `base/1`, which was then goopg's primary postgres catalog copy — the
+    same corruption, so it is pre\-existing\. Any template1 write on the primary \(autovacuum of template1, DDL in
+    template1\) triggers it\.
+  - PG: `RelFileLocator.dbOid` 1 is template1 \(`relpath.c`\); redo writes the block to `base/1`\.
+  - Fix: M0149\-0001a1 S3 Option C — namespace and storage OIDs coincide, so DBOid 1 is template1 everywhere
+    \(design doc 0149\-0001a1 § "S3 design"\)\.
+  - Verification: PG 18\.3 primary → goopg standby; on the primary `\\c template1` + CREATE TABLE + INSERT;
+    on the standby postgres' catalogs are unchanged and template1 shows the table\.
 - [ ] **M0122\-0008a — apply `pg_db_role_setting` at session start: `ALTER DATABASE / ROLE … SET` never reaches a new connection**
   \(filed 2026\-11\-15 by the loop, found while verifying M0149\-0001a1 S2; below\-item\-10 fallback, not S2: no wrong
   query result, a missing session\-setup step\)\.
@@ -11547,6 +11564,24 @@ verify each at HEAD when the task starts.
       session start; pre-existing\).
     - Next: S3 \(template1 at base/1\) — that is M0149-0001a itself.
     Movement: none — tap 034\_create\_database 3/4 \(display layer only; mixed A1 needs S3\)
+  - 2026-11-15 S3 designed and probed \(design doc § "S3 design"\):
+    - Adding `2 → 1` to StorageDBOid breaks idempotency: the Pool sees both
+      namespace OIDs \(executor\) and storage OIDs \(redo\), so redo of a
+      template1 record at DBOid 1 would land in base/5. The same conflict
+      already sends a PG primary's template1 WAL into a goopg standby's
+      postgres catalogs \(pre-existing, mixed topology\).
+    - Chosen: Option C — `DefaultDBOid = 5`, `Template1NamespaceDBOid = 1`,
+      StorageDBOid identity \(namespace = storage = WAL = display\).
+    - Probe in a worktree: one duplicate-case fix; 4 pinned tests to re-key
+      or retire. On a fresh cluster PG 18.3 cold start connects to template1
+      and postgres and reads goopg tables in both \(HEAD cannot open
+      template1\).
+    - Existing clusters: replace base/1 with base/2 before redo; a legacy
+      decode map \(1 → 5, 2 → 1\) during that startup's redo; record the
+      feature flag only after the end-of-recovery checkpoint.
+    - Next: implement S3 \(diff tmp/m0149-s3-optionC-probe.diff, then the
+      migration and the legacy map\).
+    Movement: none — tap 034\_create\_database 3/4 \(design only\)
 - [ ] **M0149-0001b — Go `Cluster.pm`-equivalent harness for single-node ports \(goopg and PG 18.3 nodes behind one API\)**
   Kind: impl
   Parent: M0149-0001
@@ -11559,6 +11594,23 @@ verify each at HEAD when the task starts.
     `e2e_pg_crashstart_on_goopgdata_test.go`.
   - Verification: TestPort\_Recovery034CreateDatabase runs all-goopg and the
     PG cold-start variant through the one API.
+- [ ] **M0149-0001c — per-database pg\_class heaps carry every shared catalog's row \(19 missing: pg\_shdepend, pg\_shdescription, shared TOAST\)**
+  Kind: impl
+  Parent: M0149-0001
+  - Found 2026-11-15 by the M0149-0001a1 S3 probe: with template1 at base/1, a PG 18.3 cold start on a goopg
+    directory connects to every database, but PG `CREATE DATABASE` fails with "could not open relation with OID
+    1214" — pg\_class \(in postgres and in template1\) has no row for pg\_shdepend.
+  - Missing relisshared rows vs a scratch PG 18.3 \(46 rows there\): 1214 pg\_shdepend, 1232/1233 its indexes,
+    2396 pg\_shdescription, 2397 its index, and the shared TOAST pairs 2846/2847 \(2396\), 2966/2967 \(2964\),
+    4060/4061 \(3592\), 4177/4178 \(1262\), 4183/4184 \(6100\), 4185/4186 \(1213\), 6244/6245 \(6243\).
+    `global/1214` exists and is in `global/pg_filenode.map`.
+  - PG: every database's pg\_class carries a row for each shared catalog, index and TOAST relation
+    \(`BKI_SHARED_RELATION`, genbki / initdb bootstrap\); relcache opens shared relations through it.
+  - First step: compare goopg initdb's pg\_class bootstrap row list with PG's postgres.bki shared set, then add
+    the missing rows \(with their pg\_attribute / pg\_index / pg\_type rows\) to the bootstrap image every database
+    copies.
+  - Verification: on a fresh goopg cluster under a PG 18.3 cold start, `CREATE DATABASE` succeeds and the
+    relisshared row set equals PG's \(46\).
 - [ ] **M0149-0002 — port recovery/t/036_truncated_dropped.pl**
   Kind: impl
   Parent: none

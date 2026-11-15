@@ -1,7 +1,8 @@
 # M0149\-0001a1 — one OID per database on disk, in WAL and on display
 
 Status: S1 and S2 landed 2026\-11\-15 \(postgres catalogs stored and
-WAL\-logged at DBOid 5; postgres displayed as oid 5\). S3 open.
+WAL\-logged at DBOid 5; postgres displayed as oid 5\). S3 designed and
+probed \(see "S3 design"\); not implemented.
 Parent: M0149\-0001a \(template1's PG catalog image\) → M0149\-0001 \(port
 `recovery/t/034_create_database.pl`\).
 
@@ -211,6 +212,106 @@ Key observation: PG compatibility constrains only the **displayed** and
   - spotcheck; sf025 99; acceptance.
 - Not changed: `operators_ddl.go` LOCK TABLE keeps a 16384 fallback, which is
   only used when the catalog is not an `InMemory`.
+
+## S3 design \(2026\-11\-15, fifth loop\) — template1 at base/1
+
+### Why the S1 mapping cannot be extended
+
+- The obvious S3 is to add `2 → 1` to `storage.StorageDBOid`, routing
+  template1's namespace 2 to `base/1`. That breaks idempotency.
+  - The normalization runs at the Pool, which sees both namespace OIDs
+    \(from executor writers\) and storage OIDs \(from WAL redo\).
+  - Once template1 is stored at 1, a redo record naming DBOid 1 means
+    template1. The Pool cannot tell it apart from the postgres namespace 1,
+    which must go to 5.
+  - Replaying goopg's own post\-S3 WAL would write template1 blocks into
+    postgres's `base/5`.
+- The same conflict already exists today for PG\-sourced WAL. A PG 18.3
+  primary's template1 writes \(autovacuum of template1, for example\) arrive
+  at a goopg standby as `1663/1/<rel>`, and S1's `1 → 5` writes them into
+  postgres's catalog files.
+  - Before S1 they landed in `base/1`, which was then goopg's primary copy of
+    the postgres catalogs.
+  - Either way this is pre\-existing standby corruption in the mixed
+    PG\-primary topology. S3 below removes it.
+
+### Chosen design: Option C — namespace OIDs equal storage OIDs
+
+- Set `catalog.DefaultDBOid = 5` and `catalog.Template1NamespaceDBOid = 1`,
+  and make `storage.StorageDBOid` the identity. Namespace, storage, WAL and
+  display then coincide: 1/1/1, 4/4/4, 5/5/5.
+  - `NamespaceDBOid`'s `5 → 1` fold becomes the identity.
+  - The `base/1 → base/5` mirror and `PgDatabaseRowOid`'s template1 special
+    case become no\-ops and can be deleted.
+  - This is slice S4, folded into S3, because it is the only design in which
+    WAL decoding needs no namespace inverse.
+- Probe \(worktree at d556cbbd7; diff kept as
+  `tmp/m0149-s3-optionC-probe.diff`, 49 lines\):
+  - Only one source fix was needed: a duplicate `case` in
+    `CreatePerDatabaseScaffolding`, where `DefaultDBOid` and `PostgresDBOid`
+    are now equal. Template1 now gets the image copy.
+  - Unit packages: storage, access/\*, executor and postmaster PASS.
+  - catalog fails 2 tests, `Test{Index,Table}RealPagesInUsesCatalogDatabase`.
+    They are pinned to the old 1\-vs\-5 divergence and report "the case no
+    longer reproduces"; retire them.
+  - initdb fails 2 tests, close\_checkpoint and recovery. They build a
+    literal `DBOid: 1` RelFileNode and expect `base/5`; re\-key them to 5.
+  - Fresh cluster: `base/{1,4,5}` with `pg_filenode.map` in each, and
+    `pg_database` shows 1/4/5. A table created in template1 is invisible
+    from postgres and the reverse, and both survive a restart.
+  - **PG 18.3 cold start on the goopg directory connects to template1 and
+    to postgres and reads goopg\-created tables in both**. At HEAD, PG cannot
+    open template1 at all \(no `base/1/pg_filenode.map`\). This is
+    M0149\-0001a's verification.
+  - PG\-side `CREATE DATABASE` then fails with "could not open relation with
+    OID 1214". goopg's per\-database `pg_class` heap lacks 19 shared\-catalog
+    rows: `pg_shdepend` and its 2 indexes, `pg_shdescription` and its
+    index, and 7 shared TOAST tables with their indexes \(2846/2847,
+    2966/2967, 4060/4061, 4177/4178, 4183/4184, 4185/4186, 6244/6245\).
+    Filed as M0149\-0001c.
+
+### Existing clusters: migration and legacy WAL
+
+- Layout before S3: postgres at `base/5`; template1 at `base/2`; `base/1`
+  holding a stale pre\-S1 postgres copy. The pre\-S1 corpora `:65433` and
+  `:65436` still keep their primary postgres catalogs in `base/1`; S1's
+  migration handles those first.
+- Open\(\), in order:
+  1. S1 `migratePostgresCatalogsToBase5` \(unchanged; it must run first\).
+  2. When `template1_at_base1` is absent from `global/pg_goopg_features`
+     and `base/2` exists, replace `base/1` with `base/2`'s files \(temp,
+     fsync, rename\). Re\-running this after a crash is safe, because redo
+     restarts from the same checkpoint on the same `base/2` image.
+  3. Redo. If step 2 ran during this startup, every record replayed in
+     this redo pass predates S3. Decoding maps the legacy DBOids, applied
+     only to records from this pass: storage 1 → 5 \(pre\-S1 postgres
+     catalogs\), 2 → 1 \(template1\), identity otherwise.
+  4. After the end\-of\-recovery checkpoint, record `template1_at_base1`.
+     A crash before that point repeats steps 2–3.
+- The legacy map is applied at the WAL decode sites:
+  - the block\-reference RelFileLocator \(`pg_xlog_decode.go`\);
+  - the main\-data locators: smgr create/truncate in recovery.go; xact
+    dropped rels in `pg_xact_parse.go`; `seq_log.go`; the 22 goopg\-private
+    `payload[1:5]` decoders in recovery.go; the relmap\-update dbid
+    \(`relmap.go`\).
+  - Use one helper, `xlog.legacyRedoDBOid`, which is identity unless the
+    legacy pass is active.
+- Not covered: a goopg standby streaming WAL from an older goopg primary.
+  Mixed\-version goopg replication is unsupported; ledger it.
+
+### S3 verification
+
+- units; initdb two\-restart tests; the template1 namespace tests
+  \(0119\-0006bv\); CREATE DATABASE … TEMPLATE template1.
+- A cluster built by the S2 binary, killed with an unclean WAL tail that
+  touches both template1 and postgres, then opened by S3: the data is
+  correct in both databases. Run it twice: once killed during the S3 redo,
+  once not.
+- A fresh cluster under PG 18.3 cold start: template1 and postgres
+  readable.
+- PG\-interop e2e and the Recovery ports.
+- spotcheck, sf025 \(the shipped SF0.25 corpus migrates; idempotent\),
+  acceptance, fire\-set.
 
 ## Risks
 
