@@ -42,3 +42,29 @@ func TestPgClassBootstrapRelACLs(t *testing.T) {
 		t.Fatal("no bootstrap relation received an ACL")
 	}
 }
+
+// TestPgProcBootstrapACLs guards M0149-0001g slice 13: every built-in function
+// a PG 18.3 initdb leaves with a proacl gets it on its bootstrap pg_proc row,
+// as a one-dimensional aclitem[]; every other row keeps NULL.
+func TestPgProcBootstrapACLs(t *testing.T) {
+	have := map[uint32]bool{}
+	for _, e := range pgProcInitialEntries() {
+		have[e.OID] = true
+		d := pgProcRow(e)[29]
+		_, want := pgProcInitdbProACL[e.OID]
+		if want != !d.IsNull() {
+			t.Errorf("function %d (%s): proacl set=%v, want %v", e.OID, e.Name, !d.IsNull(), want)
+			continue
+		}
+		if want {
+			if b := d.BytesValue(); len(b) < 24 || b[4] != 1 {
+				t.Errorf("function %d (%s): proacl is not a one-dimensional aclitem[]", e.OID, e.Name)
+			}
+		}
+	}
+	for oid := range pgProcInitdbProACL {
+		if !have[oid] {
+			t.Errorf("function %d has a PG initdb proacl but no goopg bootstrap pg_proc row", oid)
+		}
+	}
+}

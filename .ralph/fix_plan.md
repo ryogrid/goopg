@@ -12083,6 +12083,31 @@ verify each at HEAD when the task starts.
       set, regress A/B on 7 privilege cases \(no movement\), spotcheck,
       sf025 99, acceptance.
     Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 13: pg\_proc.proacl equals a PG 18.3 initdb, and aclitem\[\] is 8\-byte aligned.
+    - Bootstrap pg\_proc rows carry the 66 proacl values a PG initdb leaves.
+      system\_functions.sql REVOKEs EXECUTE from PUBLIC \(pg\_ls\_dir,
+      pg\_read\_file, signalling, replication control\) and GRANTs some of
+      them to pg\_monitor and pg\_read\_all\_stats.
+    - The table comes from scripts/gen\-pg\-initdb\-acls.sh, which supersedes
+      slice 12's gen\-pg\-class\-relacl.sh. One generated file,
+      pg\_initdb\_acls\_generated.go, now holds relacl and proacl.
+    - Found while verifying: \_aclitem is typalign 'd' \(AclMode is 64\-bit
+      since PG 16\). goopg aligned it to 4:
+      - The zero pad byte made a hosted PG align to 8 inside the array header.
+      - Reading a non\-NULL proacl asserted in execTuples.c.
+      - Fixed in all three siblings: catalog.PhysicalTypeAlign \(heap
+        codec\), initdb pgTypeAlignChar \(pg\_attribute rows\), and the
+        relcache init\-file attalign. The latter now takes a varlena's
+        typalign instead of 'i' from attlen alone.
+    - PG cold start: proacl is identical to a PG initdb \(66/66\).
+      - A plain user is denied pg\_ls\_dir; a pg\_monitor member runs
+        pg\_ls\_waldir.
+      - pg\_proc.proacl attalign is 'd'; database\-wide VACUUM passes.
+    - Old\-data check: a datacl written by the previous binary reloads
+      intact under the new one.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      7 privilege cases \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

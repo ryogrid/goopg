@@ -2196,7 +2196,7 @@ func buildPgAttributeBlob(a nailedAttr) []byte {
 		buf[86] = 1
 	}
 	buf[82] = pgTypeIsByVal(a.TypeOID) // attbyval
-	buf[83] = pgAlignChar(a.Len)         // attalign
+	buf[83] = pgAttrAlignChar(a)         // attalign
 	buf[84] = 'p'                       // attstorage = 'p' (plain)
 	buf[92] = 1                  // attislocal = true
 	if a.IsDropped {
@@ -2216,6 +2216,17 @@ func pgTypeIsByVal(oid uint32) byte {
 }
 
 // pgAlignChar returns the PG alignment character for a given attlen.
+// pgAttrAlignChar is a nailed attribute's attalign: the fixed-length rule of
+// pgAlignChar, but for a varlena the type's own typalign (pgTypeAlignChar) —
+// a varlena is not uniformly 'i': _aclitem, anyarray and _pg_statistic are 'd'
+// (M0149-0001g slice 13; the init-file descriptor must agree with pg_attribute).
+func pgAttrAlignChar(a nailedAttr) byte {
+	if a.Len == -1 {
+		return pgTypeAlignChar(a.TypeOID)[0]
+	}
+	return pgAlignChar(a.Len)
+}
+
 func pgAlignChar(l int16) byte {
 	switch {
 	case l == 1:

@@ -40,9 +40,9 @@ func TestPgProcSeedLeavesAbsentVarlenaAttrsNull(t *testing.T) {
 	if len(entries) == 0 {
 		t.Fatal("pg_proc seed data is empty")
 	}
-	// proconfig/proacl/probin/protrftypes are absent for ALL seed entries
-	// (goopg seeds no per-function GUCs, grants, C-language binaries or
-	// transforms), so those four are unconditional. prosqlbody is absent for
+	// proconfig/probin/protrftypes are absent for ALL seed entries (goopg seeds
+	// no per-function GUCs, C-language binaries or transforms), and proacl for
+	// every function PG's initdb leaves at the default. prosqlbody is absent for
 	// every seed row EXCEPT the 10 information_schema helpers that carry a
 	// captured SQL body (M0133-S2) — and for those it must be a genuine node
 	// tree (nailedProcSqlBody), never an empty shell.
@@ -52,6 +52,12 @@ func TestPgProcSeedLeavesAbsentVarlenaAttrsNull(t *testing.T) {
 			t.Fatalf("oid=%d: pgProcRow len=%d, want 30", e.OID, len(row))
 		}
 		for _, idx := range []int{24, 26, 28, 29} {
+			// proacl carries a real ACL exactly for the functions a PG 18.3
+			// initdb REVOKEs/GRANTs (pgProcInitdbProACL, M0149-0001g slice 13);
+			// TestPgProcBootstrapACLs checks those. Never an empty shell.
+			if _, hasACL := pgProcInitdbProACL[e.OID]; idx == 29 && hasACL {
+				continue
+			}
 			if !row[idx].IsNull() {
 				t.Fatalf("oid=%d (%s): %s is NOT NULL — an empty varlena shell here "+
 					"aborts a hosted PG (M0131-S13)", e.OID, e.Name, nullable[idx])

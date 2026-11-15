@@ -3211,7 +3211,7 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		executor.NullDatum,                     // 27 probin
 		sqlBody,                                // 28 prosqlbody (NULL ⇒ PG executes prosrc)
 		executor.NullDatum,                     // 29 proconfig (NULL ⇒ no fmgr_security_definer)
-		executor.NullDatum,                     // 30 proacl (NULL ⇒ owner + PUBLIC EXECUTE default)
+		pgProcBootstrapACL(e.OID),              // 30 proacl: PG initdb's REVOKE/GRANT result, else NULL (owner + PUBLIC EXECUTE)
 	}
 }
 
@@ -6915,9 +6915,14 @@ func pgTypeAlignChar(oid uint32) string {
 		return "c"
 	case 21:
 		return "s"
-	case 23, 26, 700, 194, 1009, 1034, 24, 325, 269, 30, 22, 1002, 1028, 3361, 3402, 5017:
+	case 23, 26, 700, 194, 1009, 24, 325, 269, 30, 22, 1002, 1028, 3361, 3402, 5017:
 		return "i"
 	case 20, 701, 10028, 3220,
+		// _aclitem (1034) is typalign 'd' (aclitem carries a 64-bit AclMode
+		// since PG 16). It had been grouped with the 'i' varlenas; harmless
+		// while every ACL column was NULL or sat on an 8-byte boundary, fatal
+		// for the first non-NULL proacl (M0149-0001g slice 13).
+		1034,
 		// anyarray (2277) is typalign='d', not 'i'
 		// (postgres/src/include/catalog/pg_type.dat:573). It had been grouped
 		// with the 'i' varlenas above, which under-declared the alignment of

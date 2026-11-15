@@ -625,6 +625,17 @@ Key observation: PG compatibility constrains only the **displayed** and
   pg\_class\-only writer did not, which went unnoticed until relacl became
   NULL. All bootstrap heap writers now go through `buildMultiPageHeapFile`.
 
+## Follow\-up: M0149\-0001g slice 13 — proacl, and aclitem\[\] alignment \(2026\-11\-16\)
+
+- `scripts/gen-pg-initdb-acls.sh` generates `pg_initdb_acls_generated.go`
+  with both initdb ACL tables:
+  - relacl, keyed by `nspname.relname`;
+  - proacl, keyed by function OID.
+- `_aclitem` is typalign 'd'. The heap codec \(`catalog.PhysicalTypeAlign`\),
+  the pg\_attribute rows \(`pgTypeAlignChar`\) and the relcache init file
+  \(`pgAttrAlignChar`\) must all agree on that. A varlena's attalign comes
+  from its type, not from attlen.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

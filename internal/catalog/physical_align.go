@@ -49,8 +49,17 @@ func PhysicalTypeAlign(t Type, tname string) int {
 		// exceed a Datum but carry no field wider than a byte. M0119-0006.
 		"uuid":
 		return 1 // PG 'c' alignment (fixed-size, 1-byte aligned)
-	case "aclitem[]", "_aclitem", "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "char[]", "_char", "float4[]", "_float4", "pg_node_tree", "oidvector", "int2vector":
+	case "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "char[]", "_char", "float4[]", "_float4", "pg_node_tree", "oidvector", "int2vector":
 		return 4 // PG 'i' alignment for varlena ArrayType / pg_node_tree / oidvector / int2vector
+	case "aclitem[]", "_aclitem":
+		// _aclitem (OID 1034) is typalign 'd' since PG 16 made AclMode 64-bit
+		// (pg_type.dat: aclitem typalign 'd'). 4-byte padding left a zero byte
+		// that a hosted PG's att_align_pointer took as alignment padding and
+		// skipped to the next 8-byte boundary, landing inside the array header:
+		// reading a non-NULL proacl asserted in slot_deform_heap_tuple
+		// (execTuples.c). Sibling of initdb.pgTypeAlignChar(1034).
+		// M0149-0001g slice 13.
+		return 8
 	case "anyarray":
 		// anyarray (OID 2277) is typalign='d' — 8 bytes, NOT the 'i' every
 		// other varlena array uses (postgres/src/include/catalog/pg_type.dat:573).
