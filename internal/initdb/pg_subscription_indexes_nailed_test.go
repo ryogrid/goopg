@@ -65,7 +65,7 @@ func TestNailedSharedRelsContainsPgSubscriptionIndexes(t *testing.T) {
 func TestPgSubscriptionIndexInitialEntries(t *testing.T) {
 	const (
 		oidOpsID    uint32 = 1981
-		nameOpsID   uint32 = 1986
+		nameOpsID   uint32 = 10028
 		cCollation  uint32 = 950
 	)
 	type want struct {

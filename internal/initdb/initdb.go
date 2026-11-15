@@ -3268,128 +3268,131 @@ func pgOpclassInitialEntries() []pgOpclassEntry {
 		amHash      uint32 = 405
 		amGist      uint32 = 783
 		amGin       uint32 = 2742
-		amBrin      uint32 = 4000
-		amSpgist    uint32 = 3580
+		amBrin      uint32 = 3580 // BRIN_AM_OID (pg_am.dat); was swapped with spgist before M0149-0001g slice 7
+		amSpgist    uint32 = 4000 // SPGIST_AM_OID
 	)
-	// Entries with explicit OIDs from pg_opclass_d.h / pg_opclass.dat.
-	// Entries without explicit OIDs in pg_opclass.dat use synthetic OIDs
-	// starting at 9000, assigned in dat-file order.
+	// OIDs are PostgreSQL 18.3's: the explicit ones from pg_opclass.dat and,
+	// for the rest, the ones genbki assigns from 10000 in dat-file order
+	// (postgres/src/include/catalog/postgres.bki). pg_index.indclass and
+	// every OID-keyed lookup on a PG node depend on them — goopg's former
+	// synthetic 9000-series / 1984-1987 OIDs made PG fail "could not find
+	// tuple for opclass 10012" (M0149-0001g slice 7).
 	return []pgOpclassEntry{
 		// btree/array_ops
-		{OID: 9000, Method: amBtree, Name: "array_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 397, IntType: 2277, Default: true, KeyType: 0},
+		{OID: 10000, Method: amBtree, Name: "array_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 397, IntType: 2277, Default: true, KeyType: 0},
 		// hash/array_ops
-		{OID: 9001, Method: amHash, Name: "array_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 627, IntType: 2277, Default: true, KeyType: 0},
+		{OID: 10001, Method: amHash, Name: "array_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 627, IntType: 2277, Default: true, KeyType: 0},
 		// btree/bit_ops
-		{OID: 9002, Method: amBtree, Name: "bit_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 423, IntType: 1560, Default: true, KeyType: 0},
-		// btree/bool_ops — synthetic OID 1984 (no explicit OID in dat; pinned for nailed-index indclass)
-		{OID: 1984, Method: amBtree, Name: "bool_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 424, IntType: 16, Default: true, KeyType: 0},
+		{OID: 10002, Method: amBtree, Name: "bit_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 423, IntType: 1560, Default: true, KeyType: 0},
+		// btree/bool_ops
+		{OID: 10003, Method: amBtree, Name: "bool_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 424, IntType: 16, Default: true, KeyType: 0},
 		// btree/bpchar_ops
-		{OID: 9003, Method: amBtree, Name: "bpchar_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 426, IntType: 1042, Default: true, KeyType: 0},
+		{OID: 10004, Method: amBtree, Name: "bpchar_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 426, IntType: 1042, Default: true, KeyType: 0},
 		// hash/bpchar_ops
-		{OID: 9004, Method: amHash, Name: "bpchar_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 427, IntType: 1042, Default: true, KeyType: 0},
+		{OID: 10005, Method: amHash, Name: "bpchar_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 427, IntType: 1042, Default: true, KeyType: 0},
 		// btree/bytea_ops
-		{OID: 9005, Method: amBtree, Name: "bytea_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 428, IntType: 17, Default: true, KeyType: 0},
-		// btree/char_ops — synthetic OID 1985 (no explicit OID in dat; pinned for nailed-index indclass)
-		{OID: 1985, Method: amBtree, Name: "char_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 429, IntType: 18, Default: true, KeyType: 0},
+		{OID: 10006, Method: amBtree, Name: "bytea_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 428, IntType: 17, Default: true, KeyType: 0},
+		// btree/char_ops
+		{OID: 10007, Method: amBtree, Name: "char_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 429, IntType: 18, Default: true, KeyType: 0},
 		// hash/char_ops
-		{OID: 9006, Method: amHash, Name: "char_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 431, IntType: 18, Default: true, KeyType: 0},
+		{OID: 10008, Method: amHash, Name: "char_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 431, IntType: 18, Default: true, KeyType: 0},
 		// btree/cidr_ops (default=false: inet_ops is the default for inet)
-		{OID: 9007, Method: amBtree, Name: "cidr_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1974, IntType: 869, Default: false, KeyType: 0},
+		{OID: 10009, Method: amBtree, Name: "cidr_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1974, IntType: 869, Default: false, KeyType: 0},
 		// hash/cidr_ops
-		{OID: 9008, Method: amHash, Name: "cidr_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1975, IntType: 869, Default: false, KeyType: 0},
+		{OID: 10010, Method: amHash, Name: "cidr_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1975, IntType: 869, Default: false, KeyType: 0},
 		// btree/date_ops — OID 3122 = DATE_BTREE_OPS_OID
 		{OID: 3122, Method: amBtree, Name: "date_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 434, IntType: 1082, Default: true, KeyType: 0},
 		// hash/date_ops
-		{OID: 9009, Method: amHash, Name: "date_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 435, IntType: 1082, Default: true, KeyType: 0},
+		{OID: 10011, Method: amHash, Name: "date_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 435, IntType: 1082, Default: true, KeyType: 0},
 		// btree/float4_ops
-		{OID: 9010, Method: amBtree, Name: "float4_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1970, IntType: 700, Default: true, KeyType: 0},
+		{OID: 10012, Method: amBtree, Name: "float4_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1970, IntType: 700, Default: true, KeyType: 0},
 		// hash/float4_ops
-		{OID: 9011, Method: amHash, Name: "float4_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1971, IntType: 700, Default: true, KeyType: 0},
+		{OID: 10013, Method: amHash, Name: "float4_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1971, IntType: 700, Default: true, KeyType: 0},
 		// btree/float8_ops — OID 3123 = FLOAT8_BTREE_OPS_OID
 		{OID: 3123, Method: amBtree, Name: "float8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1970, IntType: 701, Default: true, KeyType: 0},
 		// hash/float8_ops
-		{OID: 9012, Method: amHash, Name: "float8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1971, IntType: 701, Default: true, KeyType: 0},
+		{OID: 10014, Method: amHash, Name: "float8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1971, IntType: 701, Default: true, KeyType: 0},
 		// btree/inet_ops
-		{OID: 9013, Method: amBtree, Name: "inet_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1974, IntType: 869, Default: true, KeyType: 0},
+		{OID: 10015, Method: amBtree, Name: "inet_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1974, IntType: 869, Default: true, KeyType: 0},
 		// hash/inet_ops
-		{OID: 9014, Method: amHash, Name: "inet_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1975, IntType: 869, Default: true, KeyType: 0},
+		{OID: 10016, Method: amHash, Name: "inet_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1975, IntType: 869, Default: true, KeyType: 0},
 		// gist/inet_ops (default=false: spgist is the default for inet gist)
-		{OID: 9015, Method: amGist, Name: "inet_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3550, IntType: 869, Default: false, KeyType: 0},
+		{OID: 10017, Method: amGist, Name: "inet_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3550, IntType: 869, Default: false, KeyType: 0},
 		// spgist/inet_ops
-		{OID: 9016, Method: amSpgist, Name: "inet_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3794, IntType: 869, Default: true, KeyType: 0},
+		{OID: 10018, Method: amSpgist, Name: "inet_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3794, IntType: 869, Default: true, KeyType: 0},
 		// btree/int2_ops — OID 1979 = INT2_BTREE_OPS_OID
 		{OID: 1979, Method: amBtree, Name: "int2_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1976, IntType: 21, Default: true, KeyType: 0},
 		// hash/int2_ops
-		{OID: 9017, Method: amHash, Name: "int2_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1977, IntType: 21, Default: true, KeyType: 0},
+		{OID: 10019, Method: amHash, Name: "int2_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1977, IntType: 21, Default: true, KeyType: 0},
 		// btree/int4_ops — OID 1978 = INT4_BTREE_OPS_OID
 		{OID: 1978, Method: amBtree, Name: "int4_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1976, IntType: 23, Default: true, KeyType: 0},
 		// hash/int4_ops
-		{OID: 9018, Method: amHash, Name: "int4_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1977, IntType: 23, Default: true, KeyType: 0},
+		{OID: 10020, Method: amHash, Name: "int4_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1977, IntType: 23, Default: true, KeyType: 0},
 		// btree/int8_ops — OID 3124 = INT8_BTREE_OPS_OID
 		{OID: 3124, Method: amBtree, Name: "int8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1976, IntType: 20, Default: true, KeyType: 0},
 		// hash/int8_ops
-		{OID: 9019, Method: amHash, Name: "int8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1977, IntType: 20, Default: true, KeyType: 0},
+		{OID: 10021, Method: amHash, Name: "int8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1977, IntType: 20, Default: true, KeyType: 0},
 		// btree/interval_ops
-		{OID: 9020, Method: amBtree, Name: "interval_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1982, IntType: 1186, Default: true, KeyType: 0},
+		{OID: 10022, Method: amBtree, Name: "interval_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1982, IntType: 1186, Default: true, KeyType: 0},
 		// hash/interval_ops
-		{OID: 9021, Method: amHash, Name: "interval_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1983, IntType: 1186, Default: true, KeyType: 0},
+		{OID: 10023, Method: amHash, Name: "interval_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1983, IntType: 1186, Default: true, KeyType: 0},
 		// btree/macaddr_ops
-		{OID: 9022, Method: amBtree, Name: "macaddr_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1984, IntType: 829, Default: true, KeyType: 0},
+		{OID: 10024, Method: amBtree, Name: "macaddr_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1984, IntType: 829, Default: true, KeyType: 0},
 		// hash/macaddr_ops
-		{OID: 9023, Method: amHash, Name: "macaddr_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1985, IntType: 829, Default: true, KeyType: 0},
+		{OID: 10025, Method: amHash, Name: "macaddr_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1985, IntType: 829, Default: true, KeyType: 0},
 		// btree/macaddr8_ops
-		{OID: 9024, Method: amBtree, Name: "macaddr8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3371, IntType: 774, Default: true, KeyType: 0},
+		{OID: 10026, Method: amBtree, Name: "macaddr8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3371, IntType: 774, Default: true, KeyType: 0},
 		// hash/macaddr8_ops
-		{OID: 9025, Method: amHash, Name: "macaddr8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3372, IntType: 774, Default: true, KeyType: 0},
-		// btree/name_ops — synthetic OID 1986 (no explicit OID; pinned for nailed-index indclass)
+		{OID: 10027, Method: amHash, Name: "macaddr8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3372, IntType: 774, Default: true, KeyType: 0},
+		// btree/name_ops
 		// name_ops keys are stored as cstring (2275) for index space — see pg_opclass.dat comment.
-		{OID: 1986, Method: amBtree, Name: "name_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1994, IntType: 19, Default: true, KeyType: 2275},
+		{OID: 10028, Method: amBtree, Name: "name_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1994, IntType: 19, Default: true, KeyType: 2275},
 		// hash/name_ops
-		{OID: 9026, Method: amHash, Name: "name_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1995, IntType: 19, Default: true, KeyType: 0},
+		{OID: 10029, Method: amHash, Name: "name_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1995, IntType: 19, Default: true, KeyType: 0},
 		// btree/numeric_ops — OID 3125 = NUMERIC_BTREE_OPS_OID
 		{OID: 3125, Method: amBtree, Name: "numeric_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1988, IntType: 1700, Default: true, KeyType: 0},
 		// hash/numeric_ops
-		{OID: 9027, Method: amHash, Name: "numeric_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1998, IntType: 1700, Default: true, KeyType: 0},
+		{OID: 10030, Method: amHash, Name: "numeric_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1998, IntType: 1700, Default: true, KeyType: 0},
 		// btree/oid_ops — OID 1981 = OID_BTREE_OPS_OID
 		{OID: 1981, Method: amBtree, Name: "oid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1989, IntType: 26, Default: true, KeyType: 0},
 		// hash/oid_ops
-		{OID: 9028, Method: amHash, Name: "oid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1990, IntType: 26, Default: true, KeyType: 0},
-		// btree/oidvector_ops — synthetic OID 1987 (pinned for nailed-index indclass)
-		{OID: 1987, Method: amBtree, Name: "oidvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1991, IntType: 30, Default: true, KeyType: 0},
+		{OID: 10031, Method: amHash, Name: "oid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1990, IntType: 26, Default: true, KeyType: 0},
+		// btree/oidvector_ops
+		{OID: 10032, Method: amBtree, Name: "oidvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1991, IntType: 30, Default: true, KeyType: 0},
 		// hash/oidvector_ops
-		{OID: 9029, Method: amHash, Name: "oidvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1992, IntType: 30, Default: true, KeyType: 0},
+		{OID: 10033, Method: amHash, Name: "oidvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1992, IntType: 30, Default: true, KeyType: 0},
 		// btree/record_ops
-		{OID: 9030, Method: amBtree, Name: "record_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2994, IntType: 2249, Default: true, KeyType: 0},
+		{OID: 10034, Method: amBtree, Name: "record_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2994, IntType: 2249, Default: true, KeyType: 0},
 		// hash/record_ops
-		{OID: 9031, Method: amHash, Name: "record_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 6194, IntType: 2249, Default: true, KeyType: 0},
+		{OID: 10035, Method: amHash, Name: "record_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 6194, IntType: 2249, Default: true, KeyType: 0},
 		// btree/record_image_ops (default=false: record_ops is the default)
-		{OID: 9032, Method: amBtree, Name: "record_image_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3194, IntType: 2249, Default: false, KeyType: 0},
+		{OID: 10036, Method: amBtree, Name: "record_image_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3194, IntType: 2249, Default: false, KeyType: 0},
 		// btree/text_ops — OID 3126 = TEXT_BTREE_OPS_OID
 		{OID: 3126, Method: amBtree, Name: "text_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1994, IntType: 25, Default: true, KeyType: 0},
 		// hash/text_ops
-		{OID: 9033, Method: amHash, Name: "text_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1995, IntType: 25, Default: true, KeyType: 0},
+		{OID: 10037, Method: amHash, Name: "text_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1995, IntType: 25, Default: true, KeyType: 0},
 		// btree/time_ops
-		{OID: 9034, Method: amBtree, Name: "time_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1996, IntType: 1083, Default: true, KeyType: 0},
+		{OID: 10038, Method: amBtree, Name: "time_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1996, IntType: 1083, Default: true, KeyType: 0},
 		// hash/time_ops
-		{OID: 9035, Method: amHash, Name: "time_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1997, IntType: 1083, Default: true, KeyType: 0},
+		{OID: 10039, Method: amHash, Name: "time_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1997, IntType: 1083, Default: true, KeyType: 0},
 		// btree/timestamptz_ops — OID 3127 = TIMESTAMPTZ_BTREE_OPS_OID
 		{OID: 3127, Method: amBtree, Name: "timestamptz_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 434, IntType: 1184, Default: true, KeyType: 0},
 		// hash/timestamptz_ops
-		{OID: 9036, Method: amHash, Name: "timestamptz_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1999, IntType: 1184, Default: true, KeyType: 0},
+		{OID: 10040, Method: amHash, Name: "timestamptz_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1999, IntType: 1184, Default: true, KeyType: 0},
 		// btree/timetz_ops
-		{OID: 9037, Method: amBtree, Name: "timetz_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2000, IntType: 1266, Default: true, KeyType: 0},
+		{OID: 10041, Method: amBtree, Name: "timetz_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2000, IntType: 1266, Default: true, KeyType: 0},
 		// hash/timetz_ops
-		{OID: 9038, Method: amHash, Name: "timetz_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2001, IntType: 1266, Default: true, KeyType: 0},
+		{OID: 10042, Method: amHash, Name: "timetz_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2001, IntType: 1266, Default: true, KeyType: 0},
 		// btree/varbit_ops
-		{OID: 9039, Method: amBtree, Name: "varbit_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2002, IntType: 1562, Default: true, KeyType: 0},
+		{OID: 10043, Method: amBtree, Name: "varbit_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2002, IntType: 1562, Default: true, KeyType: 0},
 		// btree/varchar_ops (default=false: text_ops is the default for varchar=25)
-		{OID: 9040, Method: amBtree, Name: "varchar_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1994, IntType: 25, Default: false, KeyType: 0},
+		{OID: 10044, Method: amBtree, Name: "varchar_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1994, IntType: 25, Default: false, KeyType: 0},
 		// hash/varchar_ops
-		{OID: 9041, Method: amHash, Name: "varchar_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1995, IntType: 25, Default: false, KeyType: 0},
+		{OID: 10045, Method: amHash, Name: "varchar_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1995, IntType: 25, Default: false, KeyType: 0},
 		// btree/timestamp_ops — OID 3128 = TIMESTAMP_BTREE_OPS_OID
 		{OID: 3128, Method: amBtree, Name: "timestamp_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 434, IntType: 1114, Default: true, KeyType: 0},
 		// hash/timestamp_ops
-		{OID: 9042, Method: amHash, Name: "timestamp_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2040, IntType: 1114, Default: true, KeyType: 0},
+		{OID: 10046, Method: amHash, Name: "timestamp_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2040, IntType: 1114, Default: true, KeyType: 0},
 		// btree/text_pattern_ops — OID 4217 = TEXT_BTREE_PATTERN_OPS_OID
 		{OID: 4217, Method: amBtree, Name: "text_pattern_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2095, IntType: 25, Default: false, KeyType: 0},
 		// btree/varchar_pattern_ops — OID 4218 = VARCHAR_BTREE_PATTERN_OPS_OID
@@ -3397,239 +3400,239 @@ func pgOpclassInitialEntries() []pgOpclassEntry {
 		// btree/bpchar_pattern_ops — OID 4219 = BPCHAR_BTREE_PATTERN_OPS_OID
 		{OID: 4219, Method: amBtree, Name: "bpchar_pattern_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2097, IntType: 1042, Default: false, KeyType: 0},
 		// btree/money_ops
-		{OID: 9043, Method: amBtree, Name: "money_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2099, IntType: 790, Default: true, KeyType: 0},
+		{OID: 10047, Method: amBtree, Name: "money_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2099, IntType: 790, Default: true, KeyType: 0},
 		// hash/bool_ops
-		{OID: 9044, Method: amHash, Name: "bool_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2222, IntType: 16, Default: true, KeyType: 0},
+		{OID: 10048, Method: amHash, Name: "bool_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2222, IntType: 16, Default: true, KeyType: 0},
 		// hash/bytea_ops
-		{OID: 9045, Method: amHash, Name: "bytea_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2223, IntType: 17, Default: true, KeyType: 0},
+		{OID: 10049, Method: amHash, Name: "bytea_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2223, IntType: 17, Default: true, KeyType: 0},
 		// btree/tid_ops
-		{OID: 9046, Method: amBtree, Name: "tid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2789, IntType: 27, Default: true, KeyType: 0},
+		{OID: 10050, Method: amBtree, Name: "tid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2789, IntType: 27, Default: true, KeyType: 0},
 		// hash/xid_ops
-		{OID: 9047, Method: amHash, Name: "xid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2225, IntType: 28, Default: true, KeyType: 0},
+		{OID: 10051, Method: amHash, Name: "xid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2225, IntType: 28, Default: true, KeyType: 0},
 		// hash/xid8_ops
-		{OID: 9048, Method: amHash, Name: "xid8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 5032, IntType: 5069, Default: true, KeyType: 0},
+		{OID: 10052, Method: amHash, Name: "xid8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 5032, IntType: 5069, Default: true, KeyType: 0},
 		// btree/xid8_ops
-		{OID: 9049, Method: amBtree, Name: "xid8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 5067, IntType: 5069, Default: true, KeyType: 0},
+		{OID: 10053, Method: amBtree, Name: "xid8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 5067, IntType: 5069, Default: true, KeyType: 0},
 		// hash/cid_ops
-		{OID: 9050, Method: amHash, Name: "cid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2226, IntType: 29, Default: true, KeyType: 0},
+		{OID: 10054, Method: amHash, Name: "cid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2226, IntType: 29, Default: true, KeyType: 0},
 		// hash/tid_ops
-		{OID: 9051, Method: amHash, Name: "tid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2227, IntType: 27, Default: true, KeyType: 0},
+		{OID: 10055, Method: amHash, Name: "tid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2227, IntType: 27, Default: true, KeyType: 0},
 		// hash/text_pattern_ops
-		{OID: 9052, Method: amHash, Name: "text_pattern_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2229, IntType: 25, Default: false, KeyType: 0},
+		{OID: 10056, Method: amHash, Name: "text_pattern_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2229, IntType: 25, Default: false, KeyType: 0},
 		// hash/varchar_pattern_ops
-		{OID: 9053, Method: amHash, Name: "varchar_pattern_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2229, IntType: 25, Default: false, KeyType: 0},
+		{OID: 10057, Method: amHash, Name: "varchar_pattern_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2229, IntType: 25, Default: false, KeyType: 0},
 		// hash/bpchar_pattern_ops
-		{OID: 9054, Method: amHash, Name: "bpchar_pattern_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2231, IntType: 1042, Default: false, KeyType: 0},
+		{OID: 10058, Method: amHash, Name: "bpchar_pattern_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2231, IntType: 1042, Default: false, KeyType: 0},
 		// hash/aclitem_ops
-		{OID: 9055, Method: amHash, Name: "aclitem_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2235, IntType: 1033, Default: true, KeyType: 0},
+		{OID: 10059, Method: amHash, Name: "aclitem_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2235, IntType: 1033, Default: true, KeyType: 0},
 		// gist/box_ops
-		{OID: 9056, Method: amGist, Name: "box_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2593, IntType: 603, Default: true, KeyType: 0},
+		{OID: 10060, Method: amGist, Name: "box_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2593, IntType: 603, Default: true, KeyType: 0},
 		// gist/point_ops (opckeytype=box 603)
-		{OID: 9057, Method: amGist, Name: "point_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1029, IntType: 600, Default: true, KeyType: 603},
+		{OID: 10061, Method: amGist, Name: "point_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1029, IntType: 600, Default: true, KeyType: 603},
 		// gist/poly_ops (opckeytype=box 603)
-		{OID: 9058, Method: amGist, Name: "poly_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2594, IntType: 604, Default: true, KeyType: 603},
+		{OID: 10062, Method: amGist, Name: "poly_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2594, IntType: 604, Default: true, KeyType: 603},
 		// gist/circle_ops (opckeytype=box 603)
-		{OID: 9059, Method: amGist, Name: "circle_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2595, IntType: 718, Default: true, KeyType: 603},
+		{OID: 10063, Method: amGist, Name: "circle_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2595, IntType: 718, Default: true, KeyType: 603},
 		// gin/array_ops (opckeytype=anyelement 2283)
-		{OID: 9060, Method: amGin, Name: "array_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2745, IntType: 2277, Default: true, KeyType: 2283},
+		{OID: 10064, Method: amGin, Name: "array_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2745, IntType: 2277, Default: true, KeyType: 2283},
 		// btree/uuid_ops
-		{OID: 9061, Method: amBtree, Name: "uuid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2968, IntType: 2950, Default: true, KeyType: 0},
+		{OID: 10065, Method: amBtree, Name: "uuid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2968, IntType: 2950, Default: true, KeyType: 0},
 		// hash/uuid_ops
-		{OID: 9062, Method: amHash, Name: "uuid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2969, IntType: 2950, Default: true, KeyType: 0},
+		{OID: 10066, Method: amHash, Name: "uuid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2969, IntType: 2950, Default: true, KeyType: 0},
 		// btree/pg_lsn_ops
-		{OID: 9063, Method: amBtree, Name: "pg_lsn_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3253, IntType: 3220, Default: true, KeyType: 0},
+		{OID: 10067, Method: amBtree, Name: "pg_lsn_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3253, IntType: 3220, Default: true, KeyType: 0},
 		// hash/pg_lsn_ops
-		{OID: 9064, Method: amHash, Name: "pg_lsn_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3254, IntType: 3220, Default: true, KeyType: 0},
+		{OID: 10068, Method: amHash, Name: "pg_lsn_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3254, IntType: 3220, Default: true, KeyType: 0},
 		// btree/enum_ops (opcintype=anyenum 3500)
-		{OID: 9065, Method: amBtree, Name: "enum_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3522, IntType: 3500, Default: true, KeyType: 0},
+		{OID: 10069, Method: amBtree, Name: "enum_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3522, IntType: 3500, Default: true, KeyType: 0},
 		// hash/enum_ops
-		{OID: 9066, Method: amHash, Name: "enum_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3523, IntType: 3500, Default: true, KeyType: 0},
+		{OID: 10070, Method: amHash, Name: "enum_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3523, IntType: 3500, Default: true, KeyType: 0},
 		// btree/tsvector_ops
-		{OID: 9067, Method: amBtree, Name: "tsvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3626, IntType: 3614, Default: true, KeyType: 0},
+		{OID: 10071, Method: amBtree, Name: "tsvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3626, IntType: 3614, Default: true, KeyType: 0},
 		// gist/tsvector_ops (opckeytype=gtsvector 3642)
-		{OID: 9068, Method: amGist, Name: "tsvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3655, IntType: 3614, Default: true, KeyType: 3642},
+		{OID: 10072, Method: amGist, Name: "tsvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3655, IntType: 3614, Default: true, KeyType: 3642},
 		// gin/tsvector_ops (opckeytype=text 25)
-		{OID: 9069, Method: amGin, Name: "tsvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3659, IntType: 3614, Default: true, KeyType: 25},
+		{OID: 10073, Method: amGin, Name: "tsvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3659, IntType: 3614, Default: true, KeyType: 25},
 		// btree/tsquery_ops (opcintype=tsquery 3615)
-		{OID: 9070, Method: amBtree, Name: "tsquery_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3683, IntType: 3615, Default: true, KeyType: 0},
+		{OID: 10074, Method: amBtree, Name: "tsquery_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3683, IntType: 3615, Default: true, KeyType: 0},
 		// gist/tsquery_ops (opckeytype=int8 20)
-		{OID: 9071, Method: amGist, Name: "tsquery_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3702, IntType: 3615, Default: true, KeyType: 20},
+		{OID: 10075, Method: amGist, Name: "tsquery_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3702, IntType: 3615, Default: true, KeyType: 20},
 		// btree/range_ops (opcintype=anyrange 3831)
-		{OID: 9072, Method: amBtree, Name: "range_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3901, IntType: 3831, Default: true, KeyType: 0},
+		{OID: 10076, Method: amBtree, Name: "range_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3901, IntType: 3831, Default: true, KeyType: 0},
 		// hash/range_ops
-		{OID: 9073, Method: amHash, Name: "range_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3903, IntType: 3831, Default: true, KeyType: 0},
+		{OID: 10077, Method: amHash, Name: "range_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3903, IntType: 3831, Default: true, KeyType: 0},
 		// gist/range_ops
-		{OID: 9074, Method: amGist, Name: "range_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3919, IntType: 3831, Default: true, KeyType: 0},
+		{OID: 10078, Method: amGist, Name: "range_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3919, IntType: 3831, Default: true, KeyType: 0},
 		// spgist/range_ops
-		{OID: 9075, Method: amSpgist, Name: "range_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3474, IntType: 3831, Default: true, KeyType: 0},
+		{OID: 10079, Method: amSpgist, Name: "range_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3474, IntType: 3831, Default: true, KeyType: 0},
 		// btree/multirange_ops (opcintype=anymultirange 4537)
-		{OID: 9076, Method: amBtree, Name: "multirange_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4199, IntType: 4537, Default: true, KeyType: 0},
+		{OID: 10080, Method: amBtree, Name: "multirange_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4199, IntType: 4537, Default: true, KeyType: 0},
 		// hash/multirange_ops
-		{OID: 9077, Method: amHash, Name: "multirange_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4225, IntType: 4537, Default: true, KeyType: 0},
+		{OID: 10081, Method: amHash, Name: "multirange_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4225, IntType: 4537, Default: true, KeyType: 0},
 		// gist/multirange_ops (opckeytype=anyrange 3831)
-		{OID: 9078, Method: amGist, Name: "multirange_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 6158, IntType: 4537, Default: true, KeyType: 3831},
+		{OID: 10082, Method: amGist, Name: "multirange_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 6158, IntType: 4537, Default: true, KeyType: 3831},
 		// spgist/box_ops
-		{OID: 9079, Method: amSpgist, Name: "box_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 5000, IntType: 603, Default: true, KeyType: 0},
+		{OID: 10083, Method: amSpgist, Name: "box_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 5000, IntType: 603, Default: true, KeyType: 0},
 		// spgist/quad_point_ops
-		{OID: 9080, Method: amSpgist, Name: "quad_point_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4015, IntType: 600, Default: true, KeyType: 0},
+		{OID: 10084, Method: amSpgist, Name: "quad_point_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4015, IntType: 600, Default: true, KeyType: 0},
 		// spgist/kd_point_ops (default=false: quad_point_ops is default)
-		{OID: 9081, Method: amSpgist, Name: "kd_point_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4016, IntType: 600, Default: false, KeyType: 0},
+		{OID: 10085, Method: amSpgist, Name: "kd_point_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4016, IntType: 600, Default: false, KeyType: 0},
 		// spgist/text_ops
-		{OID: 9082, Method: amSpgist, Name: "text_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4017, IntType: 25, Default: true, KeyType: 0},
+		{OID: 10086, Method: amSpgist, Name: "text_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4017, IntType: 25, Default: true, KeyType: 0},
 		// spgist/poly_ops (opckeytype=box 603)
-		{OID: 9083, Method: amSpgist, Name: "poly_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 5008, IntType: 604, Default: true, KeyType: 603},
+		{OID: 10087, Method: amSpgist, Name: "poly_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 5008, IntType: 604, Default: true, KeyType: 603},
 		// btree/jsonb_ops (opcintype=jsonb 3802)
-		{OID: 9084, Method: amBtree, Name: "jsonb_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4033, IntType: 3802, Default: true, KeyType: 0},
+		{OID: 10088, Method: amBtree, Name: "jsonb_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4033, IntType: 3802, Default: true, KeyType: 0},
 		// hash/jsonb_ops
-		{OID: 9085, Method: amHash, Name: "jsonb_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4034, IntType: 3802, Default: true, KeyType: 0},
+		{OID: 10089, Method: amHash, Name: "jsonb_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4034, IntType: 3802, Default: true, KeyType: 0},
 		// gin/jsonb_ops (opckeytype=text 25)
-		{OID: 9086, Method: amGin, Name: "jsonb_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4036, IntType: 3802, Default: true, KeyType: 25},
+		{OID: 10090, Method: amGin, Name: "jsonb_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4036, IntType: 3802, Default: true, KeyType: 25},
 		// gin/jsonb_path_ops (default=false; opckeytype=int4 23)
-		{OID: 9087, Method: amGin, Name: "jsonb_path_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4037, IntType: 3802, Default: false, KeyType: 23},
+		{OID: 10091, Method: amGin, Name: "jsonb_path_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4037, IntType: 3802, Default: false, KeyType: 23},
 		// brin/bytea_minmax_ops
-		{OID: 9088, Method: amBrin, Name: "bytea_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4064, IntType: 17, Default: true, KeyType: 17},
+		{OID: 10092, Method: amBrin, Name: "bytea_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4064, IntType: 17, Default: true, KeyType: 17},
 		// brin/bytea_bloom_ops
-		{OID: 9089, Method: amBrin, Name: "bytea_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4578, IntType: 17, Default: false, KeyType: 17},
+		{OID: 10093, Method: amBrin, Name: "bytea_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4578, IntType: 17, Default: false, KeyType: 17},
 		// brin/char_minmax_ops
-		{OID: 9090, Method: amBrin, Name: "char_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4062, IntType: 18, Default: true, KeyType: 18},
+		{OID: 10094, Method: amBrin, Name: "char_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4062, IntType: 18, Default: true, KeyType: 18},
 		// brin/char_bloom_ops
-		{OID: 9091, Method: amBrin, Name: "char_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4577, IntType: 18, Default: false, KeyType: 18},
+		{OID: 10095, Method: amBrin, Name: "char_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4577, IntType: 18, Default: false, KeyType: 18},
 		// brin/name_minmax_ops
-		{OID: 9092, Method: amBrin, Name: "name_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4065, IntType: 19, Default: true, KeyType: 19},
+		{OID: 10096, Method: amBrin, Name: "name_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4065, IntType: 19, Default: true, KeyType: 19},
 		// brin/name_bloom_ops
-		{OID: 9093, Method: amBrin, Name: "name_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4579, IntType: 19, Default: false, KeyType: 19},
+		{OID: 10097, Method: amBrin, Name: "name_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4579, IntType: 19, Default: false, KeyType: 19},
 		// brin/int8_minmax_ops
-		{OID: 9094, Method: amBrin, Name: "int8_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4054, IntType: 20, Default: true, KeyType: 20},
+		{OID: 10098, Method: amBrin, Name: "int8_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4054, IntType: 20, Default: true, KeyType: 20},
 		// brin/int8_minmax_multi_ops
-		{OID: 9095, Method: amBrin, Name: "int8_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4602, IntType: 20, Default: false, KeyType: 20},
+		{OID: 10099, Method: amBrin, Name: "int8_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4602, IntType: 20, Default: false, KeyType: 20},
 		// brin/int8_bloom_ops
-		{OID: 9096, Method: amBrin, Name: "int8_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4572, IntType: 20, Default: false, KeyType: 20},
+		{OID: 10100, Method: amBrin, Name: "int8_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4572, IntType: 20, Default: false, KeyType: 20},
 		// brin/int2_minmax_ops
-		{OID: 9097, Method: amBrin, Name: "int2_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4054, IntType: 21, Default: true, KeyType: 21},
+		{OID: 10101, Method: amBrin, Name: "int2_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4054, IntType: 21, Default: true, KeyType: 21},
 		// brin/int2_minmax_multi_ops
-		{OID: 9098, Method: amBrin, Name: "int2_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4602, IntType: 21, Default: false, KeyType: 21},
+		{OID: 10102, Method: amBrin, Name: "int2_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4602, IntType: 21, Default: false, KeyType: 21},
 		// brin/int2_bloom_ops
-		{OID: 9099, Method: amBrin, Name: "int2_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4572, IntType: 21, Default: false, KeyType: 21},
+		{OID: 10103, Method: amBrin, Name: "int2_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4572, IntType: 21, Default: false, KeyType: 21},
 		// brin/int4_minmax_ops
-		{OID: 9100, Method: amBrin, Name: "int4_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4054, IntType: 23, Default: true, KeyType: 23},
+		{OID: 10104, Method: amBrin, Name: "int4_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4054, IntType: 23, Default: true, KeyType: 23},
 		// brin/int4_minmax_multi_ops
-		{OID: 9101, Method: amBrin, Name: "int4_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4602, IntType: 23, Default: false, KeyType: 23},
+		{OID: 10105, Method: amBrin, Name: "int4_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4602, IntType: 23, Default: false, KeyType: 23},
 		// brin/int4_bloom_ops
-		{OID: 9102, Method: amBrin, Name: "int4_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4572, IntType: 23, Default: false, KeyType: 23},
+		{OID: 10106, Method: amBrin, Name: "int4_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4572, IntType: 23, Default: false, KeyType: 23},
 		// brin/text_minmax_ops
-		{OID: 9103, Method: amBrin, Name: "text_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4056, IntType: 25, Default: true, KeyType: 25},
+		{OID: 10107, Method: amBrin, Name: "text_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4056, IntType: 25, Default: true, KeyType: 25},
 		// brin/text_bloom_ops
-		{OID: 9104, Method: amBrin, Name: "text_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4573, IntType: 25, Default: false, KeyType: 25},
+		{OID: 10108, Method: amBrin, Name: "text_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4573, IntType: 25, Default: false, KeyType: 25},
 		// brin/oid_minmax_ops
-		{OID: 9105, Method: amBrin, Name: "oid_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4068, IntType: 26, Default: true, KeyType: 26},
+		{OID: 10109, Method: amBrin, Name: "oid_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4068, IntType: 26, Default: true, KeyType: 26},
 		// brin/oid_minmax_multi_ops
-		{OID: 9106, Method: amBrin, Name: "oid_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4606, IntType: 26, Default: false, KeyType: 26},
+		{OID: 10110, Method: amBrin, Name: "oid_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4606, IntType: 26, Default: false, KeyType: 26},
 		// brin/oid_bloom_ops
-		{OID: 9107, Method: amBrin, Name: "oid_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4580, IntType: 26, Default: false, KeyType: 26},
+		{OID: 10111, Method: amBrin, Name: "oid_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4580, IntType: 26, Default: false, KeyType: 26},
 		// brin/tid_minmax_ops
-		{OID: 9108, Method: amBrin, Name: "tid_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4069, IntType: 27, Default: true, KeyType: 27},
+		{OID: 10112, Method: amBrin, Name: "tid_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4069, IntType: 27, Default: true, KeyType: 27},
 		// brin/tid_bloom_ops
-		{OID: 9109, Method: amBrin, Name: "tid_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4581, IntType: 27, Default: false, KeyType: 27},
+		{OID: 10113, Method: amBrin, Name: "tid_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4581, IntType: 27, Default: false, KeyType: 27},
 		// brin/tid_minmax_multi_ops
-		{OID: 9110, Method: amBrin, Name: "tid_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4607, IntType: 27, Default: false, KeyType: 27},
+		{OID: 10114, Method: amBrin, Name: "tid_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4607, IntType: 27, Default: false, KeyType: 27},
 		// brin/float4_minmax_ops
-		{OID: 9111, Method: amBrin, Name: "float4_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4070, IntType: 700, Default: true, KeyType: 700},
+		{OID: 10115, Method: amBrin, Name: "float4_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4070, IntType: 700, Default: true, KeyType: 700},
 		// brin/float4_minmax_multi_ops
-		{OID: 9112, Method: amBrin, Name: "float4_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4608, IntType: 700, Default: false, KeyType: 700},
+		{OID: 10116, Method: amBrin, Name: "float4_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4608, IntType: 700, Default: false, KeyType: 700},
 		// brin/float4_bloom_ops
-		{OID: 9113, Method: amBrin, Name: "float4_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4582, IntType: 700, Default: false, KeyType: 700},
+		{OID: 10117, Method: amBrin, Name: "float4_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4582, IntType: 700, Default: false, KeyType: 700},
 		// brin/float8_minmax_ops
-		{OID: 9114, Method: amBrin, Name: "float8_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4070, IntType: 701, Default: true, KeyType: 701},
+		{OID: 10118, Method: amBrin, Name: "float8_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4070, IntType: 701, Default: true, KeyType: 701},
 		// brin/float8_minmax_multi_ops
-		{OID: 9115, Method: amBrin, Name: "float8_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4608, IntType: 701, Default: false, KeyType: 701},
+		{OID: 10119, Method: amBrin, Name: "float8_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4608, IntType: 701, Default: false, KeyType: 701},
 		// brin/float8_bloom_ops
-		{OID: 9116, Method: amBrin, Name: "float8_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4582, IntType: 701, Default: false, KeyType: 701},
+		{OID: 10120, Method: amBrin, Name: "float8_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4582, IntType: 701, Default: false, KeyType: 701},
 		// brin/macaddr_minmax_ops
-		{OID: 9117, Method: amBrin, Name: "macaddr_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4074, IntType: 829, Default: true, KeyType: 829},
+		{OID: 10121, Method: amBrin, Name: "macaddr_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4074, IntType: 829, Default: true, KeyType: 829},
 		// brin/macaddr_minmax_multi_ops
-		{OID: 9118, Method: amBrin, Name: "macaddr_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4609, IntType: 829, Default: false, KeyType: 829},
+		{OID: 10122, Method: amBrin, Name: "macaddr_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4609, IntType: 829, Default: false, KeyType: 829},
 		// brin/macaddr_bloom_ops
-		{OID: 9119, Method: amBrin, Name: "macaddr_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4583, IntType: 829, Default: false, KeyType: 829},
+		{OID: 10123, Method: amBrin, Name: "macaddr_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4583, IntType: 829, Default: false, KeyType: 829},
 		// brin/macaddr8_minmax_ops
-		{OID: 9120, Method: amBrin, Name: "macaddr8_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4109, IntType: 774, Default: true, KeyType: 774},
+		{OID: 10124, Method: amBrin, Name: "macaddr8_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4109, IntType: 774, Default: true, KeyType: 774},
 		// brin/macaddr8_minmax_multi_ops
-		{OID: 9121, Method: amBrin, Name: "macaddr8_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4610, IntType: 774, Default: false, KeyType: 774},
+		{OID: 10125, Method: amBrin, Name: "macaddr8_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4610, IntType: 774, Default: false, KeyType: 774},
 		// brin/macaddr8_bloom_ops
-		{OID: 9122, Method: amBrin, Name: "macaddr8_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4584, IntType: 774, Default: false, KeyType: 774},
+		{OID: 10126, Method: amBrin, Name: "macaddr8_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4584, IntType: 774, Default: false, KeyType: 774},
 		// brin/inet_minmax_ops (default=false: inet_inclusion_ops is default for inet brin)
-		{OID: 9123, Method: amBrin, Name: "inet_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4075, IntType: 869, Default: false, KeyType: 869},
+		{OID: 10127, Method: amBrin, Name: "inet_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4075, IntType: 869, Default: false, KeyType: 869},
 		// brin/inet_minmax_multi_ops
-		{OID: 9124, Method: amBrin, Name: "inet_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4611, IntType: 869, Default: false, KeyType: 869},
+		{OID: 10128, Method: amBrin, Name: "inet_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4611, IntType: 869, Default: false, KeyType: 869},
 		// brin/inet_bloom_ops
-		{OID: 9125, Method: amBrin, Name: "inet_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4585, IntType: 869, Default: false, KeyType: 869},
+		{OID: 10129, Method: amBrin, Name: "inet_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4585, IntType: 869, Default: false, KeyType: 869},
 		// brin/inet_inclusion_ops
-		{OID: 9126, Method: amBrin, Name: "inet_inclusion_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4102, IntType: 869, Default: true, KeyType: 869},
+		{OID: 10130, Method: amBrin, Name: "inet_inclusion_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4102, IntType: 869, Default: true, KeyType: 869},
 		// brin/bpchar_minmax_ops
-		{OID: 9127, Method: amBrin, Name: "bpchar_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4076, IntType: 1042, Default: true, KeyType: 1042},
+		{OID: 10131, Method: amBrin, Name: "bpchar_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4076, IntType: 1042, Default: true, KeyType: 1042},
 		// brin/bpchar_bloom_ops
-		{OID: 9128, Method: amBrin, Name: "bpchar_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4586, IntType: 1042, Default: false, KeyType: 1042},
+		{OID: 10132, Method: amBrin, Name: "bpchar_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4586, IntType: 1042, Default: false, KeyType: 1042},
 		// brin/time_minmax_ops
-		{OID: 9129, Method: amBrin, Name: "time_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4077, IntType: 1083, Default: true, KeyType: 1083},
+		{OID: 10133, Method: amBrin, Name: "time_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4077, IntType: 1083, Default: true, KeyType: 1083},
 		// brin/time_minmax_multi_ops
-		{OID: 9130, Method: amBrin, Name: "time_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4612, IntType: 1083, Default: false, KeyType: 1083},
+		{OID: 10134, Method: amBrin, Name: "time_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4612, IntType: 1083, Default: false, KeyType: 1083},
 		// brin/time_bloom_ops
-		{OID: 9131, Method: amBrin, Name: "time_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4587, IntType: 1083, Default: false, KeyType: 1083},
+		{OID: 10135, Method: amBrin, Name: "time_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4587, IntType: 1083, Default: false, KeyType: 1083},
 		// brin/date_minmax_ops
-		{OID: 9132, Method: amBrin, Name: "date_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4059, IntType: 1082, Default: true, KeyType: 1082},
+		{OID: 10136, Method: amBrin, Name: "date_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4059, IntType: 1082, Default: true, KeyType: 1082},
 		// brin/date_minmax_multi_ops
-		{OID: 9133, Method: amBrin, Name: "date_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4605, IntType: 1082, Default: false, KeyType: 1082},
+		{OID: 10137, Method: amBrin, Name: "date_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4605, IntType: 1082, Default: false, KeyType: 1082},
 		// brin/date_bloom_ops
-		{OID: 9134, Method: amBrin, Name: "date_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4576, IntType: 1082, Default: false, KeyType: 1082},
+		{OID: 10138, Method: amBrin, Name: "date_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4576, IntType: 1082, Default: false, KeyType: 1082},
 		// brin/timestamp_minmax_ops
-		{OID: 9135, Method: amBrin, Name: "timestamp_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4059, IntType: 1114, Default: true, KeyType: 1114},
+		{OID: 10139, Method: amBrin, Name: "timestamp_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4059, IntType: 1114, Default: true, KeyType: 1114},
 		// brin/timestamp_minmax_multi_ops
-		{OID: 9136, Method: amBrin, Name: "timestamp_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4605, IntType: 1114, Default: false, KeyType: 1114},
+		{OID: 10140, Method: amBrin, Name: "timestamp_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4605, IntType: 1114, Default: false, KeyType: 1114},
 		// brin/timestamp_bloom_ops
-		{OID: 9137, Method: amBrin, Name: "timestamp_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4576, IntType: 1114, Default: false, KeyType: 1114},
+		{OID: 10141, Method: amBrin, Name: "timestamp_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4576, IntType: 1114, Default: false, KeyType: 1114},
 		// brin/timestamptz_minmax_ops
-		{OID: 9138, Method: amBrin, Name: "timestamptz_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4059, IntType: 1184, Default: true, KeyType: 1184},
+		{OID: 10142, Method: amBrin, Name: "timestamptz_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4059, IntType: 1184, Default: true, KeyType: 1184},
 		// brin/timestamptz_minmax_multi_ops
-		{OID: 9139, Method: amBrin, Name: "timestamptz_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4605, IntType: 1184, Default: false, KeyType: 1184},
+		{OID: 10143, Method: amBrin, Name: "timestamptz_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4605, IntType: 1184, Default: false, KeyType: 1184},
 		// brin/timestamptz_bloom_ops
-		{OID: 9140, Method: amBrin, Name: "timestamptz_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4576, IntType: 1184, Default: false, KeyType: 1184},
+		{OID: 10144, Method: amBrin, Name: "timestamptz_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4576, IntType: 1184, Default: false, KeyType: 1184},
 		// brin/interval_minmax_ops
-		{OID: 9141, Method: amBrin, Name: "interval_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4078, IntType: 1186, Default: true, KeyType: 1186},
+		{OID: 10145, Method: amBrin, Name: "interval_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4078, IntType: 1186, Default: true, KeyType: 1186},
 		// brin/interval_minmax_multi_ops
-		{OID: 9142, Method: amBrin, Name: "interval_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4613, IntType: 1186, Default: false, KeyType: 1186},
+		{OID: 10146, Method: amBrin, Name: "interval_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4613, IntType: 1186, Default: false, KeyType: 1186},
 		// brin/interval_bloom_ops
-		{OID: 9143, Method: amBrin, Name: "interval_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4588, IntType: 1186, Default: false, KeyType: 1186},
+		{OID: 10147, Method: amBrin, Name: "interval_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4588, IntType: 1186, Default: false, KeyType: 1186},
 		// brin/timetz_minmax_ops
-		{OID: 9144, Method: amBrin, Name: "timetz_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4058, IntType: 1266, Default: true, KeyType: 1266},
+		{OID: 10148, Method: amBrin, Name: "timetz_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4058, IntType: 1266, Default: true, KeyType: 1266},
 		// brin/timetz_minmax_multi_ops
-		{OID: 9145, Method: amBrin, Name: "timetz_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4604, IntType: 1266, Default: false, KeyType: 1266},
+		{OID: 10149, Method: amBrin, Name: "timetz_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4604, IntType: 1266, Default: false, KeyType: 1266},
 		// brin/timetz_bloom_ops
-		{OID: 9146, Method: amBrin, Name: "timetz_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4575, IntType: 1266, Default: false, KeyType: 1266},
+		{OID: 10150, Method: amBrin, Name: "timetz_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4575, IntType: 1266, Default: false, KeyType: 1266},
 		// brin/bit_minmax_ops
-		{OID: 9147, Method: amBrin, Name: "bit_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4079, IntType: 1560, Default: true, KeyType: 1560},
+		{OID: 10151, Method: amBrin, Name: "bit_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4079, IntType: 1560, Default: true, KeyType: 1560},
 		// brin/varbit_minmax_ops
-		{OID: 9148, Method: amBrin, Name: "varbit_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4080, IntType: 1562, Default: true, KeyType: 1562},
+		{OID: 10152, Method: amBrin, Name: "varbit_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4080, IntType: 1562, Default: true, KeyType: 1562},
 		// brin/numeric_minmax_ops
-		{OID: 9149, Method: amBrin, Name: "numeric_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4055, IntType: 1700, Default: true, KeyType: 1700},
+		{OID: 10153, Method: amBrin, Name: "numeric_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4055, IntType: 1700, Default: true, KeyType: 1700},
 		// brin/numeric_minmax_multi_ops
-		{OID: 9150, Method: amBrin, Name: "numeric_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4603, IntType: 1700, Default: false, KeyType: 1700},
+		{OID: 10154, Method: amBrin, Name: "numeric_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4603, IntType: 1700, Default: false, KeyType: 1700},
 		// brin/numeric_bloom_ops
-		{OID: 9151, Method: amBrin, Name: "numeric_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4574, IntType: 1700, Default: false, KeyType: 1700},
+		{OID: 10155, Method: amBrin, Name: "numeric_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4574, IntType: 1700, Default: false, KeyType: 1700},
 		// brin/uuid_minmax_ops
-		{OID: 9152, Method: amBrin, Name: "uuid_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4081, IntType: 2950, Default: true, KeyType: 2950},
+		{OID: 10156, Method: amBrin, Name: "uuid_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4081, IntType: 2950, Default: true, KeyType: 2950},
 		// brin/uuid_minmax_multi_ops
-		{OID: 9153, Method: amBrin, Name: "uuid_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4614, IntType: 2950, Default: false, KeyType: 2950},
+		{OID: 10157, Method: amBrin, Name: "uuid_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4614, IntType: 2950, Default: false, KeyType: 2950},
 		// brin/uuid_bloom_ops
-		{OID: 9154, Method: amBrin, Name: "uuid_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4589, IntType: 2950, Default: false, KeyType: 2950},
+		{OID: 10158, Method: amBrin, Name: "uuid_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4589, IntType: 2950, Default: false, KeyType: 2950},
 		// brin/range_inclusion_ops (opcintype=anyrange 3831)
-		{OID: 9155, Method: amBrin, Name: "range_inclusion_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4103, IntType: 3831, Default: true, KeyType: 3831},
+		{OID: 10159, Method: amBrin, Name: "range_inclusion_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4103, IntType: 3831, Default: true, KeyType: 3831},
 		// brin/pg_lsn_minmax_ops
-		{OID: 9156, Method: amBrin, Name: "pg_lsn_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4082, IntType: 3220, Default: true, KeyType: 3220},
+		{OID: 10160, Method: amBrin, Name: "pg_lsn_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4082, IntType: 3220, Default: true, KeyType: 3220},
 		// brin/pg_lsn_minmax_multi_ops
-		{OID: 9157, Method: amBrin, Name: "pg_lsn_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4615, IntType: 3220, Default: false, KeyType: 3220},
+		{OID: 10161, Method: amBrin, Name: "pg_lsn_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4615, IntType: 3220, Default: false, KeyType: 3220},
 		// brin/pg_lsn_bloom_ops
-		{OID: 9158, Method: amBrin, Name: "pg_lsn_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4590, IntType: 3220, Default: false, KeyType: 3220},
+		{OID: 10162, Method: amBrin, Name: "pg_lsn_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4590, IntType: 3220, Default: false, KeyType: 3220},
 		// brin/box_inclusion_ops
-		{OID: 9159, Method: amBrin, Name: "box_inclusion_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4104, IntType: 603, Default: true, KeyType: 603},
+		{OID: 10163, Method: amBrin, Name: "box_inclusion_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4104, IntType: 603, Default: true, KeyType: 603},
 	}
 }
 
@@ -4994,11 +4997,11 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		oidOps       uint32 = 1981
 		int2Ops      uint32 = 1979
 		int4Ops      uint32 = 1978
-		nameOps      uint32 = 1986
+		nameOps      uint32 = 10028
 		textOps      uint32 = 3126
-		charOps      uint32 = 1985
-		oidvectorOps uint32 = 1987
-		boolOps      uint32 = 1984
+		charOps      uint32 = 10007
+		oidvectorOps uint32 = 10032
+		boolOps      uint32 = 10003
 		float4Ops    uint32 = 10012 // btree float4_ops (postgres.bki: am=403 / btree)
 		cCollation   uint32 = 950   // C_COLLATION_OID — name/text use C in catalogs
 	)

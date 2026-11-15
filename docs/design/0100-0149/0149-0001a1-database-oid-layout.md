@@ -549,6 +549,17 @@ Key observation: PG compatibility constrains only the **displayed** and
 - 3766 and 3767 \(pg\_ts\_template\) were in the list. They have been removed
   and a unit test now rejects any bootstrap index OID there.
 
+## Follow\-up: M0149\-0001g slice 7 — opclass/opfamily rows are PG's \(2026\-11\-16\)
+
+- The bootstrap pg\_opclass and pg\_opfamily rows are now identical to
+  PostgreSQL 18.3's `postgres.bki`, including:
+  - the genbki\-assigned 10000\+ opclass OIDs;
+  - the spgist \(4000\) and BRIN \(3580\) access\-method OIDs, which were
+    swapped before.
+- Unit tests compare the Go tables with `postgres.bki` directly, so any
+  further drift fails at `go test`. Before, it surfaced only as a crash on a
+  PG node.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

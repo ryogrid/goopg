@@ -11930,6 +11930,30 @@ verify each at HEAD when the task starts.
     - Gates: units, initdb, postmaster, testport interop set, spotcheck,
       sf025 99, acceptance 24 MATCH.
     Movement: none — C3 cold-start fix
+  - 2026-11-16 slice 7: pg\_opclass / pg\_opfamily match PostgreSQL 18.3's postgres.bki row for row.
+    - Opclass OIDs: goopg used private OIDs \(a 9000 series plus
+      1984–1987\) for the 164 opclasses that pg\_opclass.dat leaves to
+      genbki. pg\_index.indclass and goopg's runtime opclass map
+      \(catalog.go\) use PG's 10000\+ OIDs, so PG failed "could not find tuple
+      for opclass 10012" on pg\_enum's index. That was the last blocker of a
+      database\-wide VACUUM.
+    - Access methods: opcmethod and opfmethod had spgist and BRIN swapped
+      \(spgist is 4000, brin is 3580\). This was the cause of the slice\-4
+      BRIN CREATE INDEX SIGSEGV: BRIN resolved spgist opclasses and called
+      spg\_text\_leaf\_consistent.
+    - Renumbered from PG's own pg\_opclass, and fixed the four pg\_index
+      opclass constants \(name, char, oidvector and bool\_ops\).
+    - New oracle tests TestPgOpclassMatchesPostgresBKI and
+      TestPgOpfamilyMatchesPostgresBKI parse postgres.bki.
+    - PG 18.3 cold start with no workarounds:
+      - database\-wide VACUUM completes;
+      - CREATE INDEX USING brin and spgist work;
+      - float4 and bool btrees work, and index\-driven counts are correct.
+    - New finding: goopg's own SQL\-level pg\_opclass / pg\_opfamily return 0
+      rows on a fresh cluster. This predates the change; HEAD does the same.
+    - Gates: units, initdb, postmaster, testport interop set, spotcheck,
+      sf025 99, acceptance.
+    Movement: none — C3 cold-start fix
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

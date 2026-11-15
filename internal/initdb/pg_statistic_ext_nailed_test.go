@@ -105,7 +105,7 @@ func TestNailedLocalRelsContainsPgStatisticExtIndexes(t *testing.T) {
 func TestPgStatisticExtIndexInitialEntries(t *testing.T) {
 	const (
 		oidOpsID    = uint32(1981)
-		nameOpsID   = uint32(1986)
+		nameOpsID   = uint32(10028)
 		cCollation  = uint32(950)
 	)
 	want := map[uint32]struct {

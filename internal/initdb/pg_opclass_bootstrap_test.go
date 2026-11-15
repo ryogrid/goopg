@@ -91,10 +91,10 @@ func TestPgOpclassInitialEntriesCoverNailedIndexNeeds(t *testing.T) {
 		4217: "text_pattern_ops",
 		4218: "varchar_pattern_ops",
 		4219: "bpchar_pattern_ops",
-		1986: "name_ops",
-		1985: "char_ops",
-		1987: "oidvector_ops",
-		1984: "bool_ops",
+		10028: "name_ops",
+		10007: "char_ops",
+		10032: "oidvector_ops",
+		10003: "bool_ops",
 	}
 	for oid, name := range required {
 		got, ok := byOID[oid]
@@ -113,7 +113,7 @@ func TestPgOpclassInitialEntriesCoverNailedIndexNeeds(t *testing.T) {
 		}
 	}
 	// name_ops must store cstring keys (opckeytype = 2275).
-	if got, ok := byOID[1986]; ok && got.KeyType != 2275 {
+	if got, ok := byOID[10028]; ok && got.KeyType != 2275 {
 		t.Errorf("name_ops opckeytype: got %d, want 2275 (cstring)", got.KeyType)
 	}
 	// Canonical opfamily OIDs from pg_opfamily.dat. Step 3b set
@@ -128,13 +128,13 @@ func TestPgOpclassInitialEntriesCoverNailedIndexNeeds(t *testing.T) {
 		3124: {1976, "int8_ops → INTEGER_BTREE_FAM_OID"},
 		1981: {1989, "oid_ops → OID_BTREE_FAM_OID"},
 		3126: {1994, "text_ops → TEXT_BTREE_FAM_OID"},
-		1986: {1994, "name_ops → TEXT_BTREE_FAM_OID (shared)"},
+		10028: {1994, "name_ops → TEXT_BTREE_FAM_OID (shared)"},
 		4217: {2095, "text_pattern_ops → TEXT_PATTERN_BTREE_FAM_OID"},
 		4218: {2095, "varchar_pattern_ops → TEXT_PATTERN_BTREE_FAM_OID (shared)"},
 		4219: {2097, "bpchar_pattern_ops → BPCHAR_PATTERN_BTREE_FAM_OID"},
-		1985: {429, "char_ops → btree/char_ops"},
-		1987: {1991, "oidvector_ops → btree/oidvector_ops"},
-		1984: {424, "bool_ops → BOOL_BTREE_FAM_OID"},
+		10007: {429, "char_ops → btree/char_ops"},
+		10032: {1991, "oidvector_ops → btree/oidvector_ops"},
+		10003: {424, "bool_ops → BOOL_BTREE_FAM_OID"},
 	}
 	for oid, want := range wantFamily {
 		got, ok := byOID[oid]
