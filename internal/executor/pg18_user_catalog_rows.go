@@ -572,6 +572,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table, dbOid ...uint3
 	// that `_bt_checkpage` rejects: the flag would only have converted a silent
 	// gap into `index "…" contains corrupted page at block 0` (blocker #12).
 	// See pgClassRelhasindex for why it is not simply `len(indexes) > 0`.
+	frozenXID, frozenMXID := PGClassFrozenIDs(relkind)
 	return Row{
 		NewIntDatum(int64(tbl.OID)), // oid
 		NewStringDatum(tbl.Name),    // relname (name)
@@ -602,8 +603,8 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table, dbOid ...uint3
 		NewStringDatum(replIdent),                       // relreplident ('d' default; FULL/NOTHING via ALTER, DU-002 slice 305)
 		NewBoolDatum(isPartition),                       // relispartition
 		NewIntDatum(0),                                  // relrewrite
-		NewIntDatum(minFrozenXID),                       // relfrozenxid
-		NewIntDatum(minFrozenMXID),                      // relminmxid
+		NewIntDatum(frozenXID),                          // relfrozenxid (valid only for r/t/m — PGClassFrozenIDs)
+		NewIntDatum(frozenMXID),                         // relminmxid
 		NewStringDatum("{}"),                            // relacl (encoded as empty aclitem[] ArrayType)
 		reloptionsDatum,                                 // reloptions (fillfactor/autovacuum_*/security_*/check_option, or NULL)
 		NewStringDatum(relpartbound),                    // relpartbound (FOR VALUES … for partition children)
@@ -734,8 +735,8 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index, dbOid 
 		NewStringDatum("n"),                   // relreplident
 		NewBoolDatum(false),                   // relispartition
 		NewIntDatum(0),                        // relrewrite
-		NewIntDatum(minFrozenXID),             // relfrozenxid
-		NewIntDatum(minFrozenMXID),            // relminmxid
+		NewIntDatum(0),                        // relfrozenxid (InvalidTransactionId: indexes have no table AM)
+		NewIntDatum(0),                        // relminmxid
 		NewStringDatum("{}"),                  // relacl
 		idxReloptionsDatum,                    // reloptions (fillfactor/fastupdate/… or NULL)
 		NewStringDatum(""),                    // relpartbound
@@ -2904,4 +2905,22 @@ func buildUserPGAggregateRow(ctx *Context, agg *catalog.UserAggregate) Row {
 		initCond,       // agginitval
 		NullDatum,      // aggminitval
 	}
+}
+
+// PGClassFrozenIDs returns the pg_class relfrozenxid / relminmxid a new
+// relation of relkind starts with. PostgreSQL sets them only for relkinds with
+// a table access method — RELKIND_HAS_TABLE_AM (pg_class.h): 'r', 't', 'm' —
+// through table_relation_set_new_filelocator (heap_create, catalog/heap.c);
+// every other relkind (indexes, sequences, views, composite types, foreign and
+// partitioned tables/indexes) keeps InvalidTransactionId / InvalidMultiXactId.
+// A valid value on a storage-less relation trips PG's
+// Assert(!TransactionIdIsValid(relfrozenxid)) when autovacuum or VACUUM
+// recomputes datfrozenxid (vac_update_datfrozenxid, commands/vacuum.c) on a
+// goopg directory (M0149-0001g slice 5).
+func PGClassFrozenIDs(relkind string) (int64, int64) {
+	switch relkind {
+	case "r", "t", "m":
+		return minFrozenXID, minFrozenMXID
+	}
+	return 0, 0
 }

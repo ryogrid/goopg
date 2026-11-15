@@ -11891,6 +11891,26 @@ verify each at HEAD when the task starts.
       final tree, regress A/B on 7 DDL cases \(no movement\), spotcheck,
       sf025 99, acceptance.
     Movement: none — C3 cold-start fix
+  - 2026-11-16 slice 5: pg\_class relfrozenxid / relminmxid by relkind.
+    - PG gives a valid pair only to relkinds with a table AM \(r, t, m —
+      RELKIND\_HAS\_TABLE\_AM; heap\_create in catalog/heap.c\). goopg wrote
+      3/1 on every on\-disk row: views, indexes, sequences, partitioned
+      tables, initdb's nailed catalog indexes and information\_schema views.
+    - New executor.PGClassFrozenIDs is used by the user\-relation and index
+      builders, initdb's pgClassRow and the relcache init\-file blob.
+    - A/B with PG 18.3 cold\-started on a copy, database\-wide VACUUM:
+      - at the previous commit: TRAP Assert\("\!TransactionIdIsValid\(relfrozenxid\)"\)
+        vacuum.c:1696 \(vac\_update\_datfrozenxid\);
+      - now: VACUUM completes.
+      - To reach that step, the copies had pg\_enum's index \(opclass 10012\)
+        hidden and REINDEXed 3766 and 3767.
+    - relkind census on the copy now matches a PG 18.3 initdb \(r/t/m
+      valid; i/S/v/c/p 0\).
+    - New finding: pg\_ts\_template\_oid\_index 3767 is also a corrupted
+      page, not only 3766.
+    - Gates: units, postmaster, testport interop set ×3 \(failover,
+      standby full cycle, crash start, recovery 034, pg\_dump\), spotcheck.
+    Movement: none — C3 cold-start fix
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

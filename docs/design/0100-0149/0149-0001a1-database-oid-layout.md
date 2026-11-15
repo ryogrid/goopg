@@ -526,6 +526,20 @@ Key observation: PG compatibility constrains only the **displayed** and
   that registry entry. It stays open until the WAL interaction is
   understood.
 
+## Follow\-up: M0149\-0001g slice 5 — relfrozenxid by relkind \(2026\-11\-16\)
+
+- PostgreSQL gives pg\_class.relfrozenxid and relminmxid a valid value only
+  for relkinds with a table access method \(r, t, m\). heap\_create leaves
+  every other relkind at InvalidTransactionId / InvalidMultiXactId, and
+  vac\_update\_datfrozenxid asserts it.
+- goopg derives both fields from `executor.PGClassFrozenIDs` in every
+  writer of an on\-disk pg\_class row:
+  - user relations and indexes;
+  - initdb's bootstrap rows;
+  - the relcache init file.
+- goopg's own SQL\-level pg\_class \(catalog virtual rows\) still reports 0/1
+  for every relkind; that view is not read by PG.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

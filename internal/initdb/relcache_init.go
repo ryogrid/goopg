@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -2145,10 +2146,13 @@ func buildPgClassBlob(rel nailedRel) []byte {
 	// relispopulated (offset 129): true
 	buf[129] = 1
 	// relispartition (offset 131): false
-	// relfrozenxid (offset 136): 3 (FirstNormalTransactionId)
-	le.PutUint32(buf[136:140], 3)
-	// relminmxid (offset 140): 1 (FirstMultiXactId)
-	le.PutUint32(buf[140:144], 1)
+	// relfrozenxid (offset 136) / relminmxid (offset 140): FirstNormal-
+	// TransactionId / FirstMultiXactId for heaps; InvalidTransactionId for
+	// indexes and views, as PG's heap_create leaves them (it must equal the
+	// on-disk pg_class row — executor.PGClassFrozenIDs).
+	fx, fm := executor.PGClassFrozenIDs(string(rune(rel.RelKind)))
+	le.PutUint32(buf[136:140], uint32(fx))
+	le.PutUint32(buf[140:144], uint32(fm))
 
 	return buf
 }

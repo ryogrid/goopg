@@ -6277,6 +6277,7 @@ func pgClassColDefs() []catalog.Column {
 
 // pgClassRow builds a 14-col pg_class tuple matching pgClassColDefs order.
 func pgClassRow(rel nailedRel) executor.Row {
+	frozenXID, frozenMXID := executor.PGClassFrozenIDs(string(rune(rel.RelKind)))
 	relType := rel.RelType
 	if relType == 0 && !isNailedToastRel(rel) {
 		relType = rel.OID
@@ -6378,8 +6379,8 @@ func pgClassRow(rel nailedRel) executor.Row {
 		executor.NewStringDatum("n"),                       // 130: relreplident
 		executor.NewBoolDatum(false),                       // 131: relispartition
 		executor.NewIntDatum(0),                            // 132: relrewrite
-		executor.NewIntDatum(3),                            // 136: relfrozenxid
-		executor.NewIntDatum(1),                            // 140: relminmxid
+		executor.NewIntDatum(frozenXID),                    // 136: relfrozenxid (r/t only — executor.PGClassFrozenIDs)
+		executor.NewIntDatum(frozenMXID),                   // 140: relminmxid
 		executor.NewStringDatum("{}"),                      // relacl (empty aclitem[])
 		executor.NewStringDatum("{}"),                      // reloptions (empty text[])
 		executor.NewStringDatum(""),                        // relpartbound (empty pg_node_tree)
