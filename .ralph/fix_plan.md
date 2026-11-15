@@ -275,7 +275,8 @@ it to hold the lineage.)
    M0145-0003/0010, so these are NOT selectable work (archive 013).
 9. **M0143 remaining tasks: DISCHARGED** (milestone complete; archive 014).
 10. M-NIGHTLY open items, then the pre-existing milestones
-    (M0119 → **M0147** → the already-filed M0122 tasks → **M0148** → M0131 →
+    (M0119 → **M0147** → the already-filed M0122 tasks → **M0149** →
+    **M0148** → M0131 →
     M0134 → M0135/M0136 → M0095/M0110).
     (Reachable only after the S9 pass above files nothing.)
     **M0122 filing pause (owner decision 2026-10-29).** M0122-0012 is complete
@@ -284,9 +285,38 @@ it to hold the lineage.)
     new M0122 tasks until the owner lifts this pause. Mandatory S2 and M-NIGHTLY
     defect filing continues under their own rules, and M0148 discoveries are
     filed under the selected M0148 suite task, not under M0122.
-    **M0148 regress coverage closure (owner decision 2026-10-29).** After the
-    already-filed M0122 queue has no selectable task, take M0148's first open
-    suite task in its canonical queue. A failing suite is not parked or closed
+    **M0149 recovery/subscription TAP port (owner decision 2026-11-15).**
+    After the already-filed M0122 queue has no selectable task, take M0149's
+    first open task in its canonical queue. M0148 is paused while M0149 has
+    a selectable task; the M0148-0001c3a10 state recorded in the
+    baton/fix_plan is resumed when M0148 becomes selectable again. M0149
+    tasks and all their descendants inherit item-10 rank — the S7
+    correctness-only carve-out does not demote them. One task per upstream
+    `recovery/t/` or `subscription/t/` TAP test (74); every missing feature
+    is filed immediately as a `Kind: impl` child directly below its parent.
+    A task with an open descendant is not selected itself — take its first
+    open descendant in file order (depth-first); the parent returns for its
+    close-out run once all descendants are `[x]`. One task per loop. A
+    deferral-ledger row never completes or parks an M0149 task. Movement
+    uses the `tap` instrument (`tap <test> assertions a/n→b/n`).
+    **PG 18.3 COMPATIBILITY IS THE PASS CONDITION:** goopg must match PG
+    18.3 on the wire (walsender commands, CopyBoth streaming, pgoutput
+    v1–4, `test_decoding`, matched log/error texts) and in EVERY file it
+    creates (WAL segments/records, `.history`, `archive_status`,
+    `backup_label`/`backup_manifest`, `pg_control`, signal files,
+    `pg_replslot`, `pg_logical/`, `pg_twophase`), proven by mixed runs
+    against real PG 18.3 nodes. goopg↔goopg-only, in-process shortcuts or
+    private formats = NOT ported. **Same commit as each port:** inventory
+    row → `status=port`, `pass_required=yes`, rationale names the
+    `TestPort_*` func, `deferred_to` = `-`; `make regen-testport`,
+    `make check-testport-inventory`, drop any `ci/batch/expected-failures.csv`
+    row. A port whose row is not promoted is not complete; a promoted row
+    whose test violates C1–C3 is a defect. Design doc
+    `docs/design/0100-0149/0149-00NN-<slug>.md` is created when the task is
+    STARTED, not up front. Rules: `docs/milestones/0149-replication-tap-port.md`.
+    **M0148 regress coverage closure (owner decision 2026-10-29).** After
+    M0149 has no selectable task, take M0148's first open suite task in its
+    canonical queue. A failing suite is not parked or closed
     with a deferral-ledger row alone: immediately file each required missing
     feature as an implementation child of that suite task, implement the
     children, and keep the suite task open until the PG 18.3 expected output
@@ -317,7 +347,9 @@ why the instruments cannot see the change (the LINEAGE-BASELINE pins show
 why this matters for S4's budget). For M0147 lever-retirement tasks only,
 `lever-count` (`scripts/lever-count.sh`) is an instrument:
 `Movement: yes — lever-count 34→30 (census 22/22·99/99·99/99 held)`
-(owner decision 2026-10-21).
+(owner decision 2026-10-21). For M0149 TAP-port tasks only, `tap` (upstream
+assertions passing in the all-goopg + mixed PG 18.3 runs) is an instrument:
+`Movement: yes — tap 034_create_database 3/12→7/12` (owner decision 2026-11-15).
 
 FROZEN-PREFIXES:
 (empty — the M0142-0008 chain was UNFROZEN by owner decision 2026-09-20;
@@ -505,6 +537,25 @@ OWNER DECISION 2026-10-29 — M0122-0012 closed; regress closure queued:
 - M0148 must implement missing prerequisites as suite-task children; a
   deferral-ledger row by itself never completes or parks a suite task.
 
+OWNER DECISION 2026-11-15 — M0149 filed:
+- M0149 (`docs/milestones/0149-replication-tap-port.md`, section
+  `## M0149`) ports the 74 non-`port` `recovery/t/` + `subscription/t/`
+  TAP tests, one task per test, with every missing feature implemented as a
+  child of its test task. It ranks immediately above M0148 in item 10:
+  after the already-filed M0122 queue, before M0148.
+- The 2026-10-29 sequencing "finish the already-filed M0122 tasks, then
+  enter M0148" is superseded accordingly: after the M0122 queue, enter
+  M0149; enter M0148 only when M0149 has no selectable task.
+- M0148 is paused while M0149 has selectable work. The M0148-0001c3a10
+  state recorded in the baton/fix_plan is resumed, not discarded, when
+  M0148 becomes selectable again.
+- A port counts only at PG 18.3 compatibility on the wire and in every
+  file goopg writes, proven against real PG 18.3 nodes (milestone doc
+  C1–C4).
+- New Movement instrument `tap` for M0149:
+  `Movement: yes — tap <test> assertions <before>/<total>→<after>/<total>`
+  (upstream assertions passing in the all-goopg + mixed runs).
+
 **M-NIGHTLY filing is unconditional**: every loop reads
 `ci/logs/action-items.md` and files each new `## AI-` subject under M-NIGHTLY.
 Its selection condition lives in this section's **Selection rules**
@@ -517,7 +568,8 @@ repro at HEAD first, fix with normal gates, cite the AI-id, tick it.
   item larger than one agent invocation (new tasks carry `Parent:`).
 - Design docs: non-trivial subsystems land with `docs/design/<id>-NNNN-*.md`
   and a `docs/design/README.md` entry in the same commit. For M0137–M0145 and
-  `P0-` tasks follow `AGENT.md` §"Plan-parity harness" D3.
+  `P0-` tasks follow `AGENT.md` §"Plan-parity harness" D3, and M0149
+  (design doc created when the task is started).
 - Deferrals: never close a task with a forward reference. A deferral needs
   **both** a `.ralph/deferral_ledger.md` row (`date | task-id | landed |
   deferred | resume point | why`) **and** an unchecked task that owns the
@@ -11273,11 +11325,433 @@ Basis: the 2026-10-21 lever census and its review
     \(not a residual Filter above the tree, not a scan restriction\), admit it in `outerOnQualsOK`, and check the
     witness plans as PG does; then census \+ regress\.
 
+## M0149 — Recovery/subscription TAP port with prerequisite implementation (filed 2026-11-15, owner decision)
+
+**Milestone doc:** `docs/milestones/0149-replication-tap-port.md` — its
+compatibility contract \(C1–C4\), task model, inventory rule and canonical
+queue are binding.
+**Rank:** banner item 10, after the already-filed M0122 queue and
+immediately before M0148; M0148 is paused while M0149 has a selectable
+task. M0149 tasks and all their descendants inherit item-10 rank — the S7
+correctness-only carve-out does not demote them.
+**Task model:** one task per upstream TAP test, in the order below. Every
+missing feature is filed immediately as a `Kind: impl` child
+\(`M0149-00NNa`, `b`, …; `Parent: M0149-00NN`\), placed immediately below
+its parent entry, and implemented before the test task can close. A test
+task with an open descendant is not selected itself: take its first open
+descendant in file order \(depth-first\); the parent is re-selected for its
+close-out run once all descendants are `[x]`. A test task normally spans
+many loops; each loop works exactly one task \(the parent or one
+descendant\). If a prerequisite is already an open task elsewhere
+\(e.g. M0122-0014 for the subscription tiers\), the child references it
+\(`Prerequisite: <id>`\) and adopts or waits on it — no duplicate.
+Ledger-only parking is not a completion path. A step needing a change to
+goopg's process model \(per-backend OS processes, SysV shared memory\) is
+escalated as `[!] blocked-on owner: architecture` on a child — no
+substitution, no further filing.
+**Compatibility is the pass condition.** A port counts only if goopg is
+PG 18.3-compatible on the wire \(walsender commands, CopyBoth streaming,
+pgoutput v1–4, `test_decoding` text, log/error texts the test matches\)
+and in every file it writes \(WAL segments/records, `.history`,
+`archive_status`, `backup_label`/`backup_manifest`, `pg_control`, signal
+files, `pg_replslot`, `pg_logical/`, `pg_twophase`, …\), proven by mixed
+runs against real PG 18.3 nodes from `postgres/local_install/bin`. A
+goopg↔goopg-only port, an in-process shortcut, or a goopg-private format
+is NOT a port. A mirrored upstream skip condition must evaluate false in
+the all-goopg run; a test that skips there is not ported.
+**Movement:** M0149 tasks report the `tap` instrument —
+`Movement: yes — tap <test> assertions <before>/<total>→<after>/<total>`
+\(upstream assertions passing in the all-goopg + mixed runs, e.g.
+`tap 034_create_database 3/12→7/12`\).
+**On close:** inventory row → `status=port`, `pass_required=yes`,
+rationale names the `TestPort_*` func, `deferred_to` = `-`, id
+`R-<NNN>`/`S-<NNN>` \(upstream 3-digit number\); then
+`make regen-testport`, `make check-testport-inventory`, and delete any
+`ci/batch/expected-failures.csv` row — same commit.
+**Design doc at start:** the first loop that selects a task creates
+`docs/design/0100-0149/0149-00NN-<slug>.md` and indexes it in
+`docs/design/README.md`; none are written up front.
+The "Likely prerequisites" lines are filing-time hints from a grep survey —
+verify each at HEAD when the task starts.
+
+- [ ] **M0149-0001 — port recovery/t/034_create_database.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/034_create_database.pl` — WAL replay of `CREATE DATABASE … STRATEGY WAL_LOG` after template DDL.
+  Likely prerequisites \(verify at start\): PG-format `XLOG_DBASE_CREATE_WAL_LOG` emission and replay \(`dbcommands.c`\), immediate-stop crash recovery; first test also files the Go `Cluster.pm`-equivalent harness child \(goopg and PG nodes behind one API\).
+- [ ] **M0149-0002 — port recovery/t/036_truncated_dropped.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/036_truncated_dropped.pl` — replay against relation files shorter than the WAL expects \(truncated/dropped\).
+  Likely prerequisites \(verify at start\): `XLOG_SMGR_TRUNCATE` replay, missing-page tolerance in `XLogReadBufferExtended`/`xlogutils.c`, VACUUM truncation WAL in PG format. Overlap: VACUUM tail truncation emitting no `XLOG_SMGR_TRUNCATE` is the M0122-0009c finding \(deferral ledger 2026-10-13; no fix\_plan entry exists at filing — reference it if filed, else file it here\).
+- [ ] **M0149-0003 — port recovery/t/014_unlogged_reinit.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/014_unlogged_reinit.pl` — unlogged tables/sequences reinitialised from `_init` forks after crash, incl. tablespaces.
+  Likely prerequisites \(verify at start\): on-disk `_init` forks, `ResetUnloggedRelations` \(`reinit.c`\) at crash-recovery start, in-place tablespace layout under `pg_tblspc/`.
+- [ ] **M0149-0004 — port recovery/t/022_crash_temp_files.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/022_crash_temp_files.pl` — temp-file removal after a backend crash.
+  Likely prerequisites \(verify at start\): postmaster crash-restart cycle after a killed backend \(`restart_after_crash`; `013` port substituted whole-server SIGKILL\), `remove_temp_files_after_crash`, PG `pgsql_tmp<PID>.<N>` naming. Never `kill()` a goopg "backend pid" — `pg_backend_pid()` is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID; a backend-kill step that needs per-backend OS processes goes to `[!] blocked-on owner: architecture`.
+- [ ] **M0149-0005 — port recovery/t/037_invalid_database.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/037_invalid_database.pl` — interrupted DROP DATABASE leaves an invalid database.
+  Likely prerequisites \(verify at start\): `datconnlimit = -2` invalid marker \(`DATCONNLIMIT_INVALID_DB`\) and its replay, connect/ALTER refusal texts, prepared-xact lock interplay, `vacuumdb` against goopg. `pg_backend_pid()` is used only at SQL level here \(fine\); never `kill()` it — on goopg it is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID.
+- [ ] **M0149-0006 — port recovery/t/018_wal_optimize.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/018_wal_optimize.pl` — replay after `wal_level=minimal` WAL-skipping operations.
+  Likely prerequisites \(verify at start\): `wal_level=minimal` skip-WAL + pending-sync at commit \(`storage.c` `smgrDoPendingSyncs`, `wal_skip_threshold`\), COPY/TRUNCATE/SET TABLESPACE in-xact matrix, PREPARE TRANSACTION. Overlap: SET TABLESPACE copying files without WAL is the M0122-0009b finding \(deferral ledger 2026-10-13; no fix\_plan entry at filing — reference it if filed, else file it here\).
+- [ ] **M0149-0007 — port recovery/t/029_stats_restart.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/029_stats_restart.pl` — cumulative stats across clean/crash restarts and invalid stats files.
+  Likely prerequisites \(verify at start\): `pg_stat/pgstat.stat` in PG format \(`PGSTAT_FILE_FORMAT_ID`, `pgstat.c` write/read\), discard on crash, replication-slot stats persistence.
+- [ ] **M0149-0008 — port recovery/t/017_shm.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/017_shm.pl` — shared-memory interlock via `postmaster.pid` key and orphaned backends.
+  Likely prerequisites \(verify at start\): `postmaster.pid` shmem-key line and `PGSharedMemoryIsInUse` interlock semantics for goopg's process model \(design doc must decide a PG-faithful answer\), `kill9` of postmaster with a live backend. Never `kill()` a goopg "backend pid" — `pg_backend_pid()` is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID; a backend-kill step that needs per-backend OS processes goes to `[!] blocked-on owner: architecture`.
+- [ ] **M0149-0009 — port recovery/t/008_fsm_truncation.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/008_fsm_truncation.pl` — FSM-driven INSERT after truncation on a promoted standby.
+  Likely prerequisites \(verify at start\): PG-format FSM fork + FPIs, FSM/VM truncation in `XLOG_SMGR_TRUNCATE` replay, promotion of a streaming standby. Overlap: VACUUM tail truncation emitting no `XLOG_SMGR_TRUNCATE` is the M0122-0009c finding \(deferral ledger 2026-10-13; no fix\_plan entry exists at filing — reference it if filed, else file it here\).
+- [ ] **M0149-0010 — port recovery/t/015_promotion_pages.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/015_promotion_pages.pl` — WAL generated after promotion before the first checkpoint.
+  Likely prerequisites \(verify at start\): `XLOG_END_OF_RECOVERY` / fast promotion, crash recovery of a just-promoted node, `minRecoveryPoint` handling. Overlap: the ledger's M0122-0009 review found VM bits logged with a goopg-private HeapVisible record — PG `XLOG_HEAP2_VISIBLE` is required.
+- [ ] **M0149-0011 — port recovery/t/016_min_consistency.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/016_min_consistency.pl` — on-disk page LSNs never exceed `minRecoveryPoint` on a standby.
+  Likely prerequisites \(verify at start\): `UpdateMinRecoveryPoint` on buffer flush during recovery, PG page-header LSN layout read straight from relation files, PG `pg_controldata` on the goopg standby dir.
+- [ ] **M0149-0012 — port recovery/t/021_row_visibility.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/021_row_visibility.pl` — hot-standby snapshot visibility incl. prepared transactions.
+  Likely prerequisites \(verify at start\): `XLOG_RUNNING_XACTS` + KnownAssignedXids, prepared-xact replay, `background_psql` harness method.
+- [ ] **M0149-0013 — port recovery/t/005_replay_delay.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/005_replay_delay.pl` — `recovery_min_apply_delay` and recovery pause.
+  Likely prerequisites \(verify at start\): apply-delay wait in the startup loop, `pg_wal_replay_pause/resume`, `pg_get_wal_replay_pause_state`, pause-at-promotion semantics.
+- [ ] **M0149-0014 — port recovery/t/007_sync_rep.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/007_sync_rep.pl` — `sync_priority`/`sync_state` transitions.
+  Likely prerequisites \(verify at start\): `synchronous_standby_names` FIRST/ANY/priority over ≥3 standbys, `application_name` from `primary_conninfo`, `pg_stat_replication` sync columns \(design 0102-0005 exists — verify against PG\).
+- [ ] **M0149-0015 — port recovery/t/012_subtransactions.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/012_subtransactions.pl` — subtransactions \(incl. overflowed and prepared\) across replay and promotion.
+  Likely prerequisites \(verify at start\): `XLOG_XACT_ASSIGNMENT` + subxid overflow on standby, prepared xact with many subxacts, plpgsql exception blocks, `pg_subtrans` SLRU format.
+- [ ] **M0149-0016 — port recovery/t/009_twophase.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/009_twophase.pl` — two-phase commit across crashes and primary/standby role swaps.
+  Likely prerequisites \(verify at start\): `pg_twophase/` state files in PG format, `XLOG_XACT_PREPARE` replay, checkpoint-time state-file writes, standby→primary role swap via `primary_conninfo`.
+- [ ] **M0149-0017 — port recovery/t/026_overwrite_contrecord.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/026_overwrite_contrecord.pl` — segments ending in an incomplete record propagated to a replica.
+  Likely prerequisites \(verify at start\): `XLOG_OVERWRITE_CONTRECORD` + `XLP_FIRST_IS_OVERWRITE_CONTRECORD` emission after torn-record recovery \(see `e2e_pg_torn_contrecord_test.go`\), `backup_fs_cold`.
+- [ ] **M0149-0018 — port recovery/t/002_archiving.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/002_archiving.pl` — WAL archiving with a hot standby restoring from the archive.
+  Likely prerequisites \(verify at start\): a WAL archiver \(`pgarch.c`: `.ready` → `archive_command` → `.done`; only the GUC exists today\), `restore_command` `%f`/`%p`, `archive_cleanup_command`, `recovery_end_command`, `pg_stat_archiver`.
+- [ ] **M0149-0019 — port recovery/t/020_archive_status.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/020_archive_status.pl` — archiver failure/retry and `.ready`/`.done` on primary and standby.
+  Likely prerequisites \(verify at start\): `archive_mode=on|always` on standby, `.done` for streamed segments, `pg_stat_archiver` failure columns, archive status kept across `backup_fs_cold` restore.
+- [ ] **M0149-0020 — port recovery/t/024_archive_recovery.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/024_archive_recovery.pl` — archive recovery refusing WAL generated with `wal_level=minimal`.
+  Likely prerequisites \(verify at start\): `XLOG_PARAMETER_CHANGE` record + PG FATAL text, restart with changed `wal_level`.
+- [ ] **M0149-0021 — port recovery/t/042_low_level_backup.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/042_low_level_backup.pl` — `pg_backup_start`/`pg_backup_stop` backups restored with/without `backup_label`.
+  Likely prerequisites \(verify at start\): non-exclusive low-level backup returning PG-exact `backup_label`/`tablespace_map` text, recovery from caller-written `backup_label`, the "missing backup\_label" behaviour.
+- [ ] **M0149-0022 — port recovery/t/045_archive_restartpoint.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/045_archive_restartpoint.pl` — restartpoints during archive recovery.
+  Likely prerequisites \(verify at start\): `CreateRestartPoint` during archive recovery, segment recycling/removal on the recovering node.
+- [ ] **M0149-0023 — port recovery/t/003_recovery_targets.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/003_recovery_targets.pl` — PITR to name/time/XID/LSN/immediate targets.
+  Likely prerequisites \(verify at start\): all `recovery_target*` GUCs + `recovery_target_action`, `pg_create_restore_point` \(`XLOG_RESTORE_POINT`\), conflicting-target FATAL texts, PG `pg_ctl` on goopg data dirs.
+- [ ] **M0149-0024 — port recovery/t/023_pitr_prepared_xact.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/023_pitr_prepared_xact.pl` — PITR with a prepared transaction, then promotion.
+  Likely prerequisites \(verify at start\): prepared-xact restore from WAL at a PITR stop point, `recovery_target_action=promote`, end-of-recovery checkpoint keeping `pg_twophase`.
+- [ ] **M0149-0025 — port recovery/t/004_timeline_switch.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/004_timeline_switch.pl` — cascading standby follows a newly promoted standby.
+  Likely prerequisites \(verify at start\): streaming end-of-timeline exchange + `TIMELINE_HISTORY` \(design 0102-0002 — verify vs PG\), `recovery_target_timeline=latest`, `primary_conninfo` reload without restart.
+- [ ] **M0149-0026 — port recovery/t/025_stuck_on_old_timeline.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/025_stuck_on_old_timeline.pl` — cascading standby without WAL fetches the history file from the archive.
+  Likely prerequisites \(verify at start\): archiving of `.history` before segments, `restore_command` history fetch, cascaded walsender on a promoted node.
+- [ ] **M0149-0027 — port recovery/t/028_pitr_timelines.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/028_pitr_timelines.pl` — PITR whose target lies in a higher-TLI segment.
+  Likely prerequisites \(verify at start\): `XLogFileReadAnyTLI` / `expectedTLEs` segment selection, old-TLI `.partial` segment handling.
+- [ ] **M0149-0028 — port recovery/t/043_no_contrecord_switch.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/043_no_contrecord_switch.pl` — incomplete record at a segment boundary across a timeline switch.
+  Likely prerequisites \(verify at start\): contrecord handling at TLI switch on promotion, streaming from the promoted node.
+- [ ] **M0149-0029 — port recovery/t/032_relfilenode_reuse.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/032_relfilenode_reuse.pl` — relfilenode reuse after DROP/CREATE DATABASE without corrupting cached buffers.
+  Likely prerequisites \(verify at start\): buffer invalidation on DB/relation drop replay, `CREATE DATABASE` both strategies, tablespaces, `background_psql`. Overlap: SET TABLESPACE copying files without WAL is the M0122-0009b finding \(deferral ledger 2026-10-13; no fix\_plan entry at filing — reference it if filed, else file it here\).
+- [ ] **M0149-0030 — port recovery/t/033_replay_tsp_drops.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/033_replay_tsp_drops.pl` — replay of tablespace/database create/drop incl. missing directories.
+  Likely prerequisites \(verify at start\): `XLOG_TBLSPC_*` replay, `allow_in_place_tablespaces`, missing-directory tracking during `CREATE DATABASE` replay with PG log texts. Overlap: SET TABLESPACE copying files without WAL is the M0122-0009b finding \(deferral ledger 2026-10-13; no fix\_plan entry at filing — reference it if filed, else file it here\).
+- [ ] **M0149-0031 — port recovery/t/031_recovery_conflict.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/031_recovery_conflict.pl` — hot-standby query cancellation on recovery conflicts.
+  Likely prerequisites \(verify at start\): buffer-pin/lock/snapshot/tablespace/startup-deadlock/database conflicts with `max_standby_streaming_delay`, PG cancel texts + SQLSTATEs, `pg_stat_database_conflicts`.
+- [ ] **M0149-0032 — port recovery/t/030_stats_cleanup_replica.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/030_stats_cleanup_replica.pl` — standbys drop object stats on replayed drops and keep them across restart.
+  Likely prerequisites \(verify at start\): stats-drop items in xact commit/abort records and their replay \(`pgstat_execute_transactional_drops`\), stats on standby.
+- [ ] **M0149-0033 — port recovery/t/048_vacuum_horizon_floor.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/048_vacuum_horizon_floor.pl` — VACUUM removes all tuples dead before OldestXmin while the standby feedback horizon moves.
+  Likely prerequisites \(verify at start\): `hot_standby_feedback` xmin on the walsender slot, `GlobalVisState`/OldestXmin floor in VACUUM, walreceiver reconnect mid-VACUUM. `pg_backend_pid()` is used only at SQL level here \(fine\); never `kill()` it — on goopg it is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID.
+- [ ] **M0149-0034 — port recovery/t/041_checkpoint_at_promote.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/041_checkpoint_at_promote.pl` — restartpoint racing a promotion; WAL removal stays correct.
+  Likely prerequisites \(verify at start\): `injection_points` extension equivalent \(`injection_points_attach/wakeup/detach`, wait mode, PG point names\) — first test to need it; restartpoint/promotion race. Never `kill()` a goopg "backend pid" — `pg_backend_pid()` is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID; a backend-kill step that needs per-backend OS processes goes to `[!] blocked-on owner: architecture`.
+- [ ] **M0149-0035 — port recovery/t/006_logical_decoding.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/006_logical_decoding.pl` — logical decoding via SQL and `pg_recvlogical`.
+  Likely prerequisites \(verify at start\): `test_decoding` output plugin \(absent today\), `pg_logical_slot_get/peek_changes`, PG 18.3 `pg_recvlogical` against goopg, slot persistence/`pg_replslot` format, drop-database-with-slot errors.
+- [ ] **M0149-0036 — port recovery/t/010_logical_decoding_timelines.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/010_logical_decoding_timelines.pl` — logical slots surviving a timeline switch.
+  Likely prerequisites \(verify at start\): `pg_replslot` copied by `backup_fs_cold` and loaded at startup, catalog\_xmin via `hot_standby_feedback`, decoding across TLI.
+- [ ] **M0149-0037 — port recovery/t/044_invalidate_inactive_slots.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/044_invalidate_inactive_slots.pl` — slot invalidation by `idle_replication_slot_timeout`.
+  Likely prerequisites \(verify at start\): checkpoint-time idle invalidation, `invalidation_reason = idle_timeout`, injection point `slot-timeout-inval`, PG log text.
+- [ ] **M0149-0038 — port recovery/t/046_checkpoint_logical_slot.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/046_checkpoint_logical_slot.pl` — logical slot advanced during a checkpoint keeps a valid `restart_lsn`.
+  Likely prerequisites \(verify at start\): injection points in checkpoint/slot code \(`checkpoint-before-old-wal-removal`, etc.\), `restart_lsn` vs WAL removal ordering, standby slot sync paths.
+- [ ] **M0149-0039 — port recovery/t/035_standby_logical_decoding.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/035_standby_logical_decoding.pl` — logical decoding on a standby, conflicts and promotion.
+  Likely prerequisites \(verify at start\): logical slots on standby \(`pg_log_standby_snapshot`\), invalidation `rows_removed`/`wal_level_insufficient`, `confl_active_logicalslot` stats, slots kept through promotion.
+- [ ] **M0149-0040 — port subscription/t/003_constraints.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/003_constraints.pl` — FKs and triggers on the subscriber.
+  Likely prerequisites \(verify at start\): existing ports drive pgoutput in-process; verify the libpq apply path \(`internal/executor/applyworker.go`, `internal/postmaster/subscription_refresh.go`\) covers the test; `session_replication_role=replica` trigger rules, `ENABLE REPLICA/ALWAYS TRIGGER`. Overlap: M0122-0014 \(logical replication / decoding / subscription, open\) — reference it with `Prerequisite: M0122-0014` where its scope covers a gap.
+- [ ] **M0149-0041 — port subscription/t/005_encoding.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/005_encoding.pl` — publisher and subscriber databases in different encodings.
+  Likely prerequisites \(verify at start\): non-UTF8 database encodings \(LATIN1\), `client_encoding` conversion in the apply connection.
+- [ ] **M0149-0042 — port subscription/t/006_rewrite.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/006_rewrite.pl` — decoding across a heap rewrite.
+  Likely prerequisites \(verify at start\): decoding DML after a table rewrite \(new relfilenode, `RelidByRelfilenumber`, rewrite mappings\).
+- [ ] **M0149-0043 — port subscription/t/007_ddl.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/007_ddl.pl` — subscription DDL behaviour.
+  Likely prerequisites \(verify at start\): `ALTER SUBSCRIPTION … SET/ADD PUBLICATION` with missing-publication WARNING texts, DROP SUBSCRIPTION transaction-block rules.
+- [ ] **M0149-0044 — port subscription/t/008_diff_schema.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/008_diff_schema.pl` — subscriber with a different table schema.
+  Likely prerequisites \(verify at start\): attribute mapping by name, extra/missing-column errors with PG texts, Relation-message re-send after publisher ALTER.
+- [ ] **M0149-0045 — port subscription/t/009_matviews.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/009_matviews.pl` — materialized views are not replicated.
+  Likely prerequisites \(verify at start\): decoding skips matview refresh / transient heaps.
+- [ ] **M0149-0046 — port subscription/t/002_types.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/002_types.pl` — arrays, composites, enums, domains, ranges over logical replication.
+  Likely prerequisites \(verify at start\): pgoutput Type \(`Y`\) messages, text I/O of every listed type on both sides, range/multirange, domain constraints at apply.
+- [ ] **M0149-0047 — port subscription/t/010_truncate.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/010_truncate.pl` — TRUNCATE replication incl. CASCADE / RESTART IDENTITY and sync rep.
+  Likely prerequisites \(verify at start\): pgoutput Truncate message + options, `publish = 'truncate'`, logical walsender in `synchronous_standby_names`.
+- [ ] **M0149-0048 — port subscription/t/011_generated.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/011_generated.pl` — generated columns in initial sync and apply.
+  Likely prerequisites \(verify at start\): PG 18 `publish_generated_columns`, stored vs virtual generated columns on both sides.
+- [ ] **M0149-0049 — port subscription/t/012_collation.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/012_collation.pl` — nondeterministic ICU collations as replica identity.
+  Likely prerequisites \(verify at start\): ICU nondeterministic collations \(mirror upstream ICU skip only\); overlaps M0148's collation family.
+- [ ] **M0149-0050 — port subscription/t/014_binary.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/014_binary.pl` — `binary = true` subscriptions.
+  Likely prerequisites \(verify at start\): pgoutput `b` tuple data via type send/recv, binary initial COPY, mismatch errors with PG texts.
+- [ ] **M0149-0051 — port subscription/t/020_messages.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/020_messages.pl` — logical decoding messages through pgoutput.
+  Likely prerequisites \(verify at start\): `messages` option + `M` message, `pg_logical_slot_peek_binary_changes` with pgoutput, transactional vs non-transactional messages.
+- [ ] **M0149-0052 — port subscription/t/024_add_drop_pub.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/024_add_drop_pub.pl` — ALTER SUBSCRIPTION ADD/DROP PUBLICATION.
+  Likely prerequisites \(verify at start\): `REFRESH PUBLICATION` semantics, `pg_subscription_rel` states, publication created after the subscription.
+- [ ] **M0149-0053 — port subscription/t/025_rep_changes_for_schema.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/025_rep_changes_for_schema.pl` — `FOR TABLES IN SCHEMA` publications.
+  Likely prerequisites \(verify at start\): `pg_publication_namespace`, relation-sync-cache invalidation on schema changes, rename/move of tables between schemas.
+- [ ] **M0149-0054 — port subscription/t/032_subscribe_use_index.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/032_subscribe_use_index.pl` — apply uses non-PK indexes for REPLICA IDENTITY FULL lookups.
+  Likely prerequisites \(verify at start\): `FindUsableIndexForReplicaIdentityFull` equivalent, `pg_stat_all_indexes.idx_scan` counted by apply.
+- [ ] **M0149-0055 — port subscription/t/034_temporal.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/034_temporal.pl` — temporal PK/UNIQUE \(`WITHOUT OVERLAPS`\) as replica identity.
+  Likely prerequisites \(verify at start\): PG 18 `WITHOUT OVERLAPS` constraints, replica-identity rules and error texts.
+- [ ] **M0149-0056 — port subscription/t/035_conflicts.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/035_conflicts.pl` — `multiple_unique_conflicts` detection.
+  Likely prerequisites \(verify at start\): apply-side conflict detection and PG log text, `pg_stat_subscription_stats` conflict counters.
+- [ ] **M0149-0057 — port subscription/t/027_nosuperuser.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/027_nosuperuser.pl` — logical replication respects permissions.
+  Likely prerequisites \(verify at start\): non-superuser subscription owners \(`pg_create_subscription`, `password_required`\), apply privilege checks incl. RLS, owner change mid-stream.
+- [ ] **M0149-0058 — port subscription/t/033_run_as_table_owner.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/033_run_as_table_owner.pl` — `run_as_owner` and table-owner apply.
+  Likely prerequisites \(verify at start\): `run_as_owner` option, apply switching to table owner under a security-restricted operation.
+- [ ] **M0149-0059 — port subscription/t/028_row_filter.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/028_row_filter.pl` — publication row filters.
+  Likely prerequisites \(verify at start\): `PUBLICATION … WHERE` parse/validation, old/new tuple transformation on UPDATE, filtered initial COPY, `publish_via_partition_root`.
+- [ ] **M0149-0060 — port subscription/t/031_column_list.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/031_column_list.pl` — publication column lists.
+  Likely prerequisites \(verify at start\): column lists in pgoutput Relation/tuple data, combining lists across publications, `pg_publication_tables.attnames`, column-subset initial sync.
+- [ ] **M0149-0061 — port subscription/t/013_partition.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/013_partition.pl` — partitioned tables on publisher and subscriber.
+  Likely prerequisites \(verify at start\): `publish_via_partition_root`, subscriber-side tuple routing into differently shaped partitions, ATTACH/DETACH.
+- [ ] **M0149-0062 — port subscription/t/030_origin.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/030_origin.pl` — `origin` parameter and `copy_data` interaction.
+  Likely prerequisites \(verify at start\): replication origins \(`pg_replication_origin_status`, `replorigin_checkpoint` file\), `origin = none` filtering, PG WARNING text for copy\_data with origin, bidirectional setups.
+- [ ] **M0149-0063 — port subscription/t/015_stream.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/015_stream.pl` — streaming of a large in-progress transaction.
+  Likely prerequisites \(verify at start\): `logical_decoding_work_mem` spill \(PG `xid-*.spill` files\), pgoutput Stream Start/Stop/Commit/Abort, `streaming = on|parallel` incl. parallel apply workers, `debug_logical_replication_streaming`.
+- [ ] **M0149-0064 — port subscription/t/016_stream_subxact.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/016_stream_subxact.pl` — streaming a transaction with subtransactions.
+  Likely prerequisites \(verify at start\): subxact assignment in streamed chunks, parallel apply of subxacts.
+- [ ] **M0149-0065 — port subscription/t/017_stream_ddl.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/017_stream_ddl.pl` — DDL inside a streamed transaction.
+  Likely prerequisites \(verify at start\): mid-stream Relation messages, catalog snapshots for in-progress DDL during decoding.
+- [ ] **M0149-0066 — port subscription/t/018_stream_subxact_abort.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/018_stream_subxact_abort.pl` — streamed subtransaction rollbacks.
+  Likely prerequisites \(verify at start\): Stream Abort for subxacts \(proto v4 abort LSN/timestamp\), parallel-apply subxact rollback.
+- [ ] **M0149-0067 — port subscription/t/019_stream_subxact_ddl_abort.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/019_stream_subxact_ddl_abort.pl` — streamed subxacts mixing DDL, DML and rollbacks.
+  Likely prerequisites \(verify at start\): aborted-subxact catalog changes invisible to later decoding.
+- [ ] **M0149-0068 — port subscription/t/021_twophase.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/021_twophase.pl` — logical replication of two-phase commit.
+  Likely prerequisites \(verify at start\): `two_phase` slots/subscriptions \(pending→enabled states, PG 18 ALTER\), Begin Prepare/Prepare/Commit Prepared/Rollback Prepared, subscriber gid `pg_gid_<subid>_<xid>`.
+- [ ] **M0149-0069 — port subscription/t/022_twophase_cascade.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/022_twophase_cascade.pl` — cascaded 2PC replication A→B→C.
+  Likely prerequisites \(verify at start\): forwarding prepared xacts through an intermediate subscriber/publisher, origin tracking, streaming + 2PC combination.
+- [ ] **M0149-0070 — port subscription/t/023_twophase_stream.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/023_twophase_stream.pl` — 2PC with streaming.
+  Likely prerequisites \(verify at start\): Stream Prepare message, parallel apply of prepared streamed xacts.
+- [ ] **M0149-0071 — port subscription/t/029_on_error.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/029_on_error.pl` — `disable_on_error` and `ALTER SUBSCRIPTION … SKIP`.
+  Likely prerequisites \(verify at start\): `disable_on_error`, `subskiplsn` + skip-transaction log texts, interplay with streaming and two-phase.
+- [ ] **M0149-0072 — port recovery/t/040_standby_failover_slots_sync.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/040_standby_failover_slots_sync.pl` — failover slots synced to a standby and used after promotion.
+  Likely prerequisites \(verify at start\): `failover` slots + `ALTER_REPLICATION_SLOT`, slotsync worker \(`sync_replication_slots`, `synchronized_standby_slots`\), `pg_sync_replication_slots()`, subscriber switching to the promoted standby.
+- [ ] **M0149-0073 — port subscription/t/100_bugs.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/100_bugs.pl` — historical logical-replication regression cases.
+  Likely prerequisites \(verify at start\): triage each bug case at start; file one child per uncovered case.
+- [ ] **M0149-0074 — port recovery/t/027_stream_regress.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/027_stream_regress.pl` — full regress schedule on a streaming primary; `pg_dumpall` of primary and standby compared.
+  Likely prerequisites \(verify at start\): replay of every regress-exercised WAL record; pass requires M0148 regress parity — if reached first, land the replication children, then mark `[!] blocked-on M0148 regress parity` \(explicit blocker, not a ledger park\).
+
 ## M0148 — pg_regress coverage closure with prerequisite implementation (filed 2026-10-29, owner decision)
 
 **Milestone doc:** `docs/milestones/0148-regress-coverage-closure.md`.
-**Rank:** banner item 10 after the already-filed M0122 queue. The milestone
-document defines the canonical suite queue and is binding. A suite parent stays
+**Rank:** banner item 10 after the already-filed M0122 queue and after M0149
+(paused while M0149 has a selectable task; owner decision 2026-11-15). The
+milestone document defines the canonical suite queue and is binding. A suite
+parent stays
 open until its output matches PostgreSQL 18.3; every missing prerequisite is
 filed and implemented as that suite task's child. Ledger-only parking is not a
 completion path.

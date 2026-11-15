@@ -187,6 +187,10 @@ case("D: Movement: yes citing a regress diff count -> ok", base,
      base + "- [x] **M0142-0054 — t**\n  Parent: M0142-0008\n  Movement: yes — regress join 14931 -> 14876\n", None)
 case("D: Movement: yes citing lever-count with a number -> ok", base,
      base + "- [x] **M0142-0056 — t**\n  Parent: M0142-0008\n  Movement: yes — lever-count 34→33 (census 22/22·99/99·99/99 held)\n", None)
+case("D: Movement: yes citing tap with a number -> ok", base,
+     base + "- [x] **M0142-0058 — t**\n  Parent: M0142-0008\n  Movement: yes — tap 034_create_database 3/12→7/12\n", None)
+case("D: Movement: yes citing tap without a number -> violation", base,
+     base + "- [x] **M0142-0059 — t**\n  Parent: M0142-0008\n  Movement: yes — tap assertions improved\n", "D")
 case("D: Movement: yes citing lever-count without a number -> violation", base,
      base + "- [x] **M0142-0057 — t**\n  Parent: M0142-0008\n  Movement: yes — lever-count went down\n", "D")
 case("D: Movement: yes citing regress without a number -> violation", base,

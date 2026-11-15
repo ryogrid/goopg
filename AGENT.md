@@ -637,7 +637,9 @@ remains below is filing/completion discipline, not rank.
   moved beyond ±3, or `make ea-ratchet` findings decreased, or a `regress`
   suite's diff count moved (e.g. `regress join 14868 -> 14730`), or — for M0147
   lever-retirement tasks only — `lever-count` decreased (`scripts/lever-count.sh`,
-  e.g. `lever-count 34 -> 33`). `Movement: yes`
+  e.g. `lever-count 34 -> 33`), or — for M0149 TAP-port tasks only — the
+  ported test's passing upstream assertions moved in its all-goopg + mixed
+  PG 18.3 runs (`tap 034_create_database 3/12 -> 7/12`). `Movement: yes`
   must cite one of those instruments **with a number** on the same line;
   anything else (a unit test now passing, a feature now working) is
   `Movement: none` — real work, but not movement toward this goal.
