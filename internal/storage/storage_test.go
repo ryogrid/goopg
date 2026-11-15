@@ -71,7 +71,7 @@ func TestSMGRReadWriteRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 16385, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 16385, Fork: MainFork}
 
 	page := make(Page, BlockSize)
 	if err := InitPage(page); err != nil {
@@ -124,7 +124,7 @@ func TestSMGRReadWriteRoundTrip(t *testing.T) {
 	}
 
 	// Confirm the file lives where we expect.
-	want := filepath.Join(dir, "base", "1", "16385")
+	want := filepath.Join(dir, "base", "16384", "16385")
 	if _, err := mgr.relFile(rel); err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestPoolPinReadsThroughSMGR(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 100, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 100, Fork: MainFork}
 
 	// Stage: extend a block via smgr directly so the file exists.
 	src := make(Page, BlockSize)
@@ -192,7 +192,7 @@ func TestPoolDirtyEvictionWritesBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 200, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 200, Fork: MainFork}
 
 	// Extend three blocks via PinNew so they exist on disk.
 	for i := 0; i < 3; i++ {
@@ -231,7 +231,7 @@ func TestPoolPinAllExhaustsBuffers(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 300, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 300, Fork: MainFork}
 
 	// Extend 3 blocks.
 	for i := 0; i < 3; i++ {
@@ -275,7 +275,7 @@ func TestPoolEvictHighUsageDoesNotSpuriouslyExhaust(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 301, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 301, Fork: MainFork}
 
 	// Create 4 blocks directly in smgr so pinning block 3 requires
 	// evicting one of the cached blocks 0..2.
@@ -329,7 +329,7 @@ func TestPoolFlushAllClearsDirty(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 400, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 400, Fork: MainFork}
 
 	s, _, err := pool.PinNew(rel)
 	if err != nil {
@@ -374,8 +374,8 @@ func TestPoolFlushRelWritesOnlyTargetRelationAndKeepsSlotsCached(t *testing.T) {
 	}
 	defer pool.Close()
 
-	relA := RelFileNode{DBOid: 1, RelOid: 400, Fork: MainFork}
-	relB := RelFileNode{DBOid: 1, RelOid: 401, Fork: MainFork}
+	relA := RelFileNode{DBOid: 16384, RelOid: 400, Fork: MainFork}
+	relB := RelFileNode{DBOid: 16384, RelOid: 401, Fork: MainFork}
 
 	sA, _, err := pool.PinNew(relA)
 	if err != nil {
@@ -442,7 +442,7 @@ func TestPoolEvictionFlushesWALBeforeData(t *testing.T) {
 	}
 	defer pool.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 500, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 500, Fork: MainFork}
 
 	s0, _, err := pool.PinNew(rel)
 	if err != nil {
@@ -500,7 +500,7 @@ func TestPoolFPIEmittedOncePerEpoch(t *testing.T) {
 	}
 	defer pool.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 600, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 600, Fork: MainFork}
 	s, _, err := pool.PinNew(rel)
 	if err != nil {
 		t.Fatal(err)
@@ -556,7 +556,7 @@ func TestPoolFPISkippedWhenDisabled(t *testing.T) {
 	}
 	defer pool.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 601, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 601, Fork: MainFork}
 	s, _, err := pool.PinNew(rel)
 	if err != nil {
 		t.Fatal(err)
@@ -604,7 +604,7 @@ func TestMarkDirtyLogicalChangeEmitsLogicalAndFPIOnFirstDirty(t *testing.T) {
 	}
 	defer pool.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 700, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 700, Fork: MainFork}
 	s, _, err := pool.PinNew(rel)
 	if err != nil {
 		t.Fatal(err)
@@ -675,7 +675,7 @@ func TestMarkDirtyLogicalChangeEmitsLogicalOnlyOnSecondDirty(t *testing.T) {
 	}
 	defer pool.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 701, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 701, Fork: MainFork}
 	s, _, err := pool.PinNew(rel)
 	if err != nil {
 		t.Fatal(err)
@@ -724,7 +724,7 @@ func TestMarkDirtyLogicalChangeWithoutFPIHookEmitsLogicalOnly(t *testing.T) {
 	}
 	defer pool.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 702, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 702, Fork: MainFork}
 	s, _, err := pool.PinNew(rel)
 	if err != nil {
 		t.Fatal(err)
@@ -762,7 +762,7 @@ func TestMarkDirtyLogicalChangeRequiresEmitter(t *testing.T) {
 	}
 	defer pool.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 703, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 703, Fork: MainFork}
 	s, _, err := pool.PinNew(rel)
 	if err != nil {
 		t.Fatal(err)
@@ -788,7 +788,7 @@ func TestPoolEvictionReturnsWALFlushError(t *testing.T) {
 	}
 	defer pool.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 501, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 501, Fork: MainFork}
 
 	s0, _, err := pool.PinNew(rel)
 	if err != nil {
@@ -850,7 +850,7 @@ func TestPrefetchBlockSyncFallback(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 17000, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 17000, Fork: MainFork}
 
 	page := make(Page, BlockSize)
 	if err := InitPage(page); err != nil {
@@ -886,7 +886,7 @@ func TestPrefetchBlockUsesAttachedEngine(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 17001, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 17001, Fork: MainFork}
 
 	// Two pages so PrefetchBlock(blk=1) lands at offset BlockSize.
 	page := make(Page, BlockSize)
@@ -930,7 +930,7 @@ func TestPrefetchBlockOutOfRange(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 17002, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 17002, Fork: MainFork}
 	page := make(Page, BlockSize)
 	_ = InitPage(page)
 	if _, err := mgr.Extend(rel, page); err != nil {
@@ -971,7 +971,7 @@ func TestPoolPinFiresNoSpeculativeReads(t *testing.T) {
 	}
 	defer pool.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 17100, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 17100, Fork: MainFork}
 	const nblk = 6 // > Slots, so the walk also exercises eviction
 	for b := 0; b < nblk; b++ {
 		page := make(Page, BlockSize)
@@ -1012,7 +1012,7 @@ func TestWriteBlockAIOSyncFallback(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 17200, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 17200, Fork: MainFork}
 
 	page := make(Page, BlockSize)
 	if err := InitPage(page); err != nil {
@@ -1049,7 +1049,7 @@ func TestWriteBlockAIOUsesAttachedEngine(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 17201, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 17201, Fork: MainFork}
 
 	page := make(Page, BlockSize)
 	if err := InitPage(page); err != nil {
@@ -1095,7 +1095,7 @@ func TestWriteBlockAIORejectsOutOfRange(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 17202, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 17202, Fork: MainFork}
 	page := make(Page, BlockSize)
 	_ = InitPage(page)
 	if _, err := mgr.Extend(rel, page); err != nil {
@@ -1132,7 +1132,7 @@ func TestFlushAllPacedBatchedSubmitsThroughEngine(t *testing.T) {
 	defer pool.Close()
 	pool.SetAsyncFlushBatchSize(4)
 
-	rel := RelFileNode{DBOid: 1, RelOid: 17300, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 17300, Fork: MainFork}
 	page := make(Page, BlockSize)
 	if err := InitPage(page); err != nil {
 		t.Fatal(err)
@@ -1199,7 +1199,7 @@ func TestFlushAllPacedBatchSizeOneEquivalentToLegacy(t *testing.T) {
 	}
 	defer pool.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 17301, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 17301, Fork: MainFork}
 	page := make(Page, BlockSize)
 	_ = InitPage(page)
 	if _, err := mgr.Extend(rel, page); err != nil {
@@ -1268,8 +1268,8 @@ func TestFlushBatchSkipsStaleTag(t *testing.T) {
 	}
 	defer pool.Close()
 
-	relOld := RelFileNode{DBOid: 1, RelOid: 20001, Fork: MainFork}
-	relNew := RelFileNode{DBOid: 1, RelOid: 20002, Fork: MainFork}
+	relOld := RelFileNode{DBOid: 16384, RelOid: 20001, Fork: MainFork}
+	relNew := RelFileNode{DBOid: 16384, RelOid: 20002, Fork: MainFork}
 	page := make(Page, BlockSize)
 	_ = InitPage(page)
 	if _, err := mgr.Extend(relOld, page); err != nil {
@@ -1344,7 +1344,7 @@ func TestPrefetchBlockPopulatesTarget(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 17400, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 17400, Fork: MainFork}
 	page := make(Page, BlockSize)
 	_ = InitPage(page)
 	if _, err := mgr.Extend(rel, page); err != nil {
@@ -1364,7 +1364,7 @@ func TestPrefetchBlockPopulatesTarget(t *testing.T) {
 	if len(eng.submits) != 1 {
 		t.Fatalf("submits=%d want 1", len(eng.submits))
 	}
-	want := filepath.Join(dir, "base", "1", "17400")
+	want := filepath.Join(dir, "base", "16384", "17400")
 	if got := eng.submits[0].Target; got != want {
 		t.Errorf("Target=%q want %q", got, want)
 	}
@@ -1376,7 +1376,7 @@ func TestWriteBlockAIOPopulatesTarget(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 17401, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 17401, Fork: MainFork}
 	page := make(Page, BlockSize)
 	_ = InitPage(page)
 	if _, err := mgr.Extend(rel, page); err != nil {
@@ -1392,7 +1392,7 @@ func TestWriteBlockAIOPopulatesTarget(t *testing.T) {
 	if _, werr := h.Wait(); werr != nil {
 		t.Fatal(werr)
 	}
-	want := filepath.Join(dir, "base", "1", "17401")
+	want := filepath.Join(dir, "base", "16384", "17401")
 	if got := eng.submits[0].Target; got != want {
 		t.Errorf("Target=%q want %q", got, want)
 	}
@@ -1406,7 +1406,7 @@ func TestPinNewEmitsSmgrCreateOnFirstBlock(t *testing.T) {
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 88888, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 88888, Fork: MainFork}
 
 	var emitted []RelFileNode
 	pool, err := NewPool(mgr, PoolConfig{
@@ -1459,7 +1459,7 @@ func TestExtendRelationBatchAppendsContiguousBlocks(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 90001, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 90001, Fork: MainFork}
 
 	pool, err := NewPool(mgr, PoolConfig{Slots: 8})
 	if err != nil {
@@ -1511,7 +1511,7 @@ func TestExtendRelationBatchEmitsSmgrCreateOnceOnFirstBatch(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 90002, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 90002, Fork: MainFork}
 
 	var emitted []RelFileNode
 	pool, err := NewPool(mgr, PoolConfig{
@@ -1547,7 +1547,7 @@ func TestExtendRelationBatchInteropWithPinAndExtend(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 90003, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 90003, Fork: MainFork}
 
 	pool, err := NewPool(mgr, PoolConfig{Slots: 8})
 	if err != nil {
@@ -1609,7 +1609,7 @@ func TestExtendRelationBatchRejectsNonPositiveN(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 90004, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 90004, Fork: MainFork}
 
 	pool, err := NewPool(mgr, PoolConfig{Slots: 4})
 	if err != nil {
@@ -1638,7 +1638,7 @@ func TestSlotPinCountUnmappedTag(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 91001, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 91001, Fork: MainFork}
 
 	// Never-pinned tag: returns 0.
 	tag := BufferTag{Rel: rel, Block: 42}
@@ -1658,7 +1658,7 @@ func TestSlotPinCountReflectsPinUnpin(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 91002, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 91002, Fork: MainFork}
 
 	src := make(Page, BlockSize)
 	if err := InitPage(src); err != nil {
@@ -1709,7 +1709,7 @@ func TestSlotPinCountAfterEviction(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 91003, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 91003, Fork: MainFork}
 
 	src := make(Page, BlockSize)
 	if err := InitPage(src); err != nil {
@@ -1747,7 +1747,7 @@ func TestSlotPinCountIsolatesByTag(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 91004, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 91004, Fork: MainFork}
 
 	src := make(Page, BlockSize)
 	if err := InitPage(src); err != nil {
@@ -1830,7 +1830,7 @@ func TestBlockLatchSerializesAIOAgainstSync(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 17300, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 17300, Fork: MainFork}
 
 	page := make(Page, BlockSize)
 	if err := InitPage(page); err != nil {

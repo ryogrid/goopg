@@ -38,7 +38,7 @@ func TestMarkDirtyCoveredByRecordStampsSecondaryPage(t *testing.T) {
 	}
 	defer pool.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 626, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 626, Fork: MainFork}
 	s, _, err := pool.PinNew(rel)
 	if err != nil {
 		t.Fatal(err)
@@ -124,7 +124,7 @@ func TestMarkDirtyCoveredByRecordEmitsFirstTouchImage(t *testing.T) {
 	}
 	defer pool.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 627, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 627, Fork: MainFork}
 	s, _, err := pool.PinNew(rel)
 	if err != nil {
 		t.Fatal(err)

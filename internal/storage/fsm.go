@@ -5,7 +5,8 @@ import "sync"
 // fsmKey identifies a heap relation (without fork) for FSM lookups.
 type fsmKey struct{ DBOid, RelOid uint32 }
 
-func fsmKeyFor(rel RelFileNode) fsmKey { return fsmKey{rel.DBOid, rel.RelOid} }
+// fsmKeyFor keys by the canonical identity (StorageDBOid), as vmKeyFor.
+func fsmKeyFor(rel RelFileNode) fsmKey { return fsmKey{StorageDBOid(rel.DBOid), rel.RelOid} }
 
 // FSM is the in-memory free-space map for heap relations (M0046-0003).
 //

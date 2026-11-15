@@ -1,6 +1,7 @@
 # M0149\-0001a1 — one OID per database on disk, in WAL and on display
 
-Status: census and slice plan, 2026\-11\-15. No code changed yet.
+Status: S1 landed 2026\-11\-15 \(postgres catalogs stored and WAL\-logged at
+DBOid 5\). S2–S3 open.
 Parent: M0149\-0001a \(template1's PG catalog image\) → M0149\-0001 \(port
 `recovery/t/034_create_database.pl`\).
 
@@ -132,6 +133,48 @@ Key observation: PG compatibility constrains only the **displayed** and
   pg\_waldump on the same probe shows no `1663/1/…` block reference;
   spotcheck, sf025 and acceptance on old corpora; replay of a pre\-S1 WAL
   segment.
+
+## S1 as landed \(2026\-11\-15, third loop\)
+
+- `storage.StorageDBOid` \(1 → 5\) and `RelFileNode.Canonical()` are applied
+  at every `Pool` / smgr entry point, in the VM and FSM map keys, in the heap
+  extension lock key, and in the WAL block\-reference and main\-data
+  encoders.
+- The mirror returns early once the source and destination normalize to the
+  same OID.
+- **The mirror did not keep `base/5` complete.** This contradicts the
+  assumption under "Risks". On the shipped SF0.25 corpus, 13 files differed.
+  For example, `pg_statistic` \(2619\) was 688 KB in `base/1` but one empty
+  page in `base/5`. With routing alone, sf025 values passed, but the fire\-set
+  plan parity dropped from 99/99 to 2/99.
+- Fix: a one\-time startup migration, `migratePostgresCatalogsToBase5`
+  \(internal/initdb/layout\_postgres\_base5.go\).
+  - It runs in `initdb.Open` before the storage Manager opens and before
+    WAL redo.
+  - For each relation file in `base/1`, it copies the file over `base/5`
+    when `base/1`'s maximum page LSN is higher. It also copies when `base/5`
+    lacks the file and the `base/1` file is non\-empty.
+  - Each copy goes through a temp file, fsync and rename.
+  - When done, it records `postgres_catalogs_at_base5` in
+    `global/pg_goopg_features`.
+  - Redo then replays any later record on top. A pre\-S1 record naming
+    DBOid 1 is mapped to `base/5`.
+- Measured:
+  - A fresh probe running a postgres CREATE TABLE, INSERT and CHECKPOINT
+    emits 70 block refs at `1663/5/…` and zero at `1663/1/…`.
+  - A cluster and WAL written by the pre\-S1 binary replay correctly under
+    S1.
+- Gates:
+  - units, postmaster, and tpch\-spotcheck PASS;
+  - fire\-set fires=none on all three corpora, with parity 99/99, 99/99 and
+    22/22;
+  - sf025 99 PASS, with plans identical to the pre\-S1 baseline;
+  - acceptance PASS;
+  - the PG\-interop e2e tests PASS: FailoverGoopgToPG, PGStandbyFullCycle,
+    PGCrashStartOnGoopgDataDir and PGStandbyFollowsGoopgTimelineSwitch;
+  - the TAP ports Recovery001, 013, 019, 038, 039 and 047 PASS.
+- A side effect of the sf025 sweep: the shipped SF0.25 corpus is now
+  migrated. The migration is idempotent and only copies newer data.
 
 ## Risks
 

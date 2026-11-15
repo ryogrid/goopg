@@ -505,7 +505,7 @@ func appendXactRelFileLocators(mainData []byte, rels []storage.RelFileNode) []by
 			spc = pgDefaultTableSpaceOID
 		}
 		mainData = binary.LittleEndian.AppendUint32(mainData, spc)
-		mainData = binary.LittleEndian.AppendUint32(mainData, r.DBOid)
+		mainData = binary.LittleEndian.AppendUint32(mainData, storage.StorageDBOid(r.DBOid))
 		mainData = binary.LittleEndian.AppendUint32(mainData, r.RelOid)
 	}
 	return mainData
@@ -1309,7 +1309,7 @@ func EncodeSmgrCreatePG(rel storage.RelFileNode, xid storage.TransactionID) ([]b
 	}
 	mainData := make([]byte, 0, 16)
 	mainData = binary.LittleEndian.AppendUint32(mainData, spc)
-	mainData = binary.LittleEndian.AppendUint32(mainData, rel.DBOid)
+	mainData = binary.LittleEndian.AppendUint32(mainData, storage.StorageDBOid(rel.DBOid))
 	mainData = binary.LittleEndian.AppendUint32(mainData, rel.RelOid)
 	mainData = binary.LittleEndian.AppendUint32(mainData, uint32(rel.Fork))
 	return framedAssemble(RmgrStorage, xlogSmgrCreate, uint32(xid), mainData, nil)

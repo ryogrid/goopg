@@ -15,7 +15,7 @@ func newBgwriterPool(t *testing.T, slots int) (*Pool, RelFileNode) {
 		t.Fatalf("NewPool: %v", err)
 	}
 	t.Cleanup(func() { _ = pool.Close(); _ = mgr.Close() })
-	rel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 1, Fork: MainFork}
 	return pool, rel
 }
 
@@ -151,8 +151,8 @@ func TestBgwriterDoDDirtyVictimRate(t *testing.T) {
 	}
 	defer func() { _ = pool.Close(); _ = mgr.Close() }()
 
-	hotRel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
-	coldRel := RelFileNode{DBOid: 1, RelOid: 2, Fork: MainFork}
+	hotRel := RelFileNode{DBOid: 16384, RelOid: 1, Fork: MainFork}
+	coldRel := RelFileNode{DBOid: 16384, RelOid: 2, Fork: MainFork}
 
 	seedPage := make(Page, BlockSize)
 	if err := InitPage(seedPage); err != nil {

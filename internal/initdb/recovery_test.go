@@ -199,7 +199,8 @@ func TestCrashRecoveryReplaysChecksummedClusterCleanly(t *testing.T) {
 	if err := rt2.Pool.FlushAll(); err != nil {
 		t.Fatalf("FlushAll before on-disk verify: %v", err)
 	}
-	btreePath := filepath.Join(dir, "base", "1", "9200")
+	// DBOid 1 is stored at base/5 (storage.StorageDBOid, M0149-0001a1 S1).
+	btreePath := filepath.Join(dir, "base", "5", "9200")
 	if fi, err := os.Stat(btreePath); err != nil {
 		t.Fatalf("stat recovered btree file %q: %v", btreePath, err)
 	} else if fi.Size() <= storage.BlockSize {

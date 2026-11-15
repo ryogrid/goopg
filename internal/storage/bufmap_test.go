@@ -39,7 +39,7 @@ func TestBufmapPackUnpackRoundtrip(t *testing.T) {
 // Lookup returns the same values rather than (0, 3) or "not found".
 func TestBufmapInsertLookupSlotZeroGenOne(t *testing.T) {
 	m := newBufmap(8)
-	tag := BufferTag{Rel: RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}, Block: 0}
+	tag := BufferTag{Rel: RelFileNode{DBOid: 16384, RelOid: 1, Fork: MainFork}, Block: 0}
 	if ok := m.Insert(tag, 0, 1); !ok {
 		t.Fatal("Insert(slot=0, gen=1) failed")
 	}
@@ -65,14 +65,14 @@ func TestBufmapInsertSkipsPastTombstoneToExistingKey(t *testing.T) {
 	m := newBufmap(4) // next pow2 >= 2*4 => 8 buckets
 	mask := m.inner.Load().mask
 
-	tagA := BufferTag{Rel: RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}, Block: 0}
+	tagA := BufferTag{Rel: RelFileNode{DBOid: 16384, RelOid: 1, Fork: MainFork}, Block: 0}
 	hA := bufTagHash(tagA) & mask
 
 	// Find tagB whose starting probe bucket collides with tagA's.
 	var tagB BufferTag
 	found := false
 	for blk := BlockNumber(1); blk < 100000; blk++ {
-		cand := BufferTag{Rel: RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}, Block: blk}
+		cand := BufferTag{Rel: RelFileNode{DBOid: 16384, RelOid: 1, Fork: MainFork}, Block: blk}
 		if bufTagHash(cand)&mask == hA {
 			tagB = cand
 			found = true

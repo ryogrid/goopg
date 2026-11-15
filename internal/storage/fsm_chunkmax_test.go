@@ -64,7 +64,7 @@ func TestFSMChunkMaxMatchesFullScan(t *testing.T) {
 	const npages = fsmChunkBlocks*3 + 137
 	rng := rand.New(rand.NewSource(20260831))
 	f := NewFSM()
-	rel := RelFileNode{DBOid: 1, RelOid: 16384}
+	rel := RelFileNode{DBOid: 16384, RelOid: 16384}
 	want := make([]uint16, npages)
 
 	set := func(blk int, free uint16) {
@@ -98,7 +98,7 @@ func TestFSMChunkMaxMatchesFullScan(t *testing.T) {
 // number grows the array in one step and leaves every skipped block at zero.
 func TestFSMRecordFreeSpaceGrowth(t *testing.T) {
 	f := NewFSM()
-	rel := RelFileNode{DBOid: 1, RelOid: 16385}
+	rel := RelFileNode{DBOid: 16384, RelOid: 16385}
 	f.RecordFreeSpace(rel, 5000, 4096)
 	if _, ok := f.GetPageWithFreeSpace(rel, 1); !ok {
 		t.Fatal("block 5000 not visible after RecordFreeSpace")

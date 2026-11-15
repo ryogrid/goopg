@@ -8,7 +8,10 @@ import (
 // vmKey identifies a heap relation (without fork) for Visibility Map lookups.
 type vmKey struct{ DBOid, RelOid uint32 }
 
-func vmKeyFor(rel RelFileNode) vmKey { return vmKey{rel.DBOid, rel.RelOid} }
+// vmKeyFor keys a relation's map by its canonical identity (StorageDBOid),
+// as buffer tags are: a caller holding a slot's tag and one holding the
+// catalog's RelFileNode must reach the same bits (M0149-0001a1 S1).
+func vmKeyFor(rel RelFileNode) vmKey { return vmKey{StorageDBOid(rel.DBOid), rel.RelOid} }
 
 // VM bit flags per heap block are declared in vm_fork.go (VMAllVisible=0x01,
 // VMAllFrozen=0x02 — upstream visibilitymap.c two-bit layout, which the

@@ -80,6 +80,29 @@ type RelFileNode struct {
 	Fork   ForkNumber
 }
 
+// StorageDBOid maps a relation's database OID to the OID its files live
+// under and its WAL block references name — the PostgreSQL database OID.
+// goopg's catalog namespace for the `postgres` database is the legacy
+// sentinel 1 (catalog.DefaultDBOid), while PG stores postgres at base/5
+// (catalog.PostgresDBOid) and uses 1 for template1: every relation written
+// under 1 is postgres', so it lives in base/5 and its WAL says 5. Defined
+// here with literal OIDs because storage cannot import catalog. M0149-0001a1
+// S1 (docs/design/0100-0149/0149-0001a1-database-oid-layout.md).
+func StorageDBOid(dbOid uint32) uint32 {
+	if dbOid == 1 {
+		return 5
+	}
+	return dbOid
+}
+
+// Canonical returns rel with its database OID mapped by StorageDBOid: the
+// identity every storage entry point (buffer tags, smgr files, WAL block
+// references) uses, so (1, rel) and (5, rel) are one relation.
+func (r RelFileNode) Canonical() RelFileNode {
+	r.DBOid = StorageDBOid(r.DBOid)
+	return r
+}
+
 // BufferTag is RelFileNode + BlockNumber. Used as the buffer-pool
 // hash-table key.
 type BufferTag struct {

@@ -27,7 +27,7 @@ func newAssertPool(t *testing.T) (*Pool, *Slot) {
 	}
 	t.Cleanup(func() { pool.Close() })
 
-	s, _, err := pool.PinNew(RelFileNode{DBOid: 1, RelOid: 626, Fork: MainFork})
+	s, _, err := pool.PinNew(RelFileNode{DBOid: 16384, RelOid: 626, Fork: MainFork})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestPDLSNAssertSilentWhenWALUnwired(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	s, _, err := pool.PinNew(RelFileNode{DBOid: 1, RelOid: 626, Fork: MainFork})
+	s, _, err := pool.PinNew(RelFileNode{DBOid: 16384, RelOid: 626, Fork: MainFork})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -29,7 +29,7 @@ func TestBMIOInProgressSingleRead(t *testing.T) {
 	t.Cleanup(func() { _ = baseMgr.Close() })
 
 	// Create the relation file and write block 0 so ReadBlock succeeds.
-	rel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 1, Fork: MainFork}
 	seedPage := make(Page, BlockSize)
 	if err := InitPage(seedPage); err != nil {
 		t.Fatal(err)
@@ -99,7 +99,7 @@ func TestBMIOInProgressDistinctBlocks(t *testing.T) {
 	baseMgr := NewManager(ManagerConfig{DataDir: dir})
 	t.Cleanup(func() { _ = baseMgr.Close() })
 
-	rel := RelFileNode{DBOid: 1, RelOid: 2, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 2, Fork: MainFork}
 	seedPage := make(Page, BlockSize)
 	if err := InitPage(seedPage); err != nil {
 		t.Fatal(err)
@@ -151,7 +151,7 @@ func TestBMIOInProgressRaceCondition(t *testing.T) {
 	baseMgr := NewManager(ManagerConfig{DataDir: dir})
 	t.Cleanup(func() { _ = baseMgr.Close() })
 
-	rel := RelFileNode{DBOid: 1, RelOid: 3, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 3, Fork: MainFork}
 	seedPage := make(Page, BlockSize)
 	if err := InitPage(seedPage); err != nil {
 		t.Fatal(err)

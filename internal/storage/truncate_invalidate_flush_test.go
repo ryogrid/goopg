@@ -37,8 +37,8 @@ func TestTruncateDuringEvictionFlushDiscardsStalePage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	relA := RelFileNode{DBOid: 1, RelOid: 7401, Fork: MainFork}
-	relB := RelFileNode{DBOid: 1, RelOid: 7402, Fork: MainFork}
+	relA := RelFileNode{DBOid: 16384, RelOid: 7401, Fork: MainFork}
+	relB := RelFileNode{DBOid: 16384, RelOid: 7402, Fork: MainFork}
 
 	// Put one dirty page of A in each slot (both slots are then occupied by
 	// A's blocks 0 and 1, matching the nightly shape where the history
@@ -83,7 +83,7 @@ func TestTruncateDuringEvictionFlushDiscardsStalePage(t *testing.T) {
 	pool.Unpin(slotB)
 
 	// The stale page must not have been written: A's file is 0 bytes.
-	st, serr := os.Stat(filepath.Join(dir, "base", "1", "7401"))
+	st, serr := os.Stat(filepath.Join(dir, "base", "16384", "7401"))
 	if serr != nil {
 		t.Fatalf("stat relA: %v", serr)
 	}
@@ -113,7 +113,7 @@ func TestInvalidateRelBumpsGenerationOfClaimedSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	relA := RelFileNode{DBOid: 1, RelOid: 7411, Fork: MainFork}
+	relA := RelFileNode{DBOid: 16384, RelOid: 7411, Fork: MainFork}
 
 	s, _, err := pool.PinNew(relA)
 	if err != nil {
@@ -173,7 +173,7 @@ func TestFlushBatchSkipsInvalidatedSlots(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	relA := RelFileNode{DBOid: 1, RelOid: 7421, Fork: MainFork}
+	relA := RelFileNode{DBOid: 16384, RelOid: 7421, Fork: MainFork}
 
 	s, _, err := pool.PinNew(relA)
 	if err != nil {

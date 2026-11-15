@@ -7,7 +7,7 @@ import (
 // TestVMSetAllVisible verifies the basic set/check/clear cycle.
 func TestVMSetAllVisible(t *testing.T) {
 	vm := NewVisibilityMap()
-	rel := RelFileNode{DBOid: 1, RelOid: 10, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 10, Fork: MainFork}
 
 	if vm.AllVisible(rel, 0) {
 		t.Fatal("expected false before any SetAllVisible call")
@@ -28,7 +28,7 @@ func TestVMSetAllVisible(t *testing.T) {
 // TestVMClearBlock verifies that ClearBlock resets the bit.
 func TestVMClearBlock(t *testing.T) {
 	vm := NewVisibilityMap()
-	rel := RelFileNode{DBOid: 1, RelOid: 11}
+	rel := RelFileNode{DBOid: 16384, RelOid: 11}
 	vm.SetAllVisible(rel, 2)
 	vm.ClearBlock(rel, 2)
 	if vm.AllVisible(rel, 2) {
@@ -41,7 +41,7 @@ func TestVMClearBlock(t *testing.T) {
 // TestVMDropRelation verifies that DropRelation removes all entries.
 func TestVMDropRelation(t *testing.T) {
 	vm := NewVisibilityMap()
-	rel := RelFileNode{DBOid: 1, RelOid: 12}
+	rel := RelFileNode{DBOid: 16384, RelOid: 12}
 	vm.SetAllVisible(rel, 0)
 	vm.SetAllVisible(rel, 1)
 	vm.DropRelation(rel)
@@ -53,7 +53,7 @@ func TestVMDropRelation(t *testing.T) {
 // TestVMNilSafe verifies that all methods are nil-safe.
 func TestVMNilSafe(t *testing.T) {
 	var vm *VisibilityMap
-	rel := RelFileNode{DBOid: 1, RelOid: 1}
+	rel := RelFileNode{DBOid: 16384, RelOid: 1}
 	if vm.AllVisible(rel, 0) {
 		t.Fatal("nil VM must return false")
 	}
@@ -117,7 +117,7 @@ func TestPageAllVisibleDeadTuple(t *testing.T) {
 // retain theirs, and a nil receiver stays a no-op.
 func TestVMTruncateRel(t *testing.T) {
 	vm := NewVisibilityMap()
-	rel := RelFileNode{DBOid: 1, RelOid: 13}
+	rel := RelFileNode{DBOid: 16384, RelOid: 13}
 	for b := BlockNumber(0); b < 10; b++ {
 		vm.SetAllVisible(rel, b)
 	}
@@ -135,7 +135,7 @@ func TestVMTruncateRel(t *testing.T) {
 	// Truncating beyond the recorded end and truncating a never-seen
 	// relation are no-ops.
 	vm.TruncateRel(rel, 64)
-	vm.TruncateRel(RelFileNode{DBOid: 1, RelOid: 9999}, 3)
+	vm.TruncateRel(RelFileNode{DBOid: 16384, RelOid: 9999}, 3)
 
 	var nilVM *VisibilityMap
 	nilVM.TruncateRel(rel, 1) // must not panic
@@ -148,8 +148,8 @@ func TestVMTruncateForkForHeap(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(ManagerConfig{DataDir: dir})
 	defer m.Close()
-	heapRel := RelFileNode{DBOid: 1, RelOid: 7000, Fork: MainFork}
-	vmRel := RelFileNode{DBOid: 1, RelOid: 7000, Fork: VisibilityMapFork}
+	heapRel := RelFileNode{DBOid: 16384, RelOid: 7000, Fork: MainFork}
+	vmRel := RelFileNode{DBOid: 16384, RelOid: 7000, Fork: VisibilityMapFork}
 
 	// Two map pages fully set.
 	page := make([]byte, BlockSize)
@@ -203,7 +203,7 @@ func TestVMTruncateForkForHeap(t *testing.T) {
 	}
 
 	// Missing fork is a no-op.
-	miss := RelFileNode{DBOid: 1, RelOid: 4242, Fork: MainFork}
+	miss := RelFileNode{DBOid: 16384, RelOid: 4242, Fork: MainFork}
 	if err := VMTruncateForkForHeap(m, miss, 3); err != nil {
 		t.Fatalf("missing-fork VMTruncateForkForHeap: %v", err)
 	}

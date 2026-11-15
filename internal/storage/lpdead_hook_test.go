@@ -137,7 +137,7 @@ func TestMarkDirtyHintFlushBarrier(t *testing.T) {
 	}
 	defer pool.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 604, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 604, Fork: MainFork}
 	s, _, err := pool.PinNew(rel)
 	if err != nil {
 		t.Fatal(err)

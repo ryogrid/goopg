@@ -1504,6 +1504,23 @@ heuristic stays live.)
     and RelOID, before the user\-table reload. Then advance the OID counter and prove with a two\-restart test
     that covers field access, a new column, DROP TYPE and pg\_proc OIDs.
   - Expected instrument: Movement: none — correctness fix — no plan instrument.
+- [ ] **P0\-E32 — `ALTER TABLE … ADD COLUMN … DEFAULT <const>` loses attmissingval across a restart: old rows read NULL**
+  \(filed 2026\-11\-15 by the loop, found while verifying M0149\-0001a1 S1 WAL replay; S2 — wrong results\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-15 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Pre\-existing: reproduced with the pre\-S1 binary too, after a clean or a crash
+    > restart\.
+  - Repro: `create table t (a int); insert into t values (1),(2); alter table t add column z int default 3;
+    select sum(z) from t;` → 6; restart the server; `select sum(z) from t;` → NULL \(PG 18\.3: 6\)\.
+    - After the restart `pg_attribute` still shows `atthasmissing = t`, but `attmissingval` is empty, so pre\-ALTER
+      tuples \(natts < attnum\) deform the column as NULL\.
+  - PG: `StoreAttrMissingVal` \(catalog/heap\.c\) writes attmissingval as a one\-element array in the pg\_attribute
+    row; relcache rebuilds `TupleConstr.missing` from it \(`RelationBuildTupleDesc`\)\.
+  - Suggested first step: check whether the ALTER path writes attmissingval into the pg\_attribute HEAP row
+    \(the heap re\-sync, memory pg\_attribute\_alter\_needs\_heap\_resync\) and whether the startup reload reads it back
+    into catalog\.Column's missing value; fix whichever side drops it, and prove with a two\-restart test\.
+  - Expected instrument: Movement: none — correctness fix — no plan instrument\.
 - [ ] **P0\-E31 — INSERT into a table partitioned by an expression key fails: `no partition of relation … found for row`**
   \(filed 2026\-11\-15 by the loop, found while measuring M0148\-0001c3a10 slice 9; S2 — wrong error: PG stores
   the row\)\.
@@ -11464,6 +11481,21 @@ verify each at HEAD when the task starts.
       buffer tag, smgr path, WAL block-ref encoders, mirror guard\), all in
       one commit.
     Movement: none — tap 034\_create\_database 3/4 \(design only\)
+  - 2026-11-15 S1 landed \(design doc § "S1 as landed"\):
+    - storage.StorageDBOid \(1 → 5\) at every Pool / smgr entry, in the VM /
+      FSM / extension-lock keys and in the WAL block-ref and main-data
+      encoders; the mirror is now a no-op.
+    - The mirror had NOT kept base/5 complete \(SF0.25 corpus: 13 files,
+      pg\_statistic 688 KB vs 8 KB\), so a one-time startup migration
+      copies the newer-LSN base/1 file over base/5 \(feature
+      `postgres_catalogs_at_base5`\).
+    - Probe: 70 block refs at 1663/5, zero at 1663/1; pre-S1 WAL replays
+      correctly. Gates: units, postmaster, spotcheck, fire-set parity
+      99/99/22, sf025 99 \(plans = pre-S1 baseline\), acceptance, PG-interop
+      e2e \(4\) and Recovery ports \(6\) PASS.
+    - Found P0-E32 \(ADD COLUMN DEFAULT lost after restart, pre-existing\).
+    - Next: S2 \(displayed postgres OID 5\).
+    Movement: none — tap 034\_create\_database 3/4 \(storage layer only; mixed A1 needs S3\)
 - [ ] **M0149-0001b — Go `Cluster.pm`-equivalent harness for single-node ports \(goopg and PG 18.3 nodes behind one API\)**
   Kind: impl
   Parent: M0149-0001

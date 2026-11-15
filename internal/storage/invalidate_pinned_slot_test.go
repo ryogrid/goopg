@@ -24,8 +24,8 @@ func TestTruncateWaitsOutPinnedDirtyPage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	relA := RelFileNode{DBOid: 1, RelOid: 7411, Fork: MainFork}
-	relB := RelFileNode{DBOid: 1, RelOid: 7412, Fork: MainFork}
+	relA := RelFileNode{DBOid: 16384, RelOid: 7411, Fork: MainFork}
+	relB := RelFileNode{DBOid: 16384, RelOid: 7412, Fork: MainFork}
 
 	// Six blocks of A on disk; block 5 stays pinned (the concurrent pin
 	// holder).

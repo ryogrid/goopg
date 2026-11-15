@@ -26,7 +26,7 @@ func prefetchTestPool(t *testing.T, slots int) (*Manager, *Pool, RelFileNode) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rel := RelFileNode{DBOid: 1, RelOid: 900, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 900, Fork: MainFork} // not the sentinel 1 (StorageDBOid)
 	return mgr, pool, rel
 }
 

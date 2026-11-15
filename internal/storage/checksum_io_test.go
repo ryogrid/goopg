@@ -25,7 +25,7 @@ func TestChecksumWriteVerifyRoundTrip(t *testing.T) {
 	mgr := NewManager(ManagerConfig{DataDir: dir, ChecksumsEnabled: true})
 	defer mgr.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 100, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 100, Fork: MainFork}
 	page := makeDataPage(0x5A)
 	// The caller's in-memory page must NOT carry a checksum after write —
 	// PageSetChecksumCopy works on a copy.
@@ -54,7 +54,7 @@ func TestChecksumWriteVerifyRoundTrip(t *testing.T) {
 // read with a *ChecksumError.
 func TestChecksumDetectsCorruption(t *testing.T) {
 	dir := t.TempDir()
-	rel := RelFileNode{DBOid: 1, RelOid: 101, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 101, Fork: MainFork}
 
 	// Write a properly-checksummed page.
 	mgrCk := NewManager(ManagerConfig{DataDir: dir, ChecksumsEnabled: true})
@@ -93,7 +93,7 @@ func TestChecksumDetectsCorruption(t *testing.T) {
 // mismatch to a non-fatal event and still fires OnChecksumFailure.
 func TestChecksumIgnoreFailure(t *testing.T) {
 	dir := t.TempDir()
-	rel := RelFileNode{DBOid: 1, RelOid: 102, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 102, Fork: MainFork}
 
 	mgrCk := NewManager(ManagerConfig{DataDir: dir, ChecksumsEnabled: true})
 	blk, err := mgrCk.Extend(rel, makeDataPage(0x22))
@@ -130,7 +130,7 @@ func TestChecksumIgnoreFailure(t *testing.T) {
 // default-OFF fast path that keeps existing clusters byte-identical.
 func TestChecksumDisabledIsByteIdentical(t *testing.T) {
 	dir := t.TempDir()
-	rel := RelFileNode{DBOid: 1, RelOid: 103, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 103, Fork: MainFork}
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
 
@@ -154,7 +154,7 @@ func TestChecksumDisabledIsByteIdentical(t *testing.T) {
 // its own block-number-specific checksum and reads back clean.
 func TestChecksumExtendBatch(t *testing.T) {
 	dir := t.TempDir()
-	rel := RelFileNode{DBOid: 1, RelOid: 104, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 104, Fork: MainFork}
 	mgr := NewManager(ManagerConfig{DataDir: dir, ChecksumsEnabled: true})
 	defer mgr.Close()
 
@@ -174,7 +174,7 @@ func TestChecksumExtendBatch(t *testing.T) {
 // read back without a checksum being imposed — new pages carry none.
 func TestChecksumNewPageSkipped(t *testing.T) {
 	dir := t.TempDir()
-	rel := RelFileNode{DBOid: 1, RelOid: 105, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 105, Fork: MainFork}
 	mgr := NewManager(ManagerConfig{DataDir: dir, ChecksumsEnabled: true})
 	defer mgr.Close()
 
@@ -207,7 +207,7 @@ func TestChecksumRelFilePrepareWriteVerifyRead(t *testing.T) {
 	mgr := NewManager(ManagerConfig{DataDir: dir, ChecksumsEnabled: true})
 	defer mgr.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 106, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 106, Fork: MainFork}
 	page := makeDataPage(0x7C)
 	blk, err := mgr.Extend(rel, page)
 	if err != nil {

@@ -48,7 +48,7 @@ func TestSlotSemaConcurrentPinSameBlock(t *testing.T) {
 	}
 
 	// Create relation + block via PinNew.
-	rel := RelFileNode{DBOid: 1, RelOid: 7001, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 7001, Fork: MainFork}
 	slot, _, err := pool.PinNew(rel)
 	if err != nil {
 		t.Fatal(err)
@@ -111,7 +111,7 @@ func TestSlotSemaWaiterCountReturnsToZero(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rel := RelFileNode{DBOid: 1, RelOid: 7002, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 7002, Fork: MainFork}
 	slot, _, err := pool.PinNew(rel)
 	if err != nil {
 		t.Fatal(err)

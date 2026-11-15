@@ -68,7 +68,9 @@ func TestRuntimeCloseTriggersFinalCheckpoint(t *testing.T) {
 	// version of what's on disk now, not "the file was empty all
 	// along"). Note: Extend's pwrite immediately grew the file —
 	// the gap is the dirty content, not the file length.
-	relPath := filepath.Join(dir, "base", "1", "9700")
+	// The postgres namespace (DBOid 1) is stored at base/5 (storage.StorageDBOid,
+	// M0149-0001a1 S1).
+	relPath := filepath.Join(dir, "base", "5", "9700")
 	preCloseStat, err := os.Stat(relPath)
 	if err != nil {
 		t.Fatalf("stat %s before close: %v", relPath, err)

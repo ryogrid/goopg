@@ -17,7 +17,7 @@ func TestScanRingBasic(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = pool.Close() })
 
-	rel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 1, Fork: MainFork}
 	seedPage := make(Page, BlockSize)
 	if err := InitPage(seedPage); err != nil {
 		t.Fatal(err)
@@ -58,7 +58,7 @@ func TestScanRingCacheHitUsesPool(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = pool.Close() })
 
-	rel := RelFileNode{DBOid: 1, RelOid: 2, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 2, Fork: MainFork}
 	seedPage := make(Page, BlockSize)
 	if err := InitPage(seedPage); err != nil {
 		t.Fatal(err)
@@ -120,8 +120,8 @@ func TestScanRingCacheMissNoEviction(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = pool.Close() })
 
-	hotRel := RelFileNode{DBOid: 1, RelOid: 10, Fork: MainFork}
-	scanRel := RelFileNode{DBOid: 1, RelOid: 20, Fork: MainFork}
+	hotRel := RelFileNode{DBOid: 16384, RelOid: 10, Fork: MainFork}
+	scanRel := RelFileNode{DBOid: 16384, RelOid: 20, Fork: MainFork}
 
 	seedPage := make(Page, BlockSize)
 	if err := InitPage(seedPage); err != nil {
@@ -209,7 +209,7 @@ func TestScanRingMultiBlock(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = pool.Close() })
 
-	rel := RelFileNode{DBOid: 1, RelOid: 3, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 3, Fork: MainFork}
 	seedPage := make(Page, BlockSize)
 	if err := InitPage(seedPage); err != nil {
 		t.Fatal(err)

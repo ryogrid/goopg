@@ -23,8 +23,8 @@ func TestBufferCountersDirtiedAndWritten(t *testing.T) {
 	}
 	defer func() { _ = pool.Close(); _ = mgr.Close() }()
 
-	hotRel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
-	coldRel := RelFileNode{DBOid: 1, RelOid: 2, Fork: MainFork}
+	hotRel := RelFileNode{DBOid: 16384, RelOid: 1, Fork: MainFork}
+	coldRel := RelFileNode{DBOid: 16384, RelOid: 2, Fork: MainFork}
 
 	seedPage := make(Page, BlockSize)
 	if err := InitPage(seedPage); err != nil {
@@ -100,7 +100,7 @@ func TestBufferCountersEvictionAndExtend(t *testing.T) {
 	}
 	defer func() { _ = pool.Close(); _ = mgr.Close() }()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 1, Fork: MainFork}
 
 	if got := pool.EvictionCount(); got != 0 {
 		t.Fatalf("EvictionCount before any activity = %d, want 0", got)
@@ -225,7 +225,7 @@ func TestPoolOnFlushHooksFireOnDirtyVictimEviction(t *testing.T) {
 	pool.OnFlushWait = func() { waits++ }
 	pool.OnFlushDone = func() { dones++ }
 
-	rel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 1, Fork: MainFork}
 
 	// Fill the pool and dirty every page; nothing evicted yet (clean fill,
 	// mirrors TestBufferCountersEvictionAndExtend), so the hooks must not
@@ -301,7 +301,7 @@ func TestPoolOnExtendHooksFireOnPinNewExtend(t *testing.T) {
 	pool.OnExtendWait = func() { waits++ }
 	pool.OnExtendDone = func() { dones++ }
 
-	rel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 1, Fork: MainFork}
 
 	for i := 0; i < 3; i++ {
 		s, _, err := pool.PinNew(rel)

@@ -962,7 +962,9 @@ var heapExtendLocks sync.Map // map[storage.RelFileNode]*heapExtendLockSet
 // `RelationGetBufferForTuple` — see
 // `docs/design/perf-optimize/07-wal-fsm-insert.md` §3.
 func lockHeapExtend(rel storage.RelFileNode, procNum int32) (release func(), contended bool) {
-	v, _ := heapExtendLocks.LoadOrStore(rel, &heapExtendLockSet{})
+	// Keyed by the canonical identity (storage.StorageDBOid): one lock set
+	// per relation file whichever database-OID form the caller holds.
+	v, _ := heapExtendLocks.LoadOrStore(rel.Canonical(), &heapExtendLockSet{})
 	set := v.(*heapExtendLockSet)
 	mu := &set.locks[uint32(procNum)&(heapExtendLockStripes-1)].mu
 	if mu.TryLock() {

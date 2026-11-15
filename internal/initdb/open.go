@@ -361,6 +361,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	if err := verifyInitialized(abs); err != nil {
 		return nil, err
 	}
+	// M0149-0001a1 S1: consolidate the postgres namespace's base/1 relation
+	// files into base/5 before any relation is opened or WAL replayed.
+	if err := migratePostgresCatalogsToBase5(abs); err != nil {
+		return nil, err
+	}
 
 	slots := opts.PoolSlots
 	if slots <= 0 {

@@ -1149,6 +1149,7 @@ func (p *Pool) Close() error {
 
 // NBlocks reports the number of blocks currently in rel.
 func (p *Pool) NBlocks(rel RelFileNode) (BlockNumber, error) {
+	rel = rel.Canonical()
 	return p.mgr.NBlocks(rel)
 }
 
@@ -1157,22 +1158,26 @@ func (p *Pool) NBlocks(rel RelFileNode) (BlockNumber, error) {
 // CachedNBlocks reports an already-open fork's size without a file-system
 // call (see Manager.CachedNBlocks).
 func (p *Pool) CachedNBlocks(rel RelFileNode) (BlockNumber, bool) {
+	rel = rel.Canonical()
 	return p.mgr.CachedNBlocks(rel)
 }
 
 func (p *Pool) Exists(rel RelFileNode) bool {
+	rel = rel.Canonical()
 	return p.mgr.Exists(rel)
 }
 
 // CreateFile eagerly creates rel's main-fork file on disk with zero blocks
 // (mirrors smgrcreate). See Manager.CreateFile.
 func (p *Pool) CreateFile(rel RelFileNode) error {
+	rel = rel.Canonical()
 	return p.mgr.CreateFile(rel)
 }
 
 // RelPath returns rel's fork path relative to the data directory (e.g.
 // "base/5/16407"), for building the upstream-verbatim missing-file message.
 func (p *Pool) RelPath(rel RelFileNode) string {
+	rel = rel.Canonical()
 	return p.mgr.RelPath(rel)
 }
 
@@ -1435,6 +1440,7 @@ func (p *Pool) flushBatchSize() int {
 // range, then the physical smgr truncate. Idempotent when the relation is
 // already <= keep blocks.
 func (p *Pool) TruncateRelationTail(rel RelFileNode, keep BlockNumber) error {
+	rel = rel.Canonical()
 	oldN, err := p.NBlocks(rel)
 	if err != nil {
 		return err
@@ -1454,6 +1460,7 @@ func (p *Pool) TruncateRelationTail(rel RelFileNode, keep BlockNumber) error {
 }
 
 func (p *Pool) InvalidateRel(rel RelFileNode) {
+	rel = rel.Canonical()
 	p.invalidateRel(rel, false)
 }
 
@@ -1465,6 +1472,7 @@ func (p *Pool) InvalidateRel(rel RelFileNode) {
 // InvalidateRel keeps skipping pinned slots: its other callers (rewrites,
 // rollback, index builds) may hold a pin of their own.
 func (p *Pool) InvalidateRelForTruncate(rel RelFileNode) {
+	rel = rel.Canonical()
 	p.invalidateRel(rel, true)
 }
 
@@ -1562,6 +1570,7 @@ func (p *Pool) bumpSlotGen(s *Slot, st uint64) bool {
 // InvalidateBlock evicts the slot bound to tag if it exists and is unpinned
 // (retrying a CAS that loses a race; an in-flight slot is told to discard).
 func (p *Pool) InvalidateBlock(tag BufferTag) {
+	tag.Rel = tag.Rel.Canonical()
 	slotIdx, _ := p.bm.Lookup(tag)
 	if slotIdx < 0 {
 		return
@@ -1894,6 +1903,7 @@ func (p *Pool) DumpEventsForTag(tag BufferTag) []string {
 // xid=0; transactional relfile creation should use PinNewWithXID so the
 // record is PG-faithful and routes to decoded replay (A9).
 func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
+	rel = rel.Canonical()
 	return p.pinNewXID(rel, InvalidTransactionID)
 }
 
@@ -1901,10 +1911,12 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 // block-0 smgr-create WAL record. Callers that create a fresh relfile inside a
 // transaction (heap/index/TOAST creation) pass ctx.Tx.XID here.
 func (p *Pool) PinNewWithXID(rel RelFileNode, createXID TransactionID) (*Slot, BlockNumber, error) {
+	rel = rel.Canonical()
 	return p.pinNewXID(rel, createXID)
 }
 
 func (p *Pool) pinNewXID(rel RelFileNode, createXID TransactionID) (*Slot, BlockNumber, error) {
+	rel = rel.Canonical()
 	p.pinMu.Lock()
 
 	victimIdx, wasDirty, oldTag, claimGen, err := p.claimVictim()
@@ -2016,12 +2028,14 @@ func (p *Pool) pinNewXID(rel RelFileNode, createXID TransactionID) (*Slot, Block
 // the executor consumer (`selectInsertPage`) lands after the third
 // foundation (`Pool.SlotPinCount`, blocked on M0107-0006).
 func (p *Pool) ExtendRelationBatch(rel RelFileNode, n int) (BlockNumber, error) {
+	rel = rel.Canonical()
 	return p.ExtendRelationBatchWithXID(rel, n, InvalidTransactionID)
 }
 
 // ExtendRelationBatchWithXID is ExtendRelationBatch with the creating
 // transaction's xid stamped onto the block-0 smgr-create WAL record (A9).
 func (p *Pool) ExtendRelationBatchWithXID(rel RelFileNode, n int, createXID TransactionID) (BlockNumber, error) {
+	rel = rel.Canonical()
 	if n <= 0 {
 		return InvalidBlockNumber, fmt.Errorf("ExtendRelationBatch: n=%d must be > 0", n)
 	}
@@ -2054,6 +2068,7 @@ func (p *Pool) ExtendRelationBatchWithXID(rel RelFileNode, n int, createXID Tran
 // Fast path (cache hit): lock-free Lookup + CAS, no mutex.
 // Slow path (cache miss / IO wait): acquires pinMu.
 func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
+	tag.Rel = tag.Rel.Canonical()
 	for {
 		// Fast path: tag is cached and valid (no IO in flight).
 		slotIdx, gen := p.bm.Lookup(tag)
@@ -2236,6 +2251,7 @@ func (p *Pool) Capacity() int { return len(p.slots) }
 // TryPin returns the pool slot for tag if it is already cached.
 // Returns (nil, false) when the tag is not in the pool.
 func (p *Pool) TryPin(tag BufferTag) (*Slot, bool) {
+	tag.Rel = tag.Rel.Canonical()
 	slotIdx, gen := p.bm.Lookup(tag)
 	if slotIdx < 0 {
 		return nil, false
@@ -2271,6 +2287,7 @@ func (p *Pool) TryPin(tag BufferTag) (*Slot, bool) {
 // avoidance in selectInsertPage) use this helper to avoid inlining
 // slotState bit-mask arithmetic.
 func (p *Pool) SlotPinCount(tag BufferTag) int32 {
+	tag.Rel = tag.Rel.Canonical()
 	slotIdx, gen := p.bm.Lookup(tag)
 	if slotIdx < 0 {
 		return 0
@@ -2721,6 +2738,7 @@ func (p *Pool) FlushAll() error {
 // Callers still need InvalidateRel afterward to drop the now-clean cached
 // slots so the next access re-resolves rel's (possibly changed) tag.
 func (p *Pool) FlushRel(rel RelFileNode) error {
+	rel = rel.Canonical()
 	type pending struct {
 		idx int
 		tag BufferTag
