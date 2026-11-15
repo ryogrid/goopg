@@ -11446,7 +11446,7 @@ rationale names the `TestPort_*` func, `deferred_to` = `-`, id
 The "Likely prerequisites" lines are filing-time hints from a grep survey —
 verify each at HEAD when the task starts.
 
-- [ ] **M0149-0001 — port recovery/t/034_create_database.pl**
+- [x] **M0149-0001 — port recovery/t/034_create_database.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/034_create_database.pl` — WAL replay of `CREATE DATABASE … STRATEGY WAL_LOG` after template DDL.
@@ -11615,7 +11615,7 @@ verify each at HEAD when the task starts.
     - Gates: units, postmaster, race \(storage, xlog\), testport 58,
       spotcheck, sf025 99, acceptance, fire-set fires=none ×3.
     Movement: none — tap 034\_create\_database 3/4 \(PG now opens template1 on goopg data; the mixed run needs the 0001b harness\)
-- [ ] **M0149-0001b — Go `Cluster.pm`-equivalent harness for single-node ports \(goopg and PG 18.3 nodes behind one API\)**
+- [x] **M0149-0001b — Go `Cluster.pm`-equivalent harness for single-node ports \(goopg and PG 18.3 nodes behind one API\)**
   Kind: impl
   Parent: M0149-0001
   - Methods 034 needs: `init`, `start`, `stop('immediate')`, per-database
@@ -11627,9 +11627,22 @@ verify each at HEAD when the task starts.
     `e2e_pg_crashstart_on_goopgdata_test.go`.
   - Verification: TestPort\_Recovery034CreateDatabase runs all-goopg and the
     PG cold-start variant through the one API.
+  - 2026-11-15 COMPLETE \(design doc 0149-0001b-tap-node-harness.md\):
+    - `internal/testutil/tapnode`: NewGoopg \(durable\), Start,
+      Stop\(fast/immediate\), SafePSQL / PSQL, and ColdStartPG \(copy a
+      stopped goopg directory, start PG 18.3 on the copy\), over the existing
+      cluster / pgcluster harnesses.
+    - TestPort\_Recovery034CreateDatabase: variants pg18-cold-start and
+      all-goopg PASS, 2/2 assertions each. Inventory row R-034 promoted to
+      `port`; M0149-0001 closes with it.
+    Movement: yes — tap 034\_create\_database assertions 3/4→4/4 \(all-goopg 2/2 + mixed 2/2\)
 - [ ] **M0149-0001c — per-database pg\_class heaps carry every shared catalog's row \(19 missing: pg\_shdepend, pg\_shdescription, shared TOAST\)**
   Kind: impl
-  Parent: M0149-0001
+  Parent: none
+  - 2026-11-15 re-parented from M0149-0001: 034 does not need it \(the PG
+    side never runs CREATE DATABASE in the 034 port\), so it no longer
+    blocks that port. It stays an M0149 task \(C3 finding, item-10 rank\)
+    and is the next M0149 task in file order.
   - Found 2026-11-15 by the M0149-0001a1 S3 probe: with template1 at base/1, a PG 18.3 cold start on a goopg
     directory connects to every database, but PG `CREATE DATABASE` fails with "could not open relation with OID
     1214" — pg\_class \(in postgres and in template1\) has no row for pg\_shdepend.
