@@ -503,3 +503,48 @@ func TestListOrderedAppendRelChildPaths(t *testing.T) {
 		}
 	}
 }
+
+// TestUnrestrictedListOrderedAppend is M0148-0001c3a10 slice 9: an
+// unrestricted LIST table whose partitions do not interleave gets PG 18.3's
+// plain Append in partition order for its ORDER BY. It became reachable once
+// the appendrel's own seq-scan Append was priced as cost_append over its
+// members (appendRelSeqScanCost) — on the old sub-plan floor the ordered
+// Append also beat the HashAggregate PG keeps over an unordered appendrel.
+func TestUnrestrictedListOrderedAppend(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	for _, s := range []string{
+		"create table um (a int NOT NULL) partition by list (a)",
+		"create table um_1 partition of um for values in (1)",
+		"create table um_2 partition of um for values in (2)",
+		"create table um_35 partition of um for values in (3, 5)",
+		"create index on um (a)",
+		"insert into um select 1 + (i % 2) from generate_series(1, 3000) i",
+		"insert into um select 3 + 2 * (i % 2) from generate_series(1, 3000) i",
+		"vacuum um_1", "vacuum um_2", "vacuum um_35",
+		"analyze um",
+	} {
+		runSQL(t, ctx, s)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	for _, c := range []struct{ q, plan string }{
+		{"select * from um order by a",
+			"Append\n  ->  Index Only Scan using um_1_a_idx on um_1\n  ->  Index Only Scan using um_2_a_idx on um_2\n" +
+				"  ->  Index Only Scan using um_35_a_idx on um_35 um_3"},
+		{"select * from um order by a desc limit 3",
+			"Limit\n  ->  Append\n        ->  Index Only Scan Backward using um_35_a_idx on um_35 um_3\n" +
+				"        ->  Index Only Scan Backward using um_2_a_idx on um_2\n        ->  Index Only Scan Backward using um_1_a_idx on um_1"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+	}
+	for _, c := range []struct{ q, rows string }{
+		{"select * from um order by a desc limit 3", "5;5;5"},
+		{"select count(*), sum(a) from (select * from um order by a) s", "6000|16500"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

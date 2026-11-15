@@ -1452,6 +1452,28 @@ heuristic stays live.)
     and RelOID, before the user\-table reload. Then advance the OID counter and prove with a two\-restart test
     that covers field access, a new column, DROP TYPE and pg\_proc OIDs.
   - Expected instrument: Movement: none — correctness fix — no plan instrument.
+- [ ] **P0\-E31 — INSERT into a table partitioned by an expression key fails: `no partition of relation … found for row`**
+  \(filed 2026\-11\-15 by the loop, found while measuring M0148\-0001c3a10 slice 9; S2 — wrong error: PG stores
+  the row\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-15 \(S2, wrong error\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. The regress partition\_join table plt1\_e stays EMPTY on goopg, which skews every
+    > plan that reads it \(and blocks applying cost\_append to appendrels inside joins, slice 9\)\.
+  - Repro: `create table ex1 (c text) partition by list (upper(c)); create table ex1_a partition of ex1 for values
+    in ('A'); insert into ex1 values ('a');`
+    - PG 18.3: `INSERT 0 1`\.
+    - goopg: `ERROR: no partition of relation "ex1" found for row`\. Regress partition\_join's `PARTITION BY
+      LIST(ltrim(c, 'A'))` table plt1\_e fails the same way\.
+  - Cause: routeToPartitionDepth \(internal/executor/operators_storage\.go\) evaluates key expressions with
+    evalPartitionKeyExpr, a hand\-rolled evaluator that knows ColumnRef, a few operators, constants and `abs()`
+    only; any other function returns NULL, and the NULL key matches no partition\.
+  - PG: FormPartitionKeyDatum \(executor/execPartition\.c\) evaluates partexprs with ExecPrepareExprList over the
+    row \(any immutable expression\)\.
+  - Suggested first step: evaluate PartitionKeyExprs through the executor's real expression evaluator \(the
+    analyzer/planner expression for the key, bound to the parent's columns\), the same evaluator CHECK
+    constraints use; keep evalPartitionKeyExpr only as a fallback\.
+
 - [ ] **P0\-E30 — `(A JOIN B) LEFT JOIN C … WHERE <qual on A>` returns A's columns in B's place**
   \(filed 2026\-11\-15 by the loop, found while probing M0148\-0001c3a9 slice 5; S2 — wrong results\)\.
   Kind: impl
@@ -13261,6 +13283,21 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
       every partition / inheritance EXPLAIN cost to move. Then drop the
       `unrestricted && isList` guard and re-measure aggregates p\_t1 and
       inherit mclparted.
+  - 2026-11-15 slice 9 LANDED: the stamper is createPlanNode over the seed
+    path that buildInitialRels prices with costSubplanLeaf for an appendrel
+    leaf. appendRelSeqScanCost \(cost\_append over the members'
+    estimate\_rel\_size seq scans\) now prices an unrestricted single-FROM
+    appendrel; the `unrestricted && isList` guard is dropped
+    \(TestUnrestrictedListOrderedAppend\).
+    Movement: yes — regress inherit 664→662 \(inventory re-measured on this
+    build; same-suite A/B 679→677\); aggregates p\_t1 keeps the
+    HashAggregate \(99 unchanged\)
+    - Scope limits: inside joins it moved partition\_join 1879→1897
+      \(pruning k1; expression routing P0-E31\); on restricted appendrels
+      it undercut the child-rel paths \(pm `order by a + 1`\).
+    - Resume: extend to joins after k1 and P0-E31; to restricted
+      appendrels with per-member quals once the child-rel and seed costs
+      agree.
 - [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
   (NULL-keyed entries)**.
   Kind: impl

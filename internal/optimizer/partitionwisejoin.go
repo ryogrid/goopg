@@ -472,13 +472,10 @@ func (s *searchCtx) addAppendRelChildPaths(cat catalog.Catalog) {
 // there (M0148-0001c3a10 slice 3). This is what PG's per-partition min / max
 // rides: `Limit -> Append -> Index Only Scan Backward … (c = 3)`.
 //
-// An unrestricted appendrel (slice 6) takes only the Merge Append arm when its
-// partitions are RANGE-ordered (the plain Append there is
-// addOrderedPartitionAppendPaths', orderedpartitionappend.go) and treats LIST
-// partitions as unordered: the plain Append over ordered LIST children beats
-// the appendrel's HashAggregate input on goopg's display cost of the
-// members' Append (twice PG's cost_append; regress aggregates' p_t1),
-// ledgered (slice 8).
+// An unrestricted appendrel (slice 6) with RANGE-ordered partitions takes only
+// the Merge Append arm here: its plain Append is
+// addOrderedPartitionAppendPaths' (orderedpartitionappend.go). An unrestricted
+// ordered LIST table gets the plain Append here (slice 9).
 func (s *searchCtx) addOrderedAppendRelChildPath(rel *RelOptInfo, so *SetOp, ps *partScheme, childRels []*RelOptInfo, fills []map[int]Expr, unrestricted bool) {
 	qk := s.queryPathkeys
 	if len(qk) == 0 || len(ps.keyPos) == 0 {
@@ -494,7 +491,7 @@ func (s *searchCtx) addOrderedAppendRelChildPath(rel *RelOptInfo, so *SetOp, ps 
 		}
 	}
 	isList := strings.EqualFold(ps.parent.PartitionMethod, "LIST")
-	if !rangePartitionsOrderedOn(ps, qk[0].Expr.(*ColumnRef)) || (unrestricted && isList) {
+	if !rangePartitionsOrderedOn(ps, qk[0].Expr.(*ColumnRef)) {
 		// Not partitions_are_ordered on the leading key: the ordering is a
 		// Merge Append of the children (slice 5), for every useful ordering
 		// a child delivers.
@@ -503,7 +500,10 @@ func (s *searchCtx) addOrderedAppendRelChildPath(rel *RelOptInfo, so *SetOp, ps 
 		}
 		return
 	}
-	if unrestricted {
+	// An unrestricted RANGE table's plain Append over full index scans is
+	// addOrderedPartitionAppendPaths' (orderedpartitionappend.go); a LIST one
+	// is filed here (slice 9, now that the appendrel's own cost is PG's).
+	if unrestricted && !isList {
 		return
 	}
 	backward := !qk[0].SortAsc

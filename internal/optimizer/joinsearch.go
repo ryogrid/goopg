@@ -30,6 +30,7 @@ import (
 	"math/bits"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // maxSearchRels is the relset width. `RelSet` is a uint16 (path.go:29), so the
@@ -511,6 +512,20 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 			// M0146-0005az: a reference to a CTE that stays a CTE is
 			// cost_ctescan, not a sub-plan: its body is an initPlan.
 			p.Cost = c
+		} else if c, ok := appendRelSeqScanCost(cp, leaf, rel); ok && len(bindings) == 1 {
+			// M0148-0001c3a10 slice 9: a partitioned / inherited table's
+			// appendrel is cost_append over its members' seq scans, not the
+			// sub-plan floor below (which charged a cpu_tuple_cost per row at
+			// every UNION ALL link and every member's tableoid wrapper).
+			// Scope: an UNRESTRICTED appendrel that is the whole problem (one
+			// FROM item). Inside a join the honest Append cost exposes two
+			// missing PG mechanisms the floor happened to mask — plan-time
+			// pruning (k1) and expression partition-key tuple routing (P0-E31;
+			// regress partition_join 1879→1897 when applied everywhere) — and
+			// a restricted appendrel's members are priced below PG's while
+			// its child-rel paths are not (inherit's pm `order by a + 1`);
+			// ledgered.
+			p.Cost = c
 		} else if isSubplanLeaf(leaf) {
 			// M0144-0011b-1: a leaf that wraps a finished SUB-PLAN is not a
 			// relation and must not be priced as a scan of one — see
@@ -533,6 +548,83 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 		setCheapest(rel)
 	}
 	return s, nil
+}
+
+// appendRelSeqScanCost is set_append_rel_pathlist's Append over the members'
+// seq scans for an UNRESTRICTED partitioned or inherited table's appendrel
+// leaf (setOpExpandsTableHierarchy) whose members are plain seq scans:
+// cost_append (costsize.c) — the first member's startup, Σ of each member's
+// cost_seqscan on its own estimate_rel_size pages and tuples
+// (memberSeqScanSize), plus cpu_tuple_cost *
+// APPEND_CPU_COST_MULTIPLIER per output row. The leaf was otherwise priced as
+// ONE synthetic seq scan over row-derived pages (baseSeqScanCostInputs'
+// fallback) — regress aggregates' p_t1 Append at 148.00 where PG's is 75.50 —
+// and the HashAggregate over it lost to ordered child index paths
+// (M0148-0001c3a10 slice 9). createPlanNode stamps this cost on the SetOp,
+// which is what EXPLAIN prints and what the upper stages read
+// (upperInputPathCost). Declines (ok=false) for anything else.
+func appendRelSeqScanCost(cp costParams, leaf Node, rel *RelOptInfo) (Cost, bool) {
+	if rel == nil {
+		return Cost{}, false
+	}
+	so, parentFilter := appendRelLeafNode(leaf)
+	if parentFilter != nil || so == nil || so.Op != parser.SetOpUnion || !so.All || len(so.MergeKeys) > 0 || !setOpExpandsTableHierarchy(so) {
+		return Cost{}, false
+	}
+	members := unionAllMembers(so)
+	if len(members) == 0 {
+		return Cost{}, false
+	}
+	var c Cost
+	for i, m := range members {
+		scan, ok := leafBaseScan(memberScanRoot(m)).(*SeqScan)
+		if !ok || scan.Table == nil || memberLocalFilter(m) != nil {
+			return Cost{}, false
+		}
+		pages, tuples := memberSeqScanSize(m, scan.Table)
+		mc := costSeqscan(cp, pages, tuples, 0)
+		if i == 0 {
+			c.Startup = mc.Startup
+		}
+		c.Total += mc.Total
+	}
+	// The Append's rows are the members' rows summed — the rel's own size
+	// (set_append_rel_size).
+	c.Total += cp.cpuTupleCost * appendCPUCostMultiplier * rel.Rows
+	return c, true
+}
+
+// memberSeqScanSize is estimate_rel_size (plancat.c,
+// table_block_relation_estimate_size) for an appendrel member's table: the
+// live size when the table is ANALYZEd (liveRelSize), otherwise its current
+// block count through the 10-page heuristic for a never-vacuumed relation —
+// PG prices an empty regress partition at 10 pages and their tuple density.
+func memberSeqScanSize(member Node, tbl *catalog.Table) (int64, float64) {
+	if p, t, ok := liveRelSize(tbl); ok {
+		return p, t
+	}
+	tuples := float64(childScanRows(member, tbl))
+	if tbl == nil || tbl.Virtual || catalog.RelationBlocksFunc == nil {
+		return baseRelPages(tbl, tuples), tuples
+	}
+	blocks, known := catalog.RelationBlocksFunc(tbl)
+	if !known {
+		return baseRelPages(tbl, tuples), tuples
+	}
+	in := relSizeInputs{
+		curpages:    blocks,
+		hasSubclass: len(tbl.PartitionKey) > 0,
+		fillfactor:  tbl.Fillfactor,
+		dataWidth:   tableDataWidth(tbl),
+	}
+	if tbl.Stats != nil {
+		in.relpages, in.reltuples, in.analyzed = int64(tbl.Stats.Pages), tbl.Stats.RowCount, tbl.Stats.Analyzed
+	}
+	pages, t := estimateRelSize(in)
+	if t < 1 {
+		t = tuples
+	}
+	return pages, t
 }
 
 // baseSeqScanCostInputs resolves `cost_seqscan`'s three inputs for a base

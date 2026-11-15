@@ -298,6 +298,38 @@ Status: slices 1\-3 landed 2026\-11\-15. Parent: M0148\-0001c3a5.
   restricted ordered LIST query\). With the unrestricted arm enabled,
   inherit 679→677 but aggregates 99→103, so it was not taken.
 
+## Slice 9 — the appendrel's own Append is cost\_append \(landed\)
+
+- The appendrel leaf's seed path was priced by the sub\-plan floor
+  \(`costSubplanLeaf`, `isSubplanLeaf`\). That floor charges a
+  cpu\_tuple\_cost per row at every UNION ALL link and every member's
+  tableoid wrapper: regress aggregates' p\_t1 Append was 148.00 where PG
+  has 75.50.
+  - `createPlanNode` stamps this path cost on the SetOp. EXPLAIN prints
+    the stamp, and the upper stages read it \(`upperInputPathCost`\).
+  - Last loop's display\-cost edits \(plancost.go\) therefore changed
+    nothing. A stack dump of `stampPlanCost` on `*SetOp` found the
+    stamper.
+- `appendRelSeqScanCost` \(joinsearch.go\) is cost\_append over the
+  members' seq scans: the first member's startup, plus Σ cost\_seqscan on
+  each member's estimate\_rel\_size \(`memberSeqScanSize`: liveRelSize, or
+  the block count through the 10\-page heuristic\), plus cpu\_tuple\_cost ×
+  0.5 × rows.
+  - p\_t1, lt and lo now price exactly as PG \(75.50, 6.50, 103.00\).
+- Scope: an unrestricted appendrel that is the whole problem \(one FROM
+  item, no parent or member filter\).
+  - Applied inside joins, it moved partition\_join 1879→1897. The honest
+    cost exposes plan\-time pruning \(k1, plt1\_adv\) and expression\-key
+    tuple routing \(P0\-E31: plt1\_e stays empty on goopg\).
+  - Applied to restricted appendrels, it undercut the child\-rel paths in
+    inherit's pm `order by a + 1` probe.
+- With the HashAggregate input priced right, slice 8's `unrestricted &&
+  isList` guard is dropped. Unrestricted non\-interleaved LIST tables plan
+  PG's plain Append \(`TestUnrestrictedListOrderedAppend`\), and
+  aggregates' p\_t1 keeps PG's HashAggregate.
+- Regress: inherit 679→677 in the same\-suite run, 664→662 standalone;
+  others unchanged.
+
 ## Not covered
 
 - Multi\-relation problems: inside a join the Append's columns still reach
