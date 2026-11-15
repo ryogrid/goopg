@@ -65,6 +65,23 @@ children M0149\-0001a, M0149\-0001b\).
     `internal/testutil/pgcluster` \(PG\); the precedent is
     `e2e_pg_crashstart_on_goopgdata_test.go`.
 
+### M0149\-0001a investigation \(2026\-11\-15\)
+
+- goopg's database OID layout is not PG's:
+  - `pg_database` holds template1 = 1, template0 = 4, postgres = 16384;
+  - the `postgres` namespace is catalog OID 1 \(`catalog.DefaultDBOid`\),
+    mirrored to base/5;
+  - template1 lives in base/2 \(`Template1NamespaceDBOid`, owner Option A
+    2026\-09\-25\).
+- PG reads template1 from base/1. A `pg_filenode.map` there would expose
+  goopg's postgres catalogs under template1's name.
+- A storage\-only remap does not suffice: WAL records carry the
+  RelFileNode database OID, which PG replay uses as\-is.
+- Filed **M0149\-0001a1**: one OID per database at every layer \(remove
+  the DefaultDBOid sentinel; postgres → 5, template1 → 1\). It has 603
+  references in 61 non\-test files and is the M0122\-0007 4b\-4e epic
+  recorded in the deferral ledger.
+
 ## Mixed topology \(C3\)
 
 034 is single\-node. Its mixed variant is the artifact cross\-check:

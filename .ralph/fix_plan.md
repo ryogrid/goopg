@@ -11400,6 +11400,46 @@ verify each at HEAD when the task starts.
     18.3 `postgres` started on a goopg directory connects to `template1`;
     034's A1 returns 1 in the mixed run; the initdb and template unit tests
     stay green.
+  - 2026-11-15 investigated — blocked on its own prerequisite, filed as
+    M0149-0001a1:
+    - goopg's database layout is not PG's. pg\_database shows template1=1,
+      template0=4, postgres=16384, where PG has postgres=5.
+    - goopg stores the `postgres` namespace at catalog OID 1
+      \(`catalog.DefaultDBOid` sentinel, mirrored to base/5\) and template1 at
+      base/2 \(`Template1NamespaceDBOid`; owner Option A, 2026-09-25\).
+    - PG reads template1 from base/1, so writing a `pg_filenode.map` there
+      would expose goopg's postgres catalogs as "template1".
+    - A storage-only remap is not enough: WAL records carry the
+      RelFileNode database OID, so PG replay needs PG's OIDs in the WAL too.
+- [ ] **M0149-0001a1 — one OID per database at every layer: remove the `DefaultDBOid` sentinel \(postgres → 5, template1 → 1\)**
+  Kind: impl
+  Parent: M0149-0001a
+  - PG: `template_pg_database.h` Template1DbOid=1; initdb creates template0
+    \(4\) and postgres \(5\) by copying template1 \(`make_template0`,
+    `make_postgres`\). base/<oid> is the database's storage and RelFileNode
+    dbOid in every WAL record \(`relpath.c`\).
+  - goopg: `catalog.DefaultDBOid = 1` is the namespace the `postgres`
+    database reads and writes \(603 references in 61 non-test files;
+    catalog.go 329, initdb/catalog\_heap\_reload.go 32, postmaster/dispatch.go
+    25, executor/operators.go 24, operators\_ddl.go 23, initdb/open.go 22,
+    executor/context.go 19, …\). base/1 is mirrored to base/5
+    \(sys\_catalog\_postgres\_db\_mirror.go\); template1 lives at base/2
+    \(Template1NamespaceDBOid\).
+  - This is the "Option B / M0122-0007 4b-4e" epic recorded in the
+    deferral ledger \(2026-10-10 row\). No open fix\_plan entry existed, so it
+    is filed here per M0149's task model rule 4. NOTE for the owner: it
+    reverses the bounded Option A \(2026-09-25\); M0149's C2 contract
+    \(PG 18.3 file formats\) requires it.
+  - First step: a census design doc
+    \(`docs/design/0100-0149/0149-0001a1-database-oid-layout.md`\)
+    classifying every DefaultDBOid use as namespace / storage / WAL /
+    display, then slices: storage+WAL OID mapping, postgres → 5, template1
+    → 1, mirror removal.
+  - Verification: `goopg init` matches PG's base/<oid> set \(1, 4, 5\) and
+    pg\_database OIDs; PG 18.3 pg\_waldump shows template1 writes under
+    `1663/1/…`; PG cold start on a goopg directory sees template1 and
+    postgres contents; existing multi-database / template / pg\_dump tests
+    stay green.
 - [ ] **M0149-0001b — Go `Cluster.pm`-equivalent harness for single-node ports \(goopg and PG 18.3 nodes behind one API\)**
   Kind: impl
   Parent: M0149-0001
