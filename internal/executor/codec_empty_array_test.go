@@ -80,6 +80,12 @@ func TestEncodeValuePGAclItemArrayEmitsEmptyArrayType(t *testing.T) {
 				t.Fatalf("encodeValuePG: %v", err)
 			}
 			want := emptyArrayTypeBytes(tc.elemType)
+			if tc.elemType == 1033 {
+				// aclitem[] encodes PG's empty ACL, allocacl(0) — one
+				// dimension of length 0 — not the ndim-0 empty array, which
+				// check_acl rejects (M0149-0001g slice 12).
+				want = emptyACLBytes()
+			}
 			if len(got) != len(want) {
 				t.Fatalf("len: got %d, want %d", len(got), len(want))
 			}

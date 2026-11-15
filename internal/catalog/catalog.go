@@ -18753,6 +18753,15 @@ func (c *InMemory) RelaclText(relOID uint32) string {
 	return c.relaclTextLocked(relOID)
 }
 
+// SequenceRelaclText is RelaclText for a sequence (relkind 'S'), rendered with
+// the sequence privilege order and owner default (relaclTextLockedSeq). Used by
+// the pg_class heap row builder (M0149-0001g slice 12).
+func (c *InMemory) SequenceRelaclText(relOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLockedSeq(relOID)
+}
+
 // relaclTextLockedSeq is relaclTextLocked for a sequence (relkind 'S'): it
 // renders with the sequence privilege order (USAGE/SELECT/UPDATE) and the
 // sequence owner-default string "rwU", which is what pg_dump diffs against via

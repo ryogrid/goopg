@@ -6439,7 +6439,7 @@ func pgClassRow(rel nailedRel) executor.Row {
 		executor.NewIntDatum(0),                            // 132: relrewrite
 		executor.NewIntDatum(frozenXID),                    // 136: relfrozenxid (r/t only — executor.PGClassFrozenIDs)
 		executor.NewIntDatum(frozenMXID),                   // 140: relminmxid
-		executor.NewStringDatum("{}"),                      // relacl (empty aclitem[])
+		pgClassBootstrapRelACL(rel),                        // relacl: PG initdb's ACL, or NULL (M0149-0001g slice 12)
 		executor.NewStringDatum("{}"),                      // reloptions (empty text[])
 		executor.NewStringDatum(""),                        // relpartbound (empty pg_node_tree)
 	}
@@ -6692,55 +6692,19 @@ type pgAuthidEntry struct {
 // input rels) so callers that need to build a covering btree index over the
 // same rows can stamp the correct ItemPointer into each IndexTuple.
 func writeMultiPageHeap(dataDir, relFile string, cols []catalog.Column, rels []nailedRel, rowFn func(nailedRel) executor.Row) ([]heapTID, error) {
-	var pages [][]byte
-	page := make(storage.Page, storage.BlockSize)
-	if err := storage.InitPage(page); err != nil {
-		return nil, err
-	}
-	tids := make([]heapTID, len(rels))
-	// review/260831 IN-8: the column set does not change between rows, so the
-	// varlena scan is a loop invariant.
-	varWidth := hasVarWidthCol(cols)
+	// Delegates to writeMultiPageHeapRows so NULL columns get a real null
+	// bitmap (HEAP_HASNULL). The former private loop built every tuple with
+	// storage.NewHeapTuple: a NULL datum was dropped from the payload but not
+	// marked NULL, so PG read the following column at the NULL's offset —
+	// harmless while every bootstrap pg_class column was non-NULL, fatal once
+	// relacl became NULL (PG asserted in build_reloptions; M0149-0001g slice 12).
+	rows := make([]executor.Row, len(rels))
 	for i, rel := range rels {
-		row := rowFn(rel)
-		payload, err := executor.EncodeRowPG(cols, row)
-		if err != nil {
-			return nil, fmt.Errorf("encode %s row for %s: %w", relFile, rel.RelName, err)
-		}
-		tuple := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload)
-		tuple.Header.SetNatts(len(cols))
-		if varWidth {
-			tuple.Header.Infomask |= storage.HeapHasVarWidth
-		}
-		off, err := storage.PageAddHeapTuple(page, tuple)
-		if err != nil {
-			pages = append(pages, page)
-			page = make(storage.Page, storage.BlockSize)
-			if err := storage.InitPage(page); err != nil {
-				return nil, err
-			}
-			off, err = storage.PageAddHeapTuple(page, tuple)
-			if err != nil {
-				return nil, fmt.Errorf("add %s tuple for %s on fresh page: %w", relFile, rel.RelName, err)
-			}
-		}
-		tids[i] = heapTID{Block: uint32(len(pages)), Offset: off}
+		rows[i] = rowFn(rel)
 	}
-	pages = append(pages, page)
-	raw := make([]byte, 0, storage.BlockSize*len(pages))
-	for _, p := range pages {
-		raw = append(raw, p...)
-	}
-	b1 := filepath.Join(dataDir, "base", "1")
-	if err := os.WriteFile(filepath.Join(b1, relFile), raw, 0o600); err != nil {
-		return nil, err
-	}
-	b5 := filepath.Join(dataDir, "base", "5")
-	if err := os.MkdirAll(b5, 0o700); err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(filepath.Join(b5, relFile), raw, 0o600); err != nil {
-		return nil, err
+	tids, err := writeMultiPageHeapRows(dataDir, relFile, cols, rows)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", relFile, err)
 	}
 	return tids, nil
 }

@@ -605,7 +605,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table, dbOid ...uint3
 		NewIntDatum(0),                                  // relrewrite
 		NewIntDatum(frozenXID),                          // relfrozenxid (valid only for r/t/m — PGClassFrozenIDs)
 		NewIntDatum(frozenMXID),                         // relminmxid
-		NewStringDatum("{}"),                            // relacl (encoded as empty aclitem[] ArrayType)
+		userRelACLDatum(cat, tbl.OID, relkind),          // relacl: NULL (acldefault) until a GRANT, then the materialized ACL
 		reloptionsDatum,                                 // reloptions (fillfactor/autovacuum_*/security_*/check_option, or NULL)
 		NewStringDatum(relpartbound),                    // relpartbound (FOR VALUES … for partition children)
 	}
@@ -737,7 +737,7 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index, dbOid 
 		NewIntDatum(0),                        // relrewrite
 		NewIntDatum(0),                        // relfrozenxid (InvalidTransactionId: indexes have no table AM)
 		NewIntDatum(0),                        // relminmxid
-		NewStringDatum("{}"),                  // relacl
+		NullDatum,                             // relacl: indexes have none (PG stores NULL)
 		idxReloptionsDatum,                    // reloptions (fillfactor/fastupdate/… or NULL)
 		NewStringDatum(""),                    // relpartbound
 	}
@@ -2175,7 +2175,7 @@ func buildUserPGClassRowForComposite(cat catalog.Catalog, ct *catalog.CompositeT
 		NewIntDatum(0),                                 // relrewrite
 		NewIntDatum(0),                                 // relfrozenxid (InvalidTransactionId — no storage)
 		NewIntDatum(0),                                 // relminmxid
-		NewStringDatum("{}"),                           // relacl
+		NullDatum,                                      // relacl: NULL, as PG stores for a composite type's relation
 		NewStringDatum("{}"),                           // reloptions
 		NewStringDatum(""),                             // relpartbound
 	}
@@ -2923,4 +2923,32 @@ func PGClassFrozenIDs(relkind string) (int64, int64) {
 		return minFrozenXID, minFrozenMXID
 	}
 	return 0, 0
+}
+
+// userRelACLDatum is pg_class.relacl for a user relation: NULL while no
+// privilege has been granted away (PG's acldefault), otherwise the ACL goopg's
+// store materializes, as a PG-native aclitem[]. Never the empty array: an
+// explicit empty ACL denies even the owner on a PG node (M0149-0001g slice 12).
+func userRelACLDatum(cat catalog.Catalog, relOID uint32, relkind string) Datum {
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		return NullDatum
+	}
+	txt := im.RelaclText(relOID)
+	if relkind == "S" {
+		txt = im.SequenceRelaclText(relOID)
+	}
+	if txt == "" {
+		return NullDatum
+	}
+	blob, err := encodeAclItemArrayText(txt, func(roleName string) uint32 {
+		if roid, ok := im.RoleOID(roleName); ok {
+			return roid
+		}
+		return 0
+	})
+	if err != nil {
+		return NullDatum
+	}
+	return NewBytesDatum(blob)
 }

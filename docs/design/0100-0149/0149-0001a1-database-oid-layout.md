@@ -613,6 +613,18 @@ Key observation: PG compatibility constrains only the **displayed** and
 - relacl, proacl and the other ACL columns still go through "\{\}". They
   are the next slice.
 
+## Follow\-up: M0149\-0001g slice 12 — catalog relacl and the empty\-ACL shape \(2026\-11\-16\)
+
+- Bootstrap pg\_class rows take their relacl from `pg_class_relacl_generated.go`.
+  `scripts/gen-pg-class-relacl.sh` regenerates it by running its own PG 18.3
+  initdb; the bootstrap superuser is rendered as `B`.
+- User relations store NULL until a GRANT, then the ACL goopg's store
+  materializes.
+- An empty ACL is encoded as `allocacl(0)`: one dimension of length 0.
+- Writers must mark NULL columns in the tuple's null bitmap. The old
+  pg\_class\-only writer did not, which went unnoticed until relacl became
+  NULL. All bootstrap heap writers now go through `buildMultiPageHeapFile`.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

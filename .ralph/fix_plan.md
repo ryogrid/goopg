@@ -8664,6 +8664,13 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
     relacl column back; probe REVOKE \.\.\. FROM PUBLIC and column grants too\.
   > \#\# ESCALATION 2026\-10\-12 \(S2\) — M0146\-0161 loses granted privileges on restart
   > Filed under M0146\-0157\. RESOLVED 2026\-10\-13 (OWNER DECISIONS 2026\-10\-13): NOT placed — queues below item 10 under the S7 correctness carve\-out\.
+  - 2026\-11\-16 reconfirmed by M0149\-0001g slice 12: GRANT ON TABLE / ON SEQUENCE and
+    REVOKE ALL are all gone after a goopg restart. The pg\_class heap row is built only at
+    CREATE time \(its relacl is now NULL rather than "\{\}"\), and tryRecordTableGrant /
+    tryRecordTableRevoke \(postmaster/grant\_ddl.go\) never rewrite it. Resume point:
+    call resyncTableClassHeapRowForIndexSet after the ACL store changes — it rebuilds
+    the row through userRelACLDatum — and reload relacl into the ACL store at Open,
+    as reloadDatabaseACLsFromHeap does for datacl.
 - [x] **M0146\-0158 — PGC\_SUSET parameters can be SET by a non\-superuser**
   (full entry archived → `completed_milestones/completed_fix_plan_015.md`)
 - [ ] **M0146\-0162 — WRONG RESULTS: a non\-superuser that logs in directly runs with superuser
@@ -12046,6 +12053,35 @@ verify each at HEAD when the task starts.
       - pg\_language lacks plpgsql.
     - Gates: units, initdb, postmaster, testport interop set, regress A/B on
       6 cases \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 12: ACL columns — the catalogs carry PG initdb's relacl, and no ACL is the ndim\-0 array PG rejects.
+    - Cause: goopg wrote "\{\}" into every pg\_class.relacl and encoded it as
+      a 0\-dimensional array. PG's check\_acl rejects that with "ACL arrays
+      must be one\-dimensional", so a non\-superuser on a PG node could not
+      read pg\_catalog.pg\_class.
+    - Bootstrap pg\_class rows now carry the relacl a PG 18.3 initdb leaves:
+      - 205 relations, from pg\_class\_relacl\_generated.go;
+      - scripts/gen\-pg\-class\-relacl.sh regenerates it from its own
+        throwaway initdb; regeneration is idempotent;
+      - the rest stay NULL;
+      - pg\_largeobject has no bootstrap row yet.
+    - User relations: relacl is NULL until a GRANT, then the materialized
+      ACL \(userRelACLDatum, SequenceRelaclText for sequences\). Indexes and
+      composite\-type relations store NULL.
+    - A genuinely emptied ACL encodes as PG's allocacl\(0\) \(ndim 1, dims 0\).
+    - writeMultiPageHeap \(the pg\_class bootstrap writer\) built tuples with
+      no null bitmap. A NULL column was dropped but never marked NULL, so PG
+      asserted in build\_reloptions. It now delegates to the null\-aware
+      writer.
+    - PG cold start: catalog relacl values equal a PG initdb. A non\-superuser
+      reads pg\_class, information\_schema.tables and pg\_stat\_activity, and
+      is denied pg\_authid, as on PG.
+    - Reconfirmed: M0146\-0161, table grants lost on restart.
+    - The postmaster package flaked once: TestSimpleQueryBatchAbortUndoesEarlierCreateTable
+      failed 1 of 3 full runs and passed 3 of 3 in isolation.
+    - Gates: units, initdb, postmaster \(after the flake\), testport interop
+      set, regress A/B on 7 privilege cases \(no movement\), spotcheck,
+      sf025 99, acceptance.
     Movement: none — C3 cold-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl

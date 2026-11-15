@@ -959,13 +959,15 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 		}
 		return varlenaBytes(body), nil
 	case "aclitem[]", "_aclitem":
-		// PG binary empty ArrayType, elemtype = aclitem (1033).
-		// PG's deconstruct_array asserts on ARR_ELEMTYPE; a text varlena
-		// "{}" is not a valid ArrayType*. Match construct_empty_array.
+		// A text "{}" is not a valid ArrayType*; encode PG's empty ACL,
+		// allocacl(0) — one dimension of length 0 — which check_acl accepts
+		// (the generic ndim-0 empty array is rejected: "ACL arrays must be
+		// one-dimensional"). Writers that mean "no GRANT yet" must store
+		// NULL instead (M0149-0001g slice 12).
 		if d.Kind == KindBytes {
 			return d.BytesValue(), nil
 		}
-		return emptyArrayTypeBytes(1033), nil
+		return emptyACLBytes(), nil
 	case "text[]", "_text":
 		// PG binary empty ArrayType, elemtype = text (25). M0106-0010
 		// Step 3dk lets callers (initdb pg_proc seed) pass a pre-built

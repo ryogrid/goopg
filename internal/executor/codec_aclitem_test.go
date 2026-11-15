@@ -177,23 +177,29 @@ func TestAclItemArrayRoundTrip(t *testing.T) {
 }
 
 // TestAclItemArrayEmpty confirms an empty ACL ("{}" — an owner-side REVOKE that
-// emptied the grants) encodes to a PG-valid empty _aclitem ArrayType (elemtype
-// 1033, ndim 0) and decodes back to "{}".
+// emptied the grants) encodes to PG's empty ACL, allocacl(0) (elemtype 1033,
+// ndim 1, dims[0] 0), and decodes back to "{}".
 func TestAclItemArrayEmpty(t *testing.T) {
 	for _, in := range []string{"{}", ""} {
 		blob, err := encodeAclItemArrayText(in, fixtureResolveOID)
 		if err != nil {
 			t.Fatalf("encode(%q): %v", in, err)
 		}
-		// Empty array: 16-byte header, ndim 0, elemtype 1033.
-		if len(blob) != 16 {
-			t.Errorf("encode(%q): empty array blob len = %d, want 16", in, len(blob))
+		// PG's empty ACL is allocacl(0): ONE dimension of length 0 (24-byte
+		// header), elemtype 1033. The generic ndim-0 empty array is rejected
+		// by check_acl ("ACL arrays must be one-dimensional"). M0149-0001g
+		// slice 12.
+		if len(blob) != 24 {
+			t.Errorf("encode(%q): empty ACL blob len = %d, want 24", in, len(blob))
 		}
 		if et := binary.LittleEndian.Uint32(blob[12:16]); et != 1033 {
 			t.Errorf("encode(%q): elemtype = %d, want 1033", in, et)
 		}
-		if nd := binary.LittleEndian.Uint32(blob[4:8]); nd != 0 {
-			t.Errorf("encode(%q): ndim = %d, want 0", in, nd)
+		if nd := binary.LittleEndian.Uint32(blob[4:8]); nd != 1 {
+			t.Errorf("encode(%q): ndim = %d, want 1", in, nd)
+		}
+		if n := binary.LittleEndian.Uint32(blob[16:20]); n != 0 {
+			t.Errorf("encode(%q): dims[0] = %d, want 0", in, n)
 		}
 		got, err := decodeAclItemArrayText(blob, fixtureResolveName)
 		if err != nil {

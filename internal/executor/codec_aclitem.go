@@ -269,7 +269,7 @@ func encodeAclItemArrayText(aclText string, resolveOID func(roleName string) uin
 	body = strings.TrimSuffix(body, "}")
 	items := splitTopLevelAclItems(body)
 	if len(items) == 0 {
-		return emptyArrayTypeBytes(aclItemElemTypeOID), nil
+		return emptyACLBytes(), nil
 	}
 
 	elems := make([]byte, 0, len(items)*aclItemSize)
@@ -374,4 +374,19 @@ func DecodeACLItemArray(blob []byte, resolveName func(oid uint32) string) ([]ACL
 // executor (initdb's bootstrap catalog rows, M0149-0001g slice 11).
 func EncodeAclItemArrayText(aclText string, resolveOID func(roleName string) uint32) ([]byte, error) {
 	return encodeAclItemArrayText(aclText, resolveOID)
+}
+
+// emptyACLBytes is PostgreSQL's empty ACL, allocacl(0) (utils/adt/acl.c): a
+// ONE-dimensional aclitem array with dims[0] = 0. It is not the generic empty
+// array (ndim 0) — check_acl rejects that with "ACL arrays must be
+// one-dimensional", so a PG node reading such a column fails every privilege
+// check on the object (M0149-0001g slice 12). An empty ACL grants nothing; an
+// object that never had a GRANT carries NULL (acldefault) instead.
+func emptyACLBytes() []byte {
+	buf := make([]byte, arrayHeaderSize)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(arrayHeaderSize)<<2) // varlena header
+	binary.LittleEndian.PutUint32(buf[4:8], 1)                          // ndim
+	binary.LittleEndian.PutUint32(buf[12:16], aclItemElemTypeOID)       // elemtype
+	binary.LittleEndian.PutUint32(buf[20:24], 1)                        // lbound[0]; dims[0] stays 0
+	return buf
 }
