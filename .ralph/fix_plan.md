@@ -11453,6 +11453,17 @@ verify each at HEAD when the task starts.
       5; S3 template1 at base/1 with a startup migration; S4 \(optional\)
       namespace keys.
     Movement: none — tap 034\_create\_database 3/4 \(design only\)
+  - 2026-11-15 S1 implementation findings \(design doc § "S1
+    implementation findings"\):
+    - A postgres CREATE TABLE writes about 40 WAL block references under
+      DBOid 1 \(pg\_attribute, pg\_class, pg\_index, pg\_constraint and
+      their indexes\) and 41 under DBOid 5 \(the mirror's FPI copies\). PG
+      replay would put postgres catalogs into its template1.
+    - 193 computed-DBOid `RelFileNode{}` constructions, so S1 normalizes at
+      the storage boundary instead \(storage.StorageDBOid 1 → 5 at the Pool
+      buffer tag, smgr path, WAL block-ref encoders, mirror guard\), all in
+      one commit.
+    Movement: none — tap 034\_create\_database 3/4 \(design only\)
 - [ ] **M0149-0001b — Go `Cluster.pm`-equivalent harness for single-node ports \(goopg and PG 18.3 nodes behind one API\)**
   Kind: impl
   Parent: M0149-0001

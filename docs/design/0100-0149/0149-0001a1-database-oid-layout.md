@@ -96,6 +96,43 @@ Key observation: PG compatibility constrains only the **displayed** and
    This retires `NamespaceDBOid`'s 5 → 1 fold. It is internal only and not
    needed for C2.
 
+## S1 implementation findings \(2026\-11\-15, second loop\)
+
+- Measured on a fresh cluster: `create table s1t (a int primary key, b
+  text); insert …; checkpoint` in `postgres` emits about 40 WAL block
+  references under DBOid **1** and 41 under DBOid **5**.
+  - The DBOid\-1 references are the primary catalog writes: `pg_attribute`
+    1249 \(12\), `pg_class` 1259 and its indexes 2659 / 2662 / 2663,
+    `pg_index` 2610, `pg_constraint` 2606, and the `pg_depend` indexes
+    2678 / 2679.
+  - The DBOid\-5 references are the mirror's copies \(mostly `XLOG FPI`\).
+  - PG 18.3 replaying this stream would write postgres's catalog rows into
+    its own template1 \(`base/1`\). C2 therefore needs S1, not just S3.
+- The writers are not only the 23 literal sites. `RelFileNode{…}` is built
+  with a computed DBOid in 193 non\-test places: `cat.DBOID()` 29,
+  `heapDBOid` 16, `dbOid` 14, `tableCatalogHeapDBOid(ctx)` 5, `key.DBOid`
+  5, …
+  - A source\-level rewrite is error\-prone.
+- Chosen approach: one storage\-boundary normalization, `storage.StorageDBOid`
+  \(1 → 5\), applied at every chokepoint **in a single commit**:
+  1. the buffer tag at every `Pool` method taking a `RelFileNode` \(Pin,
+     NBlocks, CachedNBlocks, Exists, CreateFile, RelPath, truncate / drop\),
+     so `(1, rel)` and `(5, rel)` share one buffer;
+  2. the smgr `Manager` path computation, for callers that bypass the Pool;
+  3. the WAL block\-reference encoders \(`pg_assembled_emit.go` and the
+     `recovery.go` record encoders that write `rel.DBOid`\), so new WAL names
+     5;
+  4. `mirrorCatalogRelToPostgresDB` returns early when the normalized source
+     equals the destination, which is always the case after 1–2.
+- Replay of a pre\-S1 segment decodes DBOid 1 and is normalized by \(1\) to
+  base/5, which is what the mirror kept current.
+- Applying only some of the chokepoints is unsafe: two buffers for one
+  file means incoherence. Hence the single\-commit rule.
+- Verification for the S1 commit: units; crash and restart tests;
+  pg\_waldump on the same probe shows no `1663/1/…` block reference;
+  spotcheck, sf025 and acceptance on old corpora; replay of a pre\-S1 WAL
+  segment.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the
