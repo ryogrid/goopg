@@ -589,6 +589,17 @@ Key observation: PG compatibility constrains only the **displayed** and
   against a scratch PG initdb. The latest residuals are recorded in
   fix\_plan under M0149\-0001g slice 9.
 
+## Follow\-up: M0149\-0001g slice 10 — shared catalog rows at initdb \(2026\-11\-16\)
+
+- `writeSharedHeapRows` writes the one global/ copy of a shared catalog's
+  bootstrap heap. It shares `buildMultiPageHeapFile` with the local writer,
+  which writes base/1 and base/5.
+- pg\_auth\_members is its first user: PG initdb's three predefined
+  memberships for pg\_monitor, plus the catalog's four btree indexes built
+  from those rows.
+- Rows written at initdb with xmin 1 are loaded by goopg's own catalog
+  reload, so goopg and a PG node see the same memberships.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

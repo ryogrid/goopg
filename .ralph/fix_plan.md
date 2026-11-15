@@ -12002,6 +12002,24 @@ verify each at HEAD when the task starts.
     - Gates: units, initdb, postmaster, testport interop set, regress A/B
       on 6 cases \(no movement\), spotcheck, sf025 99, acceptance.
     Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 10: pg\_auth\_members carries PG initdb's three predefined memberships.
+    - The rows: pg\_monitor is granted pg\_read\_all\_settings,
+      pg\_read\_all\_stats and pg\_stat\_scan\_tables \(system\_functions.sql\),
+      OIDs 10308–10310, grantor 10, INHERIT and SET true.
+    - bootstrapPgAuthMembers writes global/1261 through the new
+      writeSharedHeapRows \(buildMultiPageHeapFile was factored out of the
+      local writer\). It also builds indexes 6303, 2694, 2695 and 6302.
+    - PG 18.3 cold start: pg\_has\_role\(mon, pg\_stat\_scan\_tables\) is true
+      for a pg\_monitor member. Index lookups, GRANT, REVOKE and VACUUM work.
+    - goopg loads the rows through reloadRoleMembershipsFromHeap and keeps
+      them across two restarts, next to a runtime GRANT.
+    - Findings:
+      - goopg has no pg\_has\_role function at all \(PG has 6 overloads\).
+      - goopg start runs on a directory whose init failed halfway \(no
+        global/pg\_control\) without complaint.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      6 role/catalog cases \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none
