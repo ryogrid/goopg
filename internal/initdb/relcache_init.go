@@ -82,7 +82,7 @@ type nailedAttr struct {
 var nailedSharedRels = flattenRels([]nailedRel{
 	{1262, "pg_database", 1248, 'r', 18, true, pgDatabaseAttrs()},
 	{1260, "pg_authid", 2842, 'r', 12, true, pgAuthidAttrs()},
-	{1261, "pg_auth_members", 2843, 'r', 5, true, pgAuthMembersAttrs()},
+	{1261, "pg_auth_members", 2843, 'r', 7, true, pgAuthMembersAttrs()},
 	// pg_shseclabel reltype must equal SharedSecLabelRelation_Rowtype_Id
 	// (4066) from postgres/src/include/catalog/pg_shseclabel_d.h. PG's
 	// formrdesc("pg_shseclabel", ...) call in
@@ -330,9 +330,9 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	{2604, "pg_attrdef", 83, 'r', 4, false, pgAttrdefAttrs()},
 	{2606, "pg_constraint", 83, 'r', 28, false, pgConstraintAttrs()},
 	{2601, "pg_am", 83, 'r', 4, false, pgAmAttrs()},
-	{2617, "pg_operator", 83, 'r', 10, false, pgOperatorAttrs()},
+	{2617, "pg_operator", 83, 'r', 15, false, pgOperatorAttrs()},
 	{3456, "pg_collation", 83, 'r', 12, false, pgCollationAttrs()},
-	{2611, "pg_inherits", 83, 'r', 3, false, pgInheritsAttrs()},
+	{2611, "pg_inherits", 83, 'r', 4, false, pgInheritsAttrs()},
 	{2612, "pg_language", 83, 'r', 9, false, pgLanguageAttrs()},
 	{2602, "pg_amop", 83, 'r', 9, false, pgAmopAttrs()},
 	{2609, "pg_description", 83, 'r', 4, false, pgDescriptionAttrs()},
@@ -2289,6 +2289,11 @@ func pgAuthMembersAttrs() []nailedAttr {
 		{Name: "member", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
 		{Name: "grantor", TypeOID: 26, Num: 4, Len: 4, NotNull: true},
 		{Name: "admin_option", TypeOID: 16, Num: 5, Len: 1, NotNull: true},
+		// inherit_option / set_option (PG 16+): goopg's writer (executor
+		// sys_pg_auth_members.go) always stored them; the descriptor lacked
+		// them until M0149-0001g slice 9.
+		{Name: "inherit_option", TypeOID: 16, Num: 6, Len: 1, NotNull: true},
+		{Name: "set_option", TypeOID: 16, Num: 7, Len: 1, NotNull: true},
 	}
 }
 
@@ -2837,7 +2842,7 @@ func pgAmAttrs() []nailedAttr {
 	return []nailedAttr{
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
 		{Name: "amname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},
-		{Name: "amhandler", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
+		{Name: "amhandler", TypeOID: 24, Num: 3, Len: 4, NotNull: true}, // regproc (pg_am.h)
 		// M0106-0010 step 2: PG18 FormData_pg_am declares 4 columns.
 		// Heap-tuple seed in initdb writes a 1-byte char at the
 		// trailing slot; the init file's TupleDesc must agree.
@@ -2857,6 +2862,15 @@ func pgOperatorAttrs() []nailedAttr {
 		{Name: "oprleft", TypeOID: 26, Num: 8, Len: 4, NotNull: true},
 		{Name: "oprright", TypeOID: 26, Num: 9, Len: 4, NotNull: true},
 		{Name: "oprresult", TypeOID: 26, Num: 10, Len: 4, NotNull: true},
+		// oprcom … oprjoin: bootstrapPgOperatorTuples always wrote all 15
+		// columns, but the descriptor stopped at oprresult, so a PG node on a
+		// goopg directory reported `column "oprcode" does not exist`
+		// (M0149-0001g slice 9).
+		{Name: "oprcom", TypeOID: 26, Num: 11, Len: 4, NotNull: true},
+		{Name: "oprnegate", TypeOID: 26, Num: 12, Len: 4, NotNull: true},
+		{Name: "oprcode", TypeOID: 24, Num: 13, Len: 4, NotNull: true},
+		{Name: "oprrest", TypeOID: 24, Num: 14, Len: 4, NotNull: true},
+		{Name: "oprjoin", TypeOID: 24, Num: 15, Len: 4, NotNull: true},
 	}
 }
 
@@ -2865,6 +2879,7 @@ func pgInheritsAttrs() []nailedAttr {
 		{Name: "inhrelid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
 		{Name: "inhparent", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
 		{Name: "inhseqno", TypeOID: 23, Num: 3, Len: 4, NotNull: true},
+		{Name: "inhdetachpending", TypeOID: 16, Num: 4, Len: 1, NotNull: true}, // written by sys_pg_inherits.go; descriptor gained it in M0149-0001g slice 9
 	}
 }
 

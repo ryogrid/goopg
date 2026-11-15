@@ -572,6 +572,23 @@ Key observation: PG compatibility constrains only the **displayed** and
 - The bki oracle tests now cover pg\_am, pg\_amop, pg\_amproc, pg\_opclass
   and pg\_opfamily.
 
+## Follow\-up: M0149\-0001g slice 9 — nailed descriptors pinned to postgres.bki \(2026\-11\-16\)
+
+- Every nailed catalog's attribute list, and the pg\_attribute heap rows
+  derived from it, is compared with the catalog's `create` declaration in
+  `postgres.bki`. This covers column names, order and types, plus relnatts.
+- The test found four descriptors that were shorter than, or typed
+  differently from, the tuples goopg actually writes. Two examples:
+  - pg\_operator stopped at oprresult;
+  - `oid` and `xid` columns were labelled int4.
+- PostgreSQL's syscache reads catalog tuples through compiled structs, so
+  these never broke operator execution. They broke every SQL reference to
+  the missing columns.
+- Cross\-catalog census method: start PG 18.3 on a goopg directory, then
+  `select * from <catalog>` with index scans disabled. Diff the output
+  against a scratch PG initdb. The latest residuals are recorded in
+  fix\_plan under M0149\-0001g slice 9.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

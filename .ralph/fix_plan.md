@@ -11973,6 +11973,35 @@ verify each at HEAD when the task starts.
     - Gates: units, initdb, postmaster, testport interop set, spotcheck,
       sf025 99, acceptance.
     Movement: regress opr\_sanity 774→733, create\_am 153→148 \(attributed to slices 5–7; this slice none\)
+  - 2026-11-16 slice 9: nailed\-catalog descriptors pinned to postgres.bki create declarations.
+    - TestNailedRelAttrsMatchPostgresBKI checks names, order, types and
+      relnatts. It checks both the nailed descriptor and the pg\_attribute
+      heap rows \(pgAttrEntriesForRel\).
+    - Fixed:
+      - pg\_operator: 10→15 columns. oprcom, oprnegate, oprcode, oprrest and
+        oprjoin were stored but not declared, so a PG node answered
+        "column oprcode does not exist".
+      - pg\_auth\_members: 5→7 columns \(inherit\_option, set\_option\).
+      - pg\_inherits: 3→4 columns \(inhdetachpending\).
+      - pg\_am.amhandler: oid→regproc.
+      - pgCatalogTypeOID mapped oid and xid to int4 \(23\). 14 pg\_class and
+        3 pg\_attribute columns are now oid 26 / xid 28.
+    - Also pinned: pg\_operator \(799\) and pg\_cast \(235\) Go tables
+      against postgres.bki. Both already matched.
+    - Cross\-catalog SQL census, PG cold start vs scratch PG:
+      - identical: pg\_operator, pg\_am, pg\_opclass, pg\_opfamily,
+        pg\_amop, pg\_amproc, pg\_aggregate, pg\_cast, pg\_conversion,
+        pg\_range, pg\_tablespace;
+      - still diverging: pg\_proc \(2669 rows\), pg\_type \(666 missing,
+        mostly initdb\-time rowtypes\), pg\_description / pg\_shdescription
+        \(empty\), pg\_ts\_\* \(empty\), pg\_collation \(7 vs 860\),
+        pg\_namespace \(4 vs 16\), pg\_language \(no plpgsql\),
+        pg\_auth\_members \(0 vs 3\).
+    - psql \\do\+ on PG fails on the SQL\-function prosrc placeholder
+      "see system\_functions.sql".
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B
+      on 6 cases \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

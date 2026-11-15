@@ -6800,8 +6800,12 @@ func pgCatalogTypeOID(t string) uint32 {
 		return 20
 	case "int2":
 		return 21
-	case "int4", "oid", "xid":
+	case "int4":
 		return 23
+	case "oid":
+		return 26 // OIDOID — was folded into int4 before M0149-0001g slice 9
+	case "xid":
+		return 28 // XIDOID
 	case "text":
 		return 25
 	case "pg_node_tree":
