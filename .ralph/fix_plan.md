@@ -11839,6 +11839,27 @@ verify each at HEAD when the task starts.
       cases \(no movement\), spotcheck. sf025 and acceptance are blocked by
       the nightly batch \(01:15–\) and are re-run before the commit.
     Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 3:
+    - Bootstrapped six indexes over catalogs that are empty at initdb and
+      that goopg does not write: 2699 / 2702 pg\_trigger, 2996
+      pg\_largeobject\_metadata, 3257 / 3258 pg\_policy, 3597 pg\_seclabel.
+    - Added the pg\_init\_privs catalog \(3394, reltype 10090, 5 columns,
+      empty heap\) and its index 3395. It had no pg\_class row and no file.
+    - PG 18.3 over goopg data, after the 30-statement goopg workload:
+      - CREATE TABLE … REFERENCES works, and the FK is enforced.
+      - DROP VIEW, DROP TABLE, DROP TABLE … CASCADE \(of goopg-created
+        tables\), DROP MATERIALIZED VIEW / TYPE / DOMAIN / SEQUENCE / FUNCTION
+        all succeed. Before: "could not open relation with OID 2702 / 3597 /
+        3394".
+      - No backend crash.
+    - Coverage audit: 130 indexes; only the already-recorded pg\_enum
+      \(opclass 10012\) and 3766 defects remain.
+    - Still missing: 2651 / 2652 pg\_am, 2756 pg\_amop, 2757 pg\_amproc and
+      3455 pg\_class \(all over heaps with bootstrap rows, so they must be built
+      from the rows\); 2683 needs the pg\_largeobject catalog \(no pg\_class
+      row\). pg\_init\_privs lacks PG's 229 initdb rows and its TOAST 4155.
+    - Gates: units, postmaster, testport interop set, spotcheck, sf025 99.
+    Movement: none — C3 cold-start fix
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

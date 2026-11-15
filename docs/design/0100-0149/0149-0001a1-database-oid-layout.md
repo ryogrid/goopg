@@ -505,6 +505,17 @@ Key observation: PG compatibility constrains only the **displayed** and
   - the obj\_description source text;
   - the pg\_enum opclass and the pg\_ts\_template index image.
 
+## Follow\-up: M0149\-0001g slice 3 — FK and DROP on PG \(2026\-11\-16\)
+
+- Bootstrapped six indexes over empty catalogs \(pg\_trigger,
+  pg\_largeobject\_metadata, pg\_policy, pg\_seclabel\).
+- Added the pg\_init\_privs catalog with its index.
+- PG 18.3 over a goopg directory can now create and enforce foreign keys,
+  and DROP every object kind tried, including goopg\-created tables with
+  CASCADE.
+- Remaining indexes: pg\_am, pg\_amop, pg\_amproc and pg\_class 3455. These
+  need builds from the bootstrap rows. pg\_largeobject needs its catalog.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

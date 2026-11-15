@@ -149,6 +149,14 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		2675: {1, 2, 3}, // pg_description_o_c_o_index : btree(objoid, classoid, objsubid) UNIQUE PRIMARY
 		2664: {2, 3},    // pg_constraint_conname_nsp_index : btree(conname, connamespace)
 		2579: {12},      // pg_constraint_conparentid_index : btree(conparentid)
+		// M0149-0001g slice 3.
+		2699: {11},         // pg_trigger_tgconstraint_index
+		2702: {1},          // pg_trigger_oid_index
+		2996: {1},          // pg_largeobject_metadata_oid_index
+		3257: {1},          // pg_policy_oid_index
+		3258: {3, 2},       // pg_policy_polrelid_polname_index
+		3597: {1, 2, 3, 4}, // pg_seclabel_object_index
+		3395: {1, 2, 3},    // pg_init_privs_o_c_o_index
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {

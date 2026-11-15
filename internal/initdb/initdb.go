@@ -1711,6 +1711,7 @@ func mappedLocalCatalogPlaceholderOIDs() []uint32 {
 		//	  removing a laid-down file is not this slice's business.)
 		2619, // pg_statistic
 		2620, // pg_trigger
+		3394, // pg_init_privs (M0149-0001g slice 3)
 		2995, // pg_largeobject_metadata (M0131-S9.3f — base catalog of the
 		//	  pg_seclabels view's "large object" branch; 3596 below is the
 		//	  other half. Both heaps stay empty.)
@@ -2262,6 +2263,11 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		2673, 2674, // pg_depend_depender_index, pg_depend_reference_index
 		2187,       // pg_inherits_parent_index
 		2675,       // pg_description_o_c_o_index
+		2699, 2702, // pg_trigger_tgconstraint_index, pg_trigger_oid_index (slice 3)
+		2996,       // pg_largeobject_metadata_oid_index (slice 3)
+		3257, 3258, // pg_policy_oid_index, pg_policy_polrelid_polname_index (slice 3)
+		3597,       // pg_seclabel_object_index (slice 3)
+		3395,       // pg_init_privs_o_c_o_index (slice 3)
 		// Local critical indexes
 		827,  // pg_default_acl_role_nsp_obj_index (Step 3al)
 		828,  // pg_default_acl_oid_index (Step 3am)
@@ -5263,6 +5269,17 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		entry(2675, 2609, []int16{1, 2, 3}, []uint32{oidOps, oidOps, int4Ops}, []uint32{0, 0, 0}, true, true),                        // pg_description_o_c_o_index
 		entry(2664, 2606, []int16{2, 3}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, false, false),                           // pg_constraint_conname_nsp_index
 		entry(2579, 2606, []int16{12}, []uint32{oidOps}, []uint32{0}, false, false),                                                  // pg_constraint_conparentid_index
+		// M0149-0001g slice 3: indexes over catalogs that are empty at initdb
+		// and that goopg does not write at runtime (pg_trigger, pg_policy,
+		// pg_largeobject_metadata, pg_seclabel). PG's FK trigger creation
+		// opens 2702 and every DROP probes 3597 (DeleteSecurityLabel).
+		entry(2699, 2620, []int16{11}, []uint32{oidOps}, []uint32{0}, false, false),                                                  // pg_trigger_tgconstraint_index
+		entry(2702, 2620, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                                     // pg_trigger_oid_index
+		entry(2996, 2995, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                                     // pg_largeobject_metadata_oid_index
+		entry(3257, 3256, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                                     // pg_policy_oid_index
+		entry(3258, 3256, []int16{3, 2}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false),                            // pg_policy_polrelid_polname_index
+		entry(3597, 3596, []int16{1, 2, 3, 4}, []uint32{oidOps, oidOps, int4Ops, textOps}, []uint32{0, 0, 0, cCollation}, true, true), // pg_seclabel_object_index
+		entry(3395, 3394, []int16{1, 2, 3}, []uint32{oidOps, oidOps, int4Ops}, []uint32{0, 0, 0}, true, true),                        // pg_init_privs_o_c_o_index
 		// pg_namespace columns (PG18, pg_namespace.h): 1=oid, 2=nspname,
 		// 3=nspowner, 4=nspacl. PG18 indexing.h:
 		//   NamespaceNameIndexId = 2684 = pg_namespace_nspname_index

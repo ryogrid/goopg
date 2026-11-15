@@ -721,6 +721,13 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	// a seq scan answers the view and nothing ever needs the index —
 	// ledgered, not assumed.
 	{3256, "pg_policy", 83, 'r', 8, false, pgPolicyAttrs()},
+	// M0149-0001g slice 3: pg_init_privs (InitPrivsRelationId 3394,
+	// pg_init_privs.h; reltype 10090 from a PG 18.3 initdb). Every DROP runs
+	// RemoveRoleFromInitPriv / recordExtObjInitPriv lookups through it, so a
+	// PG node over a goopg directory failed every DROP with "could not open
+	// relation with OID 3394". The heap starts empty (PG's initdb stores 229
+	// rows for built-in objects; ledgered).
+	{3394, "pg_init_privs", 10090, 'r', 5, false, pgInitPrivsAttrs()},
 	// M0131-S9.3f: pg_seclabel and pg_largeobject_metadata are S9.3e's
 	// construction repeated, and for the last view that needs it. The
 	// `pg_seclabels` view (12099) is a 13-branch UNION ALL whose local half
@@ -870,6 +877,14 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	{OID: 2675, Name: "pg_description_o_c_o_index"},
 	{OID: 2664, Name: "pg_constraint_conname_nsp_index"},
 	{OID: 2579, Name: "pg_constraint_conparentid_index"},
+	// M0149-0001g slice 3.
+	{OID: 2699, Name: "pg_trigger_tgconstraint_index"},
+	{OID: 2702, Name: "pg_trigger_oid_index"},
+	{OID: 2996, Name: "pg_largeobject_metadata_oid_index"},
+	{OID: 3257, Name: "pg_policy_oid_index"},
+	{OID: 3258, Name: "pg_policy_polrelid_polname_index"},
+	{OID: 3597, Name: "pg_seclabel_object_index"},
+	{OID: 3395, Name: "pg_init_privs_o_c_o_index"},
 	// M0106-0010 batched-36 loop 5: pg_namespace_nspname_index (OID 2684)
 	// is a 1-column UNIQUE btree on pg_namespace.nspname (name_ops) — same
 	// shape as pg_authid_rolname_index (Step 3dg) and pg_database_datname_index
@@ -3598,6 +3613,17 @@ func pgDbRoleSettingAttrs() []nailedAttr {
 		{Name: "setdatabase", TypeOID: 26, Num: 1, Len: 4, NotNull: true},   // oid (0 ⇒ role-specific)
 		{Name: "setrole", TypeOID: 26, Num: 2, Len: 4, NotNull: true},       // oid (0 ⇒ database-specific)
 		{Name: "setconfig", TypeOID: 1009, Num: 3, Len: -1, NotNull: false}, // text[] (CATALOG_VARLEN, nullable)
+	}
+}
+
+// pgInitPrivsAttrs is FormData_pg_init_privs (postgres/src/include/catalog/pg_init_privs.h).
+func pgInitPrivsAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "objoid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
+		{Name: "classoid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
+		{Name: "objsubid", TypeOID: 23, Num: 3, Len: 4, NotNull: true},
+		{Name: "privtype", TypeOID: 18, Num: 4, Len: 1, NotNull: true},
+		{Name: "initprivs", TypeOID: 1034, Num: 5, Len: -1, NotNull: true},
 	}
 }
 
