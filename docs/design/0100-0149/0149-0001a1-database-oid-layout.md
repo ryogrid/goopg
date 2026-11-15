@@ -560,6 +560,18 @@ Key observation: PG compatibility constrains only the **displayed** and
   further drift fails at `go test`. Before, it surfaced only as a crash on a
   PG node.
 
+## Follow\-up: M0149\-0001g slice 8 — pg\_am/pg\_amop/pg\_amproc OIDs \(2026\-11\-16\)
+
+- PG's pg\_amop and pg\_amproc rows carry genbki OIDs from 10000 in .dat
+  order.
+- goopg's pg\_amproc list is already in .dat order, so its OIDs are simply
+  base 10000 plus the row index.
+- goopg emits pg\_amop rows grouped differently, so each row's OID is looked
+  up by natural key in `pg_amop_oids_generated.go`. That file is regenerated
+  by `scripts/gen-pg-amop-oids.py` from `postgres.bki`.
+- The bki oracle tests now cover pg\_am, pg\_amop, pg\_amproc, pg\_opclass
+  and pg\_opfamily.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

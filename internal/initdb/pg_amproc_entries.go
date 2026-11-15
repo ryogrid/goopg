@@ -1,9 +1,12 @@
 package initdb
 
 // pgAmprocInitialEntries returns all 714 rows of pg_amproc (OID 2603) from
-// PG18 pg_amproc.dat. OIDs are assigned by the caller (baseOID + index).
+// PG18 pg_amproc.dat, in .dat order. OIDs are baseOID + index: genbki assigns
+// pg_amproc.dat's rows 10000, 10001, ... in file order (postgres.bki), so the
+// OIDs equal PostgreSQL 18.3's (M0149-0001g slice 8;
+// TestPgAmprocMatchesPostgresBKI).
 func pgAmprocInitialEntries() []pgAmprocEntry {
-	const baseOID uint32 = 7100
+	const baseOID uint32 = 10000
 	out := []pgAmprocEntry{
 		// btree/array_ops (family=397)
 		{Family: 397, LeftType: 2277, RightType: 2277, Num: 1, Proc: 382}, // anyarray x anyarray: btarraycmp

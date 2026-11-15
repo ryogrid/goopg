@@ -11954,6 +11954,25 @@ verify each at HEAD when the task starts.
     - Gates: units, initdb, postmaster, testport interop set, spotcheck,
       sf025 99, acceptance.
     Movement: none — C3 cold-start fix
+  - 2026-11-16 slice 8: pg\_am / pg\_amop / pg\_amproc pinned to postgres.bki.
+    - Content already matched PG 18.3 on the natural key \(945 amop and 714
+      amproc rows\); only the OIDs were goopg's \(7000\+ and 7100\+\).
+    - pg\_amproc is in .dat order, so its base is now 10000, which equals
+      genbki's.
+    - pg\_amop is emitted in goopg's own order. Each row now takes its PG OID
+      from pg\_amop\_oids\_generated.go \(scripts/gen\-pg\-amop\-oids.py,
+      keyed on family, left type, right type and strategy\).
+    - Oracle tests: TestPgAmMatchesPostgresBKI, TestPgAmopMatchesPostgresBKI
+      and TestPgAmprocMatchesPostgresBKI.
+    - PG cold start: OID lookups through 2756 / 2757 return PG's rows;
+      VACUUM, BRIN and btree all work.
+    - Regress A/B against a HEAD worktree: no movement from this slice.
+    - The inventory was stale since e11971ba1. Re\-measured with
+      \-\-update\-inventory: opr\_sanity 774→733 and create\_am 153→148,
+      both already present at 6ffd8f664 \(slices 5–7\).
+    - Gates: units, initdb, postmaster, testport interop set, spotcheck,
+      sf025 99, acceptance.
+    Movement: regress opr\_sanity 774→733, create\_am 153→148 \(attributed to slices 5–7; this slice none\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

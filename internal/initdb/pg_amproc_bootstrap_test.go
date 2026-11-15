@@ -241,11 +241,11 @@ func TestBootstrapPgAmprocTuplesWritesRowsToBase1And5(t *testing.T) {
 	if _, err := bootstrapPgAmprocTuples(dir); err != nil {
 		t.Fatalf("bootstrapPgAmprocTuples: %v", err)
 	}
-	// Needle: oid=7100 || family=1976 || left=23 || right=23 (first entry: btarraycmp is at 7100
+	// Needle: oid=10000 || family=1976 || left=23 || right=23 (first entry: btarraycmp is at 10000
 	// but the integer_ops int4 cmp is the historically pinned row).
 	le := binary.LittleEndian
 	needle := make([]byte, 16)
-	le.PutUint32(needle[0:4], 7100)   // OID of first entry
+	le.PutUint32(needle[0:4], 10000)  // OID of first entry (PG 18.3 genbki)
 	le.PutUint32(needle[4:8], 397)    // family=array_ops (first in PG18 dat order)
 	le.PutUint32(needle[8:12], 2277)  // lefttype=anyarray
 	le.PutUint32(needle[12:16], 2277) // righttype=anyarray
@@ -260,7 +260,7 @@ func TestBootstrapPgAmprocTuplesWritesRowsToBase1And5(t *testing.T) {
 			t.Fatalf("%s: file size %d not a multiple of BlockSize", path, len(raw))
 		}
 		if !bytes.Contains(raw, needle) {
-			t.Fatalf("%s: first row (OID=7100, array_ops) not found in heap pages", path)
+			t.Fatalf("%s: first row (OID=10000, array_ops) not found in heap pages", path)
 		}
 	}
 }

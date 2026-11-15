@@ -3730,8 +3730,8 @@ func pgAmopInitialEntries() []pgAmopEntry {
 		purposeSearch byte = 's'
 		purposeOrder  byte = 'o'
 	)
-	// Synthetic OIDs: PG assigns these at initdb time; we pin contiguous
-	// ranges starting from baseOID so pg_amop_oid_index can be heap-rebuilt.
+	// Provisional OIDs, replaced with PostgreSQL's genbki OIDs (from
+	// pgAmopOIDByKey) before return.
 	const baseOID uint32 = 7000
 	out := make([]pgAmopEntry, 0, 945)
 	// addPair emits 5 strategy rows (1..5) for one (family, left, right, am) triple.
@@ -4792,7 +4792,22 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	// Total non-btree amOp calls: 660
 	// Grand total: 945 rows (= 945 pg_amop entries)
 
+	// The rows above are emitted in goopg's own order; PostgreSQL's OIDs follow
+	// pg_amop.dat's order (genbki, from 10000). Give each row its PG OID by
+	// natural key (M0149-0001g slice 8, TestPgAmopMatchesPostgresBKI).
+	for i := range out {
+		e := &out[i]
+		if oid, ok := pgAmopOIDByKey[pgAmopKey{e.Family, e.LeftType, e.RightType, e.Strategy}]; ok {
+			e.OID = oid
+		}
+	}
 	return out
+}
+
+// pgAmopKey is pg_amop's natural key — the pg_amop_fam_strat_index columns.
+type pgAmopKey struct {
+	Family, LeftType, RightType uint32
+	Strategy                    int16
 }
 
 // pgAmopRow encodes one pg_amop row. Field order mirrors

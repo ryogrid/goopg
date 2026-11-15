@@ -157,10 +157,10 @@ func TestBootstrapPgAmopTuplesWritesRowsToBase1And5(t *testing.T) {
 		t.Fatalf("bootstrapPgAmopTuples returned %d TIDs, want one per entry (%d)",
 			len(tids), len(pgAmopInitialEntries()))
 	}
-	// Build the needle: oid=7000 || family=1976 || left=23 || right=23.
+	// Build the needle: oid=10015 (PG 18.3 genbki OID of integer_ops int4 strategy 1) || family=1976 || left=23 || right=23.
 	le := binary.LittleEndian
 	needle := make([]byte, 16)
-	le.PutUint32(needle[0:4], 7000)
+	le.PutUint32(needle[0:4], 10015)
 	le.PutUint32(needle[4:8], 1976)
 	le.PutUint32(needle[8:12], 23)
 	le.PutUint32(needle[12:16], 23)
