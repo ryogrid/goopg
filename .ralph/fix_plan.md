@@ -13233,6 +13233,34 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
       default arm: per-link and tableoid-Project cpu\_tuple\_cost; member
       seq-scan pages without the 10-page floor\), then enable the
       unrestricted LIST arm.
+  - 2026-11-15 slice 9 attempt — NOT landed \(code reverted; trace
+    recorded\). Aim: make the appendrel's Append cost PG's cost\_append
+    \(p\_t1 75.50, lt 6.50\).
+    - Tried and measured, none of which moved the printed Append cost
+      \(still p\_t1 92.50, lt 7.50\):
+      - a plancost.go SetOp arm \(Σ member totals plus 0.5 × cpu\_tuple\_cost
+        × rows over the flattened chain, gated by
+        setOpExpandsTableHierarchy\);
+      - a free tableoid-wrapper Project, and a free column-selection
+        Project over the appendrel;
+      - a search seed cost \(joinsearch.go appendRelSeqScanCost, members
+        sized via estimate\_rel\_size\).
+    - Debug-proven facts:
+      - The SetOp display arm runs. It sees childTotal 37 for p\_t1 and
+        computes 55.50.
+      - The members are \(tableoid Project → SeqScan\) at 18.50 each.
+      - The SetOp embeds PlanCost, so EXPLAIN prints a STAMPED cost, not
+        the display arm's.
+      - upperInputPathCost returns that carried stamp, and the upper stage
+        re-stamps the node from a prebuilt path's cost \(stampPlanCost\).
+      - The 92.50 stamp = 55.50 \+ 37, one extra cpu\_tuple\_cost per row.
+        Its producer is still unidentified: neither buildInitialRels'
+        seed nor the display arm is it.
+    - Resume: find the SetOp's first stamper \(instrument setPlanCost on
+      SetOp with a stack dump\), then apply cost\_append there; expect
+      every partition / inheritance EXPLAIN cost to move. Then drop the
+      `unrestricted && isList` guard and re-measure aggregates p\_t1 and
+      inherit mclparted.
 - [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
   (NULL-keyed entries)**.
   Kind: impl
