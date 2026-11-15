@@ -417,6 +417,23 @@ Key observation: PG compatibility constrains only the **displayed** and
 - Connecting to a database created on the PG side then fails, because its
   `pg_database` index entries cannot be found. Filed as M0149\-0001d.
 
+## Follow\-up: M0149\-0001d — relhasindex \(2026\-11\-15\)
+
+- PG's `CREATE DATABASE` on a goopg directory left the new database
+  unconnectable.
+- Cause: `pg_class.relhasindex` was false on every goopg\-bootstrapped
+  catalog heap. PG never re\-derives the flag: `ExecOpenIndices` and
+  `RelationGetIndexList` skip indexes when it is false, so PG's catalog
+  inserts never reached `pg_database_datname_index` and
+  `pg_database_oid_index`.
+- Fix: shared catalogs now carry true, as do TOAST heaps.
+  `pg_rewrite_oid_index` \(2692\) gained its missing `pg_class` row.
+- Local catalogs stay false for now. Turning the flag on lets PG's planner
+  use goopg\-built local indexes, and some of those are empty \(2658\).
+- The catalog\-image divergences are filed as M0149\-0001g: descriptors,
+  missing indexes and missing TOAST relations. PG\-side `CREATE TABLE`
+  segfaults on `pg_depend`'s extra column.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

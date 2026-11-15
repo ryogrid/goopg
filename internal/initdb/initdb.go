@@ -4911,6 +4911,19 @@ type pgIndexEntry struct {
 // index initialisation walks both critical-local AND critical-shared
 // lists against the current database's pg_index, so shared-catalog
 // index rows must be present in every per-database pg_index too.
+// bootstrapRelHasIndexSet holds every relation with at least one bootstrap
+// pg_index row (see pgClassRow's relhasindex).
+var bootstrapRelHasIndexSet = func() map[uint32]bool {
+	m := make(map[uint32]bool)
+	for _, e := range pgIndexInitialEntries() {
+		m[e.IndRelid] = true
+	}
+	return m
+}()
+
+// bootstrapRelHasIndex reports whether initdb bootstraps an index on oid.
+func bootstrapRelHasIndex(oid uint32) bool { return bootstrapRelHasIndexSet[oid] }
+
 func pgIndexInitialEntries() []pgIndexEntry {
 	const (
 		oidOps       uint32 = 1981
@@ -6248,12 +6261,25 @@ func pgClassRow(rel nailedRel) executor.Row {
 		executor.NewIntDatum(0),                            // 104: relallvisible
 		executor.NewIntDatum(0), // 108: relallfrozen
 		// 112: reltoastrelid — 2838 on pg_rewrite (DECLARE_TOAST), 0 elsewhere.
-		// 116: relhasindex — true on a TOAST heap, whose (chunk_id, chunk_seq)
-		// btree is the only way PG reaches a chunk. Every other nailed heap
-		// keeps the historical false (goopg's index rows live in pg_index and
-		// PG re-derives them; changing that is out of this slice's scope).
+		// 116: relhasindex — true exactly when the relation has an index, as
+		// PG maintains it (index.c index_update_stats). It is not cosmetic: PG
+		// does not re-derive it. ExecOpenIndices (execIndexing.c) and
+		// RelationGetIndexList (relcache.c) return no indexes when it is false,
+		// so with the historical false every catalog row a PG 18.3 node wrote on
+		// a goopg directory skipped index maintenance — a database PG created
+		// was then invisible to the pg_database_datname_index lookup that
+		// connection start uses (M0149-0001d). Derived from the bootstrap
+		// pg_index entries; a TOAST heap is indexed by construction.
+		//
+		// Scope: SHARED catalogs only, for now. The flag also makes PG's planner
+		// use the index, and some goopg-built LOCAL catalog indexes are not yet
+		// complete — pg_attribute_relid_attnam_index (2658) carries no leaf
+		// tuple at all — so a PG-side catalog query would plan an index scan
+		// and miss rows (TestE2E_PGColdStartOnGoopgDataDir). Local catalogs
+		// keep false until their indexes are audited and populated
+		// (M0149-0001g).
 		executor.NewIntDatum(int64(pgClassReltoastrelidFor(rel.OID))),
-		executor.NewBoolDatum(isNailedToastRelOID(rel.OID)), // 116: relhasindex
+		executor.NewBoolDatum(isNailedToastRelOID(rel.OID) || (rel.IsShared && bootstrapRelHasIndex(rel.OID))), // 116: relhasindex
 		executor.NewBoolDatum(rel.IsShared),                // 117: relisshared
 		executor.NewStringDatum("p"),                       // 118: relpersistence
 		executor.NewStringDatum(string(rune(rel.RelKind))), // 119: relkind

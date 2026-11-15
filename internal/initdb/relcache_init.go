@@ -813,6 +813,11 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	{OID: 2679, Name: "pg_index_indexrelid_index"},
 	{OID: 2687, Name: "pg_opclass_oid_index"},
 	{OID: 2655, Name: "pg_amproc_oid_index"},
+	// M0149-0001d: pg_rewrite_oid_index had a pg_index entry and a file but no
+	// pg_class row; once pg_rewrite carries relhasindex = true, PG's
+	// RelationGetIndexList opens it and failed "could not open relation with
+	// OID 2692".
+	{OID: 2692, Name: "pg_rewrite_oid_index"},
 	{OID: 2693, Name: "pg_rewrite_rel_rulename_index"},
 	{OID: 2701, Name: "pg_trigger_tgrelid_tgname_index"},
 	{OID: 2667, Name: "pg_constraint_oid_index"},

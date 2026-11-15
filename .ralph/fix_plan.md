@@ -11676,7 +11676,7 @@ verify each at HEAD when the task starts.
       subscription / pgoutput / template1 / CREATE DATABASE, spotcheck,
       sf025 99.
     Movement: none — C3 cold-start finding \(no TAP assertion moved\)
-- [ ] **M0149-0001d — PG 18.3 inserts into goopg-bootstrapped pg\_database indexes are unreachable: a PG-created database cannot be connected to** \(filed 2026-11-15 by the loop; S2 — catalog corruption on the PG side of a mixed setup\)
+- [x] **M0149-0001d — PG 18.3 inserts into goopg-bootstrapped pg\_database indexes are unreachable: a PG-created database cannot be connected to** \(filed 2026-11-15 by the loop; S2 — catalog corruption on the PG side of a mixed setup\)
   Kind: impl
   Parent: none
   - > **ESCALATION 2026-11-15 \(S2\) — OWNER PLACEMENT NEEDED.** Filed under M0149 \(item-10 rank\); the loop continues
@@ -11693,6 +11693,58 @@ verify each at HEAD when the task starts.
     criticalSharedRelcachesBuilt.
   - First step: on the PG copy, run amcheck `bt_index_check` on 2671 / 2672 from a private PG build, or dump the
     index pages with `pg_filedump`. Compare them with a PG-initdb'd 2671 after the same CREATE DATABASE.
+  - 2026-11-15 COMPLETE:
+    - Root cause: pg\_class.relhasindex was false on every goopg-bootstrapped
+      catalog heap \(PG: true\). PG does not re-derive it:
+      ExecOpenIndices \(execIndexing.c:173\) and RelationGetIndexList
+      \(relcache.c:5338\) return no indexes, so CatalogTupleInsert never
+      touched 2671 / 2672. The index files were byte-identical after PG's
+      CREATE DATABASE + CHECKPOINT.
+    - Fix: relhasindex = true for shared catalogs with a bootstrap index
+      \(and TOAST heaps\). Also added pg\_rewrite\_oid\_index 2692's
+      missing pg\_class row, which PG opened "could not open relation with
+      OID 2692" once relhasindex was on. New tests:
+      TestPgClassRelhasindexMatchesBootstrapIndexes and
+      TestBootstrapIndexEntriesHavePgClassRows.
+    - Verified: on PG 18.3, CREATE DATABASE pgside, connect, restart,
+      connect, DROP DATABASE all work, and 2671 holds PG's entry.
+    - Local catalogs keep relhasindex false. Turning it on made PG's planner
+      use goopg-built local indexes that are incomplete
+      \(pg\_attribute\_relid\_attnam\_index 2658 has zero leaf tuples\),
+      so TestE2E\_PGColdStartOnGoopgDataDir read no pg\_attribute row by
+      attname. Filed M0149-0001g.
+    - Gates: units, postmaster, testport interop / Recovery / pg\_dump /
+      subscription / pgoutput / template1 / CREATE DATABASE, spotcheck,
+      sf025 99.
+    Movement: none — C3 cold-start fix \(no TAP assertion moved\)
+- [ ] **M0149-0001g — goopg's bootstrap catalog image diverges from PG 18.3: 20 catalog descriptors, 19 missing and some empty indexes, 29 missing TOAST relations, local relhasindex false; PG-side CREATE TABLE segfaults** \(filed 2026-11-15; S2 — a PG 18.3 node crashes and would write malformed catalog rows on a goopg directory\)
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026-11-15 \(S2\) — OWNER PLACEMENT NEEDED.** Filed under M0149 \(item-10 rank\). Any PG-side DDL
+    > on a goopg-initialised directory crashes the backend: CREATE TABLE → GenerateTypeDependencies →
+    > CatalogTuplesMultiInsertWithInfo \(pg\_depend\) → heap\_form\_tuple SIGSEGV. It happens with or without M0149-0001d.
+  - Measured on a PG cold start versus a scratch PG 18.3 \(pg\_attribute attnum > 0 of the 74 shared catalogs\):
+    - **Extra columns:** pg\_depend.objversion \(the crash: PG forms 7 values against 8 attributes\),
+      pg\_description.shared, pg\_namespace.nspblocked.
+    - **Missing columns:** pg\_operator \(oprcom, oprnegate, oprcode, oprrest, oprjoin\),
+      pg\_auth\_members \(inherit\_option, set\_option\), pg\_inherits \(inhdetachpending\).
+    - **Wrong types / flags:** oid columns typed int4 \(pg\_class.oid / relnamespace, pg\_attribute.attrelid /
+      atttypid\); pg\_am.amhandler typed oid, PG regproc; aclitem\[\] attalign i, PG d \(10 catalogs\);
+      attbyval false for xid \(datfrozenxid, datminmxid\) and timestamptz \(rolvaliduntil\).
+    - **Missing catalog indexes \(19\):** 2187, 2579, 2651, 2652, 2664, 2673, 2674, 2675, 2683, 2699, 2702, 2756, 2757,
+      2996, 3257, 3258, 3395, 3455, 3597.
+    - **Missing local TOAST relations \(29\):** e.g. those of pg\_proc, pg\_type and pg\_attrdef.
+    - **Empty / incomplete indexes:** pg\_attribute\_relid\_attnam\_index 2658 has zero leaf tuples, while 2659 has
+      2345. Audit every index's tuple count against its heap.
+    - **relhasindex:** false for local catalogs \(M0149-0001d set it only for shared catalogs\). Flip it once
+      the local indexes are complete.
+  - The goopg runtime writers use the PG shapes in places \(PGDependColumnsPG18 is 7 columns\). Only the nailed
+    descriptors \(relcache\_init.go \*Attrs\(\)\) are off, but the goopg readers of each catalog must be checked
+    before changing a descriptor.
+  - First step: drop pg\_depend.objversion \(the segfault\). Then align the descriptor table catalog by catalog
+    against pg\_\*.h, with a unit test that compares every nailed descriptor with a pinned PG 18.3 dump.
+  - Verification: on a PG cold start, CREATE TABLE / CREATE INDEX / DROP TABLE work, and the pg\_attribute and
+    pg\_index audits equal PG's.
 - [ ] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none
