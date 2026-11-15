@@ -548,3 +548,47 @@ func TestUnrestrictedListOrderedAppend(t *testing.T) {
 		}
 	}
 }
+
+// TestBoolPartitionBoundsAndPinnedOrder is M0148-0001c3a10 slice 10. A
+// boolean partition bound is stored as `true` / `false` (it was the Go dump
+// "&{68 false}", so no row of a boolean-keyed table could be routed and
+// PartitionDesc order was undecidable), and a leading partition key column
+// pinned to a constant (`b = true`) is skipped when judging whether the
+// partitions are ordered: (b, a) bounds in bound order deliver `order by a`
+// under b = true — PG 18.3's plain Append over partitions created out of
+// order.
+func TestBoolPartitionBoundsAndPinnedOrder(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	for _, s := range []string{
+		"create table bt (b bool NOT NULL, a int NOT NULL) partition by range (b, a)",
+		"create table bt_2k partition of bt for values from (true, 1000) to (true, 2000)",
+		"create table bt_1k partition of bt for values from (true, 0) to (true, 1000)",
+		"create index on bt (b, a)",
+		"insert into bt select true, i from generate_series(0, 1999) i",
+		"vacuum bt_1k", "vacuum bt_2k",
+		"analyze bt",
+		"create table bl (b bool NOT NULL, a int NOT NULL) partition by list (b)",
+		"create table bl_t partition of bl for values in (true)",
+		"create table bl_f partition of bl for values in (false)",
+		"insert into bl select i % 3 = 0, i from generate_series(1, 30) i",
+	} {
+		runSQL(t, ctx, s)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	want := "Limit\n  ->  Append\n        ->  Index Only Scan using bt_1k_b_a_idx on bt_1k bt_1\n              Index Cond: (b = true)\n" +
+		"        ->  Index Only Scan using bt_2k_b_a_idx on bt_2k bt_2\n              Index Cond: (b = true)"
+	if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) select a from bt where b = true order by a limit 3", ps)), "\n"); got != want {
+		t.Errorf("pinned-key ordered Append:\ngot:\n%s\nwant (PG 18.3):\n%s", got, want)
+	}
+	for _, c := range []struct{ q, rows string }{
+		{"select a from bt where b = true order by a limit 3", "0;1;2"},
+		{"select a from bt where b order by a desc limit 3", "1999;1998;1997"},
+		{"select b, count(*) from bl group by b order by b", "f|20;t|10"},
+		{"select count(*) from bl_t", "10"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

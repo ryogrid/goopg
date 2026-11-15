@@ -13772,6 +13772,21 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Resume: extend to joins after k1 and P0-E31; to restricted
       appendrels with per-member quals once the child-rel and seed costs
       agree.
+  - 2026-11-15 slice 10 LANDED: constant-pinned leading partition keys
+    \(constPinnedColumns, stripPinnedPathkeys\) and a bound-order check
+    for RANGE \(rangePartsAscending\); executor fix: boolean partition
+    bounds stored as `true` / `false`, which makes boolean-keyed tables
+    routable \(they errored "no partition found"\).
+    TestBoolPartitionBoundsAndPinnedOrder.
+    Movement: yes — regress inherit 662→651, create\_table 133→122,
+    alter\_table 733→732 \(inventory re-measured on this build;
+    same-suite A/B inherit 677→666\)
+    - Finding: regress `select` FAILS 8/874 at HEAD too \(onek2 index-only
+      scans, `Index Searches`, list\_parted\_tbl\) while the inventory still
+      says `pass`; not caused here \(HEAD worktree run identical\).
+    - Resume: plan-time pruning \(k1\) for bool\_rp's extra partitions;
+      `order by b, a desc` under `b` \(PG Incremental Sort on the pinned
+      prefix\); restricted-appendrel cost\_append; joins.
 - [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
   (NULL-keyed entries)**.
   Kind: impl

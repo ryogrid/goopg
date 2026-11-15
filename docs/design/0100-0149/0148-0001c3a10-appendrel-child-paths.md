@@ -330,6 +330,36 @@ Status: slices 1\-3 landed 2026\-11\-15. Parent: M0148\-0001c3a5.
 - Regress: inherit 679→677 in the same\-suite run, 664→662 standalone;
   others unchanged.
 
+## Slice 10 — constant\-pinned partition keys; boolean partition bounds \(landed\)
+
+- build\_partition\_pathkeys drops a partition key column whose
+  equivalence class holds a constant. Under `b = true`, a RANGE (b, a)
+  table's partitions in bound order deliver `order by a`.
+  - `constPinnedColumns` reads the restriction's `col = const` and bare
+    boolean quals.
+  - `rangePartitionsOrderedOn` skips pinned leading key columns, and leading
+    query pathkeys on pinned columns are skipped too.
+  - The child paths' pathkeys are compared after stripping pinned leading
+    keys \(`stripPinnedPathkeys`\).
+- Soundness: the plain Append emits `ps.parts` in order, so RANGE
+  partitions must now really be in bound order \(`rangePartsAscending`\).
+  Slice 3 assumed partitionDescOrder had sorted them; when it cannot
+  decide, the parts stay in catalog order and the Merge Append is used.
+- Executor fix found on the way: a boolean partition bound was stored as
+  the Go dump `&{68 false}`, because `exprToString` and
+  `boundExprToSQLLiteral` had no `BooleanConst` arm.
+  - Every INSERT into a boolean\-keyed table failed with `no partition …
+    found for row`.
+  - pg\_get\_expr printed the dump, and PartitionDesc order was
+    undecidable.
+  - Bounds now store `true` / `false`, and the RANGE router formats a bool
+    key the same way.
+- Witnesses: inherit's bool\_rp \(plain Append; PG still prunes two
+  partitions\), a bool RANGE table created out of order, and bool LIST
+  routing. `TestBoolPartitionBoundsAndPinnedOrder` pins them.
+- Regress: inherit 662→651, create\_table 133→122, alter\_table 733→732
+  \(inventory\); same\-suite A/B inherit 677→666.
+
 ## Not covered
 
 - Multi\-relation problems: inside a join the Append's columns still reach

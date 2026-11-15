@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // Partitionwise join (M0148-0001c3a9 slice 3).
@@ -456,7 +457,13 @@ func (s *searchCtx) addAppendRelChildPaths(cat catalog.Catalog) {
 			pa.pwFills = fills
 			addPath(rel, pa, "appendrel-children")
 		}
-		s.addOrderedAppendRelChildPath(rel, so, ps, childRels, fills, unrestricted)
+		var restriction Expr
+		if f != nil {
+			restriction = f.Predicate
+		} else if ms := unionAllMembers(so); len(ms) > 0 {
+			restriction = memberLocalFilter(ms[0])
+		}
+		s.addOrderedAppendRelChildPath(rel, so, ps, childRels, fills, unrestricted, constPinnedColumns(restriction))
 		setCheapest(rel)
 	}
 }
@@ -476,10 +483,21 @@ func (s *searchCtx) addAppendRelChildPaths(cat catalog.Catalog) {
 // the Merge Append arm here: its plain Append is
 // addOrderedPartitionAppendPaths' (orderedpartitionappend.go). An unrestricted
 // ordered LIST table gets the plain Append here (slice 9).
-func (s *searchCtx) addOrderedAppendRelChildPath(rel *RelOptInfo, so *SetOp, ps *partScheme, childRels []*RelOptInfo, fills []map[int]Expr, unrestricted bool) {
+func (s *searchCtx) addOrderedAppendRelChildPath(rel *RelOptInfo, so *SetOp, ps *partScheme, childRels []*RelOptInfo, fills []map[int]Expr, unrestricted bool, pinned map[string]bool) {
 	qk := s.queryPathkeys
 	if len(qk) == 0 || len(ps.keyPos) == 0 {
 		return
+	}
+	// A leading query key pinned to a constant by the restriction orders
+	// nothing (pathkey_is_redundant: its equivalence class holds a
+	// constant); the partitions' order is judged on the keys after it
+	// (slice 10).
+	for len(qk) > 1 {
+		c, ok := qk[0].Expr.(*ColumnRef)
+		if !ok || !pinned[strings.ToLower(c.Name)] {
+			break
+		}
+		qk = qk[1:]
 	}
 	// Every query key must be a plain column of this appendrel: the child
 	// rels' paths order by those columns only.
@@ -491,7 +509,7 @@ func (s *searchCtx) addOrderedAppendRelChildPath(rel *RelOptInfo, so *SetOp, ps 
 		}
 	}
 	isList := strings.EqualFold(ps.parent.PartitionMethod, "LIST")
-	if !rangePartitionsOrderedOn(ps, qk[0].Expr.(*ColumnRef)) {
+	if !rangePartitionsOrderedOn(ps, qk[0].Expr.(*ColumnRef), pinned) {
 		// Not partitions_are_ordered on the leading key: the ordering is a
 		// Merge Append of the children (slice 5), for every useful ordering
 		// a child delivers.
@@ -511,7 +529,7 @@ func (s *searchCtx) addOrderedAppendRelChildPath(rel *RelOptInfo, so *SetOp, ps 
 	for j, c := range childRels {
 		var best *Path
 		for _, p := range c.Pathlist {
-			if p == nil || p.RequiredOuter != 0 || !pathkeysContainedIn(p.Pathkeys, qk) {
+			if p == nil || p.RequiredOuter != 0 || !pathkeysContainedIn(stripPinnedPathkeys(p.Pathkeys, pinned), qk) {
 				continue
 			}
 			if best == nil || p.DisabledNodes < best.DisabledNodes ||
@@ -543,8 +561,17 @@ func (s *searchCtx) addOrderedAppendRelChildPath(rel *RelOptInfo, so *SetOp, ps 
 // a RANGE table without a default partition, or a LIST table without
 // interleaved partitions (listPartitionsOrdered, slice 8), whose (first)
 // partition key column is col.
-func rangePartitionsOrderedOn(ps *partScheme, col *ColumnRef) bool {
-	if !strings.EqualFold(col.Name, ps.parent.Columns[ps.keyPos[0]].Name) {
+func rangePartitionsOrderedOn(ps *partScheme, col *ColumnRef, pinned map[string]bool) bool {
+	// build_partition_pathkeys drops a partition key column the restriction
+	// pins to a constant (its pathkey is redundant): partitions in bound
+	// order, restricted to that one value, are ordered on the next key
+	// column. All key columns pinned leaves no partition pathkey, which
+	// partitions_are_ordered then matches trivially (slice 10).
+	k := 0
+	for k < len(ps.keyPos) && pinned[strings.ToLower(ps.parent.Columns[ps.keyPos[k]].Name)] {
+		k++
+	}
+	if k < len(ps.keyPos) && !strings.EqualFold(col.Name, ps.parent.Columns[ps.keyPos[k]].Name) {
 		return false
 	}
 	for _, part := range ps.parts {
@@ -556,11 +583,115 @@ func rangePartitionsOrderedOn(ps *partScheme, col *ColumnRef) bool {
 	}
 	switch {
 	case strings.EqualFold(ps.parent.PartitionMethod, "RANGE"):
-		return true
+		// The plain Append emits ps.parts in order, so they must be in
+		// bound order — PartitionDesc order, which partitionDescOrder may
+		// have left undecided (rangePartsAscending, slice 10).
+		return rangePartsAscending(ps)
 	case strings.EqualFold(ps.parent.PartitionMethod, "LIST"):
 		return listPartitionsOrdered(ps)
 	}
 	return false
+}
+
+// stripPinnedPathkeys drops the leading pathkeys on constant-pinned columns
+// (pathkey_is_redundant): an index on (b, a) under `b = true` delivers the
+// ordering a.
+func stripPinnedPathkeys(keys []PathKey, pinned map[string]bool) []PathKey {
+	for len(keys) > 0 {
+		c, ok := keys[0].Expr.(*ColumnRef)
+		if !ok || !pinned[strings.ToLower(c.Name)] {
+			break
+		}
+		keys = keys[1:]
+	}
+	return keys
+}
+
+// rangePartsAscending reports whether a RANGE table's partitions, in
+// ps.parts order, have strictly ascending lower bounds (MINVALUE lowest,
+// MAXVALUE highest, compared column by column with the key types). An
+// uncomparable value declines.
+func rangePartsAscending(ps *partScheme) bool {
+	kinds := make([]boundKind, len(ps.keyPos))
+	for i := range kinds {
+		kinds[i] = partitionKeyBoundKind(ps.parent, i)
+	}
+	flag := func(f []bool, i int) bool { return i < len(f) && f[i] }
+	// cmp compares two lower bounds: -1, 0, +1; ok=false if undecidable.
+	cmp := func(a, b catalog.PartitionBound) (int, bool) {
+		if len(a.FromValues) != len(kinds) || len(b.FromValues) != len(kinds) {
+			return 0, false
+		}
+		for i := range kinds {
+			ra, rb := 0, 0 // -1 MINVALUE, +1 MAXVALUE, 0 a value
+			if flag(a.FromUnbounded, i) {
+				ra = -1
+				if flag(a.FromUnboundMax, i) {
+					ra = 1
+				}
+			}
+			if flag(b.FromUnbounded, i) {
+				rb = -1
+				if flag(b.FromUnboundMax, i) {
+					rb = 1
+				}
+			}
+			if ra != 0 || rb != 0 {
+				if ra != rb {
+					if ra < rb {
+						return -1, true
+					}
+					return 1, true
+				}
+				continue
+			}
+			c, ok := compareBoundValue(kinds[i], a.FromValues[i], b.FromValues[i])
+			if !ok {
+				return 0, false
+			}
+			if c != 0 {
+				return c, true
+			}
+		}
+		return 0, true
+	}
+	for j := 1; j < len(ps.parts); j++ {
+		a, ok1 := ownPartitionBound(ps.parts[j-1])
+		b, ok2 := ownPartitionBound(ps.parts[j])
+		if !ok1 || !ok2 {
+			return false
+		}
+		if c, ok := cmp(a, b); !ok || c >= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// constPinnedColumns is the set of (lower-cased) column names the restriction
+// pins to a single constant — `col = const` and match_boolean_index_clause's
+// bare boolean column / NOT col / IS TRUE / IS FALSE — the columns whose
+// equivalence class holds a constant (M0148-0001c3a10 slice 10).
+func constPinnedColumns(restriction Expr) map[string]bool {
+	if restriction == nil {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, conj := range flattenExprAnd(restriction) {
+		if name, _, ok := booleanIndexQual(conj); ok {
+			out[strings.ToLower(name)] = true
+			continue
+		}
+		bin, ok := conj.(*BinaryOp)
+		if !ok || bin.Op != parser.OpEq {
+			continue
+		}
+		cr, val, _, ok := normalizeColumnIndexKey(bin.Left, bin.Right)
+		if ok && cr.Name != "" && isConstExpr(val) {
+			out[strings.ToLower(cr.Name)] = true
+		}
+	}
+	return out
 }
 
 // listPartitionsOrdered is create_list_bounds' interleaved_parts test

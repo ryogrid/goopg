@@ -3532,6 +3532,10 @@ func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory,
 				keyStrs = append(keyStrs, d.StringValue())
 			case KindNumeric:
 				keyStrs = append(keyStrs, d.StringValue())
+			case KindBool:
+				// The bound text a boolean bound stores (exprToString):
+				// "false" < "true" lexically, which is bool's order.
+				keyStrs = append(keyStrs, partitionKeyDatumToListStr(d))
 			default:
 				if d.IsNull() {
 					keyStrs = append(keyStrs, "null")

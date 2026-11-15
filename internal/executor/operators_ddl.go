@@ -6553,6 +6553,16 @@ func exprToString(e parser.Expr) string {
 		return v.Value
 	case *parser.NullConst:
 		return "null"
+	case *parser.BooleanConst:
+		// A boolean partition bound (`FOR VALUES IN (true)`, `FROM (false,
+		// 0)`): the routing form is the text the router builds for a bool
+		// key (partitionKeyDatumToListStr), and pg_get_expr prints it as PG
+		// does. It fell through to %v and stored "&{68 false}", so no row of
+		// a boolean-keyed table could be routed (M0148-0001c3a10 slice 10).
+		if v.Value {
+			return "true"
+		}
+		return "false"
 	case *parser.PartitionRangeBoundKeyword:
 		// Unbounded RANGE edge. The raw routing form keeps the uppercase keyword
 		// as a sentinel string; the parallel FromUnbounded/ToUnbounded flags carry
