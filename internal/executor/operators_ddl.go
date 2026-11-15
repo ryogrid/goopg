@@ -20718,7 +20718,16 @@ func resyncTableClassHeapRowForIndexSet(ctx *Context, tbl *catalog.Table) error 
 // docs/design/wal-native-pg-format/04-*). The name is retained to avoid
 // churning ~24 call sites.
 func writeHeapRowCanonical(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) (storage.ItemPointer, error) {
-	return writeHeapRowReturningPG(ctx, rel, cols, row)
+	tid, err := writeHeapRowReturningPG(ctx, rel, cols, row)
+	if err != nil {
+		return tid, err
+	}
+	// M0149-0001g: CatalogIndexInsert for the catalogs whose indexes have no
+	// explicit inserter (sys_catalog_index_generic.go).
+	if err := maintainCatalogIndexes(ctx, rel, row, tid); err != nil {
+		return tid, err
+	}
+	return tid, nil
 }
 
 // execCreateTrigger registers a trigger on a table. M0096-0012.

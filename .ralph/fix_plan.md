@@ -11803,6 +11803,42 @@ verify each at HEAD when the task starts.
     - Next slice: bootstrap and maintain the 19 missing catalog indexes,
       starting with 2673 / 2674 \(pg\_depend\), 2664 and 2675.
     Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 2 \(committed with the slice-2 commit\):
+    - Generic CatalogIndexInsert: sys\_catalog\_index\_generic.go registers,
+      per catalog, the indexes no explicit inserter keeps. writeHeapRowCanonical
+      calls maintainCatalogIndexes after every write, and the split table
+      falls back to the registry for the layout.
+    - It covers 2606 \(2664 / 2665 / 2666 / 2667 / 2579\), 2611 \(2680 / 2187\),
+      1261 \(6303 / 2694 / 2695 / 6302\), 2619 \(2696\), 2964 \(2965\), 3381
+      \(3380 / 3379 / 3997\), 6106 \(6116\) and 2608 \(2673 / 2674\).
+    - Bootstrapped six missing indexes: 2673, 2674, 2187 and 2675 as empty
+      images over empty heaps; 2664 and 2579 built from the two bootstrap
+      pg\_constraint rows.
+    - Coverage audit after a 30-statement DDL workload \(constraints, FK,
+      domain, enum, range, inheritance, roles, GRANT, ALTER … SET, ANALYZE,
+      CREATE STATISTICS, publication, partitions\): every audited index covers
+      its heap. Before: 19 under-covered.
+    - PG 18.3 over goopg data: PRIMARY KEY / UNIQUE and COMMENT now work.
+    - Still failing on PG, all recorded here:
+      - FK needs 2702 pg\_trigger\_oid\_index; DROP needs 3597
+        pg\_seclabel\_object\_index \(remaining missing indexes: 2651 2652
+        2683 2699 2702 2756 2757 2996 3257 3258 3395 3455 3597\).
+      - obj\_description fails because pg\_proc prosrc is the placeholder
+        "see system\_functions.sql".
+      - `ORDER BY conname` fails with "could not determine which collation":
+        name columns lack attcollation 950.
+      - DROP … CASCADE of a goopg-created table warns "unexpected pg\_constraint
+        record".
+      - PG rejects goopg's catalog FSM forks \(1247 / 1249 / 1259 / 2606 /
+        2608 / 2610 / 2618\).
+      - pg\_enum: "could not find tuple for opclass 10012".
+      - pg\_ts\_template\_tmplname\_index 3766: "contains corrupted page at
+        block 0".
+    - Gates: units, postmaster, testport interop set, regress A/B over 16
+      constraint / FK / domain / inherit / stats / privilege / publication
+      cases \(no movement\), spotcheck. sf025 and acceptance are blocked by
+      the nightly batch \(01:15–\) and are re-run before the commit.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

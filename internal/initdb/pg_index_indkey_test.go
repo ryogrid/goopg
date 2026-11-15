@@ -142,6 +142,13 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		1232: {1, 2, 3, 4}, // pg_shdepend_depender_index : btree(dbid, classid, objid, objsubid)
 		1233: {5, 6},       // pg_shdepend_reference_index : btree(refclassid, refobjid)
 		2397: {1, 2},       // pg_shdescription_o_c_index : btree(objoid, classoid) UNIQUE PRIMARY
+		// M0149-0001g: indexes the bootstrap image lacked (indkey from PG 18.3).
+		2187: {2},       // pg_inherits_parent_index : btree(inhparent)
+		2673: {1, 2, 3}, // pg_depend_depender_index : btree(classid, objid, objsubid)
+		2674: {4, 5, 6}, // pg_depend_reference_index : btree(refclassid, refobjid, refobjsubid)
+		2675: {1, 2, 3}, // pg_description_o_c_o_index : btree(objoid, classoid, objsubid) UNIQUE PRIMARY
+		2664: {2, 3},    // pg_constraint_conname_nsp_index : btree(conname, connamespace)
+		2579: {12},      // pg_constraint_conparentid_index : btree(conparentid)
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {

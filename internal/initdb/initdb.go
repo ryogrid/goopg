@@ -1482,6 +1482,13 @@ func Init(opts Options) error {
 	if err := bootstrapPgConstraintRelidTypidNameIndex(abs, pgConstraintTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_constraint_relid_typid_name_index: %w", err)
 	}
+	// M0149-0001g: the two pg_constraint indexes the image lacked.
+	if err := bootstrapPgConstraintConnameNspIndex(abs, pgConstraintTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_constraint_conname_nsp_index: %w", err)
+	}
+	if err := bootstrapPgConstraintConparentidIndex(abs, pgConstraintTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_constraint_conparentid_index: %w", err)
+	}
 	// M0106-0010 step 3w: write an empty heap page for every mapped local
 	// catalog that lacks a dedicated bootstrapper (pg_aggregate=2600,
 	// pg_type=1247, pg_namespace=2615, …). Without these files PG's
@@ -2249,6 +2256,12 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 	// files don't exist (load_critical_index in relcache.c).
 	btreePage = makeBtreeRootPage()
 	perDBIndexOIDs := []uint32{
+		// M0149-0001g: indexes over catalogs that are empty at initdb
+		// (pg_depend, pg_inherits, pg_description); goopg maintains them
+		// at runtime (sys_catalog_index_generic.go).
+		2673, 2674, // pg_depend_depender_index, pg_depend_reference_index
+		2187,       // pg_inherits_parent_index
+		2675,       // pg_description_o_c_o_index
 		// Local critical indexes
 		827,  // pg_default_acl_role_nsp_obj_index (Step 3al)
 		828,  // pg_default_acl_oid_index (Step 3am)
@@ -5242,6 +5255,14 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		entry(2656, 2604, []int16{2, 3}, []uint32{oidOps, int2Ops}, []uint32{0, 0}, true, false), // pg_attrdef_adrelid_adnum_index (UNIQUE, not PKEY)
 		entry(2657, 2604, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                 // pg_attrdef_oid_index (UNIQUE PRIMARY)
 		entry(2680, 2611, []int16{1, 3}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true),                          // pg_inherits_relid_seqno_index
+		// M0149-0001g: the six indexes the bootstrap image lacked (keys and
+		// uniqueness checked against a PG 18.3 initdb).
+		entry(2187, 2611, []int16{2}, []uint32{oidOps}, []uint32{0}, false, false),                                                   // pg_inherits_parent_index
+		entry(2673, 2608, []int16{1, 2, 3}, []uint32{oidOps, oidOps, int4Ops}, []uint32{0, 0, 0}, false, false),                      // pg_depend_depender_index
+		entry(2674, 2608, []int16{4, 5, 6}, []uint32{oidOps, oidOps, int4Ops}, []uint32{0, 0, 0}, false, false),                      // pg_depend_reference_index
+		entry(2675, 2609, []int16{1, 2, 3}, []uint32{oidOps, oidOps, int4Ops}, []uint32{0, 0, 0}, true, true),                        // pg_description_o_c_o_index
+		entry(2664, 2606, []int16{2, 3}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, false, false),                           // pg_constraint_conname_nsp_index
+		entry(2579, 2606, []int16{12}, []uint32{oidOps}, []uint32{0}, false, false),                                                  // pg_constraint_conparentid_index
 		// pg_namespace columns (PG18, pg_namespace.h): 1=oid, 2=nspname,
 		// 3=nspowner, 4=nspacl. PG18 indexing.h:
 		//   NamespaceNameIndexId = 2684 = pg_namespace_nspname_index

@@ -863,6 +863,13 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	{OID: 2656, Name: "pg_attrdef_adrelid_adnum_index"},
 	{OID: 2657, Name: "pg_attrdef_oid_index"},
 	{OID: 2680, Name: "pg_inherits_relid_seqno_index"},
+	// M0149-0001g: indexes the bootstrap image lacked.
+	{OID: 2187, Name: "pg_inherits_parent_index"},
+	{OID: 2673, Name: "pg_depend_depender_index"},
+	{OID: 2674, Name: "pg_depend_reference_index"},
+	{OID: 2675, Name: "pg_description_o_c_o_index"},
+	{OID: 2664, Name: "pg_constraint_conname_nsp_index"},
+	{OID: 2579, Name: "pg_constraint_conparentid_index"},
 	// M0106-0010 batched-36 loop 5: pg_namespace_nspname_index (OID 2684)
 	// is a 1-column UNIQUE btree on pg_namespace.nspname (name_ops) — same
 	// shape as pg_authid_rolname_index (Step 3dg) and pg_database_datname_index

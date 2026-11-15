@@ -479,6 +479,32 @@ Key observation: PG compatibility constrains only the **displayed** and
   - 29 missing TOAST relations;
   - goopg's catalog FSM forks, which PG rejects as invalid pages.
 
+## Follow\-up: M0149\-0001g slice 2 — generic catalog\-index maintenance \(2026\-11\-16\)
+
+- PG inserts every catalog row into every index of its catalog
+  \(`CatalogTupleInsert` → `CatalogIndexInsert`\). goopg had one hand\-written
+  inserter per index, and some catalogs had none.
+- An audit after a DDL workload found 19 indexes missing rows that goopg
+  had written, across pg\_constraint, pg\_inherits, pg\_auth\_members,
+  pg\_statistic, pg\_db\_role\_setting, pg\_statistic\_ext and
+  pg\_publication\_rel.
+- `sys_catalog_index_generic.go` now records, per catalog, the indexes no
+  explicit inserter keeps: key column positions and fixed\-width key types,
+  laid out by `att_align_nominal`.
+  - `writeHeapRowCanonical` inserts every new catalog row into those
+    indexes.
+  - The system\-btree split code reads the tuple layout from the same
+    registry.
+- Six indexes missing from the image were bootstrapped: pg\_depend 2673 and
+  2674, pg\_inherits 2187, pg\_description 2675, and pg\_constraint 2664
+  and 2579.
+- Remaining work, recorded under M0149\-0001g:
+  - 13 missing indexes;
+  - descriptor fixes;
+  - the TOAST relations and FSM forks;
+  - the obj\_description source text;
+  - the pg\_enum opclass and the pg\_ts\_template index image.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

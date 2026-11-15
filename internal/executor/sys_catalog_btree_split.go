@@ -221,6 +221,12 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 		pgAttributeRelidAttnamIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 2}, true
 	default:
+		// M0149-0001g: indexes kept by the generic catalog-index maintenance
+		// (sys_catalog_index_generic.go) carry their layout in the registry.
+		if d, ok := catalogIndexDefByOID[indexOID]; ok {
+			_, size := catKeyLayout(d.keys)
+			return btreeIndexKeyMeta{tupleSize: size, nkeyatts: uint16(len(d.keys))}, true
+		}
 		return btreeIndexKeyMeta{}, false
 	}
 }
