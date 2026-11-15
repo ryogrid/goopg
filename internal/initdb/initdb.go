@@ -1091,6 +1091,11 @@ func Init(opts Options) error {
 	if err := bootstrapPgAuthidIndexes(abs, pgAuthidEntries); err != nil {
 		return fmt.Errorf("goopg init: pg_authid indexes: %w", err)
 	}
+	// M0149-0001g slice 10: the three predefined-role memberships a PG initdb
+	// grants to pg_monitor (system_functions.sql), with their four indexes.
+	if err := bootstrapPgAuthMembers(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_auth_members: %w", err)
+	}
 	// M0106-0010 batched-12: overwrite the empty placeholder at global/1213
 	// with two pg_tablespace rows (pg_default OID 1663, pg_global OID 1664)
 	// and populate the oid-index (global/2697) and spcname-index (global/2698)
@@ -6727,10 +6732,45 @@ func writeMultiPageHeapRows(dataDir, relFile string, cols []catalog.Column, rows
 // VARATT_IS_EXTERNAL (postgres/src/backend/access/common/heaptuple.c:343); it
 // is what tells heap_delete/heap_update that the tuple owns toast chunks.
 func writeMultiPageHeapRowsExternal(dataDir, relFile string, cols []catalog.Column, rows []executor.Row, external []bool) ([]heapTID, error) {
+	raw, tids, err := buildMultiPageHeapFile(relFile, cols, rows, external)
+	if err != nil {
+		return nil, err
+	}
+	b1 := filepath.Join(dataDir, "base", "1")
+	if err := os.WriteFile(filepath.Join(b1, relFile), raw, 0o600); err != nil {
+		return nil, err
+	}
+	b5 := filepath.Join(dataDir, "base", "5")
+	if err := os.MkdirAll(b5, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(filepath.Join(b5, relFile), raw, 0o600); err != nil {
+		return nil, err
+	}
+	return tids, nil
+}
+
+// writeSharedHeapRows is writeMultiPageHeapRows for a SHARED catalog: the one
+// copy lives in global/ (M0149-0001g slice 10, pg_auth_members).
+func writeSharedHeapRows(dataDir, relFile string, cols []catalog.Column, rows []executor.Row) ([]heapTID, error) {
+	raw, tids, err := buildMultiPageHeapFile(relFile, cols, rows, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "global", relFile), raw, 0o600); err != nil {
+		return nil, err
+	}
+	return tids, nil
+}
+
+// buildMultiPageHeapFile encodes rows as PG heap tuples (xmin 1, frozen by
+// FrozenTransactionId semantics at bootstrap) over as many 8 KiB pages as
+// needed, returning the file image and each row's TID.
+func buildMultiPageHeapFile(relFile string, cols []catalog.Column, rows []executor.Row, external []bool) ([]byte, []heapTID, error) {
 	var pages [][]byte
 	page := make(storage.Page, storage.BlockSize)
 	if err := storage.InitPage(page); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	tids := make([]heapTID, 0, len(rows))
 	// review/260831 IN-8: loop invariant, see writeMultiPageHeap.
@@ -6738,7 +6778,7 @@ func writeMultiPageHeapRowsExternal(dataDir, relFile string, cols []catalog.Colu
 	for i, row := range rows {
 		payload, err := executor.EncodeRowPG(cols, row)
 		if err != nil {
-			return nil, fmt.Errorf("encode %s row: %w", relFile, err)
+			return nil, nil, fmt.Errorf("encode %s row: %w", relFile, err)
 		}
 		bitmap := executor.NullBitmapPG(row)
 		var tuple storage.HeapTuple
@@ -6759,11 +6799,11 @@ func writeMultiPageHeapRowsExternal(dataDir, relFile string, cols []catalog.Colu
 			pages = append(pages, page)
 			page = make(storage.Page, storage.BlockSize)
 			if err := storage.InitPage(page); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			off, err = storage.PageAddHeapTuple(page, tuple)
 			if err != nil {
-				return nil, fmt.Errorf("add %s tuple on fresh page: %w", relFile, err)
+				return nil, nil, fmt.Errorf("add %s tuple on fresh page: %w", relFile, err)
 			}
 		}
 		tids = append(tids, heapTID{Block: uint32(len(pages)), Offset: off})
@@ -6773,18 +6813,7 @@ func writeMultiPageHeapRowsExternal(dataDir, relFile string, cols []catalog.Colu
 	for _, p := range pages {
 		raw = append(raw, p...)
 	}
-	b1 := filepath.Join(dataDir, "base", "1")
-	if err := os.WriteFile(filepath.Join(b1, relFile), raw, 0o600); err != nil {
-		return nil, err
-	}
-	b5 := filepath.Join(dataDir, "base", "5")
-	if err := os.MkdirAll(b5, 0o700); err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(filepath.Join(b5, relFile), raw, 0o600); err != nil {
-		return nil, err
-	}
-	return tids, nil
+	return raw, tids, nil
 }
 
 // pgCatalogTypeOID maps a goopg type name → PG type OID.
