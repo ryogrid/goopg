@@ -11636,7 +11636,7 @@ verify each at HEAD when the task starts.
       all-goopg PASS, 2/2 assertions each. Inventory row R-034 promoted to
       `port`; M0149-0001 closes with it.
     Movement: yes — tap 034\_create\_database assertions 3/4→4/4 \(all-goopg 2/2 + mixed 2/2\)
-- [ ] **M0149-0001c — per-database pg\_class heaps carry every shared catalog's row \(19 missing: pg\_shdepend, pg\_shdescription, shared TOAST\)**
+- [x] **M0149-0001c — per-database pg\_class heaps carry every shared catalog's row \(19 missing: pg\_shdepend, pg\_shdescription, shared TOAST\)**
   Kind: impl
   Parent: none
   - 2026-11-15 re-parented from M0149-0001: 034 does not need it \(the PG
@@ -11657,6 +11657,59 @@ verify each at HEAD when the task starts.
     copies.
   - Verification: on a fresh goopg cluster under a PG 18.3 cold start, `CREATE DATABASE` succeeds and the
     relisshared row set equals PG's \(46\).
+  - 2026-11-15 COMPLETE:
+    - initdb bootstraps pg\_shdepend \(1214, reltype 10060\) and
+      pg\_shdescription \(2396, reltype 10062\) as shared catalogs, with
+      their indexes 1232 / 1233 / 2397, plus the seven shared TOAST pairs
+      \(4177/4178, 2966/2967, 4060/4061, 2846/2847, 4183/4184, 4185/4186,
+      6244/6245\). Parents carry reltoastrelid.
+    - Each new relation gets its pg\_class / pg\_attribute / pg\_index rows
+      and its global/ file \(empty heap page, or btree metapage\).
+      `toastRelPair.Shared` routes shared pairs to global/.
+    - Also fixed: the placeholder list labelled 3592 as pg\_shdescription.
+      3592 is pg\_shseclabel, and global/2396 was never written.
+    - PG 18.3 cold start on a fresh goopg cluster: relisshared rows = 46 in
+      postgres and template1 \(PG: 46\). PG-side CREATE DATABASE succeeds
+      \(before: "could not open relation with OID 1214"\).
+    - Found: M0149-0001d \(S2\), M0149-0001e and M0149-0001f, filed below.
+    - Gates: units, postmaster, testport interop / Recovery / pg\_dump /
+      subscription / pgoutput / template1 / CREATE DATABASE, spotcheck,
+      sf025 99.
+    Movement: none — C3 cold-start finding \(no TAP assertion moved\)
+- [ ] **M0149-0001d — PG 18.3 inserts into goopg-bootstrapped pg\_database indexes are unreachable: a PG-created database cannot be connected to** \(filed 2026-11-15 by the loop; S2 — catalog corruption on the PG side of a mixed setup\)
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026-11-15 \(S2\) — OWNER PLACEMENT NEEDED.** Filed under M0149 \(item-10 rank\); the loop continues
+    > in file order. A PG 18.3 node hosting a goopg-initialised directory cannot use a database it creates itself.
+  - Repro: fresh `goopg init`, start and stop goopg, copy the directory, start PG 18.3 on the copy, then
+    `CREATE DATABASE pgside` \(succeeds\). After that, `psql -d pgside` fails with FATAL "database \"pgside\" does not
+    exist". After a PG restart the error becomes FATAL "cache lookup failed for database 16408".
+    `SELECT … FROM pg_database WHERE datname='pgside'` finds the row with both seq and index scans disabled or
+    enabled, and base/16408 exists.
+  - Diagnosis so far: the backend's name lookup \(pg\_database\_datname\_index 2671\) and OID lookup
+    \(pg\_database\_oid\_index 2672, DATABASEOID syscache\) miss the PG-inserted tuple. Suspect the goopg-built btree
+    images for 2671 / 2672 \(bootstrapped leaf/meta layout\), or the shared relcache init file's index descriptors.
+  - PG: `GetDatabaseTuple` / `GetDatabaseTupleByOid` \(utils/init/postinit.c\) use these indexes once
+    criticalSharedRelcachesBuilt.
+  - First step: on the PG copy, run amcheck `bt_index_check` on 2671 / 2672 from a private PG build, or dump the
+    index pages with `pg_filedump`. Compare them with a PG-initdb'd 2671 after the same CREATE DATABASE.
+- [ ] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
+  Kind: impl
+  Parent: none
+  - Found 2026-11-15: PG 18.3 on a goopg directory answers `SELECT ctid FROM pg_database` with "column \"ctid\" does
+    not exist". goopg's bootstrap writes attnum > 0 rows only.
+  - PG: genbki / heap\_create\_with\_catalog writes the six system attributes \(attnum −1 … −6: ctid, xmin, cmin,
+    xmax, cmax, tableoid\) for every heap relation \(`heap.c` AddNewAttributeTuples, SysAtt\[\]\).
+  - First step: in bootstrapPgAttributeTuples, emit the six system rows for every relkind 'r' / 't' nailed
+    relation, then rebuild pg\_attribute's indexes. Verify `SELECT ctid, xmin FROM pg_database` on a PG cold start.
+- [ ] **M0149-0001f — goopg's own catalog does not expose pg\_shdepend / pg\_shdescription**
+  Kind: impl
+  Parent: none
+  - Found 2026-11-15: on goopg, `SELECT count(*) FROM pg_shdepend` returns 42P01 "relation \"pg\_shdepend\" does not
+    exist", although the on-disk catalog now exists \(M0149-0001c\). PG always has both relations.
+  - First step: register pg\_shdepend and pg\_shdescription as catalog tables backed by global/1214 and
+    global/2396. Then decide whether goopg records shared dependencies \(owner and ACL of databases, roles,
+    tablespaces: `shdepend.c`\).
 - [ ] **M0149-0002 — port recovery/t/036_truncated_dropped.pl**
   Kind: impl
   Parent: none

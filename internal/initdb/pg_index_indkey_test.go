@@ -130,6 +130,18 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		13465: {1, 2},     // pg_toast_13461_index : btree(chunk_id oid_ops, chunk_seq int4_ops) UNIQUE PRIMARY ← M0133-S3 (sql_implementation_info)
 		13470: {1, 2},     // pg_toast_13466_index : btree(chunk_id oid_ops, chunk_seq int4_ops) UNIQUE PRIMARY ← M0133-S3 (sql_parts)
 		13475: {1, 2},     // pg_toast_13471_index : btree(chunk_id oid_ops, chunk_seq int4_ops) UNIQUE PRIMARY ← M0133-S3 (sql_sizing)
+		// M0149-0001c: shared TOAST indexes and pg_shdepend / pg_shdescription's
+		// indexes (indkey checked against a PG 18.3 initdb).
+		4178: {1, 2},       // pg_toast_1262_index
+		2967: {1, 2},       // pg_toast_2964_index
+		4061: {1, 2},       // pg_toast_3592_index
+		2847: {1, 2},       // pg_toast_2396_index
+		4184: {1, 2},       // pg_toast_6100_index
+		4186: {1, 2},       // pg_toast_1213_index
+		6245: {1, 2},       // pg_toast_6243_index
+		1232: {1, 2, 3, 4}, // pg_shdepend_depender_index : btree(dbid, classid, objid, objsubid)
+		1233: {5, 6},       // pg_shdepend_reference_index : btree(refclassid, refobjid)
+		2397: {1, 2},       // pg_shdescription_o_c_index : btree(objoid, classoid) UNIQUE PRIMARY
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {

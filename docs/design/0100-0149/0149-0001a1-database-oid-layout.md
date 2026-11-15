@@ -397,6 +397,26 @@ Key observation: PG compatibility constrains only the **displayed** and
   - Hand\-run mixed 034, goopg steps then PG 18.3 crash recovery: A1 = 1,
     A2 = 0.
 
+## Follow\-up: M0149\-0001c — shared catalog rows \(2026\-11\-15\)
+
+- PG 18.3 on a goopg directory needs `pg_class` rows for every shared
+  relation. goopg had 27 of PG's 46.
+- The missing ones were:
+  - pg\_shdepend \(1214\) and its indexes 1232 and 1233;
+  - pg\_shdescription \(2396\) and its index 2397;
+  - the shared TOAST pairs of pg\_database, pg\_db\_role\_setting,
+    pg\_shseclabel, pg\_shdescription, pg\_subscription, pg\_tablespace and
+    pg\_parameter\_acl.
+- All of them are now bootstrapped:
+  - `nailedSharedRels` entries for the two catalogs;
+  - `toastRelPair.Shared` for the TOAST pairs, whose files go to
+    `global/`;
+  - `pg_index` entries and `global/` files for every new relation.
+- Measured: a PG cold start sees 46 shared rows, and PG\-side `CREATE
+  DATABASE` succeeds.
+- Connecting to a database created on the PG side then fails, because its
+  `pg_database` index entries cannot be found. Filed as M0149\-0001d.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

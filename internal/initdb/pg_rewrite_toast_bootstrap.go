@@ -82,6 +82,9 @@ type toastRelPair struct {
 	ToastRel uint32 // pg_class OID of the TOAST heap (relkind 't')
 	ToastIdx uint32 // pg_class OID of its UNIQUE btree (chunk_id, chunk_seq)
 	RelName  string // pg_toast_<Parent>; the index is <RelName>_index
+	// Shared marks the TOAST pair of a shared catalog: relisshared, files
+	// under global/ instead of base/<db>/ (M0149-0001c).
+	Shared bool
 }
 
 // nailedToastPairs returns every TOAST relation goopg bootstraps at initdb.
@@ -99,6 +102,18 @@ func nailedToastPairs() []toastRelPair {
 		{Parent: 13461, ToastRel: 13464, ToastIdx: 13465, RelName: "pg_toast_13461"}, // sql_implementation_info
 		{Parent: 13466, ToastRel: 13469, ToastIdx: 13470, RelName: "pg_toast_13466"}, // sql_parts
 		{Parent: 13471, ToastRel: 13474, ToastIdx: 13475, RelName: "pg_toast_13471"}, // sql_sizing
+		// M0149-0001c: the shared catalogs' DECLARE_TOAST_WITH_MACRO pairs
+		// (pg_database.h, pg_db_role_setting.h, pg_shseclabel.h,
+		// pg_shdescription.h, pg_subscription.h, pg_tablespace.h,
+		// pg_parameter_acl.h). Every database's pg_class carries their rows;
+		// the files are empty, as upstream's initdb leaves them.
+		{Parent: 1262, ToastRel: 4177, ToastIdx: 4178, RelName: "pg_toast_1262", Shared: true}, // pg_database
+		{Parent: 2964, ToastRel: 2966, ToastIdx: 2967, RelName: "pg_toast_2964", Shared: true}, // pg_db_role_setting
+		{Parent: 3592, ToastRel: 4060, ToastIdx: 4061, RelName: "pg_toast_3592", Shared: true}, // pg_shseclabel
+		{Parent: 2396, ToastRel: 2846, ToastIdx: 2847, RelName: "pg_toast_2396", Shared: true}, // pg_shdescription
+		{Parent: 6100, ToastRel: 4183, ToastIdx: 4184, RelName: "pg_toast_6100", Shared: true}, // pg_subscription
+		{Parent: 1213, ToastRel: 4185, ToastIdx: 4186, RelName: "pg_toast_1213", Shared: true}, // pg_tablespace
+		{Parent: 6243, ToastRel: 6244, ToastIdx: 6245, RelName: "pg_toast_6243", Shared: true}, // pg_parameter_acl
 	}
 }
 
@@ -116,7 +131,7 @@ func nailedToastRels() []nailedRel {
 		rels = append(rels,
 			nailedRel{
 				OID: p.ToastRel, RelName: p.RelName, RelType: 0,
-				RelKind: 't', RelNatts: 3, IsShared: false,
+				RelKind: 't', RelNatts: 3, IsShared: p.Shared,
 				Attrs: []nailedAttr{
 					{Name: "chunk_id", TypeOID: 26, Num: 1, Len: 4},
 					{Name: "chunk_seq", TypeOID: 23, Num: 2, Len: 4},
@@ -125,7 +140,7 @@ func nailedToastRels() []nailedRel {
 			},
 			nailedRel{
 				OID: p.ToastIdx, RelName: p.RelName + "_index", RelType: 0,
-				RelKind: 'i', RelNatts: 2, IsShared: false,
+				RelKind: 'i', RelNatts: 2, IsShared: p.Shared,
 				Attrs: []nailedAttr{
 					{Name: "chunk_id", TypeOID: 26, Num: 1, Len: 4},
 					{Name: "chunk_seq", TypeOID: 23, Num: 2, Len: 4},
@@ -248,8 +263,13 @@ func bootstrapToastRelationFiles(dataDir string, chunks []toastChunk) error {
 	for _, dir := range []string{
 		filepath.Join(dataDir, "base", "1"),
 		filepath.Join(dataDir, "base", "5"),
+		filepath.Join(dataDir, "global"),
 	} {
+		shared := filepath.Base(dir) == "global"
 		for _, p := range pairs {
+			if p.Shared != shared {
+				continue
+			}
 			heapPath := filepath.Join(dir, strconv.FormatUint(uint64(p.ToastRel), 10))
 			if err := os.WriteFile(heapPath, heapPage, 0o600); err != nil {
 				return fmt.Errorf("write toast heap %d: %w", p.ToastRel, err)

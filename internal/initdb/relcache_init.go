@@ -161,6 +161,16 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// setdatabase/setrole/setconfig). The empty 8 KiB heap at
 	// `global/2964` is produced by `bootstrapSharedCatalogPlaceholders`.
 	{2964, "pg_db_role_setting", 83, 'r', 3, true, pgDbRoleSettingAttrs()},
+	// M0149-0001c: pg_shdepend and pg_shdescription. Every database's pg_class
+	// carries a row for each shared catalog (genbki BKI_SHARED_RELATION); a
+	// PG 18.3 node reading a goopg directory opens both — CREATE DATABASE's
+	// copyTemplateDependencies scans pg_shdepend, COMMENT ON DATABASE and
+	// \l+ read pg_shdescription — and without the rows relation_open FATALs
+	// "could not open relation with OID 1214". Row types per
+	// pg_shdepend.h / pg_shdescription.h (PG 18.3: reltype 10060 / 10062,
+	// verified on a scratch initdb).
+	{1214, "pg_shdepend", 10060, 'r', 7, true, pgShdependAttrs()},
+	{2396, "pg_shdescription", 10062, 'r', 3, true, pgShdescriptionAttrs()},
 }, []idxSpec{
 	// M0106-0010 Step 3dh: pg_database_datname_index (OID 2671) is a
 	// 1-column UNIQUE btree on pg_database.datname (name_ops) — same
@@ -175,6 +185,10 @@ var nailedSharedRels = flattenRels([]nailedRel{
 		{Name: "datname", TypeOID: 19, Num: 1, Len: 64, NotNull: true},
 	}},
 	{OID: 2672, Name: "pg_database_oid_index"},
+	// M0149-0001c: pg_shdepend's two indexes and pg_shdescription's primary key.
+	{OID: 1232, Name: "pg_shdepend_depender_index"},
+	{OID: 1233, Name: "pg_shdepend_reference_index"},
+	{OID: 2397, Name: "pg_shdescription_o_c_index"},
 	// M0106-0010 Step 3dg: pg_authid_rolname_index (OID 2676) is a
 	// 1-column UNIQUE btree on pg_authid.rolname (name_ops). The
 	// default oid-stamped descriptor (attlen=4, attbyval=1) was wrong:
@@ -3570,6 +3584,29 @@ func pgDbRoleSettingAttrs() []nailedAttr {
 		{Name: "setdatabase", TypeOID: 26, Num: 1, Len: 4, NotNull: true},   // oid (0 ⇒ role-specific)
 		{Name: "setrole", TypeOID: 26, Num: 2, Len: 4, NotNull: true},       // oid (0 ⇒ database-specific)
 		{Name: "setconfig", TypeOID: 1009, Num: 3, Len: -1, NotNull: false}, // text[] (CATALOG_VARLEN, nullable)
+	}
+}
+
+// pgShdependAttrs is FormData_pg_shdepend (postgres/src/include/catalog/pg_shdepend.h).
+func pgShdependAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "dbid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
+		{Name: "classid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
+		{Name: "objid", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
+		{Name: "objsubid", TypeOID: 23, Num: 4, Len: 4, NotNull: true},
+		{Name: "refclassid", TypeOID: 26, Num: 5, Len: 4, NotNull: true},
+		{Name: "refobjid", TypeOID: 26, Num: 6, Len: 4, NotNull: true},
+		{Name: "deptype", TypeOID: 18, Num: 7, Len: 1, NotNull: true},
+	}
+}
+
+// pgShdescriptionAttrs is FormData_pg_shdescription
+// (postgres/src/include/catalog/pg_shdescription.h).
+func pgShdescriptionAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "objoid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
+		{Name: "classoid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
+		{Name: "description", TypeOID: 25, Num: 3, Len: -1, NotNull: true, Collation: 950},
 	}
 }
 

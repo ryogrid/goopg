@@ -1612,7 +1612,8 @@ func bootstrapSharedCatalogPlaceholders(dataDir string) error {
 		1262, // pg_database
 		1213, // pg_tablespace
 		1214, // pg_shdepend
-		3592, // pg_shdescription
+		2396, // pg_shdescription (M0149-0001c; was mislabeled 3592)
+		3592, // pg_shseclabel
 		6000, // pg_replication_origin
 		6100, // pg_subscription
 		6243, // pg_parameter_acl
@@ -2339,6 +2340,9 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		6001, // pg_replication_origin_roiident_index (Step 3ca)
 		6002, // pg_replication_origin_roname_index (Step 3ca)
 		2965, // pg_db_role_setting_databaseid_rol_index (Step 3cu)
+		1232, // pg_shdepend_depender_index (M0149-0001c)
+		1233, // pg_shdepend_reference_index (M0149-0001c)
+		2397, // pg_shdescription_o_c_index (M0149-0001c)
 		// Also copy all local critical indexes to global/
 		827,  // pg_default_acl_role_nsp_obj_index (Step 3al)
 		828,  // pg_default_acl_oid_index (Step 3am)
@@ -5156,6 +5160,20 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		entry(13460, 13459, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_13456_index
 		entry(13465, 13464, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_13461_index
 		entry(13470, 13469, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_13466_index
+		// M0149-0001c: the shared catalogs' TOAST indexes (same UNIQUE PRIMARY
+		// (chunk_id oid_ops, chunk_seq int4_ops) shape) and pg_shdepend /
+		// pg_shdescription's own indexes (pg_shdepend.h, pg_shdescription.h;
+		// indclass checked against a PG 18.3 initdb).
+		entry(4178, 4177, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_1262_index
+		entry(2967, 2966, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_2964_index
+		entry(4061, 4060, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_3592_index
+		entry(2847, 2846, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_2396_index
+		entry(4184, 4183, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_6100_index
+		entry(4186, 4185, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_1213_index
+		entry(6245, 6244, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_6243_index
+		entry(1232, 1214, []int16{1, 2, 3, 4}, []uint32{oidOps, oidOps, oidOps, int4Ops}, []uint32{0, 0, 0, 0}, false, false), // pg_shdepend_depender_index
+		entry(1233, 1214, []int16{5, 6}, []uint32{oidOps, oidOps}, []uint32{0, 0}, false, false),                               // pg_shdepend_reference_index
+		entry(2397, 2396, []int16{1, 2}, []uint32{oidOps, oidOps}, []uint32{0, 0}, true, true),                                 // pg_shdescription_o_c_index
 		entry(13475, 13474, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_13471_index
 		// pg_trigger columns (PG18, pg_trigger.h): 1=oid, 2=tgrelid,
 		// 3=tgparentid, 4=tgname. Index = btree(tgrelid, tgname).
