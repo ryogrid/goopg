@@ -409,3 +409,52 @@ func TestPartitionedUpsertSingleArbiterEntry(t *testing.T) {
 		}
 	}
 }
+
+// TestStarMergeAppendIndexOnlyChildren is M0148-0001c3a10 slice 7: `select *`
+// voids the statement-wide needed-column set, so the children of an
+// interleaved LIST table's Merge Append were Index Scans; the child's own
+// scan columns now stand in for the star (childNeededColumns) and PG 18.3's
+// Index Only Scans plan — while a statement that also reads `ctid` keeps the
+// Index Scans, and the merge carries each row's ctid (it returned NULL).
+func TestStarMergeAppendIndexOnlyChildren(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	for _, s := range []string{
+		"create table un (a int NOT NULL) partition by list (a)",
+		"create table un_1 partition of un for values in (1)",
+		"create table un_35 partition of un for values in (3, 5)",
+		"create table un_4 partition of un for values in (4)",
+		"create index on un (a)",
+		"insert into un select 1 + 2 * (i % 3) from generate_series(1, 3000) i",
+		"insert into un select 4 from generate_series(1, 1000) i",
+		"vacuum un_1", "vacuum un_35", "vacuum un_4",
+		"analyze un",
+	} {
+		runSQL(t, ctx, s)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	for _, c := range []struct{ q, plan string }{
+		{"select * from un order by a",
+			"Merge Append\n  Sort Key: un.a\n  ->  Index Only Scan using un_1_a_idx on un_1\n" +
+				"  ->  Index Only Scan using un_35_a_idx on un_35 un_2\n  ->  Index Only Scan using un_4_a_idx on un_4 un_3"},
+		{"select * from un order by a desc limit 3",
+			"Limit\n  ->  Merge Append\n        Sort Key: un.a DESC\n        ->  Index Only Scan Backward using un_1_a_idx on un_1\n" +
+				"        ->  Index Only Scan Backward using un_35_a_idx on un_35 un_2\n        ->  Index Only Scan Backward using un_4_a_idx on un_4 un_3"},
+		{"select *, ctid from un order by a limit 3",
+			"Limit\n  ->  Merge Append\n        Sort Key: un.a\n        ->  Index Scan using un_1_a_idx on un_1\n" +
+				"        ->  Index Scan using un_35_a_idx on un_35 un_2\n        ->  Index Scan using un_4_a_idx on un_4 un_3"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+	}
+	for _, c := range []struct{ q, rows string }{
+		{"select * from un order by a desc limit 2", "5;5"},
+		{"select count(*), sum(a) from (select * from un order by a) s", "4000|13000"},
+		{"select count(*) from (select a, ctid from un order by a limit 1500) s where ctid is not null", "1500"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}

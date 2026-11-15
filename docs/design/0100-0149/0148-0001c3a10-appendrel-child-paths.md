@@ -233,6 +233,41 @@ Status: slices 1\-3 landed 2026\-11\-15. Parent: M0148\-0001c3a5.
 - Restricted child rels are still sized from pg\_class until the boolean
   index\-only clause gap is closed.
 
+## Slice 7 — index\-only children under `select \*` \(landed\)
+
+- A bare `*` makes the statement\-wide needed\-column set untrustworthy
+  \(`neededColumnNames`\). The child rels of a `select * … order by a`
+  Merge Append therefore offered no index\-only path, and PG's Index Only
+  Scans planned as Index Scans \(regress inherit's mclparted\).
+- `addBareStarOnlyNeededColumns` \(pathindexonlyneed.go\): when the set is
+  unknown, the walk is retried with the bare `*` targets dropped and over
+  every pulled\-up body. If that walks, the set is published under
+  `neededBareStarOnlyKey`, with `neededColsKnown` still false. Consumers
+  that gate on `neededColsKnown` never read it.
+- `childNeededColumns` \(partitionwisejoin.go\): with the marker present, a
+  child rel needs every column its bare scan emits, plus any system column
+  the rest of the statement names.
+  - Every scan column must be covered, a superset of what the query reads,
+    so the path is offered only where it is sound.
+  - `select *, ctid` still declines.
+- Executor fix found while testing: the Merge Append \(`setOp.nextMerge`\)
+  emitted rows without their input slot's tid. A `ctid` read above it was
+  NULL — wrong results since slice 5. The merge now keeps each front row's
+  tid \(`mergeTID`\) and stamps it on the emitted slot.
+- Witnesses: mclparted and an interleaved LIST `un` table \(`select *`,
+  DESC LIMIT, `*, ctid`\) match PG 18.3 in plan and values.
+  `TestStarMergeAppendIndexOnlyChildren` pins them, including a ctid check
+  that fails without the executor fix.
+- Regress: inherit 705→679 in the same\-suite run, 690→664 standalone.
+
+### Not covered by slice 7
+
+- A non\-interleaved LIST table is partitions\_are\_ordered in PG, which
+  plans a plain Append, while goopg plans a Merge Append.
+- With `enable_indexscan = off`, goopg still prefers a disabled ordered
+  index path. This happens on plain tables too \(`select … from ud_1 order
+  by a limit 5`\); PG sorts a seq scan.
+
 ## Not covered
 
 - Multi\-relation problems: inside a join the Append's columns still reach

@@ -55,6 +55,11 @@ type setOp struct {
 	// M0141-S2b-4c: ordered merge (plan.MergeKeys). Each side's front row
 	// and its evaluated keys, and whether the side is exhausted.
 	mergeCur  [2]Row
+	// mergeTID is each front row's input-slot tid: the emitted row carries
+	// it, as a Merge Append's child tuple keeps its t_self, so a `ctid`
+	// read above the merge is the row's own (M0148-0001c3a10: the
+	// partition Merge Append returned NULL ctids).
+	mergeTID [2]queueTID
 	mergeKeys [2][]Datum
 	mergeLive [2]bool
 	mergeInit bool
@@ -199,11 +204,13 @@ func (o *setOp) nextMerge() (TupleSlot, error) {
 	default:
 		return nil, EOF
 	}
-	row := o.mergeCur[pick]
+	row, tid := o.mergeCur[pick], o.mergeTID[pick]
 	if err := o.mergeAdvance(pick); err != nil {
 		return nil, err
 	}
-	return SlotFromRow(o.plan.Output(), row), nil
+	out := SlotFromRow(o.plan.Output(), row)
+	tid.stamp(out)
+	return out, nil
 }
 
 // mergeAdvance pulls side's next row, copying it out of the child's reused
@@ -229,7 +236,8 @@ func (o *setOp) mergeAdvance(side int) error {
 	// slot's carried tid, so a `ctid` key does not read NULL (M0146-0052).
 	keyView := &o.mergeKeySlot
 	keyView.row = row
-	slotQueueTID(slot).stamp(keyView)
+	o.mergeTID[side] = slotQueueTID(slot)
+	o.mergeTID[side].stamp(keyView)
 	keys := make([]Datum, len(o.plan.MergeKeys))
 	for i, k := range o.plan.MergeKeys {
 		v, kerr := evalSortKeyValueSlot(k.Expr, keyView, o.ctx)

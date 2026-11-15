@@ -13207,6 +13207,18 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
       Only Scan children\); restricted child sizing after the boolean
       index-only clause gap \(bool\_rp\); LIST partitions\_are\_ordered;
       joins.
+  - 2026-11-15 slice 7 LANDED: the child's full index-only scan already
+    carried ordering. The real gap was that a bare `*` voided the needed
+    set. addBareStarOnlyNeededColumns plus childNeededColumns let child rels
+    plan PG's Index Only Scans under `select *`.
+    - Gate finding, fixed in the same commit: the Merge Append dropped each
+      row's tid, so `ctid` read NULL above it \(wrong results since slice
+      5\); setOp.mergeTID carries it.
+    Movement: yes — regress inherit 690→664 \(inventory re-measured on this
+    build; same-suite A/B 705→679\); other cases unchanged \(join flap\)
+    - Resume: LIST partitions\_are\_ordered \(plain Append\); boolean
+      index-only clause then restricted child sizing \(bool\_rp\);
+      disabled-node choice under LIMIT; joins.
 - [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
   (NULL-keyed entries)**.
   Kind: impl

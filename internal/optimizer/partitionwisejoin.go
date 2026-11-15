@@ -218,6 +218,57 @@ func membersCarryFilters(so *SetOp) bool {
 	return false
 }
 
+// childNeededColumns is check_index_only's attrs_used for a child rel. With a
+// trustworthy statement-wide needed set it is that set read under the
+// member's alias (neededColumnsOfRel). A bare `*` makes the statement-wide
+// set untrustworthy (neededColumnNames), where PG's attr_needed is every
+// column the star expands to: the child's own bare scan columns stand in —
+// every column it emits must be covered, a superset of what the query reads,
+// so an index-only path is offered only where it is certainly sound. A scan
+// column that is not one of the table's (a system column) is carried as is
+// and is never covered, so the producer declines (M0148-0001c3a10 slice 7,
+// regress inherit's `select * from mclparted order by a`).
+func (s *searchCtx) childNeededColumns(rel *RelOptInfo, tbl *catalog.Table) []catalog.Column {
+	if s.neededColsKnown {
+		return s.neededColumnsOfRel(rel, tbl)
+	}
+	// Only when the set is unknown solely through bare `*` targets
+	// (addBareStarOnlyNeededColumns): the map then still names every other
+	// column read, so a system column the statement reads (`select *,
+	// ctid`) is seen and declines the index-only path.
+	if !s.neededCols[neededBareStarOnlyKey] {
+		return nil
+	}
+	scan := leafBaseScan(memberScanRoot(rel.baseLeaf))
+	if scan == nil {
+		return nil
+	}
+	out := make([]catalog.Column, 0, len(tbl.Columns))
+	for _, sc := range scan.Output() {
+		found := false
+		for _, c := range tbl.Columns {
+			if strings.EqualFold(c.Name, sc.Name) {
+				out = append(out, c)
+				found = true
+				break
+			}
+		}
+		if !found {
+			out = append(out, catalog.Column{Name: sc.Name})
+		}
+	}
+	// The system columns the rest of the statement reads (neededColumnsOfRel
+	// appends them as never-covered entries).
+	for _, c := range s.neededColumnsOfRel(rel, tbl) {
+		for _, sys := range heapSystemColumnNames {
+			if c.Name == sys {
+				out = append(out, c)
+			}
+		}
+	}
+	return out
+}
+
 // childRelTuples is the tuple count the child producers price with. An
 // unrestricted child (slice 6: an ordering-only child rel) takes PG's
 // estimate_rel_size (childScanRows). A restricted one keeps the pg_class
@@ -271,8 +322,10 @@ func (s *searchCtx) addChildIndexPaths(rel *RelOptInfo, tbl *catalog.Table) {
 	// The index-only arm (check_index_only on the child): the parent's
 	// needed columns, read under the member's alias, against the child
 	// table — a partition carries the parent's column names. Run before the
-	// other producers turn the statement-wide set off below.
-	if s.neededColsKnown && !indexOnlyHardDisabled(s.cat) {
+	// other producers turn the statement-wide set off below. Without a
+	// trustworthy statement-wide set (a bare `*`), the child's own scan
+	// columns stand in (childNeededColumns).
+	if !indexOnlyHardDisabled(s.cat) {
 		s.addChildIndexOnlyPaths(rel, tbl, colExprs, relPages, relTuples, totalPages)
 	}
 	saved := s.neededColsKnown
@@ -836,7 +889,7 @@ func (s *searchCtx) addChildIndexOnlyPaths(rel *RelOptInfo, tbl *catalog.Table, 
 			return
 		}
 	}
-	needed := s.neededColumnsOfRel(rel, tbl)
+	needed := s.childNeededColumns(rel, tbl)
 	if len(needed) == 0 {
 		return
 	}
