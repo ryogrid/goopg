@@ -11911,6 +11911,25 @@ verify each at HEAD when the task starts.
     - Gates: units, postmaster, testport interop set ×3 \(failover,
       standby full cycle, crash start, recovery 034, pg\_dump\), spotcheck.
     Movement: none — C3 cold-start fix
+  - 2026-11-16 slice 6: pg\_ts\_template indexes 3766 / 3767 are btrees again.
+    - Cause: bootstrapPostgresDatabase wrote empty btree pages for them.
+      bootstrapMappedLocalCatalogHeaps, which runs later, overwrote both with
+      HEAP pages because they were in mappedLocalCatalogPlaceholderOIDs.
+      PG's \_bt\_checkpage then reported "contains corrupted page at block 0".
+    - Removed them, and the shared pg\_parameter\_acl TOAST index 6245
+      \(mislabelled as a local catalog\), from the heap\-placeholder list.
+    - New guard: TestMappedLocalCatalogPlaceholdersAreNotIndexes rejects any
+      bootstrap index OID in that list.
+    - TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages had pinned the
+      bug; its list was corrected.
+    - PG 18.3 cold start: an Index Scan on pg\_ts\_template\_oid\_index works.
+      With only pg\_enum's index hidden, database\-wide VACUUM completes.
+    - The last VACUUM blocker is "could not find tuple for opclass 10012".
+      10012 is PG's real btree float4\_ops OID, so the gap is goopg's
+      pg\_opclass heap or its index 2687.
+    - Gates: units, initdb, postmaster, testport interop set, spotcheck,
+      sf025 99, acceptance 24 MATCH.
+    Movement: none — C3 cold-start fix
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

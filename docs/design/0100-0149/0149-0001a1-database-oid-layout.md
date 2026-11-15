@@ -540,6 +540,15 @@ Key observation: PG compatibility constrains only the **displayed** and
 - goopg's own SQL\-level pg\_class \(catalog virtual rows\) still reports 0/1
   for every relkind; that view is not read by PG.
 
+## Follow\-up: M0149\-0001g slice 6 — heap placeholders must not name indexes \(2026\-11\-16\)
+
+- `bootstrapMappedLocalCatalogHeaps` writes an empty heap page for every
+  OID in `mappedLocalCatalogPlaceholderOIDs`. It runs after
+  `bootstrapPostgresDatabase` has laid down the catalog btrees, so an index
+  OID in that list silently turns a btree into a heap page.
+- 3766 and 3767 \(pg\_ts\_template\) were in the list. They have been removed
+  and a unit test now rejects any bootstrap index OID there.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

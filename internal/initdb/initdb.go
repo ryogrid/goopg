@@ -1733,9 +1733,7 @@ func mappedLocalCatalogPlaceholderOIDs() []uint32 {
 		3603, // pg_ts_config_map (M0106-0010 step 3cj)
 		3765, // pg_ts_config_map (stale — true pg_ts_config_map OID is 3603)
 		3600, // pg_ts_dict (M0106-0010 step 3cm)
-		3766, // pg_ts_template_tmplname_index — overwritten with btree root below
 		3601, // pg_ts_parser (M0106-0010 step 3cn)
-		3767, // pg_ts_template_oid_index — overwritten with btree root below
 		3764, // pg_ts_template (M0106-0010 step 3co)
 		3768, // pg_ts_template (stale — true pg_ts_template OID is 3764)
 		3466, // pg_event_trigger (M0106-0010 step 3ar)
@@ -1755,8 +1753,13 @@ func mappedLocalCatalogPlaceholderOIDs() []uint32 {
 		6101, // pg_publication_rel
 		6102, // pg_subscription_rel
 		6137, // pg_transform (stale — true pg_transform OID is 3576)
-		6245, // pg_statistic_ext_data
 		9400, // pg_db_role_setting
+		// M0149-0001g slice 6: never list an index OID here — this runs after
+		// bootstrapPostgresDatabase and would overwrite its btree page with a
+		// heap page. 3766/3767 (pg_ts_template indexes) were listed and PG
+		// failed _bt_checkpage on them; 6245 is the SHARED pg_parameter_acl
+		// TOAST index (global/), not a local catalog.
+		// (TestMappedLocalCatalogPlaceholdersAreNotIndexes)
 	}
 }
 

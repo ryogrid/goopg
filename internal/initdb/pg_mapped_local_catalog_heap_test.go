@@ -57,9 +57,9 @@ func TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages(t *testing.T) {
 		3601, // pg_ts_parser (M0106-0010 step 3cn)
 		3602, // pg_ts_config (M0106-0010 step 3ck)
 		3603, // pg_ts_config_map (M0106-0010 step 3cj)
-		3764, 3765, 3766, 3767, 3768,
+		3764, 3765, 3768, // 3766/3767 are pg_ts_template's btree indexes (M0149-0001g slice 6)
 		6003, 6101, 6102, 6104, 6106, 6137, 6237,
-		6245, 9400,
+		9400, // 6245 is the shared pg_parameter_acl TOAST index, not a local heap
 	}
 
 	for _, db := range []string{"base/1", "base/5"} {
