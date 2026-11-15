@@ -409,7 +409,7 @@ func (m *advisoryManager) PgLockRows() [][]string {
 		}
 		rows = append(rows, []string{
 			"advisory", // locktype
-			"16384",    // database
+			fmt.Sprintf("%d", catalog.PostgresDBOid), // database (postgres, M0149-0001a1 S2)
 			"",         // relation
 			"",         // page
 			"",         // tuple

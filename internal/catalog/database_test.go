@@ -111,10 +111,7 @@ func TestPgDatabaseVirtualRowsEnumeratesRegistry(t *testing.T) {
 // pg_database.oid, so two CREATE DATABASE calls were indistinguishable by
 // oid — a real bug (pg_database.oid is a primary key in upstream PG) and the
 // blocking prerequisite for ever allocating a real base/<dbOid> directory.
-// The live "postgres" row must keep its pre-existing placeholder unchanged
-// (CREATE SUBSCRIPTION's subdbid / datacl heap resync depend on it — see the
-// VirtualRows doc comment), so only newly created, non-bootstrap databases
-// are expected to diverge.
+// The live "postgres" row displays PostgresDBOid (5), as PG does.
 func TestCreateDatabaseAllocatesDistinctDisplayedOid(t *testing.T) {
 	c := NewInMemory()
 	oidA, err := c.CreateDatabase("dba", BootstrapSuperuserOID)
@@ -159,11 +156,10 @@ func TestCreateDatabaseAllocatesDistinctDisplayedOid(t *testing.T) {
 	if byName["dba"] == byName["dbb"] {
 		t.Errorf("dba and dbb rendered the same pg_database.oid %q — must be distinct", byName["dba"])
 	}
-	// The live "postgres" row's displayed oid is unchanged by this slice
-	// (still the legacy 16384 placeholder — see the VirtualRows doc comment
-	// on why it must not diverge).
-	if byName["postgres"] != "16384" {
-		t.Errorf("pg_database.oid for postgres = %q, want unchanged placeholder 16384", byName["postgres"])
+	// The live "postgres" row displays PG's oid 5 (M0149-0001a1 S2; it was
+	// the legacy 16384 placeholder).
+	if byName["postgres"] != "5" {
+		t.Errorf("pg_database.oid for postgres = %q, want 5 (PostgresDBOid)", byName["postgres"])
 	}
 }
 
@@ -259,11 +255,11 @@ func TestPgDatabaseExposesFrozenXidColumns(t *testing.T) {
 // duplicate. M0119-0004-ACLHEAP (ALTER DATABASE ... SET follow-up).
 func TestSetDatabaseConfigUpsertsInPlace(t *testing.T) {
 	c := NewInMemory()
-	c.SetDatabaseConfig(FirstUserOID, "work_mem", "64MB")
-	c.SetDatabaseConfig(FirstUserOID, "search_path", "public")
-	c.SetDatabaseConfig(FirstUserOID, "work_mem", "128MB")
+	c.SetDatabaseConfig(PostgresDBOid, "work_mem", "64MB")
+	c.SetDatabaseConfig(PostgresDBOid, "search_path", "public")
+	c.SetDatabaseConfig(PostgresDBOid, "work_mem", "128MB")
 
-	got := c.DatabaseConfigEntries(FirstUserOID)
+	got := c.DatabaseConfigEntries(PostgresDBOid)
 	want := []string{"work_mem=128MB", "search_path=public"}
 	if len(got) != len(want) {
 		t.Fatalf("DatabaseConfigEntries = %v, want %v", got, want)
@@ -280,9 +276,9 @@ func TestSetDatabaseConfigUpsertsInPlace(t *testing.T) {
 // replaces in place.
 func TestSetDatabaseConfigNameIsCaseInsensitive(t *testing.T) {
 	c := NewInMemory()
-	c.SetDatabaseConfig(FirstUserOID, "Work_Mem", "64MB")
-	c.SetDatabaseConfig(FirstUserOID, "work_mem", "128MB")
-	got := c.DatabaseConfigEntries(FirstUserOID)
+	c.SetDatabaseConfig(PostgresDBOid, "Work_Mem", "64MB")
+	c.SetDatabaseConfig(PostgresDBOid, "work_mem", "128MB")
+	got := c.DatabaseConfigEntries(PostgresDBOid)
 	if len(got) != 1 || got[0] != "work_mem=128MB" {
 		t.Errorf("DatabaseConfigEntries = %v, want [\"work_mem=128MB\"]", got)
 	}
@@ -292,16 +288,16 @@ func TestSetDatabaseConfigNameIsCaseInsensitive(t *testing.T) {
 // the matching entry, leaving sibling overrides untouched.
 func TestResetDatabaseConfigRemovesOnlyNamedEntry(t *testing.T) {
 	c := NewInMemory()
-	c.SetDatabaseConfig(FirstUserOID, "work_mem", "64MB")
-	c.SetDatabaseConfig(FirstUserOID, "search_path", "public")
-	c.ResetDatabaseConfig(FirstUserOID, "work_mem")
-	got := c.DatabaseConfigEntries(FirstUserOID)
+	c.SetDatabaseConfig(PostgresDBOid, "work_mem", "64MB")
+	c.SetDatabaseConfig(PostgresDBOid, "search_path", "public")
+	c.ResetDatabaseConfig(PostgresDBOid, "work_mem")
+	got := c.DatabaseConfigEntries(PostgresDBOid)
 	if len(got) != 1 || got[0] != "search_path=public" {
 		t.Errorf("DatabaseConfigEntries after reset = %v, want [\"search_path=public\"]", got)
 	}
 	// Resetting an unrecorded name is a no-op, not an error/panic.
-	c.ResetDatabaseConfig(FirstUserOID, "no_such_guc")
-	if len(c.DatabaseConfigEntries(FirstUserOID)) != 1 {
+	c.ResetDatabaseConfig(PostgresDBOid, "no_such_guc")
+	if len(c.DatabaseConfigEntries(PostgresDBOid)) != 1 {
 		t.Errorf("ResetDatabaseConfig on unknown name should be a no-op")
 	}
 }
@@ -314,11 +310,11 @@ func TestResetDatabaseConfigRemovesOnlyNamedEntry(t *testing.T) {
 // loop #82 row).
 func TestResetDatabaseConfigLastEntryDeletesMapKey(t *testing.T) {
 	c := NewInMemory()
-	c.SetDatabaseConfig(FirstUserOID, "work_mem", "64MB")
-	c.ResetDatabaseConfig(FirstUserOID, "work_mem")
+	c.SetDatabaseConfig(PostgresDBOid, "work_mem", "64MB")
+	c.ResetDatabaseConfig(PostgresDBOid, "work_mem")
 
-	if _, ok := c.dbRoleSettings[FirstUserOID]; ok {
-		t.Errorf("dbRoleSettings still has a key for %d after its last entry was reset", FirstUserOID)
+	if _, ok := c.dbRoleSettings[PostgresDBOid]; ok {
+		t.Errorf("dbRoleSettings still has a key for %d after its last entry was reset", PostgresDBOid)
 	}
 	tbl, ok := c.ns(DefaultDBOid).tables["pg_catalog.pg_db_role_setting"]
 	if !ok || tbl.VirtualRows == nil {
@@ -333,17 +329,17 @@ func TestResetDatabaseConfigLastEntryDeletesMapKey(t *testing.T) {
 // semantics.
 func TestResetAllDatabaseConfigClearsEverything(t *testing.T) {
 	c := NewInMemory()
-	c.SetDatabaseConfig(FirstUserOID, "work_mem", "64MB")
-	c.SetDatabaseConfig(FirstUserOID, "search_path", "public")
-	c.ResetAllDatabaseConfig(FirstUserOID)
-	if got := c.DatabaseConfigEntries(FirstUserOID); len(got) != 0 {
+	c.SetDatabaseConfig(PostgresDBOid, "work_mem", "64MB")
+	c.SetDatabaseConfig(PostgresDBOid, "search_path", "public")
+	c.ResetAllDatabaseConfig(PostgresDBOid)
+	if got := c.DatabaseConfigEntries(PostgresDBOid); len(got) != 0 {
 		t.Errorf("DatabaseConfigEntries after RESET ALL = %v, want empty", got)
 	}
 }
 
 // TestPgDbRoleSettingVirtualRowsProjectsOverrides confirms the previously
 // permanently-empty pg_db_role_setting virtual table now projects real
-// SetDatabaseConfig state as one row keyed by FirstUserOID/setrole=0, with
+// SetDatabaseConfig state as one row keyed by PostgresDBOid/setrole=0, with
 // setconfig rendered as a PG-native text[] literal.
 func TestPgDbRoleSettingVirtualRowsProjectsOverrides(t *testing.T) {
 	c := NewInMemory()
@@ -355,15 +351,15 @@ func TestPgDbRoleSettingVirtualRowsProjectsOverrides(t *testing.T) {
 		t.Errorf("fresh catalog: pg_db_role_setting rows = %v, want none", rows)
 	}
 
-	c.SetDatabaseConfig(FirstUserOID, "work_mem", "64MB")
-	c.SetDatabaseConfig(FirstUserOID, "search_path", "public,pg_catalog")
+	c.SetDatabaseConfig(PostgresDBOid, "work_mem", "64MB")
+	c.SetDatabaseConfig(PostgresDBOid, "search_path", "public,pg_catalog")
 	rows := tbl.VirtualRows()
 	if len(rows) != 1 {
 		t.Fatalf("pg_db_role_setting rows = %v, want exactly 1 row", rows)
 	}
 	row := rows[0]
-	if row[0] != "16384" {
-		t.Errorf("setdatabase = %q, want FirstUserOID (16384)", row[0])
+	if row[0] != "5" {
+		t.Errorf("setdatabase = %q, want PostgresDBOid (5)", row[0])
 	}
 	if row[1] != "0" {
 		t.Errorf("setrole = %q, want \"0\"", row[1])
@@ -400,7 +396,7 @@ func TestSetRoleConfigUpsertsInPlace(t *testing.T) {
 }
 
 // TestRoleConfigScopedByDatabase confirms the same role's cluster-wide
-// (dbOid=0) and IN-DATABASE (dbOid=FirstUserOID) overrides are independent
+// (dbOid=0) and IN-DATABASE (dbOid=PostgresDBOid) overrides are independent
 // pg_db_role_setting rows.
 func TestRoleConfigScopedByDatabase(t *testing.T) {
 	c := NewInMemory()
@@ -408,20 +404,20 @@ func TestRoleConfigScopedByDatabase(t *testing.T) {
 	roleOid, _ := c.RoleOID("alice")
 
 	c.SetRoleConfig(roleOid, 0, "work_mem", "64MB")
-	c.SetRoleConfig(roleOid, FirstUserOID, "work_mem", "1MB")
+	c.SetRoleConfig(roleOid, PostgresDBOid, "work_mem", "1MB")
 
 	if got := c.RoleConfigEntries(roleOid, 0); len(got) != 1 || got[0] != "work_mem=64MB" {
 		t.Errorf("RoleConfigEntries(role, 0) = %v, want [work_mem=64MB]", got)
 	}
-	if got := c.RoleConfigEntries(roleOid, FirstUserOID); len(got) != 1 || got[0] != "work_mem=1MB" {
-		t.Errorf("RoleConfigEntries(role, FirstUserOID) = %v, want [work_mem=1MB]", got)
+	if got := c.RoleConfigEntries(roleOid, PostgresDBOid); len(got) != 1 || got[0] != "work_mem=1MB" {
+		t.Errorf("RoleConfigEntries(role, PostgresDBOid) = %v, want [work_mem=1MB]", got)
 	}
 
 	c.ResetAllRoleConfig(roleOid, 0)
 	if got := c.RoleConfigEntries(roleOid, 0); len(got) != 0 {
 		t.Errorf("RoleConfigEntries(role, 0) after RESET ALL = %v, want empty", got)
 	}
-	if got := c.RoleConfigEntries(roleOid, FirstUserOID); len(got) != 1 {
+	if got := c.RoleConfigEntries(roleOid, PostgresDBOid); len(got) != 1 {
 		t.Errorf("RESET ALL on dbOid=0 must not touch the IN-DATABASE scope: %v", got)
 	}
 }
@@ -483,14 +479,14 @@ func TestUnregisterRoleDropsRoleConfigRows(t *testing.T) {
 	c.RegisterRole("alice")
 	roleOid, _ := c.RoleOID("alice")
 	c.SetRoleConfig(roleOid, 0, "work_mem", "64MB")
-	c.SetRoleConfig(roleOid, FirstUserOID, "search_path", "public")
+	c.SetRoleConfig(roleOid, PostgresDBOid, "search_path", "public")
 
 	c.UnregisterRole("alice")
 
 	if got := c.RoleConfigEntries(roleOid, 0); len(got) != 0 {
 		t.Errorf("cluster-wide RoleConfigEntries after UnregisterRole = %v, want empty", got)
 	}
-	if got := c.RoleConfigEntries(roleOid, FirstUserOID); len(got) != 0 {
+	if got := c.RoleConfigEntries(roleOid, PostgresDBOid); len(got) != 0 {
 		t.Errorf("IN-DATABASE RoleConfigEntries after UnregisterRole = %v, want empty", got)
 	}
 	for _, row := range c.AllRoleConfigRows() {
@@ -502,7 +498,7 @@ func TestUnregisterRoleDropsRoleConfigRows(t *testing.T) {
 
 // TestPgDbRoleSettingVirtualRowsProjectsRoleOverrides confirms
 // pg_db_role_setting also projects setrole != 0 rows (both the cluster-wide
-// dbOid=0 and IN-DATABASE FirstUserOID forms) alongside the pre-existing
+// dbOid=0 and IN-DATABASE PostgresDBOid forms) alongside the pre-existing
 // setrole=0 database row, sorted deterministically by (RoleOID, DBOid).
 func TestPgDbRoleSettingVirtualRowsProjectsRoleOverrides(t *testing.T) {
 	c := NewInMemory()
@@ -513,17 +509,17 @@ func TestPgDbRoleSettingVirtualRowsProjectsRoleOverrides(t *testing.T) {
 
 	c.RegisterRole("alice")
 	roleOid, _ := c.RoleOID("alice")
-	c.SetDatabaseConfig(FirstUserOID, "log_statement", "all")
+	c.SetDatabaseConfig(PostgresDBOid, "log_statement", "all")
 	c.SetRoleConfig(roleOid, 0, "work_mem", "64MB")
-	c.SetRoleConfig(roleOid, FirstUserOID, "search_path", "public")
+	c.SetRoleConfig(roleOid, PostgresDBOid, "search_path", "public")
 
 	rows := tbl.VirtualRows()
 	if len(rows) != 3 {
 		t.Fatalf("pg_db_role_setting rows = %v, want exactly 3 rows", rows)
 	}
 	// row 0: the pre-existing setrole=0 database row.
-	if rows[0][0] != "16384" || rows[0][1] != "0" {
-		t.Errorf("row 0 (setdatabase, setrole) = (%q, %q), want (16384, 0)", rows[0][0], rows[0][1])
+	if rows[0][0] != "5" || rows[0][1] != "0" {
+		t.Errorf("row 0 (setdatabase, setrole) = (%q, %q), want (5, 0)", rows[0][0], rows[0][1])
 	}
 	roleOidStr := strconv.FormatUint(uint64(roleOid), 10)
 	// row 1: the role's cluster-wide (dbOid=0) override.
@@ -531,7 +527,7 @@ func TestPgDbRoleSettingVirtualRowsProjectsRoleOverrides(t *testing.T) {
 		t.Errorf("row 1 = %v, want (0, %s, {work_mem=64MB})", rows[1], roleOidStr)
 	}
 	// row 2: the role's IN-DATABASE override.
-	if rows[2][0] != "16384" || rows[2][1] != roleOidStr || rows[2][2] != "{search_path=public}" {
-		t.Errorf("row 2 = %v, want (16384, %s, {search_path=public})", rows[2], roleOidStr)
+	if rows[2][0] != "5" || rows[2][1] != roleOidStr || rows[2][2] != "{search_path=public}" {
+		t.Errorf("row 2 = %v, want (5, %s, {search_path=public})", rows[2], roleOidStr)
 	}
 }

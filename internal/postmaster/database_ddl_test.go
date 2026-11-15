@@ -249,8 +249,8 @@ func TestTryHandleDatabaseDDLAlterDatabaseConfigFromCurrent(t *testing.T) {
 	if !handled || err != nil {
 		t.Fatalf("ALTER DATABASE postgres SET work_mem FROM CURRENT: handled=%v err=%v", handled, err)
 	}
-	if got := im.DatabaseConfigEntries(catalog.FirstUserOID); len(got) != 1 || got[0] != "work_mem=128MB" {
-		t.Errorf("DatabaseConfigEntries(FirstUserOID) = %v, want [work_mem=128MB]", got)
+	if got := im.DatabaseConfigEntries(catalog.PostgresDBOid); len(got) != 1 || got[0] != "work_mem=128MB" {
+		t.Errorf("DatabaseConfigEntries(PostgresDBOid) = %v, want [work_mem=128MB]", got)
 	}
 
 	// An unrecognised GUC name (resolver reports ok=false) errors.

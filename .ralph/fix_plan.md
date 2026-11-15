@@ -1518,6 +1518,23 @@ heuristic stays live.)
     and RelOID, before the user\-table reload. Then advance the OID counter and prove with a two\-restart test
     that covers field access, a new column, DROP TYPE and pg\_proc OIDs.
   - Expected instrument: Movement: none — correctness fix — no plan instrument.
+- [ ] **M0122\-0008a — apply `pg_db_role_setting` at session start: `ALTER DATABASE / ROLE … SET` never reaches a new connection**
+  \(filed 2026\-11\-15 by the loop, found while verifying M0149\-0001a1 S2; below\-item\-10 fallback, not S2: no wrong
+  query result, a missing session\-setup step\)\.
+  Kind: impl
+  Parent: none
+  - Repro: `alter database postgres set work_mem = '9MB'; alter role al in database postgres set search_path =
+    public;` then a NEW connection: `show work_mem` → `512MB`, and `al` sees `"$user", public`\. PG 18\.3: `9MB` and
+    `public`\. The rows are stored and survive restarts \(`pg_db_role_setting` shows them\); nothing reads them back
+    into the session\.
+  - PG: `process_settings` \(`utils/init/postinit.c`\) calls `ApplySetting` \(`catalog/pg_db_role_setting.c`\) four
+    times — \(db, role\), \(0, role\), \(db, 0\), \(0, 0\) — with `PGC_S_DATABASE_USER` / `PGC_S_USER` /
+    `PGC_S_DATABASE` / `PGC_S_GLOBAL` sources, before the startup packet's options\.
+  - Suggested first step: at session start in internal/postmaster \(after authentication, before the client's
+    startup options\), read `DatabaseConfigEntries\(dbOid\)` and `RoleConfigEntries\(role, dbOid / 0\)` in PG's order
+    and apply each through the GUC set path with the matching source; `SHOW` / `pg_settings.source` must report
+    `database` / `user` / `database user`\.
+  - Expected instrument: Movement: none — correctness fix — no plan instrument\.
 - [ ] **P0\-E32 — `ALTER TABLE … ADD COLUMN … DEFAULT <const>` loses attmissingval across a restart: old rows read NULL**
   \(filed 2026\-11\-15 by the loop, found while verifying M0149\-0001a1 S1 WAL replay; S2 — wrong results\)\.
   Kind: impl
@@ -11515,6 +11532,21 @@ verify each at HEAD when the task starts.
     - Found P0-E32 \(ADD COLUMN DEFAULT lost after restart, pre-existing\).
     - Next: S2 \(displayed postgres OID 5\).
     Movement: none — tap 034\_create\_database 3/4 \(storage layer only; mixed A1 needs S3\)
+  - 2026-11-15 S2 landed \(design doc § "S2 as landed"\):
+    - pg\_database displays postgres = 5 \(was 16384\); pg\_stat\_database
+      datid, subscription subdbid \(both producers\), pg\_db\_role\_setting
+      setdatabase \(ALTER DATABASE / ALTER ROLE … IN DATABASE\), the pg\_locks
+      static row and advisory-lock rows follow it.
+    - Legacy clusters: heap rows keyed 16384 fold into 5 at reload; the next
+      write of the key deletes the legacy row. Probe on a cluster built by the
+      pre-S1 binary: rows show 5 before and after a restart.
+    - Gates: units, catalog / postmaster / initdb / executor packages,
+      testport pg\_dump / subscription / pgoutput interop / PG cold start /
+      Recovery \(56 PASS\), spotcheck, sf025 99, acceptance PASS.
+    - Found M0122-0008a \(database / role settings are never applied at
+      session start; pre-existing\).
+    - Next: S3 \(template1 at base/1\) — that is M0149-0001a itself.
+    Movement: none — tap 034\_create\_database 3/4 \(display layer only; mixed A1 needs S3\)
 - [ ] **M0149-0001b — Go `Cluster.pm`-equivalent harness for single-node ports \(goopg and PG 18.3 nodes behind one API\)**
   Kind: impl
   Parent: M0149-0001

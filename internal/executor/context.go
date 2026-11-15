@@ -876,8 +876,8 @@ type Context struct {
 	// CurrentDatabaseOid is the REAL, physical pg_database.oid resolved for
 	// CurrentDatabase via catalog.(*InMemory).ResolveDatabaseOid — the same
 	// oid that keys on-disk storage/ACLs, NOT pg_database's displayed oid
-	// column (which shows "postgres" as a legacy 16384 placeholder for
-	// compat, see ResolveDatabaseOid's doc comment). Zero if CurrentDatabase
+	// column (the two differ only for template1, see ResolveDatabaseOid's
+	// doc comment). Zero if CurrentDatabase
 	// is empty or unresolvable (embedded/test contexts, or a database name
 	// the catalog doesn't recognize). This is plumbing only today — no
 	// lookup site yet keys off it, since catalog.InMemory's table/index

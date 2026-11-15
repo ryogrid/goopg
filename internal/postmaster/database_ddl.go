@@ -2118,13 +2118,10 @@ func (s *Server) applyAlterDatabaseConfig(op alterDatabaseConfigOp, liveDBName s
 		}
 		op.configValue = val
 	}
-	// FirstUserOID (16384) is the SAME SQL-visible placeholder OID
-	// pg_database.VirtualRows displays for the "postgres" row — NOT
-	// catalog.InMemory.DBOID() (the real on-disk physical OID datacl keys
-	// its heap resync under). pg_db_role_setting is a pure virtual table
-	// with no heap to resync, and pg_dump's dumpDatabaseConfig
-	// cross-references setdatabase against the oid it already read from
-	// pg_database, so the two must agree.
+	// PostgresDBOid (5) is the oid pg_database displays for the "postgres"
+	// row (M0149-0001a1 S2; it was the legacy 16384 placeholder). pg_dump's
+	// dumpDatabaseConfig cross-references setdatabase against the oid it
+	// already read from pg_database, so the two must agree.
 	if op.valueErr != nil {
 		return true, "", &databaseDDLError{code: errcodes.InvalidParameterValue, msg: op.valueErr.Error()}
 	}
@@ -2135,7 +2132,7 @@ func (s *Server) applyAlterDatabaseConfig(op alterDatabaseConfigOp, liveDBName s
 		}
 		op.configName = name
 	}
-	dbOid := catalog.FirstUserOID
+	dbOid := catalog.PostgresDBOid
 	switch {
 	case op.resetAll:
 		cat.ResetAllDatabaseConfig(dbOid)

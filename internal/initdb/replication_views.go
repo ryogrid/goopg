@@ -576,14 +576,9 @@ func registerSubscriptionViews(cat *catalog.InMemory, ps *catalog.PubSub) error 
 				// subdbid must match pg_database.oid for the live database so
 				// pg_dump's `s.subdbid = (SELECT oid FROM pg_database WHERE
 				// datname = current_database())` filter actually matches a row.
-				// catalog.InMemory.DBOID() is the unrelated *storage* identity
-				// (RelFileNode base/<oid> directory — see its doc comment); the
-				// SQL-visible pg_database.oid for any live non-template database
-				// is unconditionally catalog.FirstUserOID (16384) per the
-				// hardcoded convention pgDatabase.VirtualRows already uses
-				// (internal/catalog/catalog.go), so mirror that here rather than
-				// DBOID().
-				fmt.Sprintf("%d", catalog.FirstUserOID), // subdbid
+				// The live database is "postgres", whose pg_database.oid is
+				// catalog.PostgresDBOid (5) as in PG (M0149-0001a1 S2).
+				fmt.Sprintf("%d", catalog.PostgresDBOid), // subdbid
 				sub.Name,
 				fmt.Sprintf("%d", sub.Owner), // subowner
 				boolText(sub.Enabled),

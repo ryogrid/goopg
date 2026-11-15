@@ -55,6 +55,13 @@ func SyncDbRoleSettingRow(ctx *Context, setDatabase, setRole uint32, entries []s
 		return err
 	}
 	stampDbRoleSettingRow(ctx, setDatabase, setRole)
+	if setDatabase == catalog.PostgresDBOid {
+		// Retire a pre-M0149-0001a1-S2 row keyed by the legacy 16384
+		// placeholder: reloadDbRoleSettingsFromHeap folded its entries into
+		// the postgres (5) key, so the registry state written below already
+		// carries them.
+		stampDbRoleSettingRow(ctx, catalog.FirstUserOID, setRole)
+	}
 	if len(entries) == 0 {
 		return nil
 	}

@@ -2916,21 +2916,18 @@ type InMemory struct {
 	// bootstrap postgres/template0/template1 rows) report 0 via DatabaseOid's
 	// comma-less lookup — pgDatabase.VirtualRows treats 0 as "no override,
 	// keep the legacy hardcoded placeholder", which is deliberate: the LIVE
-	// "postgres" database's displayed oid must stay the 16384 placeholder
-	// (see VirtualRows' own comment — CREATE SUBSCRIPTION's subdbid and the
-	// datacl heap resync both depend on it), and only a genuinely new
+	// "postgres" database displays PostgresDBOid (5) through
+	// databaseDisplayOID (M0149-0001a1 S2), and only a genuinely new
 	// CREATE DATABASE name is affected.
 	databaseOid map[string]uint32
 	// dbRoleSettings holds per-database `ALTER DATABASE name SET config =
 	// value` overrides (pg_db_role_setting, setrole=0 scope only — ALTER
 	// ROLE ... SET / ALTER ROLE ... IN DATABASE ... SET are a separate,
-	// unimplemented feature). Keyed by FirstUserOID (16384) — the SAME
-	// SQL-visible placeholder pg_database.VirtualRows displays for every
-	// non-template database (not c.DBOID(), the real on-disk physical OID
-	// used to key the datacl ACL store / heap resync: pg_db_role_setting is
-	// a pure virtual table with no heap to resync, and pg_dump's
-	// dumpDatabaseConfig cross-references setdatabase against the oid it
-	// already read from pg_database, so the two must agree). Each value is
+	// unimplemented feature). Keyed by PostgresDBOid (5) — the oid
+	// pg_database displays for the live postgres database (M0149-0001a1 S2;
+	// formerly the 16384 placeholder): pg_dump's dumpDatabaseConfig
+	// cross-references setdatabase against the oid it already read from
+	// pg_database, so the two must agree. Each value is
 	// an ordered list of "name=value" entries in PG's
 	// pg_db_role_setting.setconfig on-disk format (mirrors guc.c's
 	// flatten_set_variable_args output); SET replaces an existing
@@ -2943,9 +2940,9 @@ type InMemory struct {
 	// complement of dbRoleSettings' setrole=0 rows). Keyed by
 	// roleSettingKey{RoleOID, DBOid}: DBOid is 0 for a plain cluster-wide
 	// `ALTER ROLE ... SET` (setdatabase=0, applies in every database) or
-	// FirstUserOID for the `IN DATABASE` form scoped to goopg's single live
-	// database (mirrors dbRoleSettings' FirstUserOID keying — the same SQL
-	// -visible placeholder oid pg_database.VirtualRows displays). Entry
+	// PostgresDBOid for the `IN DATABASE` form scoped to goopg's single live
+	// database (mirrors dbRoleSettings' keying — the oid pg_database
+	// displays for postgres). Entry
 	// format matches dbRoleSettings (ordered "name=value" strings).
 	// M0119-0004-ACLHEAP (ALTER ROLE ... SET follow-up).
 	roleSettings map[roleSettingKey][]string
@@ -6011,11 +6008,11 @@ func (c *InMemory) DatabaseOid(name string) uint32 {
 }
 
 // databaseDisplayOID returns the SQL-visible pg_database.oid that goopg
-// DISPLAYS for name: template1→1, template0→4, a CreateDatabase-allocated
-// database→its real distinct oid, and every other row (notably the live
-// "postgres" database — whose real on-disk oid is c.DBOID() but which is shown
-// as the legacy 16384 placeholder for CREATE SUBSCRIPTION / datacl compat)
-// →16384. This is deliberately the DISPLAY oid, not ResolveDatabaseOid's
+// DISPLAYS for name: template1→1, template0→4, postgres→5 (PostgresDBOid,
+// initdb's make_postgres oid — the value PG 18.3 shows and the oid of the
+// global/1262 heap row; M0149-0001a1 S2 retired the legacy 16384
+// placeholder), a CreateDatabase-allocated database→its real distinct oid.
+// This is deliberately the DISPLAY oid, not ResolveDatabaseOid's
 // physical oid: pg_stat_database.datid must join to pg_database.oid exactly as
 // goopg renders it, so both the pg_database VirtualRows closure and
 // PGStatDatabaseRows go through this single helper to stay in sync (resolving
@@ -6027,6 +6024,8 @@ func (c *InMemory) databaseDisplayOID(name string) string {
 		return "1"
 	case "template0":
 		return "4"
+	case "postgres":
+		return strconv.FormatUint(uint64(PostgresDBOid), 10)
 	default:
 		if realOid := c.DatabaseOid(name); realOid != 0 {
 			return strconv.FormatUint(uint64(realOid), 10)
@@ -6120,9 +6119,9 @@ func (c *InMemory) PGStatDatabaseConflictsRows() [][]string {
 // the same oid that keys on-disk storage/ACLs (c.DBOID() for "postgres",
 // the fixed bootstrap oids for template1/template0, or the CreateDatabase-
 // allocated oid via DatabaseOid for any other registered database) — as
-// opposed to pg_database's VirtualRows column, which deliberately DISPLAYS
-// "postgres" as the legacy 16384 placeholder for CREATE SUBSCRIPTION/datacl
-// compat (see that closure's "oid, datallowconn, datistemplate" comment).
+// opposed to pg_database's displayed oid (databaseDisplayOID: postgres→5,
+// template1→1; they differ only for template1, whose namespace/storage oid is
+// Template1NamespaceDBOid).
 // Returns ok=false if name is not a database this catalog knows about.
 // M0122-0007 physical-storage-isolation slice 4a — see
 // docs/design/0122-0018-per-database-catalog-namespace.md. Keep this switch
@@ -6340,7 +6339,7 @@ func (c *InMemory) DatabaseConfigEntries(dbOid uint32) []string {
 }
 
 // roleSettingKey identifies one `ALTER ROLE ... SET` override row. See
-// InMemory.roleSettings' doc comment for the DBOid=0 vs FirstUserOID
+// InMemory.roleSettings' doc comment for the DBOid=0 vs PostgresDBOid
 // distinction.
 type roleSettingKey struct {
 	RoleOID uint32
@@ -9355,11 +9354,10 @@ func (c *InMemory) registerSystemTables() {
 			// correctly omitted from --all while template1 is included.
 			// databaseDisplayOID renders the SQL-visible oid: template1→1,
 			// template0→4, a CreateDatabase-allocated database→its real distinct
-			// oid (M0122-0007 physical-storage-isolation slice 1), and every
-			// other row (notably the live "postgres" row, which never goes
-			// through CreateDatabase so DatabaseOid is 0)→the legacy 16384
-			// placeholder CREATE SUBSCRIPTION's subdbid and the datacl heap
-			// resync both key off (see the datacl comment below). Shared with
+			// oid (M0122-0007 physical-storage-isolation slice 1), and the
+			// live "postgres" row→PostgresDBOid (5), as in PG (M0149-0001a1
+			// S2 retired the legacy 16384 placeholder; CREATE SUBSCRIPTION's
+			// subdbid and pg_db_role_setting follow it). Shared with
 			// PGStatDatabaseRows so pg_stat_database.datid joins to this exactly.
 			oid := c.databaseDisplayOID(n)
 			datallowconn, datistemplate := "true", "false"
@@ -9381,11 +9379,8 @@ func (c *InMemory) registerSystemTables() {
 			// "oid" placeholder above. execDatabaseACLChange / resyncDatabaseACLHeapRow
 			// key the ACL store and the physical heap resync under c.DBOID() (the
 			// heap resync MUST match the real on-disk tuple's oid column), so this
-			// lookup mirrors that key rather than the legacy 16384
-			// firstNormalObjectOID placeholder other subsystems (e.g. CREATE
-			// SUBSCRIPTION's subdbid) already depend on for "the" connected
-			// database — changing the displayed oid to match broke pg_dump's
-			// subscription round-trip (subdbid join no longer matched). Only the
+			// lookup mirrors that key (which since M0149-0001a1 S2 also equals
+			// the displayed postgres oid, 5). Only the
 			// live "postgres" row could carry a granted ACL, because
 			// execDatabaseACLChange only ever wrote that one.
 			//
@@ -9925,7 +9920,7 @@ func (c *InMemory) registerSystemTables() {
 		// locktype, database, relation, page, tuple, virtualxid, transactionid,
 		// classid, objid, objsubid, virtualtransaction, pid, mode, granted, fastpath, waitstart
 		rows := [][]string{
-			{"relation", "16384", "1259", "", "", "", "", "", "", "", "1/1", "0", "AccessShareLock", "t", "t", ""},
+			{"relation", "5", "1259", "", "", "", "", "", "", "", "1/1", "0", "AccessShareLock", "t", "t", ""},
 		}
 		if RelationLockRowsFunc != nil {
 			rows = append(rows, RelationLockRowsFunc()...)
@@ -12573,11 +12568,11 @@ func (c *InMemory) registerSystemTables() {
 	// SET ...` clauses. `ALTER DATABASE ... SET`/`RESET` writes into
 	// SetDatabaseConfig/ResetDatabaseConfig (setrole=0 rows, v0 scope: only
 	// the live connected database, mirroring execDatabaseACLChange's datacl
-	// restriction), keyed by FirstUserOID (16384) to match the oid pg_dump
+	// restriction), keyed by PostgresDBOid (5) to match the oid pg_dump
 	// already read from the pg_database row. `ALTER ROLE ... SET`/`RESET`
 	// writes into SetRoleConfig/ResetRoleConfig (setrole != 0 rows), keyed by
 	// the role's real OID and either 0 (cluster-wide) or the same
-	// FirstUserOID (`IN DATABASE`, same v0 single-live-database scope
+	// PostgresDBOid (`IN DATABASE`, same v0 single-live-database scope
 	// restriction). M0119-0004-ACLHEAP (ALTER DATABASE/ROLE ... SET
 	// follow-up).
 	pgDbRoleSetting := &Table{
@@ -12591,7 +12586,7 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgDbRoleSetting.VirtualRows = func() [][]string {
 		var out [][]string
-		dbOid := FirstUserOID
+		dbOid := PostgresDBOid
 		if entries := c.DatabaseConfigEntries(dbOid); len(entries) > 0 {
 			out = append(out, []string{
 				strconv.FormatUint(uint64(dbOid), 10),
@@ -12601,7 +12596,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		// setrole != 0 rows: `ALTER ROLE ... [IN DATABASE ...] SET ...`
 		// (M0119-0004-ACLHEAP, ALTER ROLE ... SET follow-up). DBOid is 0 for
-		// a plain cluster-wide override (setdatabase=0) or FirstUserOID for
+		// a plain cluster-wide override (setdatabase=0) or PostgresDBOid for
 		// the IN DATABASE form.
 		for _, row := range c.AllRoleConfigRows() {
 			out = append(out, []string{

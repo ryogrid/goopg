@@ -951,7 +951,7 @@ func (s *Server) applyAlterRoleConfig(op alterRoleConfigOp, liveDBName string, r
 		if !strings.EqualFold(strings.Trim(op.dbName, `"`), liveDBName) {
 			return true, nil
 		}
-		dbOid = catalog.FirstUserOID
+		dbOid = catalog.PostgresDBOid
 	}
 	if op.fromCurrent {
 		// Resolve the live session's CURRENT effective value now — see

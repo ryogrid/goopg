@@ -3572,7 +3572,7 @@ func subscriptionRowsForDBOid(ps *catalog.PubSub, dbOid uint32) [][]string {
 	for _, sub := range subs {
 		out = append(out, []string{
 			fmt.Sprintf("%d", sub.OID),
-			fmt.Sprintf("%d", catalog.FirstUserOID), // subdbid — matches pg_database.oid
+			fmt.Sprintf("%d", catalog.PostgresDBOid), // subdbid — matches pg_database.oid
 			sub.Name,
 			fmt.Sprintf("%d", sub.Owner), // subowner
 			boolToText(sub.Enabled),

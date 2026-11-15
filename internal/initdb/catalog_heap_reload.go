@@ -1708,10 +1708,19 @@ func reloadDbRoleSettingsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 				continue
 			}
 			name, value := entry[:eq], entry[eq+1:]
+			setDatabase := c.setDatabase
+			if setDatabase == catalog.FirstUserOID {
+				// Before M0149-0001a1 S2 the postgres database's settings were
+				// keyed by the legacy 16384 display placeholder (ALTER DATABASE /
+				// ALTER ROLE ... IN DATABASE only ever wrote the live postgres
+				// database). Fold them into PostgresDBOid; the next write of the
+				// key deletes the legacy heap row (SyncDbRoleSettingRow).
+				setDatabase = catalog.PostgresDBOid
+			}
 			if c.setRole == 0 {
-				cat.SetDatabaseConfig(c.setDatabase, name, value)
+				cat.SetDatabaseConfig(setDatabase, name, value)
 			} else {
-				cat.SetRoleConfig(c.setRole, c.setDatabase, name, value)
+				cat.SetRoleConfig(c.setRole, setDatabase, name, value)
 			}
 		}
 	}

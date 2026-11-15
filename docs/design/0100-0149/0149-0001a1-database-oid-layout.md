@@ -1,7 +1,7 @@
 # M0149\-0001a1 — one OID per database on disk, in WAL and on display
 
-Status: S1 landed 2026\-11\-15 \(postgres catalogs stored and WAL\-logged at
-DBOid 5\). S2–S3 open.
+Status: S1 and S2 landed 2026\-11\-15 \(postgres catalogs stored and
+WAL\-logged at DBOid 5; postgres displayed as oid 5\). S3 open.
 Parent: M0149\-0001a \(template1's PG catalog image\) → M0149\-0001 \(port
 `recovery/t/034_create_database.pl`\).
 
@@ -175,6 +175,42 @@ Key observation: PG compatibility constrains only the **displayed** and
   - the TAP ports Recovery001, 013, 019, 038, 039 and 047 PASS.
 - A side effect of the sf025 sweep: the shipped SF0.25 corpus is now
   migrated. The migration is idempotent and only copies newer data.
+
+## S2 as landed \(2026\-11\-15, fourth loop\)
+
+- `databaseDisplayOID("postgres")` returns `PostgresDBOid` \(5\). The
+  `pg_database` heap row already carried 5 \(`detectCatalogDBOID` reads it),
+  so only the virtual display lied.
+- The consumers that had copied the 16384 placeholder now use
+  `catalog.PostgresDBOid`:
+  - `pg_subscription.subdbid`, from both producers \(initdb
+    replication\_views.go and postmaster dispatch.go\);
+  - the `pg_db_role_setting.setdatabase` key, from ALTER DATABASE … SET,
+    ALTER ROLE … IN DATABASE … SET and the virtual rows;
+  - `pg_locks.database`, in both the static relation row and the advisory
+    rows.
+- Legacy clusters. `reloadDbRoleSettingsFromHeap` folds a heap row keyed
+  16384 into 5.
+  - Before S2, only the live postgres database could be written, so 16384
+    always meant postgres.
+  - `SyncDbRoleSettingRow` deletes the legacy \(16384, role\) row whenever
+    it writes \(5, role\).
+  - Until that first write, the on\-disk row still says 16384. A PG 18.3 node
+    reading the heap would not apply it to postgres. That is acceptable
+    because goopg itself never applies these settings at session start
+    \(filed as M0122\-0008a\).
+- Measured:
+  - On a cluster created and configured by the pre\-S1 binary, the new
+    binary shows `pg_database` 1/4/5 and `pg_db_role_setting` rows keyed 5.
+  - A new ALTER DATABASE … SET rewrites the row under 5, and the result
+    survives a restart.
+- Gates PASS:
+  - units; the catalog, postmaster, initdb and executor packages;
+  - testport pg\_dump, subscription, pgoutput interop, PG cold start and
+    Recovery: 56 tests;
+  - spotcheck; sf025 99; acceptance.
+- Not changed: `operators_ddl.go` LOCK TABLE keeps a 16384 fallback, which is
+  only used when the catalog is not an `InMemory`.
 
 ## Risks
 
