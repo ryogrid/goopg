@@ -4561,7 +4561,7 @@ func NewInMemory() *InMemory {
 		defaultACLOIDs:     make(map[defaultACLKey]uint32),
 		defaultACLKeys:     make(map[uint32]defaultACLKey),
 		defaultACLGlobal:   make(map[uint32]bool),
-		comments:           make(map[commentKey]string),
+		comments:           defaultSharedComments(),
 		statisticsObjs:     make(map[string]*StatisticsObject),
 		extensions:         make(map[string]*extensionRow),
 		tablespaces:        make(map[string]*tablespaceRow),
@@ -4971,6 +4971,30 @@ func (c *InMemory) SetComment(classoid, objoid uint32, objsubid int32, descripti
 }
 
 // GetComment retrieves a stored description, returning ("", false) when absent.
+// IsSharedCommentClass reports whether a comment on an object of classoid is
+// stored in pg_shdescription (a shared catalog) rather than the per-database
+// pg_description: databases (1262), roles (1260) and tablespaces (1213), the
+// classes CreateSharedComments handles (postgres/src/backend/commands/comment.c).
+func IsSharedCommentClass(classoid uint32) bool {
+	switch classoid {
+	case 1262, 1260, 1213:
+		return true
+	}
+	return false
+}
+
+// defaultSharedComments returns the comment store as PostgreSQL's initdb leaves
+// it: the three database descriptions setup_description writes into
+// pg_shdescription (postgres/src/bin/initdb/initdb.c), keyed by the
+// databases' OIDs (template1 1, template0 4, postgres 5). M0149-0001f.
+func defaultSharedComments() map[commentKey]string {
+	return map[commentKey]string{
+		{ClassOID: 1262, ObjOID: 1}: "default template for new databases",
+		{ClassOID: 1262, ObjOID: 4}: "unmodifiable empty database",
+		{ClassOID: 1262, ObjOID: 5}: "default administrative connection database",
+	}
+}
+
 func (c *InMemory) GetComment(classoid, objoid uint32, objsubid int32) (string, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -9440,16 +9464,13 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_database"] = pgDatabase
 
-	// pg_shdescription — stores COMMENT ON <shared object> descriptions (OID
-	// 3592, matches the placeholder heap file initdb bootstraps under
-	// global/3592 — bootstrapSharedCatalogPlaceholders,
-	// internal/initdb/initdb.go). goopg doesn't track shared-object comments
-	// yet (COMMENT ON DATABASE/ROLE/TABLESPACE is a no-op), so this is a
-	// permanently-empty stub — same rationale as pg_description above, but for
-	// the shared (cluster-wide, not per-database) comment catalog. Registered
-	// so `REINDEX TABLE pg_shdescription` and any plain `SELECT * FROM
-	// pg_shdescription` resolve instead of erroring "relation does not exist".
-	// M0134-0062 (reindex_catalog.sql regress parity).
+	// pg_shdescription (SharedDescriptionRelationId 2396, pg_shdescription.h)
+	// — comments on shared objects (databases, roles, tablespaces). Rows are
+	// the comment store's shared classes (IsSharedCommentClass), starting with
+	// the three database descriptions PostgreSQL's initdb writes
+	// (defaultSharedComments). Registered so `REINDEX TABLE pg_shdescription`
+	// and plain SELECTs resolve (M0134-0062). M0149-0001f: OID was 3592
+	// (pg_shseclabel's), and the table was a permanently empty stub.
 	pgShdescription := &Table{
 		Schema: "pg_catalog", Name: "pg_shdescription", Virtual: true,
 		Columns: []Column{
@@ -9457,9 +9478,18 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "classoid", Type: Type{Name: "oid"}, Ordinal: 1},
 			{Name: "description", Type: Type{Name: "text"}, Ordinal: 2},
 		},
-		OID: 3592,
+		OID: 2396,
 	}
-	pgShdescription.VirtualRows = func() [][]string { return nil }
+	pgShdescription.VirtualRows = func() [][]string {
+		var out [][]string
+		for _, r := range c.AllComments() {
+			if !IsSharedCommentClass(r.ClassOID) || r.ObjSubID != 0 {
+				continue
+			}
+			out = append(out, []string{fmt.Sprintf("%d", r.ObjOID), fmt.Sprintf("%d", r.ClassOID), r.Description})
+		}
+		return out
+	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_shdescription"] = pgShdescription
 
 	// Nailed system index stubs — REINDEX INDEX <name> on a nailed catalog
@@ -10785,6 +10815,9 @@ func (c *InMemory) registerSystemTables() {
 		rows := c.AllComments()
 		out := make([][]string, 0, len(rows))
 		for _, r := range rows {
+			if IsSharedCommentClass(r.ClassOID) {
+				continue // pg_shdescription's (M0149-0001f)
+			}
 			out = append(out, []string{
 				fmt.Sprintf("%d", r.ObjOID),
 				fmt.Sprintf("%d", r.ClassOID),
@@ -12554,6 +12587,28 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgShseclabel.VirtualRows = func() [][]string { return nil }
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_shseclabel"] = pgShseclabel
+
+	// pg_shdepend (SharedDependRelationId 1214, pg_shdepend.h) — dependencies
+	// of objects on shared objects (owners and ACL grantees that are roles,
+	// tablespaces). goopg records none (shdepend.c has no counterpart yet), so
+	// the table is empty, as on a freshly initialised PostgreSQL cluster.
+	// M0149-0001f.
+	pgShdepend := &Table{
+		Schema: "pg_catalog", Name: "pg_shdepend", Virtual: true,
+		Columns: []Column{
+			{Name: "dbid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "classid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "objid", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "objsubid", Type: Type{Name: "int4"}, Ordinal: 3},
+			{Name: "refclassid", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "refobjid", Type: Type{Name: "oid"}, Ordinal: 5},
+			{Name: "deptype", Type: Type{Name: "char"}, Ordinal: 6},
+		},
+		OID: 1214,
+	}
+	pgShdepend.VirtualRows = func() [][]string { return nil }
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_shdepend"] = pgShdepend
+
 
 	// pg_db_role_setting — per-database/per-role GUC override catalog
 	// (pg_db_role_setting.h, DbRoleSettingRelationId 2964). dumpDatabaseConfig

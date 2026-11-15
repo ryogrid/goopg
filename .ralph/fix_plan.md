@@ -11717,6 +11717,37 @@ verify each at HEAD when the task starts.
       subscription / pgoutput / template1 / CREATE DATABASE, spotcheck,
       sf025 99.
     Movement: none — C3 cold-start fix \(no TAP assertion moved\)
+  - 2026-11-16 COMPLETE:
+    - pg\_catalog.pg\_shdepend \(1214, 7 columns\) is now a virtual table. It is
+      empty: goopg records no shared dependencies, and a fresh PG 18.3 has 0
+      rows too.
+    - pg\_shdescription already existed as an empty stub with the wrong OID
+      \(3592, which is pg\_shseclabel\). It now has OID 2396 and serves the
+      comment store's shared classes \(databases, roles, tablespaces:
+      IsSharedCommentClass\). The store is seeded with the three database
+      descriptions PG's initdb writes.
+    - pg\_description no longer lists shared-object comments.
+      shobj\_description\(5, 'pg\_database'\) now returns "default
+      administrative connection database", as on PG.
+    - Regress A/B on the 7 cases that read these catalogs: misc\_sanity
+      18→15, privileges 1252→1242 \(inventory updated\); the others are
+      unchanged.
+    - Found: psql `\\l+` fails on goopg because has\_database\_privilege\(name,
+      text\) is not implemented. Filed M0149-0001h, below the item-10 rank.
+    - Not done: goopg records no pg\_shdepend rows \(shdepend.c\) and has no
+      COMMENT ON DATABASE / ROLE / TABLESPACE writer \(ledgered\).
+    - Gates: units, postmaster, testport \(pg\_dump, Recovery, interop, template1,
+      CREATE DATABASE\), spotcheck, sf025 99.
+    Movement: yes — regress misc\_sanity 18→15, privileges 1252→1242
+- [ ] **M0149-0001h — has\_database\_privilege is not implemented: psql \\l+ fails** \(filed 2026-11-16; correctness / client-tool conformance, below the item-10 rank\)
+  Kind: impl
+  Parent: none
+  - Repro: goopg `psql -c '\\l+'` → "function pg\_catalog.has\_database\_privilege does not exist". pg\_proc
+    seeds OIDs 2250/2251 \(and the other overloads\), but the executor has no handler.
+  - PG: `has_database_privilege` family in utils/adt/acl.c \(name/oid user × text/oid database × privilege
+    text, plus the two-argument current\_user forms\), with CREATE / CONNECT / TEMP / TEMPORARY privileges.
+  - First step: implement the six overloads over goopg's datacl store \(the same ACL source pg\_database.datacl
+    renders\), then compare `\\l+` against the PG oracle.
 - [ ] **M0149-0001g — goopg's bootstrap catalog image diverges from PG 18.3: 20 catalog descriptors, 19 missing and some empty indexes, 29 missing TOAST relations, local relhasindex false; PG-side CREATE TABLE segfaults** \(filed 2026-11-15; S2 — a PG 18.3 node crashes and would write malformed catalog rows on a goopg directory\)
   Kind: impl
   Parent: none
@@ -11775,7 +11806,7 @@ verify each at HEAD when the task starts.
       pg\_attribute cases \(no movement; join ±1 is the known flapper\),
       spotcheck, sf025 99, acceptance.
     Movement: none — C3 cold-start fix \(regress A/B unchanged\)
-- [ ] **M0149-0001f — goopg's own catalog does not expose pg\_shdepend / pg\_shdescription**
+- [x] **M0149-0001f — goopg's own catalog does not expose pg\_shdepend / pg\_shdescription**
   Kind: impl
   Parent: none
   - Found 2026-11-15: on goopg, `SELECT count(*) FROM pg_shdepend` returns 42P01 "relation \"pg\_shdepend\" does not

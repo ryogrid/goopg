@@ -448,6 +448,16 @@ Key observation: PG compatibility constrains only the **displayed** and
 - goopg's own resolution of xmin and the other system columns in queries
   remains M0146\-0239.
 
+## Follow\-up: M0149\-0001f — goopg's view of the shared catalogs \(2026\-11\-16\)
+
+- goopg now exposes `pg_shdepend` \(empty, as on a fresh PG\).
+- `pg_shdescription` has its real OID 2396; it was 3592, which is
+  pg\_shseclabel's. It is served from the comment store's shared classes,
+  seeded with PG initdb's three database descriptions.
+- `pg_description` no longer lists shared\-object comments.
+- Still missing: pg\_shdepend bookkeeping \(`shdepend.c`\) and the
+  `COMMENT ON DATABASE`, `ROLE` and `TABLESPACE` writers.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the
