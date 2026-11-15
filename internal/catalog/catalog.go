@@ -4337,10 +4337,13 @@ func IsSystemRelation(oid uint32) bool {
 	return oid < FirstUserOID
 }
 
-// DefaultDBOid is the v0 default database OID. Real multi-database
-// support (CREATE DATABASE) lives in milestone 7; until then every
-// catalog entry lives in this database.
-const DefaultDBOid uint32 = 1
+// DefaultDBOid is the catalog namespace of the `postgres` database — the
+// database every connection without a resolved database falls back to. Since
+// M0149-0001a1 S3 it equals PostgreSQL's postgres OID (PostgresDBOid, 5): a
+// namespace OID is the database's storage OID (base/<oid>), WAL dbOid and
+// displayed pg_database.oid. Before S3 it was the sentinel 1, which collided
+// with template1. Design: docs/design/0100-0149/0149-0001a1-database-oid-layout.md.
+const DefaultDBOid uint32 = 5
 
 // PostgresDBOid is the PG-canonical OID for the "postgres" database
 // (template_pg_database.h: Template1ObjectId=1, PostgresObjectId=5).
@@ -4352,19 +4355,13 @@ const DefaultDBOid uint32 = 1
 // CREATE TABLE sees the user-table row through its postgres-DB lens.
 const PostgresDBOid uint32 = 5
 
-// Template1NamespaceDBOid is template1's catalog-namespace AND storage oid
-// (base/2) — deliberately NOT its displayed pg_database.oid (1, rendered by
-// databaseDisplayOID). template1's real PostgreSQL oid 1 is also goopg's
-// DefaultDBOid sentinel, the namespace the postgres database reads and writes,
-// so a template1 connection used to share postgres' tables (a table created in
-// template1 was visible from postgres and vice versa, and pg_dumpall emitted
-// it under both). Owner decision 2026-09-25 (Option A): route template1 around
-// the sentinel to its own namespace; removing the sentinel (postgres at
-// namespace 5, one oid per database at every layer) is the real fix and stays
-// with M0122-0007 slices 4b-4e. 2 lies between the bootstrap oids (1, 4, 5)
-// and FirstUserOID, so no CREATE DATABASE can allocate it.
-// Design: docs/design/0100-0149/0119-0006bv-template1-namespace-collision.md.
-const Template1NamespaceDBOid uint32 = 2
+// Template1NamespaceDBOid is template1's catalog namespace, storage directory
+// (base/1) and pg_database.oid — PostgreSQL's Template1DbOid. Before
+// M0149-0001a1 S3 template1 was routed to namespace/storage 2 (owner Option A,
+// 2026-09-25, design 0119-0006bv) because 1 was postgres' namespace sentinel;
+// S3 made namespaces equal PostgreSQL's database OIDs and migrates an older
+// cluster's base/2 to base/1 at startup (initdb layout_template1_base1.go).
+const Template1NamespaceDBOid uint32 = 1
 
 // PgDatabaseRowOid maps a database's namespace/storage oid — what
 // ResolveDatabaseOid returns — to the oid of its pg_database row, which is

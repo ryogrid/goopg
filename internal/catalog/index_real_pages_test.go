@@ -36,14 +36,17 @@ func TestIndexRealPagesInUsesCatalogDatabase(t *testing.T) {
 		}
 		return 0, false
 	}
-	if _, ok := IndexRealPages(idx); ok {
-		t.Fatal("IndexRealPages found the file under the default database; the case no longer reproduces")
+	// Since M0149-0001a1 S3 the postgres namespace key IS its storage OID
+	// (DefaultDBOid == PostgresDBOid == 5), so the package-level lookup finds
+	// the file too; before S3 it looked under base/1 and missed.
+	if got, ok := IndexRealPages(idx); !ok || got != 52 {
+		t.Errorf("IndexRealPages = %d, %v; want 52 (namespace = storage since S3)", got, ok)
 	}
 	if got, ok := IndexRealPagesIn(c, idx); !ok || got != 52 {
 		t.Errorf("IndexRealPagesIn = %d, %v; want 52 from database 5", got, ok)
 	}
-	if got, ok := IndexRealPagesIn(nil, idx); ok {
-		t.Errorf("IndexRealPagesIn(nil) = %d; want the package-level miss", got)
+	if got, ok := IndexRealPagesIn(nil, idx); !ok || got != 52 {
+		t.Errorf("IndexRealPagesIn(nil) = %d, %v; want the package-level 52", got, ok)
 	}
 	found := false
 	for _, row := range c.PGClassRowsForDBOid(DefaultDBOid) {
@@ -86,8 +89,9 @@ func TestTableRealPagesInUsesCatalogDatabase(t *testing.T) {
 		}
 		return 0, false
 	}
-	if _, ok := TableRealPages(tbl); ok {
-		t.Fatal("TableRealPages found the file under the default database; the case no longer reproduces")
+	// Namespace = storage since M0149-0001a1 S3 (see the index sibling).
+	if got, ok := TableRealPages(tbl); !ok || got != 1284 {
+		t.Errorf("TableRealPages = %d, %v; want 1284 (namespace = storage since S3)", got, ok)
 	}
 	if got, ok := TableRealPagesIn(c, tbl); !ok || got != 1284 {
 		t.Errorf("TableRealPagesIn = %d, %v; want 1284 from database 5", got, ok)

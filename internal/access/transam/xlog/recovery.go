@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/goopg/goopg/internal/access/nbtree"
@@ -2158,9 +2159,31 @@ func replayRecordsFrom(mgr *storage.Manager, records []Record, redoLSN uint64, i
 		return stats, err
 	}
 
+	legacyEnd := legacyLayoutWALEnd.Load()
+	if legacyEnd != 0 {
+		defer storage.SetLegacyRedoDBOidMap(false)
+	}
 	for i, r := range records[startIdx:] {
 		if interrupted != nil && interrupted() {
 			return stats, fmt.Errorf("wal: replay stopped before record %d lsn %d: %w", startIdx+i, r.StartLSN, ErrRecoveryShutdown)
+		}
+		if legacyEnd != 0 {
+			// A record written before the M0149-0001a1 S3 layout migration
+			// names the old database directories (storage.StorageDBOid).
+			legacy := r.StartLSN < legacyEnd
+			storage.SetLegacyRedoDBOidMap(legacy)
+			if !legacy {
+				// First post-migration record (only after a crash inside
+				// the migration window): template1's legacy redo is done,
+				// so move it to base/1 before a record names base/1.
+				if hook := legacyLayoutBoundary; hook != nil {
+					if err := hook(); err != nil {
+						return stats, fmt.Errorf("wal: legacy layout boundary at lsn %d: %w", r.StartLSN, err)
+					}
+				}
+				legacyEnd = 0
+				storage.SetLegacyRedoDBOidMap(false)
+			}
 		}
 		applied, err := ApplyRecord(mgr, r)
 		if err != nil {
@@ -2171,6 +2194,23 @@ func replayRecordsFrom(mgr *storage.Manager, records []Record, redoLSN uint64, i
 		}
 	}
 	return stats, nil
+}
+
+// legacyLayoutWALEnd is the end of the WAL that existed when this cluster's
+// M0149-0001a1 S3 layout migration ran (0 = no legacy WAL to map). Records
+// starting below it are replayed with storage's pre-S3 database-OID mapping.
+var legacyLayoutWALEnd atomic.Uint64
+
+// legacyLayoutBoundary runs when startup redo reaches the first record at or
+// past legacyLayoutWALEnd (initdb's template1 base/2 → base/1 copy).
+var legacyLayoutBoundary func() error
+
+// SetLegacyLayoutWALEnd records the pre-S3 WAL end for startup redo and the
+// hook to run at the boundary (initdb.Open, before replay). lsn 0 disables
+// the legacy mapping.
+func SetLegacyLayoutWALEnd(lsn uint64, boundary func() error) {
+	legacyLayoutWALEnd.Store(lsn)
+	legacyLayoutBoundary = boundary
 }
 
 // ExportedReplayStart returns the start index (first post-checkpoint record)

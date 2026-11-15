@@ -36,7 +36,7 @@ func TestCrashRecoveryReplaysWALAfterUncleanShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rel := storage.RelFileNode{DBOid: 1, RelOid: 9200, Fork: storage.MainFork}
+	rel := storage.RelFileNode{DBOid: 5, RelOid: 9200, Fork: storage.MainFork}
 
 	// Phase 1: build a populated tree.
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 16})
@@ -128,7 +128,7 @@ func TestCrashRecoveryReplaysChecksummedClusterCleanly(t *testing.T) {
 		t.Fatalf("data_checksum_version = %d, want 1 (checksums not enabled)", ctrl.DataChecksumVersion)
 	}
 
-	rel := storage.RelFileNode{DBOid: 1, RelOid: 9200, Fork: storage.MainFork}
+	rel := storage.RelFileNode{DBOid: 5, RelOid: 9200, Fork: storage.MainFork}
 
 	// Phase 1: build a multi-page tree on the checksum-enabled Manager. Every
 	// WriteBlock here flows through checksummedForWrite, so the runtime pages

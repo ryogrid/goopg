@@ -44,7 +44,7 @@ func TestRuntimeCloseTriggersFinalCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rel := storage.RelFileNode{DBOid: 1, RelOid: 9700, Fork: storage.MainFork}
+	rel := storage.RelFileNode{DBOid: 5, RelOid: 9700, Fork: storage.MainFork}
 
 	// Phase 1: open, create a btree, insert ONE entry, then call
 	// Close without any explicit checkpoint / save. Close must

@@ -366,6 +366,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	if err := migratePostgresCatalogsToBase5(abs); err != nil {
 		return nil, err
 	}
+	// M0149-0001a1 S3: template1 moves from base/2 to base/1 (namespace OIDs
+	// now equal PostgreSQL's database OIDs). Records of the WAL that existed
+	// when the migration started are replayed with the pre-S3 mapping; the
+	// copy runs after them (layout_template1_base1.go).
+	legacyLayoutWALEnd, template1MigrationPending, err := prepareTemplate1Migration(abs)
+	if err != nil {
+		return nil, err
+	}
+	if template1MigrationPending {
+		xlog.SetLegacyLayoutWALEnd(legacyLayoutWALEnd, func() error { return copyTemplate1ToBase1(abs) })
+	}
 
 	slots := opts.PoolSlots
 	if slots <= 0 {
@@ -470,6 +481,21 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	if _, err := xlog.ReplayFromDirWithMgrAtInterruptible(mgr, filepath.Join(abs, "pg_wal"), 0, recov.redoLSN, opts.Interrupted); err != nil {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: wal replay: %w", err)
+	}
+	xlog.SetLegacyLayoutWALEnd(0, nil)
+	if template1MigrationPending {
+		if err := copyTemplate1ToBase1(abs); err != nil {
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: %w", err)
+		}
+		if !recov.crashRecovery {
+			// Clean start: no WAL past the checkpoint, so nothing to cover.
+			if err := finishTemplate1Migration(abs); err != nil {
+				_ = mgr.Close()
+				return nil, fmt.Errorf("goopg: %w", err)
+			}
+			template1MigrationPending = false
+		}
 	}
 
 	// Load (or generate) the cluster system identifier for WAL page headers.
@@ -3074,7 +3100,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// recovered cluster rather than the pre-crash one. No-op for a clean
 	// start (the common path pays nothing).
 	if recov.crashRecovery {
-		endOfRecoveryCheckpoint(rt.Checkpointer, abs)
+		if endOfRecoveryCheckpoint(rt.Checkpointer, abs) && template1MigrationPending {
+			// M0149-0001a1 S3: the checkpoint covers the copied template1.
+			if err := finishTemplate1Migration(abs); err != nil {
+				slog.Warn("template1 layout migration not finished; it resumes at the next start", "err", err)
+			}
+		}
 	}
 
 	// M0131-S17: the cluster is now live — say so in pg_control BEFORE the

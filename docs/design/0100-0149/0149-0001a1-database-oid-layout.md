@@ -1,8 +1,8 @@
 # M0149\-0001a1 — one OID per database on disk, in WAL and on display
 
-Status: S1 and S2 landed 2026\-11\-15 \(postgres catalogs stored and
-WAL\-logged at DBOid 5; postgres displayed as oid 5\). S3 designed and
-probed \(see "S3 design"\); not implemented.
+Status: complete 2026\-11\-15. S1, S2 and S3 landed \(S4 folded into S3\):
+namespace, storage, WAL and displayed database OIDs coincide with PostgreSQL's
+\(template1 1, template0 4, postgres 5\).
 Parent: M0149\-0001a \(template1's PG catalog image\) → M0149\-0001 \(port
 `recovery/t/034_create_database.pl`\).
 
@@ -312,6 +312,75 @@ Key observation: PG compatibility constrains only the **displayed** and
 - PG\-interop e2e and the Recovery ports.
 - spotcheck, sf025 \(the shipped SF0.25 corpus migrates; idempotent\),
   acceptance, fire\-set.
+
+## S3 as landed \(2026\-11\-15, sixth loop\)
+
+- Option C as designed: `catalog.DefaultDBOid = 5` and
+  `catalog.Template1NamespaceDBOid = 1`.
+  - `storage.StorageDBOid` is the identity outside legacy redo.
+  - initdb records `postgres_catalogs_at_base5` and `template1_at_base1` in
+    every new cluster, so neither migration runs on a fresh S3 cluster.
+- **Correction to the S3 design: the legacy map must be idempotent.** The
+  design's map \(1 → 5, 2 → 1\) is not.
+  - A storage access can pass `Canonical\(\)` twice \(a Manager method,
+    then its path helper\), so a template1 record mapped 2 → 1 → 5 and
+    landed in postgres's `base/5`.
+  - Measured: redo failed with "will not overwrite used line pointer 17"
+    on `1663/2/1259`.
+  - The landed map is `1 → 5` only, for records below the legacy WAL end.
+    Legacy template1 records keep naming 2 and replay into the old `base/2`.
+- Migration, in `internal/initdb/layout_template1_base1.go`:
+  1. `prepareTemplate1Migration` runs before redo. It persists the legacy
+     WAL end \(`global/pg_goopg_template1_legacy_wal_end`, the max
+     record EndLSN of `pg_wal`\).
+  2. Redo maps legacy records `1 → 5`.
+  3. `copyTemplate1ToBase1` then replaces `base/1` with `base/2`. It runs
+     after redo, or from the replay loop's boundary hook at the first record
+     at or past the legacy end, which only happens after a crash inside the
+     window. A copy marker stops a restart from copying stale `base/2` over
+     a newer `base/1`.
+  4. `finishTemplate1Migration` runs right away on a clean start, or after a
+     successful end\-of\-recovery checkpoint \(`endOfRecoveryCheckpoint`
+     now reports success\). It writes the feature line and removes `base/2`
+     and the copy marker. The next start removes the legacy\-end marker.
+- Repair of emptied bootstrap catalogs.
+  - A cluster built and used by the S2 binary had template1's
+    `pg_namespace` \(`base/2/2615`\) truncated to 0 bytes after a CREATE
+    TABLE in template1. goopg never read that file; PostgreSQL does.
+  - The copy restores each zero\-length bootstrap relation file \(oid
+    below 16384\) from template0's pristine image \(`base/4`\).
+  - On a fresh S3 cluster the same DDL leaves 2615 intact \(measured\), so
+    the truncation was a pre\-S3 layout artifact. Its writer was not
+    identified \(ledgered\).
+- Measured on a cluster built by the S2 binary:
+  - Setup: postgres `pt` 500 rows, then a checkpoint, then template1 `tt`
+    300 rows; after that 300 more `pt` rows, `pt2`, and 50 more `tt` rows;
+    then kill \-9.
+  - The S3 binary recovers it: `pt` 800 / 320400, `pt2` 42, `tt` 350 /
+    61425. The databases stay isolated, and the result holds over two more
+    restarts. `base/{1,4,5}`; marker files retired.
+  - The S2 binary recovers the same copy too, which confirms the earlier
+    failure was the non\-idempotent map.
+  - A **PG 18.3 cold start on the migrated cluster reads template1's `tt`
+    \(350 / 61425\) and postgres's `pt` / `pt2`**. At HEAD PG cannot open
+    template1.
+- Tests:
+  - `TestTemplate1MigrationIsRestartable` covers prepare, copy, the
+    emptied\-catalog repair, the no\-recopy rule and finish/cleanup.
+  - Seven tests pinned to the old 1\-vs\-5 divergence or to literal base
+    paths were rewritten to assert namespace = storage: catalog real\-pages
+    ×2, optimizer index geometry ×2, initdb features marker, close
+    checkpoint, and recovery.
+- Gates PASS:
+  - units; postmaster; race on storage and xlog;
+  - testport interop, Recovery, pg\_dump, subscription, pgoutput,
+    template1 and CREATE DATABASE: 58;
+  - spotcheck; sf025 99, with plans identical \(the shipped SF0.25 corpus
+    is migrated, `base/{1,4,5}`\); acceptance; fire\-set fires=none on all
+    three corpora \(99/99, 99/99, 22/22\).
+- Left as no\-ops, to delete in a cleanup slice: the `base/1 → base/5`
+  mirror, `NamespaceDBOid`'s `5 → 1` fold, and
+  `PgDatabaseRowOid` / `NamespaceOidForPgDatabaseRow`.
 
 ## Risks
 

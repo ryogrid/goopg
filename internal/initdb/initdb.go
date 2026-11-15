@@ -207,7 +207,8 @@ const goopgFeaturesFile = "global/pg_goopg_features"
 
 func defaultGoopgFeatures() []byte {
 	return []byte(catalog.NullKeyedIndexEntriesFeature + "\n" + storage.HeapLinePointerLifecycleFeature + "\n" +
-		storage.VMWALLoggedFeature + "\n" + clogCompleteHistoryFeature + "\n")
+		storage.VMWALLoggedFeature + "\n" + clogCompleteHistoryFeature + "\n" +
+		PostgresCatalogsAtBase5Feature + "\n" + Template1AtBase1Feature + "\n")
 }
 
 // clogCompleteHistoryFeature says this binary's initdb created the cluster:
@@ -487,7 +488,7 @@ func CreatePerDatabaseScaffolding(dataDir string, dbOID uint32) error {
 	// their OIDs — a documented goopg deviation.) The three system databases
 	// are populated by initdb itself and skip this.
 	switch dbOID {
-	case catalog.DefaultDBOid, template0DbOid, catalog.PostgresDBOid:
+	case template0DbOid, catalog.PostgresDBOid:
 		return nil
 	}
 	return copyBootstrapCatalogImage(dataDir, dbOID)

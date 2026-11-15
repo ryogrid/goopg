@@ -1535,6 +1535,8 @@ heuristic stays live.)
     \(design doc 0149\-0001a1 § "S3 design"\)\.
   - Verification: PG 18\.3 primary → goopg standby; on the primary `\\c template1` + CREATE TABLE + INSERT;
     on the standby postgres' catalogs are unchanged and template1 shows the table\.
+  - 2026\-11\-15: fix landed with M0149\-0001a1 S3 \(DBOid 1 is template1 at every layer; the legacy `1 → 5` map
+    applies only to the migrating cluster's own pre\-S3 WAL\)\. Still open until the verification above runs\.
 - [ ] **M0122\-0008a — apply `pg_db_role_setting` at session start: `ALTER DATABASE / ROLE … SET` never reaches a new connection**
   \(filed 2026\-11\-15 by the loop, found while verifying M0149\-0001a1 S2; below\-item\-10 fallback, not S2: no wrong
   query result, a missing session\-setup step\)\.
@@ -11481,7 +11483,7 @@ verify each at HEAD when the task starts.
       would expose goopg's postgres catalogs as "template1".
     - A storage-only remap is not enough: WAL records carry the
       RelFileNode database OID, so PG replay needs PG's OIDs in the WAL too.
-- [ ] **M0149-0001a1 — one OID per database at every layer: remove the `DefaultDBOid` sentinel \(postgres → 5, template1 → 1\)**
+- [x] **M0149-0001a1 — one OID per database at every layer: remove the `DefaultDBOid` sentinel \(postgres → 5, template1 → 1\)**
   Kind: impl
   Parent: M0149-0001a
   - PG: `template_pg_database.h` Template1DbOid=1; initdb creates template0
@@ -11582,6 +11584,22 @@ verify each at HEAD when the task starts.
     - Next: implement S3 \(diff tmp/m0149-s3-optionC-probe.diff, then the
       migration and the legacy map\).
     Movement: none — tap 034\_create\_database 3/4 \(design only\)
+  - 2026-11-15 S3 landed — task COMPLETE \(design doc § "S3 as landed"\):
+    - `DefaultDBOid = 5`, `Template1NamespaceDBOid = 1`; namespace = storage
+      = WAL = display for template1 / template0 / postgres.
+    - Design correction: the legacy redo map must be idempotent
+      \(Canonical runs twice on one access\). Landed `1 → 5` only; legacy
+      template1 records replay into base/2, which is copied to base/1 after
+      legacy redo \(copy marker; feature after the end-of-recovery
+      checkpoint\).
+    - S2-binary cluster killed with a WAL tail in both databases: S3
+      recovers both exactly \(800/320400, 350/61425\), isolated, over two
+      restarts; PG 18.3 cold start on it reads template1 and postgres.
+    - Emptied template1 bootstrap catalogs \(pg\_namespace 0 bytes in a
+      pre-S3 base/2\) are restored from template0 during the copy.
+    - Gates: units, postmaster, race \(storage, xlog\), testport 58,
+      spotcheck, sf025 99, acceptance, fire-set fires=none ×3.
+    Movement: none — tap 034\_create\_database 3/4 \(PG now opens template1 on goopg data; the mixed run needs the 0001b harness\)
 - [ ] **M0149-0001b — Go `Cluster.pm`-equivalent harness for single-node ports \(goopg and PG 18.3 nodes behind one API\)**
   Kind: impl
   Parent: M0149-0001

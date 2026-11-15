@@ -7,6 +7,7 @@ package storage
 import (
 	"encoding/binary"
 	"fmt"
+	"sync/atomic"
 )
 
 // BlockSize is the fixed page size, matching upstream's BLCKSZ
@@ -82,18 +83,33 @@ type RelFileNode struct {
 
 // StorageDBOid maps a relation's database OID to the OID its files live
 // under and its WAL block references name — the PostgreSQL database OID.
-// goopg's catalog namespace for the `postgres` database is the legacy
-// sentinel 1 (catalog.DefaultDBOid), while PG stores postgres at base/5
-// (catalog.PostgresDBOid) and uses 1 for template1: every relation written
-// under 1 is postgres', so it lives in base/5 and its WAL says 5. Defined
-// here with literal OIDs because storage cannot import catalog. M0149-0001a1
-// S1 (docs/design/0100-0149/0149-0001a1-database-oid-layout.md).
+//
+// Since M0149-0001a1 S3 goopg's catalog namespace OIDs ARE PostgreSQL's
+// database OIDs (postgres 5, template1 1, template0 4), so the mapping is the
+// identity. The one exception is startup redo of WAL written before S3
+// (legacyRedoDBOidMap, switched per record by the replay loop): such records
+// may name the pre-S1 postgres catalog store 1, now at 5. Their template1
+// records name 2 and replay into template1's old directory base/2, which the
+// layout migration then copies to base/1 (initdb migrateTemplate1ToBase1).
+// The mapping must stay idempotent: a storage access can pass through it more
+// than once (a Manager method and its path helper). S1/S3 design:
+// docs/design/0100-0149/0149-0001a1-database-oid-layout.md.
 func StorageDBOid(dbOid uint32) uint32 {
-	if dbOid == 1 {
+	if dbOid == 1 && legacyRedoDBOidMap.Load() {
 		return 5
 	}
 	return dbOid
 }
+
+// legacyRedoDBOidMap is on only while startup redo applies a record written
+// before the M0149-0001a1 S3 layout migration. Startup redo runs before the
+// buffer pool exists and is single-threaded, so every storage access in that
+// window is the record's own.
+var legacyRedoDBOidMap atomic.Bool
+
+// SetLegacyRedoDBOidMap switches StorageDBOid's pre-S3 WAL mapping (1 → 5).
+// Only the startup replay loop calls it.
+func SetLegacyRedoDBOidMap(on bool) { legacyRedoDBOidMap.Store(on) }
 
 // Canonical returns rel with its database OID mapped by StorageDBOid: the
 // identity every storage entry point (buffer tags, smgr files, WAL block

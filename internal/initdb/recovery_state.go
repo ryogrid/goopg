@@ -170,12 +170,14 @@ func clearRelcacheInitFiles(dataDir string) {
 // A failure here is logged rather than fatal: replay itself already
 // succeeded and the data files are consistent, so refusing to start would
 // deny service over bookkeeping that the next checkpoint redoes anyway.
-func endOfRecoveryCheckpoint(cp *xlog.Checkpointer, dataDir string) {
+func endOfRecoveryCheckpoint(cp *xlog.Checkpointer, dataDir string) bool {
 	if cp == nil {
-		return
+		return false
 	}
 	if err := cp.CheckpointNow(); err != nil {
 		slog.Warn("end-of-recovery checkpoint failed; recovery is complete but pg_control still points at the pre-crash checkpoint",
 			"dataDir", dataDir, "err", err)
+		return false
 	}
+	return true
 }
