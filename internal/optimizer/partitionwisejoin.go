@@ -173,7 +173,7 @@ func (s *searchCtx) appendChildRel(parent *RelOptInfo, member Node, restrict *Fi
 	cinfo := pinfo
 	cinfo.table = tbl
 	cinfo.appendrel = false
-	cinfo.baseRows = tableRows(tbl)
+	cinfo.baseRows = childRelTuples(member, tbl)
 	cinfo.localFilter = memberLocalFilter(member)
 	cinfo.hasLocalFilter = cinfo.localFilter != nil
 	p := newPrebuiltPath(rel, member)
@@ -187,6 +187,52 @@ func (s *searchCtx) appendChildRel(parent *RelOptInfo, member Node, restrict *Fi
 	}
 	setCheapest(rel)
 	return rel, fill
+}
+
+// childScanRows is a child rel's tuple count as set_append_rel_size sizes
+// each member: its own scan's estimate_rel_size (with the 10-page floor for a
+// never-vacuumed, empty-looking partition), as a single-leaf base rel is sized
+// (cardinality.go). The raw pg_class count (tableRows) is 0 for such a
+// partition and priced its index paths as if it held one row, where PG prices
+// the 10-page estimate (M0148-0001c3a10 slice 6, regress aggregates' p_t1).
+func childScanRows(member Node, tbl *catalog.Table) int64 {
+	if scan := leafBaseScan(memberScanRoot(member)); scan != nil {
+		if r := EstimateRows(scan); r >= 1 {
+			return r
+		}
+	}
+	if r := tableRows(tbl); r >= 1 {
+		return r
+	}
+	return 1
+}
+
+// membersCarryFilters reports whether any appendrel member's scan already
+// carries a local filter.
+func membersCarryFilters(so *SetOp) bool {
+	for _, m := range unionAllMembers(so) {
+		if memberLocalFilter(m) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// childRelTuples is the tuple count the child producers price with. An
+// unrestricted child (slice 6: an ordering-only child rel) takes PG's
+// estimate_rel_size (childScanRows). A restricted one keeps the pg_class
+// count slices 1-5 priced with: moving it to the scan estimate exposes a
+// missing child index-only path for boolean-column quals (regress inherit's
+// bool_rp: `Filter: b` instead of `Index Cond: (b = true)`), which turns
+// PG's Index Only Scans into Seq Scans (ledgered).
+func childRelTuples(member Node, tbl *catalog.Table) int64 {
+	if len(extractFilterConjuncts(memberScanRoot(member))) == 0 {
+		return childScanRows(member, tbl)
+	}
+	// Unclamped, as slices 1-5 passed it: a zero count makes the child's seq
+	// scan cost fall back to the scan's own page estimate
+	// (baseSeqScanCostInputs); the index producers clamp to one row.
+	return tableRows(tbl)
 }
 
 // addChildIndexPaths runs the base-rel index producers over a child rel
@@ -203,7 +249,7 @@ func (s *searchCtx) addChildIndexPaths(rel *RelOptInfo, tbl *catalog.Table) {
 	if _, _, ok := scanLeafFor(rel.baseLeaf); !ok {
 		return
 	}
-	relTuples := float64(tableRows(tbl))
+	relTuples := float64(childRelTuples(rel.baseLeaf, tbl))
 	if relTuples < 1 {
 		relTuples = 1
 	}
@@ -302,19 +348,26 @@ func (s *searchCtx) addAppendRelChildPaths(cat catalog.Catalog) {
 			continue
 		}
 		so, f := appendRelLeaf(rel)
-		// Only an appendrel with a restriction: the slice is the WHERE quals
-		// reaching the partitions' indexes. Without one, the children's
-		// ordering-only index paths can undercut a seq scan on goopg's cost
-		// model where PG keeps the seq scan (regress aggregates' p_t1);
-		// ordered child paths belong with Merge Append (ledgered).
-		if f == nil || f.Predicate == nil {
+		// Without a restriction the child rels only matter for an ordering:
+		// slice 6 files just the ordered Append / Merge Append over them, so
+		// they compete with the Sort over the appendrel as PG's
+		// generate_orderedappend_paths do. The unordered Append over the
+		// children's cheapest paths is filed only with a restriction — an
+		// unrestricted one would let the children's ordering-only index
+		// paths undercut the appendrel's seq scans on goopg's cost model
+		// where PG keeps them (regress aggregates' p_t1).
+		unrestricted := f == nil || f.Predicate == nil
+		if unrestricted && (len(s.queryPathkeys) == 0 || membersCarryFilters(so)) {
+			// Members whose scans already carry the WHERE quals (pushed
+			// down before the search) are a restricted appendrel without
+			// the parent Filter slices 1-5 key on; they stay whole.
 			continue
 		}
 		// A correlated restriction (a sublink body's qual reading the outer
 		// row) stays on the appendrel: PG plans those statements as semi /
 		// anti joins, and per-member copies of a SubPlan's parameterised
 		// qual only multiply the divergence (regress partition_join).
-		if exprHasOuterRef(f.Predicate) {
+		if !unrestricted && exprHasOuterRef(f.Predicate) {
 			continue
 		}
 		members := unionAllMembers(so)
@@ -343,11 +396,13 @@ func (s *searchCtx) addAppendRelChildPaths(cat catalog.Catalog) {
 		if !ok {
 			continue
 		}
-		pa := newPartitionwiseAppendPath(rel, children, s.cp)
-		pa.pwParents = []*SetOp{so}
-		pa.pwFills = fills
-		addPath(rel, pa, "appendrel-children")
-		s.addOrderedAppendRelChildPath(rel, so, ps, childRels, fills)
+		if !unrestricted {
+			pa := newPartitionwiseAppendPath(rel, children, s.cp)
+			pa.pwParents = []*SetOp{so}
+			pa.pwFills = fills
+			addPath(rel, pa, "appendrel-children")
+		}
+		s.addOrderedAppendRelChildPath(rel, so, ps, childRels, fills, unrestricted)
 		setCheapest(rel)
 	}
 }
@@ -362,7 +417,13 @@ func (s *searchCtx) addAppendRelChildPaths(cat catalog.Catalog) {
 // path declines the whole Append, as PG would need a Merge Append or a Sort
 // there (M0148-0001c3a10 slice 3). This is what PG's per-partition min / max
 // rides: `Limit -> Append -> Index Only Scan Backward … (c = 3)`.
-func (s *searchCtx) addOrderedAppendRelChildPath(rel *RelOptInfo, so *SetOp, ps *partScheme, childRels []*RelOptInfo, fills []map[int]Expr) {
+//
+// For an unrestricted appendrel (slice 6) only the Merge Append arm runs: the
+// partitions-ordered plain Append over full index scans is
+// addOrderedPartitionAppendPaths' (orderedpartitionappend.go), which already
+// files PG's Index Only Scans there; a child rel's full index-only scan
+// carries no ordering yet (ledgered).
+func (s *searchCtx) addOrderedAppendRelChildPath(rel *RelOptInfo, so *SetOp, ps *partScheme, childRels []*RelOptInfo, fills []map[int]Expr, unrestricted bool) {
 	qk := s.queryPathkeys
 	if len(qk) == 0 || len(ps.keyPos) == 0 {
 		return
@@ -383,6 +444,9 @@ func (s *searchCtx) addOrderedAppendRelChildPath(rel *RelOptInfo, so *SetOp, ps 
 		for _, keys := range childOrderingPrefixes(childRels, qk) {
 			s.addMergeAppendRelChildPaths(rel, so, childRels, fills, keys)
 		}
+		return
+	}
+	if unrestricted {
 		return
 	}
 	backward := !qk[0].SortAsc

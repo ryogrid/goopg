@@ -13191,6 +13191,22 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Resume: plain Append for non-interleaved LIST partitions
       \(partitions\_are\_ordered\); sorted children under the ordered plain
       Append; multi-relation problems \(joins\).
+  - 2026-11-15 slice 6 LANDED: unrestricted partitioned tables with a query
+    ordering get child rels and the Merge Append arm \(no unordered Append\);
+    unrestricted child rels are sized by estimate\_rel\_size
+    \(childScanRows\).
+    - Gate finding, fixed in the same commit: INSERT … ON CONFLICT routed
+      to a partition filed the row twice in the leaf's arbiter index
+      \(skipOID was the parent's; arbiterIndexOIDOn\). It was a wrong-results
+      bug for every index scan of that leaf; isolation
+      partition-key-update-2/3 exposed it; TestPartitionedUpsertSingleArbiterEntry.
+    Movement: yes — regress inherit 692→690 \(inventory re-measured on this
+    build; same-suite A/B 707→705\); aggregates and the other suite cases
+    unchanged
+    - Resume: ordering on a child rel's full index-only scan \(PG's Index
+      Only Scan children\); restricted child sizing after the boolean
+      index-only clause gap \(bool\_rp\); LIST partitions\_are\_ordered;
+      joins.
 - [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
   (NULL-keyed entries)**.
   Kind: impl

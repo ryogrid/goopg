@@ -186,6 +186,53 @@ Status: slices 1\-3 landed 2026\-11\-15. Parent: M0148\-0001c3a5.
   `b = 'v12'`\) is not dropped from the query pathkeys. PG drops it, so its
   index path delivers the ordering. This also happens on plain tables.
 
+## Slice 6 — unrestricted ordered appendrels \(landed\)
+
+- A partitioned table with no WHERE but a query ordering now gets child rels
+  too \(`addAppendRelChildPaths`\). Only the Merge Append arm is filed over
+  them. The unordered Append over the children's cheapest paths stays
+  restricted\-only, because unrestricted ordering\-only child index paths
+  would undercut the seq scans \(regress aggregates' p\_t1\).
+  - The partitions\-ordered plain Append stays with
+    `addOrderedPartitionAppendPaths` \(orderedpartitionappend.go\). That
+    producer already files PG's Index Only Scans, while a child rel's full
+    index\-only scan carries no ordering yet \(regress inherit's
+    range\_parted\).
+  - Members whose scans already carry the WHERE quals
+    \(`membersCarryFilters`\) are restricted appendrels without the parent
+    Filter. They stay whole, as in slices 1\-5.
+- Sizing: an unrestricted child rel is sized by its scan's
+  estimate\_rel\_size, with the 10\-page floor \(`childScanRows`\), as
+  set\_append\_rel\_size sizes a member. pg\_class's count of 0 for a
+  never\-vacuumed partition priced its index paths as one row, which made
+  the Merge Append beat PG's HashAggregate on aggregates' p\_t1.
+  - Restricted child rels keep the pg\_class count \(`childRelTuples`\).
+    Moving them exposes a missing child index\-only path for boolean\-column
+    quals \(bool\_rp: `Filter: b` against PG's `Index Cond: (b = true)`\).
+- Executor fix found by the gates: an `INSERT … ON CONFLICT` routed to a
+  partition wrote the row twice into the leaf's arbiter index.
+  - Cause: the non\-arbiter maintenance skipped the parent's arbiter OID,
+    while `maintainArbiter` had written the leaf's matching index
+    \(`arbiterIndexOIDOn`, operators\_upsert.go\).
+  - Effect: every index scan of that leaf returned the row twice. Isolation
+    partition\-key\-update\-2 / 3 caught it once `SELECT * FROM foo ORDER BY
+    a` became a Merge Append of index scans.
+  - Pinned by `TestPartitionedUpsertSingleArbiterEntry`.
+- Witnesses \(`tmp/c3a10s6.sql`\): ordered RANGE Append, default\-partition
+  Merge Append with and without LIMIT, min/max, a GroupAggregate over the
+  merge, and Sort / Append where PG keeps them. All match PG 18.3;
+  `TestUnrestrictedMergeAppendRelChildPaths`.
+- Regress: inherit 707→705 in the same\-suite run, 692→690 standalone. The
+  mclparted / bool\_lp `Merge Append` headers now match; their children are
+  Index Scan where PG has Index Only Scan.
+
+### Not covered by slice 6
+
+- A child rel's full index\-only scan has no pathkeys, so unrestricted
+  ordered children are Index Scans where PG uses Index Only Scans.
+- Restricted child rels are still sized from pg\_class until the boolean
+  index\-only clause gap is closed.
+
 ## Not covered
 
 - Multi\-relation problems: inside a join the Append's columns still reach

@@ -660,6 +660,27 @@ func (o *upsertOp) routeAndOpenLeaf(inserted Row) (*catalog.Table, *nbtree.BTree
 	return leaf, tree, nil
 }
 
+// arbiterIndexOIDOn is the OID of the index on tbl that maintainArbiter
+// writes: the planner's arbiter itself, or — when the row was routed to a
+// leaf partition (routeAndOpenLeaf swaps arbiterTree to the leaf's matching
+// index) — that leaf index. The non-arbiter maintenance skips it; skipping
+// the parent's OID instead filed every routed ON CONFLICT row twice in the
+// leaf's arbiter index, and an index scan then returned the row twice
+// (isolation partition-key-update-2/3; M0148-0001c3a10 slice 6). 0 when there
+// is no arbiter, or the leaf has no matching index (nothing was written).
+func (o *upsertOp) arbiterIndexOIDOn(tbl *catalog.Table) uint32 {
+	if o.plan.OnConflict == nil || o.plan.OnConflict.ArbiterIndex == nil {
+		return 0
+	}
+	if tbl == nil || o.plan.Table == nil || tbl.OID == o.plan.Table.OID {
+		return o.plan.OnConflict.ArbiterIndex.OID
+	}
+	if leafIdx := o.resolveLeafArbiter(tbl); leafIdx != nil {
+		return leafIdx.OID
+	}
+	return 0
+}
+
 // resolveLeafArbiter finds the leaf-partition index whose column list
 // (and primary/unique flag) matches the parent's planner-resolved
 // arbiter index.  M0100-0005t.
@@ -1091,11 +1112,7 @@ func (o *upsertOp) applyInsert(rel storage.RelFileNode, tbl *catalog.Table, cols
 	// skipping it here prevents double-insertion and expression re-evaluation.
 	// Capture each index's key so the DO UPDATE retry can reuse it without
 	// re-evaluating a side-effectful expression index. M0100-0006b.
-	var arbiterOID uint32
-	if o.plan.OnConflict != nil && o.plan.OnConflict.ArbiterIndex != nil {
-		arbiterOID = o.plan.OnConflict.ArbiterIndex.OID
-	}
-	o.specIndexKeys = o.maintainNonArbiterIndexesCapture(tbl, cols, insertedLeaf, ptr, arbiterOID)
+	o.specIndexKeys = o.maintainNonArbiterIndexesCapture(tbl, cols, insertedLeaf, ptr, o.arbiterIndexOIDOn(tbl))
 	o.specInsertedLeaf = insertedLeaf
 	return ptr, nil
 }
@@ -1206,7 +1223,7 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 			return err
 		}
 		_ = o.maintainArbiter(key, newPtr)
-		o.maintainNonArbiterIndexesForUpdate(tbl, cols, updatedLeaf, newPtr, o.plan.OnConflict.ArbiterIndex.OID)
+		o.maintainNonArbiterIndexesForUpdate(tbl, cols, updatedLeaf, newPtr, o.arbiterIndexOIDOn(tbl))
 	} else {
 		// No explicit arbiter: maintain all indexes, reusing speculative keys
 		// where the indexed columns are unchanged. M0097-0028 / M0100-0006b.

@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -317,6 +318,91 @@ func TestMergeAppendRelChildPaths(t *testing.T) {
 		{"select max(a), min(a) from qd where c = 3", "11994|3"},
 		{"select a from ql where b = 'v12' order by a limit 2", "12;1012"},
 		{"select a from ql where b = 'v12' order by a desc limit 3", "9012;8012;7012"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}
+
+// TestUnrestrictedMergeAppendRelChildPaths is M0148-0001c3a10 slice 6: a
+// partitioned table with no WHERE but an ORDER BY its partitions are not
+// ordered on (here a default partition) gets the Merge Append of the
+// children's index paths — PG 18.3's plans below — while an ordering no child
+// index delivers keeps the Sort over the Append.
+func TestUnrestrictedMergeAppendRelChildPaths(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	for _, s := range []string{
+		"create table ue (a int NOT NULL, b text NOT NULL) partition by range (a)",
+		"create table ue_1 partition of ue for values from (0) to (5000)",
+		"create table ue_2 partition of ue for values from (5000) to (10000)",
+		"create table ue_def partition of ue default",
+		"create index on ue (a)",
+		"insert into ue select i, 'v' || (i % 1000) from generate_series(0, 11999) i",
+		"vacuum ue_1", "vacuum ue_2", "vacuum ue_def",
+		"analyze ue",
+	} {
+		runSQL(t, ctx, s)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	back := "->  Index Only Scan Backward using ue_1_a_idx on ue_1\n%s->  Index Only Scan Backward using ue_2_a_idx on ue_2\n" +
+		"%s->  Index Only Scan Backward using ue_def_a_idx on ue_def ue_3"
+	ind := func(n int) string { return strings.Repeat(" ", n) }
+	for _, c := range []struct{ q, plan string }{
+		{"select * from ue order by a limit 5",
+			"Limit\n  ->  Merge Append\n        Sort Key: ue.a\n" +
+				"        ->  Index Scan using ue_1_a_idx on ue_1\n        ->  Index Scan using ue_2_a_idx on ue_2\n" +
+				"        ->  Index Scan using ue_def_a_idx on ue_def ue_3"},
+		{"select a from ue order by a desc limit 3",
+			"Limit\n  ->  Merge Append\n        Sort Key: ue.a DESC\n" + ind(8) + fmt.Sprintf(back, ind(8), ind(8))},
+		{"select max(a) from ue",
+			"Result\n  InitPlan 1\n    ->  Limit\n          ->  Merge Append\n                Sort Key: ue.a DESC\n" + ind(16) + fmt.Sprintf(back, ind(16), ind(16))},
+		{"select * from ue order by b limit 5",
+			"Limit\n  ->  Sort\n        Sort Key: ue.b\n        ->  Append\n              ->  Seq Scan on ue_1\n" +
+				"              ->  Seq Scan on ue_2\n              ->  Seq Scan on ue_def ue_3"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps)), "\n"); got != c.plan {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.plan)
+		}
+	}
+	for _, c := range []struct{ q, rows string }{
+		{"select * from ue order by a limit 3", "0|v0;1|v1;2|v2"},
+		{"select a from ue order by a desc limit 3", "11999;11998;11997"},
+		{"select max(a), min(a) from ue", "11999|0"},
+		{"select count(*), sum(a) from (select a from ue order by a) s", "12000|71994000"},
+	} {
+		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
+		}
+	}
+}
+
+// TestPartitionedUpsertSingleArbiterEntry: an INSERT … ON CONFLICT routed to a
+// partition files the row once in the leaf's arbiter index. The non-arbiter
+// maintenance skipped the PARENT's arbiter OID, so the leaf's own copy of
+// that index got a second entry, and an index scan returned the row twice
+// (isolation partition-key-update-2/3 under the slice-6 Merge Append).
+func TestPartitionedUpsertSingleArbiterEntry(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	for _, s := range []string{
+		"create table uz (a int primary key, b text) partition by list (a)",
+		"create table uz1 partition of uz for values in (1)",
+		"create table uz2 partition of uz for values in (2)",
+		"insert into uz values (1, 'x') on conflict do nothing",
+		"insert into uz values (1, 'y') on conflict do nothing",
+		"insert into uz values (2, 'u') on conflict (a) do update set b = 'v'",
+		"insert into uz values (2, 'u') on conflict (a) do update set b = 'w'",
+	} {
+		runSQL(t, ctx, s)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	ps.EnableSeqScan = false
+	for _, c := range []struct{ q, rows string }{
+		{"select * from uz1 where a = 1", "1|x"},
+		{"select * from uz2 where a = 2", "2|w"},
+		{"select * from uz order by a", "1|x;2|w"},
 	} {
 		if got := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";"); got != c.rows {
 			t.Errorf("%s: rows %q, want %q", c.q, got, c.rows)
