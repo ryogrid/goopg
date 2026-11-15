@@ -22,6 +22,12 @@ must-pass `TestPort_*` Go test against goopg **and against real PostgreSQL
 implements that feature first, as an implementation child of the test task.
 Discovery of a gap is never completion.
 
+M0149 also **re-implements the nine shortcut ports** already `port` at
+filing (recovery 001, 013, 019, 038, 039, 047; subscription 001, 004, 026;
+owner decision 2026-11-15): each gets a re-port task (`M0149-0075` …
+`M0149-0083`) that brings it up to the same contract. M0149 therefore has
+83 top-level tasks: 74 ports + 9 re-ports.
+
 goopg's claim is drop-in PostgreSQL compatibility. For replication and
 recovery that claim is only true if a goopg node can stand in for a PG 18.3
 node in any position of a replication topology and if every file goopg writes
@@ -33,7 +39,7 @@ subscription suites the proof of that claim.
 **A port that only works goopg↔goopg, or that passes because goopg reads and
 writes a goopg-private format, does NOT count as ported.** The inventory row
 stays non-`port` and the task stays open until the contract below holds for
-everything the upstream test exercises.
+everything the upstream test exercises — except the nine shortcut rows under re-port tasks M0149-0075…0083, which stay `port` until their re-port closes.
 
 ### C1. Wire protocol — byte-compatible with PG 18.3
 
@@ -85,9 +91,8 @@ everything the upstream test exercises.
   state) — readable by PG 18.3 `pg_controldata`.
 - Signal files exactly as PG names and interprets them: `standby.signal`,
   `recovery.signal`, and the promote trigger `promote` (`PROMOTE_SIGNAL_FILE`
-  in `src/include/access/xlog.h`). Example of a current deviation to
-  verify: `internal/initdb/standby.go` defines `PromoteSignalFile =
-  "promote.signal"`.
+  in `src/include/access/xlog.h`). goopg's trigger file is `promote`
+  (`internal/initdb/standby.go` `PromoteSignalFile`, fixed 2026-11-15).
 - `postgresql.auto.conf` / `primary_conninfo` as written by PG 18.3
   `pg_basebackup -R`.
 - Replication-slot state `pg_replslot/<slot>/state`
@@ -102,7 +107,8 @@ everything the upstream test exercises.
 ### C3. Mixed-topology verification against real PG 18.3
 
 Every ported test runs its upstream topology all-goopg **and** at least one
-mixed variant using PG 18.3 nodes from `postgres/local_install/bin`
+mixed variant using PG 18.3 nodes from `postgres/local_install/bin` (or, for
+tests needing PG-side test modules, the private PG 18.3 build below)
 (`internal/testutil/pgcluster`, `internal/testutil/pubsubcluster`; earlier
 heterogeneous precedents: `e2e_failover_goopg_to_pg_test.go`,
 `e2e_pg183_standby_full_cycle_test.go`,
@@ -126,19 +132,36 @@ heterogeneous precedents: `e2e_failover_goopg_to_pg_test.go`,
 - Client tools the upstream test invokes (`pg_basebackup`, `pg_recvlogical`,
   `pg_receivewal`, `pg_ctl`, `pg_resetwal`, …) are the PG 18.3 binaries,
   never goopg re-implementations, wherever they act on a goopg node.
-- A step that cannot be mixed **by upstream construction** is listed with
-  its reason in the task's design doc; all other steps still run mixed.
-  - `injection_points`: the `local_install` PG build has no
-    `USE_INJECTION_POINTS` (not configured with
-    `--enable-injection-points`), so injection-point steps **cannot** run on
-    the PG node — they run on goopg nodes only.
-  - A PG-side contrib module that `local_install` lacks (e.g.
-    `test_decoding`) is built out-of-tree into a private prefix
-    (e.g. `tmp/pg183-extra/`) — **never into `./postgres/`** — and loaded by
-    pointing the PG node's `dynamic_library_path` GUC at it (plus PG 18's
-    `extension_control_path` when the test runs `CREATE EXTENSION`). If that
-    is impossible, escalate to the owner instead of dropping the mixed
-    variant.
+- **PG-side test modules are built by the loop.** The pieces
+  `local_install` lacks — `contrib/test_decoding`,
+  `src/test/modules/injection_points`, and a PG 18.3 server built with
+  `--enable-injection-points` (`local_install` was configured with only
+  `--enable-cassert --enable-tap-tests`, so it has no
+  `USE_INJECTION_POINTS`) — are built by a one-time M0149 child task,
+  "build the PG 18.3 test-module toolchain", filed under `M0149-0034`, the
+  first task in the queue that needs them:
+  - Source: a copy of `./postgres` —
+    `mkdir -p tmp/pg183-src && git -C postgres archive HEAD | tar -x -C tmp/pg183-src`.
+    `./postgres` is read-only and already configured in-tree, so a VPATH
+    build from it fails.
+  - Build, in `tmp/pg183-src`:
+    `./configure --enable-cassert --enable-tap-tests --enable-injection-points --prefix=$PWD/../pg183-inj`
+    (or an absolute `tmp/pg183-inj` path), then `make`, `make install`,
+    `make -C contrib/test_decoding install`,
+    `make -C src/test/modules/injection_points install`. **Do not reuse the
+    `--prefix` from `pg_config --configure`** — it points at
+    `postgres/local_install`. Everything installs into the one private
+    prefix, so no `dynamic_library_path` / `extension_control_path` change
+    is needed.
+  - **Never modify `./postgres` or `postgres/local_install`.**
+  - If `M0149-0034` is ever `[!]`, re-parent the toolchain child to
+    `M0149-0035` (a held root holds its children).
+  - Mixed runs of tests that need these modules use that build for their PG
+    nodes. Injection-point and `test_decoding` steps run mixed like every
+    other step — there is no goopg-only allowance for them.
+- The only step allowed to stay un-mixed is one escalated under C4's
+  architecture escape hatch (`[!] blocked-on owner: architecture`), with the
+  design doc's analysis.
 
 ### C4. Port fidelity
 
@@ -152,7 +175,7 @@ heterogeneous precedents: `e2e_failover_goopg_to_pg_test.go`,
 - Adaptations of the kind used by earlier ports — driving pgoutput
   in-process instead of over a subscription connection, substituting a
   whole-server SIGKILL for a backend crash-restart, dropping an injection
-  point step — are **not** ports under M0149. They mark a missing feature,
+  point step — are **not** ports under M0149 — except the nine shortcut rows under re-port tasks M0149-0075…0083, which stay `port` until their re-port closes. They mark a missing feature,
   which becomes an implementation child.
 - **Architecture escape hatch.** A step that requires a change to goopg's
   process model (per-backend OS processes, SysV shared memory) is escalated
@@ -160,8 +183,10 @@ heterogeneous precedents: `e2e_failover_goopg_to_pg_test.go`,
   analysis; the loop does not substitute and does not keep filing.
 - **Never `kill()` a goopg "backend pid".** `pg_backend_pid()` on goopg is
   a synthetic per-connection number (`internal/executor/expr.go`), not an
-  OS PID. Upstream steps that `pg_ctl kill` / `kill` a backend PID
-  (`017_shm`, `022_crash_temp_files`, `041_checkpoint_at_promote`) fall
+  OS PID (nor is goopg's `pg_stat_activity.pid`). Upstream steps that
+  `pg_ctl kill` / `kill` a backend, walsender or walreceiver PID
+  (`013_crash_restart` QUIT/KILL, `017_shm`, `019_replslot_limit` STOP/CONT,
+  `022_crash_temp_files`, `041_checkpoint_at_promote`) fall
   under the escape hatch above; SQL-level uses of the value
   (`pg_cancel_backend`, `pg_stat_activity.pid` filters, as in
   `037_invalid_database` and `048_vacuum_horizon_floor`) are fine.
@@ -181,7 +206,8 @@ heterogeneous precedents: `e2e_failover_goopg_to_pg_test.go`,
 
 1. **One task per upstream test.** `M0149-0001` … `M0149-0074` in
    `.ralph/fix_plan.md`, in the canonical queue order below, each
-   `Kind: impl`, `Parent: none`.
+   `Kind: impl`, `Parent: none`; plus one re-port task per shortcut port,
+   `M0149-0075` … `M0149-0083` (see "Re-port of the nine shortcut ports").
 2. **Start of a task.** Read the `.pl` end to end and the PG 18.3 code it
    exercises; verify the entry's "Likely prerequisites" hint at HEAD (it is
    a filing-time hint, not a finding); run whatever of the test is already
@@ -241,7 +267,7 @@ In the **same commit** that lands a passing port:
 4. If the test appears in `ci/batch/expected-failures.csv`, delete its row.
 
 A port whose row is not promoted is not complete; a promoted row whose test
-violates C1–C3 is a defect.
+violates C1–C3 is a defect — except the nine shortcut rows under re-port tasks M0149-0075…0083, which stay `port` until their re-port closes.
 
 ## Design-doc rule
 
@@ -263,7 +289,10 @@ then logical decoding on the recovery side, then subscriptions (basic apply
 cross-cutting tests. Earlier tiers build the substrate (harness methods,
 archiver, timelines, `test_decoding`, `injection_points`, wire subscription
 apply) that later tiers reuse. IDs are assigned in this order and never
-renumbered.
+renumbered. The nine re-port tasks (`M0149-0075` … `M0149-0083`, filed
+2026-11-15) are the bulleted blocks between tiers: each sits right after the
+tier whose substrate it needs. File order in `.ralph/fix_plan.md` is the
+binding queue order.
 
 **Tier 1 — single-node crash recovery and on-disk formats**
 
@@ -276,6 +305,12 @@ renumbered.
 7. `M0149-0007` — `recovery/t/029_stats_restart.pl`
 8. `M0149-0008` — `recovery/t/017_shm.pl`
 
+**Re-ports after Tier 1** (need the backend crash-restart child of
+`M0149-0004` and single-node WAL-format work)
+
+- `M0149-0075` — re-port `recovery/t/013_crash_restart.pl`
+- `M0149-0076` — re-port `recovery/t/039_end_of_wal.pl`
+
 **Tier 2 — physical streaming standby, promotion, replay correctness**
 
 9. `M0149-0009` — `recovery/t/008_fsm_truncation.pl`
@@ -287,6 +322,10 @@ renumbered.
 15. `M0149-0015` — `recovery/t/012_subtransactions.pl`
 16. `M0149-0016` — `recovery/t/009_twophase.pl`
 17. `M0149-0017` — `recovery/t/026_overwrite_contrecord.pl`
+
+**Re-port after Tier 2** (needs physical streaming and cascading)
+
+- `M0149-0077` — re-port `recovery/t/001_stream_rep.pl`
 
 **Tier 3 — WAL archiving, archive recovery, PITR**
 
@@ -324,6 +363,11 @@ injection points**
 38. `M0149-0038` — `recovery/t/046_checkpoint_logical_slot.pl`
 39. `M0149-0039` — `recovery/t/035_standby_logical_decoding.pl`
 
+**Re-port after Tier 6** (needs `injection_points` from `M0149-0034` and
+the checkpoint/slot injection points of `M0149-0038`)
+
+- `M0149-0079` — re-port `recovery/t/047_checkpoint_physical_slot.pl`
+
 **Tier 7 — subscription apply over the wire (basics)**
 
 40. `M0149-0040` — `subscription/t/003_constraints.pl`
@@ -343,6 +387,16 @@ injection points**
 54. `M0149-0054` — `subscription/t/032_subscribe_use_index.pl`
 55. `M0149-0055` — `subscription/t/034_temporal.pl`
 56. `M0149-0056` — `subscription/t/035_conflicts.pl`
+
+**Re-ports after Tier 7** (need wire-level subscription apply and
+tablesync)
+
+- `M0149-0080` — re-port `subscription/t/001_rep_changes.pl`
+- `M0149-0081` — re-port `subscription/t/004_sync.pl`
+- `M0149-0082` — re-port `subscription/t/026_stats.pl`
+- `M0149-0083` — re-port `recovery/t/038_save_logical_slots_shutdown.pl`
+- `M0149-0078` — re-port `recovery/t/019_replslot_limit.pl` (uses
+  `CREATE SUBSCRIPTION` / `wait_for_subscription_sync`)
 
 **Tier 8 — permissions, row filters, column lists, partitions, origins**
 
@@ -384,22 +438,44 @@ injection points**
 
 All paths above are relative to `postgres/src/test/`.
 
-## Out of scope / known gap
+## Re-port of the nine shortcut ports (owner decision 2026-11-15)
 
 The nine rows already `port` at filing (recovery 001, 013, 019, 038, 039,
-047; subscription 001, 004, 026) are not M0149 tasks. Several of them are
-adaptations that would not satisfy C3/C4 (the subscription ports drive
-pgoutput in-process; `013` substitutes a whole-server SIGKILL for a backend
-crash-restart; `047` omits its injection point). M0149 does not reopen them
-without an owner decision; when an M0149 child lands the missing feature
-(e.g. `injection_points`, wire-level subscription apply), the child's design
-doc notes which of these ports could now be made faithful.
+047; subscription 001, 004, 026) are **in scope** as re-port tasks
+`M0149-0075` … `M0149-0083`. Each existing `TestPort_*` func was audited
+against C1–C4 at filing; the concrete deviations are recorded on each
+task's "Current shortcut (audit)" line. Common to all nine: no mixed PG 18.3
+variant, and most upstream assertions are dropped. Specific shortcuts:
+
+- The subscription ports drive pgoutput in-process instead of over a
+  subscription connection.
+- `013` substitutes a whole-server SIGKILL for a backend crash-restart.
+- `019`, `038` and `047` create slots offline through goopg's Go API.
+- `039` has none of its defective-header cases.
+- `047` omits its injection point.
+
+Rules for a re-port task:
+
+1. Same task model, compatibility contract, Movement instrument and
+   design-doc-at-start rule as a port task. The audit line is a filing-time
+   finding, verified at start.
+2. **The existing inventory row stays `port` / `pass_required=yes` while the
+   re-port is open** — the shortcut test still passes and stays in the
+   must-pass set. Do not demote it.
+3. The faithful port replaces the shortcut func (same `TestPort_*` name, or
+   a new name with the old one deleted in the same commit). On close, in the
+   same commit, the row's `rationale` is rewritten to name the faithful
+   `TestPort_*` func and the mixed PG 18.3 variants it covers, then
+   `make regen-testport` and `make check-testport-inventory`.
 
 ## Acceptance
 
-M0149 is complete when all 74 tests above are `port` / `pass_required=yes`
-in the inventory, each satisfying the compatibility contract (all-goopg and
-mixed PG 18.3 variants passing, all upstream assertions present),
-`make check-testport-inventory` succeeds, and the regenerated
-`docs/test-port/upstream-tap-coverage.md` shows no `not-tried` row under
-`postgres/src/test/recovery/t/` or `postgres/src/test/subscription/t/`.
+M0149 is complete when all 74 port tasks and all 9 re-port tasks are closed:
+every one of the 83 tests is `port` / `pass_required=yes` in the inventory
+and satisfies the compatibility contract C1–C4 (all-goopg and mixed PG 18.3
+variants passing, all upstream assertions present). Each re-ported test's
+inventory `rationale` has been rewritten to name the faithful `TestPort_*`
+func and its mixed variants. `make check-testport-inventory` succeeds, and
+the regenerated `docs/test-port/upstream-tap-coverage.md` shows no
+`not-tried` row under `postgres/src/test/recovery/t/` or
+`postgres/src/test/subscription/t/`.

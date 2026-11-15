@@ -38,8 +38,11 @@ const RecoverySignalFile = "recovery.signal"
 // `pg_ctl promote` to convert a running standby into a primary.
 // Polled by the standby controller every promoteSignalPollInterval;
 // presence drives Promote(). Mirrors upstream
-// `postgres/src/include/access/xlog.h` PROMOTE_SIGNAL_FILE.
-const PromoteSignalFile = "promote.signal"
+// `postgres/src/include/access/xlog.h` PROMOTE_SIGNAL_FILE, which is
+// `promote` — NOT `promote.signal` (unlike standby.signal /
+// recovery.signal). pg_ctl.c do_promote writes exactly this name, so a
+// different name left `pg_ctl promote` unable to promote a goopg standby.
+const PromoteSignalFile = "promote"
 
 // IsStandby reports whether `<dataDir>/standby.signal` is present.
 // A missing data directory or unreadable file returns (false, nil) —

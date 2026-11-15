@@ -127,7 +127,7 @@ func TestStandbyControllerPromoteDrainsPendingReplay(t *testing.T) {
 }
 
 // TestStandbyControllerPromoteSignalTriggersPromote covers M0102-0004.
-// Dropping `promote.signal` into the data directory of a running
+// Dropping the `promote` signal file into the data directory of a running
 // standby controller must cause the controller to (a) remove the
 // file and (b) call Promote within ~1 second, flipping rt.Standby
 // to false and clearing standby.signal.
@@ -154,7 +154,7 @@ func TestStandbyControllerPromoteSignalTriggersPromote(t *testing.T) {
 
 	promotePath := filepath.Join(dataDir, initdb.PromoteSignalFile)
 	if err := os.WriteFile(promotePath, nil, 0o600); err != nil {
-		t.Fatalf("write promote.signal: %v", err)
+		t.Fatalf("write promote signal file: %v", err)
 	}
 
 	// Watcher polls at 250ms; allow ~1.5s for detect + Promote. We
@@ -169,7 +169,7 @@ func TestStandbyControllerPromoteSignalTriggersPromote(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if !sc.promoted.Load() {
-		t.Fatal("standbyController.promoted still false 1.5s after promote.signal dropped")
+		t.Fatal("standbyController.promoted still false 1.5s after promote signal file dropped")
 	}
 	// Wait for the watcher goroutine to actually exit so the
 	// finalizePromotion store on rt.Standby happens-before our read.
@@ -179,7 +179,7 @@ func TestStandbyControllerPromoteSignalTriggersPromote(t *testing.T) {
 		t.Error("Runtime.Standby = true after Promote, want false")
 	}
 	if _, err := os.Stat(promotePath); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("promote.signal still present after Promote (err=%v)", err)
+		t.Errorf("promote signal file still present after Promote (err=%v)", err)
 	}
 	if _, err := os.Stat(filepath.Join(dataDir, initdb.StandbySignalFile)); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("standby.signal still present after Promote (err=%v)", err)
@@ -187,7 +187,7 @@ func TestStandbyControllerPromoteSignalTriggersPromote(t *testing.T) {
 }
 
 // TestStandbyControllerRemovesStalePromoteSignal verifies that a
-// pre-existing promote.signal left over from a previous run is
+// pre-existing promote signal file left over from a previous run is
 // cleared at standby controller startup (and a warning logged),
 // matching upstream's StartupXLOG init order. Without this guard,
 // the watcher would fire on its very first poll and promote a
@@ -197,7 +197,7 @@ func TestStandbyControllerRemovesStalePromoteSignal(t *testing.T) {
 
 	stale := filepath.Join(dataDir, initdb.PromoteSignalFile)
 	if err := os.WriteFile(stale, nil, 0o600); err != nil {
-		t.Fatalf("seed stale promote.signal: %v", err)
+		t.Fatalf("seed stale promote signal file: %v", err)
 	}
 
 	rt, err := initdb.Open(initdb.OpenOptions{DataDir: dataDir, PoolSlots: 4})
@@ -214,14 +214,14 @@ func TestStandbyControllerRemovesStalePromoteSignal(t *testing.T) {
 
 	// Stale file must be removed synchronously inside startStandby.
 	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("stale promote.signal not removed (err=%v)", err)
+		t.Errorf("stale promote signal file not removed (err=%v)", err)
 	}
 
 	// Wait a couple of poll intervals to confirm no auto-promote
 	// happened (rt.Standby should still be true).
 	time.Sleep(600 * time.Millisecond)
 	if !rt.Standby {
-		t.Error("auto-promoted from stale promote.signal; want no promote")
+		t.Error("auto-promoted from stale promote signal file; want no promote")
 	}
 }
 
@@ -387,7 +387,7 @@ func TestStandbyControllerPromoteSkipsKnownTimelines(t *testing.T) {
 // promoteSignalWatcher's "removed first so a partial Promote can be retried
 // by re-creating the file" comment promises. The `promoting` flag used to be
 // set and never cleared, so every later PROMOTE — control socket and
-// promote.signal alike — came back "promotion already in progress" and the
+// promote signal file alike — came back "promotion already in progress" and the
 // standby could never be promoted for the life of the process.
 //
 // The controller is assembled by hand rather than via startStandby so the

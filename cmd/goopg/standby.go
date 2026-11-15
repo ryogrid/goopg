@@ -48,7 +48,7 @@ const drainPollInterval = 10 * time.Millisecond
 const drainTimeout = 5 * time.Second
 
 // promoteSignalPollInterval is how often the standby checks for the
-// presence of `<datadir>/promote.signal`. 250 ms matches PG's
+// presence of `<datadir>/promote`. 250 ms matches PG's
 // `min_recovery_apply_delay` granularity; faster is wasted poll
 // traffic on idle standbys, slower makes M0102 E2E tests sluggish.
 const promoteSignalPollInterval = 250 * time.Millisecond
@@ -80,7 +80,7 @@ type standbyController struct {
 	neverConsistent bool
 	consistent      atomic.Bool
 
-	// signalCancel cancels the promote.signal poller goroutine.
+	// signalCancel cancels the promote signal file poller goroutine.
 	// Close cancels it explicitly; a successful Promote also
 	// returns from the watcher loop on its own.
 	signalCancel context.CancelFunc
@@ -222,7 +222,7 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 		walLevel:           walLevelEnum(stringGUC(registry, "wal_level", "replica")),
 	}
 	sc.consistentAt, sc.neverConsistent = recoveryConsistencyPoint(rt.DataDir)
-	// Clear any stale promote.signal left by a previous run before
+	// Clear any stale promote signal file left by a previous run before
 	// starting the watcher. Upstream's xlogrecovery.c initialises
 	// the trigger state in StartupXLOG before the replay loop ever
 	// calls CheckForStandbyTrigger; a residual file would otherwise
@@ -231,7 +231,7 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 	if rt.DataDir != "" {
 		path := filepath.Join(rt.DataDir, initdb.PromoteSignalFile)
 		if err := os.Remove(path); err == nil {
-			logger.Warn("removed stale promote.signal at standby startup",
+			logger.Warn("removed stale promote signal file at standby startup",
 				"path", path)
 		}
 	}
@@ -280,7 +280,7 @@ func (sc *standbyController) Promote(ctx context.Context) error {
 	// a promote that returned an error (drain timeout, cancelled
 	// context) leaves the node a standby, and the operator must be
 	// able to try again. Leaving the flag set wedged every later
-	// PROMOTE — control socket and promote.signal alike — behind a
+	// PROMOTE — control socket and promote signal file alike — behind a
 	// misleading "already in progress" (review/260831-2 CM-1).
 	defer sc.promoting.Store(false)
 	// A promote may have completed between the two loads above.
@@ -527,7 +527,7 @@ func (sc *standbyController) Close() {
 	}
 }
 
-// promoteSignalWatcher polls for `<DataDir>/promote.signal` at
+// promoteSignalWatcher polls for `<DataDir>/promote` at
 // promoteSignalPollInterval and triggers Promote(ctx) when the file
 // appears. Mirrors upstream's `CheckForStandbyTrigger` in
 // `postgres/src/backend/access/transam/xlogrecovery.c`, which checks
@@ -563,13 +563,13 @@ func (sc *standbyController) promoteSignalWatcher(ctx context.Context) {
 			// do not block the Promote call — if removal fails the
 			// next loop iteration will re-fire.
 			if rmErr := os.Remove(path); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-				sc.logger.Warn("promote.signal removal failed",
+				sc.logger.Warn("promote signal file removal failed",
 					"path", path, "err", rmErr)
 			}
-			sc.logger.Info("promote.signal detected; triggering Promote",
+			sc.logger.Info("promote signal file detected; triggering Promote",
 				"path", path)
 			if err := sc.Promote(ctx); err != nil {
-				sc.logger.Error("promote.signal triggered Promote failed",
+				sc.logger.Error("promote signal file triggered Promote failed",
 					"err", err)
 			}
 			return

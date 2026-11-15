@@ -292,7 +292,8 @@ it to hold the lineage.)
     baton/fix_plan is resumed when M0148 becomes selectable again. M0149
     tasks and all their descendants inherit item-10 rank — the S7
     correctness-only carve-out does not demote them. One task per upstream
-    `recovery/t/` or `subscription/t/` TAP test (74); every missing feature
+    `recovery/t/` or `subscription/t/` TAP test (74 ports + 9 re-ports of
+    the shortcut ports); every missing feature
     is filed immediately as a `Kind: impl` child directly below its parent.
     A task with an open descendant is not selected itself — take its first
     open descendant in file order (depth-first); the parent returns for its
@@ -311,7 +312,9 @@ it to hold the lineage.)
     `TestPort_*` func, `deferred_to` = `-`; `make regen-testport`,
     `make check-testport-inventory`, drop any `ci/batch/expected-failures.csv`
     row. A port whose row is not promoted is not complete; a promoted row
-    whose test violates C1–C3 is a defect. Design doc
+    whose test violates C1–C3 is a defect — except the nine shortcut rows
+    under re-port tasks M0149-0075…0083, which stay `port` until their
+    re-port closes. Design doc
     `docs/design/0100-0149/0149-00NN-<slug>.md` is created when the task is
     STARTED, not up front. Rules: `docs/milestones/0149-replication-tap-port.md`.
     **M0148 regress coverage closure (owner decision 2026-10-29).** After
@@ -555,6 +558,17 @@ OWNER DECISION 2026-11-15 — M0149 filed:
 - New Movement instrument `tap` for M0149:
   `Movement: yes — tap <test> assertions <before>/<total>→<after>/<total>`
   (upstream assertions passing in the all-goopg + mixed runs).
+- Owner decision 2026-11-15 — the 9 shortcut ports (recovery 001, 013,
+  019, 038, 039, 047; subscription 001, 004, 026) are re-implemented under
+  M0149 as re-port tasks M0149-0075 … M0149-0083. Their inventory rows stay
+  `port` while each re-port is open; on close the rationale is rewritten to
+  name the faithful `TestPort_*` func and its mixed variants.
+- Owner decision 2026-11-15 — the loop builds the missing PG 18.3 test
+  modules itself (`test_decoding`, `injection_points`, a server with
+  `--enable-injection-points`) from a copy of `./postgres` into a private
+  prefix, as a one-time child of M0149-0034. It never modifies `./postgres`
+  or `postgres/local_install`. Injection-point steps no longer get a
+  goopg-only allowance (milestone doc C3).
 
 **M-NIGHTLY filing is unconditional**: every loop reads
 `ci/logs/action-items.md` and files each new `## AI-` subject under M-NIGHTLY.
@@ -11351,7 +11365,11 @@ queue are binding.
 immediately before M0148; M0148 is paused while M0149 has a selectable
 task. M0149 tasks and all their descendants inherit item-10 rank — the S7
 correctness-only carve-out does not demote them.
-**Task model:** one task per upstream TAP test, in the order below. Every
+**Task model:** one task per upstream TAP test, in the order below, plus
+nine re-port tasks \(`M0149-0075` … `M0149-0083`\) for the shortcut ports
+already `port` at filing — their inventory rows stay `port` while the
+re-port is open; when a re-port closes, its row's rationale is rewritten to
+name the faithful `TestPort_*` func and its mixed PG 18.3 variants. Every
 missing feature is filed immediately as a `Kind: impl` child
 \(`M0149-00NNa`, `b`, …; `Parent: M0149-00NN`\), placed immediately below
 its parent entry, and implemented before the test task can close. A test
@@ -11372,7 +11390,8 @@ pgoutput v1–4, `test_decoding` text, log/error texts the test matches\)
 and in every file it writes \(WAL segments/records, `.history`,
 `archive_status`, `backup_label`/`backup_manifest`, `pg_control`, signal
 files, `pg_replslot`, `pg_logical/`, `pg_twophase`, …\), proven by mixed
-runs against real PG 18.3 nodes from `postgres/local_install/bin`. A
+runs against real PG 18.3 nodes from `postgres/local_install/bin` \(or the
+private test-module build, milestone C3\). A
 goopg↔goopg-only port, an in-process shortcut, or a goopg-private format
 is NOT a port. A mirrored upstream skip condition must evaluate false in
 the all-goopg run; a test that skips there is not ported.
@@ -11543,11 +11562,46 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/recovery/t/017_shm.pl` — shared-memory interlock via `postmaster.pid` key and orphaned backends.
   Likely prerequisites \(verify at start\): `postmaster.pid` shmem-key line and `PGSharedMemoryIsInUse` interlock semantics for goopg's process model \(design doc must decide a PG-faithful answer\), `kill9` of postmaster with a live backend. Never `kill()` a goopg "backend pid" — `pg_backend_pid()` is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID; a backend-kill step that needs per-backend OS processes goes to `[!] blocked-on owner: architecture`.
+- [ ] **M0149-0075 — re-port recovery/t/013_crash_restart.pl to the M0149 contract**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/013_crash_restart.pl` — postmaster crash-restart after a backend is killed with SIGQUIT and then SIGKILL.
+  Current shortcut \(audit\): `TestPort_Recovery013CrashRestart` kills the whole server \(`c.Kill()`\) and restarts it by hand instead of killing one backend and letting the postmaster run its crash-restart cycle. It makes 1 assertion against \~18 upstream: the in-progress-transaction loss, the client "server closed the connection" / "terminating connection" errors and the second SIGKILL round are dropped. No PG 18.3 cross-check.
+  Likely prerequisites \(verify at start\): the backend crash-restart child of M0149-0004 \(`restart_after_crash`\). Never `kill()` the synthetic `pg_backend_pid()` \(`internal/executor/expr.go`\); if a faithful backend kill needs per-backend OS processes, escalate `[!] blocked-on owner: architecture`. If its dependency \(the backend crash-restart child of M0149-0004\) is `[!]` on architecture, 0075 is too. Inventory row stays `port` until this closes.
+- [ ] **M0149-0076 — re-port recovery/t/039_end_of_wal.pl to the M0149 contract**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/039_end_of_wal.pl` — end-of-WAL detection with hand-crafted defective page and record headers written into WAL files.
+  Current shortcut \(audit\): `TestPort_Recovery039EndOfWal` only checks that 24-character segment files exist after a checkpoint. None of the upstream defective-header cases \(`write_wal` page/record corruption\) and none of the "invalid magic number" / "invalid record length" / "invalid contrecord length" / "invalid info bits" log matches are ported \(\~14 upstream assertions\). No PG 18.3 cross-check.
+  Likely prerequisites \(verify at start\): PG-exact WAL page/record layout so byte-level writes land where PG's would \(`pg_logical_emit_message`, insert-LSN arithmetic\); PG 18.3 end-of-WAL log texts from `xlogreader.c`; a PG 18.3 server recovering the same doctored goopg WAL in the mixed run. Inventory row stays `port` until this closes.
 - [ ] **M0149-0009 — port recovery/t/008_fsm_truncation.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/008_fsm_truncation.pl` — FSM-driven INSERT after truncation on a promoted standby.
   Likely prerequisites \(verify at start\): PG-format FSM fork + FPIs, FSM/VM truncation in `XLOG_SMGR_TRUNCATE` replay, promotion of a streaming standby. Overlap: VACUUM tail truncation emitting no `XLOG_SMGR_TRUNCATE` is the M0122-0009c finding \(deferral ledger 2026-10-13; no fix\_plan entry exists at filing — reference it if filed, else file it here\).
+- [ ] **M0149-0009a — a standby in recovery must be read-only: every transaction during recovery raises 25006 on writes** \(filed 2026-11-15 by the owner session; S2 — divergent data on a standby\)
+  Kind: impl
+  Parent: M0149-0009
+  - Found while verifying the 2026-11-15 promote-file rename \(`promote.signal` → PG's `promote`\): on a goopg
+    streaming standby with `pg_is_in_recovery()` = `t`, `CREATE TABLE zz\_sb \(x int\)` and
+    `INSERT INTO zz\_sb VALUES \(1\)` both succeed, `SELECT count\(\*\)` returns 1, and `txid\_current\(\)` assigns
+    a new xid on the standby. The primary has no such table — the standby has silently diverged.
+  - PG 18.3: `StartTransaction` sets `XactReadOnly = DefaultXactReadOnly || RecoveryInProgress\(\)`
+    \(`access/transam/xact.c`\); writes then fail in `PreventCommandIfReadOnly` / `ExecCheckXactReadOnly`
+    \(`executor/execMain.c`\) with 25006 "cannot execute <cmd> in a read-only transaction";
+    `GetNewTransactionId` errors "cannot assign TransactionIds during recovery"; `SET TRANSACTION READ WRITE`
+    during recovery raises 25006 "cannot set transaction read-write mode during recovery"
+    \(`check\_transaction\_read\_only`, `utils/misc/guc\_funcs` / `commands/variable.c`\).
+  - `SHOW transaction\_read\_only` answers 42704 \(unregistered\); PG reports `on` on a standby.
+  - Prerequisite: the open task "Read-only transactions are not enforced; `default\_transaction\_read\_only` is
+    ignored" \(placed below item 10\). This child adopts that enforcement work — it inherits M0149's item-10 rank —
+    and closes it too when both are satisfied.
+  - Test-validity note: a promotion test that proves promotion by a successful write proves nothing while this
+    is open \(e.g. `TestE2E\_NativeOnlyReplicationAndPromotion`\); such tests must assert `pg\_is\_in\_recovery\(\)`
+    and, before promotion, that the write fails with 25006.
+  - Verification: postmaster/testport test on a goopg standby \(writes, DDL, `txid\_current\(\)`, `SET TRANSACTION
+    READ WRITE` all fail with PG's SQLSTATEs and texts; `SHOW transaction\_read\_only` = `on`\), then the same
+    statements succeed after `pg\_ctl promote`; mixed variant with a PG 18.3 primary → goopg standby.
 - [ ] **M0149-0010 — port recovery/t/015_promotion_pages.pl**
   Kind: impl
   Parent: none
@@ -11588,6 +11642,12 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/recovery/t/026_overwrite_contrecord.pl` — segments ending in an incomplete record propagated to a replica.
   Likely prerequisites \(verify at start\): `XLOG_OVERWRITE_CONTRECORD` + `XLP_FIRST_IS_OVERWRITE_CONTRECORD` emission after torn-record recovery \(see `e2e_pg_torn_contrecord_test.go`\), `backup_fs_cold`.
+- [ ] **M0149-0077 — re-port recovery/t/001_stream_rep.pl to the M0149 contract**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/001_stream_rep.pl` — streaming replication with a cascading standby, hot-standby feedback, read-only checks and replication-connection commands.
+  Current shortcut \(audit\): `TestPort_Recovery001StreamRep` covers 2 of \~47 upstream assertions \(walreceiver streaming, one row visible\). Missing: the cascading `standby_2`; read-only transaction errors; `hot_standby_feedback` xmin/catalog\_xmin on slots; sequence and unlogged checks on the standby; replication-connection `SHOW` and `READ_REPLICATION_SLOT`; the `pg_backup_start` checks. The slot is pre-created by the harness. All-goopg only — no PG 18.3 primary/standby variant.
+  Likely prerequisites \(verify at start\): the Tier 2 substrate \(streaming, promotion, harness `wait_for_catchup` / `background_psql`\), a cascading walsender on a standby, `READ_REPLICATION_SLOT`, mixed goopg↔PG streaming \(`e2e_failover_*` precedents\). Inventory row stays `port` until this closes.
 - [ ] **M0149-0018 — port recovery/t/002_archiving.pl**
   Kind: impl
   Parent: none
@@ -11672,32 +11732,38 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/041_checkpoint_at_promote.pl` — restartpoint racing a promotion; WAL removal stays correct.
-  Likely prerequisites \(verify at start\): `injection_points` extension equivalent \(`injection_points_attach/wakeup/detach`, wait mode, PG point names\) — first test to need it; restartpoint/promotion race. Never `kill()` a goopg "backend pid" — `pg_backend_pid()` is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID; a backend-kill step that needs per-backend OS processes goes to `[!] blocked-on owner: architecture`.
+  Likely prerequisites \(verify at start\): `injection_points` extension equivalent \(`injection_points_attach/wakeup/detach`, wait mode, PG point names\) — first test to need it; restartpoint/promotion race. Never `kill()` a goopg "backend pid" — `pg_backend_pid()` is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID; a backend-kill step that needs per-backend OS processes goes to `[!] blocked-on owner: architecture`. PG side: first task needing `injection_points` — file the one-time child "build the PG 18.3 test-module toolchain" first: `mkdir -p tmp/pg183-src && git -C postgres archive HEAD | tar -x -C tmp/pg183-src`; in `tmp/pg183-src` run `./configure --enable-cassert --enable-tap-tests --enable-injection-points --prefix=$PWD/../pg183-inj`, `make`, `make install`, `make -C contrib/test_decoding install`, `make -C src/test/modules/injection_points install`. Do not reuse the `--prefix` from `pg_config --configure` \(it is `postgres/local_install`\); never touch `./postgres` or `postgres/local_install` \(milestone C3\). If M0149-0034 is ever `[!]`, re-parent the toolchain child to M0149-0035 \(a held root holds its children\).
 - [ ] **M0149-0035 — port recovery/t/006_logical_decoding.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/006_logical_decoding.pl` — logical decoding via SQL and `pg_recvlogical`.
-  Likely prerequisites \(verify at start\): `test_decoding` output plugin \(absent today\), `pg_logical_slot_get/peek_changes`, PG 18.3 `pg_recvlogical` against goopg, slot persistence/`pg_replslot` format, drop-database-with-slot errors.
+  Likely prerequisites \(verify at start\): `test_decoding` output plugin \(absent today\), `pg_logical_slot_get/peek_changes`, PG 18.3 `pg_recvlogical` against goopg, slot persistence/`pg_replslot` format, drop-database-with-slot errors. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034.
 - [ ] **M0149-0036 — port recovery/t/010_logical_decoding_timelines.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/010_logical_decoding_timelines.pl` — logical slots surviving a timeline switch.
-  Likely prerequisites \(verify at start\): `pg_replslot` copied by `backup_fs_cold` and loaded at startup, catalog\_xmin via `hot_standby_feedback`, decoding across TLI.
+  Likely prerequisites \(verify at start\): `pg_replslot` copied by `backup_fs_cold` and loaded at startup, catalog\_xmin via `hot_standby_feedback`, decoding across TLI. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034.
 - [ ] **M0149-0037 — port recovery/t/044_invalidate_inactive_slots.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/044_invalidate_inactive_slots.pl` — slot invalidation by `idle_replication_slot_timeout`.
-  Likely prerequisites \(verify at start\): checkpoint-time idle invalidation, `invalidation_reason = idle_timeout`, injection point `slot-timeout-inval`, PG log text.
+  Likely prerequisites \(verify at start\): checkpoint-time idle invalidation, `invalidation_reason = idle_timeout`, injection point `slot-timeout-inval`, PG log text. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034.
 - [ ] **M0149-0038 — port recovery/t/046_checkpoint_logical_slot.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/046_checkpoint_logical_slot.pl` — logical slot advanced during a checkpoint keeps a valid `restart_lsn`.
-  Likely prerequisites \(verify at start\): injection points in checkpoint/slot code \(`checkpoint-before-old-wal-removal`, etc.\), `restart_lsn` vs WAL removal ordering, standby slot sync paths.
+  Likely prerequisites \(verify at start\): injection points in checkpoint/slot code \(`checkpoint-before-old-wal-removal`, etc.\), `restart_lsn` vs WAL removal ordering, standby slot sync paths. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034.
 - [ ] **M0149-0039 — port recovery/t/035_standby_logical_decoding.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/035_standby_logical_decoding.pl` — logical decoding on a standby, conflicts and promotion.
-  Likely prerequisites \(verify at start\): logical slots on standby \(`pg_log_standby_snapshot`\), invalidation `rows_removed`/`wal_level_insufficient`, `confl_active_logicalslot` stats, slots kept through promotion.
+  Likely prerequisites \(verify at start\): logical slots on standby \(`pg_log_standby_snapshot`\), invalidation `rows_removed`/`wal_level_insufficient`, `confl_active_logicalslot` stats, slots kept through promotion. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034.
+- [ ] **M0149-0079 — re-port recovery/t/047_checkpoint_physical_slot.pl to the M0149 contract**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/047_checkpoint_physical_slot.pl` — physical slot advanced during a checkpoint keeps a valid `restart_lsn` across a crash.
+  Current shortcut \(audit\): `TestPort_Recovery047CheckpointPhysicalSlot` has no injection point, no `pg_replication_slot_advance`, no `advance_wal`, and no crash + restart check that the WAL at `restart_lsn` still exists. `restart_lsn` is only logged, never asserted. The slot is created offline through the Go API, and the upstream `enable_injection_points` / `check_extension` skip gates are absent.
+  Likely prerequisites \(verify at start\): `injection_points` \(M0149-0034\) incl. `checkpoint-before-old-wal-removal` \(shared with M0149-0038\), `pg_replication_slot_advance`, slot `restart_lsn` vs old-WAL removal ordering. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034. Inventory row stays `port` until this closes.
 - [ ] **M0149-0040 — port subscription/t/003_constraints.pl**
   Kind: impl
   Parent: none
@@ -11783,6 +11849,36 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/subscription/t/035_conflicts.pl` — `multiple_unique_conflicts` detection.
   Likely prerequisites \(verify at start\): apply-side conflict detection and PG log text, `pg_stat_subscription_stats` conflict counters.
+- [ ] **M0149-0080 — re-port subscription/t/001_rep_changes.pl to the M0149 contract**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/001_rep_changes.pl` — the canonical publisher/subscriber logical-replication test.
+  Current shortcut \(audit\): `TestPort_Subscription001RepChanges` drives pgoutput in-process \(`PgOutput` → `DecodeMessage` → `ApplyWorker`\) with hand-built tuples. There are no publisher/subscriber servers, no CREATE PUBLICATION / SUBSCRIPTION, and no walsender or libpq connection. It covers 3 operations against \~38 upstream assertions \(publication add/drop table, replica identity full, publish options, ALTER SUBSCRIPTION, `wal_level=minimal` subscriber restart, slot checks, …\). No PG 18.3 variant.
+  Likely prerequisites \(verify at start\): the Tier 7 wire-apply substrate \(`internal/executor/applyworker.go`, `internal/postmaster/subscription_refresh.go`\); overlap M0122-0014 \(`Prerequisite: M0122-0014` where it covers a gap\). Inventory row stays `port` until this closes.
+- [ ] **M0149-0081 — re-port subscription/t/004_sync.pl to the M0149 contract**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/004_sync.pl` — initial table synchronisation by tablesync workers.
+  Current shortcut \(audit\): `TestPort_Subscription004Sync` simulates the initial COPY as a batch of INSERT messages applied in-process. There is no tablesync worker, no `copy_data`, no `pg_subscription_rel` state waits, no unique-violation-during-sync recovery, no REFRESH and no tablesync-slot cleanup check \(\~9 upstream\). No PG 18.3 variant.
+  Likely prerequisites \(verify at start\): tablesync over libpq \(COPY from the publisher, `pg_subscription_rel` i→d→s→r states\), sync-worker error retry, tablesync slot / origin cleanup on DROP SUBSCRIPTION; overlap M0122-0014. Inventory row stays `port` until this closes.
+- [ ] **M0149-0082 — re-port subscription/t/026_stats.pl to the M0149 contract**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/026_stats.pl` — `pg_stat_subscription_stats` error and conflict counters and their reset.
+  Current shortcut \(audit\): `TestPort_Subscription026Stats` checks goopg's in-process `xlog.Subscribers` registry \(the `pg_stat_subscription` backing\) — not the view upstream tests. `apply_error_count`, `sync_error_count`, `confl_insert_exists`, `confl_delete_missing`, `stats_reset`, `pg_stat_reset_subscription_stats` and stats removal on DROP SUBSCRIPTION are all absent \(\~12 upstream\). No servers, no PG 18.3 variant.
+  Likely prerequisites \(verify at start\): `pg_stat_subscription_stats` counters fed by real apply/sync errors and conflicts, `pg_stat_reset_subscription_stats`, stats persistence/drop; overlap M0122-0014 and M0149-0056 \(conflict stats\). Inventory row stays `port` until this closes.
+- [ ] **M0149-0083 — re-port recovery/t/038_save_logical_slots_shutdown.pl to the M0149 contract**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/038_save_logical_slots_shutdown.pl` — logical slots flushed at the shutdown checkpoint; `confirmed_flush_lsn` equals the latest checkpoint location.
+  Current shortcut \(audit\): `TestPort_Recovery038SaveLogicalSlots` creates a logical slot offline through the Go API and only checks that it survives a restart. Upstream's publisher + subscriber setup and the comparison of `confirmed_flush_lsn` with `pg_controldata`'s "Latest checkpoint location" are dropped. The func comment claims JSON slot files \(stale: `slots_pg.go` writes PG's 200-byte `ReplicationSlotOnDisk` plus a 64-byte goopg NameData extension — verify that extension against C2\). No PG 18.3 variant.
+  Likely prerequisites \(verify at start\): wire subscription \(Tier 7\), shutdown-checkpoint slot flush \(`CheckPointReplicationSlots` with `is_shutdown`\), PG 18.3 `pg_controldata` on the goopg data dir, a slot state file byte-identical to PG's. Inventory row stays `port` until this closes.
+- [ ] **M0149-0078 — re-port recovery/t/019_replslot_limit.pl to the M0149 contract**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/019_replslot_limit.pl` — `max_slot_wal_keep_size` WAL retention, `wal_status` / `safe_wal_size`, and slot invalidation.
+  Current shortcut \(audit\): `TestPort_Recovery019ReplslotLimit` creates two slots offline through the Go API \(`xlog.OpenSlots`\) and checks only that they are listed after start \(2 of \~24 upstream assertions\). Missing: no standby, no `max_slot_wal_keep_size`, no `wal_status` reserved/extended/unreserved/lost transitions, no `safe_wal_size`, no "invalidating obsolete replication slot" log, no walsender STOP/CONT termination case. No PG 18.3 variant.
+  Likely prerequisites \(verify at start\): `max_slot_wal_keep_size` retention and checkpoint-time invalidation \(`InvalidateObsoleteReplicationSlots`\) with PG log texts, `pg_replication_slots.wal_status` / `safe_wal_size`, standby on a slot, walsender termination on invalidation; wire subscription \(Tier 7\) for its `CREATE SUBSCRIPTION` / `wait_for_subscription_sync` steps. It `kill`s \(STOP/CONT\) the walsender and walreceiver pids read from `pg_stat_activity`: never `kill()` a synthetic goopg pid — without a faithful equivalent this needs the process-model escalation `[!] blocked-on owner: architecture`. Inventory row stays `port` until this closes.
 - [ ] **M0149-0057 — port subscription/t/027_nosuperuser.pl**
   Kind: impl
   Parent: none
@@ -11862,7 +11958,7 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/040_standby_failover_slots_sync.pl` — failover slots synced to a standby and used after promotion.
-  Likely prerequisites \(verify at start\): `failover` slots + `ALTER_REPLICATION_SLOT`, slotsync worker \(`sync_replication_slots`, `synchronized_standby_slots`\), `pg_sync_replication_slots()`, subscriber switching to the promoted standby.
+  Likely prerequisites \(verify at start\): `failover` slots + `ALTER_REPLICATION_SLOT`, slotsync worker \(`sync_replication_slots`, `synchronized_standby_slots`\), `pg_sync_replication_slots()`, subscriber switching to the promoted standby. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034.
 - [ ] **M0149-0073 — port subscription/t/100_bugs.pl**
   Kind: impl
   Parent: none
