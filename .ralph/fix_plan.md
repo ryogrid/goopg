@@ -11440,6 +11440,19 @@ verify each at HEAD when the task starts.
     `1663/1/…`; PG cold start on a goopg directory sees template1 and
     postgres contents; existing multi-database / template / pg\_dump tests
     stay green.
+  - 2026-11-15 census and slice plan
+    \(docs/design/0100-0149/0149-0001a1-database-oid-layout.md\):
+    - Only the displayed and storage/WAL OIDs must equal PG's. The
+      catalog-namespace key is internal, so the 603-reference sentinel need
+      not be removed for C2.
+    - Storage sites: 23 literal `RelFileNode{DBOid: DefaultDBOid}` catalog
+      writers plus the 68-call base/1 → base/5 mirror. Display:
+      `databaseDisplayOID` 16384.
+    - Slices: S1 postgres catalogs stored at base/5 \(the mirror kept base/5
+      complete, so old clusters read unchanged\); S2 displayed postgres OID
+      5; S3 template1 at base/1 with a startup migration; S4 \(optional\)
+      namespace keys.
+    Movement: none — tap 034\_create\_database 3/4 \(design only\)
 - [ ] **M0149-0001b — Go `Cluster.pm`-equivalent harness for single-node ports \(goopg and PG 18.3 nodes behind one API\)**
   Kind: impl
   Parent: M0149-0001
