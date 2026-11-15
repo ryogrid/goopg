@@ -369,3 +369,9 @@ func DecodeACLItemArray(blob []byte, resolveName func(oid uint32) string) ([]ACL
 	}
 	return items, nil
 }
+
+// EncodeAclItemArrayText is encodeAclItemArrayText for callers outside the
+// executor (initdb's bootstrap catalog rows, M0149-0001g slice 11).
+func EncodeAclItemArrayText(aclText string, resolveOID func(roleName string) uint32) ([]byte, error) {
+	return encodeAclItemArrayText(aclText, resolveOID)
+}

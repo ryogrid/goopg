@@ -29,7 +29,7 @@ type pgLanguageEntry struct {
 	LanIspl       bool   // is procedural language?
 	LanPltrusted  bool   // is PL trusted?
 	LanPlcallfoid uint32 // oid of call handler (0 for built-in languages)
-	LanInline     uint32 // oid of inline handler (0 for most; 2511 for sql)
+	LanInline     uint32 // oid of inline handler (0 for every BKI row)
 	LanValidator  uint32 // oid of validator (2246/2247/2248 for the BKI rows)
 }
 
@@ -78,9 +78,9 @@ func pgLanguageInitialEntries() []pgLanguageEntry {
 		{12, "internal", pguid, false, false, 0, 0, 2246},
 		// oid=13: dynamically-loaded C functions; lanvalidator=2247=fmgr_c_validator
 		{13, "c", pguid, false, false, 0, 0, 2247},
-		// oid=14: SQL function language (trusted; laninline=2511=inline_sql_handler,
+		// oid=14: SQL function language (trusted; laninline=0 — sql has no inline handler, OID 2511 is pg_cursor; M0149-0001g slice 11 —
 		// lanvalidator=2248=fmgr_sql_validator)
-		{14, "sql", pguid, false, true, 0, 2511, 2248},
+		{14, "sql", pguid, false, true, 0, 0, 2248},
 	}
 }
 

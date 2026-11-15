@@ -600,6 +600,19 @@ Key observation: PG compatibility constrains only the **displayed** and
 - Rows written at initdb with xmin 1 are loaded by goopg's own catalog
   reload, so goopg and a PG node see the same memberships.
 
+## Follow\-up: M0149\-0001g slice 11 — ACL columns: NULL or a real ACL, never "\{\}" \(2026\-11\-16\)
+
+- In PostgreSQL a NULL ACL column means acldefault: the owner holds every
+  privilege, PUBLIC whatever the object kind defaults to.
+- An empty ACL grants nothing, and PG builds it with ndim 1 and dims\[0\] = 0
+  \(allocacl\(0\)\).
+- goopg wrote the text "\{\}" into ACL columns. The codec turns that into an
+  ndim\-0 array, which `check_acl` rejects.
+- From slice 11 on, bootstrap pg\_namespace rows carry PG's initdb ACLs
+  \(`executor.EncodeAclItemArrayText`\), and user schemas store NULL.
+- relacl, proacl and the other ACL columns still go through "\{\}". They
+  are the next slice.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

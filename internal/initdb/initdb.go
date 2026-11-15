@@ -2688,6 +2688,9 @@ type pgNamespaceEntry struct {
 	OID      uint32
 	NspName  string
 	NspOwner uint32
+	// NspACL is the aclitemout text a PG 18.3 initdb leaves in nspacl, with
+	// "B" standing for the bootstrap superuser (OID 10); "" means NULL.
+	NspACL string
 }
 
 // pgNamespaceInitialEntries returns the four namespaces a PG18 initdb produces:
@@ -2700,20 +2703,45 @@ type pgNamespaceEntry struct {
 // without its types.
 func pgNamespaceInitialEntries() []pgNamespaceEntry {
 	return []pgNamespaceEntry{
-		{OID: 11, NspName: "pg_catalog", NspOwner: 10},
+		// pg_catalog / public: postgres.bki inserts NULL, then initdb's
+		// setup_privileges runs GRANT USAGE ON SCHEMA pg_catalog, public TO
+		// PUBLIC (initdb.c). public is owned by pg_database_owner (6171) per
+		// pg_namespace.dat. information_schema.sql grants USAGE to PUBLIC.
+		// pg_toast keeps NULL. Values measured on a PG 18.3 initdb
+		// (M0149-0001g slice 11).
+		{OID: 11, NspName: "pg_catalog", NspOwner: 10, NspACL: "{B=UC/B,=U/B}"},
 		{OID: 99, NspName: "pg_toast", NspOwner: 10},
-		{OID: 2200, NspName: "public", NspOwner: 10},
-		{OID: 13273, NspName: "information_schema", NspOwner: 10},
+		{OID: 2200, NspName: "public", NspOwner: 6171, NspACL: "{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}"},
+		{OID: 13273, NspName: "information_schema", NspOwner: 10, NspACL: "{B=UC/B,=U/B}"},
 	}
 }
 
-func pgNamespaceRow(e pgNamespaceEntry) executor.Row {
+func pgNamespaceRow(e pgNamespaceEntry) (executor.Row, error) {
+	// nspacl: NULL (acldefault) or the initdb ACL. Never the empty array "{}":
+	// on a PG node an explicit empty ACL grants nothing — not even USAGE to
+	// the owner (aclmask only implies the owner's grant options).
+	acl := executor.NullDatum
+	if e.NspACL != "" {
+		blob, err := executor.EncodeAclItemArrayText(e.NspACL, func(role string) uint32 {
+			switch role {
+			case "B":
+				return 10 // BOOTSTRAP_SUPERUSERID
+			case "pg_database_owner":
+				return 6171 // ROLE_PG_DATABASE_OWNER
+			}
+			return 0
+		})
+		if err != nil {
+			return nil, fmt.Errorf("pg_namespace %s nspacl: %w", e.NspName, err)
+		}
+		acl = executor.NewBytesDatum(blob)
+	}
 	return executor.Row{
 		executor.NewIntDatum(int64(e.OID)),      // oid
 		executor.NewStringDatum(e.NspName),      // nspname
 		executor.NewIntDatum(int64(e.NspOwner)), // nspowner
-		executor.NewStringDatum("{}"),           // nspacl (empty aclitem[])
-	}
+		acl,                                     // nspacl
+	}, nil
 }
 
 // bootstrapPgNamespaceTuples writes pg_catalog(11)/pg_toast(99)/public(2200)/
@@ -2728,7 +2756,11 @@ func bootstrapPgNamespaceTuples(dataDir string) (map[uint32]heapTID, error) {
 	entries := pgNamespaceInitialEntries()
 	rows := make([]executor.Row, 0, len(entries))
 	for _, e := range entries {
-		rows = append(rows, pgNamespaceRow(e))
+		row, err := pgNamespaceRow(e)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, row)
 	}
 	tids, err := writeMultiPageHeapRows(dataDir, "2615", cols, rows)
 	if err != nil {

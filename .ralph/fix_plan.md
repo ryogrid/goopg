@@ -12020,6 +12020,33 @@ verify each at HEAD when the task starts.
     - Gates: units, initdb, postmaster, testport interop set, regress A/B on
       6 role/catalog cases \(no movement\), spotcheck, sf025 99, acceptance.
     Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 11: pg\_namespace and pg\_language rows equal a PG 18.3 initdb.
+    - pg\_namespace:
+      - public is owned by pg\_database\_owner \(6171\).
+      - nspacl carries setup\_privileges' and information\_schema.sql's
+        GRANT USAGE TO PUBLIC: pg\_catalog and information\_schema
+        \{B=UC/B,=U/B\}; public
+        \{pg\_database\_owner=UC/pg\_database\_owner,=U/pg\_database\_owner\};
+        pg\_toast NULL. It used to be the empty array everywhere.
+      - The value is encoded through the new exported
+        executor.EncodeAclItemArrayText.
+    - User CREATE SCHEMA rows now store nspacl NULL \(acldefault\) instead of
+      "\{\}". On a PG node an explicit empty ACL denies even the owner USAGE,
+      because aclmask implies only the owner's grant options.
+    - pg\_language: sql.laninline was 2511, which is pg\_cursor and not an
+      inline handler. It is now 0, as in postgres.bki.
+    - Oracle tests: TestPgLanguageMatchesPostgresBKI and
+      TestPgNamespaceRowsMatchPG18Initdb.
+    - Found, recorded for the next slice:
+      - "\{\}" aclitem\[\] values are encoded with ndim 0, so PG's check\_acl
+        fails with "ACL arrays must be one\-dimensional". A non\-superuser on
+        a PG node cannot even read pg\_catalog.pg\_class.
+      - PG's catalog relacl is a real initdb ACL \(=r to PUBLIC\).
+      - goopg's CREATE SCHEMA … AUTHORIZATION records owner 10.
+      - pg\_language lacks plpgsql.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      6 cases \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none
