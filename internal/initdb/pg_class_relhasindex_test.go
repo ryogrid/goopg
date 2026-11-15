@@ -7,8 +7,8 @@ import (
 )
 
 // TestPgClassRelhasindexMatchesBootstrapIndexes pins M0149-0001d: every
-// bootstrapped SHARED catalog heap that has an index in pgIndexInitialEntries
-// carries pg_class.relhasindex = true (local catalogs follow in M0149-0001g). PostgreSQL does not re-derive the flag —
+// bootstrapped catalog heap that has an index in pgIndexInitialEntries carries
+// pg_class.relhasindex = true (shared: M0149-0001d; local: M0149-0001g). PostgreSQL does not re-derive the flag —
 // ExecOpenIndices (execIndexing.c) and RelationGetIndexList (relcache.c)
 // return no indexes when it is false — so a false here made every catalog row
 // a PG 18.3 node wrote on a goopg directory skip index maintenance, and a
@@ -30,15 +30,14 @@ func TestPgClassRelhasindexMatchesBootstrapIndexes(t *testing.T) {
 		if rel.RelKind != 'r' && rel.RelKind != 't' {
 			continue
 		}
-		// Local catalogs stay false until M0149-0001g (see pgClassRow).
-		want := (rel.IsShared && bootstrapRelHasIndex(rel.OID)) || rel.RelKind == 't'
+		want := bootstrapRelHasIndex(rel.OID) || rel.RelKind == 't'
 		got := pgClassRow(rel)[col]
 		if got.Kind != executor.KindBool || got.BoolValue() != want {
 			t.Errorf("pg_class row for %s (%d): relhasindex = %v, want %v", rel.RelName, rel.OID, got, want)
 		}
 		checked++
 	}
-	for _, oid := range []uint32{1259, 1262, 1260} { // pg_class, pg_database, pg_authid
+	for _, oid := range []uint32{1259, 1249, 1262, 1260} { // pg_class, pg_attribute, pg_database, pg_authid
 		if !bootstrapRelHasIndex(oid) {
 			t.Errorf("catalog %d has no bootstrap index; relhasindex would be false", oid)
 		}

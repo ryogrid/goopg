@@ -44,7 +44,7 @@ func TestPgRewriteToastPairPgClassRows(t *testing.T) {
 	}{
 		{oid: 2838, relName: "pg_toast_2618", relKind: "t", relNamespace: 99, relAm: 2, relNatts: 3, relHasIndex: true},
 		{oid: 2839, relName: "pg_toast_2618_index", relKind: "i", relNamespace: 99, relAm: 403, relNatts: 2},
-		{oid: 2618, relName: "pg_rewrite", relKind: "r", relNamespace: 11, relAm: 2, relNatts: 8, relToastRelID: 2838}, // relhasindex: PG 18.3 has true; goopg keeps false for local catalogs until M0149-0001g
+		{oid: 2618, relName: "pg_rewrite", relKind: "r", relNamespace: 11, relAm: 2, relNatts: 8, relHasIndex: true, relToastRelID: 2838}, // relhasindex true as in PG 18.3 (indexes 2692/2693; M0149-0001g)
 	}
 	for _, tc := range tests {
 		got, ok := rows[tc.oid]

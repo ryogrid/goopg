@@ -1294,6 +1294,53 @@ func bootstrapToastChunkIndex(dataDir string, toastIdx uint32, chunks []toastChu
 // such as ctid / xmin), and PG probes attnum > 0 in this code path;
 // system columns are resolved from a hardcoded table in
 // `SystemAttributeDefinition`.
+// bootstrapPgAttributeRelidAttnamIndex populates pg_attribute_relid_attnam_index
+// (OID 2658, AttributeRelidNameIndexId: btree(attrelid oid_ops, attname
+// name_ops), UNIQUE) with one IndexTuple per bootstrapped pg_attribute row,
+// system attributes included, sorted (attrelid, attname) — name_ops under the
+// C collation is a byte comparison of the NUL-padded NameData. M0149-0001g.
+func bootstrapPgAttributeRelidAttnamIndex(dataDir string, tids map[pgAttrTIDKey]heapTID) error {
+	names := pgAttributeBootstrapNames()
+	type entry struct {
+		attrelid uint32
+		attname  string
+		block    uint32
+		off      uint16
+	}
+	entries := make([]entry, 0, len(tids))
+	for k, t := range tids {
+		name, ok := names[k]
+		if !ok {
+			return fmt.Errorf("pg_attribute_relid_attnam_index: no attname for (%d, %d)", k.AttRelID, k.AttNum)
+		}
+		entries = append(entries, entry{attrelid: k.AttRelID, attname: name, block: t.Block, off: t.Offset})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].attrelid != entries[j].attrelid {
+			return entries[i].attrelid < entries[j].attrelid
+		}
+		return entries[i].attname < entries[j].attname
+	})
+	tuples := make([][]byte, len(entries))
+	for i, e := range entries {
+		tuples[i] = pgBuildIndexTupleOidNameKey(e.block, e.off, e.attrelid, e.attname)
+	}
+	file, err := pgBuildBtreeBulkLoadSized(tuples, 80 /* oid+name tuple size */, 2 /* nkeyatts */)
+	if err != nil {
+		return fmt.Errorf("pg_attribute_relid_attnam_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+		filepath.Join(dataDir, "global"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2658, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_attribute_relid_attnam_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
 func bootstrapPgAttributeRelidAttnumIndex(dataDir string, tids map[pgAttrTIDKey]heapTID) error {
 	type entry struct {
 		attrelid uint32

@@ -320,7 +320,12 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	{2603, "pg_amproc", 83, 'r', 6, false, pgAmprocAttrs()},
 	{2618, "pg_rewrite", 83, 'r', 8, false, pgRewriteAttrs()},
 	{2620, "pg_trigger", 83, 'r', 19, false, pgTriggerAttrs()},
-	{2615, "pg_namespace", 83, 'r', 5, false, pgNamespaceAttrs()},
+	// M0149-0001g: relnatts 5→4 and 8→7 / 5→4 below — the extra goopg-only
+	// columns (nspblocked, objversion, shared) made PG 18.3 form a row with
+	// fewer values than the descriptor and SIGSEGV in heap_form_tuple
+	// (PG-side CREATE TABLE → pg_depend, CREATE SCHEMA → pg_namespace,
+	// COMMENT → pg_description).
+	{2615, "pg_namespace", 83, 'r', 4, false, pgNamespaceAttrs()},
 	{2604, "pg_attrdef", 83, 'r', 4, false, pgAttrdefAttrs()},
 	{2606, "pg_constraint", 83, 'r', 28, false, pgConstraintAttrs()},
 	{2601, "pg_am", 83, 'r', 4, false, pgAmAttrs()},
@@ -329,8 +334,8 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	{2611, "pg_inherits", 83, 'r', 3, false, pgInheritsAttrs()},
 	{2612, "pg_language", 83, 'r', 9, false, pgLanguageAttrs()},
 	{2602, "pg_amop", 83, 'r', 9, false, pgAmopAttrs()},
-	{2609, "pg_description", 83, 'r', 5, false, pgDescriptionAttrs()},
-	{2608, "pg_depend", 83, 'r', 8, false, pgDependAttrs()},
+	{2609, "pg_description", 83, 'r', 4, false, pgDescriptionAttrs()},
+	{2608, "pg_depend", 83, 'r', 7, false, pgDependAttrs()},
 	// M0106-0010 step 3w: pg_aggregate is opened during InitPostgres'
 	// `find_inheritance_children → table_open(AggregateRelationId)` path.
 	// Without a pg_class row, PG FATALs with
@@ -2930,7 +2935,6 @@ func pgNamespaceAttrs() []nailedAttr {
 		{Name: "nspname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},
 		{Name: "nspowner", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
 		{Name: "nspacl", TypeOID: 1034, Num: 4, Len: -1},
-		{Name: "nspblocked", TypeOID: 16, Num: 5, Len: 1},
 	}
 }
 
@@ -2965,7 +2969,6 @@ func pgDescriptionAttrs() []nailedAttr {
 		{Name: "classoid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
 		{Name: "objsubid", TypeOID: 23, Num: 3, Len: 4, NotNull: true},
 		{Name: "description", TypeOID: 25, Num: 4, Len: -1, NotNull: true},
-		{Name: "shared", TypeOID: 16, Num: 5, Len: 1, NotNull: true},
 	}
 }
 
@@ -2978,7 +2981,6 @@ func pgDependAttrs() []nailedAttr {
 		{Name: "refobjid", TypeOID: 26, Num: 5, Len: 4, NotNull: true},
 		{Name: "refobjsubid", TypeOID: 23, Num: 6, Len: 4, NotNull: true},
 		{Name: "deptype", TypeOID: 18, Num: 7, Len: 1, NotNull: true},
-		{Name: "objversion", TypeOID: 28, Num: 8, Len: 4, NotNull: true},
 	}
 }
 

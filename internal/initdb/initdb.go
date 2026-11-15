@@ -1424,6 +1424,12 @@ func Init(opts Options) error {
 	if err := bootstrapPgAttributeRelidAttnumIndex(abs, pgAttrTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_attribute_relid_attnum_index: %w", err)
 	}
+	// M0149-0001g: pg_attribute_relid_attnam_index (2658) was left an empty
+	// placeholder — zero leaf tuples over ~2800 heap rows — which a PG 18.3
+	// node's planner and ATTNAME syscache trust once relhasindex is true.
+	if err := bootstrapPgAttributeRelidAttnamIndex(abs, pgAttrTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_attribute_relid_attnam_index: %w", err)
+	}
 	// M0106-0010 step 3dm phase B: seed pg_rewrite heap + leaf indices.
 	// Step 3dl seeded pg_stat_wal_receiver into pg_class with
 	// relhasrules=true, which tells PG's relcache to fetch the
@@ -2507,36 +2513,8 @@ type pgAttrTIDKey struct {
 // metadata from disk. Returns a map from (attrelid, attnum) → heapTID so
 // callers can build composite-key btree index tuples that point at each row.
 func bootstrapPgAttributeTuples(dataDir string) (map[pgAttrTIDKey]heapTID, error) {
-	attrCols := pgAttrColDefs()
-	allRels := append([]nailedRel{}, nailedSharedRels...)
-	allRels = append(allRels, nailedLocalRels...)
-	allRels = append(allRels, nailedToastRels()...) // M0131-S20.1
-	allRels = append(allRels, informationSchemaDataTableRels()...) // M0133-S3
-	allRels = append(allRels, informationSchemaViewSeedRels()...) // M0133-S4
-	type rowKey struct {
-		AttRelID uint32
-		AttNum   int16
-	}
-	var rows []executor.Row
-	keys := make([]rowKey, 0)
-	for _, rel := range allRels {
-		attrs := pgAttrEntriesForRel(rel)
-		for _, a := range attrs {
-			rows = append(rows, pgAttributeRow(rel.OID, a))
-			keys = append(keys, rowKey{AttRelID: rel.OID, AttNum: a.Num})
-		}
-		// M0149-0001e: every table-like relation also carries the six system
-		// attributes (heap.c AddNewAttributeTuples over SysAtt[]); without them
-		// a PG 18.3 node answers `SELECT ctid FROM pg_database` with
-		// "column \"ctid\" does not exist".
-		if rel.RelKind == 'r' || rel.RelKind == 't' {
-			for _, row := range pgSystemAttributeRows(rel.OID) {
-				rows = append(rows, row)
-				keys = append(keys, rowKey{AttRelID: rel.OID, AttNum: int16(row[4].Int)})
-			}
-		}
-	}
-	tids, err := writeMultiPageHeapRows(dataDir, "1249", attrCols, rows)
+	rows, keys := pgAttrBootstrapHeapRows()
+	tids, err := writeMultiPageHeapRows(dataDir, "1249", pgAttrColDefs(), rows)
 	if err != nil {
 		return nil, err
 	}
@@ -2545,9 +2523,52 @@ func bootstrapPgAttributeTuples(dataDir string) (map[pgAttrTIDKey]heapTID, error
 	}
 	out := make(map[pgAttrTIDKey]heapTID, len(tids))
 	for i, k := range keys {
-		out[pgAttrTIDKey{AttRelID: k.AttRelID, AttNum: k.AttNum}] = tids[i]
+		out[k] = tids[i]
 	}
 	return out, nil
+}
+
+// pgAttrBootstrapHeapRows is the single source of the bootstrapped pg_attribute
+// rows, in heap order, with their (attrelid, attnum) keys. The heap writer and
+// the two pg_attribute index builders (2659 by attnum, 2658 by attname) all
+// derive from it, so they cannot disagree.
+func pgAttrBootstrapHeapRows() ([]executor.Row, []pgAttrTIDKey) {
+	allRels := append([]nailedRel{}, nailedSharedRels...)
+	allRels = append(allRels, nailedLocalRels...)
+	allRels = append(allRels, nailedToastRels()...)               // M0131-S20.1
+	allRels = append(allRels, informationSchemaDataTableRels()...) // M0133-S3
+	allRels = append(allRels, informationSchemaViewSeedRels()...)  // M0133-S4
+	var rows []executor.Row
+	var keys []pgAttrTIDKey
+	for _, rel := range allRels {
+		attrs := pgAttrEntriesForRel(rel)
+		for _, a := range attrs {
+			rows = append(rows, pgAttributeRow(rel.OID, a))
+			keys = append(keys, pgAttrTIDKey{AttRelID: rel.OID, AttNum: a.Num})
+		}
+		// M0149-0001e: every table-like relation also carries the six system
+		// attributes (heap.c AddNewAttributeTuples over SysAtt[]); without them
+		// a PG 18.3 node answers `SELECT ctid FROM pg_database` with
+		// "column \"ctid\" does not exist".
+		if rel.RelKind == 'r' || rel.RelKind == 't' {
+			for _, row := range pgSystemAttributeRows(rel.OID) {
+				rows = append(rows, row)
+				keys = append(keys, pgAttrTIDKey{AttRelID: rel.OID, AttNum: int16(row[4].Int)})
+			}
+		}
+	}
+	return rows, keys
+}
+
+// pgAttributeBootstrapNames maps each bootstrapped (attrelid, attnum) to its
+// attname, for pg_attribute_relid_attnam_index (2658).
+func pgAttributeBootstrapNames() map[pgAttrTIDKey]string {
+	rows, keys := pgAttrBootstrapHeapRows()
+	out := make(map[pgAttrTIDKey]string, len(keys))
+	for i, k := range keys {
+		out[k] = rows[i][1].StringValue()
+	}
+	return out
 }
 
 // pgAmColDefs returns pg_am column descriptors matching PG18's
@@ -6281,15 +6302,11 @@ func pgClassRow(rel nailedRel) executor.Row {
 		// connection start uses (M0149-0001d). Derived from the bootstrap
 		// pg_index entries; a TOAST heap is indexed by construction.
 		//
-		// Scope: SHARED catalogs only, for now. The flag also makes PG's planner
-		// use the index, and some goopg-built LOCAL catalog indexes are not yet
-		// complete — pg_attribute_relid_attnam_index (2658) carries no leaf
-		// tuple at all — so a PG-side catalog query would plan an index scan
-		// and miss rows (TestE2E_PGColdStartOnGoopgDataDir). Local catalogs
-		// keep false until their indexes are audited and populated
-		// (M0149-0001g).
+		// Local catalogs followed in M0149-0001g once every bootstrap index was
+		// complete — pg_attribute_relid_attnam_index (2658) had been an empty
+		// placeholder, which PG's planner would have trusted.
 		executor.NewIntDatum(int64(pgClassReltoastrelidFor(rel.OID))),
-		executor.NewBoolDatum(isNailedToastRelOID(rel.OID) || (rel.IsShared && bootstrapRelHasIndex(rel.OID))), // 116: relhasindex
+		executor.NewBoolDatum(isNailedToastRelOID(rel.OID) || bootstrapRelHasIndex(rel.OID)), // 116: relhasindex
 		executor.NewBoolDatum(rel.IsShared),                // 117: relisshared
 		executor.NewStringDatum("p"),                       // 118: relpersistence
 		executor.NewStringDatum(string(rune(rel.RelKind))), // 119: relkind

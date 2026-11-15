@@ -458,6 +458,27 @@ Key observation: PG compatibility constrains only the **displayed** and
 - Still missing: pg\_shdepend bookkeeping \(`shdepend.c`\) and the
   `COMMENT ON DATABASE`, `ROLE` and `TABLESPACE` writers.
 
+## Follow\-up: M0149\-0001g slice 1 — catalog image vs PG 18.3 \(2026\-11\-16\)
+
+- Dropped the three goopg\-only catalog columns \(objversion, shared,
+  nspblocked\). PG built rows with fewer values than those descriptors and
+  SIGSEGV'd.
+- An index audit over all 117 bootstrap indexes compared leaf tuples with
+  heap rows. It found exactly one empty index, 2658
+  \(`pg_attribute_relid_attnam_index`\).
+  - It is now built at initdb from the single pg\_attribute row source.
+  - goopg maintains it at runtime: every pg\_attribute writer calls
+    `insertPgAttributeIndexEntries`, which inserts into both 2659 and 2658.
+- With every index complete, local catalogs carry `relhasindex = true`
+  \(M0149\-0001d did the shared ones\).
+- PG 18.3 on a goopg directory can now run ordinary DDL.
+- The remaining gaps:
+  - 19 missing catalog indexes, starting with pg\_depend's two;
+  - three catalogs with missing columns;
+  - type and flag fixes;
+  - 29 missing TOAST relations;
+  - goopg's catalog FSM forks, which PG rejects as invalid pages.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

@@ -41,6 +41,7 @@ const (
 	pgClassOidIndexOID             uint32 = 2662
 	pgClassRelnameNspIndexOID      uint32 = 2663
 	pgAttributeRelidAttnumIndexOID uint32 = 2659
+	pgAttributeRelidAttnamIndexOID uint32 = 2658 // M0149-0001g
 	pgAttrdefAdrelidAdnumIndexOID  uint32 = 2656
 	pgAttrdefOidIndexOID           uint32 = 2657
 	pgIndexIndrelidIndexOID        uint32 = 2678
@@ -626,6 +627,30 @@ func insertPgClassRelnameNspIndexEntry(ctx *Context, relname string, relnamespac
 func insertPgAttributeRelidAttnumIndexEntry(ctx *Context, attrelid uint32, attnum int16, tid storage.ItemPointer) error {
 	tup := buildIndexTupleOidInt2Key(uint32(tid.Block), tid.Offset, attrelid, attnum)
 	return insertCanonicalSysBtreeLeaf(ctx, pgAttributeRelidAttnumIndexOID, tup, cmpKeyOidInt2)
+}
+
+// insertPgAttributeRelidAttnamIndexEntry inserts an entry into
+// pg_attribute_relid_attnam_index (OID 2658, AttributeRelidNameIndexId) for
+// ((attrelid, attname) → heap TID). M0149-0001g: goopg never maintained this
+// index, so once a PG 18.3 node trusted it (relhasindex, the ATTNAME syscache)
+// every goopg-created column was invisible to lookups by name.
+func insertPgAttributeRelidAttnamIndexEntry(ctx *Context, attrelid uint32, attname string, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidNameKey(uint32(tid.Block), tid.Offset, attrelid, attname)
+	return insertCanonicalSysBtreeLeaf(ctx, pgAttributeRelidAttnamIndexOID, tup, cmpKeyOidName)
+}
+
+// insertPgAttributeIndexEntries maintains both pg_attribute indexes for one
+// new row, as CatalogTupleInsert does in PG — by attnum (2659) and by attname
+// (2658). Every pg_attribute heap writer goes through it so the two cannot
+// diverge again.
+func insertPgAttributeIndexEntries(ctx *Context, attrelid uint32, attnum int16, attname string, tid storage.ItemPointer) error {
+	if err := insertPgAttributeRelidAttnumIndexEntry(ctx, attrelid, attnum, tid); err != nil {
+		return err
+	}
+	if err := insertPgAttributeRelidAttnamIndexEntry(ctx, attrelid, attname, tid); err != nil {
+		return fmt.Errorf("pg_attribute_relid_attnam_index: %w", err)
+	}
+	return nil
 }
 
 // insertPgAttrdefAdrelidAdnumIndexEntry inserts an entry into

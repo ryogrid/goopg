@@ -19828,11 +19828,12 @@ func syncCompositeTypeToCatalogHeap(ctx *Context, ct *catalog.CompositeType) {
 	}
 	for i, field := range ct.Fields {
 		attnum := i + 1 // 1-based
-		attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), buildUserPGAttributeRowForCompositeField(ctx.Catalog, ct, field, attnum))
+		compRow := buildUserPGAttributeRowForCompositeField(ctx.Catalog, ct, field, attnum)
+		attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), compRow)
 		if err != nil {
 			return
 		}
-		if err := insertPgAttributeRelidAttnumIndexEntry(ctx, ct.RelOID, int16(attnum), attrTID); err != nil {
+		if err := insertPgAttributeIndexEntries(ctx, ct.RelOID, int16(attnum), compRow[1].StringValue(), attrTID); err != nil {
 			return
 		}
 	}
@@ -20166,13 +20167,14 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		Fork:   storage.MainFork,
 	}
 	for _, col := range tbl.Columns {
-		attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), buildUserPGAttributeRow(ctx.Catalog, tbl, col))
+		colRow := buildUserPGAttributeRow(ctx.Catalog, tbl, col)
+		attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), colRow)
 		if err != nil {
 			return fmt.Errorf("pg_attribute col %q: %w", col.Name, err)
 		}
 		// attnum is the 1-based ordinal of the column in PG18. B0.3: routed
 		// per-DB like the pg_class entries above (skip lifted).
-		if err := insertPgAttributeRelidAttnumIndexEntry(ctx, tbl.OID, int16(col.Ordinal+1), attrTID); err != nil {
+		if err := insertPgAttributeIndexEntries(ctx, tbl.OID, int16(col.Ordinal+1), colRow[1].StringValue(), attrTID); err != nil {
 			return fmt.Errorf("pg_attribute_relid_attnum_index col %q: %w", col.Name, err)
 		}
 	}
@@ -20184,7 +20186,7 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 			if err != nil {
 				return fmt.Errorf("pg_attribute system column %s: %w", row[1].StringValue(), err)
 			}
-			if err := insertPgAttributeRelidAttnumIndexEntry(ctx, tbl.OID, int16(row[4].Int), attrTID); err != nil {
+			if err := insertPgAttributeIndexEntries(ctx, tbl.OID, int16(row[4].Int), row[1].StringValue(), attrTID); err != nil {
 				return fmt.Errorf("pg_attribute_relid_attnum_index system column %s: %w", row[1].StringValue(), err)
 			}
 		}
@@ -20638,7 +20640,7 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 		if err != nil {
 			return fmt.Errorf("pg_attribute for index attr %q: %w", attrNames[i], err)
 		}
-		if err := insertPgAttributeRelidAttnumIndexEntry(ctx, idx.OID, int16(i+1), attrTID); err != nil {
+		if err := insertPgAttributeIndexEntries(ctx, idx.OID, int16(i+1), attrRow[1].StringValue(), attrTID); err != nil {
 			return fmt.Errorf("pg_attribute_relid_attnum_index for index attr %q: %w", attrNames[i], err)
 		}
 	}
@@ -25389,7 +25391,7 @@ func (o *ddlOp) resyncAttrACLHeapRow(im *catalog.InMemory, tbl *catalog.Table, c
 	}
 	// Re-index the rebuilt row so a pg_attribute (attrelid, attnum) index lookup
 	// finds the new tuple, matching syncTableToCatalogHeap's index maintenance.
-	if err := insertPgAttributeRelidAttnumIndexEntry(ctx, tbl.OID, attNum, attrTID); err != nil {
+	if err := insertPgAttributeIndexEntries(ctx, tbl.OID, attNum, row[1].StringValue(), attrTID); err != nil {
 		return err
 	}
 	if ctx.TxnMgr != nil {

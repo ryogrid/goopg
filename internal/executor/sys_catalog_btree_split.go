@@ -215,7 +215,10 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 2}, true
 	case pgExtensionNameIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 72, nkeyatts: 1}, true
-	case pgRewriteRelRulenameIndexOID:
+	case pgRewriteRelRulenameIndexOID,
+		// M0149-0001g: pg_attribute_relid_attnam_index, maintained at runtime
+		// through insertPgAttributeIndexEntries (buildIndexTupleOidNameKey).
+		pgAttributeRelidAttnamIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 2}, true
 	default:
 		return btreeIndexKeyMeta{}, false

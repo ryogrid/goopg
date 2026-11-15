@@ -11776,6 +11776,33 @@ verify each at HEAD when the task starts.
     against pg\_\*.h, with a unit test that compares every nailed descriptor with a pinned PG 18.3 dump.
   - Verification: on a PG cold start, CREATE TABLE / CREATE INDEX / DROP TABLE work, and the pg\_attribute and
     pg\_index audits equal PG's.
+  - 2026-11-16 slice 1 landed:
+    - Dropped the three extra columns \(pg\_depend.objversion,
+      pg\_description.shared, pg\_namespace.nspblocked; relnatts 8→7 / 5→4 /
+      5→4\). The PG-side heap\_form\_tuple SIGSEGV is gone.
+    - Index audit \(leaf tuples vs heap rows, all 117 bootstrap indexes\):
+      only 2658 was wrong, with 0 vs 2802. It is now built at initdb from the
+      same row source as the heap \(pgAttrBootstrapHeapRows\). goopg maintains
+      it at runtime through insertPgAttributeIndexEntries, which all five
+      pg\_attribute writers use; 2658 is registered in the sys-btree split
+      table.
+    - relhasindex is now true for local catalogs too, completing
+      M0149-0001d's scope.
+    - PG 18.3 on a goopg directory now succeeds at CREATE TABLE, INSERT,
+      CREATE SCHEMA, CREATE INDEX, ALTER TABLE ADD COLUMN, CREATE VIEW /
+      SELECT and CREATE DATABASE + connect.
+    - Still failing on PG \(the missing-index item\): a PRIMARY KEY needs
+      2664 pg\_constraint\_conname\_nsp\_index; COMMENT needs 2675
+      pg\_description\_o\_c\_o\_index; DROP needs 2673 pg\_depend\_depender\_index.
+    - New finding: PG warns "invalid page in block 0 of relation
+      base/5/1247\_fsm \(1249\_fsm, 1259\_fsm\); zeroing out page" on its first
+      catalog write. goopg's catalog FSM forks are not PG-format.
+    - Gates: units, postmaster, testport interop set, regress A/B on 20
+      cases \(only the join ±1 flapper moved\), spotcheck, sf025 99,
+      acceptance.
+    - Next slice: bootstrap and maintain the 19 missing catalog indexes,
+      starting with 2673 / 2674 \(pg\_depend\), 2664 and 2675.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none
