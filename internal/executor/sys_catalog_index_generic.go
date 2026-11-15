@@ -88,6 +88,23 @@ var catalogIndexDefs = map[uint32][]catIdxDef{
 	6106: {
 		{6116, []catIdxKey{{1, catKeyOid}}},
 	},
+	// pg_class (1259) is deliberately NOT registered. Maintaining
+	// pg_class_tblspc_relfilenode_index (3455) from goopg's runtime made a
+	// PG 18.3 node promoted from a goopg primary trip
+	// Assert("tuplesz <= BTMaxItemSize") (nbtdedup.c) on a user-index insert in
+	// TestE2E_FailoverGoopgToPG (2 of 5 runs; 0 of 10 at the previous commit and
+	// 0 of 5 without this entry). Until that is understood 3455 carries only
+	// its bootstrap rows, so goopg-created relations are missing from it
+	// (M0149-0001g, ledger 2026-11-16).
+	// pg_am (2601): oid 0, amname 1.
+	2601: {
+		{2652, []catIdxKey{{0, catKeyOid}}},  // pg_am_oid_index
+		{2651, []catIdxKey{{1, catKeyName}}}, // pg_am_name_index
+	},
+	// pg_amop (2602) / pg_amproc (2603): oid 0 (the family-keyed indexes keep
+	// their explicit inserters).
+	2602: {{2756, []catIdxKey{{0, catKeyOid}}}},
+	2603: {{2757, []catIdxKey{{0, catKeyOid}}}},
 	// pg_depend (2608): classid 0, objid 1, objsubid 2, refclassid 3,
 	// refobjid 4, refobjsubid 5.
 	2608: {

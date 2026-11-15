@@ -516,6 +516,16 @@ Key observation: PG compatibility constrains only the **displayed** and
 - Remaining indexes: pg\_am, pg\_amop, pg\_amproc and pg\_class 3455. These
   need builds from the bootstrap rows. pg\_largeobject needs its catalog.
 
+## Follow\-up: M0149\-0001g slice 4 — row\-built catalog indexes \(2026\-11\-16\)
+
+- pg\_am 2651 / 2652, pg\_amop 2756, pg\_amproc 2757 and pg\_class 3455 are
+  now built at initdb from the same row sources as their heaps. goopg
+  maintains the first three at runtime through the generic registry.
+- 3455 is not maintained at runtime. Doing so made a promoted PG node trip
+  an nbtree deduplication assertion on a user index; this was bisected to
+  that registry entry. It stays open until the WAL interaction is
+  understood.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

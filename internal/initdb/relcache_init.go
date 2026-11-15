@@ -885,6 +885,12 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	{OID: 3258, Name: "pg_policy_polrelid_polname_index"},
 	{OID: 3597, Name: "pg_seclabel_object_index"},
 	{OID: 3395, Name: "pg_init_privs_o_c_o_index"},
+	// M0149-0001g slice 4.
+	{OID: 2651, Name: "pg_am_name_index"},
+	{OID: 2652, Name: "pg_am_oid_index"},
+	{OID: 2756, Name: "pg_amop_oid_index"},
+	{OID: 2757, Name: "pg_amproc_oid_index"},
+	{OID: 3455, Name: "pg_class_tblspc_relfilenode_index"},
 	// M0106-0010 batched-36 loop 5: pg_namespace_nspname_index (OID 2684)
 	// is a 1-column UNIQUE btree on pg_namespace.nspname (name_ops) — same
 	// shape as pg_authid_rolname_index (Step 3dg) and pg_database_datname_index

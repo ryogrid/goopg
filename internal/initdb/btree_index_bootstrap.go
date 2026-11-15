@@ -3047,3 +3047,166 @@ func bootstrapPgLanguageNameIndex(dataDir string, tids map[uint32]heapTID) error
 	}
 	return nil
 }
+
+// ── M0149-0001g slice 4: indexes over catalogs that carry bootstrap rows ──
+//
+// PG 18.3 declares these on pg_am, pg_amop, pg_amproc and pg_class; goopg's
+// image lacked them, so a PG node over a goopg directory failed "could not open
+// relation with OID …" whenever it reached for one (e.g. pg_class 3455 in
+// RelidByRelfilenumber, pg_am 2651 for CREATE INDEX … USING). Each is built from
+// the same row source and heap TIDs as the catalog's other indexes.
+
+// writeLocalIndexFile writes one local catalog index image to base/{1,5}.
+func writeLocalIndexFile(dataDir string, oid uint32, file []byte) error {
+	for _, dir := range []string{filepath.Join(dataDir, "base", "1"), filepath.Join(dataDir, "base", "5")} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(uint64(oid), 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write index %d in %s: %w", oid, dir, err)
+		}
+	}
+	return nil
+}
+
+type oidKeyedTID struct {
+	oid   uint32
+	block uint32
+	off   uint16
+}
+
+// buildOidIndexFile bulk-loads a UNIQUE single-oid index from (oid, TID) pairs.
+func buildOidIndexFile(items []oidKeyedTID) ([]byte, error) {
+	sort.Slice(items, func(i, j int) bool { return items[i].oid < items[j].oid })
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidKey(it.block, it.off, it.oid)
+	}
+	return pgBuildBtreeBulkLoad(tuples, 1)
+}
+
+// bootstrapPgAmopOidIndex writes pg_amop_oid_index (2756, btree(oid)).
+func bootstrapPgAmopOidIndex(dataDir string, tids []heapTID) error {
+	entries := pgAmopInitialEntries()
+	if len(entries) != len(tids) {
+		return fmt.Errorf("pg_amop_oid_index: entries=%d tids=%d", len(entries), len(tids))
+	}
+	items := make([]oidKeyedTID, len(entries))
+	for i, e := range entries {
+		items[i] = oidKeyedTID{e.OID, tids[i].Block, tids[i].Offset}
+	}
+	file, err := buildOidIndexFile(items)
+	if err != nil {
+		return fmt.Errorf("pg_amop_oid_index: %w", err)
+	}
+	return writeLocalIndexFile(dataDir, 2756, file)
+}
+
+// bootstrapPgAmprocOidIndex writes pg_amproc_oid_index (2757, btree(oid)).
+func bootstrapPgAmprocOidIndex(dataDir string, tids []heapTID) error {
+	entries := pgAmprocInitialEntries()
+	if len(entries) != len(tids) {
+		return fmt.Errorf("pg_amproc_oid_index: entries=%d tids=%d", len(entries), len(tids))
+	}
+	items := make([]oidKeyedTID, len(entries))
+	for i, e := range entries {
+		items[i] = oidKeyedTID{e.OID, tids[i].Block, tids[i].Offset}
+	}
+	file, err := buildOidIndexFile(items)
+	if err != nil {
+		return fmt.Errorf("pg_amproc_oid_index: %w", err)
+	}
+	return writeLocalIndexFile(dataDir, 2757, file)
+}
+
+// bootstrapPgAmIndexes writes pg_am_oid_index (2652, btree(oid)) and
+// pg_am_name_index (2651, btree(amname)).
+func bootstrapPgAmIndexes(dataDir string, tids []heapTID) error {
+	entries := pgAmInitialEntries()
+	if len(entries) != len(tids) {
+		return fmt.Errorf("pg_am indexes: entries=%d tids=%d", len(entries), len(tids))
+	}
+	items := make([]oidKeyedTID, len(entries))
+	for i, e := range entries {
+		items[i] = oidKeyedTID{e.OID, tids[i].Block, tids[i].Offset}
+	}
+	file, err := buildOidIndexFile(items)
+	if err != nil {
+		return fmt.Errorf("pg_am_oid_index: %w", err)
+	}
+	if err := writeLocalIndexFile(dataDir, 2652, file); err != nil {
+		return err
+	}
+	type named struct {
+		name  string
+		block uint32
+		off   uint16
+	}
+	ns := make([]named, len(entries))
+	for i, e := range entries {
+		ns[i] = named{e.Name, tids[i].Block, tids[i].Offset}
+	}
+	sort.Slice(ns, func(i, j int) bool { return ns[i].name < ns[j].name })
+	tuples := make([][]byte, len(ns))
+	for i, n := range ns {
+		tuples[i] = pgBuildIndexTupleNameKey(n.block, n.off, n.name)
+	}
+	file, err = pgBuildBtreeBulkLoadSized(tuples, 72 /* name tuple size */, 1)
+	if err != nil {
+		return fmt.Errorf("pg_am_name_index: %w", err)
+	}
+	return writeLocalIndexFile(dataDir, 2651, file)
+}
+
+// bootstrapPgClassTblspcRelfilenodeIndex writes pg_class_tblspc_relfilenode_index
+// (3455, btree(reltablespace oid_ops, relfilenode oid_ops), non-unique) over
+// every bootstrapped pg_class row, reading both keys from the rows pgClassRow
+// writes so index and heap cannot disagree.
+func bootstrapPgClassTblspcRelfilenodeIndex(dataDir string, tids map[uint32]heapTID) error {
+	cols := pgClassColDefs()
+	tsPos, fnPos := -1, -1
+	for i, c := range cols {
+		switch c.Name {
+		case "reltablespace":
+			tsPos = i
+		case "relfilenode":
+			fnPos = i
+		}
+	}
+	if tsPos < 0 || fnPos < 0 {
+		return fmt.Errorf("pg_class_tblspc_relfilenode_index: pg_class columns not found")
+	}
+	type entry struct {
+		ts, fn uint32
+		block  uint32
+		off    uint16
+	}
+	var entries []entry
+	for _, rel := range pgClassBootstrapRels() {
+		t, ok := tids[rel.OID]
+		if !ok {
+			return fmt.Errorf("pg_class_tblspc_relfilenode_index: no heap TID for %d", rel.OID)
+		}
+		row := pgClassRow(rel)
+		entries = append(entries, entry{uint32(row[tsPos].Int), uint32(row[fnPos].Int), t.Block, t.Offset})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		a, b := entries[i], entries[j]
+		if a.ts != b.ts {
+			return a.ts < b.ts
+		}
+		if a.fn != b.fn {
+			return a.fn < b.fn
+		}
+		if a.block != b.block {
+			return a.block < b.block
+		}
+		return a.off < b.off
+	})
+	tuples := make([][]byte, len(entries))
+	for i, e := range entries {
+		tuples[i] = pgBuildIndexTupleOidOidKey(e.block, e.off, e.ts, e.fn)
+	}
+	file, err := pgBuildBtreeBulkLoad(tuples, 2)
+	if err != nil {
+		return fmt.Errorf("pg_class_tblspc_relfilenode_index: %w", err)
+	}
+	return writeLocalIndexFile(dataDir, 3455, file)
+}

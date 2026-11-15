@@ -11860,6 +11860,37 @@ verify each at HEAD when the task starts.
       row\). pg\_init\_privs lacks PG's 229 initdb rows and its TOAST 4155.
     - Gates: units, postmaster, testport interop set, spotcheck, sf025 99.
     Movement: none — C3 cold-start fix
+  - 2026-11-16 slice 4:
+    - Built the indexes over catalogs that carry bootstrap rows, from those
+      rows: 2651 / 2652 pg\_am, 2756 pg\_amop, 2757 pg\_amproc, 3455 pg\_class
+      \(pgClassBootstrapRels is now the single pg\_class row source\).
+      Runtime maintenance is registered for pg\_am, pg\_amop and pg\_amproc.
+    - PG 18.3 now runs CREATE INDEX USING hash, pg\_filenode\_relation \(3455\)
+      and the pg\_am / pg\_amop OID lookups.
+    - **Not registered: pg\_class 3455 runtime maintenance.** With it,
+      TestE2E\_FailoverGoopgToPG tripped PG's Assert\("tuplesz <=
+      BTMaxItemSize"\) \(nbtdedup.c, \_bt\_dedup\_finish\_pending\) on a user-index
+      insert \(b5a\_idx\) on the promoted PG node.
+      - Bisect: 2 of 5 runs failed with the entry; 0 of 10 at the previous
+        commit; 0 of 5 without the entry.
+      - The mechanism is unknown. goopg's sys-btree inserter
+        \(insertCanonicalSysBtreeLeafInDB → MarkDirtyForceFPI\) WAL-logs a
+        3455 page that somehow corrupts the user index on the replayed
+        side. Investigate with pg\_waldump on the standby's WAL around b5a\_idx.
+      - Until fixed, 3455 lacks goopg-created relations.
+    - New findings:
+      - CREATE INDEX USING brin SIGSEGVs PG in index\_opclass\_options →
+        spg\_text\_leaf\_consistent: a pg\_amproc support function maps to
+        the wrong proc. Pre-existing \(the slice-3 binary crashes too\).
+      - PG autovacuum asserts !TransactionIdIsValid\(relfrozenxid\)
+        \(vacuum.c\): goopg's pg\_class rows for storage-less relations
+        \(views\) carry a valid relfrozenxid.
+      - The text search configuration "simple" is missing \(pg\_ts\_config is
+        empty\).
+    - Gates: units, postmaster, testport interop set, failover 5 of 5 on the
+      final tree, regress A/B on 7 DDL cases \(no movement\), spotcheck,
+      sf025 99, acceptance.
+    Movement: none — C3 cold-start fix
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

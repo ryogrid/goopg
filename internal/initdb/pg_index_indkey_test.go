@@ -157,6 +157,12 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		3258: {3, 2},       // pg_policy_polrelid_polname_index
 		3597: {1, 2, 3, 4}, // pg_seclabel_object_index
 		3395: {1, 2, 3},    // pg_init_privs_o_c_o_index
+		// M0149-0001g slice 4.
+		2651: {2},    // pg_am_name_index
+		2652: {1},    // pg_am_oid_index
+		2756: {1},    // pg_amop_oid_index
+		2757: {1},    // pg_amproc_oid_index
+		3455: {9, 8}, // pg_class_tblspc_relfilenode_index
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {

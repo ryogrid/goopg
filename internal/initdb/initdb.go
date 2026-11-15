@@ -1240,6 +1240,9 @@ func Init(opts Options) error {
 	if err := bootstrapPgAmopFamStratIndex(abs, pgAmopTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_amop_fam_strat_index: %w", err)
 	}
+	if err := bootstrapPgAmopOidIndex(abs, pgAmopTIDs); err != nil { // M0149-0001g slice 4
+		return fmt.Errorf("goopg init: pg_amop_oid_index: %w", err)
+	}
 	if err := bootstrapPgAmopOprFamIndex(abs, pgAmopTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_amop_opr_fam_index: %w", err)
 	}
@@ -1255,6 +1258,9 @@ func Init(opts Options) error {
 	// the cmp/sortsupport/equalimage rows. Without this the next FATAL
 	// during standby boot is "missing support function 1 for attribute
 	// 1 of index pg_authid_rolname_index".
+	if err := bootstrapPgAmprocOidIndex(abs, pgAmprocTIDs); err != nil { // M0149-0001g slice 4
+		return fmt.Errorf("goopg init: pg_amproc_oid_index: %w", err)
+	}
 	if err := bootstrapPgAmprocFamProcIndex(abs, pgAmprocTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_amproc_fam_proc_index: %w", err)
 	}
@@ -1405,6 +1411,9 @@ func Init(opts Options) error {
 	// loading the SHARED critical indexes — can find pg_class rows
 	// via pg_class_oid_index. Without this the next FATAL during
 	// standby boot is "could not open critical system index 2671".
+	if err := bootstrapPgClassTblspcRelfilenodeIndex(abs, pgClassTIDs); err != nil { // M0149-0001g slice 4
+		return fmt.Errorf("goopg init: pg_class_tblspc_relfilenode_index: %w", err)
+	}
 	if err := bootstrapPgClassOidIndex(abs, pgClassTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_class_oid_index: %w", err)
 	}
@@ -2489,22 +2498,21 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 //
 // Returns a map[oid]heapTID so the Step 3m caller can build the matching
 // pg_class_oid_index btree over the same heap-row locations.
-func bootstrapPgClassTuples(dataDir string) (map[uint32]heapTID, error) {
-	cols := pgClassColDefs()
+// pgClassBootstrapRels is the bootstrapped pg_class row set, in heap order.
+func pgClassBootstrapRels() []nailedRel {
 	allRels := append([]nailedRel{}, nailedSharedRels...)
 	allRels = append(allRels, nailedLocalRels...)
-	// M0131-S20.1: the TOAST pair rides in the pg_class heap but NOT in
-	// nailedLocalRels — see nailedToastRels for why (no pg_type row, no
-	// pg_internal.init entry).
 	allRels = append(allRels, nailedToastRels()...)
-	// M0133-S3: the four information_schema data tables carry pg_class rows
-	// (relkind 'r', relnamespace 13273) but are NOT nailed — they ride the heap
-	// here, and their pg_type composite rows via their RelType, but never
-	// pg_internal.init (see informationSchemaDataTableRels).
 	allRels = append(allRels, informationSchemaDataTableRels()...)
-	// M0133-S4: the information_schema VIEWS (relkind 'v', relnamespace 13273)
-	// likewise ride the pg_class heap but never pg_internal.init.
 	allRels = append(allRels, informationSchemaViewSeedRels()...)
+	return allRels
+}
+
+func bootstrapPgClassTuples(dataDir string) (map[uint32]heapTID, error) {
+	cols := pgClassColDefs()
+	// M0131-S20.1 TOAST pairs, M0133-S3/S4 information_schema tables and
+	// views ride the pg_class heap too (see pgClassBootstrapRels).
+	allRels := pgClassBootstrapRels()
 	tids, err := writeMultiPageHeap(dataDir, "1259", cols, allRels, func(rel nailedRel) executor.Row {
 		return pgClassRow(rel)
 	})
@@ -2649,8 +2657,12 @@ func bootstrapPgAmTuples(dataDir string) error {
 	for _, e := range entries {
 		rows = append(rows, pgAmRow(e))
 	}
-	_, err := writeMultiPageHeapRows(dataDir, "2601", cols, rows)
-	return err
+	tids, err := writeMultiPageHeapRows(dataDir, "2601", cols, rows)
+	if err != nil {
+		return err
+	}
+	// M0149-0001g slice 4: pg_am_oid_index 2652 / pg_am_name_index 2651.
+	return bootstrapPgAmIndexes(dataDir, tids)
 }
 
 // pgNamespaceColDefs returns PG18's 4-column FormData_pg_namespace layout.
@@ -5280,6 +5292,13 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		entry(3258, 3256, []int16{3, 2}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false),                            // pg_policy_polrelid_polname_index
 		entry(3597, 3596, []int16{1, 2, 3, 4}, []uint32{oidOps, oidOps, int4Ops, textOps}, []uint32{0, 0, 0, cCollation}, true, true), // pg_seclabel_object_index
 		entry(3395, 3394, []int16{1, 2, 3}, []uint32{oidOps, oidOps, int4Ops}, []uint32{0, 0, 0}, true, true),                        // pg_init_privs_o_c_o_index
+		// M0149-0001g slice 4: indexes over catalogs with bootstrap rows, built
+		// from those rows (btree_index_bootstrap.go).
+		entry(2651, 2601, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false),                                        // pg_am_name_index
+		entry(2652, 2601, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                                   // pg_am_oid_index
+		entry(2756, 2602, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                                   // pg_amop_oid_index
+		entry(2757, 2603, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                                   // pg_amproc_oid_index
+		entry(3455, 1259, []int16{9, 8}, []uint32{oidOps, oidOps}, []uint32{0, 0}, false, false),                                   // pg_class_tblspc_relfilenode_index
 		// pg_namespace columns (PG18, pg_namespace.h): 1=oid, 2=nspname,
 		// 3=nspowner, 4=nspacl. PG18 indexing.h:
 		//   NamespaceNameIndexId = 2684 = pg_namespace_nspname_index
