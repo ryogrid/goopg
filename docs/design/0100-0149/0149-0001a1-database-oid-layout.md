@@ -434,6 +434,20 @@ Key observation: PG compatibility constrains only the **displayed** and
   missing indexes and missing TOAST relations. PG\-side `CREATE TABLE`
   segfaults on `pg_depend`'s extra column.
 
+## Follow\-up: M0149\-0001e — system attributes \(2026\-11\-15\)
+
+- PG stores six system attributes for every table\-like relation, at
+  attnum −1 … −6: ctid, xmin, cmin, xmax, cmax and tableoid
+  \(`heap.c` `SysAtt[]`, `AddNewAttributeTuples`\).
+- goopg wrote none, so a PG 18.3 node on a goopg directory rejected
+  `SELECT ctid`.
+- The rows now come from two places, both indexed in 2659:
+  - initdb, for the bootstrapped catalogs;
+  - the table\-persist funnel, for user tables of every relkind except
+    views.
+- goopg's own resolution of xmin and the other system columns in queries
+  remains M0146\-0239.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

@@ -20176,6 +20176,19 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 			return fmt.Errorf("pg_attribute_relid_attnum_index col %q: %w", col.Name, err)
 		}
 	}
+	// M0149-0001e: the six system attributes (ctid … tableoid) every
+	// table-like relation carries in PG (heap.c AddNewAttributeTuples).
+	if relKindHasSystemAttributes(tbl) {
+		for _, row := range buildUserPGSystemAttributeRows(tbl.OID) {
+			attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), row)
+			if err != nil {
+				return fmt.Errorf("pg_attribute system column %s: %w", row[1].StringValue(), err)
+			}
+			if err := insertPgAttributeRelidAttnumIndexEntry(ctx, tbl.OID, int16(row[4].Int), attrTID); err != nil {
+				return fmt.Errorf("pg_attribute_relid_attnum_index system column %s: %w", row[1].StringValue(), err)
+			}
+		}
+	}
 
 	// B5 Slice B: column DEFAULT persistence via real pg_attrdef HEAP rows
 	// (base/<dbOid>/2604), replacing the goopg-private RecordKindColumnDefaults(69)

@@ -1303,7 +1303,9 @@ func bootstrapPgAttributeRelidAttnumIndex(dataDir string, tids map[pgAttrTIDKey]
 	}
 	entries := make([]entry, 0, len(tids))
 	for k, t := range tids {
-		if k.AttNum <= 0 {
+		// M0149-0001e: system attributes (attnum < 0) are indexed too, as in
+		// PG; attnum 0 is never stored.
+		if k.AttNum == 0 {
 			continue
 		}
 		entries = append(entries, entry{

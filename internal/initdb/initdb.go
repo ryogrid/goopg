@@ -2525,6 +2525,16 @@ func bootstrapPgAttributeTuples(dataDir string) (map[pgAttrTIDKey]heapTID, error
 			rows = append(rows, pgAttributeRow(rel.OID, a))
 			keys = append(keys, rowKey{AttRelID: rel.OID, AttNum: a.Num})
 		}
+		// M0149-0001e: every table-like relation also carries the six system
+		// attributes (heap.c AddNewAttributeTuples over SysAtt[]); without them
+		// a PG 18.3 node answers `SELECT ctid FROM pg_database` with
+		// "column \"ctid\" does not exist".
+		if rel.RelKind == 'r' || rel.RelKind == 't' {
+			for _, row := range pgSystemAttributeRows(rel.OID) {
+				rows = append(rows, row)
+				keys = append(keys, rowKey{AttRelID: rel.OID, AttNum: int16(row[4].Int)})
+			}
+		}
 	}
 	tids, err := writeMultiPageHeapRows(dataDir, "1249", attrCols, rows)
 	if err != nil {
@@ -6420,6 +6430,42 @@ func nailedAttrsFromColDefs(cols []catalog.Column) []nailedAttr {
 }
 
 // pgAttributeRow builds one pg_attribute tuple.
+// pgSystemAttributes is PostgreSQL's SysAtt[] (postgres/src/backend/catalog/
+// heap.c): attnum, name, type, length, byval, align — the values a PG 18.3
+// initdb stores for every table-like relation (checked against a scratch
+// initdb's pg_attribute WHERE attnum < 0).
+var pgSystemAttributes = []struct {
+	num   int16
+	name  string
+	typ   uint32
+	len   int16
+	byval bool
+	align string
+}{
+	{-1, "ctid", 27, 6, false, "s"},
+	{-2, "xmin", 28, 4, true, "i"},
+	{-3, "cmin", 29, 4, true, "i"},
+	{-4, "xmax", 28, 4, true, "i"},
+	{-5, "cmax", 29, 4, true, "i"},
+	{-6, "tableoid", 26, 4, true, "i"},
+}
+
+// pgSystemAttributeRows renders the six system attributes of relOID as
+// pg_attribute rows: attstorage 'p', attnotnull true, attislocal true,
+// attcollation 0, attstattarget NULL — PG's own values. byval / align are set
+// from SysAtt[] directly rather than through pgTypeByVal / pgTypeAlignChar.
+func pgSystemAttributeRows(relOID uint32) []executor.Row {
+	rows := make([]executor.Row, 0, len(pgSystemAttributes))
+	for _, sa := range pgSystemAttributes {
+		row := pgAttributeRow(relOID, nailedAttr{Name: sa.name, TypeOID: sa.typ, Num: sa.num, Len: sa.len, NotNull: true})
+		row[7] = executor.NewBoolDatum(sa.byval)  // attbyval
+		row[8] = executor.NewStringDatum(sa.align) // attalign
+		row[9] = executor.NewStringDatum("p")      // attstorage
+		rows = append(rows, row)
+	}
+	return rows
+}
+
 func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 	return executor.Row{
 		executor.NewIntDatum(int64(relOID)),

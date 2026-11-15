@@ -11745,7 +11745,7 @@ verify each at HEAD when the task starts.
     against pg\_\*.h, with a unit test that compares every nailed descriptor with a pinned PG 18.3 dump.
   - Verification: on a PG cold start, CREATE TABLE / CREATE INDEX / DROP TABLE work, and the pg\_attribute and
     pg\_index audits equal PG's.
-- [ ] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
+- [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none
   - Found 2026-11-15: PG 18.3 on a goopg directory answers `SELECT ctid FROM pg_database` with "column \"ctid\" does
@@ -11754,6 +11754,27 @@ verify each at HEAD when the task starts.
     xmax, cmax, tableoid\) for every heap relation \(`heap.c` AddNewAttributeTuples, SysAtt\[\]\).
   - First step: in bootstrapPgAttributeTuples, emit the six system rows for every relkind 'r' / 't' nailed
     relation, then rebuild pg\_attribute's indexes. Verify `SELECT ctid, xmin FROM pg_database` on a PG cold start.
+  - 2026-11-15 COMPLETE:
+    - initdb writes PG's six system attributes \(SysAtt\[\]: ctid −1, xmin −2,
+      cmin −3, xmax −4, cmax −5, tableoid −6, with values checked against a
+      scratch initdb\) for every bootstrapped relkind r / t catalog, and
+      indexes them in pg\_attribute\_relid\_attnum\_index 2659.
+    - User tables get the same rows at CREATE / ALTER TABLE through the
+      table-persist funnel \(buildUserPGSystemAttributeRows; every relkind
+      but views, per heap\_create\_with\_catalog\). goopg's reload already
+      filters attnum > 0.
+    - PG 18.3 cold start: `SELECT ctid, xmin, tableoid` works on pg\_database,
+      pg\_class and a goopg-created user table \(before: "column \"ctid\" does
+      not exist"\). goopg's own pg\_attribute now lists the system rows, as PG
+      does.
+    - goopg itself still rejects `SELECT xmin` / cmin / xmax / cmax: already
+      filed as M0146-0239.
+    - Seven tests that counted user columns now filter attnum > 0 or expect
+      the extra index entries.
+    - Gates: units, postmaster, testport interop set, regress A/B on the 20
+      pg\_attribute cases \(no movement; join ±1 is the known flapper\),
+      spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
 - [ ] **M0149-0001f — goopg's own catalog does not expose pg\_shdepend / pg\_shdescription**
   Kind: impl
   Parent: none

@@ -423,6 +423,9 @@ func TestBootstrappedPGAttributeRowsReadable(t *testing.T) {
 					continue
 				}
 			}
+			if row.AttNum < 0 {
+				continue // system attributes (M0149-0001e); this test counts user columns
+			}
 			byRelID[row.AttRelID] = append(byRelID[row.AttRelID], row.AttName)
 		}
 	}

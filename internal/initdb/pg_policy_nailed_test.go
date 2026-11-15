@@ -131,9 +131,15 @@ func TestPgPolicyIsOnDiskAfterInit(t *testing.T) {
 		// 3. the eight pg_attribute rows. attrelid is the leading oid column
 		//    and attname the 64-byte NameData right behind it (pgAttrColDefs).
 		attrRows := scanHeapPayloadsForOID(t, filepath.Join(dir, db, "1249"), 3256)
-		if len(attrRows) != 8 {
-			t.Fatalf("%s/1249 holds %d pg_attribute rows for attrelid 3256, want 8",
+		// 8 user columns, then the six system attributes (M0149-0001e).
+		if len(attrRows) != 14 {
+			t.Fatalf("%s/1249 holds %d pg_attribute rows for attrelid 3256, want 14 (8 columns + 6 system)",
 				db, len(attrRows))
+		}
+		for i, want := range []string{"ctid", "xmin", "cmin", "xmax", "cmax", "tableoid"} {
+			if name := string(bytes.TrimRight(attrRows[8+i][4:4+64], "\x00")); name != want {
+				t.Errorf("%s/1249 pg_attribute(3256) system row %d attname = %q, want %q", db, i, name, want)
+			}
 		}
 		for i, want := range pgPolicyAttrs() {
 			name := string(bytes.TrimRight(attrRows[i][4:4+64], "\x00"))

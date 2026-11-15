@@ -154,7 +154,9 @@ func TestUserCreateTableEmitsPG18CanonicalPgAttributeRows(t *testing.T) {
 			if err != nil {
 				continue
 			}
-			if row.AttRelID != tbl.OID {
+			// System attributes (attnum < 0, M0149-0001e) are covered by their own
+			// tests; this one pins the user columns.
+			if row.AttRelID != tbl.OID || row.AttNum < 0 {
 				continue
 			}
 			byAttNum[row.AttNum] = row

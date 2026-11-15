@@ -1142,6 +1142,71 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 	}
 }
 
+// relKindHasSystemAttributes reports whether PG gives a relation of tbl's
+// relkind the six system attributes: every kind except views and composite
+// types (heap_create_with_catalog → AddNewAttributeTuples is skipped only for
+// RELKIND_VIEW and RELKIND_COMPOSITE_TYPE).
+func relKindHasSystemAttributes(tbl *catalog.Table) bool {
+	return relkindByteForTable(tbl) != 'v'
+}
+
+// buildUserPGSystemAttributeRows returns the six system-attribute pg_attribute
+// rows heap_create_with_catalog writes for every table-like relation
+// (AddNewAttributeTuples over SysAtt[], postgres/src/backend/catalog/heap.c):
+// ctid, xmin, cmin, xmax, cmax, tableoid at attnum -1 … -6. Without them a
+// PG 18.3 node reading a goopg directory answers `SELECT ctid FROM t` with
+// "column \"ctid\" does not exist" (M0149-0001e). Values checked against a
+// scratch PG 18.3 initdb: attstorage 'p', attnotnull true, attislocal true,
+// attcollation 0, every nullable trailing column NULL.
+func buildUserPGSystemAttributeRows(relOID uint32) []Row {
+	sys := []struct {
+		num   int64
+		name  string
+		typ   int64
+		len   int64
+		byval bool
+		align string
+	}{
+		{-1, "ctid", 27, 6, false, "s"},
+		{-2, "xmin", 28, 4, true, "i"},
+		{-3, "cmin", 29, 4, true, "i"},
+		{-4, "xmax", 28, 4, true, "i"},
+		{-5, "cmax", 29, 4, true, "i"},
+		{-6, "tableoid", 26, 4, true, "i"},
+	}
+	rows := make([]Row, 0, len(sys))
+	for _, a := range sys {
+		rows = append(rows, Row{
+			NewIntDatum(int64(relOID)), // attrelid
+			NewStringDatum(a.name),     // attname
+			NewIntDatum(a.typ),         // atttypid
+			NewIntDatum(a.len),         // attlen
+			NewIntDatum(a.num),         // attnum
+			NewIntDatum(-1),            // atttypmod
+			NewIntDatum(0),             // attndims
+			NewBoolDatum(a.byval),      // attbyval
+			NewStringDatum(a.align),    // attalign
+			NewStringDatum("p"),        // attstorage
+			NewStringDatum(""),         // attcompression
+			NewBoolDatum(true),         // attnotnull
+			NewBoolDatum(false),        // atthasdef
+			NewBoolDatum(false),        // atthasmissing
+			NewStringDatum(""),         // attidentity
+			NewStringDatum(""),         // attgenerated
+			NewBoolDatum(false),        // attisdropped
+			NewBoolDatum(true),         // attislocal
+			NewIntDatum(0),             // attinhcount
+			NewIntDatum(0),             // attcollation
+			NullDatum,                  // attstattarget
+			NullDatum,                  // attacl
+			NullDatum,                  // attoptions
+			NullDatum,                  // attfdwoptions
+			NullDatum,                  // attmissingval
+		})
+	}
+	return rows
+}
+
 // setPGAttributeCol overwrites one column of a pg_attribute row by NAME rather
 // than by literal slice index, so the index-attribute overrides below survive
 // any future reordering of pgAttributeColumnsPG18 / buildUserPGAttributeRow.

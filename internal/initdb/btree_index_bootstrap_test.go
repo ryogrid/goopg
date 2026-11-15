@@ -369,7 +369,8 @@ func TestBootstrapPgAttributeRelidAttnumIndexWritesPopulatedBtree(t *testing.T) 
 	}
 	wantKeys := make([]key, 0, len(tids))
 	for k := range tids {
-		if k.AttNum <= 0 {
+		// System attributes (attnum < 0) are indexed too since M0149-0001e.
+		if k.AttNum == 0 {
 			continue
 		}
 		wantKeys = append(wantKeys, key{AttRelID: k.AttRelID, AttNum: k.AttNum})
