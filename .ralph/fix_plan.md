@@ -11459,7 +11459,7 @@ verify each at HEAD when the task starts.
       fails — `FATAL: could not open file "base/1/pg_filenode.map"`.
     Movement: none — tap 034\_create\_database baseline 3/4 recorded \(no
     TestPort func yet\)
-- [ ] **M0149-0001a — template1 carries the full PG per-database catalog image, including `base/1/pg_filenode.map`**
+- [x] **M0149-0001a — template1 carries the full PG per-database catalog image, including `base/1/pg_filenode.map`**
   Kind: impl
   Parent: M0149-0001
   - PG: initdb's bootstrap writes `base/1` as the complete template1
@@ -11483,6 +11483,21 @@ verify each at HEAD when the task starts.
       would expose goopg's postgres catalogs as "template1".
     - A storage-only remap is not enough: WAL records carry the
       RelFileNode database OID, so PG replay needs PG's OIDs in the WAL too.
+  - 2026-11-15 COMPLETE \(after M0149-0001a1\):
+    - initdb's `refreshTemplate0Image` now writes the finished base/5 image to
+      base/1 as well as base/4. A fresh `goopg init` has base/1 byte-identical
+      to base/4: 165 files including `pg_filenode.map`. Before, it had 138
+      files and no map until the first `goopg start`.
+    - PG 18.3 cold start on a freshly initialised directory, never started by
+      goopg, connects to template1 \(pg\_class 320 rows\).
+    - Manual mixed run of 034, done by hand because the 0001b harness does
+      not exist yet. goopg ran CREATE DATABASE test\_db\_1 STRATEGY WAL\_LOG
+      TEMPLATE template1, CREATE TABLE in template1, CHECKPOINT and kill -9;
+      then PG 18.3 recovered the directory: **A1 = 1, A2 = 0** with no
+      FATAL/PANIC/ERROR. All-goopg on the same crash copy: A1 = 1, A2 = 0.
+    - Gates: units, postmaster, testport template/CREATE DATABASE/interop/
+      Recovery/pg\_dump 24, spotcheck, sf025 99.
+    Movement: none — tap 034\_create\_database 3/4 \(mixed A1/A2 measured by hand; the inventory row is promoted by the 034 port with the 0001b harness\)
 - [x] **M0149-0001a1 — one OID per database at every layer: remove the `DefaultDBOid` sentinel \(postgres → 5, template1 → 1\)**
   Kind: impl
   Parent: M0149-0001a

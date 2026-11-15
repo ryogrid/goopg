@@ -571,23 +571,40 @@ func copyBootstrapCatalogImage(dataDir string, dbOID uint32) error {
 //
 // This runs BEFORE stampClusterChecksums, so a `-k` cluster checksums the
 // refreshed pages rather than the stale ones, and before the trailing fsync.
+//
+// M0149-0001a: template1 (base/1) gets the same finished image. PostgreSQL's
+// initdb bootstraps template1 in full — every catalog file plus its
+// pg_filenode.map (bootstrap.c, relmapper.c write_relmap_file) — and a PG
+// node reads template1 from base/1 the moment it starts on the directory.
+// goopg's bootstrappers wrote only part of base/1 (138 files, no
+// pg_filenode.map); the rest arrived at the first `goopg start` through
+// CreatePerDatabaseScaffolding, so a freshly initialised directory was not
+// openable by PG as template1.
 func refreshTemplate0Image(dataDir string) error {
 	srcDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(catalog.PostgresDBOid), 10))
-	dstDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(template0DbOid), 10))
 	entries, err := os.ReadDir(srcDir)
 	if err != nil {
 		return fmt.Errorf("read postgres image: %w", err)
 	}
-	for _, e := range entries {
-		if e.IsDir() || e.Name() == "PG_VERSION" {
-			continue
+	for _, db := range []struct {
+		oid  uint32
+		name string
+	}{{template0DbOid, "template0"}, {catalog.Template1NamespaceDBOid, "template1"}} {
+		dstDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(db.oid), 10))
+		if err := os.MkdirAll(dstDir, 0o700); err != nil {
+			return fmt.Errorf("create %s image dir: %w", db.name, err)
 		}
-		data, err := os.ReadFile(filepath.Join(srcDir, e.Name()))
-		if err != nil {
-			return fmt.Errorf("read postgres %s: %w", e.Name(), err)
-		}
-		if err := os.WriteFile(filepath.Join(dstDir, e.Name()), data, 0o600); err != nil {
-			return fmt.Errorf("write template0 %s: %w", e.Name(), err)
+		for _, e := range entries {
+			if e.IsDir() || e.Name() == "PG_VERSION" {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(srcDir, e.Name()))
+			if err != nil {
+				return fmt.Errorf("read postgres %s: %w", e.Name(), err)
+			}
+			if err := os.WriteFile(filepath.Join(dstDir, e.Name()), data, 0o600); err != nil {
+				return fmt.Errorf("write %s %s: %w", db.name, e.Name(), err)
+			}
 		}
 	}
 	return nil

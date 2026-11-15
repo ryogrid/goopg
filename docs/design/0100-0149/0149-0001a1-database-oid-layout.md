@@ -382,6 +382,21 @@ Key observation: PG compatibility constrains only the **displayed** and
   mirror, `NamespaceDBOid`'s `5 → 1` fold, and
   `PgDatabaseRowOid` / `NamespaceOidForPgDatabaseRow`.
 
+## Follow\-up: M0149\-0001a — template1's image at initdb \(2026\-11\-15\)
+
+- After S3, a fresh `goopg init` still left `base/1` incomplete: 138 files
+  and no `pg_filenode.map`. `CreatePerDatabaseScaffolding` completed it at
+  the first `goopg start`.
+- `refreshTemplate0Image` now copies the finished `base/5` image to template1
+  \(`base/1`\) as well as template0 \(`base/4`\), matching PG, whose
+  template1 and template0 directories are identical after initdb.
+- Measured:
+  - `base/1` is byte\-identical to `base/4`.
+  - A PG 18.3 cold start on a directory never started by goopg connects to
+    template1.
+  - Hand\-run mixed 034, goopg steps then PG 18.3 crash recovery: A1 = 1,
+    A2 = 0.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the
