@@ -698,6 +698,14 @@ Key observation: PG compatibility constrains only the **displayed** and
 - Descriptions of initdb\-assigned objects \(locale collations, text\-search
   objects, plpgsql\) wait for those catalogs.
 
+## Follow\-up: M0149\-0001g slice 20 — text\-search bootstrap rows \(2026\-11\-16\)
+
+- The five pg\_ts\_\* catalogs carry postgres.bki's rows and their nine
+  indexes, from `pg_ts_bootstrap_generated.go`. `scripts/gen-pg-ts-bootstrap.py`
+  regenerates it from postgres.bki alone; no initdb is needed.
+- The snowball dictionaries initdb adds later depend on C functions goopg
+  does not seed.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

@@ -12257,6 +12257,32 @@ verify each at HEAD when the task starts.
     - Gates: units, initdb, postmaster, testport interop set, regress A/B on
       6 cases \(no movement\), spotcheck, sf025 99, acceptance.
     Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 20: text\-search bootstrap catalogs \(postgres.bki rows\).
+    - Before: pg\_ts\_parser, pg\_ts\_template, pg\_ts\_dict, pg\_ts\_config
+      and pg\_ts\_config\_map were empty, so a PG node had no text search
+      configuration at all.
+    - Source: scripts/gen\-pg\-ts\-bootstrap.py generates
+      pg\_ts\_bootstrap\_generated.go straight from postgres.bki:
+      - the default parser;
+      - the simple, synonym, ispell and thesaurus templates;
+      - the simple dictionary and configuration;
+      - the 19 rows of the simple configuration's token map.
+    - bootstrapPgTS writes the five heaps and nine indexes: each object
+      catalog's oid index and \(name, namespace\) index, plus
+      pg\_ts\_config\_map\_index.
+    - goopg's TS heap reloads skip bootstrap OIDs; two restarts are clean.
+    - PG cold start:
+      - to\_tsvector\('simple', …\), @@ and ts\_debug work;
+      - \\dF and \\dFd list the simple configuration and dictionary;
+      - CREATE TEXT SEARCH CONFIGURATION … \(COPY = simple\) works.
+    - Not seeded: the 29 snowball dictionaries and configurations. They need
+      initdb's dict\_snowball C functions \(pg\_proc 13212/13213, probin
+      $libdir/dict\_snowball\).
+    - goopg itself has no to\_tsvector function \(goopg\-side gap\).
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      6 cases including tsearch and tsdicts \(no movement\), spotcheck,
+      sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none
