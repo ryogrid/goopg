@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
 )
 
 // TestBootstrapPgDependHeap pins M0149-0001g slice 31: base/{1,5}/2608 holds
@@ -12,8 +14,8 @@ import (
 // pg_settings' rules 12108/12109 — including plpgsql's extension-membership
 // rows.
 func TestBootstrapPgDependHeap(t *testing.T) {
-	if len(pgDependInitdb) != 1725 {
-		t.Fatalf("pgDependInitdb has %d rows, want PG 18.3 initdb's 1725", len(pgDependInitdb))
+	if len(catalog.PGDependInitdb) != 1725 {
+		t.Fatalf("pgDependInitdb has %d rows, want PG 18.3 initdb's 1725", len(catalog.PGDependInitdb))
 	}
 	want := pgDependBootstrapRows()
 	if len(want) != 1725 {

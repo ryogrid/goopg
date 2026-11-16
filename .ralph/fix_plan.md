@@ -12644,6 +12644,27 @@ verify each at HEAD when the task starts.
       5 cases \(collate, collate.icu.utf8, collate.utf8, misc\_sanity, psql;
       no movement\), spotcheck, sf025 99, acceptance.
     Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 34: goopg's own SQL pg\_depend lists PG 18.3 initdb's 1725 dependency rows, followed by its runtime rows.
+    - Before: goopg's view held only runtime rows \(sequence OWNED BY\), while
+      the on\-disk catalog \(slices 31–32\) had the initdb rows.
+    - pg\_depend\_generated.go moved to package catalog, as
+      PGDependInitdb / InitdbDepend; initdb aliases pgDependEntry to it.
+      PGDependRowsForDBOid prepends these rows, which also feeds the
+      per\-connection hook in postmaster dispatch.go.
+    - goopg probe:
+      - pg\_depend equals the oracle's 1725 rows, plus the runtime rows;
+      - a fresh\-db pg\_dump stays identical to PG's;
+      - a serial column still dumps ALTER SEQUENCE … OWNED BY.
+    - Probing also found that goopg's \\dx\+ fails because
+      pg\_describe\_object\(\) is missing \(pre\-existing, ledgered\).
+    - Deferred instead: catalog pg\_statistic \(412 rows\). It needs typed
+      anyarray stavalues per column type, including array\-of\-array values
+      for array columns. goopg's own ANALYZE writes text\-element stavalues
+      for every column type \(ledgered\).
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      6 cases \(dependency, misc\_sanity, object\_address, psql, sequence,
+      alter\_table; no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — catalog conformance \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

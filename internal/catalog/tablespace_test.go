@@ -79,8 +79,14 @@ func TestPgDependAndForeignTableViews(t *testing.T) {
 		if tbl.VirtualRows == nil {
 			t.Fatalf("%s has no VirtualRows callback", tc.name)
 		}
-		if rows := tbl.VirtualRows(); len(rows) != 0 {
-			t.Fatalf("%s rows=%d want 0 (empty view)", tc.name, len(rows))
+		// pg_depend starts with PG 18.3 initdb's dependency rows
+		// (M0149-0001g slice 34); pg_foreign_table stays empty.
+		want := 0
+		if tc.name == "pg_catalog.pg_depend" {
+			want = len(PGDependInitdb)
+		}
+		if rows := tbl.VirtualRows(); len(rows) != want {
+			t.Fatalf("%s rows=%d want %d", tc.name, len(rows), want)
 		}
 		if len(tbl.Columns) != len(tc.cols) {
 			t.Fatalf("%s columns=%d want %d", tc.name, len(tbl.Columns), len(tc.cols))

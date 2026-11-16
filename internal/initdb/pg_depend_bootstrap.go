@@ -4,8 +4,13 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
 )
+
+// pgDependEntry is one pg_depend row; the generated rows live in package
+// catalog, which also serves them through goopg's pg_depend view (slice 34).
+type pgDependEntry = catalog.InitdbDepend
 
 // pgDependMissingObjects are objects a PG 18.3 initdb creates that goopg's
 // bootstrap image does not carry, so their pg_depend rows are left out rather
@@ -13,11 +18,11 @@ import (
 // rules pg_settings_u / pg_settings_n (12108 / 12109), the only such objects.
 var pgDependMissingObjects = map[uint32]bool{}
 
-// pgDependBootstrapRows is pgDependInitdb without the rows whose depender or
+// pgDependBootstrapRows is catalog.PGDependInitdb without the rows whose depender or
 // referenced object is in pgDependMissingObjects.
 func pgDependBootstrapRows() []pgDependEntry {
-	out := make([]pgDependEntry, 0, len(pgDependInitdb))
-	for _, d := range pgDependInitdb {
+	out := make([]pgDependEntry, 0, len(catalog.PGDependInitdb))
+	for _, d := range catalog.PGDependInitdb {
 		if pgDependMissingObjects[d.ObjID] || pgDependMissingObjects[d.RefObjID] {
 			continue
 		}
@@ -27,7 +32,7 @@ func pgDependBootstrapRows() []pgDependEntry {
 }
 
 // bootstrapPgDepend writes the pg_depend rows of a PG 18.3 initdb
-// (pgDependInitdb, scripts/gen-pg-depend.py) to base/{1,5}/2608 in heap order,
+// (catalog.PGDependInitdb, scripts/gen-pg-depend.py) to base/{1,5}/2608 in heap order,
 // with pg_depend's indexes 2673 (classid, objid, objsubid) and 2674
 // (refclassid, refobjid, refobjsubid). These are the dependencies initdb's
 // post-bootstrap SQL records — system views and their rules and rowtypes,

@@ -11331,10 +11331,11 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_am"] = pgAm
 
-	// pg_depend — dependency catalog (OID 2608).
-	// goopg does not maintain a general dependency graph (extension membership,
-	// function/type deps, etc. are not tracked), so this view is empty EXCEPT for
-	// the one dependency class pg_dump needs: a sequence's AUTO ('a') ownership of
+	// pg_depend — dependency catalog (OID 2608). It lists PG 18.3 initdb's
+	// bootstrap dependency rows (PGDependInitdb, M0149-0001g slice 34) followed
+	// by the runtime rows. goopg does not maintain a general dependency graph
+	// for user objects (function/type deps, etc. are not tracked); the one
+	// runtime class it records is the one pg_dump needs: a sequence's AUTO ('a') ownership of
 	// the column named by OWNED BY. pg_dump LEFT JOINs pg_depend in getTables
 	// (gated on relkind=RELKIND_SEQUENCE, objsubid=0, refclassid=pg_class,
 	// deptype IN ('a','i')) to discover owning_tab/owning_col, then dumpSequence
@@ -16459,6 +16460,14 @@ func pgTextArrayLiteral(elems []string) string {
 // Standalone sequences have no OwnedBy and contribute no row. M0110-0001
 // (DU-002 slice 118).
 func (c *InMemory) PGDependRowsForDBOid(dbOid uint32) [][]string {
+	// M0149-0001g slice 34: PG 18.3 initdb's dependency rows come first, as
+	// in every database's heap; the runtime-recorded rows follow.
+	return append(initdbDependRows(), c.pgDependRuntimeRowsForDBOid(dbOid)...)
+}
+
+// pgDependRuntimeRowsForDBOid renders the dependency rows goopg records at
+// runtime (sequence OWNED BY); see PGDependRowsForDBOid.
+func (c *InMemory) pgDependRuntimeRowsForDBOid(dbOid uint32) [][]string {
 	if SequenceParamsFunc == nil {
 		return nil
 	}

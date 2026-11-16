@@ -413,3 +413,13 @@ the two layouts legitimately differ.
     same as a PG cluster whose ICU was upgraded.
 - goopg's own SQL catalog still exposes only the seven built\-in
   collations; goopg has no ICU.
+
+## Follow\-up: M0149\-0001g slice 34 — goopg's pg\_depend view \(2026\-11\-16\)
+
+- `catalog.PGDependInitdb` is now the single source for both the on\-disk
+  pg\_depend that initdb writes and goopg's own pg\_depend view. The view
+  lists those rows first, then the runtime rows.
+- catalog pg\_statistic is deferred.
+  - PG's rows carry anyarray stavalues typed by each column, plus
+    element\-statistics kinds for array columns.
+  - A faithful capture needs a typed array encoder per element type.

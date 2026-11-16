@@ -15,15 +15,6 @@ type pgExtensionEntry struct {
 	Version     string
 }
 
-// pgDependEntry is one pg_depend row (FormData_pg_depend).
-type pgDependEntry struct {
-	ClassID, ObjID       uint32
-	ObjSubID             int32
-	RefClassID, RefObjID uint32
-	RefObjSubID          int32
-	DepType              byte
-}
-
 // bootstrapPgPlpgsql writes the pg_extension row PG 18.3's initdb leaves after
 // CREATE EXTENSION plpgsql (initdb.c load_plpgsql), with its indexes 3080
 // (oid) / 3081 (extname). The handler functions and the pg_language row join
