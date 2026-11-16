@@ -93,3 +93,46 @@ func TestBootstrapSchemaNspaclMatchesInitPrivs(t *testing.T) {
 		}
 	}
 }
+
+// TestPublicSchemaOwnerAndACLMatchInitdb pins M0149-0001g slice 23: schema
+// public is owned by pg_database_owner and carries PG's initdb nspacl, so a
+// fresh goopg database pg_dumps exactly like a fresh PG one (no ALTER SCHEMA
+// public OWNER, no REVOKE USAGE). A superuser GRANT renders the owner as
+// grantor (select_best_grantor), and ALTER SCHEMA public OWNER drops the
+// pg_database_owner rendering.
+func TestPublicSchemaOwnerAndACLMatchInitdb(t *testing.T) {
+	c := NewInMemory()
+	if got := c.SchemaOwnerOID("public"); got != 6171 {
+		t.Errorf("public owner = %d, want 6171 (pg_database_owner)", got)
+	}
+	want := "{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}"
+	if got := c.NamespaceACLText(2200); got != want {
+		t.Errorf("public nspacl = %q, want %q", got, want)
+	}
+	c.GrantTablePrivilege(2200, "bob", "USAGE")
+	want = "{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner,bob=U/pg_database_owner}"
+	if got := c.NamespaceACLText(2200); got != want {
+		t.Errorf("public nspacl after GRANT = %q, want %q", got, want)
+	}
+}
+
+// TestInitdbDescriptionsSeedComments: goopg's comment store starts with PG
+// initdb's built-in descriptions (M0149-0001g slice 23), e.g. schema public's.
+func TestInitdbDescriptionsSeedComments(t *testing.T) {
+	c := NewInMemory()
+	for _, k := range []struct {
+		class, obj uint32
+		want       string
+	}{
+		{2615, 2200, "standard public schema"},
+		{2615, 11, "system catalog schema"},
+		{1262, 5, "default administrative connection database"},
+	} {
+		if got, ok := c.GetComment(k.class, k.obj, 0); !ok || got != k.want {
+			t.Errorf("comment (%d,%d) = %q,%v, want %q", k.class, k.obj, got, ok, k.want)
+		}
+	}
+	if oid, ok := c.SystemCatalogOID("pg_namespace"); !ok || oid != 2615 {
+		t.Errorf("SystemCatalogOID(pg_namespace) = %d,%v, want 2615", oid, ok)
+	}
+}

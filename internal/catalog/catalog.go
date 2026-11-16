@@ -3244,6 +3244,12 @@ type InMemory struct {
 	// re-materializes the owner and clears the flag. Key: relOID → present.
 	// DU-002 slice 347.
 	relACLOwnerRevoked map[uint32]bool
+	// aclOwnerDisplay names the owner role an object's ACL renders when it is
+	// not the bootstrap superuser the ACL store assumes: schema public is
+	// owned by pg_database_owner (pg_namespace.dat). Grants recorded with the
+	// default grantor render it too — PG's select_best_grantor makes a
+	// superuser grant as the owner. M0149-0001g slice 23.
+	aclOwnerDisplay map[uint32]string
 
 	// attrACLs records column-level (pg_attribute.attacl) privileges granted to
 	// non-owner roles, keyed by (relOID, attnum) → lower-cased role name →
@@ -4553,6 +4559,7 @@ func NewInMemory() *InMemory {
 		roleACLDisplay:     make(map[string]string),
 		relACLEmptied:      make(map[uint32]bool),
 		relACLOwnerRevoked: make(map[uint32]bool),
+		aclOwnerDisplay:    map[uint32]string{publicSchemaOID: "pg_database_owner"},
 		attrACLs:           make(map[attrACLKey]map[string]map[string]bool),
 		attrACLOrder:       make(map[attrACLKey][]string),
 		attrACLGrantor:     make(map[attrACLKey]map[string]string),
@@ -4561,7 +4568,7 @@ func NewInMemory() *InMemory {
 		defaultACLOIDs:     make(map[defaultACLKey]uint32),
 		defaultACLKeys:     make(map[uint32]defaultACLKey),
 		defaultACLGlobal:   make(map[uint32]bool),
-		comments:           defaultSharedComments(),
+		comments:           defaultInitdbComments(),
 		statisticsObjs:     make(map[string]*StatisticsObject),
 		extensions:         make(map[string]*extensionRow),
 		tablespaces:        make(map[string]*tablespaceRow),
@@ -4575,9 +4582,10 @@ func NewInMemory() *InMemory {
 	// cluster's nspacl for pg_catalog / information_schema is {B=UC/B,=U/B},
 	// equal to their pg_init_privs rows; without the seed pg_dump diffs NULL
 	// against initprivs and emits REVOKE USAGE … FROM PUBLIC (M0149-0001g
-	// slice 22). public (owner pg_database_owner) is not expressible in this
-	// owner-is-postgres ACL store — see the deferral ledger.
-	for _, nsp := range []uint32{11, 13273} {
+	// slice 22).
+	// public's ACL is {pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}
+	// (owner rendered through aclOwnerDisplay, slice 23).
+	for _, nsp := range []uint32{11, 13273, publicSchemaOID} {
 		c.GrantTablePrivilege(nsp, publicPseudoRole, "USAGE")
 	}
 	return c
@@ -4993,16 +5001,45 @@ func IsSharedCommentClass(classoid uint32) bool {
 	return false
 }
 
-// defaultSharedComments returns the comment store as PostgreSQL's initdb leaves
-// it: the three database descriptions setup_description writes into
-// pg_shdescription (postgres/src/bin/initdb/initdb.c), keyed by the
-// databases' OIDs (template1 1, template0 4, postgres 5). M0149-0001f.
-func defaultSharedComments() map[commentKey]string {
-	return map[commentKey]string{
-		{ClassOID: 1262, ObjOID: 1}: "default template for new databases",
-		{ClassOID: 1262, ObjOID: 4}: "unmodifiable empty database",
-		{ClassOID: 1262, ObjOID: 5}: "default administrative connection database",
+// InitdbDescription is one pg_description / pg_shdescription row a PG 18.3
+// initdb leaves (objsubid is 0 for pg_shdescription, which has no such column).
+type InitdbDescription struct {
+	ObjOID, ClassOID uint32
+	ObjSubID         int32
+	Description      string
+}
+
+// defaultInitdbComments returns the comment store as PostgreSQL's initdb leaves
+// it: setup_description (postgres/src/bin/initdb/initdb.c) loads the
+// postgres.description / postgres.shdescription files — built-in functions,
+// operators, types, access methods, schemas, languages — plus the three
+// database descriptions, keyed by the objects' fixed OIDs. The rows are the
+// generated PGInitdbDescriptions / PGInitdbShdescriptions, the same tables
+// initdb writes to base/{1,5}/2609 and global/2396, so goopg's pg_description,
+// obj_description() and pg_dump's getComments agree with the on-disk catalog a
+// PG node reads. M0149-0001f (databases), M0149-0001g slice 23 (the rest). The
+// snowball text-search descriptions stay on disk only: goopg's SQL catalog has
+// no text-search objects.
+func defaultInitdbComments() map[commentKey]string {
+	m := make(map[commentKey]string, len(PGInitdbDescriptions)+len(PGInitdbShdescriptions))
+	for _, r := range PGInitdbDescriptions {
+		m[commentKey{ClassOID: r.ClassOID, ObjOID: r.ObjOID, ObjSubID: r.ObjSubID}] = r.Description
 	}
+	for _, r := range PGInitdbShdescriptions {
+		m[commentKey{ClassOID: r.ClassOID, ObjOID: r.ObjOID}] = r.Description
+	}
+	return m
+}
+
+// SystemCatalogOID resolves a pg_catalog relation name (e.g. "pg_namespace")
+// to its OID, the classoid obj_description(oid, name) keys pg_description on.
+func (c *InMemory) SystemCatalogOID(name string) (uint32, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if t, ok := c.ns(DefaultDBOid).tables["pg_catalog."+name]; ok && t.OID != 0 {
+		return t.OID, true
+	}
+	return 0, false
 }
 
 func (c *InMemory) GetComment(classoid, objoid uint32, objsubid int32) (string, bool) {
@@ -9478,7 +9515,7 @@ func (c *InMemory) registerSystemTables() {
 	// — comments on shared objects (databases, roles, tablespaces). Rows are
 	// the comment store's shared classes (IsSharedCommentClass), starting with
 	// the three database descriptions PostgreSQL's initdb writes
-	// (defaultSharedComments). Registered so `REINDEX TABLE pg_shdescription`
+	// (defaultInitdbComments). Registered so `REINDEX TABLE pg_shdescription`
 	// and plain SELECTs resolve (M0134-0062). M0149-0001f: OID was 3592
 	// (pg_shseclabel's), and the table was a permanently empty stub.
 	pgShdescription := &Table{
@@ -14295,8 +14332,12 @@ func (c *InMemory) unregisterSchemaLocked(lc string, db uint32) {
 func (c *InMemory) SchemaOwnerOID(name string, dbOid ...uint32) uint32 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if oid, ok := c.ns(c.schemaOwnerDBLocked(strings.ToLower(name), dbOid)).schemaOwners[strings.ToLower(name)]; ok {
+	lc := strings.ToLower(name)
+	if oid, ok := c.ns(c.schemaOwnerDBLocked(lc, dbOid)).schemaOwners[lc]; ok {
 		return oid
+	}
+	if lc == "public" {
+		return pgDatabaseOwnerRoleOID // pg_namespace.dat: public is owned by pg_database_owner
 	}
 	return 10
 }
@@ -14327,6 +14368,11 @@ func (c *InMemory) SetSchemaOwner(name string, ownerOID uint32, dbOid ...uint32)
 		return false
 	}
 	c.getOrCreateNS(c.schemaOwnerDBLocked(lc, dbOid)).schemaOwners[lc] = ownerOID
+	if lc == "public" && ownerOID != pgDatabaseOwnerRoleOID {
+		// The ACL store renders a non-pg_database_owner owner as the bootstrap
+		// superuser (PG's aclnewowner rewrites the items for any new owner).
+		delete(c.aclOwnerDisplay, publicSchemaOID)
+	}
 	return true
 }
 
@@ -18399,6 +18445,13 @@ const (
 
 const publicPseudoRole = "public"
 
+// publicSchemaOID / pgDatabaseOwnerRoleOID: PG_PUBLIC_NAMESPACE (2200) and
+// ROLE_PG_DATABASE_OWNER (6171), pg_namespace.dat / pg_authid.dat.
+const (
+	publicSchemaOID        = 2200
+	pgDatabaseOwnerRoleOID = 6171
+)
+
 // schemaACLPrivOrder lists the schema (namespace) privileges in PostgreSQL's
 // canonical aclitemout bit order, taken from ACL_ALL_RIGHTS_STR ("arwdDxtXUCTc…"):
 // USAGE('U') precedes CREATE('C'). pg_dump diffs a namespace's nspacl against
@@ -18917,7 +18970,11 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 		if ownerPrivs, ok := byRole[aclOwnerRole]; ok {
 			ownerLetters = renderACLLetters(ownerPrivs, privOrder)
 		}
-		items = append(items, "postgres="+ownerLetters+"/postgres")
+		owner := aclOwnerRole
+		if o, ok := c.aclOwnerDisplay[relOID]; ok {
+			owner = o
+		}
+		items = append(items, owner+"="+ownerLetters+"/"+owner)
 	}
 	// Render grantees in grant order (the order roles first appeared in a GRANT),
 	// matching PostgreSQL's append semantics for pg_class.relacl — NOT alphabetical
@@ -18990,6 +19047,9 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 		grantor := aclOwnerRole
 		if g, ok := c.tableACLGrantor[relOID][role]; ok && g != "" {
 			grantor = g
+		}
+		if o, ok := c.aclOwnerDisplay[relOID]; ok && grantor == aclOwnerRole {
+			grantor = o
 		}
 		if disp, ok := c.roleACLDisplay[grantor]; ok {
 			grantor = disp

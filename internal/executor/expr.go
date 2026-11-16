@@ -14592,11 +14592,32 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				n, _ := strconv.ParseUint(oidDatum.StringValue(), 10, 32)
 				objOID = uint32(n)
 			}
-			if im, ok := ctx.Catalog.(*catalog.InMemory); ok && objOID != 0 {
-				// classoid 1259 = pg_class
-				if desc, found := im.GetComment(1259, objOID, 0); found {
-					return NewStringDatum(desc), nil
+			im, ok := ctx.Catalog.(*catalog.InMemory)
+			if !ok || objOID == 0 {
+				return NullDatum, nil
+			}
+			// obj_description(oid, name): system_functions.sql keys classoid on
+			// (SELECT oid FROM pg_class WHERE relname = $2 AND relnamespace =
+			// PGNSP); an unknown catalog name matches nothing → NULL. psql's
+			// \dn+ / \dT+ / \dL+ and pg_dump pass e.g. 'pg_namespace'. The
+			// one-argument form keeps the pg_class lookup.
+			classoid := uint32(1259)
+			if len(x.Args) >= 2 {
+				catArg, err := evalExprSlot(x.Args[1], slot, ctx)
+				if err != nil {
+					return Datum{}, err
 				}
+				if catArg.IsNull() {
+					return NullDatum, nil
+				}
+				oid, found := im.SystemCatalogOID(catArg.StringValue())
+				if !found {
+					return NullDatum, nil
+				}
+				classoid = oid
+			}
+			if desc, found := im.GetComment(classoid, objOID, 0); found {
+				return NewStringDatum(desc), nil
 			}
 		}
 		return NullDatum, nil

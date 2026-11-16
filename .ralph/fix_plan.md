@@ -12330,6 +12330,33 @@ verify each at HEAD when the task starts.
       6 cases \(init\_privs, privileges, namespace, rolenames, dependency,
       psql; no movement\), spotcheck, sf025 99, acceptance.
     Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 23: a fresh goopg database pg\_dumps byte-identically to a fresh PG 18.3 one.
+    - goopg's comment store is seeded from PG initdb's built-in
+      descriptions. The generated tables moved to
+      internal/catalog/pg\_description\_generated.go \(PGInitdbDescriptions,
+      PGInitdbShdescriptions; initdb aliases pgDescriptionRow to
+      catalog.InitdbDescription\), so goopg's pg\_description and the
+      on\-disk 2609 / 2396 share one source.
+    - goopg's pg\_description now has 4451 rows; PG has 5354. The gap is
+      objects goopg's SQL catalog lacks: 835 ICU collations, plpgsql, and
+      text\-search objects.
+    - obj\_description\(oid, name\) resolves the catalog name. It ignored the
+      name and always keyed pg\_class, so \\dn\+ and \\dA\+ descriptions were
+      empty.
+    - Schema public on goopg's side:
+      - its owner is pg\_database\_owner \(6171\);
+      - its nspacl is \{pg\_database\_owner=UC/pg\_database\_owner,=U/pg\_database\_owner\}
+        \(aclOwnerDisplay; a superuser GRANT renders the owner as grantor\).
+    - Result: no ALTER SCHEMA public OWNER, COMMENT ON SCHEMA public IS
+      '' or REVOKE USAGE lines in pg\_dump.
+    - Still open \(ledgered\):
+      - goopg's pg\_namespace view omits pg\_toast;
+      - the ACL store renders any other non\-postgres owner as postgres;
+      - schema privileges are not enforced.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      10 cases \(psql 766→748, others unchanged\), spotcheck, sf025 99,
+      acceptance.
+    Movement: regress psql 774→748 \(inventory; A/B 766→748\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

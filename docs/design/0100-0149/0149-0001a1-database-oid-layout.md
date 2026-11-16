@@ -725,6 +725,21 @@ Key observation: PG compatibility constrains only the **displayed** and
   PUBLIC USAGE to equal its initprivs. Schema public would need an owner of
   pg\_database\_owner, which goopg's ACL store cannot express yet.
 
+## Follow\-up: M0149\-0001g slice 23 — goopg\-side descriptions and schema public \(2026\-11\-16\)
+
+- The generated description tables now live in package catalog
+  \(`pg_description_generated.go`\).
+  - They seed goopg's comment store, which backs `pg_description`,
+    `obj_description` and pg\_dump's getComments.
+  - initdb writes the same rows to disk.
+- `obj_description(oid, name)` keys classoid on the named system catalog,
+  as `system_functions.sql` does.
+- Schema public reports owner pg\_database\_owner and PG's initdb nspacl.
+  `aclOwnerDisplay` renders that owner in the ACL store, which otherwise
+  assumes the bootstrap superuser.
+- Invariant: pg\_dump of a fresh goopg database equals pg\_dump of a fresh
+  PG 18.3 database.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the
