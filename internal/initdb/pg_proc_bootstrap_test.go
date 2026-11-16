@@ -3,6 +3,7 @@ package initdb
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -114,7 +115,7 @@ func TestPgProcInitialEntriesCoverAMHandlers(t *testing.T) {
 	// 11 information_schema helper functions (M0133-S2) that
 	// information_schema.sql creates after bootstrap, plus the 2 dict_snowball
 	// C functions snowball_create.sql creates (M0149-0001g slice 21).
-	if got, want := len(entries), 3412; got != want {
+	if got, want := len(entries), 3410; got != want {
 		t.Fatalf("pgProcInitialEntries len: got %d, want %d", got, want)
 	}
 	byOID := make(map[uint32]pgProcEntry, len(entries))
@@ -511,5 +512,21 @@ func TestDerivePgProcKind(t *testing.T) {
 		if got := derivePgProcKind(c.handler); got != c.want {
 			t.Errorf("derivePgProcKind(%q): got %q, want %q", c.handler, got, c.want)
 		}
+	}
+}
+
+// TestPgProcInitialEntriesSignaturesUnique pins M0149-0001g slice 28: no two
+// bootstrap pg_proc rows share (proname, proargtypes) — pg_proc_proname_args_
+// nsp_index is UNIQUE and every row lives in pg_catalog. Hand-added
+// duplicates 8101/8102 of pg_stat_get_ins_since_vacuum / _mod_since_analyze
+// (PG: 5053 / 3177) made a PG node's REINDEX TABLE pg_proc fail.
+func TestPgProcInitialEntriesSignaturesUnique(t *testing.T) {
+	seen := map[string]uint32{}
+	for _, e := range pgProcInitialEntries() {
+		key := e.Name + "(" + fmt.Sprint(e.ArgTypes) + ")"
+		if prev, dup := seen[key]; dup {
+			t.Errorf("pg_proc %d duplicates %d's signature %s", e.OID, prev, key)
+		}
+		seen[key] = e.OID
 	}
 }

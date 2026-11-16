@@ -339,3 +339,12 @@ the two layouts legitimately differ.
   - A PG node does resolve paths through them, and records a rewrite
     \(VACUUM FULL, CLUSTER, REINDEX\) of a mapped catalog in the map.
 
+## Follow\-up: M0149\-0001g slice 28 — no hand edits in generated pg\_proc data \(2026\-11\-16\)
+
+- `pg_proc_seed_data.go` and `pg_proc_names_generated.go` must equal
+  `cmd/gen-pg-proc-data` output.
+  - Two hand\-added rows had duplicated existing functions under new OIDs.
+  - That broke pg\_proc's unique signature index on a PG node.
+- A goopg\-only function needs its own seed list with an OID outside PG's
+  range, and must not duplicate a pg\_proc.dat signature.
+- `TestPgProcInitialEntriesSignaturesUnique` enforces the uniqueness.

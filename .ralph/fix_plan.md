@@ -12484,6 +12484,26 @@ verify each at HEAD when the task starts.
       amcheck, basebackup and rewind ports; regress A/B on 4 cases \(no
       movement\); spotcheck, sf025 99, acceptance.
     Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 28: goopg's bootstrap pg\_proc OIDs equal PG 18.3's, except plpgsql's three handler functions.
+    - Commit 1363ae002 \(2026\-08\-26\) hand\-added OIDs 8101 / 8102 for
+      pg\_stat\_get\_ins\_since\_vacuum / pg\_stat\_get\_mod\_since\_analyze to
+      two generated files. pg\_proc.dat already carries both functions, as
+      5053 / 3177.
+    - On a PG node REINDEX TABLE pg\_proc then failed: "could not create
+      unique index pg\_proc\_proname\_args\_nsp\_index".
+    - Both lines are removed; pg\_proc\_seed\_data.go is again byte\-identical
+      to cmd/gen\-pg\-proc\-data output. goopg resolves the functions by
+      name, so they keep working \(pg\_stat\_user\_tables.n\_ins\_since\_vacuum
+      probed\).
+    - New TestPgProcInitialEntriesSignaturesUnique guards \(proname,
+      proargtypes\) uniqueness.
+    - PG cold start:
+      - pg\_proc has 3410 rows; PG has 3413. The missing three are
+        13624–13626, plpgsql's handlers \(open plpgsql item\).
+      - REINDEX TABLE pg\_proc succeeds.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      4 cases \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none
