@@ -162,6 +162,13 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 			message = "invalid input syntax for type pg_lsn: \"" + v + "\""
 			sqlCode = "22P02"
 		}
+	case "money":
+		// cash_in's soft errors (22P02 / 22003). M0149-0001k1.
+		if _, err := moneyCents(NewStringDatum(v)); err != nil {
+			if ee, ok := err.(*ExecError); ok {
+				message, sqlCode = ee.Message, ee.Code
+			}
+		}
 	case "tid":
 		// tid: validate "(block,offset)" via tidin semantics. M0097-0036.
 		if _, _, ok := parseTidInput(v); !ok {

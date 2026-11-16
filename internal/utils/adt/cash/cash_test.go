@@ -44,3 +44,20 @@ func TestInOut(t *testing.T) {
 		t.Errorf("12x: err = %v, want SyntaxError", err)
 	}
 }
+
+// TestWords pins cash_words against money.out.
+func TestWords(t *testing.T) {
+	for _, tc := range []struct {
+		v    int64
+		want string
+	}{
+		{12300, "One hundred twenty three dollars and zero cents"},
+		{12423, "One hundred twenty four dollars and twenty three cents"},
+		{101, "One dollar and one cent"},
+		{-100, "Minus one dollar and zero cents"},
+	} {
+		if got := Words(tc.v); got != tc.want {
+			t.Errorf("Words(%d) = %q, want %q", tc.v, got, tc.want)
+		}
+	}
+}

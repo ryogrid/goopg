@@ -97,7 +97,7 @@ func FoldConstants(e Expr) Expr {
 		// it silently re-types the node as unknown downstream. M0119-0006.
 		// ArgWidth is likewise a plan-time overload-width stamp (to_hex's
 		// int4/int8 dispatch) that a clone must preserve. M0134-0070.
-		folded := &FuncCall{pos: x.pos, Name: x.Name, Args: foldedArgs, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, ArgWidth: x.ArgWidth}
+		folded := &FuncCall{pos: x.pos, Name: x.Name, Args: foldedArgs, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, Operator: x.Operator, ArgWidth: x.ArgWidth}
 		if out := simplifyConditionalCall(folded); out != nil {
 			return out
 		}
@@ -1252,7 +1252,7 @@ func simplifyConditionalCall(x *FuncCall) Expr {
 		if len(kept) == 0 || len(kept) == len(x.Args) {
 			return nil
 		}
-		return &FuncCall{pos: x.pos, Name: x.Name, Args: kept, ReturnType: x.ReturnType, ArgWidth: x.ArgWidth}
+		return &FuncCall{pos: x.pos, Name: x.Name, Args: kept, ReturnType: x.ReturnType, Operator: x.Operator, ArgWidth: x.ArgWidth}
 	case "nullif":
 		if len(x.Args) != 2 {
 			return nil

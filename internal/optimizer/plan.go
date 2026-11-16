@@ -774,6 +774,11 @@ type FuncCall struct {
 	Distinct   bool
 	Variadic   bool   // true when args were expanded from VARIADIC array syntax
 	ReturnType string // return type for user-defined functions; empty for unknown
+	// Operator is the SQL operator symbol when the call implements one
+	// (moneyArithCall rewrites `m * 2` to cash_mul_int4): the target-list
+	// column is then "?column?" and EXPLAIN renders the infix form, as PG's
+	// OpExpr would. Empty for an ordinary function call. M0149-0001k1.
+	Operator string
 	// ArgWidth is the resolved overload width for width-sensitive builtins
 	// such as to_hex; empty means default int4.
 	ArgWidth string

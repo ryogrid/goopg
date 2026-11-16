@@ -1624,6 +1624,12 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			if strings.EqualFold(leftTyp.Name, "interval") && strings.EqualFold(rightTyp.Name, "date") && x.Op == parser.OpAdd {
 				return catalog.Type{Name: "timestamp"}, nil
 			}
+			// money arithmetic (pg_operator.dat: cash_pl / cash_mi /
+			// cash_mul_* / *_mul_cash / cash_div_* / cash_div_cash). The
+			// planner rewrites these into the cash_* builtins. M0149-0001k1.
+			if t, ok := moneyArithResultType(x.Op, leftTyp, rightTyp); ok {
+				return t, nil
+			}
 			if !isNumericLike(leftTyp) || !isNumericLike(rightTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires numeric operands", x.Op))
 			}
@@ -3926,4 +3932,34 @@ func pgDisplayTypeName(name string) string {
 	default:
 		return name
 	}
+}
+
+// moneyArithResultType is PG's money operator table: money ± money → money,
+// money × / ÷ a number → money, a number × money → money, money ÷ money →
+// float8. A bare literal operand (unknown) on the other side of + / - is
+// resolved to money, as PG resolves it. M0149-0001k1.
+func moneyArithResultType(op parser.OpCode, l, r catalog.Type) (catalog.Type, bool) {
+	lm, rm := strings.EqualFold(l.Name, "money") && !l.IsArray, strings.EqualFold(r.Name, "money") && !r.IsArray
+	if !lm && !rm {
+		return catalog.Type{}, false
+	}
+	money := catalog.Type{Name: "money"}
+	switch op {
+	case parser.OpAdd, parser.OpSub:
+		if (lm || isUnknownType(l)) && (rm || isUnknownType(r)) {
+			return money, true
+		}
+	case parser.OpMul:
+		if (lm && isNumericLike(r) && !strings.EqualFold(r.Name, "money")) || (rm && isNumericLike(l) && !strings.EqualFold(l.Name, "money")) {
+			return money, true
+		}
+	case parser.OpDiv:
+		if lm && rm {
+			return catalog.Type{Name: "float8"}, true
+		}
+		if lm && isNumericLike(r) {
+			return money, true
+		}
+	}
+	return catalog.Type{}, false
 }

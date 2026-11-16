@@ -12303,6 +12303,17 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			name = name[dot+1:]
 		}
 	}
+	if isCashBuiltin(name) {
+		args := make([]Datum, 0, len(x.Args))
+		for _, a := range x.Args {
+			v, err := evalExprSlot(a, slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			args = append(args, v)
+		}
+		return evalCashBuiltin(name, args, x.Pos())
+	}
 	switch name {
 	case optimizer.FieldSelectFuncName:
 		return evalFieldSelect(x, slot, ctx)
@@ -13464,6 +13475,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			switch t {
 			case "bool", "boolean":
 				return NewBoolDatum(isValidBoolInput(v)), nil
+			case "money":
+				// Sibling of pg_input_error_info's money arm: cash_in. M0149-0001k1.
+				_, err := moneyCents(NewStringDatum(v))
+				return NewBoolDatum(err == nil), nil
 			case "int2", "smallint":
 				_, err := parseIntegerInput(v, "smallint", 16)
 				return NewBoolDatum(err == nil), nil

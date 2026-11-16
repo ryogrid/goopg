@@ -5620,6 +5620,11 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		}
 		return formatExprQual(x.Operand, reg, qualify)
 	case *optimizer.FuncCall:
+		// An operator implemented as a call (money arithmetic → cash_*) is an
+		// OpExpr upstream and prints infix. M0149-0001k1.
+		if x.Operator != "" && len(x.Args) == 2 {
+			return "(" + formatExprQual(x.Args[0], reg, qualify) + " " + x.Operator + " " + formatExprQual(x.Args[1], reg, qualify) + ")"
+		}
 		// Composite field selection's run-time form renders as the SQL it
 		// came from: ruleutils' T_FieldSelect arm parenthesises the operand
 		// (unless it is itself a field selection) and appends the quoted

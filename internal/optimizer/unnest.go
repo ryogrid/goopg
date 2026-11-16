@@ -3685,7 +3685,7 @@ func liftResidualConjunctsWithOffset(residuals, innerOnly []Expr, outerSchema Sc
 			for i, a := range x.Args {
 				args[i] = rewriteIdx(a)
 			}
-			return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, ReturnType: x.ReturnType}
+			return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, ReturnType: x.ReturnType, Operator: x.Operator}
 		default:
 			return e
 		}

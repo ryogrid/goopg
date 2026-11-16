@@ -162,3 +162,91 @@ func Out(value int64) string {
 	}
 	return sign + csymbol + string(buf)
 }
+
+var smallWords = [...]string{
+	"zero", "one", "two", "three", "four", "five", "six", "seven",
+	"eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
+	"fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty",
+	"thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
+}
+
+// appendNumWord is cash.c append_num_word for 0..999.
+func appendNumWord(b *strings.Builder, value uint64) {
+	big := smallWords[18:]
+	tu := value % 100
+	if value <= 20 {
+		b.WriteString(smallWords[value])
+		return
+	}
+	if tu == 0 {
+		b.WriteString(smallWords[value/100] + " hundred")
+		return
+	}
+	if value > 99 {
+		switch {
+		case value%10 == 0 && tu > 10:
+			b.WriteString(smallWords[value/100] + " hundred " + big[tu/10])
+		case tu < 20:
+			b.WriteString(smallWords[value/100] + " hundred and " + smallWords[tu])
+		default:
+			b.WriteString(smallWords[value/100] + " hundred " + big[tu/10] + " " + smallWords[tu%10])
+		}
+		return
+	}
+	switch {
+	case value%10 == 0 && tu > 10:
+		b.WriteString(big[tu/10])
+	case tu < 20:
+		b.WriteString(smallWords[tu])
+	default:
+		b.WriteString(big[tu/10] + " " + smallWords[tu%10])
+	}
+}
+
+// Words is cash_words: the amount spelled out in English, first letter
+// capitalised ("One hundred twenty three dollars and zero cents").
+func Words(value int64) string {
+	var b strings.Builder
+	if value < 0 {
+		value = -value // wraps at the minimum, as the C code does
+		b.WriteString("minus ")
+	}
+	val := uint64(value)
+	dollars := val / 100
+	m0 := val % 100
+	parts := []struct {
+		div  uint64
+		name string
+	}{
+		{100000000000000000, " quadrillion "}, {100000000000000, " trillion "},
+		{100000000000, " billion "}, {100000000, " million "}, {100000, " thousand "},
+	}
+	for _, p := range parts {
+		if m := (val / p.div) % 1000; m != 0 {
+			appendNumWord(&b, m)
+			b.WriteString(p.name)
+		}
+	}
+	if m1 := (val / 100) % 1000; m1 != 0 {
+		appendNumWord(&b, m1)
+	}
+	if dollars == 0 {
+		b.WriteString("zero")
+	}
+	if dollars == 1 {
+		b.WriteString(" dollar and ")
+	} else {
+		b.WriteString(" dollars and ")
+	}
+	appendNumWord(&b, m0)
+	if m0 == 1 {
+		b.WriteString(" cent")
+	} else {
+		b.WriteString(" cents")
+	}
+	s := b.String()
+	if s != "" && s[0] >= 'a' && s[0] <= 'z' {
+		s = string(s[0]-'a'+'A') + s[1:]
+	}
+	return s
+}

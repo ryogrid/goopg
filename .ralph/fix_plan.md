@@ -11847,7 +11847,7 @@ verify each at HEAD when the task starts.
     - Still open: money and aclitem \(children below\); the
       knownAlignGaps entries stay for the flag\-off format.
     Movement: none — C3 interop fix \(regress A/B 31 cases unchanged\)
-- [ ] **M0149-0001k1 — money is not a real type: no fixed 8\-byte int64 cash image, cash\_in / cash\_out, arithmetic or ordering** \(filed 2026-11-16 by M0149-0001k\)
+- [x] **M0149-0001k1 — money is not a real type: no fixed 8\-byte int64 cash image, cash\_in / cash\_out, arithmetic or ordering** \(filed 2026-11-16 by M0149-0001k\)
   Kind: impl
   Parent: M0149-0001k
   - Repro on goopg: `create table m(v money)`, insert '12.34', '\-0.5', '1000000'.
@@ -11901,6 +11901,34 @@ verify each at HEAD when the task starts.
     - Gates: units, fire\-set \(fires=none\), postmaster, testport interop
       set, spotcheck, sf025 99, acceptance.
     Movement: regress money 216→130
+  - 2026-11-16 second slice (CLOSES k1): arithmetic and the remaining cash.c functions; regress money passes.
+    - The analyzer types money arithmetic by PG's pg\_operator table
+      \(moneyArithResultType\).
+    - The planner rewrites `\+ \- \* /` with a money operand into the cash\_\*
+      builtins \(moneyArithCall\), in all three BinaryOp resolvers:
+      resolveExpr, resolveExprAfterAggregate and resolveExprAfterWindow.
+      - The FuncCall carries ReturnType and the new Operator field, so the
+        column is `?column?` and EXPLAIN prints infix.
+      - Every FuncCall copier copies Operator.
+    - Executor evalCashBuiltin implements PG's semantics:
+      - cash\_pl / cash\_mi with overflow checks;
+      - rint for float operands;
+      - truncating integer division;
+      - 22012 on a zero divisor;
+      - cash\_div\_cash → float8;
+      - cashlarger / cashsmaller / cash\_words.
+    - Also:
+      - pg\_input\_is\_valid / pg\_input\_error\_info know money;
+      - the wire advertises CASHOID 790 \(psql right\-aligns it\);
+      - the most negative Cash rides the big\-numeric lane, so money::numeric
+        prints one minus sign.
+    - Regress: money 130→0, PASS; the inventory row is flipped to
+      pass / required. 24 other cases are unchanged \(join \+1, a known
+      flake\).
+    - Gates: units, fire\-set \(fires=none\), postmaster, testport interop
+      set, spotcheck, sf025 99, acceptance.
+    - Residue filed as M0149\-0001k5.
+    Movement: regress money 130→0 \(PASS\)
 - [ ] **M0149-0001k2 — aclitem column values are stored as varlena text, not PG's 16\-byte AclItem** \(filed 2026-11-16 by M0149-0001k\)
   Kind: impl
   Parent: M0149-0001k
@@ -11930,6 +11958,21 @@ verify each at HEAD when the task starts.
     big\-endian uint32 block, then a uint16 offset. lseg, box, line and
     circle work the same way \(geo\_ops.c, tid.c\).
   - First step: executor copy\_binary.go send / recv arms for the six types.
+- [ ] **M0149-0001k5 — money residue: btree cash\_ops index keys, lc\_monetary, typed stavalues, source\-typed money casts** \(filed 2026-11-16 by M0149-0001k1\)
+  Kind: impl
+  Parent: M0149-0001k
+  - `create index on m\(v\)` errors "btree v0 only supports int4 / numeric
+    keys, got money"; PG has cash\_ops \(cash\_cmp\).
+  - Only lc\_monetary=C is supported. PG reads PGLC\_localeconv for the
+    symbols, grouping and sign positions \(cash.c\).
+  - money stavalues still use the legacy text blob.
+  - Two cast gaps:
+    - money::text renders the bare numeric: evalCast "text" does not see
+      the source type;
+    - the numeric→money assignment cast is rejected by the analyzer
+      \("column … has type money but expression has type numeric"\).
+  - First step: the btree key codec for money \(int8\-like over the Cash
+    count\), then the analyzer's assignment\-cast table.
 - [ ] **M0149-0001j — goopg-written pg\_statistic stavalues are unreadable on a PG node: 0-dimensional, text-typed arrays** \(filed 2026-11-16 by M0149-0001g; C3 interop, estimates only, below the item-10 rank\)
   Kind: impl
   Parent: M0149-0001g

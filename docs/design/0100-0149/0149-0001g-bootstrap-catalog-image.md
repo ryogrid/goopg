@@ -472,3 +472,7 @@ the two layouts legitimately differ.
   count, so ordering and comparison need no money arm. cash\_in / cash\_out
   \(internal/utils/adt/cash, C locale\) handle text. Storage is the
   8\-byte Cash behind its own `fixed\_length\_money` capability.
+  money arithmetic is rewritten at plan time into PG's cash\_\* operator
+  functions. A FuncCall with Operator set keeps the `?column?` name and
+  infix EXPLAIN, and the executor applies cash.c's rounding and overflow
+  rules. regress money passes.

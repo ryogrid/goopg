@@ -4597,6 +4597,10 @@ func typeOIDFor(t catalog.Type) uint32 {
 		return 19
 	case "uuid":
 		return 2950
+	case "money":
+		// CASHOID: psql right-aligns it like the other numeric types
+		// (print.c column_type_alignment). M0149-0001k1.
+		return 790
 	case "date":
 		return 1082
 	case "time":

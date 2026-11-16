@@ -6710,7 +6710,7 @@ func replaceExprNode(e Expr, target Expr, repl Expr) Expr {
 		for i, a := range x.Args {
 			args[i] = replaceExprNode(a, target, repl)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, Operator: x.Operator}
 	case *BinaryOp:
 		return &BinaryOp{pos: x.Pos(), Op: x.Op, Left: replaceExprNode(x.Left, target, repl), Right: replaceExprNode(x.Right, target, repl), ResultType: x.ResultType}
 	case *UnaryOp:
@@ -10747,6 +10747,9 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		if err != nil {
 			return nil, err
 		}
+		if fc, ok := moneyArithCall(x.Pos(), x.Op, l, r); ok {
+			return fc, nil
+		}
 		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
 		switch x.Op {
 		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
@@ -10954,6 +10957,9 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		r, err := resolveExprAfterWindow(x.Right, win)
 		if err != nil {
 			return nil, err
+		}
+		if fc, ok := moneyArithCall(x.Pos(), x.Op, l, r); ok {
+			return fc, nil
 		}
 		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
 		switch x.Op {
@@ -16692,6 +16698,11 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	}
 	// Function call: use function name as the implicit column label.
 	// Matches PostgreSQL's FigureColname() logic for FuncCall nodes.
+	if fc, ok := e.(*FuncCall); ok && fc.Operator != "" {
+		// An operator implemented as a call (money arithmetic) is an OpExpr
+		// upstream: FigureColname gives "?column?". M0149-0001k1.
+		return "?column?", exprType(e)
+	}
 	if fc, ok := e.(*FuncCall); ok && fc.Name != "" {
 		// array_construct is the lowered form of ARRAY[...]; PostgreSQL
 		// FigureColname returns "array" for ArrayExpr nodes. M0097-0065.
@@ -17333,6 +17344,14 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: x.ReturnType}
 		}
 		switch strings.ToLower(x.Name) {
+		case "cash_pl", "cash_mi", "cashlarger", "cashsmaller",
+			"cash_mul_flt8", "cash_mul_flt4", "cash_mul_int8", "cash_mul_int4", "cash_mul_int2",
+			"flt8_mul_cash", "flt4_mul_cash", "int8_mul_cash", "int4_mul_cash", "int2_mul_cash",
+			"cash_div_flt8", "cash_div_flt4", "cash_div_int8", "cash_div_int4", "cash_div_int2":
+			// pg_proc prorettype money (cash.c builtins). M0149-0001k1.
+			return catalog.Type{Name: "money"}
+		case "cash_div_cash":
+			return catalog.Type{Name: "float8"}
 		case "row":
 			// `row(a, b)` reaches the planner as a call named row; PG's
 			// RowExpr is an anonymous record (M0146-0053) — a VALUES column
@@ -18902,6 +18921,9 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 				l = &CastExpr{pos: x.Pos(), Operand: l, TargetType: strings.ToLower(rt.Name)}
 			}
 		}
+		if fc, ok := moneyArithCall(x.Pos(), x.Op, l, r); ok {
+			return fc, nil
+		}
 		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
 		switch x.Op {
 		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod,
@@ -19896,7 +19918,7 @@ func remapColumnRefsToSchema(e Expr, oldSchema Schema, newIndex map[string]int) 
 		for i, a := range x.Args {
 			args[i] = remapColumnRefsToSchema(a, oldSchema, newIndex)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, Operator: x.Operator}
 	case *InExpr:
 		list := make([]Expr, len(x.List))
 		for i, item := range x.List {
@@ -20130,7 +20152,7 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 		for i, a := range x.Args {
 			args[i] = shiftColumnRefsBy(a, delta)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, Operator: x.Operator}
 	case *InExpr:
 		// Mirror walkColumnRefs' InExpr handling so this rewriter stays in
 		// sync with the side-classifier (classifyConjunctSide). A literal-list
@@ -20542,4 +20564,85 @@ func modResultType(args []Expr) catalog.Type {
 		return catalog.Type{Name: "int8"}
 	}
 	return catalog.Type{Name: "numeric"}
+}
+
+// moneyArithCall rewrites an arithmetic operator with a money operand into
+// the PG builtin its pg_operator row names (pg_operator.dat: cash_pl,
+// cash_mi, cash_mul_flt8/flt4/int8/int4/int2, flt8/flt4/int8/int4/int2_mul_cash,
+// cash_div_flt8/flt4/int8/int4/int2, cash_div_cash). goopg's money Datum is a
+// scale-2 numeric, so generic numeric arithmetic would type the result as
+// numeric (printed without cash_out) and round division wrongly; the builtins
+// carry PG's own semantics (rint for float operands, truncating integer
+// division, 22012 on a zero divisor) and their result type. A numeric operand
+// takes the float8 operator, as PG's implicit numeric→float8 cast resolves
+// it; a bare literal beside + / - is cast to money. All three BinaryOp
+// resolvers (resolveExpr, resolveExprAfterAggregate, resolveExprAfterWindow)
+// call it. M0149-0001k1.
+func moneyArithCall(pos int, op parser.OpCode, l, r Expr) (*FuncCall, bool) {
+	lt, rt := exprType(l), exprType(r)
+	lm := strings.EqualFold(lt.Name, "money") && !lt.IsArray
+	rm := strings.EqualFold(rt.Name, "money") && !rt.IsArray
+	if !lm && !rm {
+		return nil, false
+	}
+	suffix := func(t catalog.Type) string {
+		switch strings.ToLower(t.Name) {
+		case "int2", "smallint":
+			return "int2"
+		case "int4", "integer", "int":
+			return "int4"
+		case "int8", "bigint":
+			return "int8"
+		case "float4", "real":
+			return "flt4"
+		case "float8", "double precision", "numeric", "decimal":
+			return "flt8"
+		}
+		return ""
+	}
+	call := func(name, ret string, args ...Expr) (*FuncCall, bool) {
+		return &FuncCall{pos: pos, Name: name, Args: args, ReturnType: ret, Operator: op.String()}, true
+	}
+	asMoney := func(e Expr, t catalog.Type, isMoney bool) (Expr, bool) {
+		if isMoney {
+			return e, true
+		}
+		if isTextLikePlannerType(t.Name) || t.Name == "" || strings.EqualFold(t.Name, "unknown") {
+			return &CastExpr{pos: pos, Operand: e, TargetType: "money"}, true
+		}
+		return nil, false
+	}
+	switch op {
+	case parser.OpAdd, parser.OpSub:
+		a, okA := asMoney(l, lt, lm)
+		b, okB := asMoney(r, rt, rm)
+		if !okA || !okB {
+			return nil, false
+		}
+		if op == parser.OpAdd {
+			return call("cash_pl", "money", a, b)
+		}
+		return call("cash_mi", "money", a, b)
+	case parser.OpMul:
+		if lm && !rm {
+			if sfx := suffix(rt); sfx != "" {
+				return call("cash_mul_"+sfx, "money", l, r)
+			}
+		}
+		if rm && !lm {
+			if sfx := suffix(lt); sfx != "" {
+				return call(sfx+"_mul_cash", "money", l, r)
+			}
+		}
+	case parser.OpDiv:
+		if lm && rm {
+			return call("cash_div_cash", "float8", l, r)
+		}
+		if lm {
+			if sfx := suffix(rt); sfx != "" {
+				return call("cash_div_"+sfx, "money", l, r)
+			}
+		}
+	}
+	return nil, false
 }
