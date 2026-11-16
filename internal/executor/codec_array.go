@@ -356,7 +356,9 @@ func arrayRegOutRenderer(ctx *Context) func(typeName string, oid uint32) string 
 // lookup only for the relations that can actually render one.
 func colsHaveArray(cols []catalog.Column) bool {
 	for i := range cols {
-		if cols[i].Type.IsArray {
+		// A scalar aclitem column renders its role OIDs through the same
+		// session renderer (st.RegOut) the array elements use. M0149-0001k2.
+		if cols[i].Type.IsArray || strings.EqualFold(cols[i].Type.Name, "aclitem") {
 			return true
 		}
 	}

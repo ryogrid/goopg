@@ -34,6 +34,9 @@ func PhysicalTypeAlign(t Type, tname string) int {
 	// point/lseg/box/line/circle are typalign 'd' and tid 's' once stored in
 	// PG's fixed-length form; a cluster without the capability keeps the
 	// varlena 'i' default below. M0149-0001k.
+	if tname == "aclitem" && FixedLengthAclItem() {
+		return 8 // AclItem: typlen 16, typalign 'd'. M0149-0001k2.
+	}
 	if tname == "money" && FixedLengthMoney() {
 		return 8 // Cash: typlen 8, typalign 'd'. M0149-0001k1.
 	}
@@ -150,6 +153,10 @@ func PhysicalTypeIsVarlena(t Type) bool {
 	case "money":
 		// 8-byte Cash only with the fixed_length_money capability. M0149-0001k1.
 		return !FixedLengthMoney()
+	case "aclitem":
+		// 16-byte AclItem only with the fixed_length_aclitem capability.
+		// M0149-0001k2.
+		return !FixedLengthAclItem()
 	default:
 		return true
 	}

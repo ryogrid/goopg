@@ -11929,7 +11929,7 @@ verify each at HEAD when the task starts.
       set, spotcheck, sf025 99, acceptance.
     - Residue filed as M0149\-0001k5.
     Movement: regress money 130→0 \(PASS\)
-- [ ] **M0149-0001k2 — aclitem column values are stored as varlena text, not PG's 16\-byte AclItem** \(filed 2026-11-16 by M0149-0001k\)
+- [x] **M0149-0001k2 — aclitem column values are stored as varlena text, not PG's 16\-byte AclItem** \(filed 2026-11-16 by M0149-0001k\)
   Kind: impl
   Parent: M0149-0001k
   - PG: AclItem \{Oid ai\_grantee; Oid ai\_grantor; AclMode ai\_privs \(uint64\)\},
@@ -11939,6 +11939,29 @@ verify each at HEAD when the task starts.
     are already PG\-format \(initdbACLDatum\).
   - First step: reuse the catalog aclitem\[\] element encoder for the
     scalar, behind a capability; decode through the role\-name renderer.
+  - 2026-11-16 \(CLOSES k2\): aclitem columns are PG's 16\-byte AclItem behind the `fixed\_length\_aclitem` capability.
+    - Encode \(executor aclitem\_scalar.go encodeAclItemScalar\):
+      parseAclItemText, then role names through the session catalog
+      \(RoleOID\). An unknown role is 42704, as get\_role\_oid reports it.
+    - Decode: the new leaf internal/utils/adt/aclitem \(Decode / Putid /
+      PrivLetters / RoleName\) is shared with pgoutput.
+      - The executor's aclPutid / aclModeToPrivLetters now delegate to it.
+      - Role names come from the scan's st.RegOut.
+      - colsHaveArray now also binds the renderer for scalar aclitem
+        columns. Without a renderer a role prints as its numeric OID, as
+        aclitemout prints a dropped role.
+    - Catalog varlena / align are gated on the capability;
+      TestGoopgFeaturesMarker lists 9 features.
+    - Probe \(tmp/catidx/s45\):
+      - goopg's SELECT and COPY render names, identical across a
+        restart;
+      - a PG cold start reads every value at 16 bytes;
+      - a PG\-inserted row reads back on goopg.
+    - Regress A/B over 19 cases unchanged \(alter\_generic −1, a known
+      flake\).
+    - Gates: units, postmaster, testport interop set, spotcheck, sf025 99,
+      acceptance.
+    Movement: none — C3 interop fix \(regress A/B unchanged\)
 - [ ] **M0149-0001k3 — arrays of point / lseg / box / line / circle / tid still hold text elements \(elemtype 25\)** \(filed 2026-11-16 by M0149-0001k\)
   Kind: impl
   Parent: M0149-0001k

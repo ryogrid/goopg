@@ -38,6 +38,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/nodes"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/utils/adt/aclitem"
 	"github.com/goopg/goopg/internal/utils/adt/array"
 	"github.com/goopg/goopg/internal/utils/adt/cash"
 	"github.com/goopg/goopg/internal/utils/adt/datetime"
@@ -630,6 +631,14 @@ func pgoDecodePhysicalValue(t catalog.Type, data []byte, regOut func(string, uin
 	// Sibling of the executor heap codec's fixed-length geometric / tid arm:
 	// in a fixed_length_geometric_tid cluster these are PG's struct images,
 	// rendered back to the same canonical text. M0149-0001k.
+	if catalog.FixedLengthAclItem() && strings.EqualFold(t.Name, "aclitem") {
+		// Sibling of the heap codec's aclitem arm (aclitemout). M0149-0001k2.
+		txt, n, err := aclitem.Decode(data, regOut)
+		if err != nil {
+			return nil, 0, err
+		}
+		return []byte(txt), n, nil
+	}
 	if catalog.FixedLengthMoney() && strings.EqualFold(t.Name, "money") {
 		// Sibling of the heap codec's money arm: 8-byte Cash rendered by
 		// cash_out. M0149-0001k1.

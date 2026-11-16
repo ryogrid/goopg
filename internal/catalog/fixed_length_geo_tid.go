@@ -47,3 +47,18 @@ func SetFixedLengthMoney(on bool) { fixedLengthMoney.Store(on) }
 
 // FixedLengthMoney reports whether the open cluster stores money as Cash.
 func FixedLengthMoney() bool { return fixedLengthMoney.Load() }
+
+// fixedLengthAclItem is the cluster capability "aclitem columns are stored
+// as PG's 16-byte AclItem (typalign 'd')" rather than goopg's older varlena
+// text. M0149-0001k2.
+var fixedLengthAclItem atomic.Bool
+
+// FixedLengthAclItemFeature is the capability's name in the marker file.
+const FixedLengthAclItemFeature = "fixed_length_aclitem"
+
+// SetFixedLengthAclItem records whether the open cluster has the capability.
+func SetFixedLengthAclItem(on bool) { fixedLengthAclItem.Store(on) }
+
+// FixedLengthAclItem reports whether the open cluster stores aclitem as
+// AclItem.
+func FixedLengthAclItem() bool { return fixedLengthAclItem.Load() }

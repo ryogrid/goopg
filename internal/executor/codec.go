@@ -1133,6 +1133,17 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 			return nil, ee
 		}
 		return varlenaTextBytes(s), nil
+	case "aclitem":
+		// AclItem (16 bytes) in a cluster with the fixed_length_aclitem
+		// capability; otherwise the older varlena text. M0149-0001k2.
+		s, err := coerceTextLikeDatum(t, d)
+		if err != nil {
+			return nil, err
+		}
+		if catalog.FixedLengthAclItem() {
+			return encodeAclItemScalar(s, ctx)
+		}
+		return varlenaTextBytes(s), nil
 	case "money":
 		// Cash: int64 cents, 8 bytes by value in a cluster with the
 		// fixed_length_money capability; otherwise goopg's older varlena text,
@@ -2223,6 +2234,21 @@ func decodePhysicalPGValueLowered(t *catalog.Type, tname string, data []byte, sc
 			elem = "oid"
 		}
 		return decodeArrayValuePGStyled(catalog.Type{Name: elem, IsArray: true}, data, st)
+	case "aclitem":
+		// Sibling of encodeValuePG's "aclitem" arm: the AclItem rendered by
+		// aclitemout through the session's role renderer. M0149-0001k2.
+		if catalog.FixedLengthAclItem() {
+			txt, n, err := DecodeAclItemScalar(data, st.RegOut)
+			if err != nil {
+				return Datum{}, 0, err
+			}
+			return NewStringDatum(txt), n, nil
+		}
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, fmt.Errorf("decode aclitem as varlena: %w", err)
+		}
+		return NewStringDatum(string(payload)), n, nil
 	case "money":
 		// Sibling of encodeValuePG's "money" arm: the 8-byte Cash in a capable
 		// cluster, else the varlena text parsed by cash_in (older rows hold

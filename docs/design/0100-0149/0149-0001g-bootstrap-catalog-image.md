@@ -476,3 +476,7 @@ the two layouts legitimately differ.
   functions. A FuncCall with Operator set keeps the `?column?` name and
   infix EXPLAIN, and the executor applies cash.c's rounding and overflow
   rules. regress money passes.
+- M0149\-0001k2 \(aclitem\): a scalar aclitem column stores the 16\-byte
+  AclItem behind `fixed\_length\_aclitem`. The aclitemout renderer lives in
+  internal/utils/adt/aclitem, shared by the heap codec and pgoutput. Role
+  names come from the scan's session renderer.

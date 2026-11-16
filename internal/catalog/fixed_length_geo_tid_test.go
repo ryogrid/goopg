@@ -77,3 +77,18 @@ func TestFixedLengthMoney(t *testing.T) {
 		t.Error("legacy cluster: money must stay varlena at 'i'")
 	}
 }
+
+// TestFixedLengthAclItem pins the aclitem capability's catalog answers:
+// AclItem is typlen 16, typalign 'd' (pg_type.dat OID 1033) with
+// fixed_length_aclitem, varlena at 'i' otherwise. M0149-0001k2.
+func TestFixedLengthAclItem(t *testing.T) {
+	defer SetFixedLengthAclItem(FixedLengthAclItem())
+	SetFixedLengthAclItem(true)
+	if PhysicalTypeIsVarlena(Type{Name: "aclitem"}) || PhysicalTypeAlignName(Type{Name: "aclitem"}) != 8 {
+		t.Error("capable cluster: aclitem must be fixed-length at 'd'")
+	}
+	SetFixedLengthAclItem(false)
+	if !PhysicalTypeIsVarlena(Type{Name: "aclitem"}) || PhysicalTypeAlignName(Type{Name: "aclitem"}) != 4 {
+		t.Error("legacy cluster: aclitem must stay varlena at 'i'")
+	}
+}
