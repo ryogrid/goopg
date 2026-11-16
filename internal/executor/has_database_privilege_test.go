@@ -49,3 +49,41 @@ func TestHasDatabasePrivilege(t *testing.T) {
 		}
 	}
 }
+
+// TestHasTableSchemaPrivilege pins M0149-0001h1's first slice: superuser and
+// owner defaults, PUBLIC holding no table privilege and no CREATE on a
+// non-public schema, and PG's errors (42P01 unknown relation via regclass,
+// 3F000 unknown schema, 22023 unknown privilege; an unknown OID is NULL).
+func TestHasTableSchemaPrivilege(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	s := NewStringDatum
+	check := func(f func([]Datum, *Context, int) (Datum, error), args []Datum, want string) {
+		t.Helper()
+		d, err := f(args, ctx, 0)
+		got := "NULL"
+		if !d.IsNull() {
+			got = d.Format()
+		}
+		if err != nil || got != want {
+			t.Errorf("%v: %s, %v; want %s", args, got, err, want)
+		}
+	}
+	check(evalHasSchemaPrivilege, []Datum{s("pg_catalog"), s("usage")}, "t")
+	check(evalHasSchemaPrivilege, []Datum{s("public"), s("pg_catalog"), s("create")}, "f")
+	check(evalHasSchemaPrivilege, []Datum{s("public"), NewIntDatum(999999), s("usage")}, "NULL")
+	check(evalHasTablePrivilege, []Datum{s("public"), NewIntDatum(999999), s("select")}, "NULL")
+	for _, tc := range []struct {
+		f    func([]Datum, *Context, int) (Datum, error)
+		args []Datum
+		code string
+	}{
+		{evalHasSchemaPrivilege, []Datum{s("nosch"), s("usage")}, "3F000"},
+		{evalHasSchemaPrivilege, []Datum{s("pg_catalog"), s("select")}, "22023"},
+		{evalHasTablePrivilege, []Datum{s("nosuch"), s("select")}, "42P01"},
+	} {
+		if _, err := tc.f(tc.args, ctx, 0); err == nil || err.(*ExecError).Code != tc.code {
+			t.Errorf("%v: err = %v, want %s", tc.args, err, tc.code)
+		}
+	}
+}

@@ -12312,7 +12312,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			name = name[dot+1:]
 		}
 	}
-	if name == "has_database_privilege" {
+	if name == "has_database_privilege" || name == "has_table_privilege" || name == "has_schema_privilege" {
 		args := make([]Datum, 0, len(x.Args))
 		for _, a := range x.Args {
 			v, err := evalExprSlot(a, slot, ctx)
@@ -12320,6 +12320,12 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				return Datum{}, err
 			}
 			args = append(args, v)
+		}
+		switch name {
+		case "has_table_privilege":
+			return evalHasTablePrivilege(args, ctx, x.Pos())
+		case "has_schema_privilege":
+			return evalHasSchemaPrivilege(args, ctx, x.Pos())
 		}
 		return evalHasDatabasePrivilege(args, ctx, x.Pos())
 	}

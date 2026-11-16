@@ -11816,6 +11816,35 @@ verify each at HEAD when the task starts.
     over goopg's per\-object ACL texts \(relacl / nspacl / attacl / proacl /
     typacl\). Start with has\_table\_privilege and has\_schema\_privilege,
     then measure regress privileges.
+  - 2026-11-17 first slice: has\_table\_privilege and has\_schema\_privilege; shared evaluator.
+    - executor has\_privilege\_common.go:
+      - privilegeArgs: role via get\_role\_oid\_or\_public / OID / effective
+        user;
+      - parsePrivList: convert\_\*\_priv\_string, WITH GRANT OPTION, 22023;
+      - aclAnyHeld: aclmask with ACLMASK\_ANY — superuser; owner\-privileged
+        roles hold every grant option; PUBLIC / role / HasPrivsOfRole
+        entries; acldefault for a NULL ACL; pg\_read\_all\_data /
+        pg\_write\_all\_data / pg\_maintain implied privileges.
+      - has\_database\_privilege now uses it.
+    - has\_table\_privilege:
+      - a name goes through regclass input \(42P01, no cursor\); an OID
+        returns NULL when unknown;
+      - letters arwdDxtm; sequences use SequenceRelaclText / rwU.
+    - has\_schema\_privilege: by name \(3F000\) or OID \(NULL\); UC.
+    - Probe \(tmp/catidx/s54\): a 34\-statement grant / role / PUBLIC /
+      predefined\-role / error script matches PG 18.3 on every function
+      result. The remaining differences: the GRANT role command tag
+      \("GRANT" vs PG's "GRANT ROLE", pre\-existing\).
+    - Regress: privileges 1242→993 \(inventory updated\); 11 other cases
+      unchanged.
+    - Still missing in privileges.sql: has\_largeobject / function / column /
+      sequence / type\_privilege. Also missing: pg\_read\_all\_stats SELECT
+      grants on the stats views \(system\_views.sql\), and the
+      pg\_shmem\_allocations\* views.
+    - Tests: TestHasTableSchemaPrivilege.
+    - Gates: units, fire\-set \(fires=none\), testport, spotcheck, sf025 99,
+      acceptance.
+    Movement: regress privileges 1242→993
 - [ ] **M0149-0001k — WRONG RESULTS on a PG node: goopg stores money / point / lseg / box / line / circle / tid / aclitem columns as varlena, not PG's fixed\-length form** \(filed 2026-11-16 by M0149-0001g; S2\)
   Kind: impl
   Parent: M0149-0001g

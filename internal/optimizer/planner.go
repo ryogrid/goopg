@@ -17358,7 +17358,7 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "money"}
 		case "cash_div_cash":
 			return catalog.Type{Name: "float8"}
-		case "has_database_privilege":
+		case "has_database_privilege", "has_table_privilege", "has_schema_privilege":
 			return catalog.Type{Name: "bool"} // M0149-0001h
 		case "row":
 			// `row(a, b)` reaches the planner as a call named row; PG's

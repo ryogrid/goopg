@@ -50,3 +50,17 @@ restart.
   function, type, language, FDW, server, tablespace, parameter, large
   object\). Each has the same role / object / privilege\-string resolution
   over its own ACL text.
+
+## Shared evaluator \(M0149\-0001h1\)
+
+`has_privilege_common.go` holds acl.c's common machinery:
+
+- `privilegeArgs` — role resolution;
+- `parsePrivList` — convert\_\*\_priv\_string;
+- `aclAnyHeld` — aclmask with ACLMASK\_ANY, including the predefined\-role
+  arms \(pg\_read\_all\_data / pg\_write\_all\_data / pg\_maintain\).
+
+Each object kind supplies an `aclObject`: owner, rendered ACL text, its
+acldefault letters, all its letters, and implied privileges.
+has\_table\_privilege \(regclass input; sequences use the sequence ACL\) and
+has\_schema\_privilege are built on it. Regress privileges went 1242 → 993.
