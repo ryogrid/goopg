@@ -40,7 +40,8 @@ var typedStatValueTypes = map[string]string{
 	"timestamptz": "timestamptz", "timestamp with time zone": "timestamptz",
 	"interval": "interval",
 	"bool":     "bool", "boolean": "bool", // ANALYZE renders t / f, as boolout does
-	"name": "name", // NameData element (64 bytes, typalign 'c')
+	"name":  "name",  // NameData element (64 bytes, typalign 'c')
+	"money": "money", // cash_out text; the 8-byte Cash element under fixed_length_money
 }
 
 // pgStatValuesBytes renders a pg_statistic stavalues slot for a column of type
@@ -109,6 +110,11 @@ func init() {
 // as COPY TO's arms do (copy_text.go); every other type keeps
 // formatDatumDateStyle. M0149-0001j.
 func statValueText(d Datum, colType catalog.Type, ctx *Context) string {
+	if isMoneyTypeName(colType.Name) && !colType.IsArray && !d.IsNull() {
+		// cash_out: money statistics read like PG's pg_stats ("$12.34"),
+		// and the optimizer compares them through cash_in. M0149-0001k5.
+		return MoneyText(d)
+	}
 	if d.Kind == KindTime && !colType.IsArray {
 		switch strings.ToLower(colType.Name) {
 		case "time", "time without time zone":

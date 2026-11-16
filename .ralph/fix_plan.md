@@ -12100,6 +12100,47 @@ verify each at HEAD when the task starts.
       and histogram comparison in the optimizer\) and lc\_monetary for
       non\-C locales.
     Movement: none — correctness / interop fix \(regress A/B unchanged\)
+  - 2026-11-17 third slice: typed money statistics, with money\-aware optimizer comparison.
+    - executor statValueText renders money samples through cash\_out
+      \(`$42.00`\), so goopg's pg\_stats equals PG's. typedStatValueTypes
+      gains money \(8\-byte Cash elements under fixed\_length\_money, behind
+      the round\-trip guard\).
+    - Optimizer:
+      - moneyCastLiteral folds CastExpr\{StringConst → money\} to the
+        cash\_out text in both shape recognisers;
+      - numericValue and statNumericEqual compare money via cash\_in,
+        as convert\_numeric\_to\_scalar does for CASHOID.
+      - Before: money quals priced as column = expression, and histogram
+        bounds compared as text.
+    - Probe \(tmp/catidx/s51\): goopg vs PG 18.3 estimates for `=`, `=`,
+      `<` and `>` are 600 / 600 / 840 / 598 against 600 / 600 / 840 / 608,
+      with identical pg\_stats. Identical across a restart; a PG cold start
+      reads goopg's typed money stats.
+    - lc\_monetary: this host offers only C / C.utf8 / POSIX, which print
+      money identically, and PG rejects any other value here. goopg accepts
+      any lc\_\* value and always formats as C; filed as k5b.
+    - Tests: TestMoneyStatsComparison, plus a money case in
+      TestTypedStatValuesRoundTrip.
+    - Regress A/B over 9 cases unchanged \(join −1, a known flake\).
+    - Gates: units, fire\-set \(fires=none\), testport, spotcheck, sf025 99,
+      acceptance.
+    Movement: none — estimate / interop fix \(regress A/B unchanged; TPC fire\-set fires=none\)
+- [ ] **M0149-0001k5b — lc\_monetary / lc\_numeric / lc\_time accept any value, and money always formats as C** \(filed 2026-11-17 by M0149-0001k5\)
+  Kind: impl
+  Parent: M0149-0001k5
+  - Repro on goopg: `set lc\_monetary = 'de\_DE.UTF\-8'` succeeds and `show`
+    returns it. PG 18.3 on the same host: 22023 "invalid value for
+    parameter "lc\_monetary"" \(check\_locale runs setlocale; the host has
+    only C / C.utf8 / POSIX\).
+  - On a host with other locales installed, PG formats money through
+    PGLC\_localeconv \(symbol, separators, sign position\). goopg's cash
+    package is C\-only.
+  - goopg's GUC registry has no check\-hook mechanism yet \(defaults.go
+    Variables carry no validator\).
+  - First step:
+    - a validator for the lc\_\* string GUCs that accepts "", C, POSIX and
+      the host's installed locales \(codeset spellings normalised\);
+    - then a cash locale table filled from the chosen lc\_monetary.
 - [x] **M0149-0001k5a — the analyzer accepts an explicit cast of any type into an INSERT / UPDATE target** \(filed 2026-11-17 by M0149-0001k5\)
   Kind: impl
   Parent: M0149-0001k5

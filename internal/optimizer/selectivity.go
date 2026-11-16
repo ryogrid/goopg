@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/utils/adt/cash"
 
 	"github.com/goopg/goopg/internal/catalog"
 )
@@ -450,6 +451,13 @@ func statLiteralEqual(stamped, literal, typeName string) bool {
 // parse (numeric 'NaN', 'Infinity'), and the caller keeps the text compare.
 func statNumericEqual(a, b, typeName string) (eq, ok bool) {
 	switch strings.ToLower(typeName) {
+	case "money":
+		ca, errA := cash.In(a)
+		cb, errB := cash.In(b)
+		if errA != nil || errB != nil {
+			return false, false
+		}
+		return ca == cb, true
 	case "numeric", "decimal", "int2", "int4", "int8", "smallint", "integer", "int", "bigint":
 		ra, okA := new(big.Rat).SetString(strings.TrimSpace(a))
 		rb, okB := new(big.Rat).SetString(strings.TrimSpace(b))
@@ -902,6 +910,14 @@ func histCmp(a, b, typeName string) int {
 // byte-wise compare in histCmp.
 func numericValue(s, typeName string) (float64, bool) {
 	switch strings.ToLower(typeName) {
+	case "money":
+		// convert_numeric_to_scalar (selfuncs.c) covers CASHOID: the Cash
+		// count. Stats and literals are cash_out text. M0149-0001k5.
+		c, err := cash.In(s)
+		if err != nil {
+			return 0, false
+		}
+		return float64(c), true
 	case "int", "int2", "int4", "int8", "smallint", "integer", "bigint", "numeric", "decimal", "float", "float4", "float8", "real", "double precision":
 		v, err := strconv.ParseFloat(s, 64)
 		if err != nil {
@@ -1163,10 +1179,16 @@ func normalizeColumnConst(l, r Expr) (*ColumnRef, Expr, bool) {
 		if nc, isName := nameCastLiteral(r); isName {
 			return cr, nc, true
 		}
+		if mc, isMoney := moneyCastLiteral(r); isMoney {
+			return cr, mc, true
+		}
 	}
 	if cr, ok := r.(*ColumnRef); ok {
 		if nc, isName := nameCastLiteral(l); isName {
 			return cr, nc, true
+		}
+		if mc, isMoney := moneyCastLiteral(l); isMoney {
+			return cr, mc, true
 		}
 	}
 	return nil, nil, false
@@ -1227,6 +1249,28 @@ func nameCastLiteral(e Expr) (*StringConst, bool) {
 	return &out, true
 }
 
+// moneyCastLiteral reads a string literal cast to money (the resolver's
+// coercion of a literal compared with a money column, or an explicit
+// 'x'::money) as the money Const PG folds it to, rendered as cash_out text —
+// the form money statistics are stamped in. M0149-0001k5.
+func moneyCastLiteral(e Expr) (*StringConst, bool) {
+	c, ok := e.(*CastExpr)
+	if !ok || !strings.EqualFold(c.TargetType, "money") {
+		return nil, false
+	}
+	sc, ok := c.Operand.(*StringConst)
+	if !ok {
+		return nil, false
+	}
+	v, err := cash.In(sc.Value)
+	if err != nil {
+		return nil, false
+	}
+	out := *sc
+	out.Value = cash.Out(v)
+	return &out, true
+}
+
 // normalizeColumnConstRange is the same shape recogniser as
 // normalizeColumnConst, but it also reports whether the column
 // was on the right (so callers can flip the operator).
@@ -1251,10 +1295,16 @@ func normalizeColumnConstRange(l, r Expr) (*ColumnRef, Expr, bool, bool) {
 		if nc, isName := nameCastLiteral(r); isName {
 			return cr, nc, false, true
 		}
+		if mc, isMoney := moneyCastLiteral(r); isMoney {
+			return cr, mc, false, true
+		}
 	}
 	if cr, ok := r.(*ColumnRef); ok {
 		if nc, isName := nameCastLiteral(l); isName {
 			return cr, nc, true, true
+		}
+		if mc, isMoney := moneyCastLiteral(l); isMoney {
+			return cr, mc, true, true
 		}
 	}
 	return nil, nil, false, false

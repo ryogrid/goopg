@@ -496,3 +496,6 @@ the two layouts legitimately differ.
   INSERT / UPDATE targets now judge a top\-level explicit cast separately,
   with castAssignmentError over pg\_cast's assignment families. It raises
   PG's 42804 message and HINT. General cast typing is still open \(ledger\).
+- M0149\-0001k5 \(money statistics\): money samples are stamped as cash\_out
+  text and typed. The optimizer folds money literals to that text and
+  compares money values through cash\_in, matching PG's estimates.

@@ -37,6 +37,7 @@ func TestTypedStatValuesRoundTrip(t *testing.T) {
 		{"timestamp", 1114, []string{"2020-01-02 03:04:05"}, []string{"1998-01-01 00:00:00", "2020-12-31 23:59:59.25"}},
 		{"timestamptz", 1184, []string{"2020-01-02 03:04:05+00"}, []string{"1998-01-01 00:00:00+00", "infinity"}},
 		{"interval", 1186, []string{"1 day 02:00:00", "00:00:01"}, []string{"-1 mons", "1 year 2 mons"}},
+		{"money", catalog.OIDText, []string{"$42.00", "-$1,234.50"}, []string{"$0.00", "$123.75", "$1,248.75"}},
 		{"name", 19, []string{"pg_class", "a name, with comma"}, []string{"abc", "pg_proc", "zz"}},
 	}
 	cols := pgStatisticColumnsPG18()
