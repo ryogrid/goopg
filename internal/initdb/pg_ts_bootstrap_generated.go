@@ -14,7 +14,7 @@ var pgTSTemplateBKI = []pgTSTemplateRow{
 }
 
 var pgTSDictBKI = []pgTSDictRow{
-	{3765, "simple", 11, 10, 3727},
+	{3765, "simple", 11, 10, 3727, ""},
 }
 
 var pgTSConfigBKI = []pgTSConfigRow{

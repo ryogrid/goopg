@@ -3043,6 +3043,7 @@ type pgProcEntry struct {
 	Rows      int64  // prorows. 0 → 0.
 	Support   uint32 // prosupport regproc OID. 0 → 0 (none).
 	SqlBody   string // prosqlbody blob name (prosrc='' for these); "" → NULL.
+	Bin       string // probin for a C-language function outside pg_proc.dat; "" → NULL.
 }
 
 // pgProcColDefs returns the 30-column PG18 FormData_pg_proc layout.
@@ -3098,7 +3099,9 @@ func pgProcColDefs() []catalog.Column {
 // list of 32 entries (7 AM handlers + 24 I/O regprocs + 1 SRF) that was
 // maintained prior to M0106-0010 batched-14.
 func pgProcInitialEntries() []pgProcEntry {
-	return append(pgProcAllEntries(), informationSchemaHelperProcs()...)
+	// pgTSSnowballProcs: the dict_snowball C functions initdb's
+	// snowball_create.sql creates (M0149-0001g slice 21).
+	return append(append(pgProcAllEntries(), informationSchemaHelperProcs()...), pgTSSnowballProcs...)
 }
 
 // pgProcRow materialises one pgProcEntry as the 30-column row that
@@ -3199,6 +3202,9 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		lang = int64(e.Lang)
 	}
 	prosrc := e.HandlerName
+	if e.Bin != "" {
+		probin = executor.NewStringDatum(e.Bin)
+	}
 	// M0149-0001g slice 16: functions initdb's system_functions.sql re-creates
 	// carry the state it leaves — argument defaults and names, a prosqlbody
 	// node tree with prosrc empty for SQL-standard bodies, and the declared

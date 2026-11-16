@@ -112,8 +112,9 @@ func TestPgProcInitialEntriesCoverAMHandlers(t *testing.T) {
 	// M0106-0010 batched-14: full expansion from 32 hand-crafted entries to
 	// 3397 entries from postgres/src/include/catalog/pg_proc.dat, plus the
 	// 11 information_schema helper functions (M0133-S2) that
-	// information_schema.sql creates after bootstrap.
-	if got, want := len(entries), 3410; got != want {
+	// information_schema.sql creates after bootstrap, plus the 2 dict_snowball
+	// C functions snowball_create.sql creates (M0149-0001g slice 21).
+	if got, want := len(entries), 3412; got != want {
 		t.Fatalf("pgProcInitialEntries len: got %d, want %d", got, want)
 	}
 	byOID := make(map[uint32]pgProcEntry, len(entries))

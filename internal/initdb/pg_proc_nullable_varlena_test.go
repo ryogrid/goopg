@@ -61,6 +61,12 @@ func TestPgProcSeedLeavesAbsentVarlenaAttrsNull(t *testing.T) {
 			// probin carries pg_proc.dat's '$libdir/<module>' for the C-language
 			// conversion functions (pgProcBKIAttrsByOID, M0149-0001g slice 15) —
 			// a real path, not an empty shell.
+			if idx == 26 && e.Bin != "" { // initdb-created C function (slice 21)
+				if got := row[idx].StringValue(); got != e.Bin {
+					t.Fatalf("oid=%d (%s): probin %q, want %q", e.OID, e.Name, got, e.Bin)
+				}
+				continue
+			}
 			if bk, ok := pgProcBKIAttrsByOID[e.OID]; idx == 26 && ok && bk.Bin != "" {
 				if got := row[idx].StringValue(); got != bk.Bin {
 					t.Fatalf("oid=%d (%s): probin %q, want pg_proc.dat's %q", e.OID, e.Name, got, bk.Bin)

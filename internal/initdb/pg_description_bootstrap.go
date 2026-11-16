@@ -31,8 +31,9 @@ func bootstrapPgDescription(dataDir string) error {
 		{Name: "objsubid", Type: catalog.Type{Name: "int4"}},
 		{Name: "description", Type: catalog.Type{Name: "text"}},
 	}
-	rows := make([]executor.Row, len(pgDescriptionInitdb))
-	for i, r := range pgDescriptionInitdb {
+	local := append(append([]pgDescriptionRow{}, pgDescriptionInitdb...), pgDescriptionInitdbTS...) // + snowball TS objects (slice 21)
+	rows := make([]executor.Row, len(local))
+	for i, r := range local {
 		rows[i] = executor.Row{executor.NewIntDatum(int64(r.ObjOID)), executor.NewIntDatum(int64(r.ClassOID)),
 			executor.NewIntDatum(int64(r.ObjSubID)), executor.NewStringDatum(r.Description)}
 	}
@@ -40,7 +41,7 @@ func bootstrapPgDescription(dataDir string) error {
 	if err != nil {
 		return fmt.Errorf("pg_description heap: %w", err)
 	}
-	if err := writeDescriptionIndex(dataDir, []string{"base/1", "base/5"}, "2675", pgDescriptionInitdb, tids, 3); err != nil {
+	if err := writeDescriptionIndex(dataDir, []string{"base/1", "base/5"}, "2675", local, tids, 3); err != nil {
 		return err
 	}
 	shCols := []catalog.Column{cols[0], cols[1], cols[3]}

@@ -40,7 +40,7 @@ o.append("}\n\nvar pgTSDictBKI = []pgTSDictRow{\n")
 for r in rows["pg_ts_dict"]:
     if r[5] != "_null_":
         sys.exit("pg_ts_dict dictinitoption not modelled")
-    o.append('\t{%s, "%s", %s, %s, %s},\n' % tuple(r[:5]))
+    o.append('\t{%s, "%s", %s, %s, %s, ""},\n' % tuple(r[:5]))
 o.append("}\n\nvar pgTSConfigBKI = []pgTSConfigRow{\n")
 for r in rows["pg_ts_config"]:
     o.append('\t{%s, "%s", %s, %s, %s},\n' % tuple(r))

@@ -12283,6 +12283,29 @@ verify each at HEAD when the task starts.
       6 cases including tsearch and tsdicts \(no movement\), spotcheck,
       sf025 99, acceptance.
     Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 21: snowball text search — every pg\_ts\_\* catalog equals a PG 18.3 initdb.
+    - scripts/gen\-pg\-ts\-snowball.py captures from a throwaway initdb what
+      snowball\_create.sql adds, into pg\_ts\_snowball\_generated.go:
+      - the dict\_snowball C functions dsnowball\_init / dsnowball\_lexize
+        \(pg\_proc 13212/13213, probin $libdir/dict\_snowball\), which join the
+        pg\_proc seed through a new pgProcEntry.Bin field;
+      - the snowball template;
+      - 29 language dictionaries with their dictinitoption;
+      - 29 configurations and their token maps;
+      - the descriptions of all of these.
+    - bootstrapPgTS and bootstrapPgDescription append these rows to
+      slice 20's bki rows.
+    - PG cold start:
+      - pg\_ts\_template, pg\_ts\_dict, pg\_ts\_config and
+        pg\_ts\_config\_map are identical to a PG initdb;
+      - english and german stemming work through PG's dict\_snowball.so;
+      - plainto\_tsquery matches;
+      - \\dF lists 30 configurations, and their descriptions resolve.
+    - goopg restarts clean twice.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      6 cases including tsearch and tsdicts \(no movement\), spotcheck,
+      sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

@@ -13,9 +13,10 @@ import (
 // dictionary and configuration and its token map — generated into
 // pg_ts_bootstrap_generated.go by scripts/gen-pg-ts-bootstrap.py. Without them
 // a PostgreSQL node on a goopg directory has no text search configuration at
-// all (to_tsvector('simple', …) fails). The snowball dictionaries/configs a PG
-// initdb adds afterwards need its dict_snowball C functions (pg_proc 13212/13213)
-// and are not seeded.
+// all (to_tsvector('simple', …) fails). Slice 21 appends what initdb's
+// snowball_create.sql adds (pg_ts_snowball_generated.go): the snowball template,
+// the per-language dictionaries/configurations and their maps; the dict_snowball
+// C functions they call join the pg_proc seed (pgTSSnowballProcs).
 
 type pgTSParserRow struct {
 	OID                                       uint32
@@ -33,6 +34,7 @@ type pgTSDictRow struct {
 	OID                  uint32
 	Name                 string
 	Nsp, Owner, Template uint32
+	InitOption           string // dictinitoption; "" = NULL
 }
 
 type pgTSConfigRow struct {
@@ -77,7 +79,7 @@ func bootstrapPgTS(dataDir string) error {
 
 	r = rel{file: "3764", oidIdx: 3767, nmIdx: 3766, cols: []catalog.Column{col("oid", "oid"), col("tmplname", "name"), col("tmplnamespace", "oid"),
 		col("tmplinit", "regproc"), col("tmpllexize", "regproc")}}
-	for _, t := range pgTSTemplateBKI {
+	for _, t := range append(append([]pgTSTemplateRow{}, pgTSTemplateBKI...), pgTSTemplateInitdb...) {
 		r.rows = append(r.rows, executor.Row{i(t.OID), s(t.Name), i(t.Nsp), i(t.Init), i(t.Lexize)})
 		r.named = append(r.named, tsNamedRow{t.OID, t.Name, t.Nsp})
 	}
@@ -85,15 +87,19 @@ func bootstrapPgTS(dataDir string) error {
 
 	r = rel{file: "3600", oidIdx: 3605, nmIdx: 3604, cols: []catalog.Column{col("oid", "oid"), col("dictname", "name"), col("dictnamespace", "oid"),
 		col("dictowner", "oid"), col("dicttemplate", "oid"), col("dictinitoption", "text")}}
-	for _, d := range pgTSDictBKI {
-		r.rows = append(r.rows, executor.Row{i(d.OID), s(d.Name), i(d.Nsp), i(d.Owner), i(d.Template), executor.NullDatum})
+	for _, d := range append(append([]pgTSDictRow{}, pgTSDictBKI...), pgTSDictInitdb...) {
+		initOpt := executor.NullDatum
+		if d.InitOption != "" {
+			initOpt = s(d.InitOption)
+		}
+		r.rows = append(r.rows, executor.Row{i(d.OID), s(d.Name), i(d.Nsp), i(d.Owner), i(d.Template), initOpt})
 		r.named = append(r.named, tsNamedRow{d.OID, d.Name, d.Nsp})
 	}
 	rels = append(rels, r)
 
 	r = rel{file: "3602", oidIdx: 3712, nmIdx: 3608, cols: []catalog.Column{col("oid", "oid"), col("cfgname", "name"), col("cfgnamespace", "oid"),
 		col("cfgowner", "oid"), col("cfgparser", "oid")}}
-	for _, c := range pgTSConfigBKI {
+	for _, c := range append(append([]pgTSConfigRow{}, pgTSConfigBKI...), pgTSConfigInitdb...) {
 		r.rows = append(r.rows, executor.Row{i(c.OID), s(c.Name), i(c.Nsp), i(c.Owner), i(c.Parser)})
 		r.named = append(r.named, tsNamedRow{c.OID, c.Name, c.Nsp})
 	}
@@ -144,8 +150,9 @@ func bootstrapPgTS(dataDir string) error {
 
 	// pg_ts_config_map (3603), index 3609 on (mapcfg, maptokentype, mapseqno).
 	mapCols := []catalog.Column{col("mapcfg", "oid"), col("maptokentype", "int4"), col("mapseqno", "int4"), col("mapdict", "oid")}
-	mapRows := make([]executor.Row, len(pgTSConfigMapBKI))
-	for k, m := range pgTSConfigMapBKI {
+	allMaps := append(append([]pgTSConfigMapRow{}, pgTSConfigMapBKI...), pgTSConfigMapInitdb...)
+	mapRows := make([]executor.Row, len(allMaps))
+	for k, m := range allMaps {
 		mapRows[k] = executor.Row{i(m.Cfg), executor.NewIntDatum(int64(m.TokenType)), executor.NewIntDatum(int64(m.Seq)), i(m.Dict)}
 	}
 	tids, err := writeMultiPageHeapRows(dataDir, "3603", mapCols, mapRows)
@@ -156,9 +163,9 @@ func bootstrapPgTS(dataDir string) error {
 		m   pgTSConfigMapRow
 		tid heapTID
 	}
-	ms := make([]mk, len(pgTSConfigMapBKI))
-	for k := range pgTSConfigMapBKI {
-		ms[k] = mk{pgTSConfigMapBKI[k], tids[k]}
+	ms := make([]mk, len(allMaps))
+	for k := range allMaps {
+		ms[k] = mk{allMaps[k], tids[k]}
 	}
 	sort.Slice(ms, func(a, b int) bool {
 		x, y := ms[a].m, ms[b].m

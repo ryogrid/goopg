@@ -706,6 +706,14 @@ Key observation: PG compatibility constrains only the **displayed** and
 - The snowball dictionaries initdb adds later depend on C functions goopg
   does not seed.
 
+## Follow\-up: M0149\-0001g slice 21 — snowball text search \(2026\-11\-16\)
+
+- The snowball template, dictionaries, configurations and maps that initdb's
+  `snowball_create.sql` adds, together with the two dict\_snowball C
+  functions, come from `pg_ts_snowball_generated.go`.
+  `scripts/gen-pg-ts-snowball.py` regenerates it.
+- A PG node loads `$libdir/dict_snowball` from its own installation.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the
