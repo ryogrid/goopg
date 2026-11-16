@@ -423,3 +423,18 @@ the two layouts legitimately differ.
   - PG's rows carry anyarray stavalues typed by each column, plus
     element\-statistics kinds for array columns.
   - A faithful capture needs a typed array encoder per element type.
+
+## Follow\-up: M0149\-0001j — typed pg\_statistic stavalues \(2026\-11\-16\)
+
+- goopg wrote every stavalues slot as a text\-element array without a
+  dimension count. A PG node saw them empty, and a typed reading would have
+  handed text datums to the column's own comparison operators.
+- Now, for column types whose text form does not depend on session settings:
+  - the slot is an anyarray of the column's own type, built by goopg's array
+    codec, which is PG's update\_attstats form;
+  - goopg's reload decodes non\-text element types through
+    `catalog.StatValuesDecoder`, which the executor installs;
+  - legacy text blobs keep their old path, so existing data is read
+    unchanged.
+- Types outside the set keep the legacy blob until their text round\-trip is
+  settled \(time types depend on DateStyle and TimeZone\).

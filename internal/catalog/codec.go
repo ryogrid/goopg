@@ -1640,14 +1640,32 @@ func DecodePGStatisticPhysicalRow(data []byte, bitmap []byte) (PGStatisticRow, e
 		}
 		switch col {
 		case 27:
-			r.MCVValues = decodeTextArray(blob)
+			r.MCVValues = decodeStatValues(blob)
 		case 28:
 			if r.StaKind2 == 2 { // STATISTIC_KIND_HISTOGRAM
-				r.HistBounds = decodeTextArray(blob)
+				r.HistBounds = decodeStatValues(blob)
 			}
 		}
 	}
 	return r, nil
+}
+
+// StatValuesDecoder decodes a stavalues blob whose element type is not text
+// (M0149-0001j: goopg writes stavalues typed by the column, as PG does) into
+// the per-element text ANALYZE produced. The executor installs it; catalog
+// cannot import the executor's codec. ok=false falls back to decodeTextArray.
+var StatValuesDecoder func(blob []byte) ([]string, bool)
+
+// decodeStatValues decodes a stavalues slot: text-element blobs (the legacy
+// goopg form, and PG's own for text columns) through decodeTextArray, any
+// other element type through StatValuesDecoder.
+func decodeStatValues(blob []byte) []string {
+	if len(blob) >= 24 && binary.LittleEndian.Uint32(blob[12:16]) != OIDText && StatValuesDecoder != nil {
+		if vals, ok := StatValuesDecoder(blob); ok {
+			return vals
+		}
+	}
+	return decodeTextArray(blob)
 }
 
 // decodeFloat4Array decodes a PG ArrayType blob containing float4 elements.

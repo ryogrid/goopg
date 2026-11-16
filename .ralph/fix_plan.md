@@ -11807,6 +11807,36 @@ verify each at HEAD when the task starts.
     the MCVs must be visible and the estimate rows=200.
   - Unblocks: capturing the 412 catalog pg\_statistic rows of PG's initdb
     \(the same typed encoder\).
+  - 2026-11-16 first slice: stavalues are typed for 10 column types.
+    - The types are int2, int4, int8, oid, numeric, float8, text, varchar,
+      bpchar and date. Their text form does not depend on session settings,
+      so ANALYZE's strings round\-trip exactly.
+    - pg\_statistic\_typed\_values.go:
+      - pgStatValuesBytes builds a 1\-D anyarray of the column's own type
+        through goopg's array codec \(ndim 1, elemtype = the type's OID\);
+      - decodeTypedStatValues is catalog.StatValuesDecoder, the hook that
+        catalog.DecodePGStatisticRow uses for non\-text element types. The
+        legacy text blobs on disk, including the TPC\-DS corpora imports,
+        still decode as before.
+    - The ANALYZE writer and truncateColumnStatsToFit pass the column type
+      \(buildUserPGStatisticRowTyped\). Other types keep the legacy
+      text\-element blob, which a PG node reads as empty rather than
+      mis\-typed.
+    - Probe \(tmp/catidx/s36\):
+      - a PG node now shows the MCVs of int / text / date / numeric columns;
+      - estimates move from rows=1 to rows=231 for i = 3 \(actual 200\) and
+        to 1132 for n > 50.5 \(actual 980\);
+      - timestamptz stays legacy;
+      - goopg's own EXPLAIN estimates are byte\-identical across a restart.
+    - TestTypedStatValuesRoundTrip pins ndim, elemtype and the exact
+      round\-trip for every type.
+    - Still open: timestamp / timestamptz / time \(DateStyle and TimeZone
+      dependent text\), bool, interval, array columns \(MCELEM / DECHIST
+      kinds\), and the 412 catalog pg\_statistic rows.
+    - Gates: units, initdb, postmaster, testport interop set, spotcheck,
+      sf025 99 \(run twice: \+20% then −25%, timing noise, plans 99/99 same\),
+      acceptance.
+    Movement: none — C3 interop fix \(goopg plans unchanged: restart A/B identical\)
 - [ ] **M0149-0001i — regnamespace has no name-resolution seam: `'public'::regnamespace::oid` errors, `99::regnamespace` prints 99** \(filed 2026-11-16 by M0149-0001g slice 24; correctness, below the item-10 rank\)
   Kind: impl
   Parent: none

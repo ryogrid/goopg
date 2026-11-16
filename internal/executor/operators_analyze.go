@@ -447,9 +447,9 @@ func persistStatsToPGStatistic(ctx *Context, tbl *catalog.Table, stats *catalog.
 // An oversized row is truncated to fit, as there (B-02).
 func writeColumnStatRow(ctx *Context, statRel storage.RelFileNode, cols []catalog.Column, tbl *catalog.Table, col catalog.Column, cs catalog.ColumnStats) error {
 	attNum := int16(col.Ordinal + 1)
-	row := buildUserPGStatisticRow(tbl.OID, attNum, cs)
+	row := buildUserPGStatisticRowTyped(tbl.OID, attNum, col.Type, cs)
 	if n, serr := pgStatisticRowTupleLen(cols, row); serr == nil && n > storage.MaxHeapTupleSize {
-		row, _ = truncateColumnStatsToFit(tbl.OID, attNum, cols, cs)
+		row, _ = truncateColumnStatsToFitTyped(tbl.OID, attNum, col.Type, cols, cs)
 	}
 	if _, err := writeHeapRowCanonical(ctx, statRel, cols, row); err != nil {
 		return fmt.Errorf("pg_statistic col %q: %w", col.Name, err)
@@ -541,8 +541,8 @@ func pgStatisticRowTupleLen(cols []catalog.Column, row Row) (int, error) {
 // pgStatisticRowIfFits builds the row for cs and reports whether its tuple
 // fits on a heap page. Encode failures report not-fits; the caller then falls
 // through to the scalar-only last resort.
-func pgStatisticRowIfFits(tableOID uint32, attNum int16, cols []catalog.Column, cs catalog.ColumnStats) (Row, bool) {
-	row := buildUserPGStatisticRow(tableOID, attNum, cs)
+func pgStatisticRowIfFits(tableOID uint32, attNum int16, colType catalog.Type, cols []catalog.Column, cs catalog.ColumnStats) (Row, bool) {
+	row := buildUserPGStatisticRowTyped(tableOID, attNum, colType, cs)
 	n, err := pgStatisticRowTupleLen(cols, row)
 	if err != nil {
 		return row, false
@@ -557,7 +557,13 @@ func pgStatisticRowIfFits(tableOID uint32, attNum int16, cols []catalog.Column, 
 // outright. The scalar-only last resort (a few hundred bytes) always fits. A
 // cs that already fits is returned unchanged with its byte-identical row.
 func truncateColumnStatsToFit(tableOID uint32, attNum int16, cols []catalog.Column, cs catalog.ColumnStats) (Row, catalog.ColumnStats) {
-	if row, ok := pgStatisticRowIfFits(tableOID, attNum, cols, cs); ok {
+	return truncateColumnStatsToFitTyped(tableOID, attNum, catalog.Type{}, cols, cs)
+}
+
+// truncateColumnStatsToFitTyped is truncateColumnStatsToFit for a column of
+// type colType (typed stavalues, M0149-0001j).
+func truncateColumnStatsToFitTyped(tableOID uint32, attNum int16, colType catalog.Type, cols []catalog.Column, cs catalog.ColumnStats) (Row, catalog.ColumnStats) {
+	if row, ok := pgStatisticRowIfFits(tableOID, attNum, colType, cols, cs); ok {
 		return row, cs
 	}
 	trunc := cs
@@ -569,24 +575,24 @@ func truncateColumnStatsToFit(tableOID uint32, attNum int16, cols []catalog.Colu
 	for i, e := range cs.MCV {
 		trunc.MCV[i] = catalog.MCVEntry{Value: truncateUTF8Prefix(e.Value, pgStatisticMaxBoundBytes), Frequency: e.Frequency}
 	}
-	if row, ok := pgStatisticRowIfFits(tableOID, attNum, cols, trunc); ok {
+	if row, ok := pgStatisticRowIfFits(tableOID, attNum, colType, cols, trunc); ok {
 		return row, trunc
 	}
 	for len(trunc.Histogram) > 2 {
 		trunc.Histogram = thinStatisticBounds(trunc.Histogram, (len(trunc.Histogram)+1)/2)
-		if row, ok := pgStatisticRowIfFits(tableOID, attNum, cols, trunc); ok {
+		if row, ok := pgStatisticRowIfFits(tableOID, attNum, colType, cols, trunc); ok {
 			return row, trunc
 		}
 	}
 	for len(trunc.MCV) > 0 {
 		trunc.MCV = trunc.MCV[:len(trunc.MCV)/2]
-		if row, ok := pgStatisticRowIfFits(tableOID, attNum, cols, trunc); ok {
+		if row, ok := pgStatisticRowIfFits(tableOID, attNum, colType, cols, trunc); ok {
 			return row, trunc
 		}
 	}
 	trunc.Histogram = nil
 	trunc.MCV = nil
-	return buildUserPGStatisticRow(tableOID, attNum, trunc), trunc
+	return buildUserPGStatisticRowTyped(tableOID, attNum, colType, trunc), trunc
 }
 
 // persistRelSize writes one relation's ANALYZE/VACUUM-measured size to the

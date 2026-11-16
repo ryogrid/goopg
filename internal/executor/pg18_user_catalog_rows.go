@@ -1659,6 +1659,14 @@ const (
 // for one column of a user table. MCV values are stored in slot 1
 // (stakind1=1), histogram in slot 2 (stakind2=2), remaining slots empty.
 func buildUserPGStatisticRow(tableOID uint32, attNum int16, stats catalog.ColumnStats) Row {
+	return buildUserPGStatisticRowTyped(tableOID, attNum, catalog.Type{}, stats)
+}
+
+// buildUserPGStatisticRowTyped is buildUserPGStatisticRow with the column's
+// type: its stavalues slots are anyarrays of that type (pgStatValuesBytes),
+// readable by a PG node, where the zero Type keeps the legacy text-element
+// blob. M0149-0001j.
+func buildUserPGStatisticRowTyped(tableOID uint32, attNum int16, colType catalog.Type, stats catalog.ColumnStats) Row {
 	// float4 columns (stanullfrac, stadistinct) are encoded as varlena text
 	// by EncodeRowPG's "float4" branch; pass KindString.
 	nullFracStr := strconv.FormatFloat(stats.NullFrac, 'g', -1, 32)
@@ -1694,11 +1702,11 @@ func buildUserPGStatisticRow(tableOID uint32, attNum int16, stats catalog.Column
 			vals[i] = e.Value
 		}
 		stanumbers1 = NewBytesDatum(pgFloat4ArrayBytes(freqs))
-		stavalues1 = NewBytesDatum(pgTextArrayBytes(vals))
+		stavalues1 = NewBytesDatum(pgStatValuesBytes(colType, vals))
 	}
 	if len(stats.Histogram) > 0 {
 		stakind2 = statisticKindHistogram
-		stavalues2 = NewBytesDatum(pgTextArrayBytes(stats.Histogram))
+		stavalues2 = NewBytesDatum(pgStatValuesBytes(colType, stats.Histogram))
 	}
 	// Correlation rides in slot 3, as a one-element stanumbers array — PG's
 	// layout for STATISTIC_KIND_CORRELATION, which carries no stavalues.
