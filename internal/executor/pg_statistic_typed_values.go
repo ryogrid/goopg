@@ -2,17 +2,27 @@ package executor
 
 import (
 	"encoding/binary"
+	"slices"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/utils/adt/datetime"
 )
 
 // typedStatValueTypes are the column types whose pg_statistic stavalues goopg
 // writes as an anyarray of the column's own type (M0149-0001j), as PG's
-// update_attstats (analyze.c) does. Each is a type whose element text form is
-// independent of session settings, so the values ANALYZE rendered round-trip
-// exactly through the typed blob. Every other type keeps the legacy
+// update_attstats (analyze.c) does. Every other type keeps the legacy
 // text-element blob.
+//
+// ANALYZE keeps its values as text, and for the date-time types that text
+// follows the analysing session's DateStyle / TimeZone / IntervalStyle. The
+// array encoder parses elements under the boot defaults (ISO, MDY, UTC), so
+// a non-default rendering could parse to a different value (a DMY
+// "05/11/2026" read as May 11). pgStatValuesBytes therefore keeps a typed
+// blob only when it decodes back to exactly the strings it was built from,
+// which is the case precisely when the session rendered in the canonical
+// style. Any other session falls back to the legacy blob: a PG node reads
+// that as no statistics, never as wrong ones.
 var typedStatValueTypes = map[string]string{
 	"int2": "int2", "smallint": "int2",
 	"int4": "int4", "int": "int4", "integer": "int4",
@@ -24,7 +34,12 @@ var typedStatValueTypes = map[string]string{
 	"varchar": "varchar", "character varying": "varchar",
 	"bpchar": "bpchar", "character": "bpchar", "char": "bpchar",
 	"date": "date",
-	"bool": "bool", "boolean": "bool", // ANALYZE renders t / f, as boolout does
+	"time": "time", "time without time zone": "time",
+	"timetz": "timetz", "time with time zone": "timetz",
+	"timestamp": "timestamp", "timestamp without time zone": "timestamp",
+	"timestamptz": "timestamptz", "timestamp with time zone": "timestamptz",
+	"interval": "interval",
+	"bool":     "bool", "boolean": "bool", // ANALYZE renders t / f, as boolout does
 	"name": "name", // NameData element (64 bytes, typalign 'c')
 }
 
@@ -38,7 +53,9 @@ func pgStatValuesBytes(colType catalog.Type, vals []string) []byte {
 	if !colType.IsArray {
 		if name, ok := typedStatValueTypes[strings.ToLower(colType.Name)]; ok {
 			if blob, ok := pgTypedArrayBytes(catalog.Type{Name: name, IsArray: true}, vals); ok {
-				return blob
+				if back, ok := decodeTypedStatValues(blob); ok && slices.Equal(back, vals) {
+					return blob
+				}
 			}
 		}
 	}
@@ -82,4 +99,23 @@ func decodeTypedStatValues(blob []byte) ([]string, bool) {
 
 func init() {
 	catalog.StatValuesDecoder = decodeTypedStatValues
+}
+
+// statValueText renders one ANALYZE sample value (an MCV, a histogram bound,
+// an imported statistic or an index endpoint) as the column type's output
+// function does. A time / timetz value is a KindTime Datum like a timestamp,
+// so formatDatumDateStyle alone rendered `23:00` as "1970-01-01 23:00:00" and
+// dropped timetz's zone. Those two go through time_out / timetz_out, exactly
+// as COPY TO's arms do (copy_text.go); every other type keeps
+// formatDatumDateStyle. M0149-0001j.
+func statValueText(d Datum, colType catalog.Type, ctx *Context) string {
+	if d.Kind == KindTime && !colType.IsArray {
+		switch strings.ToLower(colType.Name) {
+		case "time", "time without time zone":
+			return datetime.FormatTime(pgTimeMicros(d.TimeValue()))
+		case "timetz", "time with time zone":
+			return datetime.FormatTimeTZ(pgTimeMicros(d.TimeValue()), int32(-d.TimeTZOffsetSecs()))
+		}
+	}
+	return formatDatumDateStyle(d, ctx)
 }

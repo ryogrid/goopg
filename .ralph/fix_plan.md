@@ -11933,6 +11933,41 @@ verify each at HEAD when the task starts.
       sf025 99 \(PLAN\-SHAPE same\), acceptance. Regress A/B over 9 cases
       unchanged \(join 2837→2836, a known flake\).
     Movement: none — estimate fix on name columns \(TPC\-H/TPC\-DS plans unchanged: fire\-set fires=none\)
+  - 2026-11-16 fifth slice: the date\-time types are typed, behind a round\-trip guard.
+    - Round\-trip guard \(pgStatValuesBytes\):
+      - a typed blob is kept only if it decodes back to exactly the
+        strings ANALYZE produced;
+      - so text rendered under a non\-default DateStyle / TimeZone keeps
+        the legacy blob, which a PG node reads as no statistics;
+      - this also closes a latent slice\-1 hole: a DMY `05/11/2026` date
+        would have been encoded as May 11.
+    - typedStatValueTypes gains time, timetz, timestamp, timestamptz and
+      interval.
+    - ANALYZE rendered time / timetz values as timestamps
+      \(`1970\-01\-01 23:00:00`, timetz losing its zone\). New
+      statValueText renders them through time\_out / timetz\_out, the leaf
+      functions COPY TO uses. All four sibling sites use it: MCVs,
+      histogram bounds, stats import \(statsColumnValueText\) and the index
+      endpoint probe.
+    - goopg's own estimates: `t < '06:00'` on a time column moved from
+      rows=1 \(HEAD\) to 764 \(actual 750\); timetz from 1 to 750.
+      Identical across two restarts.
+    - PG cold\-start probe \(tmp/catidx/s41\):
+      - all five types' MCVs and histograms are read;
+      - range estimates are 791\-814 against 750\-753 actual \(reltuples
+        scaling\);
+      - the DMY session's date column stays legacy.
+    - Pre\-existing gaps, ledgered:
+      - goopg ANALYZE writes no histogram for interval;
+      - goopg's timetz histogram order differs from timetz\_cmp;
+      - goopg lacks `timestamp \+ make\_interval\(…\)` and
+        `int \* interval`.
+    - Tests: TestTypedStatValuesRoundTrip gains the five types;
+      TestTypedStatValuesNonCanonicalFallsBack covers DMY, German, a \+09
+      session and Postgres style.
+    - Gates: units, spotcheck, sf025 99 \(PLAN\-SHAPE same\), acceptance.
+      Regress A/B over 11 cases unchanged \(join −1, a known flake\).
+    Movement: none — C3 interop fix plus a goopg time/timetz estimate fix \(TPC plans unchanged\)
 - [ ] **M0149-0001i — regnamespace has no name-resolution seam: `'public'::regnamespace::oid` errors, `99::regnamespace` prints 99** \(filed 2026-11-16 by M0149-0001g slice 24; correctness, below the item-10 rank\)
   Kind: impl
   Parent: none

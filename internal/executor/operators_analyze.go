@@ -1636,7 +1636,7 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 		stats.MCV = make([]catalog.MCVEntry, mcvCount)
 		for i := 0; i < mcvCount; i++ {
 			stats.MCV[i] = catalog.MCVEntry{
-				Value:     formatDatumDateStyle(buckets[i].val, dsCtx),
+				Value:     statValueText(buckets[i].val, colType, dsCtx),
 				Frequency: float64(buckets[i].count) / float64(len(sample)),
 			}
 		}
@@ -1685,7 +1685,7 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 	last := len(expanded) - 1
 	for i := 0; i <= bucketCount; i++ {
 		idx := i * last / bucketCount
-		bounds[i] = formatDatumDateStyle(expanded[idx], dsCtx)
+		bounds[i] = statValueText(expanded[idx], colType, dsCtx)
 	}
 	// M0138-0004: upstream does NOT dedup adjacent equal boundaries.
 	// compute_scalar_stats (analyze.c:2806-2836) copies exactly `num_hist`

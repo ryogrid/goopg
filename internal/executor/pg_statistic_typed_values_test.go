@@ -32,6 +32,11 @@ func TestTypedStatValuesRoundTrip(t *testing.T) {
 		{"varchar", catalog.OIDVarChar, []string{"x", "yz"}, []string{"abc", "abcd", "abcde"}},
 		{"date", 1082, []string{"2020-01-02"}, []string{"1998-01-01", "1998-06-15", "2020-12-31"}},
 		{"bool", 16, []string{"t", "f"}, []string{"f", "t"}},
+		{"time", 1083, []string{"10:00:00", "23:59:59.5"}, []string{"00:00:00", "12:30:00"}},
+		{"timetz", 1266, []string{"10:00:00+02", "01:00:00-05:30"}, []string{"00:00:00+00"}},
+		{"timestamp", 1114, []string{"2020-01-02 03:04:05"}, []string{"1998-01-01 00:00:00", "2020-12-31 23:59:59.25"}},
+		{"timestamptz", 1184, []string{"2020-01-02 03:04:05+00"}, []string{"1998-01-01 00:00:00+00", "infinity"}},
+		{"interval", 1186, []string{"1 day 02:00:00", "00:00:01"}, []string{"-1 mons", "1 year 2 mons"}},
 		{"name", 19, []string{"pg_class", "a name, with comma"}, []string{"abc", "pg_proc", "zz"}},
 	}
 	cols := pgStatisticColumnsPG18()
@@ -68,7 +73,7 @@ func TestTypedStatValuesRoundTrip(t *testing.T) {
 		})
 	}
 	// Outside the set (and the zero Type of the legacy wrapper): text blob.
-	for _, typ := range []catalog.Type{{Name: "timestamptz"}, {}} {
+	for _, typ := range []catalog.Type{{Name: "inet"}, {}} {
 		blob := pgStatValuesBytes(typ, []string{"x"})
 		if et := binary.LittleEndian.Uint32(blob[12:16]); et != catalog.OIDText {
 			t.Errorf("type %q: elemtype=%d, want legacy text %d", typ.Name, et, catalog.OIDText)
@@ -109,5 +114,26 @@ func TestNameArrayElementImage(t *testing.T) {
 	d, _, err = decodePhysicalPGValueMctx(typ, legacy, nil)
 	if err != nil || d.StringValue() != "{a,b}" {
 		t.Errorf("legacy text-element name[] decode = %q, %v; want {a,b}", d.StringValue(), err)
+	}
+}
+
+// TestTypedStatValuesNonCanonicalFallsBack pins the round-trip guard in
+// pgStatValuesBytes: ANALYZE text rendered under a non-default DateStyle or
+// TimeZone must not be parsed into a typed blob under the boot defaults (a DMY
+// "05/11/2026" would become May 11). Such values keep the legacy text blob.
+func TestTypedStatValuesNonCanonicalFallsBack(t *testing.T) {
+	for _, tc := range []struct {
+		typ  string
+		vals []string
+	}{
+		{"date", []string{"05/11/2026"}},                    // SQL, DMY
+		{"date", []string{"16.11.2026"}},                    // German
+		{"timestamptz", []string{"2026-11-16 10:00:00+09"}}, // Asia/Tokyo session
+		{"timestamp", []string{"Mon Nov 16 10:00:00 2026"}}, // Postgres style
+	} {
+		blob := pgStatValuesBytes(catalog.Type{Name: tc.typ}, tc.vals)
+		if et := binary.LittleEndian.Uint32(blob[12:16]); et != catalog.OIDText {
+			t.Errorf("%s %q: elemtype=%d, want legacy text %d", tc.typ, tc.vals, et, catalog.OIDText)
+		}
 	}
 }

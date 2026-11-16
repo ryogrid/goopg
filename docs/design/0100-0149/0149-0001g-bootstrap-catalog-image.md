@@ -446,3 +446,9 @@ the two layouts legitimately differ.
   literal, the resolver's CastExpr\{StringConst → name\}, as the folded
   name Const PG uses. Before this, goopg's own estimates ignored the name
   statistics it writes.
+- Slice 5 \(date\-time types\): typed stavalues sit behind a round\-trip
+  guard. The blob must decode back to ANALYZE's exact strings, so only
+  canonical\-style text \(ISO, MDY, UTC\) is typed. Other sessions keep
+  the legacy blob, which a PG node reads as no statistics rather than wrong
+  ones. time / timetz statistics are rendered by time\_out / timetz\_out
+  \(statValueText\), shared by ANALYZE, stats import and the endpoint probe.
