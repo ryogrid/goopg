@@ -653,6 +653,9 @@ func analyzeInsert(s *parser.InsertStmt, cat catalog.Catalog) error {
 			if err != nil {
 				return err
 			}
+			if err := castAssignmentError(e, targetCols[i].Name, targetCols[i].Type); err != nil {
+				return err
+			}
 			if !isAssignable(typ, targetCols[i].Type) {
 				return analyzeError(e.Pos(), "42804", fmt.Sprintf("column %q has type %q but expression has type %q", targetCols[i].Name, targetCols[i].Type.Name, typ.Name))
 			}
@@ -814,6 +817,9 @@ func analyzeOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, cat cata
 		if err != nil {
 			return err
 		}
+		if err := castAssignmentError(assign.Expr, col.Name, col.Type); err != nil {
+			return err
+		}
 		if !isAssignable(typ, col.Type) {
 			return analyzeError(assign.Expr.Pos(), "42804",
 				fmt.Sprintf("column %q has type %q but expression has type %q", col.Name, col.Type.Name, typ.Name))
@@ -876,6 +882,9 @@ func analyzeUpdate(s *parser.UpdateStmt, cat catalog.Catalog) error {
 		}
 		typ, err := analyzeExpr(assign.Expr, ctx)
 		if err != nil {
+			return err
+		}
+		if err := castAssignmentError(assign.Expr, col.Name, col.Type); err != nil {
 			return err
 		}
 		if !isAssignable(typ, col.Type) {
@@ -3712,6 +3721,14 @@ func isAssignable(src, dst catalog.Type) bool {
 	if strings.EqualFold(src.Name, dst.Name) {
 		return true
 	}
+	// pg_cast date / timestamp / timestamptz inter-convert (implicit or
+	// assignment), and timestamp(tz) → time is an assignment cast. The
+	// analyzer types a `::date` cast as date, so date → timestamp needs this.
+	// M0149-0001k5a.
+	if sf, df := castFamily(src.Name), castFamily(dst.Name); sf == "datetime" && (df == "datetime" ||
+		(df == "time" && !strings.EqualFold(src.Name, "date"))) {
+		return true
+	}
 	// pg_cast assignment casts into money: numeric_cash, int4_cash and
 	// int8_cash (castcontext 'a'). int2 has no direct cast. M0149-0001k5.
 	if strings.EqualFold(dst.Name, "money") && !dst.IsArray {
@@ -3970,4 +3987,101 @@ func moneyArithResultType(op parser.OpCode, l, r catalog.Type) (catalog.Type, bo
 		}
 	}
 	return catalog.Type{}, false
+}
+
+// castFamily classifies a built-in type for castAssignmentError. "" means
+// the type is outside the modelled set, which never rejects.
+func castFamily(name string) string {
+	switch strings.ToLower(name) {
+	case "int2", "smallint", "int4", "int", "integer", "int8", "bigint",
+		"float4", "real", "float8", "double precision", "float", "numeric", "decimal":
+		return "number"
+	case "money":
+		return "money"
+	case "bool", "boolean":
+		return "bool"
+	case "date", "timestamp", "timestamp without time zone", "timestamptz", "timestamp with time zone":
+		return "datetime"
+	case "time", "time without time zone", "timetz", "time with time zone":
+		return "time"
+	case "text", "varchar", "character varying", "bpchar", "char", "character", "name":
+		return "string"
+	}
+	return ""
+}
+
+// pgTypeDisplayName is format_type's spelling for the modelled types.
+func pgTypeDisplayName(name string) string {
+	switch strings.ToLower(name) {
+	case "int2", "smallint":
+		return "smallint"
+	case "int4", "int", "integer":
+		return "integer"
+	case "int8", "bigint":
+		return "bigint"
+	case "float4", "real":
+		return "real"
+	case "float8", "double precision", "float":
+		return "double precision"
+	case "decimal":
+		return "numeric"
+	case "bool":
+		return "boolean"
+	case "timestamp":
+		return "timestamp without time zone"
+	case "timestamptz":
+		return "timestamp with time zone"
+	case "time":
+		return "time without time zone"
+	case "timetz":
+		return "time with time zone"
+	case "varchar":
+		return "character varying"
+	case "bpchar", "char":
+		return "character"
+	}
+	return strings.ToLower(name)
+}
+
+// castAssignmentError rejects an explicit cast written as an INSERT / UPDATE
+// value when PG has no assignment coercion from the cast's type to the
+// column's (parse_target.c transformAssignedExpr → coerce_to_target_type
+// fails: 42804 "column … is of type … but expression is of type …" with
+// HINT "You will need to rewrite or cast the expression."). The analyzer
+// types every cast as unknown (see analyzeExpr), so without this an
+// `x::float8` reached a money / date / bool column and either stored or
+// failed later with a non-PG error. Only pairs inside castFamily are judged,
+// per pg_cast's assignment entries:
+//   - numbers inter-convert; numeric / int4 / int8 → money (not float or
+//     int2);
+//   - date ↔ timestamp(tz), timestamp(tz) → time;
+//   - anything → a string type (automatic I/O cast);
+//   - nothing else crosses families.
+//
+// M0149-0001k5a.
+func castAssignmentError(e parser.Expr, colName string, colType catalog.Type) error {
+	ce, ok := e.(*parser.CastExpr)
+	if !ok || colType.IsArray || strings.HasSuffix(ce.Type.Name, "[]") {
+		return nil
+	}
+	if ce.Type.Schema != "" && !strings.EqualFold(ce.Type.Schema, "pg_catalog") {
+		return nil
+	}
+	src, dst := strings.ToLower(ce.Type.Name), strings.ToLower(colType.Name)
+	sf, df := castFamily(src), castFamily(dst)
+	if sf == "" || df == "" || sf == df || df == "string" {
+		return nil
+	}
+	switch {
+	case df == "money" && sf == "number":
+		switch src {
+		case "numeric", "decimal", "int4", "int", "integer", "int8", "bigint":
+			return nil
+		}
+	case df == "time" && sf == "datetime" && src != "date":
+		return nil
+	}
+	return &AnalyzeError{Pos: ce.Operand.Pos(), Code: "42804",
+		Message: fmt.Sprintf("column \"%s\" is of type %s but expression is of type %s", colName, pgTypeDisplayName(dst), pgTypeDisplayName(src)),
+		Hint:    "You will need to rewrite or cast the expression."}
 }

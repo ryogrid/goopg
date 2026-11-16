@@ -12100,7 +12100,7 @@ verify each at HEAD when the task starts.
       and histogram comparison in the optimizer\) and lc\_monetary for
       non\-C locales.
     Movement: none — correctness / interop fix \(regress A/B unchanged\)
-- [ ] **M0149-0001k5a — the analyzer accepts an explicit cast of any type into an INSERT / UPDATE target** \(filed 2026-11-17 by M0149-0001k5\)
+- [x] **M0149-0001k5a — the analyzer accepts an explicit cast of any type into an INSERT / UPDATE target** \(filed 2026-11-17 by M0149-0001k5\)
   Kind: impl
   Parent: M0149-0001k5
   - Repro on goopg: `create table zz\(d date, b bool, m money\)`, then:
@@ -12116,6 +12116,31 @@ verify each at HEAD when the task starts.
   - First step: find what analyzeExpr returns for a CastExpr in the VALUES
     list, then make isAssignable reject casts with no pg\_cast assignment
     path. Also adopt PG's message and HINT.
+  - 2026-11-17 \(CLOSES k5a\): explicit casts in assignment targets are judged by PG's assignment coercions.
+    - Analyzer castAssignmentError, called at INSERT VALUES, UPDATE SET and
+      ON CONFLICT DO UPDATE SET. A top\-level `x::T` is checked against
+      pg\_cast's assignment paths over a modelled family set:
+      - numbers inter\-convert;
+      - numeric / int4 / int8 → money \(not float or int2\);
+      - date ↔ timestamp\(tz\), and timestamp\(tz\) → time;
+      - anything → a string type;
+      - nothing else crosses families.
+    - The error is PG's 42804 "column "c" is of type X but expression is of
+      type Y", with HINT "You will need to rewrite or cast the expression."
+      and the cursor at the expression. Types outside the set \(domains,
+      user types, arrays\) keep today's acceptance.
+    - isAssignable now admits date ↔ timestamp\(tz\) and timestamp\(tz\) →
+      time. The analyzer types `::date` as date, so `'…'::date` into a
+      timestamp column used to be rejected.
+    - Probe \(tmp/catidx/s50\): a 12\-statement script \(INSERT / UPDATE
+      across money, date, bool, int, text, time, timestamp\) is identical to
+      PG 18.3, error text and cursors included.
+    - Test: TestCastAssignmentError.
+    - Regress A/B over 22 cases unchanged \(plpgsql 1233→1244→1235 on
+      re\-run, a known flake; no new message in its diff\).
+    - Gates: units, testport \(cold\-start / pg\_dump / logical\), spotcheck,
+      sf025 99, acceptance.
+    Movement: none — correctness fix \(regress A/B unchanged\)
 - [ ] **M0149-0001j — goopg-written pg\_statistic stavalues are unreadable on a PG node: 0-dimensional, text-typed arrays** \(filed 2026-11-16 by M0149-0001g; C3 interop, estimates only, below the item-10 rank\)
   Kind: impl
   Parent: M0149-0001g
