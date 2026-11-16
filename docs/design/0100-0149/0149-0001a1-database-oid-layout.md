@@ -667,6 +667,17 @@ Key observation: PG compatibility constrains only the **displayed** and
   `postgres.bki`.
 - Large node trees use PG's inline pglz form.
 
+## Follow\-up: M0149\-0001g slice 17 — pg\_attribute metadata from a PG initdb \(2026\-11\-16\)
+
+- `pg_attribute_meta_generated.go` holds PG's pg\_attribute metadata for
+  every system\-relation column. `scripts/gen-pg-attribute-meta.py`
+  regenerates it.
+- `pgAttributeRow` overlays it when goopg writes the same atttypid.
+- For stored relations, attalign and attbyval must equal what goopg's codec
+  does. `TestPgAttributeMetaMatchesCodec` enforces this, and goopg's type
+  helpers were corrected where it disagreed.
+- Index columns on name are a format gap: PG keys them as cstring.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

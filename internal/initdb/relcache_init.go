@@ -2207,9 +2207,13 @@ func buildPgAttributeBlob(a nailedAttr) []byte {
 }
 
 // pgTypeIsByVal returns 1 if the PG type OID is pass-by-value, 0 otherwise.
+// pgTypeIsByVal is the init-file twin of pgTypeByVal and delegates to it, so
+// the relcache init file and the pg_attribute heap rows cannot disagree on
+// attbyval (they had: regproc, pg_lsn, timestamptz and others were by-value in
+// one and not the other). PG's fetchatt treats a by-reference 8-byte value as a
+// pointer, so this is a correctness property. M0149-0001g slice 17.
 func pgTypeIsByVal(oid uint32) byte {
-	switch oid {
-	case 16, 18, 21, 23, 26, 28, 700, 20, 701:
+	if pgTypeByVal(oid) {
 		return 1
 	}
 	return 0

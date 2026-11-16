@@ -12183,6 +12183,37 @@ verify each at HEAD when the task starts.
     - Gates: units, initdb, postmaster, testport interop set, regress A/B on
       7 cases \(no movement\), spotcheck, sf025 99, acceptance.
     Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 17: bootstrap pg\_attribute metadata equals a PG 18.3 initdb.
+    - Rows identical to PG went from 1559 to 2817 of 2849. psql \\do\+, \\df\+,
+      \\dt\+ and \\d now work on a PG node.
+    - The values come from pg\_attribute\_meta\_generated.go, produced by
+      scripts/gen\-pg\-attribute\-meta.py from a throwaway initdb and keyed
+      by relname.attname. pgAttributeRow overlays them only when goopg
+      writes the same atttypid. Overlaid columns:
+      - attcollation: 950 on name / sql\_identifier, 100 on text;
+      - attalign and attbyval of the declared type;
+      - attndims for arrays and atttypmod;
+      - attstorage;
+      - attnotnull: false on index columns;
+      - attacl: the column GRANTs initdb issues.
+    - Sibling fixes found by the new TestPgAttributeMetaMatchesCodec:
+      - pgTypeAlignChar said 'i' for timestamptz, timestamp, interval, time,
+        timetz and xid8, which the codec already pads to 8.
+        pg\_authid.rolvaliduntil carried the wrong attalign.
+      - pgTypeByVal said false for xid, timestamps, date, cid and xid8.
+      - The relcache init file's pgTypeIsByVal kept its own shorter list.
+        It now delegates to pgTypeByVal.
+    - Left as is: 32 index columns on name, where PG's key type is cstring
+      \(atttypid 2275, attlen \-2\). goopg's index tuples store 64\-byte
+      NameData, so this needs an index\-format change.
+    - Not bootstrapped: 312 PG\-only system columns, on relations goopg
+      lacks.
+    - Gates:
+      - units, initdb, postmaster, testport interop set, regress A/B on
+        9 catalog\-reading cases, spotcheck, sf025 99, acceptance;
+      - type\_sanity read 79 once and 82 in two reruns, so no stable
+        movement. The stale inventory \(93\) was re\-measured to 82.
+    Movement: regress type\_sanity 93→82 \(inventory catch\-up; this slice no stable movement\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

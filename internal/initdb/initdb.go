@@ -6635,21 +6635,38 @@ func pgSystemAttributeRows(relOID uint32) []executor.Row {
 }
 
 func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
+	typmod, ndims := int64(-1), int64(0)
+	byval, align := pgTypeByVal(a.TypeOID), pgTypeAlignChar(a.TypeOID)
+	// attstorage: type-derived, except on a TOAST relation's own columns,
+	// which upstream pins to 'p' (M0131-S20.1).
+	storage, notNull, collation := pgAttrStorageChar(relOID, a.TypeOID), a.NotNull, a.Collation
+	acl := executor.NullDatum
+	// M0149-0001g slice 17: a system-relation column carries the metadata a
+	// PG 18.3 initdb leaves (pgAttributeInitdbMeta) — attcollation 950 on
+	// name / sql_identifier columns, 100 on text ones, array attndims, the
+	// attalign/attbyval of the declared type, index columns attnotnull false,
+	// and the column GRANTs initdb issues. Only when goopg writes the same
+	// atttypid; attlen stays goopg's, which TestPgAttributeMetaMatchesCodec
+	// pins against the physical layout.
+	if m, ok := pgAttributeInitdbMetaFor(relOID, a.Name, a.TypeOID); ok {
+		typmod, ndims = int64(m.TypMod), int64(m.NDims)
+		byval, align = m.ByVal, string(rune(m.Align))
+		storage, notNull, collation = string(rune(m.Storage)), m.NotNull, m.Collation
+		acl = pgAttributeACLDatum(m, a.Name)
+	}
 	return executor.Row{
 		executor.NewIntDatum(int64(relOID)),
 		executor.NewStringDatum(a.Name),
 		executor.NewIntDatum(int64(a.TypeOID)),
 		executor.NewIntDatum(int64(a.Len)),
 		executor.NewIntDatum(int64(a.Num)),
-		executor.NewIntDatum(-1), // atttypmod
-		executor.NewIntDatum(0),  // attndims
-		executor.NewBoolDatum(pgTypeByVal(a.TypeOID)),
-		executor.NewStringDatum(pgTypeAlignChar(a.TypeOID)),
-		// attstorage: type-derived, except on a TOAST relation's own columns,
-		// which upstream pins to 'p' (M0131-S20.1).
-		executor.NewStringDatum(pgAttrStorageChar(relOID, a.TypeOID)),
+		executor.NewIntDatum(typmod), // atttypmod
+		executor.NewIntDatum(ndims),  // attndims
+		executor.NewBoolDatum(byval),
+		executor.NewStringDatum(align),
+		executor.NewStringDatum(storage),
 		executor.NewStringDatum(""), // attcompression
-		executor.NewBoolDatum(a.NotNull),
+		executor.NewBoolDatum(notNull),
 		executor.NewBoolDatum(false), // atthasdef
 		executor.NewBoolDatum(false), // atthasmissing
 		executor.NewStringDatum(""),  // attidentity
@@ -6657,7 +6674,7 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 		executor.NewBoolDatum(false), // attisdropped
 		executor.NewBoolDatum(true),  // attislocal
 		executor.NewIntDatum(0),      // attinhcount
-		executor.NewIntDatum(int64(a.Collation)), // attcollation (M0133-S3: C collation on non-nailed info_schema columns)
+		executor.NewIntDatum(int64(collation)), // attcollation (initdb's value; M0133-S3 C collation on info_schema columns otherwise)
 		executor.NullDatum,           // attstattarget (PG18 BKI_FORCE_NULL default)
 		// Step 3u: Emit NULL (not empty-text varlena) for the four nullable
 		// trailing varlena/array columns. Previously NewStringDatum("") wrote
@@ -6668,7 +6685,7 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 		// RelationInitIndexAccessInfo on the very index whose error message
 		// is being formatted → ERRORDATA_STACK_SIZE PANIC. PG18's default
 		// for an unconfigured catalog row is SQL NULL on all four columns.
-		executor.NullDatum, // attacl
+		acl,                // attacl (initdb column GRANTs, else NULL)
 		executor.NullDatum, // attoptions
 		executor.NullDatum, // attfdwoptions
 		executor.NullDatum, // attmissingval
@@ -6932,6 +6949,11 @@ func pgTypeByVal(oid uint32) bool {
 		// 64-bit). pg_subscription_rel.srsublsn and pg_subscription.subskiplsn
 		// both depend on this.
 		return true
+	case 28, 1184, 1114, 1082, 1083, 29, 5069:
+		// xid, timestamptz, timestamp, date, time, cid, xid8: by-value in
+		// pg_type.dat (8-byte ones via FLOAT8PASSBYVAL on 64-bit). Found by
+		// TestPgAttributeMetaMatchesCodec (M0149-0001g slice 17).
+		return true
 	}
 	return false
 }
@@ -6953,6 +6975,12 @@ func pgTypeAlignChar(oid uint32) string {
 	case 23, 26, 700, 194, 1009, 24, 325, 269, 30, 22, 1002, 1028, 3361, 3402, 5017:
 		return "i"
 	case 20, 701, 10028, 3220,
+		// timestamptz (1184), timestamp (1114), interval (1186), time (1083),
+		// timetz (1266), xid8 (5069): typalign 'd' in pg_type.dat, and the
+		// codec (catalog.PhysicalTypeAlign) already pads them to 8 — the
+		// pg_attribute side said 'i' (pg_authid.rolvaliduntil). M0149-0001g
+		// slice 17, TestPgAttributeMetaMatchesCodec.
+		1184, 1114, 1186, 1083, 1266, 5069,
 		// _aclitem (1034) is typalign 'd' (aclitem carries a 64-bit AclMode
 		// since PG 16). It had been grouped with the 'i' varlenas; harmless
 		// while every ACL column was NULL or sat on an 8-byte boundary, fatal
