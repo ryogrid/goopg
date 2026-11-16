@@ -13,6 +13,7 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/pl/plpgsql"
+	"github.com/goopg/goopg/internal/utils/errcodes"
 )
 
 // wrapSQLFunctionContext wraps an error with CONTEXT showing the SQL function
@@ -2765,101 +2766,54 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 	}
 }
 
-// conditionNameToSQLState maps a PL/pgSQL condition name to a SQLSTATE code.
-// Partial mapping covering common condition names. M0097-0003.
+// conditionNameToSQLState maps a RAISE condition name to its SQLSTATE:
+// plpgsql_recognize_err_condition (pl_comp.c) takes the FIRST plerrcodes.h
+// entry of that name (reading_sql_data_not_permitted is 2F004, not 38004).
+// An unknown name keeps the old P0001 fallback; PG rejects it at compile
+// time ("unrecognized exception condition"), see the deferral ledger.
 func conditionNameToSQLState(name string) string {
-	switch strings.ToLower(name) {
-	case "data_corrupted":
-		return "XX001"
-	case "reading_sql_data_not_permitted":
-		return "2F002"
-	case "modifying_sql_data_not_permitted":
-		return "2F003"
-	case "prohibited_sql_statement_attempted":
-		return "2F003"
-	case "division_by_zero":
-		return "22012"
-	case "unique_violation":
-		return "23505"
-	case "foreign_key_violation":
-		return "23503"
-	case "no_data_found":
-		return "P0002"
-	case "too_many_rows":
-		return "P0003"
-	case "syntax_error":
-		return "42601"
-	case "undefined_table":
-		return "42P01"
-	case "not_null_violation":
-		return "23502"
-	case "serialization_failure":
-		return "40001"
-	case "deadlock_detected":
-		return "40P01"
-	case "raise_exception":
-		return "P0001"
+	if codes := errcodes.PLpgSQLConditionCodes(strings.ToLower(name)); len(codes) > 0 {
+		return string(codes[0])
 	}
 	return "P0001" // default RAISE exception
 }
 
-// exceptionHandlerMatches reports whether any condition in the handler
-// matches the given SQLSTATE or condition name. M0097-0012.
+// exceptionHandlerMatches reports whether any condition of a WHEN clause
+// matches the error's SQLSTATE — exception_matches_conditions (pl_exec.c):
+// OTHERS matches everything except query_canceled and assert_failure; a
+// condition matches exactly or, when it names a whole class (xx000), by
+// category. A name stands for every SQLSTATE plerrcodes.h lists under it
+// (plpgsql_parse_err_condition). M0097-0012.
 func exceptionHandlerMatches(conditions []string, sqlstate string, conditionName ...string) bool {
 	raiseCondName := ""
 	if len(conditionName) > 0 {
 		raiseCondName = strings.ToLower(conditionName[0])
 	}
+	code := errcodes.Code(sqlstate)
+	matches := func(cond errcodes.Code) bool {
+		return code == cond || (errcodes.IsCategory(cond) && errcodes.Category(code) == cond)
+	}
 	for _, cond := range conditions {
+		if c, ok := strings.CutPrefix(cond, plpgsql.SQLStateConditionPrefix); ok {
+			if matches(errcodes.Code(c)) {
+				return true
+			}
+			continue
+		}
 		lower := strings.ToLower(cond)
-		// Direct condition-name match: RAISE reading_sql_data_not_permitted caught by WHEN reading_sql_data_not_permitted.
+		if lower == "others" {
+			if sqlstate != string(errcodes.QueryCanceled) && sqlstate != string(errcodes.AssertFailure) {
+				return true
+			}
+			continue
+		}
+		// A RAISE of an unknown condition name carries P0001; still let the
+		// same name catch it (the pre-table behaviour this keeps).
 		if raiseCondName != "" && lower == raiseCondName {
 			return true
 		}
-		switch strings.ToUpper(cond) {
-		case "OTHERS":
-			return true
-		case sqlstate:
-			return true
-		}
-		// Check common condition names.
-		switch lower {
-		case "others", "when others":
-			return true
-		case "division_by_zero":
-			if sqlstate == "22012" {
-				return true
-			}
-		case "unique_violation":
-			if sqlstate == "23505" {
-				return true
-			}
-		case "foreign_key_violation":
-			if sqlstate == "23503" {
-				return true
-			}
-		case "undefined_function", "undefined_object":
-			if sqlstate == "42883" || sqlstate == "42704" {
-				return true
-			}
-		case "no_data_found":
-			if sqlstate == "P0002" {
-				return true
-			}
-		case "too_many_rows":
-			if sqlstate == "P0003" {
-				return true
-			}
-		case "syntax_error":
-			if sqlstate == "42601" {
-				return true
-			}
-		case "undefined_table":
-			if sqlstate == "42P01" {
-				return true
-			}
-		case "not_null_violation":
-			if sqlstate == "23502" {
+		for _, c := range errcodes.PLpgSQLConditionCodes(lower) {
+			if matches(c) {
 				return true
 			}
 		}

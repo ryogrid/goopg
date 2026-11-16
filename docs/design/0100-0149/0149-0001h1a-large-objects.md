@@ -171,6 +171,38 @@ statements, including warnings, RESTRICT / CASCADE and rollback\) and for
 ALTER OWNER \(22 statements\). A PG cold start reads the rewritten lomacl and
 answers has\_largeobject\_privilege the same way.
 
+## Slice 4: COMMENT ON LARGE OBJECT, PL/pgSQL condition matching, zero\-filled holes
+
+- **COMMENT ON LARGE OBJECT** \(gram.y CommentStmt's `LARGE_P OBJECT_P
+  NumericOnly` arm\) is a `comment_target` alternative and a routed comment
+  kind. execCommentOn checks the object exists \(42704 "large object %u does
+  not exist"\) and that the caller owns it \(check\_object\_ownership: 42501
+  "must be owner of large object %u", waived by lo\_compat\_privileges\).
+  It then stores the description under classoid 2613
+  \(LargeObjectRelationId\), which is the key obj\_description\(oid,
+  'pg\_largeobject'\) and psql `\lo_list` read. lo\_unlink drops the comment,
+  as inv\_drop's performDeletion does.
+- **PL/pgSQL exception conditions.** `cmd/gen-sqlstate` now also emits
+  plerrcodes.h's table: every type\-E errcodes.txt entry that has a
+  condition name, 251 entries, checked against the generated header.
+  exceptionHandlerMatches is now exception\_matches\_conditions:
+  - OTHERS matches everything except query\_canceled and assert\_failure;
+  - a condition matches its exact code or, when it names a class \(xx000\),
+    any code in that class;
+  - a name stands for every code listed under it.
+
+  `WHEN SQLSTATE 'xxxxx'` used to lose its string literal in the PL/pgSQL
+  parser, leaving the bare word `SQLSTATE`, so it never matched. The parser
+  now keeps the code \(`plpgsql.SQLStateConditionPrefix`\) and rejects a
+  malformed one with "invalid SQLSTATE code".
+  RAISE \<name\> takes the first entry of that name, as
+  plpgsql\_recognize\_err\_condition does: reading\_sql\_data\_not\_permitted
+  is 2F004, where the old hand\-written map said 2F002.
+- **loread over a hole.** An lo\_truncate that extends an object writes only
+  the last page. A read window that ends before that page found no pages and
+  returned nothing. loRead now zero\-fills up to the object size, as
+  inv\_read does.
+
 ## Open
 
 - A read\-only descriptor reads with the statement's snapshot, not the
@@ -181,12 +213,20 @@ answers has\_largeobject\_privilege the same way.
   result, `x'20000'::int` and `x'20000' | x'40000'` fail, which blocks
   most large\-object steps in regress `privileges` and `largeobject`
   \(M0149\-0001h1a1\).
-- COMMENT ON LARGE OBJECT \(pg\_description, which psql `\lo_list` shows\),
-  ALTER DEFAULT PRIVILEGES … ON LARGE OBJECTS \(get\_user\_default\_acl at
+- ALTER DEFAULT PRIVILEGES … ON LARGE OBJECTS \(get\_user\_default\_acl at
   lo\_create\), and the pg\_shdepend owner / ACL role dependencies.
 - goopg's pg\_proc exposes only curated builtins. libpq's lo\_initialize
   therefore fails "cannot determine OID of function lo\_open", which breaks
-  psql `\lo_unlink`.
+  psql `\lo_unlink`, `\lo_import` and `\lo_export`. Behind that lookup,
+  libpq calls the functions through the fast\-path FunctionCall \('F'\)
+  protocol message, which goopg's postmaster does not handle at all. These
+  are the remaining 35 largeobject mismatch lines.
+- Comments \(all kinds\) live in an in\-memory map. They are neither
+  transactional nor per\-database, so a large object's comment key
+  \(2613, oid\) is shared across databases.
+- An unknown PL/pgSQL condition name is accepted and simply never matches.
+  PG rejects it when the function is compiled \("unrecognized exception
+  condition"\).
 - pg\_typeof does not evaluate its argument, so a volatile argument
   \(`pg_typeof(lo_create(0))`\) has no side effect.
 - goopg FSM forks carry no page checksum; PG warns and zeroes them

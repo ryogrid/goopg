@@ -236,6 +236,22 @@ func loRead(ctx *Context, loid uint32, off int64, n int64) ([]byte, error) {
 		out = append(out, p.data[pos-pageOff:pos-pageOff+take]...)
 		pos += take
 	}
+	if int64(len(out)) < n {
+		// The window ran out of pages but may still lie inside the object:
+		// a hole up to a later page (lo_truncate extending an object writes
+		// only its last page) reads as zeros, as inv_read does.
+		size, err := loSize(ctx, loid)
+		if err != nil {
+			return nil, err
+		}
+		if size > pos {
+			gap := size - pos
+			if gap > n-int64(len(out)) {
+				gap = n - int64(len(out))
+			}
+			out = append(out, make([]byte, gap)...)
+		}
+	}
 	return out, nil
 }
 

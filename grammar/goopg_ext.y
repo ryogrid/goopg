@@ -3105,6 +3105,10 @@ comment_target:
 	| ACCESS METHOD qualified_name    { $$ = NewCommentOnStmt(0, "access method", objectNameFromQn($3), "") }
 	| FOREIGN TABLE qualified_name    { $$ = NewCommentOnStmt(0, "foreign table", objectNameFromQn($3), "") }
 	| FOREIGN DATA_P WRAPPER qualified_name { $$ = NewCommentOnStmt(0, "foreign data wrapper", objectNameFromQn($4), "") }
+	/* gram.y CommentStmt's LARGE_P OBJECT_P NumericOnly arm; the OID rides
+	   in ObjName.Name as decimal text (an integer OID, as ALTER LARGE OBJECT
+	   takes). M0149-0001h1a. */
+	| LARGE_P OBJECT_P ICONST         { $$ = NewCommentOnStmt(0, "large object", ObjectName{Name: strconv.FormatInt(int64($3), 10)}, "") }
 	/* COLUMN's name is split at the LAST dot: `COMMENT ON COLUMN t.c` records
 	   ObjName{Name:"t"} and SubName "c", while `s.t.c` keeps the schema. */
 	| COLUMN qualified_name           { $$ = commentColumn($2) }

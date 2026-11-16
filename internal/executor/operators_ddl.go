@@ -25532,6 +25532,31 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 				Message: fmt.Sprintf("type %q does not exist", s.ObjName.String())}
 		}
 		im.SetComment(oidPgType, dom.OID, 0, s.Description)
+	case "large object":
+		// get_object_address's OBJECT_LARGEOBJECT arm (42704 when missing),
+		// then check_object_ownership: owner (or a member of it) unless
+		// lo_compat_privileges; the comment's classoid is pg_largeobject
+		// (2613), which is what obj_description(oid, 'pg_largeobject') and
+		// psql's \lo_list read. M0149-0001h1a.
+		v, err := strconv.ParseInt(s.ObjName.Name, 10, 64)
+		if err != nil || v < 0 || v > 0xffffffff {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("large object %s does not exist", s.ObjName.Name)}
+		}
+		loid := uint32(v)
+		owner, _, found, err := loLookup(o.ctx, loid)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("large object %d does not exist", loid)}
+		}
+		role := currentRoleOID(im, o.ctx)
+		if !loCompatPrivileges(o.ctx) && !im.IsSuperuser(role) && role != owner && !im.HasPrivsOfRole(role, owner) {
+			return &ExecError{Code: "42501", Message: fmt.Sprintf("must be owner of large object %d", loid)}
+		}
+		im.SetComment(largeObjectRelationOID, loid, 0, s.Description)
 	case "schema":
 		// Schemas live in pg_namespace (classoid 2615). Without this, a COMMENT
 		// ON SCHEMA was silently swallowed and never reached pg_description, so

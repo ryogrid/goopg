@@ -11986,6 +11986,34 @@ verify each at HEAD when the task starts.
       at 5 days anyway\), which leaves about 56 GB free. `tmp/fireset-bin`
       \(77 GB\) and the old `tmp/*-tpcds-sf1-data-*` clones are still
       untouched and still need an owner prune.
+  - 2026-11-17 fourth slice \(landed\): COMMENT ON LARGE OBJECT, PL/pgSQL exception\-condition matching, zero\-filled lo holes.
+    - COMMENT ON LARGE OBJECT: grammar comment\_target arm, routed kind
+      "large"; executor checks existence \(42704\) and ownership \(42501,
+      lo\_compat\_privileges\), classoid 2613; lo\_unlink drops the comment.
+    - cmd/gen\-sqlstate emits plerrcodes.h's 251\-entry name table;
+      exceptionHandlerMatches ports exception\_matches\_conditions \(OTHERS
+      exclusions, class match\); `WHEN SQLSTATE 'xxxxx'` keeps its code.
+    - Found:
+      - `EXCEPTION WHEN SQLSTATE '…'` never matched: the PL/pgSQL parser
+        dropped the string literal;
+      - only about 12 condition names were known, so `WHEN undefined_file`
+        missed lo\_export's 58P01.
+    - loRead zero\-fills a hole before a later page \(lo\_truncate extend\).
+    - Regress: largeobject 45→35 \(inventory updated\). privileges
+      unchanged on an A/B against HEAD \(616 = 616\). plpgsql A/B 1244→1236
+      \(nondeterministic case, inventory not re\-pinned\): `WHEN sqlstate
+      '22012'` handlers now fire.
+    - The remaining 35 lines are all libpq lo\_\*: pg\_proc OID lookup plus
+      the fast\-path FunctionCall protocol — next slice.
+    Movement: regress largeobject 45→35
+- [ ] **M0149-0001h1a2 — RAISE without a format string ignores `USING MESSAGE = <expr>`: `raise notice using message = sqlstate` prints the expression text** \(filed 2026-11-17 by M0149-0001h1a\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Repro: regress plpgsql raise\_test — PG prints `NOTICE:  22012`; goopg
+    prints `NOTICE:  using message = sqlstate`.
+  - PG: pl\_gram.y stmt\_raise \(the RAISE level USING … form with no
+    format string\) and exec\_stmt\_raise, which evaluates the USING option
+    expressions \(pl\_exec.c\).
 - [x] **M0149-0001h1a1 — bit strings have no `\|` / `&` / `#` operators and no bit → int4 / int8 cast: `x'20000'::int` and `x'20000' \| x'40000'` fail** \(filed 2026-11-17 by M0149-0001h1a\)
   Kind: impl
   Parent: M0149-0001h1a

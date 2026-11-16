@@ -31,6 +31,10 @@ import (
 
 // loMetaTable returns the heap-backed pg_largeobject_metadata of the
 // session's database.
+// largeObjectRelationOID is LargeObjectRelationId (pg_largeobject): the
+// classid of a large object's ObjectAddress, so of its pg_description row.
+const largeObjectRelationOID = 2613
+
 func loMetaTable(ctx *Context) (*catalog.Table, error) {
 	tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_largeobject_metadata"},
 		catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
@@ -199,6 +203,8 @@ func evalLoUnlink(args []Datum, ctx *Context) (Datum, error) {
 			return Datum{}, err
 		}
 	}
+	// inv_drop's performDeletion also removes the object's comment.
+	im.SetComment(largeObjectRelationOID, loid, 0, "")
 	return NewIntDatum(1), nil
 }
 

@@ -75,6 +75,14 @@ func (p *bodyParser) identStartsAssignment() bool {
 	return false
 }
 
+// peek returns the token n positions after the current one (EOF past the end).
+func (p *bodyParser) peek(n int) parser.Token {
+	if p.idx+n >= len(p.tokens) {
+		return parser.Token{Kind: parser.TokenEOF}
+	}
+	return p.tokens[p.idx+n]
+}
+
 func (p *bodyParser) advance() parser.Token {
 	t := p.cur()
 	p.idx++
@@ -232,6 +240,19 @@ func (p *bodyParser) parseExceptionBlock() (*ExceptionBlock, error) {
 			}
 			if ct.Kind == parser.TokenEOF {
 				break
+			}
+			if (ct.Kind == parser.TokenIdent || ct.Kind == parser.TokenKeyword) &&
+				strings.EqualFold(ct.Value, "sqlstate") && p.peek(1).Kind == parser.TokenStringLit {
+				// WHEN SQLSTATE 'xxxxx' (pl_gram.y proc_condition): five
+				// characters from [0-9A-Z], else "invalid SQLSTATE code".
+				code := p.peek(1).Value
+				if len(code) != 5 || strings.Trim(code, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") != "" {
+					return nil, p.errAtCur("invalid SQLSTATE code")
+				}
+				conditions = append(conditions, SQLStateConditionPrefix+code)
+				p.advance()
+				p.advance()
+				continue
 			}
 			if ct.Kind == parser.TokenIdent || ct.Kind == parser.TokenKeyword {
 				if !strings.EqualFold(ct.Value, "or") {

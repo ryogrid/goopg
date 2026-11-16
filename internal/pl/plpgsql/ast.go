@@ -300,8 +300,14 @@ type SelectIntoStmt struct {
 func (s *SelectIntoStmt) Pos() int          { return s.pos }
 func (s *SelectIntoStmt) plpgsqlStmtNode() {}
 
+// SQLStateConditionPrefix marks an ExceptionHandler condition written as
+// `SQLSTATE 'xxxxx'`; the five-character code follows the prefix. Any other
+// condition is a condition name (plerrcodes.h) or OTHERS.
+const SQLStateConditionPrefix = "sqlstate:"
+
 // ExceptionHandler is one WHEN clause in an EXCEPTION block.
-// Conditions are SQLSTATE codes or condition names. M0097-0012.
+// Conditions are condition names, OTHERS, or SQLStateConditionPrefix+code.
+// M0097-0012.
 type ExceptionHandler struct {
 	Conditions []string
 	Body       []Stmt

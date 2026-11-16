@@ -137,6 +137,7 @@ func goName(macro string) string {
 }
 
 func emit(pkg, srcPath string, entries []entry) []byte {
+	fileOrder := append([]entry(nil), entries...)
 	// Stable ordering by SQLSTATE.
 	sort.SliceStable(entries, func(i, j int) bool { return entries[i].SQLState < entries[j].SQLState })
 
@@ -199,6 +200,53 @@ type Code string
 		fmt.Fprintf(&b, "\t%s: %q,\n", e.Macro, e.Severity)
 	}
 	b.WriteString("}\n\n")
+
+	// PL/pgSQL condition names — the table generate-plerrcodes.pl writes to
+	// plerrcodes.h: every type-E entry that carries a condition name, in
+	// errcodes.txt order. A name may appear under several SQLSTATEs
+	// (string_data_right_truncation is 01004 and 22001, but only 22001 is
+	// type E), so lookups return every match, as plpgsql_parse_err_condition
+	// does.
+	b.WriteString(`var plpgsqlConditions = []struct {
+	Name string
+	Code Code
+}{` + "\n")
+	for _, e := range fileOrder {
+		if e.Severity != 'E' || e.Spec == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "\t{%q, %q},\n", e.Spec, e.SQLState)
+	}
+	b.WriteString("}\n\n")
+	b.WriteString(`// PLpgSQLConditionCodes returns the SQLSTATEs a PL/pgSQL exception
+// condition name stands for (plpgsql_parse_err_condition over plerrcodes.h);
+// nil when the name is unknown. The name is matched case-sensitively, as the
+// PL/pgSQL scanner has already down-cased it.
+func PLpgSQLConditionCodes(name string) []Code {
+	var out []Code
+	for _, c := range plpgsqlConditions {
+		if c.Name == name {
+			out = append(out, c.Code)
+		}
+	}
+	return out
+}
+
+// IsCategory reports whether code names a whole class (ERRCODE_IS_CATEGORY:
+// the last three characters are "000").
+func IsCategory(code Code) bool {
+	return len(code) == 5 && code[2:] == "000"
+}
+
+// Category returns the class code of a SQLSTATE (ERRCODE_TO_CATEGORY).
+func Category(code Code) Code {
+	if len(code) < 2 {
+		return code
+	}
+	return code[:2] + "000"
+}
+
+`)
 	b.WriteString(`// Lookup returns the Severity classification for the given code, or
 // (0, false) if the code is not a known upstream entry.
 func Lookup(code Code) (Severity, bool) {

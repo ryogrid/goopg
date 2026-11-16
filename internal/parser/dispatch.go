@@ -484,7 +484,7 @@ var commentKinds = map[string]bool{
 	"view": true, "sequence": true, "materialized": true, "type": true,
 	"domain": true, "collation": true, "access": true, "server": true,
 	"foreign": true, "extension": true, "cast": true, "function": true,
-	"schema": true,
+	"schema": true, "large": true,
 }
 
 func commentRouted(frag []Token) bool {
