@@ -1108,6 +1108,14 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		// expand ×4). The same scan guards the assignment chokepoint
 		// (coerceTextLikeDatum's bit arms); this is its cast-time sibling
 		// (pattern_sibling_paths_must_agree).
+		// bit → bit(n) / bit varying(n) from a bit-typed source is the
+		// length coercion bit() / varbit() with isExplicit: an explicit cast
+		// zero-pads or truncates bit(n) and truncates bit varying(n), where
+		// an implicit one keeps the length checks below. M0149-0001h1a1.
+		if isB, isVB := isBitSourceType(x.SourceType); (isB || isVB) && x.Explicit && x.Typmod > 0 && v.Kind == KindString &&
+			(strings.EqualFold(castTargetType, "bit") || strings.EqualFold(castTargetType, "varbit") || strings.EqualFold(castTargetType, "bit varying")) {
+			return NewStringDatum(bitExplicitLength(v.StringValue(), int(x.Typmod), strings.EqualFold(castTargetType, "bit"))), nil
+		}
 		if v.Kind == KindString && (strings.EqualFold(castTargetType, "bit") || strings.EqualFold(castTargetType, "varbit") || strings.EqualFold(castTargetType, "bit varying")) {
 			digits, berr := scanBitInput(v.StringValue())
 			if berr != nil {
@@ -1130,6 +1138,11 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		// money → a text type is the type's output function, cash_out
 		// ("$12.34"), not the scale-2 numeric goopg carries the value as.
 		// M0149-0001k5.
+		// bit → int4 / int8 (bittoint4 / bittoint8); no bit → int2 and no
+		// bit varying → integer cast. M0149-0001h1a1.
+		if d, ok, err := bitStringCast(v, x.SourceType, castTargetType, x.Pos()); ok {
+			return d, err
+		}
 		if isMoneyTypeName(x.SourceType) && !v.IsNull() {
 			switch strings.ToLower(castTargetType) {
 			case "text", "varchar", "character varying", "bpchar", "char", "character", "name":
@@ -12347,6 +12360,17 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			return evalLargeObjectFunc(name, args, ctx)
 		}
 		return evalHasDatabasePrivilege(args, ctx, x.Pos())
+	}
+	if isBitStringBuiltin(name) {
+		args := make([]Datum, 0, len(x.Args))
+		for _, a := range x.Args {
+			v, err := evalExprSlot(a, slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			args = append(args, v)
+		}
+		return evalBitStringFunc(name, args, x.Pos())
 	}
 	if isCashBuiltin(name) {
 		args := make([]Datum, 0, len(x.Args))

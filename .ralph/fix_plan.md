@@ -11948,7 +11948,7 @@ verify each at HEAD when the task starts.
     - Gates: units, fire\-set \(fires=none\), spotcheck, sf025 99,
       acceptance, PG cold\-start e2e.
     Movement: regress privileges 700→692
-- [ ] **M0149-0001h1a1 — bit strings have no `\|` / `&` / `#` operators and no bit → int4 / int8 cast: `x'20000'::int` and `x'20000' \| x'40000'` fail** \(filed 2026-11-17 by M0149-0001h1a\)
+- [x] **M0149-0001h1a1 — bit strings have no `\|` / `&` / `#` operators and no bit → int4 / int8 cast: `x'20000'::int` and `x'20000' \| x'40000'` fail** \(filed 2026-11-17 by M0149-0001h1a\)
   Kind: impl
   Parent: M0149-0001h1a
   - Repro on goopg: `select x'20000'::int` → "value "00100000000000000000"
@@ -11964,6 +11964,58 @@ verify each at HEAD when the task starts.
   - First step: probe the bit operator and cast surface against PG; implement
     the executor operators and casts; then re\-measure bit, privileges and
     largeobject.
+  - 2026-11-17 DONE: bit literals typed bit; operators, casts and bit overloads.
+    - The root cause was more than missing operators: `B'…'` / `X'…'` were
+      plain StringConsts typed text. Now:
+      - decodeBitStringLit sets StringConst.BitString \(dump:"omitempty", so
+        only the 5 bit\-literal goldens changed\);
+      - exprType / inferExprType say bit;
+      - parserExprKey keys `b:`.
+    - Planner bitStringOpCall \(3 BinaryOp resolvers\) and the UnaryOp
+      resolvers map & \| \# ~ << >> \|\| to bitand / bitor / bitxor / bitnot /
+      bitshiftleft / bitshiftright / bitcat. An unknown literal operand is
+      read through a varbit cast at its own position.
+    - bitStringFuncOverload: octet\_length / bit\_length / bit\_count /
+      get\_bit / set\_bit on a bit string, with FuncCall.SQLName for the label
+      and EXPLAIN.
+    - Executor bitstring\_ops.go:
+      - varbit.c errors 22026 / 2202E / 22023;
+      - bit → int4 / int8 \(22003, and 42846 for int2 / varbit\);
+      - explicit bit\(n\) / varbit\(n\) length coercion.
+    - Analyzer: bit \|\| bit types as varbit.
+    - Labels: a cast over an operator call takes the type label; int →
+      int4, decimal → numeric, char → bpchar.
+    - Probe \(39 statements, tmp/s58 vs PG 18.3\): identical.
+    - Regress A/B over 51 cases: bit 254→27, largeobject 220→46, privileges
+      693→673, arrays 1286→1281; nothing else moved \(join ±1 flake\).
+      Inventory updated.
+    - Found an S2: explicit numeric\(p\) casts apply p as the scale \(filed
+      M0149\-0001l\).
+    - Residuals ledgered: position\(B'' IN B''\), the `\\d` default deparse,
+      pg\_input\_is\_valid bit\(n\), `::dec`, and post\-aggregate overload
+      resolution.
+    - Test: TestBitStringOps; parser goldens regenerated unfiltered.
+    - Gates: units \(TestParserExprKeyUsesEveryField caught the key; fixed\),
+      fire\-set \(fires=none\), spotcheck, sf025 99, acceptance.
+    Movement: regress bit 254→27, largeobject 220→46, privileges 693→673
+- [ ] **M0149-0001l — WRONG RESULTS: an explicit cast to numeric\(p\) without a scale applies p as the scale and skips the overflow check** \(filed 2026-11-17 by M0149-0001h1a1; S2\)
+  Kind: impl
+  Parent: none
+  - Repro on goopg:
+    - `select 1.5::numeric(3), 12345::numeric(3), 1::numeric(3)` →
+      `1.500 | 12345.000 | 1.000`;
+    - PG 18.3 gives `2`, then 22003 "numeric field overflow" \(DETAIL "A field
+      with precision 3, scale 0 must round to an absolute value less than
+      10^3."\), and `1`.
+    - A numeric\(3\) column rounds correctly on INSERT, so only the cast path
+      is wrong.
+  - PG: numeric\(\) / apply\_typmod \(utils/adt/numeric.c\). `numeric(p)` is
+    scale 0, and typmod = \(\(p << 16\) \| s\) \+ VARHDRSZ.
+  - First step: find the cast\-path typmod decode in evalCastTyped's numeric
+    arm, compare it with the assignment path, and make the two agree \(Hard\-won
+    Rule \#2\).
+  > \#\# ESCALATION 2026\-11\-17 \(S2\) — M0149\-0001l: `x::numeric(p)` returns wrong values \(precision used as scale, no overflow check\)
+  > Wrong results for any query casting to a precision\-only numeric typmod. Found while probing bit casts. Owner placement requested \(below item 10 per the S7 carve\-out unless placed\).
 - [ ] **M0149-0001k — WRONG RESULTS on a PG node: goopg stores money / point / lseg / box / line / circle / tid / aclitem columns as varlena, not PG's fixed\-length form** \(filed 2026-11-16 by M0149-0001g; S2\)
   Kind: impl
   Parent: M0149-0001g

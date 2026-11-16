@@ -38,6 +38,12 @@ func canonDump(v reflect.Value) string {
 			if name == "pos" || name == "Pos" {
 				continue // position-stripped canonical form
 			}
+			// A field tagged dump:"omitempty" prints only when set, so adding
+			// one (StringConst.BitString, M0149-0001h1a1) leaves every
+			// existing golden byte-identical.
+			if t.Field(i).Tag.Get("dump") == "omitempty" && v.Field(i).IsZero() {
+				continue
+			}
 			if !first {
 				b.WriteByte(',')
 			}

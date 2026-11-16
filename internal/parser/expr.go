@@ -25,6 +25,11 @@ func (*IntegerConst) exprNode()  {}
 type StringConst struct {
 	pos   int
 	Value string
+	// BitString marks a B'...' / X'...' literal (decoded to '0'/'1' digits):
+	// PG types it bit (A_Const T_BitString → BITOID), not unknown. The value
+	// stays digit text; the planner reads the flag to type it and to resolve
+	// the bit operators. M0149-0001h1a1.
+	BitString bool `dump:"omitempty"`
 }
 
 func (e *StringConst) Pos() int { return e.pos }
@@ -63,7 +68,7 @@ func decodeBitStringLit(t Token) (Expr, error) {
 				}
 			}
 		}
-		return &StringConst{pos: t.Pos, Value: body}, nil
+		return &StringConst{pos: t.Pos, Value: body, BitString: true}, nil
 	}
 	var out strings.Builder
 	out.Grow(len(body) * 4)
@@ -91,7 +96,7 @@ func decodeBitStringLit(t Token) (Expr, error) {
 			}
 		}
 	}
-	return &StringConst{pos: t.Pos, Value: out.String()}, nil
+	return &StringConst{pos: t.Pos, Value: out.String(), BitString: true}, nil
 }
 
 // PartitionRangeBoundKeyword is the MINVALUE / MAXVALUE keyword in a RANGE

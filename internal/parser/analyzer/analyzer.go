@@ -1678,6 +1678,23 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				(isJSONB(rightTyp) && isUnknownType(leftTyp)) {
 				return catalog.Type{Name: "jsonb"}, nil
 			}
+			// bit || bit is bitcat (pg_operator 1683, result bit varying);
+			// an unknown literal beside a bit string resolves to it.
+			// M0149-0001h1a1.
+			isBits := func(t catalog.Type) bool {
+				if t.IsArray {
+					return false
+				}
+				switch strings.ToLower(t.Name) {
+				case "bit", "varbit", "bit varying":
+					return true
+				}
+				return false
+			}
+			if (isBits(leftTyp) && (isBits(rightTyp) || isUnknownType(rightTyp))) ||
+				(isBits(rightTyp) && isUnknownType(leftTyp)) {
+				return catalog.Type{Name: "varbit"}, nil
+			}
 			// Require at least one string-like (or unknown) operand.
 			// When one side is non-string but the other is string-like,
 			// PostgreSQL implicitly casts the non-string side to text

@@ -6710,7 +6710,7 @@ func replaceExprNode(e Expr, target Expr, repl Expr) Expr {
 		for i, a := range x.Args {
 			args[i] = replaceExprNode(a, target, repl)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, Operator: x.Operator}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, Operator: x.Operator, SQLName: x.SQLName}
 	case *BinaryOp:
 		return &BinaryOp{pos: x.Pos(), Op: x.Op, Left: replaceExprNode(x.Left, target, repl), Right: replaceExprNode(x.Right, target, repl), ResultType: x.ResultType}
 	case *UnaryOp:
@@ -9248,6 +9248,9 @@ func inferExprType(e Expr) catalog.Type {
 	case *NumericConst:
 		return catalog.Type{Name: "numeric"}
 	case *StringConst:
+		if x.BitString {
+			return catalog.Type{Name: "bit"} // M0149-0001h1a1
+		}
 		return catalog.Type{Name: "text"}
 	case *BooleanConst:
 		return catalog.Type{Name: "bool"}
@@ -10579,7 +10582,7 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 	case *parser.NumericConst:
 		return &NumericConst{pos: x.Pos(), Value: x.Value}, nil
 	case *parser.StringConst:
-		return &StringConst{pos: x.Pos(), Value: x.Value}, nil
+		return &StringConst{pos: x.Pos(), Value: x.Value, BitString: x.BitString}, nil
 	case *parser.TypedStringLit:
 		return &TypedStringLit{pos: x.Pos(), Type: x.Type, Value: x.Value}, nil
 	case *parser.IntervalLit:
@@ -10747,6 +10750,9 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		if err != nil {
 			return nil, err
 		}
+		if fc, ok := bitStringOpCall(x.Pos(), x.Op, l, r); ok {
+			return fc, nil
+		}
 		if fc, ok := moneyArithCall(x.Pos(), x.Op, l, r); ok {
 			return fc, nil
 		}
@@ -10763,6 +10769,9 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		op, err := resolveExprAfterAggregate(x.Operand, agg)
 		if err != nil {
 			return nil, err
+		}
+		if x.Op == parser.OpBitNot && isBitStringType(exprType(op)) {
+			return &FuncCall{pos: x.Pos(), Name: "bitnot", Args: []Expr{op}, ReturnType: "bit", Operator: "~"}, nil
 		}
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: op}, nil
 	case *parser.CastExpr:
@@ -10961,6 +10970,9 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
+		if fc, ok := bitStringOpCall(x.Pos(), x.Op, l, r); ok {
+			return fc, nil
+		}
 		if fc, ok := moneyArithCall(x.Pos(), x.Op, l, r); ok {
 			return fc, nil
 		}
@@ -10977,6 +10989,9 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		op, err := resolveExprAfterWindow(x.Operand, win)
 		if err != nil {
 			return nil, err
+		}
+		if x.Op == parser.OpBitNot && isBitStringType(exprType(op)) {
+			return &FuncCall{pos: x.Pos(), Name: "bitnot", Args: []Expr{op}, ReturnType: "bit", Operator: "~"}, nil
 		}
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: op}, nil
 	case *parser.CastExpr:
@@ -12251,6 +12266,9 @@ func parserExprKey(e parser.Expr) string {
 	case *parser.NumericConst:
 		return "n:" + x.Value
 	case *parser.StringConst:
+		if x.BitString {
+			return "b:" + x.Value // B'101' is bit, '101' unknown: distinct slots
+		}
 		return "s:" + x.Value
 	case *parser.NullConst:
 		return "null"
@@ -16690,7 +16708,9 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 		}
 		// For function-call casts (e.g. parse_ident(...)::name[]), propagate the
 		// function name as the column label (matches PostgreSQL's FigureColname). M0097-0003.
-		if _, isFuncCall := cast.Operand.(*FuncCall); isFuncCall {
+		// An operator implemented as a call (money / bit-string operators)
+		// is an OpExpr upstream and has no name, so the type label wins.
+		if fc, isFuncCall := cast.Operand.(*FuncCall); isFuncCall && fc.Operator == "" {
 			innerName, _ := targetMeta(cast.Operand, t)
 			return innerName, exprType(e)
 		}
@@ -16708,6 +16728,9 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 		// An operator implemented as a call (money arithmetic) is an OpExpr
 		// upstream: FigureColname gives "?column?". M0149-0001k1.
 		return "?column?", exprType(e)
+	}
+	if fc, ok := e.(*FuncCall); ok && fc.SQLName != "" {
+		return fc.SQLName, exprType(e)
 	}
 	if fc, ok := e.(*FuncCall); ok && fc.Name != "" {
 		// array_construct is the lowered form of ARRAY[...]; PostgreSQL
@@ -16818,8 +16841,14 @@ func castTargetLabel(t string) string {
 	switch t {
 	case "boolean":
 		return "bool"
-	case "integer":
+	case "integer", "int":
+		// gram.y's SystemTypeName: INT / INTEGER are int4, DECIMAL / DEC
+		// numeric, CHAR / CHARACTER bpchar. M0149-0001h1a1.
 		return "int4"
+	case "decimal", "dec":
+		return "numeric"
+	case "char", "character":
+		return "bpchar"
 	case "bigint":
 		return "int8"
 	case "smallint":
@@ -17160,6 +17189,9 @@ func exprType(e Expr) catalog.Type {
 	case *CTIDExpr:
 		return catalog.Type{Name: "tid"}
 	case *StringConst:
+		if x.BitString {
+			return catalog.Type{Name: "bit"} // B'...' / X'...', M0149-0001h1a1
+		}
 		return catalog.Type{Name: "text"}
 	case *BooleanConst:
 		return catalog.Type{Name: "bool"}
@@ -17358,6 +17390,16 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "money"}
 		case "cash_div_cash":
 			return catalog.Type{Name: "float8"}
+		case "bitand", "bitor", "bitxor", "bitnot", "bitshiftleft", "bitshiftright":
+			return catalog.Type{Name: "bit"} // varbit.c, M0149-0001h1a1
+		case "bitcat":
+			return catalog.Type{Name: "varbit"}
+		case "bitoctetlength", "bitlength", "bitgetbit":
+			return catalog.Type{Name: "int4"}
+		case "bit_bit_count":
+			return catalog.Type{Name: "int8"}
+		case "bitsetbit":
+			return catalog.Type{Name: "bit"}
 		case "has_database_privilege", "has_table_privilege", "has_schema_privilege",
 			"has_column_privilege", "has_any_column_privilege", "has_sequence_privilege",
 			"has_function_privilege", "has_type_privilege", "has_largeobject_privilege":
@@ -18843,7 +18885,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 	case *parser.NumericConst:
 		return &NumericConst{pos: x.Pos(), Value: x.Value}, nil
 	case *parser.StringConst:
-		return &StringConst{pos: x.Pos(), Value: x.Value}, nil
+		return &StringConst{pos: x.Pos(), Value: x.Value, BitString: x.BitString}, nil
 	case *parser.TypedStringLit:
 		return &TypedStringLit{pos: x.Pos(), Type: x.Type, Value: x.Value}, nil
 	case *parser.IntervalLit:
@@ -18942,6 +18984,9 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 				l = &CastExpr{pos: x.Pos(), Operand: l, TargetType: strings.ToLower(rt.Name)}
 			}
 		}
+		if fc, ok := bitStringOpCall(x.Pos(), x.Op, l, r); ok {
+			return fc, nil
+		}
 		if fc, ok := moneyArithCall(x.Pos(), x.Op, l, r); ok {
 			return fc, nil
 		}
@@ -18960,6 +19005,9 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		op, err := resolveExpr(x.Operand, ctx)
 		if err != nil {
 			return nil, err
+		}
+		if x.Op == parser.OpBitNot && isBitStringType(exprType(op)) {
+			return &FuncCall{pos: x.Pos(), Name: "bitnot", Args: []Expr{op}, ReturnType: "bit", Operator: "~"}, nil
 		}
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: op}, nil
 	case *parser.FuncCall:
@@ -19125,6 +19173,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 			}
 		}
 		fc := &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star, Variadic: varExp, ReturnType: returnType}
+		bitStringFuncOverload(fc)
 		if err := coerceCommonTypeArgs(fc); err != nil {
 			return nil, err
 		}
@@ -19942,7 +19991,7 @@ func remapColumnRefsToSchema(e Expr, oldSchema Schema, newIndex map[string]int) 
 		for i, a := range x.Args {
 			args[i] = remapColumnRefsToSchema(a, oldSchema, newIndex)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, Operator: x.Operator}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, Operator: x.Operator, SQLName: x.SQLName}
 	case *InExpr:
 		list := make([]Expr, len(x.List))
 		for i, item := range x.List {
@@ -20176,7 +20225,7 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 		for i, a := range x.Args {
 			args[i] = shiftColumnRefsBy(a, delta)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, Operator: x.Operator}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, Operator: x.Operator, SQLName: x.SQLName}
 	case *InExpr:
 		// Mirror walkColumnRefs' InExpr handling so this rewriter stays in
 		// sync with the side-classifier (classifyConjunctSide). A literal-list
@@ -20682,4 +20731,102 @@ func moneyConcatOperand(e Expr) Expr {
 		return e
 	}
 	return &CastExpr{pos: e.Pos(), Operand: e, TargetType: "text", SourceType: "money"}
+}
+
+// isBitStringType reports bit / bit varying (not their arrays).
+func isBitStringType(t catalog.Type) bool {
+	if t.IsArray {
+		return false
+	}
+	switch strings.ToLower(t.Name) {
+	case "bit", "varbit", "bit varying":
+		return true
+	}
+	return false
+}
+
+// bitStringOpCall resolves the bit-string operators (pg_operator.dat over
+// varbit.c) into their functions: & | # → bitand / bitor / bitxor and
+// << >> → bitshiftleft / bitshiftright, all returning bit; || on two bit
+// strings → bitcat, returning bit varying. A plain string literal next to a
+// bit operand is an unknown-type constant and resolves to bit, as PG's
+// operator resolution does. M0149-0001h1a1.
+func bitStringOpCall(pos int, op parser.OpCode, l, r Expr) (*FuncCall, bool) {
+	lt, rt := exprType(l), exprType(r)
+	lb, rb := isBitStringType(lt), isBitStringType(rt)
+	if !lb && !rb {
+		return nil, false
+	}
+	unknownLit := func(e Expr) bool {
+		sc, ok := e.(*StringConst)
+		return ok && !sc.BitString
+	}
+	bothBit := (lb || unknownLit(l)) && (rb || unknownLit(r))
+	if bothBit {
+		// The unknown literal is read by bit_in, so `B'1' | '12'` is 22P02.
+		if !lb {
+			l = &CastExpr{pos: l.Pos(), Operand: l, TargetType: "varbit"}
+		}
+		if !rb {
+			r = &CastExpr{pos: r.Pos(), Operand: r, TargetType: "varbit"}
+		}
+	}
+	call := func(name, ret string, args ...Expr) (*FuncCall, bool) {
+		return &FuncCall{pos: pos, Name: name, Args: args, ReturnType: ret, Operator: op.String()}, true
+	}
+	switch op {
+	case parser.OpBitAnd:
+		if bothBit {
+			return call("bitand", "bit", l, r)
+		}
+	case parser.OpBitOr:
+		if bothBit {
+			return call("bitor", "bit", l, r)
+		}
+	case parser.OpBitXor:
+		if bothBit {
+			return call("bitxor", "bit", l, r)
+		}
+	case parser.OpBitShiftLeft, parser.OpBitShiftRight:
+		if lb && isIntegerLikeType(rt.Name) {
+			if op == parser.OpBitShiftLeft {
+				return call("bitshiftleft", "bit", l, r)
+			}
+			return call("bitshiftright", "bit", l, r)
+		}
+	case parser.OpConcat:
+		if bothBit {
+			return call("bitcat", "varbit", l, r)
+		}
+	}
+	return nil, false
+}
+
+// bitStringFuncOverload resolves the functions overloaded on bytea / text
+// and bit (pg_proc.dat) to their bit variants when the first argument is a
+// bit string: octet_length → bitoctetlength, bit_length → bitlength (the
+// bit count, not 8 × octets), bit_count → bit_bit_count, get_bit →
+// bitgetbit, set_bit → bitsetbit. M0149-0001h1a1.
+func bitStringFuncOverload(fc *FuncCall) {
+	if len(fc.Args) == 0 || !isBitStringType(exprType(fc.Args[0])) || strings.Contains(fc.Name, ".") {
+		return
+	}
+	orig := strings.ToLower(fc.Name)
+	defer func() {
+		if fc.Name != orig {
+			fc.SQLName = orig
+		}
+	}()
+	switch orig {
+	case "octet_length":
+		fc.Name, fc.ReturnType = "bitoctetlength", "int4"
+	case "bit_length":
+		fc.Name, fc.ReturnType = "bitlength", "int4"
+	case "bit_count":
+		fc.Name, fc.ReturnType = "bit_bit_count", "int8"
+	case "get_bit":
+		fc.Name, fc.ReturnType = "bitgetbit", "int4"
+	case "set_bit":
+		fc.Name, fc.ReturnType = "bitsetbit", "bit"
+	}
 }

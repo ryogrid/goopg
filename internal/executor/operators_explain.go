@@ -5633,6 +5633,17 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		if x.Operator != "" && len(x.Args) == 2 {
 			return "(" + formatExprQual(x.Args[0], reg, qualify) + " " + x.Operator + " " + formatExprQual(x.Args[1], reg, qualify) + ")"
 		}
+		if x.Operator != "" && len(x.Args) == 1 {
+			// A prefix operator (~ on a bit string, M0149-0001h1a1).
+			return "(" + x.Operator + " " + formatExprQual(x.Args[0], reg, qualify) + ")"
+		}
+		if x.SQLName != "" {
+			// An overload resolved to its variant (bit_length(bit) →
+			// bitlength) prints under its SQL name. M0149-0001h1a1.
+			y := *x
+			y.Name, y.SQLName = x.SQLName, ""
+			return formatExprQual(&y, reg, qualify)
+		}
 		// Composite field selection's run-time form renders as the SQL it
 		// came from: ruleutils' T_FieldSelect arm parenthesises the operand
 		// (unless it is itself a field selection) and appends the quoted

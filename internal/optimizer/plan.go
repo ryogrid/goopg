@@ -133,6 +133,8 @@ func (*CTIDExpr) exprNode()  {}
 type StringConst struct {
 	pos   int
 	Value string
+	// BitString: a B'...' / X'...' literal, typed bit (M0149-0001h1a1).
+	BitString bool
 }
 
 func (e *StringConst) Pos() int { return e.pos }
@@ -779,6 +781,10 @@ type FuncCall struct {
 	// column is then "?column?" and EXPLAIN renders the infix form, as PG's
 	// OpExpr would. Empty for an ordinary function call. M0149-0001k1.
 	Operator string
+	// SQLName is the function's SQL name when Name is the resolved variant
+	// of an overloaded builtin (bit_length(bit) → bitlength): the column
+	// label and EXPLAIN print it, as PG prints proname. M0149-0001h1a1.
+	SQLName string
 	// ArgWidth is the resolved overload width for width-sensitive builtins
 	// such as to_hex; empty means default int4.
 	ArgWidth string
