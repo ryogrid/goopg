@@ -746,6 +746,17 @@ Key observation: PG compatibility constrains only the **displayed** and
   owner, nspacl and description. pg\_toast had been hidden since the era
   when its OID collided with public's.
 
+## Follow\-up: M0149\-0001g slice 25 — measured catalog sizes in pg\_class \(2026\-11\-16\)
+
+- `stampPgClassRelStats` runs after every catalog file is written and
+  before template0 is cloned. It patches relpages, reltuples, relallvisible
+  and relallfrozen in each pg\_class tuple from the relation's actual file.
+- The numbers describe goopg's own files, not PG's. The two heap layouts
+  differ, so copying PG initdb's values would misstate sizes to a PG node's
+  estimate\_rel\_size.
+- goopg's own planner is unaffected: it reads catalog sizes from the VM and
+  its private stats sidecar, never from pg\_class.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

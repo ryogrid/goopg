@@ -1539,6 +1539,11 @@ func Init(opts Options) error {
 	}
 	// M0106: generate PG-compatible relcache init files so PG backends
 	// can start from a goopg backup without PANIC on critical indexes.
+	// M0149-0001g slice 25: relpages / reltuples / relallvisible measured from
+	// the catalog files just written (PG's initdb ends with VACUUM FREEZE).
+	if err := stampPgClassRelStats(abs); err != nil {
+		return fmt.Errorf("goopg init: %w", err)
+	}
 	if err := bootstrapRelcacheInitFiles(abs); err != nil {
 		return fmt.Errorf("goopg init: relcache init files: %w", err)
 	}

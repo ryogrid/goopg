@@ -12399,6 +12399,31 @@ verify each at HEAD when the task starts.
       regress A/B on 7 cases \(no movement; alter\_generic 208–210 is its
       known flake\), spotcheck, sf025 99, acceptance.
     Movement: none — catalog conformance \(regress A/B unchanged\)
+  - 2026-11-16 slice 25: bootstrapped pg\_class rows carry relpages / reltuples / relallvisible measured from goopg's own catalog files.
+    - PG's initdb ends with VACUUM FREEZE, so its catalogs have real sizes;
+      goopg wrote 0 everywhere.
+    - goopg's heap packing differs from PG's: 79 of 219 relations have a
+      different block count. So the stats are measured, not copied.
+    - stampPgClassRelStats \(internal/initdb/pg\_class\_relstats.go\) patches
+      base/\{1,5\}/1259 in place, before template0 is cloned:
+      - heaps: relpages = blocks, reltuples = live line pointers,
+        relallvisible = PD\_ALL\_VISIBLE pages \(0, since goopg writes no VM\);
+      - btrees: leaf items without high keys;
+      - views: reltuples \-1.
+    - PG cold start:
+      - relpages equals pg\_relation\_size/8192 for every catalog \(0
+        mismatches\);
+      - pg\_proc reports 105 pages / 3412 tuples, and its plans use them.
+    - goopg restarts clean twice.
+    - Still open \(ledgered\):
+      - PG's initdb ANALYZE leaves 412 pg\_statistic rows for 38 catalogs;
+        goopg has none;
+      - relcache init files still carry 0;
+      - no visibility map, so relallvisible is 0;
+      - goopg's own SQL pg\_class reports 0 for catalogs.
+    - Gates: units, postmaster, testport interop set, regress A/B on 4 cases
+      \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none
