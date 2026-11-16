@@ -1159,6 +1159,16 @@ func normalizeColumnConst(l, r Expr) (*ColumnRef, Expr, bool) {
 			return cr, ic, true
 		}
 	}
+	if cr, ok := l.(*ColumnRef); ok {
+		if nc, isName := nameCastLiteral(r); isName {
+			return cr, nc, true
+		}
+	}
+	if cr, ok := r.(*ColumnRef); ok {
+		if nc, isName := nameCastLiteral(l); isName {
+			return cr, nc, true
+		}
+	}
 	return nil, nil, false
 }
 
@@ -1192,6 +1202,31 @@ func integerCastLiteral(e Expr) (*IntegerConst, bool) {
 	return &IntegerConst{pos: ic.pos, Value: v, Wide: wide}, true
 }
 
+// nameCastLiteral reads a string literal cast to name — the CastExpr the
+// resolver wraps around the non-name side of a comparison with a name column
+// (planner.go, M0097-0003), or an explicit 'x'::name — as the name Const
+// eval_const_expressions folds it to: namein truncates to NAMEDATALEN-1 = 63
+// bytes. Without it `relname = 'x'`-shaped quals missed the column's MCVs and
+// histogram and were priced as column = expression (1/ndistinct).
+// M0149-0001j.
+func nameCastLiteral(e Expr) (*StringConst, bool) {
+	c, ok := e.(*CastExpr)
+	if !ok || c.Typmod != 0 || !strings.EqualFold(c.TargetType, "name") {
+		return nil, false
+	}
+	sc, ok := c.Operand.(*StringConst)
+	if !ok {
+		return nil, false
+	}
+	v := sc.Value
+	if len(v) > 63 {
+		v = v[:63]
+	}
+	out := *sc
+	out.Value = v
+	return &out, true
+}
+
 // normalizeColumnConstRange is the same shape recogniser as
 // normalizeColumnConst, but it also reports whether the column
 // was on the right (so callers can flip the operator).
@@ -1210,6 +1245,16 @@ func normalizeColumnConstRange(l, r Expr) (*ColumnRef, Expr, bool, bool) {
 	if cr, ok := r.(*ColumnRef); ok {
 		if ic, isInt := integerCastLiteral(l); isInt {
 			return cr, ic, true, true
+		}
+	}
+	if cr, ok := l.(*ColumnRef); ok {
+		if nc, isName := nameCastLiteral(r); isName {
+			return cr, nc, false, true
+		}
+	}
+	if cr, ok := r.(*ColumnRef); ok {
+		if nc, isName := nameCastLiteral(l); isName {
+			return cr, nc, true, true
 		}
 	}
 	return nil, nil, false, false

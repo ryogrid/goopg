@@ -442,3 +442,7 @@ the two layouts legitimately differ.
   64\-byte NameData at typalign 'c', so name stavalues and user name\[\]
   columns are both readable on a PG node. Blobs written before this change
   \(elemtype 25\) still decode through the text path.
+- Slice 4 \(planner\): goopg's selectivity code now reads a name
+  literal, the resolver's CastExpr\{StringConst → name\}, as the folded
+  name Const PG uses. Before this, goopg's own estimates ignored the name
+  statistics it writes.

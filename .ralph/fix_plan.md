@@ -11907,6 +11907,32 @@ verify each at HEAD when the task starts.
     - Gates: units, postmaster, testport interop set, spotcheck, sf025 99
       \(PLAN\-SHAPE same\), acceptance.
     Movement: none — C3 interop fix \(regress A/B unchanged; goopg restart round\-trip identical\)
+  - 2026-11-16 fourth slice: goopg's planner reads name statistics.
+    - Cause: the resolver wraps a literal compared with a name column in
+      CastExpr\{StringConst → name\} \(planner.go, M0097\-0003\).
+      normalizeColumnConst did not see that as a constant, so `c = 'hot'`
+      was priced as column = expression \(1/ndistinct: rows=119 where PG
+      says 500\).
+    - Fix: optimizer nameCastLiteral folds that cast \(implicit or
+      explicit, no typmod\) to the name Const eval\_const\_expressions
+      produces, truncated to 63 bytes as namein does. Both shape
+      recognisers use it: normalizeColumnConst and
+      normalizeColumnConstRange.
+    - Probe vs PG 18.3 \(tmp/catidx/s40\):
+      - `c = 'hot'`: 500 = 500; `'hot' = c`: 500 = 500;
+      - `c <> 'hot'`: 2000 = 2000; `c < 'nm1'`: 600 = 600;
+      - on a 3000\-row unique\-ish column: `c < 'k2'`: 1139 = 1139,
+        `c = 'k5'`: 1 = 1.
+      - Still off: `c = 'zzz'` \(a value outside an MCV list that covers
+        every distinct value\) gives 12 where PG gives 1. Text columns do
+        the same; it is the generic fallback in eqSelectivityForColumn
+        \(ledgered\).
+    - TestNameCastLiteralReadsStatistics pins the fold, the truncation and
+      the MCV hit.
+    - Gates: units, fire\-set \(fires=none on all corpora\), spotcheck,
+      sf025 99 \(PLAN\-SHAPE same\), acceptance. Regress A/B over 9 cases
+      unchanged \(join 2837→2836, a known flake\).
+    Movement: none — estimate fix on name columns \(TPC\-H/TPC\-DS plans unchanged: fire\-set fires=none\)
 - [ ] **M0149-0001i — regnamespace has no name-resolution seam: `'public'::regnamespace::oid` errors, `99::regnamespace` prints 99** \(filed 2026-11-16 by M0149-0001g slice 24; correctness, below the item-10 rank\)
   Kind: impl
   Parent: none
