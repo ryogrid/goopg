@@ -1512,6 +1512,11 @@ func Init(opts Options) error {
 	if err := bootstrapMappedLocalCatalogHeaps(abs); err != nil {
 		return fmt.Errorf("goopg init: mapped local catalog heaps: %w", err)
 	}
+	// M0149-0001g slice 19: built-in object descriptions (after the empty
+	// placeholder heaps above, which would otherwise overwrite 2609).
+	if err := bootstrapPgDescription(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_description: %w", err)
+	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
 	}

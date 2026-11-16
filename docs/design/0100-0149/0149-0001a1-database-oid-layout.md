@@ -688,6 +688,16 @@ Key observation: PG compatibility constrains only the **displayed** and
   - the captured rowtype where one exists;
   - 0 for indexes.
 
+## Follow\-up: M0149\-0001g slice 19 — built\-in object descriptions \(2026\-11\-16\)
+
+- pg\_description and pg\_shdescription carry PG initdb's descriptions of
+  built\-in objects, from `pg_description_generated.go`.
+  `scripts/gen-pg-description.py` regenerates it.
+- Only objects with fixed pg\_\*.dat OIDs in catalogs goopg bootstraps are
+  included.
+- Descriptions of initdb\-assigned objects \(locale collations, text\-search
+  objects, plpgsql\) wait for those catalogs.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

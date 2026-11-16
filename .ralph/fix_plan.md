@@ -12237,6 +12237,26 @@ verify each at HEAD when the task starts.
     - Gates: units, initdb, postmaster, testport interop set, regress A/B on
       7 cases \(no movement\), spotcheck, sf025 99, acceptance.
     Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 19: built-in object descriptions in pg\_description / pg\_shdescription.
+    - Before: both heaps were empty placeholders. On a PG node,
+      obj\_description\(\) and the Description column of psql \\df\+, \\do\+
+      and \\l\+ came back empty.
+    - Source: scripts/gen\-pg\-description.py captures them from a throwaway
+      initdb into pg\_description\_generated.go:
+      - 4451 pg\_description rows for objects with fixed pg\_\*.dat OIDs in
+        catalogs goopg bootstraps \(pg\_proc, pg\_operator, pg\_conversion,
+        pg\_type, pg\_am, pg\_collation, pg\_namespace, pg\_language\);
+      - the 3 pg\_shdescription rows.
+    - bootstrapPgDescription writes the heaps \(base/\{1,5\}/2609 and
+      global/2396\) and bulk\-builds indexes 2675 and 2397. It runs after
+      the empty\-placeholder writer.
+    - PG cold start: obj\_description\(now\) and shobj\_description\(5\) work,
+      \\df\+, \\do\+ and \\l\+ show descriptions, lookups go through
+      pg\_description\_o\_c\_o\_index, and COMMENT ON TABLE still works next
+      to the bootstrap rows.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      6 cases \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none
