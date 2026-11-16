@@ -3184,6 +3184,33 @@ func pgProcRow(e pgProcEntry) executor.Row {
 	if e.SqlBody != "" {
 		sqlBody = executor.NewStringDatum(nailedProcSqlBody(e.SqlBody))
 	}
+	lang := int64(12) // INTERNALlanguageId
+	if e.Lang != 0 {
+		lang = int64(e.Lang)
+	}
+	prosrc := e.HandlerName
+	// M0149-0001g slice 16: functions initdb's system_functions.sql re-creates
+	// carry the state it leaves — argument defaults and names, a prosqlbody
+	// node tree with prosrc empty for SQL-standard bodies, and the declared
+	// cost/strictness/volatility/parallel/language (pgProcInitdbOverrides).
+	if ov, ok := pgProcInitdbOverrides[e.OID]; ok {
+		prosrc, lang = ov.Src, int64(ov.Lang)
+		cost, rows, strict, vol, parallel = ov.Cost, ov.Rows, ov.Strict, ov.Volatile, ov.Parallel
+		sqlBody = executor.NullDatum
+		// pglzVarlenaDatum: a node tree over the TOAST threshold is stored as
+		// PG's inline pglz-compressed varlena, as toast_compress_datum would
+		// (ts_debug's prosqlbody is 19 KB raw).
+		if ov.SqlBody != "" {
+			sqlBody = pglzVarlenaDatum(ov.SqlBody)
+		}
+		nargDefaults, argDefaultsDatum = ov.NArgDefaults, executor.NullDatum
+		if ov.ArgDefaults != "" {
+			argDefaultsDatum = pglzVarlenaDatum(ov.ArgDefaults)
+		}
+		if ov.ArgNames != nil {
+			argNames = executor.NewBytesDatum(textArrayBytes(ov.ArgNames))
+		}
+	}
 	return executor.Row{
 		executor.NewIntDatum(int64(e.OID)), // 1  oid
 		executor.NewStringDatum(e.Name),    // 2  proname
@@ -3194,12 +3221,7 @@ func pgProcRow(e pgProcEntry) executor.Row {
 			return 11
 		}()),
 		executor.NewIntDatum(10), // 4  proowner = BOOTSTRAP_SUPERUSERID
-		executor.NewIntDatum(func() int64 { // 5  prolang
-			if e.Lang != 0 {
-				return int64(e.Lang)
-			}
-			return 12 // INTERNALlanguageId
-		}()),
+		executor.NewIntDatum(lang), // 5  prolang
 		executor.NewIntDatum(cost),              // 6  procost (float4)
 		executor.NewIntDatum(rows),              // 7  prorows (float4)
 		executor.NewIntDatum(int64(variadic)),   // 8  provariadic
@@ -3220,7 +3242,7 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		argNames,                               // 23 proargnames
 		argDefaultsDatum,                       // 24 proargdefaults (pg_node_tree)
 		executor.NullDatum,                     // 25 protrftypes
-		executor.NewStringDatum(e.HandlerName), // 26 prosrc — fmgr internal lookup key
+		executor.NewStringDatum(prosrc),        // 26 prosrc — fmgr lookup key, or the initdb SQL text (empty for prosqlbody)
 		probin,                                 // 27 probin
 		sqlBody,                                // 28 prosqlbody (NULL ⇒ PG executes prosrc)
 		executor.NullDatum,                     // 29 proconfig (NULL ⇒ no fmgr_security_definer)

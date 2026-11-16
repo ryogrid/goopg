@@ -72,6 +72,18 @@ func TestPgProcSeedLeavesAbsentVarlenaAttrsNull(t *testing.T) {
 					"aborts a hosted PG (M0131-S13)", e.OID, e.Name, nullable[idx])
 			}
 		}
+		// M0149-0001g slice 16: system_functions.sql re-creates some
+		// built-ins with a SQL-standard body and argument names
+		// (pgProcInitdbOverrides); those carry PG initdb's real values.
+		if ov, ok := pgProcInitdbOverrides[e.OID]; ok {
+			if (ov.SqlBody != "") == row[27].IsNull() {
+				t.Fatalf("oid=%d (%s): prosqlbody NULL=%v, initdb override body set=%v", e.OID, e.Name, row[27].IsNull(), ov.SqlBody != "")
+			}
+			if (ov.ArgNames != nil || e.ArgNames != nil) == row[22].IsNull() {
+				t.Fatalf("oid=%d (%s): proargnames NULL=%v disagrees with the seed/initdb override", e.OID, e.Name, row[22].IsNull())
+			}
+			continue
+		}
 		if e.SqlBody == "" && !row[27].IsNull() {
 			t.Fatalf("oid=%d (%s): prosqlbody is NOT NULL without a SqlBody name — "+
 				"an empty varlena shell here aborts a hosted PG (M0131-S13)", e.OID, e.Name)

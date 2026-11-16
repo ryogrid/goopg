@@ -12161,6 +12161,28 @@ verify each at HEAD when the task starts.
     - Gates: units, initdb, postmaster, testport interop set, regress A/B on
       7 cases \(no movement\), spotcheck, sf025 99, acceptance.
     Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 16: pg\_proc rows re\-created by system\_functions.sql equal a PG initdb — all 3408 built\-in rows identical.
+    - scripts/gen\-pg\-proc\-initdb\-overrides.py runs a throwaway initdb and
+      captures each built\-in's post\-initdb row. It emits only the 122 rows
+      that differ from postgres.bki, into pg\_proc\_initdb\_overrides\_generated.go.
+      Each row carries:
+      - prosrc, and prosqlbody as nodeToString;
+      - pronargdefaults and proargdefaults;
+      - proargnames;
+      - cost, rows, strictness, volatility, parallel and language.
+    - pgProcRow applies them after slice 15's pg\_proc.dat overlay.
+    - Node trees over the TOAST threshold are stored inline pglz\-compressed,
+      via pglzVarlenaDatum. ts\_debug's 19 KB prosqlbody becomes 3.6 KB inline,
+      where PG would store it out of line.
+    - PG cold start:
+      - 3408 of 3408 built\-in pg\_proc rows are identical to a PG initdb;
+      - pg\_relation\_size, obj\_description, make\_interval\(days =\> 2\) and
+        jsonb\_set\_lax with defaulted arguments all work;
+      - psql \\do\+ now fails one step later, on the known name\-column
+        attcollation residual \("could not determine which collation"\).
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      7 cases \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

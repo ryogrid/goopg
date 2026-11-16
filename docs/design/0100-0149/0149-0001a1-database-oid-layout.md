@@ -657,6 +657,16 @@ Key observation: PG compatibility constrains only the **displayed** and
 - Only the PG\-visible heap row changes. goopg's reload never reads built\-in
   pg\_proc rows back.
 
+## Follow\-up: M0149\-0001g slice 16 — initdb's system\_functions.sql state for pg\_proc \(2026\-11\-16\)
+
+- Built\-ins that initdb re\-creates after bootstrap take their final state
+  from `pg_proc_initdb_overrides_generated.go`. That covers SQL\-standard
+  bodies, argument defaults and names, and declared attributes.
+- `scripts/gen-pg-proc-initdb-overrides.py` regenerates the file from a
+  throwaway PG 18.3 initdb and keeps only the rows that differ from
+  `postgres.bki`.
+- Large node trees use PG's inline pglz form.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the
