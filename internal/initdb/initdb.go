@@ -208,7 +208,8 @@ const goopgFeaturesFile = "global/pg_goopg_features"
 func defaultGoopgFeatures() []byte {
 	return []byte(catalog.NullKeyedIndexEntriesFeature + "\n" + storage.HeapLinePointerLifecycleFeature + "\n" +
 		storage.VMWALLoggedFeature + "\n" + clogCompleteHistoryFeature + "\n" +
-		PostgresCatalogsAtBase5Feature + "\n" + Template1AtBase1Feature + "\n")
+		PostgresCatalogsAtBase5Feature + "\n" + Template1AtBase1Feature + "\n" +
+		catalog.FixedLengthGeoTidFeature + "\n")
 }
 
 // clogCompleteHistoryFeature says this binary's initdb created the cluster:

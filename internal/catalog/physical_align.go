@@ -31,6 +31,15 @@ func PhysicalTypeAlign(t Type, tname string) int {
 	if doubleAlignedVarlena[tname] {
 		return 8
 	}
+	// point/lseg/box/line/circle are typalign 'd' and tid 's' once stored in
+	// PG's fixed-length form; a cluster without the capability keeps the
+	// varlena 'i' default below. M0149-0001k.
+	if isFixedGeoTidName(tname) && FixedLengthGeoTid() {
+		if tname == "tid" {
+			return 2
+		}
+		return 8
+	}
 	switch tname {
 	case "bool", "boolean":
 		return 1
@@ -131,6 +140,10 @@ func PhysicalTypeIsVarlena(t Type) bool {
 		"float8", "double precision", "double",
 		"xid", "xid8":
 		return false
+	case "point", "lseg", "box", "line", "circle", "tid":
+		// Fixed-length only in a cluster with the fixed_length_geometric_tid
+		// capability (fixed_length_geo_tid.go). M0149-0001k.
+		return !FixedLengthGeoTid()
 	default:
 		return true
 	}

@@ -31,6 +31,7 @@ import (
 	"io"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/goopg/goopg/internal/access/common/pglz"
@@ -39,6 +40,7 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/utils/adt/array"
 	"github.com/goopg/goopg/internal/utils/adt/datetime"
+	"github.com/goopg/goopg/internal/utils/adt/fixedgeo"
 )
 
 // pgoutput message kinds. Mirror upstream's
@@ -623,6 +625,18 @@ func pgoDecodePhysicalValue(t catalog.Type, data []byte, regOut func(string, uin
 			return nil, 0, err
 		}
 		return []byte(s), n, nil
+	}
+	// Sibling of the executor heap codec's fixed-length geometric / tid arm:
+	// in a fixed_length_geometric_tid cluster these are PG's struct images,
+	// rendered back to the same canonical text. M0149-0001k.
+	if catalog.FixedLengthGeoTid() {
+		if _, _, ok := fixedgeo.Width(strings.ToLower(t.Name)); ok {
+			txt, n, err := fixedgeo.Decode(strings.ToLower(t.Name), data)
+			if err != nil {
+				return nil, 0, err
+			}
+			return []byte(txt), n, nil
+		}
 	}
 	// External on-disk TOAST pointer: logical replication of toasted values is
 	// not supported in v0 — fail loudly rather than emit a garbled value.

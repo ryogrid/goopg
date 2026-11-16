@@ -13,6 +13,7 @@ import (
 	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/utils/adt/array"
+	"github.com/goopg/goopg/internal/utils/adt/fixedgeo"
 	"github.com/goopg/goopg/internal/utils/adt/datetime"
 	"github.com/goopg/goopg/internal/access/common/pglz"
 	"github.com/goopg/goopg/internal/nodes"
@@ -1131,6 +1132,19 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 			return nil, ee
 		}
 		return varlenaTextBytes(s), nil
+	case "point", "lseg", "box", "line", "circle", "tid":
+		// PG's fixed-length struct images (fixedgeo) in a cluster with the
+		// fixed_length_geometric_tid capability; otherwise the varlena text of
+		// the default arm below. The Datum stays the canonical text either way.
+		// M0149-0001k.
+		s, err := coerceTextLikeDatum(t, d)
+		if err != nil {
+			return nil, err
+		}
+		if catalog.FixedLengthGeoTid() {
+			return fixedgeo.Encode(strings.ToLower(t.Name), s)
+		}
+		return varlenaTextBytes(s), nil
 	default:
 		// text, varchar, char, bpchar, unknown, numeric, etc.
 		// Use PG varlena format (LE): 1-byte header for short values,
@@ -2193,6 +2207,22 @@ func decodePhysicalPGValueLowered(t *catalog.Type, tname string, data []byte, sc
 			elem = "oid"
 		}
 		return decodeArrayValuePGStyled(catalog.Type{Name: elem, IsArray: true}, data, st)
+	case "point", "lseg", "box", "line", "circle", "tid":
+		// Sibling of encodeValuePG's arm: the fixed-length image rendered
+		// back to the canonical text, in a capable cluster; otherwise the
+		// varlena text of the default arm. M0149-0001k.
+		if catalog.FixedLengthGeoTid() {
+			txt, n, err := fixedgeo.Decode(tname, data)
+			if err != nil {
+				return Datum{}, 0, err
+			}
+			if sctx != nil {
+				moff, mlen := sctx.AllocBytes([]byte(txt))
+				return newStringArenaDatum(sctx, moff, mlen), n, nil
+			}
+			return NewStringDatum(txt), n, nil
+		}
+		fallthrough
 	default:
 		// Unknown type (e.g. "point", "path", custom types).  goopg's
 		// encodeValuePG stores them as PG varlena text (the default branch

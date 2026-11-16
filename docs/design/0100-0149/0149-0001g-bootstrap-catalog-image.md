@@ -452,3 +452,19 @@ the two layouts legitimately differ.
   the legacy blob, which a PG node reads as no statistics rather than wrong
   ones. time / timetz statistics are rendered by time\_out / timetz\_out
   \(statValueText\), shared by ANALYZE, stats import and the endpoint probe.
+
+## Follow\-up: M0149\-0001k — fixed\-length geometric and tid storage \(2026\-11\-16\)
+
+- PG stores point, lseg, box, line, circle and tid as fixed\-length
+  structs \(typlen 16/32/32/24/24/6\). goopg stored their text as a
+  varlena, so a PG node read garbage and shifted every later column.
+- A heap value carries no format marker, so the switch is per cluster.
+  The `fixed\_length\_geometric\_tid` capability in
+  global/pg\_goopg\_features is written by initdb and read at open.
+  Older clusters keep the varlena format unchanged.
+- internal/utils/adt/fixedgeo is the one encoder and renderer. It is
+  shared by the executor heap codec and the pgoutput decoder, and is
+  consulted through catalog PhysicalTypeIsVarlena / PhysicalTypeAlign.
+  goopg's in\-memory Datum stays the canonical output text.
+- Open: money \(needs a real int64 type first\), aclitem, array elements
+  of these types, and their COPY BINARY send format \(M0149\-0001k1…k4\).

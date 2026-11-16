@@ -11808,6 +11808,88 @@ verify each at HEAD when the task starts.
     carve\-out unless placed\).
   > \#\# ESCALATION 2026\-11\-16 \(S2\) — M0149\-0001k: a PG node misreads goopg\-written money/point/box/tid/… columns and every column after them
   > Filed under M0149\-0001g. Wrong results in the C3 PG\-on\-goopg\-data setting; goopg itself reads its data correctly. The fix is a heap\-codec format change that needs an owner decision on existing data. Owner placement requested.
+  - 2026-11-16 first slice: point / lseg / box / line / circle / tid are stored in PG's fixed\-length form, behind a cluster capability.
+    - The data\-compat question is avoided rather than decided:
+      - initdb lists `fixed\_length\_geometric\_tid` in
+        global/pg\_goopg\_features, and open sets
+        catalog.FixedLengthGeoTid from it;
+      - this is the null\_keyed\_index\_entries pattern: older clusters
+        keep reading and writing varlena, so no stored value changes
+        meaning.
+    - New leaf package internal/utils/adt/fixedgeo: Width / Encode /
+      Decode over PG's structs \(Point, LSEG, BOX high\-then\-low, LINE,
+      CIRCLE, ItemPointerData bi\_hi/bi\_lo/ip\_posid\). Rendering uses
+      catalog.PGFloatOut, so a decoded value equals goopg's canonical text.
+    - Consumers:
+      - catalog PhysicalTypeIsVarlena / PhysicalTypeAlign \('d', or 's'
+        for tid\);
+      - executor encodeValuePG / decodePhysicalPGValueLowered \(the decode
+        arm falls through to the varlena default when the flag is off\);
+      - the pgoutput decoder.
+      The Datum stays the canonical text.
+    - Probe \(tmp/catidx/s42\):
+      - goopg round\-trips the rows and is identical across two restarts;
+      - a PG 18.3 cold start reads every value and the column after them
+        \(99, not 340322\), at PG's sizes \(16 / 32 / 6\);
+      - PG\-inserted rows read back on goopg;
+      - a cluster with the feature line removed keeps the varlena format.
+    - Tests:
+      - fixedgeo TestRoundTrip / TestPGLayout;
+      - catalog TestFixedLengthGeoTidMatchesPostgresBKI \(typlen/typalign
+        from postgres.bki, flag on and off\);
+      - executor TestFixedLengthGeoTidHeapImage \(36\-byte PG row\);
+      - xlog TestEncodePgoTuplePhysicalFixedGeoTid;
+      - TestGoopgFeaturesMarker now lists 7 features.
+    - Gates: units, postmaster, testport interop set, spotcheck, sf025 99,
+      acceptance. Rule \#5 regress A/B over 31 cases \(all geometric / tid
+      cases, create\_index, copy, arrays, alter\_table, type\_sanity,
+      opr\_sanity, …\): every count identical.
+    - Still open: money and aclitem \(children below\); the
+      knownAlignGaps entries stay for the flag\-off format.
+    Movement: none — C3 interop fix \(regress A/B 31 cases unchanged\)
+- [ ] **M0149-0001k1 — money is not a real type: no fixed 8\-byte int64 cash image, cash\_in / cash\_out, arithmetic or ordering** \(filed 2026-11-16 by M0149-0001k\)
+  Kind: impl
+  Parent: M0149-0001k
+  - Repro on goopg: `create table m(v money)`, insert '12.34', '\-0.5', '1000000'.
+    - `ORDER BY v` returns \-0.5, 1000000, 12.34: it compares text.
+    - Output is `12.34`; PG prints `$12.34`.
+    - `sum\(v\)` errors; `create index on m\(v\)` errors.
+  - PG: cash.c. Cash is an int64 in the currency's minor units, typlen 8,
+    typbyval, typalign 'd'. cash\_in / cash\_out follow lc\_monetary.
+  - Depends on M0134\-0143 \(money.sql, PARKED as a from\-scratch type\).
+    The fixed image needs the int64 Datum first.
+  - First step: a KindInt\-backed money Datum with cash\_in / cash\_out
+    under lc\_monetary=C. Then put the 8\-byte image behind its own
+    capability, as fixedgeo did.
+- [ ] **M0149-0001k2 — aclitem column values are stored as varlena text, not PG's 16\-byte AclItem** \(filed 2026-11-16 by M0149-0001k\)
+  Kind: impl
+  Parent: M0149-0001k
+  - PG: AclItem \{Oid ai\_grantee; Oid ai\_grantor; AclMode ai\_privs \(uint64\)\},
+    typlen 16, typalign 'd' \(utils/acl.h\). Output needs role\-name
+    resolution \(aclitemout\).
+  - goopg stores a user aclitem column as text; catalog aclitem\[\] arrays
+    are already PG\-format \(initdbACLDatum\).
+  - First step: reuse the catalog aclitem\[\] element encoder for the
+    scalar, behind a capability; decode through the role\-name renderer.
+- [ ] **M0149-0001k3 — arrays of point / lseg / box / line / circle / tid still hold text elements \(elemtype 25\)** \(filed 2026-11-16 by M0149-0001k\)
+  Kind: impl
+  Parent: M0149-0001k
+  - goopg's ArrayType for `point\[\]` says elemtype 25, while
+    pg\_attribute.atttypid says \_point \(1017\). PG would deform the
+    elements wrongly.
+  - First step: utils/adt/array ElemTypeInfo arms \(sizes / aligns from
+    fixedgeo.Width\) plus encode / decode arms calling fixedgeo, gated on
+    catalog.FixedLengthGeoTid. Legacy elemtype\-25 blobs keep decoding on
+    the text path.
+- [ ] **M0149-0001k4 — COPY BINARY sends point / lseg / box / line / circle / tid as text, not their send format** \(filed 2026-11-16 by M0149-0001k\)
+  Kind: impl
+  Parent: M0149-0001k
+  - Repro: `copy \(select p, t from ti\) to stdout with \(format binary\)`
+    writes the text `\(1,1\)` as the field body.
+  - PG point\_send writes two big\-endian float8. tidsend writes a
+    big\-endian uint32 block, then a uint16 offset. lseg, box, line and
+    circle work the same way \(geo\_ops.c, tid.c\).
+  - First step: executor copy\_binary.go send / recv arms for the six types.
 - [ ] **M0149-0001j — goopg-written pg\_statistic stavalues are unreadable on a PG node: 0-dimensional, text-typed arrays** \(filed 2026-11-16 by M0149-0001g; C3 interop, estimates only, below the item-10 rank\)
   Kind: impl
   Parent: M0149-0001g
