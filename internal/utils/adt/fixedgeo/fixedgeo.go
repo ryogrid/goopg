@@ -148,3 +148,78 @@ func Decode(lower string, data []byte) (string, int, error) {
 	}
 	return s, size, nil
 }
+
+// Send is the type's binary send function (point_send / lseg_send /
+// box_send / line_send / circle_send / tidsend): the struct fields in their
+// storage order, big-endian — float8 fields as pq_sendfloat8, tid as a
+// uint32 block number then a uint16 offset. M0149-0001k4.
+func Send(lower, text string) ([]byte, error) {
+	img, err := Encode(lower, text)
+	if err != nil {
+		return nil, err
+	}
+	if lower == "tid" {
+		block := uint32(binary.LittleEndian.Uint16(img[0:2]))<<16 | uint32(binary.LittleEndian.Uint16(img[2:4]))
+		out := make([]byte, 6)
+		binary.BigEndian.PutUint32(out[0:4], block)
+		binary.BigEndian.PutUint16(out[4:6], binary.LittleEndian.Uint16(img[4:6]))
+		return out, nil
+	}
+	out := make([]byte, len(img))
+	for i := 0; i+8 <= len(img); i += 8 {
+		binary.BigEndian.PutUint64(out[i:], binary.LittleEndian.Uint64(img[i:]))
+	}
+	return out, nil
+}
+
+// RecvError is a binary-input value the recv function rejects (22P02 in PG:
+// circle_recv's negative radius, line_recv's A = B = 0).
+type RecvError struct{ Msg string }
+
+func (e *RecvError) Error() string { return e.Msg }
+
+// Recv is the type's binary receive function, returning the canonical text:
+// box_recv swaps corners so high ≥ low, circle_recv rejects a negative
+// radius and line_recv rejects A = B = 0, as geo_ops.c does.
+func Recv(lower string, payload []byte) (string, error) {
+	size, _, ok := Width(lower)
+	if !ok {
+		return "", fmt.Errorf("fixedgeo: unsupported type %q", lower)
+	}
+	if lower == "tid" {
+		if len(payload) != 6 {
+			return "", fmt.Errorf("tid: expected 6 bytes, got %d", len(payload))
+		}
+		return fmt.Sprintf("(%d,%d)", binary.BigEndian.Uint32(payload[0:4]), binary.BigEndian.Uint16(payload[4:6])), nil
+	}
+	if len(payload) != size {
+		return "", fmt.Errorf("%s: expected %d bytes, got %d", lower, size, len(payload))
+	}
+	f := make([]float64, size/8)
+	for i := range f {
+		f[i] = math.Float64frombits(binary.BigEndian.Uint64(payload[8*i:]))
+	}
+	switch lower {
+	case "box":
+		if f[0] < f[2] {
+			f[0], f[2] = f[2], f[0]
+		}
+		if f[1] < f[3] {
+			f[1], f[3] = f[3], f[1]
+		}
+	case "circle":
+		if f[2] < 0 {
+			return "", &RecvError{`invalid radius in external "circle" value`}
+		}
+	case "line":
+		if f[0] == 0 && f[1] == 0 {
+			return "", &RecvError{"invalid line specification: A and B cannot both be zero"}
+		}
+	}
+	img := make([]byte, size)
+	for i, v := range f {
+		binary.LittleEndian.PutUint64(img[8*i:], math.Float64bits(v))
+	}
+	s, _, err := Decode(lower, img)
+	return s, err
+}

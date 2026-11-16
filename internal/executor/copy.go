@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -970,6 +971,25 @@ func RunCopyFromFile(ctx *Context, plan *optimizer.Copy) (int64, error) {
 	fe, err := newCopyFromExecutor(ctx, plan)
 	if err != nil {
 		return 0, err
+	}
+
+	// FORMAT binary: the file is a PGCOPY stream, fed through the same binary
+	// reader COPY FROM STDIN uses. Before this the file was split into text
+	// lines, so a binary file failed on its "PGCOPY" signature as a column
+	// value. M0149-0001k4.
+	if fe.IsBinary() {
+		data, rerr := io.ReadAll(f)
+		if rerr != nil {
+			return 0, &ExecError{Code: "58030", Pos: plan.Pos(),
+				Message: fmt.Sprintf("error reading COPY file: %v", rerr)}
+		}
+		if _, err := fe.PushBinaryData(data); err != nil {
+			return fe.rowsIn, err
+		}
+		if err := fe.Finish(); err != nil {
+			return fe.rowsIn, err
+		}
+		return fe.rowsIn, nil
 	}
 
 	scanner := bufio.NewScanner(f)

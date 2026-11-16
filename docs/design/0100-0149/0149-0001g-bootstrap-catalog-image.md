@@ -483,3 +483,6 @@ the two layouts legitimately differ.
 - M0149\-0001k3 \(arrays\): elements of the fixedgeo types use the same
   fixed images. box\[\] splits and joins on its typdelim `;`, and the
   bootstrap pg\_type now carries typdelim `;` for box and \_box.
+- M0149\-0001k4 \(COPY BINARY\): fixedgeo Send / Recv produce the types'
+  send formats, byte\-identical to PG's COPY output, and money uses
+  cash\_send. Server\-side COPY FROM a file now honours FORMAT binary.

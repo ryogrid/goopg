@@ -50,3 +50,39 @@ func TestPGLayout(t *testing.T) {
 		t.Error("point with three coordinates must fail")
 	}
 }
+
+// TestSendRecv pins the binary COPY formats: point_send is two big-endian
+// float8, tidsend a big-endian uint32 block then uint16 offset; Recv
+// inverts Send, reorders box corners and rejects a negative circle radius.
+func TestSendRecv(t *testing.T) {
+	b, _ := Send("point", "(1.5,2)")
+	if math.Float64frombits(binary.BigEndian.Uint64(b[0:])) != 1.5 || math.Float64frombits(binary.BigEndian.Uint64(b[8:])) != 2 {
+		t.Errorf("point_send: % x", b)
+	}
+	b, _ = Send("tid", "(65537,7)")
+	if binary.BigEndian.Uint32(b[0:]) != 65537 || binary.BigEndian.Uint16(b[4:]) != 7 || len(b) != 6 {
+		t.Errorf("tidsend: % x", b)
+	}
+	for _, tc := range []struct{ typ, text string }{
+		{"point", "(1.5,2)"}, {"lseg", "[(0,0),(1,1)]"}, {"box", "(5,5),(0,0)"},
+		{"line", "{1,-1,0}"}, {"circle", "<(1,2),3.25>"}, {"tid", "(4294967295,65535)"},
+	} {
+		b, err := Send(tc.typ, tc.text)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.typ, err)
+		}
+		if got, err := Recv(tc.typ, b); err != nil || got != tc.text {
+			t.Errorf("%s: Recv = %q, %v; want %q", tc.typ, got, err, tc.text)
+		}
+	}
+	lowFirst, _ := Send("lseg", "[(0,0),(5,5)]") // same 4 floats as a box written low→high
+	if got, _ := Recv("box", lowFirst); got != "(5,5),(0,0)" {
+		t.Errorf("box_recv corner order: %q", got)
+	}
+	neg, _ := Send("point", "(1,2)")
+	neg = append(neg, make([]byte, 8)...)
+	binary.BigEndian.PutUint64(neg[16:], math.Float64bits(-1))
+	if _, err := Recv("circle", neg); err == nil {
+		t.Error("circle_recv must reject a negative radius")
+	}
+}

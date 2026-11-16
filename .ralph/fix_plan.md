@@ -12000,7 +12000,7 @@ verify each at HEAD when the task starts.
     - Gates: units, postmaster, testport interop set, spotcheck, sf025 99,
       acceptance.
     Movement: none — C3 interop fix \(regress A/B unchanged\)
-- [ ] **M0149-0001k4 — COPY BINARY sends point / lseg / box / line / circle / tid as text, not their send format** \(filed 2026-11-16 by M0149-0001k\)
+- [x] **M0149-0001k4 — COPY BINARY sends point / lseg / box / line / circle / tid as text, not their send format** \(filed 2026-11-16 by M0149-0001k\)
   Kind: impl
   Parent: M0149-0001k
   - Repro: `copy \(select p, t from ti\) to stdout with \(format binary\)`
@@ -12009,6 +12009,28 @@ verify each at HEAD when the task starts.
     big\-endian uint32 block, then a uint16 offset. lseg, box, line and
     circle work the same way \(geo\_ops.c, tid.c\).
   - First step: executor copy\_binary.go send / recv arms for the six types.
+  - 2026-11-17 \(CLOSES k4\): binary COPY ships the six types and money in PG's send formats.
+    - fixedgeo Send / Recv:
+      - fields big\-endian in storage order; tid as a uint32 block then a
+        uint16 offset;
+      - Recv reorders box corners and rejects a negative circle radius and
+        line A = B = 0, as geo\_ops.c does \(22P02\).
+    - copy\_binary.go send / recv arms for point / lseg / box / line /
+      circle / tid, plus money \(cash\_send / cash\_recv, int64\).
+    - Found and fixed: server\-side `COPY … FROM 'file' WITH \(FORMAT
+      binary\)` ignored the format and split the file into text lines
+      \(an int column failed on the "PGCOPY" signature\). RunCopyFromFile
+      now feeds a binary file through PushBinaryData, the STDIN reader.
+    - Probe \(tmp/catidx/s47\):
+      - goopg's binary COPY of a 7\-type table is byte\-identical to PG
+        18.3's \(cmp\);
+      - PG loads goopg's file, and goopg loads PG's file through both STDIN
+        and a server\-side file.
+    - Tests: fixedgeo TestSendRecv, TestCopyBinaryGeoTidMoney.
+    - Regress A/B over 13 cases unchanged.
+    - Gates: units, testport interop set \(\+ copy ports\), spotcheck, sf025
+      99, acceptance.
+    Movement: none — C3 / client\-tool interop fix \(regress A/B unchanged\)
 - [ ] **M0149-0001k5 — money residue: btree cash\_ops index keys, lc\_monetary, typed stavalues, source\-typed money casts** \(filed 2026-11-16 by M0149-0001k1\)
   Kind: impl
   Parent: M0149-0001k
