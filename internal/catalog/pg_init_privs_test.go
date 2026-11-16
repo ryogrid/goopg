@@ -57,3 +57,39 @@ func TestPGInitPrivsRowsForDBOidExcludesUserTables(t *testing.T) {
 		}
 	}
 }
+
+// TestPGInitPrivsRowsMatchInitdb pins M0149-0001g slice 22: goopg's
+// pg_init_privs view serves PG 18.3 initdb's rows (the same table the on-disk
+// 3394 heap is written from), with the bootstrap superuser under its name.
+func TestPGInitPrivsRowsMatchInitdb(t *testing.T) {
+	c := NewInMemory()
+	rows := c.PGInitPrivsRowsForDBOid(DefaultDBOid)
+	if len(rows) != len(PGInitdbInitPrivs) {
+		t.Fatalf("got %d rows, want %d", len(rows), len(PGInitdbInitPrivs))
+	}
+	byKey := map[string]string{}
+	for _, r := range rows {
+		byKey[r[0]+"/"+r[1]+"/"+r[2]] = r[4]
+	}
+	for key, want := range map[string]string{
+		"11/2615/0":   "{postgres=UC/postgres,=U/postgres}",
+		"2200/2615/0": "{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}",
+		"1260/1259/0": "{postgres=arwdDxtm/postgres}",
+	} {
+		if got := byKey[key]; got != want {
+			t.Errorf("initprivs %s = %q, want %q", key, got, want)
+		}
+	}
+}
+
+// TestBootstrapSchemaNspaclMatchesInitPrivs: pg_catalog's and
+// information_schema's nspacl must equal their initprivs, else pg_dump emits
+// REVOKE USAGE ON SCHEMA … FROM PUBLIC (M0149-0001g slice 22).
+func TestBootstrapSchemaNspaclMatchesInitPrivs(t *testing.T) {
+	c := NewInMemory()
+	for _, oid := range []uint32{11, 13273} {
+		if got, want := c.NamespaceACLText(oid), "{postgres=UC/postgres,=U/postgres}"; got != want {
+			t.Errorf("nspacl(%d) = %q, want %q", oid, got, want)
+		}
+	}
+}

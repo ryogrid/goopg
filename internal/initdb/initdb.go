@@ -1522,6 +1522,10 @@ func Init(opts Options) error {
 	if err := bootstrapPgTS(abs); err != nil {
 		return fmt.Errorf("goopg init: pg_ts_*: %w", err)
 	}
+	// M0149-0001g slice 22: setup_privileges()' pg_init_privs rows + index 3395.
+	if err := bootstrapPgInitPrivs(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_init_privs: %w", err)
+	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
 	}

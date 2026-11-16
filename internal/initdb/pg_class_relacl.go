@@ -54,6 +54,8 @@ func initdbACLDatum(txt, what string) executor.Datum {
 			return 3373 // ROLE_PG_MONITOR
 		case "pg_read_all_stats":
 			return 3375 // ROLE_PG_READ_ALL_STATS
+		case "pg_database_owner":
+			return 6171 // ROLE_PG_DATABASE_OWNER
 		}
 		panic(fmt.Sprintf("pg_initdb_acls_generated.go names role %q (%s); add its pg_authid.dat OID to initdbACLDatum", role, what))
 	})

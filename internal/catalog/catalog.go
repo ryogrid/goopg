@@ -4570,6 +4570,16 @@ func NewInMemory() *InMemory {
 	// M0148-0001j4.
 	c.routines.shareOIDCounter(c.AllocOID, c.AdvanceNextOIDPast)
 	c.registerSystemTables()
+	// initdb's setup_privileges() runs GRANT USAGE ON SCHEMA pg_catalog, public
+	// TO PUBLIC and information_schema.sql grants USAGE too, so a PG 18.3
+	// cluster's nspacl for pg_catalog / information_schema is {B=UC/B,=U/B},
+	// equal to their pg_init_privs rows; without the seed pg_dump diffs NULL
+	// against initprivs and emits REVOKE USAGE … FROM PUBLIC (M0149-0001g
+	// slice 22). public (owner pg_database_owner) is not expressible in this
+	// owner-is-postgres ACL store — see the deferral ledger.
+	for _, nsp := range []uint32{11, 13273} {
+		c.GrantTablePrivilege(nsp, publicPseudoRole, "USAGE")
+	}
 	return c
 }
 
@@ -11368,9 +11378,8 @@ func (c *InMemory) registerSystemTables() {
 	// pip.initprivs` predicate degenerates to "dump the full ACL". Schema matches
 	// PG's pg_init_privs (objoid, classoid, objsubid, privtype, initprivs); like the
 	// upstream catalog it has NO oid system column. M0110-0001 (DU-002); rows added
-	// M0134-0132 (see PGInitPrivsRowsForDBOid — goopg has no bootstrap-time ACL
-	// snapshot mechanism, so the initprivs text is reconstructed on read rather than
-	// captured once at initdb; deferral recorded in .ralph/deferral_ledger.md).
+	// M0134-0132; since M0149-0001g slice 22 they are PG 18.3 initdb's own 229 rows
+	// (PGInitdbInitPrivs, the source of the on-disk 3394 heap too).
 	pgInitPrivs := &Table{
 		Schema: "pg_catalog", Name: "pg_init_privs", Virtual: true,
 		Columns: []Column{
@@ -18668,58 +18677,6 @@ var attrACLPrivOrder = []aclPrivLetter{
 	{"SELECT", 'r'},
 	{"UPDATE", 'w'},
 	{"REFERENCES", 'x'},
-}
-
-// PGInitPrivsRowsForDBOid renders pg_init_privs rows for every system-catalog
-// relation (schema pg_catalog/information_schema) that PostgreSQL's initdb
-// setup_privileges() seeds with a non-NULL relacl — RELKIND_RELATION,
-// RELKIND_VIEW, RELKIND_MATVIEW, RELKIND_SEQUENCE
-// (postgres/src/bin/initdb/initdb.c setup_privileges(), which UPDATEs
-// pg_class.relacl to `{=r/"postgres"} UNION acldefault(...)` for every such
-// relation that exists before the post-bootstrap SQL script runs, then INSERTs
-// a matching pg_init_privs row — objsubid=0, privtype='i' — for each). goopg
-// has no bootstrap-time ACL snapshot mechanism (tableACLs stays empty for
-// system catalogs until an explicit GRANT, see the SELECT-privilege carve-out
-// noted in .ralph/deferral_ledger.md M0097-0040), so this renders the SAME
-// synthetic "world-readable SELECT + owner-full" ACL text initdb would have
-// installed, keyed by each relation's real objoid/relkind, computed fresh on
-// every read rather than a captured once-at-initdb snapshot. Sufficient for
-// `SELECT count(*) > 0 FROM pg_init_privs` (init_privs.sql, M0134-0132) and
-// gives pg_dump's LEFT JOIN a real row to diff a later explicit GRANT/REVOKE
-// against; NOT a byte-faithful reconstruction of every relation's initprivs
-// (sequence text is an approximation of acldefault('s', owner), and a
-// genuinely revoked-then-regranted system catalog ACL is not distinguished
-// from its default). Caller must NOT hold c.mu (this takes its own RLock).
-func (c *InMemory) PGInitPrivsRowsForDBOid(dbOid uint32) [][]string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	keys := make([]string, 0, len(c.ns(dbOid).tables))
-	for k := range c.ns(dbOid).tables {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	out := make([][]string, 0, len(keys))
-	for _, k := range keys {
-		t := c.ns(dbOid).tables[k]
-		if t.OID == 0 {
-			continue
-		}
-		if t.Schema != "pg_catalog" && t.Schema != "information_schema" {
-			continue // only pre-existing initdb-time objects get an init_privs row
-		}
-		initprivs := "{=r/postgres,postgres=arwdDxtm/postgres}"
-		if t.IsSequence {
-			initprivs = "{=r/postgres,postgres=rwU/postgres}"
-		}
-		out = append(out, []string{
-			strconv.FormatUint(uint64(t.OID), 10),
-			"1259", // classoid = pg_class (RelationRelationId)
-			"0",    // objsubid
-			"i",    // privtype = initdb-time
-			initprivs,
-		})
-	}
-	return out
 }
 
 // relaclTextLocked renders the materialized pg_class.relacl text — an aclitem[]

@@ -714,6 +714,17 @@ Key observation: PG compatibility constrains only the **displayed** and
   `scripts/gen-pg-ts-snowball.py` regenerates it.
 - A PG node loads `$libdir/dict_snowball` from its own installation.
 
+## Follow\-up: M0149\-0001g slice 22 — pg\_init\_privs \(2026\-11\-16\)
+
+- `catalog.PGInitdbInitPrivs` holds the 229 rows that initdb's
+  `setup_privileges()` records. `scripts/gen-pg-init-privs.sh` regenerates
+  it from a throwaway PG initdb.
+- It is the single source for both the on\-disk heap 3394 \(with index
+  3395\) and goopg's virtual pg\_init\_privs, so the two cannot drift.
+- goopg's SQL nspacl for pg\_catalog and information\_schema is seeded with
+  PUBLIC USAGE to equal its initprivs. Schema public would need an owner of
+  pg\_database\_owner, which goopg's ACL store cannot express yet.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

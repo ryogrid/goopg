@@ -12306,6 +12306,30 @@ verify each at HEAD when the task starts.
       6 cases including tsearch and tsdicts \(no movement\), spotcheck,
       sf025 99, acceptance.
     Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 22: pg\_init\_privs carries PG 18.3 initdb's 229 rows on disk and in goopg's view.
+    - scripts/gen\-pg\-init\-privs.sh captures setup\_privileges\(\)' rows from
+      a throwaway initdb in ctid order into
+      internal/catalog/pg\_init\_privs\_generated.go \(PGInitdbInitPrivs:
+      66 functions, 144 relations, 17 pg\_subscription columns, 2 schemas\).
+    - initdb's bootstrapPgInitPrivs writes them to base/\{1,5\}/3394 and
+      bulk\-builds pg\_init\_privs\_o\_c\_o\_index 3395.
+    - goopg's virtual pg\_init\_privs serves the same rows; the old synthetic
+      per\-relation renderer is gone.
+    - Sibling fix: goopg's SQL nspacl for pg\_catalog and information\_schema
+      is now \{postgres=UC/postgres,=U/postgres\}, so pg\_dump on goopg emits no
+      new REVOKE USAGE ON SCHEMA pg\_catalog.
+    - PG cold start: all 229 rows read back identical to a PG initdb, and an
+      index scan on 3395 finds schema public.
+    - Still open \(ledgered\):
+      - goopg reports schema public as owner postgres with NULL nspacl, so
+        pg\_dump on goopg still emits REVOKE USAGE ON SCHEMA public FROM
+        PUBLIC \(HEAD does the same\);
+      - pg\_class relpages/reltuples for catalog relations stay 0;
+      - pg\_init\_privs TOAST 4155/4156 is absent.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      6 cases \(init\_privs, privileges, namespace, rolenames, dependency,
+      psql; no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none
