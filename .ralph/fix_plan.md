@@ -12081,6 +12081,41 @@ verify each at HEAD when the task starts.
     - Gates: units, postmaster, testport interop set, spotcheck, sf025 99,
       acceptance.
     Movement: none — C3 interop and correctness fix \(regress A/B unchanged\)
+  - 2026-11-17 second slice: money\[\] elements and money \|\| text.
+    - utils/adt/array ElemTypeInfo money arm \(790, 8, 'd'\), gated on
+      fixed\_length\_money. The encode element arm runs moneyCents; decode
+      renders cash\_out with array\_out quoting. A PG node reads the arrays
+      at 48 / 40 bytes.
+    - Planner moneyConcatOperand: a money operand of `\|\|` is cast to text
+      with SourceType money, so cash\_out renders it, as anytextcat does:
+      `m \|\| 'x'` = `$7.00x`. All three BinaryOp resolvers call it.
+    - Probe \(tmp/catidx/s49\): output equals PG 18.3, except the subscript
+      column name \(the pre\-existing k3 ledger row\) and the float8
+      assignment, filed as k5a.
+    - Test: TestMoneyArrayElements.
+    - Regress A/B over 10 cases unchanged.
+    - Gates: units, fire\-set \(fires=none\), testport interop set,
+      spotcheck, sf025 99, acceptance.
+    - Still open in k5: typed money stavalues \(they need money\-aware MCV
+      and histogram comparison in the optimizer\) and lc\_monetary for
+      non\-C locales.
+    Movement: none — correctness / interop fix \(regress A/B unchanged\)
+- [ ] **M0149-0001k5a — the analyzer accepts an explicit cast of any type into an INSERT / UPDATE target** \(filed 2026-11-17 by M0149-0001k5\)
+  Kind: impl
+  Parent: M0149-0001k5
+  - Repro on goopg: `create table zz\(d date, b bool, m money\)`, then:
+    - `insert into zz\(m\) values \(1.5::float8\)` stores $1.50;
+    - `insert into zz\(d\) values \(1.5::float8\)` fails "expected time,
+      got kind 7";
+    - `insert into zz\(b\) …` fails "expected bool, got kind 7".
+  - PG 18.3 rejects all three at parse analysis: 42804 "column "m" is of
+    type money but expression is of type double precision", with HINT "You
+    will need to rewrite or cast the expression."
+  - Cause: the analyzer's INSERT / UPDATE check does not see the cast's
+    target type. The analyzeExpr result for `x::float8` passes isAssignable.
+  - First step: find what analyzeExpr returns for a CastExpr in the VALUES
+    list, then make isAssignable reject casts with no pg\_cast assignment
+    path. Also adopt PG's message and HINT.
 - [ ] **M0149-0001j — goopg-written pg\_statistic stavalues are unreadable on a PG node: 0-dimensional, text-typed arrays** \(filed 2026-11-16 by M0149-0001g; C3 interop, estimates only, below the item-10 rank\)
   Kind: impl
   Parent: M0149-0001g

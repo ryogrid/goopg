@@ -142,3 +142,31 @@ func TestMoneyBTreeKey(t *testing.T) {
 		t.Error("money must be a supported btree key type")
 	}
 }
+
+// TestMoneyArrayElements pins M0149-0001k5's money[] elements: in a
+// fixed_length_money cluster each element is the 8-byte Cash (elemtype 790;
+// a 3-element array is 24 + 3×8 = 48 bytes, as PG 18.3 measures) and the
+// array renders through cash_out with array_out's quoting; without the
+// capability the older text elements round-trip.
+func TestMoneyArrayElements(t *testing.T) {
+	defer catalog.SetFixedLengthMoney(catalog.FixedLengthMoney())
+	typ := catalog.Type{Name: "money", IsArray: true}
+	for _, on := range []bool{true, false} {
+		catalog.SetFixedLengthMoney(on)
+		enc, err := encodeValuePG(typ, NewStringDatum(`{12.34,"$1,000.00",-5}`))
+		if err != nil {
+			t.Fatalf("capability=%v: %v", on, err)
+		}
+		d, _, err := decodePhysicalPGValueMctx(typ, enc, nil)
+		if err != nil {
+			t.Fatalf("capability=%v: decode: %v", on, err)
+		}
+		if on {
+			if len(enc) != 48 || d.StringValue() != `{$12.34,"$1,000.00",-$5.00}` {
+				t.Errorf("capable cluster: %d bytes, %q", len(enc), d.StringValue())
+			}
+		} else if d.StringValue() != `{12.34,"$1,000.00",-5}` {
+			t.Errorf("legacy cluster: %q", d.StringValue())
+		}
+	}
+}

@@ -169,6 +169,16 @@ func encodeArrayElem(elemName, e string, varlena bool, ctx *Context, pos int) ([
 		// element table declares (4/8/8/8/12) are exactly what those arms
 		// return, which is what keeps the array body self-describing.
 		return encodeValuePG(catalog.Type{Name: lower}, NewStringDatum(e))
+	case "money":
+		// Element sibling of encodeValuePG's money arm (8-byte Cash; reached
+		// only in a fixed_length_money cluster). M0149-0001k5.
+		c, err := moneyCents(NewStringDatum(e))
+		if err != nil {
+			return nil, err
+		}
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(c))
+		return b[:], nil
 	case "point", "lseg", "box", "line", "circle", "tid":
 		// Element sibling of encodeValuePG's fixedgeo arm (reached only when
 		// pgarray.ElemTypeInfo admits the type, i.e. in a

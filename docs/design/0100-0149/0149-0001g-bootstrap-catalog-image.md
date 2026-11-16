@@ -490,3 +490,5 @@ the two layouts legitimately differ.
   the Cash count. It is tuple\-format only under fixed\_length\_money.
   pg\_index.indclass now names the default opclass for money / time /
   timetz / cidr / reg\*; with 0 there, PG cannot open the table.
+  money\[\] elements are the 8\-byte Cash too, and a money operand of `\|\|`
+  renders through cash\_out, as anytextcat does.

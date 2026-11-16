@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/utils/adt/cash"
 	"github.com/goopg/goopg/internal/utils/adt/fixedgeo"
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/utils/adt/datetime"
@@ -254,6 +255,13 @@ func ElemTypeInfo(elemName string) (oid uint32, size, align int, varlena, ok boo
 	// (pg_type: point 600, lseg 601, box 603, line 628, circle 718, tid 27).
 	// Without the capability they keep the unknown-element fallback (elemtype
 	// 25, text bodies) older clusters wrote.
+	// M0149-0001k5: money[] elements are the 8-byte Cash in a
+	// fixed_length_money cluster (pg_type 790: typlen 8, typalign 'd').
+	case "money":
+		if !catalog.FixedLengthMoney() {
+			return 0, 0, 0, false, false
+		}
+		return 790, 8, 8, false, true
 	case "point", "lseg", "box", "line", "circle", "tid":
 		if !catalog.FixedLengthGeoTid() {
 			return 0, 0, 0, false, false
@@ -382,6 +390,11 @@ func DecodeElemStyled(elemName string, data []byte, varlena bool, size int, st O
 		return "", 0, fmt.Errorf("truncated fixed array element")
 	}
 	switch lower {
+	case "money":
+		// Sibling of encodeArrayElem's money arm: cash_out of the Cash count;
+		// array_out quotes it ("$1,234.56" holds the ',' delimiter).
+		// M0149-0001k5.
+		return QuoteTextElem(cash.Out(int64(binary.LittleEndian.Uint64(data[:8])))), 8, nil
 	case "point", "lseg", "box", "line", "circle", "tid":
 		// Sibling of encodeArrayElem's fixedgeo arm (M0149-0001k3).
 		txt, n, err := fixedgeo.Decode(lower, data)

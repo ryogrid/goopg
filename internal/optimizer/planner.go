@@ -10750,6 +10750,9 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		if fc, ok := moneyArithCall(x.Pos(), x.Op, l, r); ok {
 			return fc, nil
 		}
+		if x.Op == parser.OpConcat {
+			l, r = moneyConcatOperand(l), moneyConcatOperand(r)
+		}
 		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
 		switch x.Op {
 		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
@@ -10960,6 +10963,9 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		}
 		if fc, ok := moneyArithCall(x.Pos(), x.Op, l, r); ok {
 			return fc, nil
+		}
+		if x.Op == parser.OpConcat {
+			l, r = moneyConcatOperand(l), moneyConcatOperand(r)
 		}
 		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
 		switch x.Op {
@@ -18924,6 +18930,9 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		if fc, ok := moneyArithCall(x.Pos(), x.Op, l, r); ok {
 			return fc, nil
 		}
+		if x.Op == parser.OpConcat {
+			l, r = moneyConcatOperand(l), moneyConcatOperand(r)
+		}
 		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
 		switch x.Op {
 		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod,
@@ -20645,4 +20654,17 @@ func moneyArithCall(pos int, op parser.OpCode, l, r Expr) (*FuncCall, bool) {
 		}
 	}
 	return nil, false
+}
+
+// moneyConcatOperand renders a money operand of || as text: PG's anytextcat /
+// textanycat call the operand's output function (cash_out), so `m || 'x'`
+// is "$1.00x". goopg's money Datum is a scale-2 numeric, which a generic
+// concat would print bare; the implicit text cast carries SourceType money
+// to the executor's cash_out arm. M0149-0001k5.
+func moneyConcatOperand(e Expr) Expr {
+	t := exprType(e)
+	if !strings.EqualFold(t.Name, "money") || t.IsArray {
+		return e
+	}
+	return &CastExpr{pos: e.Pos(), Operand: e, TargetType: "text", SourceType: "money"}
 }
