@@ -3505,6 +3505,21 @@ func loadSystemCatalogsIfPresentForDB(dataDir string, cat *catalog.InMemory, hea
 		}
 	}
 
+	// pg_largeobject (OID 2613) — large-object data pages, a real MVCC heap
+	// like PG's (M0149-0001h1a slice 2).
+	pgLOFile := filepath.Join(base, fmt.Sprint(catalog.LargeObjectRelationId))
+	if heapFilePresent(pgLOFile) {
+		t := &catalog.Table{
+			Schema:  "pg_catalog",
+			Name:    "pg_largeobject",
+			Columns: catalog.PGLargeObjectColumns(),
+			OID:     catalog.LargeObjectRelationId,
+		}
+		if err := cat.RegisterRealTable(t, nsDBOid); err != nil {
+			return fmt.Errorf("register pg_largeobject (db %d): %w", nsDBOid, err)
+		}
+	}
+
 	return nil
 }
 

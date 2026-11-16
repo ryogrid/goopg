@@ -3,7 +3,10 @@ package testport
 // End-to-end coverage of large-object metadata (M0149-0001h1a slice 1):
 // lo_create / lo_unlink write pg_largeobject_metadata (2995) as an MVCC heap,
 // so an aborted lo_create or lo_unlink leaves no trace, the committed set
-// survives a restart, and has_largeobject_privilege reads it.
+// survives a restart, and has_largeobject_privilege reads it. Slice 2 adds
+// the pg_largeobject (2613) data pages: lo_from_bytea / lo_put / lo_get
+// follow MVCC and survive a restart, and descriptors are
+// transaction-scoped (AtEOXact_LargeObject).
 
 import (
 	"path/filepath"
@@ -33,6 +36,9 @@ func TestLargeObjectMetadataSurvivesRestart(t *testing.T) {
 		"BEGIN; SELECT lo_create(1004); ROLLBACK",
 		"BEGIN; SELECT lo_unlink(1002); ROLLBACK",
 		"SELECT lo_unlink(1003)",
+		"SELECT lo_from_bytea(1010, decode(repeat('ab', 3000), 'hex'))",
+		"SELECT lo_put(1010, 2047, 'XY')",
+		"BEGIN; SELECT lo_put(1010, 0, 'QQ'); ROLLBACK",
 	} {
 		if err := runSQLSimple(t, c, sql); err != nil {
 			t.Fatalf("%s: %v", sql, err)
@@ -42,7 +48,7 @@ func TestLargeObjectMetadataSurvivesRestart(t *testing.T) {
 	if err := runSQLSimple(t, c, "SELECT lo_create(1001)"); err == nil {
 		t.Fatalf("duplicate lo_create(1001) succeeded")
 	}
-	const want = "1001,1002"
+	const want = "1001,1002,1010"
 	check := func(phase string) {
 		t.Helper()
 		if got := queryScalar(t, c,
@@ -53,6 +59,22 @@ func TestLargeObjectMetadataSurvivesRestart(t *testing.T) {
 			"SELECT has_largeobject_privilege(1001, 'UPDATE')::text || '/' || coalesce(has_largeobject_privilege('public', 1002, 'SELECT')::text, 'null') || '/' || coalesce(has_largeobject_privilege(1003, 'SELECT')::text, 'null')"); got != "true/false/null" {
 			t.Fatalf("%s: has_largeobject_privilege = %q, want true/false/null", phase, got)
 		}
+		// 3000 bytes: page 0 (2048) and page 1 (952); 'XY' spans both.
+		if got := queryScalar(t, c,
+			"SELECT length(lo_get(1010))::text || '/' || encode(lo_get(1010, 2046, 4), 'hex') || '/' || encode(lo_get(1010, 0, 2), 'hex')"); got != "3000/ab5859ab/abab" {
+			t.Fatalf("%s: lo_get = %q, want 3000/ab5859ab/abab", phase, got)
+		}
+	}
+	// A descriptor does not outlive its transaction, and numbering restarts
+	// at 0 in the next one.
+	if err := runSQLSimple(t, c, "SELECT lo_open(1010, 262144)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runSQLSimple(t, c, "SELECT loread(0, 1)"); err == nil {
+		t.Fatalf("loread on a descriptor from a finished transaction succeeded")
+	}
+	if got := queryScalar(t, c, "SELECT lo_open(1010, 262144)"); got != "0" {
+		t.Fatalf("first descriptor of a new transaction = %q, want 0", got)
 	}
 	check("before restart")
 	if err := c.Restart(cluster.ShutdownFast); err != nil {

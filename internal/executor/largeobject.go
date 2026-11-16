@@ -187,9 +187,17 @@ func evalLoUnlink(args []Datum, ctx *Context) (Datum, error) {
 	if !loCompatPrivileges(ctx) && !im.IsSuperuser(role) && role != owner && !im.HasPrivsOfRole(role, owner) {
 		return Datum{}, &ExecError{Code: "42501", Message: fmt.Sprintf("must be owner of large object %d", loid)}
 	}
+	// Close this session's descriptors on it, then inv_drop: the metadata
+	// row and every data page.
+	loCloseObjectFDs(ctx, loid)
 	if _, err := internalCatalogQuery(ctx, fmt.Sprintf(
 		"DELETE FROM pg_catalog.pg_largeobject_metadata WHERE oid = %d::oid", loid)); err != nil {
 		return Datum{}, err
+	}
+	if _, err := loDataTable(ctx); err == nil {
+		if err := loDeletePages(ctx, loid, 0, -1); err != nil {
+			return Datum{}, err
+		}
 	}
 	return NewIntDatum(1), nil
 }

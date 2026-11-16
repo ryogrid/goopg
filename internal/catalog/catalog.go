@@ -26421,3 +26421,16 @@ func PGLargeObjectMetadataColumns() []Column {
 		{Name: "lomacl", Type: Type{Name: "aclitem", IsArray: true}, Ordinal: 2},
 	}
 }
+
+// LargeObjectRelationId is pg_largeobject's OID (pg_largeobject.h).
+const LargeObjectRelationId = 2613
+
+// PGLargeObjectColumns is pg_largeobject's row type: loid oid, pageno int4,
+// data bytea, all NOT NULL (pg_largeobject.h). M0149-0001h1a slice 2.
+func PGLargeObjectColumns() []Column {
+	return []Column{
+		{Name: "loid", Type: Type{Name: "oid"}, Ordinal: 0, NotNull: true},
+		{Name: "pageno", Type: Type{Name: "int4"}, Ordinal: 1, NotNull: true},
+		{Name: "data", Type: Type{Name: "bytea"}, Ordinal: 2, NotNull: true},
+	}
+}

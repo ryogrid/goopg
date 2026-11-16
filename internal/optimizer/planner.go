@@ -17362,10 +17362,17 @@ func exprType(e Expr) catalog.Type {
 			"has_column_privilege", "has_any_column_privilege", "has_sequence_privilege",
 			"has_function_privilege", "has_type_privilege", "has_largeobject_privilege":
 			return catalog.Type{Name: "bool"} // M0149-0001h / h1 / h1a
-		case "lo_create", "lo_creat":
+		case "lo_create", "lo_creat", "lo_from_bytea", "lo_import":
 			return catalog.Type{Name: "oid"} // M0149-0001h1a
-		case "lo_unlink":
+		case "lo_unlink", "lo_open", "lo_close", "lowrite", "lo_lseek", "lo_tell",
+			"lo_truncate", "lo_truncate64", "lo_export":
 			return catalog.Type{Name: "int4"}
+		case "lo_lseek64", "lo_tell64":
+			return catalog.Type{Name: "int8"}
+		case "loread", "lo_get":
+			return catalog.Type{Name: "bytea"}
+		case "lo_put":
+			return catalog.Type{Name: "void"}
 		case "row":
 			// `row(a, b)` reaches the planner as a call named row; PG's
 			// RowExpr is an anonymous record (M0146-0053) — a VALUES column

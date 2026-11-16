@@ -11921,6 +11921,49 @@ verify each at HEAD when the task starts.
       lo\_close, lo\_get / lo\_put / lo\_from\_bytea\); then GRANT / REVOKE
       ON LARGE OBJECT and ALTER LARGE OBJECT OWNER.
     Movement: regress privileges 889→700
+  - 2026-11-17 second slice: pg\_largeobject data pages and the descriptor API.
+    - initdb registers pg\_largeobject \(2613\) as a real heap; catalogIndexDefs
+      gains 2613 → 2683.
+    - executor largeobject\_data.go:
+      - inv\_read / inv\_write / inv\_truncate over 2048\-byte pages, with holes
+        as zeros; a page is replaced by an internal\-SQL DELETE plus
+        writeHeapRowCanonical;
+      - descriptors: lowest free slot, INV\_READ / INV\_WRITE, 42704 / 42501 /
+        55000 / 22023 / 22003 as be\-fsstubs.c;
+      - lo\_get / lo\_put / lo\_from\_bytea; lo\_import / lo\_export
+        \(superuser only\);
+      - lo\_unlink drops the pages and closes the session's descriptors on it.
+    - Found: transam.Transaction.Handle is procNum\+1, the same for every
+      transaction of a backend. Descriptor lifetime therefore hooks
+      ReleaseAdvisoryTransactionLocks, which every transaction\-end path
+      calls with the connection identity.
+    - Probe \(80 statements, tmp/s57 vs PG 18.3\): identical. A PG cold
+      start reads and updates goopg\-written pages through index 2683.
+      Data survives a restart, and lo\_put rollback holds.
+    - Regress: privileges 700→692; largeobject 218→220 \(inventory
+      updated\). Both are now blocked mainly by the bit\-string gap: filed
+      M0149\-0001h1a1.
+    - Test: TestLargeObjectMetadataSurvivesRestart extended \(pages, rollback,
+      descriptor lifetime\).
+    - Gates: units, fire\-set \(fires=none\), spotcheck, sf025 99,
+      acceptance, PG cold\-start e2e.
+    Movement: regress privileges 700→692
+- [ ] **M0149-0001h1a1 — bit strings have no `\|` / `&` / `#` operators and no bit → int4 / int8 cast: `x'20000'::int` and `x'20000' \| x'40000'` fail** \(filed 2026-11-17 by M0149-0001h1a\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Repro on goopg: `select x'20000'::int` → "value "00100000000000000000"
+    is out of range for type integer"; `select B'101' \| B'011'` →
+    "operator \| requires integer operands". PG: 131072 and 111.
+  - Impact: regress privileges and largeobject open every large object with
+    `x'20000'::int` / `x'40000'::int`, so most of their large\-object steps
+    fail before reaching the LO functions. Regress `bit` is also affected.
+  - PG: utils/adt/varbit.c — bitand / bitor / bitxor / bitnot / bitshiftleft /
+    bitshiftright, "cannot AND/OR/XOR bit strings of different sizes" \(22026\),
+    bittoint4 / bittoint8 \("integer out of range" 22003 when more than
+    32 / 64 bits are significant\), int4 → bit\(n\).
+  - First step: probe the bit operator and cast surface against PG; implement
+    the executor operators and casts; then re\-measure bit, privileges and
+    largeobject.
 - [ ] **M0149-0001k — WRONG RESULTS on a PG node: goopg stores money / point / lseg / box / line / circle / tid / aclitem columns as varlena, not PG's fixed\-length form** \(filed 2026-11-16 by M0149-0001g; S2\)
   Kind: impl
   Parent: M0149-0001g

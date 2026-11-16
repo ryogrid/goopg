@@ -421,5 +421,5 @@ func isHasPrivilegeBuiltin(name string) bool {
 		"lo_create", "lo_creat", "lo_unlink":
 		return true
 	}
-	return false
+	return isLargeObjectDataFunc(name)
 }

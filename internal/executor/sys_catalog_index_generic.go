@@ -106,6 +106,8 @@ var catalogIndexDefs = map[uint32][]catIdxDef{
 	2602: {{2756, []catIdxKey{{0, catKeyOid}}}},
 	// pg_largeobject_metadata_oid_index (M0149-0001h1a: lo_create rows).
 	2995: {{2996, []catIdxKey{{0, catKeyOid}}}},
+	// pg_largeobject_loid_pn_index (M0149-0001h1a slice 2: data pages).
+	2613: {{2683, []catIdxKey{{0, catKeyOid}, {1, catKeyInt4}}}},
 	2603: {{2757, []catIdxKey{{0, catKeyOid}}}},
 	// pg_depend (2608): classid 0, objid 1, objsubid 2, refclassid 3,
 	// refobjid 4, refobjsubid 5.

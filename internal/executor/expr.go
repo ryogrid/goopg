@@ -12343,6 +12343,9 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		case "lo_unlink":
 			return evalLoUnlink(args, ctx)
 		}
+		if isLargeObjectDataFunc(name) {
+			return evalLargeObjectFunc(name, args, ctx)
+		}
 		return evalHasDatabasePrivilege(args, ctx, x.Pos())
 	}
 	if isCashBuiltin(name) {

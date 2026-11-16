@@ -1,8 +1,13 @@
 # M0149\-0001h1a — large objects
 
-**Status:** slice 1 \(pg\_largeobject\_metadata, lo\_create / lo\_creat /
-lo\_unlink, has\_largeobject\_privilege, lo\_compat\_privileges\) landed
-2026\-11\-17. Data pages and the descriptor API are the next slices.
+**Status:** two slices landed 2026\-11\-17:
+
+- slice 1: pg\_largeobject\_metadata, lo\_create / lo\_creat / lo\_unlink,
+  has\_largeobject\_privilege and lo\_compat\_privileges;
+- slice 2: pg\_largeobject data pages, the descriptor API, the bytea
+  functions, and lo\_import / lo\_export.
+
+GRANT / ALTER / COMMENT ON LARGE OBJECT are next.
 
 ## Problem
 
@@ -70,11 +75,65 @@ Probe \(goopg vs PG 18.3\), identical on every result:
 - PG cold start on the goopg directory: the index scan finds the objects,
   has\_largeobject\_privilege agrees, and lo\_create\(existing\) is 23505.
 
+## Slice 2 — data pages and descriptors \(largeobject\_data.go\)
+
+- **Storage.** pg\_largeobject \(2613: `loid`, `pageno`, `data`\) is a real
+  heap per database, like the metadata. Pages are LOBLKSIZE \(2048\)
+  bytes or shorter. Missing pages and short pages read back as zeros. An
+  object's size is the end of its last page \(inv\_getsize\).
+- **Page writes:**
+  - a page is replaced by an internal\-SQL DELETE followed by
+    writeHeapRowCanonical, so rollback is MVCC;
+  - catalogIndexDefs gains 2613 → 2683, so a PG node finds the pages
+    through `pg_largeobject_loid_pn_index`;
+  - inv\_write keeps the bytes outside the written range and grows the
+    page to cover it;
+  - inv\_truncate either resizes the page holding `len`, or deletes the
+    first later page and inserts a page of `len % LOBLKSIZE` zero bytes
+    \(even an empty one); then it drops every later page.
+- **Descriptors** \(be\-fsstubs.c `cookies[]`\):
+  - each connection has an array; a new descriptor takes the lowest free
+    slot;
+  - INV\_WRITE implies read; neither flag is 22023;
+  - inv\_open checks existence \(42704\), then SELECT, and UPDATE as well
+    for write \(42501\); lo\_compat\_privileges skips the privilege checks;
+  - lowrite or lo\_truncate on a read\-only descriptor is 55000;
+  - seeks use whence 0 / 1 / 2, reject a negative target \(22023\), and
+    report 22003 when the int4 variants overflow.
+- **End of transaction.** AtEOXact\_LargeObject is reproduced from
+  `ReleaseAdvisoryTransactionLocks`. Every transaction\-end path already
+  calls it with the connection identity: autocommit, COMMIT / ROLLBACK,
+  chained transactions and the extended protocol.
+  `transam.Transaction.Handle` is procNum\+1, stable per backend, so it
+  cannot be used to tell transactions apart. Session end goes through
+  `ReleaseAllAdvisoryLocks`. lo\_unlink also closes the session's
+  descriptors on the object and deletes its pages.
+- **bytea functions:** lo\_get / lo\_get\(oid, off, len\) \(a negative
+  length is 22023\), lo\_put and lo\_from\_bytea.
+- **Server files:** lo\_import / lo\_export are superuser\-only, matching
+  system\_functions.sql's REVOKE EXECUTE … FROM public, and use
+  errcode\_for\_file\_access codes.
+
+**Probe** \(goopg vs PG 18.3, 80 statements\): identical. It covered:
+
+- descriptor numbering across COMMIT / ROLLBACK, seek / tell / read / write,
+  holes, page boundaries and truncation;
+- rollback of lo\_put, unlink with an open descriptor, import / export,
+  non\-superuser denials and read\-only transactions.
+
+A PG cold start on the goopg directory reads and updates goopg\-written pages
+through index 2683.
+
 ## Open
 
-- pg\_largeobject data and the descriptor API: lo\_open / loread / lowrite /
-  lo\_lseek / lo\_tell / lo\_truncate / lo\_close, lo\_get / lo\_put /
-  lo\_from\_bytea, lo\_import / lo\_export, and per\-transaction descriptors.
+- A read\-only descriptor reads with the statement's snapshot, not the
+  snapshot registered at lo\_open \(PG keeps that snapshot until close\).
+- A large object created in the same statement is visible to a later call
+  in that statement; PG's statement snapshot hides it.
+- Bit strings have no `|` / `&` operators and no `bit → int4` cast. As a
+  result, `x'20000'::int` and `x'20000' | x'40000'` fail, which blocks
+  most large\-object steps in regress `privileges` and `largeobject`
+  \(M0149\-0001h1a1\).
 - GRANT / REVOKE ON LARGE OBJECT \(parsed as a no\-op today\), ALTER LARGE
   OBJECT … OWNER TO, COMMENT ON LARGE OBJECT, ALTER DEFAULT PRIVILEGES … ON
   LARGE OBJECTS \(get\_user\_default\_acl\), and the role dependencies.
