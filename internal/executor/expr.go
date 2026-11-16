@@ -12312,6 +12312,17 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			name = name[dot+1:]
 		}
 	}
+	if name == "has_database_privilege" {
+		args := make([]Datum, 0, len(x.Args))
+		for _, a := range x.Args {
+			v, err := evalExprSlot(a, slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			args = append(args, v)
+		}
+		return evalHasDatabasePrivilege(args, ctx, x.Pos())
+	}
 	if isCashBuiltin(name) {
 		args := make([]Datum, 0, len(x.Args))
 		for _, a := range x.Args {

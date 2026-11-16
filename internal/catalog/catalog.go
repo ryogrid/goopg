@@ -6086,6 +6086,19 @@ func (c *InMemory) DatabaseOid(name string) uint32 {
 // PGStatDatabaseRows go through this single helper to stay in sync (resolving
 // the long-standing "keep this switch in sync" hazard noted on
 // ResolveDatabaseOid).
+// DatabaseNameByDisplayOID maps a SQL-visible pg_database.oid (what
+// has_database_privilege(oid, …) and friends receive) back to its name.
+// M0149-0001h.
+func (c *InMemory) DatabaseNameByDisplayOID(oid uint32) (string, bool) {
+	want := strconv.FormatUint(uint64(oid), 10)
+	for _, n := range c.ListDatabases() {
+		if c.databaseDisplayOID(n) == want {
+			return n, true
+		}
+	}
+	return "", false
+}
+
 func (c *InMemory) databaseDisplayOID(name string) string {
 	switch name {
 	case "template1":

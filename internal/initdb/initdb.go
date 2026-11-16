@@ -2112,7 +2112,7 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 			datlocaleDatum,                                   // datlocale (NULL for libc)
 			executor.NullDatum,                               // daticurules
 			executor.NullDatum,                               // datcollversion
-			executor.NullDatum,                               // datacl
+			templateDatacl(name),                             // datacl
 		}
 	}
 	writeRow := func(page storage.Page, row executor.Row) error {
@@ -7195,4 +7195,22 @@ func pgClassRelType(rel nailedRel) uint32 {
 		relType = rel.OID
 	}
 	return relType
+}
+
+// templateDatacl is pg_database.datacl after initdb's
+// "REVOKE CREATE,TEMPORARY ON DATABASE template1 / template0 FROM public"
+// (initdb.c setup_privileges): PUBLIC keeps CONNECT only, and the owner entry
+// is materialised — {=c/postgres,postgres=CTc/postgres}. Every other database
+// keeps a NULL datacl (acldefault). Without it a PG node and goopg's
+// has_database_privilege saw PUBLIC holding TEMP on the templates, and \l+
+// showed no access privileges for them. M0149-0001h.
+func templateDatacl(name string) executor.Datum {
+	if name != "template0" && name != "template1" {
+		return executor.NullDatum
+	}
+	blob, err := executor.EncodeAclItemArrayText("{=c/postgres,postgres=CTc/postgres}", func(string) uint32 { return 10 })
+	if err != nil {
+		return executor.NullDatum
+	}
+	return executor.NewBytesDatum(blob)
 }

@@ -11771,6 +11771,51 @@ verify each at HEAD when the task starts.
     text, plus the two-argument current\_user forms\), with CREATE / CONNECT / TEMP / TEMPORARY privileges.
   - First step: implement the six overloads over goopg's datacl store \(the same ACL source pg\_database.datacl
     renders\), then compare `\\l+` against the PG oracle.
+  - 2026-11-17 first slice: has\_database\_privilege works and `\\l+` equals PG.
+    - executor has\_database\_privilege.go is a port of acl.c's six
+      overloads:
+      - role by name via get\_role\_oid\_or\_public \(42704\), by OID, or the
+        effective user;
+      - database by name \(3D000\) or display OID \(NULL when unknown, via the
+        new catalog DatabaseNameByDisplayOID\);
+      - convert\_database\_priv\_string: comma list, case\-insensitive,
+        WITH GRANT OPTION, 22023;
+      - aclmask: superuser; the owner's privileges give every grant option;
+        entries for PUBLIC, the role and the roles it has privileges of;
+        NULL datacl = acldefault\('d'\).
+      - The planner's exprType gives bool.
+    - Found and fixed: goopg's initdb left template0 / template1 datacl NULL.
+      PG's initdb REVOKEs CREATE,TEMPORARY FROM public, giving
+      `\{=c/postgres,postgres=CTc/postgres\}`. templateDatacl seeds it, and
+      the heap reload restores it on restart.
+      TestDatabaseACLSurvivesRestartViaCatalogHeap's control now asserts PG's
+      value instead of the old NULL divergence.
+    - Probe \(tmp/catidx/s53\):
+      - a 13\-statement script \(grants, revokes, PUBLIC, grant options,
+        errors\) is identical to PG 18.3;
+      - `\\l+` is identical apart from database sizes;
+      - restart\-stable.
+    - Test: TestHasDatabasePrivilege.
+    - Regress A/B over 7 cases unchanged.
+    - Gates: units, postmaster, fire\-set \(fires=none\), testport interop
+      set, spotcheck, sf025 99, acceptance.
+    - The rest of the has\_\*\_privilege family is missing \(filed as
+      M0149\-0001h1\).
+    Movement: none — client\-tool conformance \(psql `\\l\+`\); regress A/B unchanged
+- [ ] **M0149-0001h1 — the rest of the has\_\*\_privilege family is missing: has\_table / schema / column / sequence / function / type / language / foreign\_data\_wrapper / server / tablespace / parameter / largeobject\_privilege** \(filed 2026-11-17 by M0149-0001h\)
+  Kind: impl
+  Parent: M0149-0001h
+  - Repro on goopg: `select has\_table\_privilege\('pg\_class','select'\)` →
+    "function has\_table\_privilege does not exist". The same holds for
+    has\_schema\_privilege and the rest. pg\_proc seeds them; there is no
+    executor handler. psql `\\dp`, pg\_dump and many regress cases
+    \(privileges, rowsecurity\) call them.
+  - PG: utils/adt/acl.c, one family per object kind, with the same role /
+    object / privilege\-string resolution as has\_database\_privilege.
+  - First step: generalise has\_database\_privilege.go's aclmask evaluation
+    over goopg's per\-object ACL texts \(relacl / nspacl / attacl / proacl /
+    typacl\). Start with has\_table\_privilege and has\_schema\_privilege,
+    then measure regress privileges.
 - [ ] **M0149-0001k — WRONG RESULTS on a PG node: goopg stores money / point / lseg / box / line / circle / tid / aclitem columns as varlena, not PG's fixed\-length form** \(filed 2026-11-16 by M0149-0001g; S2\)
   Kind: impl
   Parent: M0149-0001g
