@@ -11771,6 +11771,43 @@ verify each at HEAD when the task starts.
     text, plus the two-argument current\_user forms\), with CREATE / CONNECT / TEMP / TEMPORARY privileges.
   - First step: implement the six overloads over goopg's datacl store \(the same ACL source pg\_database.datacl
     renders\), then compare `\\l+` against the PG oracle.
+- [ ] **M0149-0001k — WRONG RESULTS on a PG node: goopg stores money / point / lseg / box / line / circle / tid / aclitem columns as varlena, not PG's fixed\-length form** \(filed 2026-11-16 by M0149-0001g; S2\)
+  Kind: impl
+  Parent: M0149-0001g
+  - Repro, 2026\-11\-16, at f2068bdbf:
+    - goopg: `CREATE TABLE g(id int, m money, p point, b box, t tid, after int)`
+      and `INSERT … VALUES (1, '12.34', '(1.5,2)', '(1,1),(0,0)', '(3,4)', 99)`;
+      goopg reads the row back correctly.
+    - PG 18.3 cold start on the directory reads m = $33,284,856,530,830,756.35,
+      p = \(8.03e\-96, 2.69e\-110\), b = garbage and t = \(535830532,0\).
+    - `after` reads **340322** instead of 99: the varlena widths shift every
+      later column, so one such column corrupts the whole row.
+  - PG: these are fixed\-length pass\-by\-reference \(or, for money, int8\-like
+    by\-value\) types. pg\_type typlen / typalign:
+    - money 8 'd';
+    - point 16 'd', lseg 32 'd', box 32 'd', line 24 'd', circle 24 'd';
+    - tid 6 's';
+    - aclitem 16 'd'.
+  - goopg: catalog.PhysicalTypeIsVarlena defaults them to varlena
+    \(knownAlignGaps in catalog/physical\_align\_bki\_test.go\).
+  - Fix design:
+    - give each type its PG fixed\-length encode/decode in the heap codec
+      \(executor codec.go encodeValuePG / decodePhysicalPGValueMctx\) and in
+      every sibling: physical\_align / PhysicalTypeIsVarlena, coltypeinfo,
+      pgoutput \(xlog\), COPY binary, array element encode/decode, and
+      btree keys for money / tid;
+    - then drop those knownAlignGaps entries.
+    - Existing goopg data in the old varlena form becomes unreadable, so a
+      decision is needed: dual\-read by format version, or accept for
+      pre\-release clusters. The bench corpora carry none of these types.
+    - Rule \#5: run the full regress suite.
+  - Also seen: goopg rejects `12.34::numeric` into a money column \("column
+    m has type money but expression has type numeric"\); PG has an
+    assignment cast numeric→money.
+  - Rank: S2, awaiting owner placement \(below item 10 per the S7
+    carve\-out unless placed\).
+  > \#\# ESCALATION 2026\-11\-16 \(S2\) — M0149\-0001k: a PG node misreads goopg\-written money/point/box/tid/… columns and every column after them
+  > Filed under M0149\-0001g. Wrong results in the C3 PG\-on\-goopg\-data setting; goopg itself reads its data correctly. The fix is a heap\-codec format change that needs an owner decision on existing data. Owner placement requested.
 - [ ] **M0149-0001j — goopg-written pg\_statistic stavalues are unreadable on a PG node: 0-dimensional, text-typed arrays** \(filed 2026-11-16 by M0149-0001g; C3 interop, estimates only, below the item-10 rank\)
   Kind: impl
   Parent: M0149-0001g
