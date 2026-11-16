@@ -11886,6 +11886,27 @@ verify each at HEAD when the task starts.
     - Gates: units, postmaster, testport interop set, spotcheck, sf025 99,
       acceptance.
     Movement: none — C3 interop fix \(goopg restart A/B identical\)
+  - 2026-11-16 third slice: name\[\] has a real element image, and name stavalues are typed.
+    - utils/adt/array ElemTypeInfo gains name \(OID 19, typlen 64,
+      typalign 'c'\). Encode and decode arms are siblings of the scalar
+      NameData arm: 64 bytes NUL\-padded, input truncated to 63 bytes.
+      Legacy name\[\] blobs \(elemtype 25, text bodies\) still decode on
+      their text path.
+    - "name" joins typedStatValueTypes.
+    - Probe \(tmp/catidx/s39\):
+      - a PG node reads name MCVs with their frequencies \(0.2 / 0.04\);
+      - a PG node reads goopg\-written name\[\] columns at PG's sizes
+        \(152 bytes for 2 elements, 88 for 1\); subscripts and `= ANY`
+        work;
+      - goopg's pg\_stats and name\[\] values survive two restarts.
+    - Pre\-existing goopg\-side gaps, also present at HEAD, ledgered:
+      - goopg's planner ignores name MCVs \(rows=119 = 1/ndistinct, where
+        PG uses the 0.2 frequency\);
+      - goopg's pg\_column\_size\(name\[\]\) prints 6.
+    - Regress A/B: arrays / name / stats / rowtypes / privileges unchanged.
+    - Gates: units, postmaster, testport interop set, spotcheck, sf025 99
+      \(PLAN\-SHAPE same\), acceptance.
+    Movement: none — C3 interop fix \(regress A/B unchanged; goopg restart round\-trip identical\)
 - [ ] **M0149-0001i — regnamespace has no name-resolution seam: `'public'::regnamespace::oid` errors, `99::regnamespace` prints 99** \(filed 2026-11-16 by M0149-0001g slice 24; correctness, below the item-10 rank\)
   Kind: impl
   Parent: none

@@ -3,6 +3,7 @@ package executor
 import (
 	"encoding/binary"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -31,6 +32,7 @@ func TestTypedStatValuesRoundTrip(t *testing.T) {
 		{"varchar", catalog.OIDVarChar, []string{"x", "yz"}, []string{"abc", "abcd", "abcde"}},
 		{"date", 1082, []string{"2020-01-02"}, []string{"1998-01-01", "1998-06-15", "2020-12-31"}},
 		{"bool", 16, []string{"t", "f"}, []string{"f", "t"}},
+		{"name", 19, []string{"pg_class", "a name, with comma"}, []string{"abc", "pg_proc", "zz"}},
 	}
 	cols := pgStatisticColumnsPG18()
 	for _, tc := range cases {
@@ -71,5 +73,41 @@ func TestTypedStatValuesRoundTrip(t *testing.T) {
 		if et := binary.LittleEndian.Uint32(blob[12:16]); et != catalog.OIDText {
 			t.Errorf("type %q: elemtype=%d, want legacy text %d", typ.Name, et, catalog.OIDText)
 		}
+	}
+}
+
+// TestNameArrayElementImage pins the name[] element arm (M0149-0001j): each
+// element is PG's 64-byte NUL-padded NameData at typalign 'c', so a 2-element
+// array is 24 + 2 x 64 = 152 bytes with elemtype 19 (PG 18.3:
+// pg_column_size(ARRAY['a','b']::name[]) = 152); input past 63 bytes is
+// truncated as namein does; and a legacy blob written before the arm
+// (elemtype 25, text bodies) still decodes on its text path.
+func TestNameArrayElementImage(t *testing.T) {
+	long := strings.Repeat("x", 70)
+	typ := catalog.Type{Name: "name", IsArray: true}
+	enc, err := encodeValuePG(typ, NewStringDatum("{a,"+long+"}"))
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if len(enc) != 152 {
+		t.Fatalf("name[] size = %d, want 152", len(enc))
+	}
+	if et := binary.LittleEndian.Uint32(enc[12:16]); et != 19 {
+		t.Fatalf("elemtype = %d, want 19", et)
+	}
+	d, _, err := decodePhysicalPGValueMctx(typ, enc, nil)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got, want := d.StringValue(), "{a,"+long[:63]+"}"; got != want {
+		t.Errorf("round-trip = %q, want %q", got, want)
+	}
+	legacy, err := encodeValuePG(catalog.Type{Name: "text", IsArray: true}, NewStringDatum("{a,b}"))
+	if err != nil {
+		t.Fatalf("legacy encode: %v", err)
+	}
+	d, _, err = decodePhysicalPGValueMctx(typ, legacy, nil)
+	if err != nil || d.StringValue() != "{a,b}" {
+		t.Errorf("legacy text-element name[] decode = %q, %v; want {a,b}", d.StringValue(), err)
 	}
 }

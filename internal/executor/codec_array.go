@@ -246,6 +246,16 @@ func encodeArrayElem(elemName, e string, varlena bool, ctx *Context, pos int) ([
 		default:
 			return []byte{0}, nil
 		}
+	case "name":
+		// Sibling of encodeValuePG's scalar "name" arm (and pgarray's decode
+		// arm): NameData, 64 bytes NUL-padded, the input truncated to
+		// NAMEDATALEN-1 = 63 bytes as namein does. M0149-0001j.
+		if len(e) > 63 {
+			e = e[:63]
+		}
+		b := make([]byte, 64)
+		copy(b, e)
+		return b, nil
 	case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation":
 		// Sibling of the scalar reg* arm in encodeValuePG (66th–68th slices,
 		// deferral 1306): an array element arrives as the text inside the array

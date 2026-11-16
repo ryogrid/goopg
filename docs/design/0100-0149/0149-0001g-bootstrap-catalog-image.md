@@ -438,3 +438,7 @@ the two layouts legitimately differ.
     unchanged.
 - Types outside the set keep the legacy blob until their text round\-trip is
   settled \(time types depend on DateStyle and TimeZone\).
+- Slice 3 \(name\): goopg's array codec gives name\[\] PG's element image,
+  64\-byte NameData at typalign 'c', so name stavalues and user name\[\]
+  columns are both readable on a PG node. Blobs written before this change
+  \(elemtype 25\) still decode through the text path.

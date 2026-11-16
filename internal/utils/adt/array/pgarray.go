@@ -20,6 +20,7 @@
 package array
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -238,6 +239,14 @@ func ElemTypeInfo(elemName string) (oid uint32, size, align int, varlena, ok boo
 		return 4096, 4, 4, false, true
 	case "regcollation":
 		return 4191, 4, 4, false, true
+	// M0149-0001j: name (pg_type 19) is NameData — typlen 64, typalign 'c' —
+	// so a name[] element is the 64-byte NUL-padded image the scalar column
+	// stores, with no per-element header. Pinned on PG 18.3: a 2-element
+	// name[] is 152 bytes = 24 + 2 × 64. Before this arm name[] fell to the
+	// unknown-element fallback (elemtype 25, text bodies), which a PG node
+	// reading pg_attribute.atttypid = _name (1003) deforms wrongly.
+	case "name":
+		return 19, 64, 1, false, true
 	default:
 		return 0, 0, 0, false, false
 	}
@@ -389,6 +398,13 @@ func DecodeElemStyled(elemName string, data []byte, varlena bool, size int, st O
 			return "t", 1, nil
 		}
 		return "f", 1, nil
+	case "name":
+		// Sibling of encodeArrayElem's "name" arm: NameData up to its NUL.
+		nd := data[:64]
+		if i := bytes.IndexByte(nd, 0); i >= 0 {
+			nd = nd[:i]
+		}
+		return QuoteTextElem(string(nd)), 64, nil
 	// Siblings of encodeArrayElem's date-time arms (M0119-0006). Each renders
 	// the same integer image the SCALAR column stores, through the shared
 	// pgdatetime renderers, so the element text is upstream's type output
