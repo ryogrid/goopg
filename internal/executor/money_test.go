@@ -116,3 +116,29 @@ func TestCashBuiltins(t *testing.T) {
 		t.Errorf("minimum money as numeric = %q", got)
 	}
 }
+
+// TestMoneyBTreeKey pins M0149-0001k5's btree key: the int64 Cash count in
+// int8 order (cash_cmp), probes resolved through cash_in, and the scalar
+// decode twin returning the money Datum.
+func TestMoneyBTreeKey(t *testing.T) {
+	col := &catalog.Column{Name: "m", Type: catalog.Type{Name: "money"}}
+	var prev []byte
+	for _, s := range []string{"-$750.00", "-0.01", "0", "12", "$1,000,000.00"} {
+		k, err := encodeBTreeKeyForColumn(nil, NewStringDatum(s), col, 0)
+		if err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+		if prev != nil && string(prev) >= string(k) {
+			t.Errorf("key for %s does not sort after its predecessor", s)
+		}
+		prev = k
+		d, n, handled, derr := decodeScalarBTreeKey(k, "money")
+		want, _ := moneyCents(NewStringDatum(s))
+		if !handled || derr != nil || n != 8 || MoneyText(d) != MoneyText(moneyDatum(want)) {
+			t.Errorf("%s: decoded %q", s, MoneyText(d))
+		}
+	}
+	if !isSupportedBTreeKeyType("money") {
+		t.Error("money must be a supported btree key type")
+	}
+}

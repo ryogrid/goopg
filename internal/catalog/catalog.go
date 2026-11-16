@@ -24651,6 +24651,20 @@ func defaultColumnOpclassNameForType(typeName string) (string, bool) {
 		return "inet_ops", true
 	case "bytea":
 		return "bytea_ops", true
+	// M0149-0001k5: types goopg can btree-index whose pg_index.indclass was
+	// written as 0, which a PG node rejects ("bogus pg_index tuple") for every
+	// query on the table. Default opclasses per pg_opclass.dat: cidr and the
+	// reg* family binary-coerce to inet_ops / oid_ops.
+	case "money":
+		return "money_ops", true
+	case "time", "time without time zone":
+		return "time_ops", true
+	case "timetz", "time with time zone":
+		return "timetz_ops", true
+	case "cidr":
+		return "inet_ops", true
+	case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation", "regnamespace", "regoper", "regoperator", "regconfig", "regdictionary":
+		return "oid_ops", true
 	}
 	return "", false
 }

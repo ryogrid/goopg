@@ -16282,6 +16282,16 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 		}
 		return nbtree.EncodeInt8(int64(oid)), nil
 	}
+	// money (cash_ops / cash_cmp): the key is the int64 Cash count, ordered
+	// as int8. A literal probe is cash_in'd, a numeric one rounded, exactly
+	// as the ::money cast does. M0149-0001k5.
+	if isMoneyTypeName(col.Type.Name) {
+		c, merr := moneyCents(v)
+		if merr != nil {
+			return nil, keyExecError(merr, pos)
+		}
+		return nbtree.EncodeInt8(c), nil
+	}
 	// Unknown-literal coercion (sibling of the seq-scan promoteCrossKind path):
 	// a probe key built from a quoted literal (`WHERE id = '1'`) arrives as
 	// KindString even for an int/numeric/timestamp column, because bare string
@@ -17271,7 +17281,9 @@ func isSupportedBTreeKeyType(name string) bool {
 		// inet / cidr — M0134-0002 C5, the order-preserving network key
 		// (encodeInetBTreeKey / decodeScalarBTreeKey). Both share the
 		// btree/inet_ops opclass (cidr binary-coerces to it).
-		isInetType(name) || isCidrType(name)
+		isInetType(name) || isCidrType(name) ||
+		// money — M0149-0001k5, the int8 key over the Cash count.
+		isMoneyTypeName(name)
 }
 
 // btreeKeyTypeRejectionError returns the PG-faithful rejection for a type goopg

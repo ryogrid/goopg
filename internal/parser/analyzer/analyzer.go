@@ -3712,6 +3712,14 @@ func isAssignable(src, dst catalog.Type) bool {
 	if strings.EqualFold(src.Name, dst.Name) {
 		return true
 	}
+	// pg_cast assignment casts into money: numeric_cash, int4_cash and
+	// int8_cash (castcontext 'a'). int2 has no direct cast. M0149-0001k5.
+	if strings.EqualFold(dst.Name, "money") && !dst.IsArray {
+		switch strings.ToLower(src.Name) {
+		case "numeric", "decimal", "int4", "int", "integer", "int8", "bigint":
+			return true
+		}
+	}
 	if isNumericTypeName(src.Name) && isNumericTypeName(dst.Name) {
 		return true
 	}

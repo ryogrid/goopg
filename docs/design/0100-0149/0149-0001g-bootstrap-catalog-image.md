@@ -486,3 +486,7 @@ the two layouts legitimately differ.
 - M0149\-0001k4 \(COPY BINARY\): fixedgeo Send / Recv produce the types'
   send formats, byte\-identical to PG's COPY output, and money uses
   cash\_send. Server\-side COPY FROM a file now honours FORMAT binary.
+- M0149\-0001k5 \(money indexes\): money is a btree key, the int8 order of
+  the Cash count. It is tuple\-format only under fixed\_length\_money.
+  pg\_index.indclass now names the default opclass for money / time /
+  timetz / cidr / reg\*; with 0 there, PG cannot open the table.

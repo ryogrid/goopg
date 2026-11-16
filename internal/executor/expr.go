@@ -1127,6 +1127,15 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			}
 			return NewStringDatum(digits), nil
 		}
+		// money → a text type is the type's output function, cash_out
+		// ("$12.34"), not the scale-2 numeric goopg carries the value as.
+		// M0149-0001k5.
+		if isMoneyTypeName(x.SourceType) && !v.IsNull() {
+			switch strings.ToLower(castTargetType) {
+			case "text", "varchar", "character varying", "bpchar", "char", "character", "name":
+				return evalCastTyped(NewStringDatum(MoneyText(v)), castTargetType, "text", x.Pos(), ctx)
+			}
+		}
 		result, err := evalCastTyped(v, castTargetType, x.SourceType, x.Pos(), ctx)
 		if err != nil {
 			return Datum{}, err

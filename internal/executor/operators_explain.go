@@ -13,6 +13,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor/hashsize"
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/utils/adt/cash"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -5618,6 +5619,13 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		if sc, isStr := x.Operand.(*optimizer.StringConst); isStr && strings.EqualFold(x.TargetType, "name") {
 			return quoteLiteral(sc.Value) + "::name"
 		}
+		// A literal cast to money is a money Const upstream, printed through
+		// cash_out: `(m = '$12.00'::money)`. M0149-0001k5.
+		if sc, isStr := x.Operand.(*optimizer.StringConst); isStr && strings.EqualFold(x.TargetType, "money") {
+			if c, err := moneyCents(NewStringDatum(sc.Value)); err == nil {
+				return quoteLiteral(cash.Out(c)) + "::money"
+			}
+		}
 		return formatExprQual(x.Operand, reg, qualify)
 	case *optimizer.FuncCall:
 		// An operator implemented as a call (money arithmetic → cash_*) is an
@@ -6295,6 +6303,14 @@ func coerceLiteralText(lit optimizer.Expr, t catalog.Type) (otherCast, text stri
 	case "text":
 		if c, isStr := lit.(*optimizer.StringConst); isStr {
 			return "", quoteLiteral(c.Value) + "::text", true
+		}
+	case "money":
+		// The unknown literal resolves to money (cash_in), printed through
+		// cash_out: `(m = '$12.00'::money)`. M0149-0001k5.
+		if c, isStr := lit.(*optimizer.StringConst); isStr {
+			if cents, err := moneyCents(NewStringDatum(c.Value)); err == nil {
+				return "", quoteLiteral(cash.Out(cents)) + "::money", true
+			}
 		}
 	case "name":
 		// The unknown literal resolves to name (namein), the operator is

@@ -12046,6 +12046,41 @@ verify each at HEAD when the task starts.
       \("column … has type money but expression has type numeric"\).
   - First step: the btree key codec for money \(int8\-like over the Cash
     count\), then the analyzer's assignment\-cast table.
+  - 2026-11-17 first slice: btree indexes on money, PG\-valid indclass for every indexable type, the assignment casts and money::text.
+    - btree key \(operators\_ddl encodeBTreeKeyForColumn, decodeScalarBTreeKey\):
+      the int64 Cash count as an int8 key \(cash\_cmp order\). Probes go
+      through moneyCents.
+    - Tuple\-format \(PG\-on\-disk\) index keys: pgindex\_keydesc maps money
+      to OIDMoney with the int8 comparator, only under fixed\_length\_money,
+      where the heap image is the Cash.
+    - Found and fixed: pg\_index.indclass was written as 0 for money, time,
+      timetz, cidr and the reg\* family, because
+      defaultColumnOpclassNameForType had no arm for them. A PG node then
+      failed every query on such a table with "bogus pg\_index tuple". They
+      now map to money\_ops / time\_ops / timetz\_ops / inet\_ops /
+      oid\_ops.
+    - EXPLAIN prints a literal against money as `'$12.00'::money`, in both
+      the qual and the Index Cond paths.
+    - Analyzer: numeric / int4 / int8 → money are assignment casts
+      \(pg\_cast castcontext 'a'\).
+    - `money::text` and the other text targets go through cash\_out \(CastExpr
+      SourceType\).
+    - Probe \(tmp/catidx/s48\):
+      - goopg index scans return the right rows, order both ways and
+        enforce unique;
+      - a PG cold start uses goopg's money index for equality, range and
+        ORDER BY;
+      - a PG\-inserted row reads back through the index on goopg.
+    - Still open in k5:
+      - lc\_monetary other than C;
+      - typed stavalues and money\[\] elements;
+      - `money \|\| text` prints the bare numeric;
+      - float8 → money is wrongly accepted as an assignment.
+    - Tests: TestMoneyBTreeKey, TestDefaultBtreeOpclassForIndexableTypes.
+    - Regress A/B over 18 cases unchanged.
+    - Gates: units, postmaster, testport interop set, spotcheck, sf025 99,
+      acceptance.
+    Movement: none — C3 interop and correctness fix \(regress A/B unchanged\)
 - [ ] **M0149-0001j — goopg-written pg\_statistic stavalues are unreadable on a PG node: 0-dimensional, text-typed arrays** \(filed 2026-11-16 by M0149-0001g; C3 interop, estimates only, below the item-10 rank\)
   Kind: impl
   Parent: M0149-0001g

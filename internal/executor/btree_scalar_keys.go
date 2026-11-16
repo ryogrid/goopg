@@ -302,6 +302,13 @@ func encodeScalarBTreeKey(v Datum, col *catalog.Column, pos int) (key []byte, ha
 // never errors (the M0119-0006 NUMERIC slice found that exact latent misread).
 func decodeScalarBTreeKey(key []byte, typeName string) (d Datum, n int, handled bool, err error) {
 	switch {
+	case isMoneyTypeName(typeName):
+		// Twin of encodeBTreeKeyForColumn's money arm. M0149-0001k5.
+		if len(key) < 8 {
+			return NullDatum, 0, true, fmt.Errorf("btree: money key truncated, got %d bytes", len(key))
+		}
+		v, derr := nbtree.DecodeInt8(key[:8])
+		return moneyDatum(v), 8, true, derr
 	case isInt2Type(typeName):
 		if len(key) < 4 {
 			return NullDatum, 0, true, fmt.Errorf("btree: int2 key truncated, got %d bytes", len(key))

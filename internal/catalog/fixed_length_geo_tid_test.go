@@ -92,3 +92,18 @@ func TestFixedLengthAclItem(t *testing.T) {
 		t.Error("legacy cluster: aclitem must stay varlena at 'i'")
 	}
 }
+
+// TestDefaultBtreeOpclassForIndexableTypes pins the pg_index.indclass
+// default-opclass mapping for the types goopg can btree-index whose indclass
+// used to be 0 (a PG node then rejects every query on the table with "bogus
+// pg_index tuple"). OIDs per a PG 18.3 initdb. M0149-0001k5.
+func TestDefaultBtreeOpclassForIndexableTypes(t *testing.T) {
+	c := NewInMemory()
+	for typ, want := range map[string]uint32{
+		"money": 10047, "time": 10038, "timetz": 10041, "cidr": 10015, "regclass": 1981, "int4": 1978,
+	} {
+		if got := c.ResolveIndexColumnOpclassOID("", typ, 403); got != want {
+			t.Errorf("default btree opclass for %s = %d, want %d", typ, got, want)
+		}
+	}
+}
