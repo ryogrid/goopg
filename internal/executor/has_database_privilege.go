@@ -48,7 +48,7 @@ func evalHasDatabasePrivilege(args []Datum, ctx *Context, pos int) (Datum, error
 	if dbArg.Kind == KindInt {
 		n, ok := im.DatabaseNameByDisplayOID(uint32(dbArg.Int))
 		if !ok {
-			return NullDatum, nil
+			return missingObjectResult(im, role, privs, dbPrivNames)
 		}
 		dbName = n
 	} else {

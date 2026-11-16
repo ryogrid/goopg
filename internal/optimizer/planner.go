@@ -17358,8 +17358,10 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "money"}
 		case "cash_div_cash":
 			return catalog.Type{Name: "float8"}
-		case "has_database_privilege", "has_table_privilege", "has_schema_privilege":
-			return catalog.Type{Name: "bool"} // M0149-0001h
+		case "has_database_privilege", "has_table_privilege", "has_schema_privilege",
+			"has_column_privilege", "has_any_column_privilege", "has_sequence_privilege",
+			"has_function_privilege", "has_type_privilege":
+			return catalog.Type{Name: "bool"} // M0149-0001h / h1
 		case "row":
 			// `row(a, b)` reaches the planner as a call named row; PG's
 			// RowExpr is an anonymous record (M0146-0053) — a VALUES column

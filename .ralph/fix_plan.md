@@ -11845,6 +11845,52 @@ verify each at HEAD when the task starts.
     - Gates: units, fire\-set \(fires=none\), testport, spotcheck, sf025 99,
       acceptance.
     Movement: regress privileges 1242→993
+  - 2026-11-17 second slice: has\_column / has\_any\_column / has\_sequence / has\_function / has\_type\_privilege.
+    - executor has\_privilege\_objects.go, on the shared evaluator:
+      - column: column\_privilege\_check — attacl first, then relacl; a name
+        \(42703; the pg.dropped name → NULL\) or an int2 attnum; system
+        columns; a missing table OID or attnum → NULL;
+      - any\_column: table privilege, else any non\-dropped column;
+      - sequence: USAGE / SELECT / UPDATE parsed before the name; 42809 for a
+        non\-sequence;
+      - function: regprocedure input \(42883\) or OID; user routines,
+        aggregates and the full builtin pg\_proc table; PUBLIC EXECUTE;
+      - type: regtype input \(42704\) or OID; arrays follow the element type;
+        PUBLIC USAGE.
+    - Found: object\_aclmask\_ext checks superuser before the lookup, so a
+      superuser gets **true** for an unknown function / type / schema /
+      database OID \(NULL for other roles\). has\_schema / has\_database
+      returned NULL; missingObjectResult fixes all four. Relations stay NULL.
+    - Probe \(tmp/s55 vs PG 18.3\): grants, revokes, dropped / system /
+      unknown columns, sequences, arrays, unknown OIDs, errors, and a
+      `SET ROLE` non\-superuser pass — identical.
+    - Regress: privileges 993→889 \(inventory updated\); 10 other cases
+      unchanged.
+    - Remaining in privileges.diff: has\_largeobject\_privilege \(26\) —
+      goopg has no large objects \(filed M0149\-0001h1a\). Still missing
+      here: has\_language / foreign\_data\_wrapper / server / tablespace /
+      parameter\_privilege.
+    - Test: TestHasObjectPrivileges.
+    - Gates: units, fire\-set \(fires=none\), spotcheck, sf025 99,
+      acceptance \(values identical\).
+    Movement: regress privileges 993→889
+- [ ] **M0149-0001h1a — large objects are not implemented: lo\_create / lo\_unlink / lo\_\* and has\_largeobject\_privilege do not exist** \(filed 2026-11-17 by M0149-0001h1\)
+  Kind: impl
+  Parent: M0149-0001h1
+  - Repro on goopg: `select lo_create(1001)` → "function lo\_create does not
+    exist"; `select has_largeobject_privilege(1001, 'SELECT')` → "function
+    has\_largeobject\_privilege does not exist". Regress privileges has 26
+    such errors plus 8 lo\_create and 4 lo\_unlink.
+  - PG: be\-fsstubs.c / inv\_api.c over pg\_largeobject\_metadata \(lomowner,
+    lomacl\) and pg\_largeobject \(loid, pageno, data\); GRANT / REVOKE ON
+    LARGE OBJECT; has\_largeobject\_privilege \(acl.c, pg\_largeobject\_aclmask\_snapshot;
+    lo\_compat\_privileges\).
+  - goopg bootstraps pg\_largeobject \(2613\) and its index for PG nodes
+    \(M0149\-0001g slice 30\) but has no SQL\-side store or functions.
+  - First step: a metadata store \(OID, owner, ACL\) with lo\_create /
+    lo\_unlink / lo\_from\_bytea / lo\_get, rendered as
+    pg\_largeobject\_metadata; then has\_largeobject\_privilege on the shared
+    evaluator \(letters rw, acldefault owner rw, no PUBLIC\).
 - [ ] **M0149-0001k — WRONG RESULTS on a PG node: goopg stores money / point / lseg / box / line / circle / tid / aclitem columns as varlena, not PG's fixed\-length form** \(filed 2026-11-16 by M0149-0001g; S2\)
   Kind: impl
   Parent: M0149-0001g

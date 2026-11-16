@@ -216,20 +216,7 @@ func evalHasTablePrivilege(args []Datum, ctx *Context, pos int) (Datum, error) {
 	if err != nil {
 		return Datum{}, err
 	}
-	owner := catalog.BootstrapSuperuserOID
-	if tbl.Owner != "" {
-		if o, ok := im.RoleOID(tbl.Owner); ok {
-			owner = o
-		}
-	}
-	obj := aclObject{owner: owner, letters: "arwdDxtm", defaultOwner: "arwdDxtm",
-		implied: map[uint32]string{roleReadAllData: "r", roleWriteAllData: "awd", roleMaintain: "m"}}
-	if tbl.IsSequence {
-		obj.aclText, obj.letters, obj.defaultOwner = im.SequenceRelaclText(relOID), "rwU", "rwU"
-		obj.implied = map[uint32]string{roleReadAllData: "r", roleWriteAllData: "w"}
-	} else {
-		obj.aclText = im.RelaclText(relOID)
-	}
+	obj := relationACLObject(im, tbl, relOID)
 	return NewBoolDatum(aclAnyHeld(im, role, obj, want)), nil
 }
 
@@ -257,7 +244,7 @@ func evalHasSchemaPrivilege(args []Datum, ctx *Context, pos int) (Datum, error) 
 		oid = uint32(objArg.Int)
 		name = im.SchemaNameForOID(oid)
 		if name == "" {
-			return NullDatum, nil
+			return missingObjectResult(im, role, privs, schemaPrivNames)
 		}
 	} else {
 		name = objArg.StringValue()
