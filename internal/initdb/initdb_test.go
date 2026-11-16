@@ -370,8 +370,11 @@ func TestBootstrappedPGClassRowsReadable(t *testing.T) {
 		if row.RelName != wantName {
 			t.Errorf("OID %d: relname=%q want %q", oid, row.RelName, wantName)
 		}
-		if row.RelFileNode != oid {
-			t.Errorf("OID %d: relfilenode=%d want %d", oid, row.RelFileNode, oid)
+		// pg_type / pg_attribute / pg_class are mapped catalogs: relfilenode
+		// is 0 and pg_filenode.map holds the file number, as in PG 18.3
+		// (M0149-0001g slice 27).
+		if row.RelFileNode != 0 {
+			t.Errorf("OID %d: relfilenode=%d want 0 (mapped)", oid, row.RelFileNode)
 		}
 	}
 }

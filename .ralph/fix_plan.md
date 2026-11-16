@@ -12458,6 +12458,32 @@ verify each at HEAD when the task starts.
       ports, regress A/B on 4 cases \(no movement\), spotcheck, sf025 99,
       acceptance.
     Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 27: the 63 mapped catalogs carry relfilenode 0, and both pg\_filenode.map files equal PG 18.3's byte for byte.
+    - Before:
+      - goopg wrote relfilenode = oid for pg\_class, pg\_attribute, pg\_proc,
+        pg\_type, every shared catalog, their indexes and TOAST pairs;
+      - the global map held 9 entries; the local map held ~60 non\-mapped
+        catalogs plus stale and duplicate OIDs.
+      - On a PG node, VACUUM FULL pg\_proc left every later backend reading
+        the truncated old file.
+    - internal/initdb/relmap\_catalogs.go holds PG's two map lists in
+      insertion order \(global 46, local 17\). They drive defaultRelMapFile,
+      the per\-database map, and pgClassRow \(relfilenode 0\). The 3455 index
+      follows from pgClassRow.
+    - Also fixed: pg\_class OID 2655 was named pg\_amproc\_oid\_index, the
+      same as 2757. That duplicated a pg\_class\_relname\_nsp\_index key;
+      2655 is now pg\_amproc\_fam\_proc\_index.
+    - PG cold start:
+      - every catalog's relname and relfilenode equal a PG initdb's, except
+        the known pg\_largeobject gap;
+      - VACUUM FULL pg\_proc / pg\_class / pg\_database, CLUSTER
+        pg\_attribute, REINDEX TABLE pg\_type / pg\_class all work, and
+        survive a PG restart.
+    - goopg restarts clean twice; its loader ignores relfilenode 0 rows.
+    - Gates: units, initdb, postmaster, testport interop set \+ toast,
+      amcheck, basebackup and rewind ports; regress A/B on 4 cases \(no
+      movement\); spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

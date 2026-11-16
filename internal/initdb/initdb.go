@@ -2221,71 +2221,11 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 			return err
 		}
 	}
-	// Local pg_filenode.map with critical local catalog entries.
-	// All standard PG local catalogs (OID == filenumber by default).
-	localRelMap := makeRelMapFile([][2]uint32{
-		{826, 826},   // pg_default_acl (M0106-0010 step 3ak)
-		{1247, 1247}, // pg_type
-		{1249, 1249}, // pg_attribute
-		{1255, 1255}, // pg_proc
-		{1259, 1259}, // pg_class
-		{2600, 2600}, // pg_aggregate
-		{2601, 2601}, // pg_am
-		{2602, 2602}, // pg_amop
-		{2603, 2603}, // pg_amproc
-		{2604, 2604}, // pg_attrdef
-		{2605, 2605}, // pg_cast
-		{2606, 2606}, // pg_constraint
-		{2607, 2607}, // pg_conversion
-		{2608, 2608}, // pg_depend
-		{2609, 2609}, // pg_description
-		{2610, 2610}, // pg_index
-		{2611, 2611}, // pg_inherits
-		{2612, 2612}, // pg_language
-		{2613, 2613}, // pg_largeobject
-		{2614, 2614}, // pg_largeobject_metadata
-		// {2615, 2615}: dedicated bootstrapper (bootstrapPgNamespaceTuples)
-		{2616, 2616}, // pg_opclass
-		{2617, 2617}, // pg_operator
-		// {2618, 2618}: dedicated bootstrapper (bootstrapPgRewriteTuples)
-		{2619, 2619}, // pg_statistic
-		{2620, 2620}, // pg_trigger
-		{3381, 3381}, // pg_statistic_ext
-		{3501, 3501}, // pg_enum (M0106-0010 step 3an)
-		{3596, 3596}, // pg_seclabel
-		{3602, 3602}, // pg_ts_config (M0106-0010 step 3ck) — authoritative OID per pg_ts_config.h:30
-		{3764, 3764}, // pg_ts_config (stale — true pg_ts_config OID is 3602, mapped above)
-		{3603, 3603}, // pg_ts_config_map (M0106-0010 step 3cj) — authoritative OID per pg_ts_config_map.h:30
-		{3765, 3765}, // pg_ts_config_map (stale — true pg_ts_config_map OID is 3603, mapped above)
-		{3600, 3600}, // pg_ts_dict (M0106-0010 step 3cm) — authoritative OID per pg_ts_dict.h:29
-		{3766, 3766}, // pg_ts_template_tmplname_index (M0106-0010 step 3co) — authoritative OID per pg_ts_template.h:48
-		{3601, 3601}, // pg_ts_parser (M0106-0010 step 3cn) — authoritative OID per pg_ts_parser.h:29
-		{3767, 3767}, // pg_ts_template_oid_index (M0106-0010 step 3co) — authoritative OID per pg_ts_template.h:49
-		{3764, 3764}, // pg_ts_template (M0106-0010 step 3co) — authoritative OID per pg_ts_template.h:29
-		{3768, 3768}, // pg_ts_template (stale — true pg_ts_template OID is 3764, mapped above; 3768 has no upstream catalog assignment)
-		{3466, 3466}, // pg_event_trigger (M0106-0010 step 3ar)
-		{3079, 3079}, // pg_extension (M0106-0010 step 3aw)
-		{2328, 2328}, // pg_foreign_data_wrapper (M0106-0010 step 3bb)
-		{1417, 1417}, // pg_foreign_server (M0106-0010 step 3be)
-		{1418, 1418}, // pg_user_mapping (M0106-0010 step 3cp) — authoritative OID per pg_user_mapping.h:28
-		{3118, 3118}, // pg_foreign_table (M0106-0010 step 3bh)
-		{2753, 2753}, // pg_opfamily (M0106-0010 step 3bm)
-		{3350, 3350}, // pg_partitioned_table (M0106-0010 step 3bs)
-		{6104, 6104}, // pg_publication (M0106-0010 step 3bu)
-		{6237, 6237}, // pg_publication_namespace (M0106-0010 step 3bx)
-		{6106, 6106}, // pg_publication_rel (M0106-0010 step 3by)
-		{3541, 3541}, // pg_range (M0106-0010 step 3bz)
-		{2224, 2224}, // pg_sequence (M0106-0010 step 3cb)
-		{3429, 3429}, // pg_statistic_ext_data (M0106-0010 step 3cc)
-		{3576, 3576}, // pg_transform (M0106-0010 step 3ci) — authoritative OID per pg_transform.h
-		{6003, 6003}, // pg_publication (stale comment — OID 6003 has no upstream catalog assignment)
-		{6101, 6101}, // pg_publication_rel
-		{6102, 6102}, // pg_subscription_rel (stale comment was "pg_sequence" — true pg_sequence OID is 2224, mapped above)
-		{6137, 6137}, // pg_transform (stale — true pg_transform OID is 3576, mapped above)
-		{6239, 6239}, // pg_authid (shared but also local copy sometimes)
-		{6245, 6245}, // pg_statistic_ext_data
-		{9400, 9400}, // pg_db_role_setting (shared but may need local mapping)
-	})
+	// Local pg_filenode.map: exactly PG 18.3's 17 local mapped relations
+	// (pgLocalRelMapOIDs, M0149-0001g slice 27). It used to list ~60
+	// non-mapped catalogs plus stale OIDs; harmless while every pg_class row
+	// carried relfilenode = oid, wrong once mapped rows carry 0.
+	localRelMap := makeRelMapFile(identityRelMap(pgLocalRelMapOIDs))
 	if err := os.WriteFile(filepath.Join(dbDir, "pg_filenode.map"), localRelMap, 0o600); err != nil {
 		return err
 	}
@@ -6432,6 +6372,9 @@ func pgClassRow(rel nailedRel) executor.Row {
 	// that PG's relcache fetches the view's ON-SELECT rewrite rule from
 	// pg_rewrite when the view is opened.
 	relFilenode := int64(rel.OID)
+	if isMappedCatalogOID(rel.OID) {
+		relFilenode = 0 // mapped: pg_filenode.map holds the file number (slice 27)
+	}
 	relHasRules := false
 	if rel.RelKind == 'v' {
 		relFilenode = 0
@@ -7199,17 +7142,9 @@ func makeRelMapFile(mappings [][2]uint32) []byte {
 }
 
 func defaultRelMapFile() []byte {
-	return makeRelMapFile([][2]uint32{
-		{1262, 1262}, // pg_database
-		{1260, 1260}, // pg_authid
-		{1261, 1261}, // pg_auth_members
-		{1213, 1213}, // pg_tablespace
-		{1214, 1214}, // pg_shdepend
-		{3592, 3592}, // pg_shdescription
-		{6000, 6000}, // pg_replication_origin
-		{6100, 6100}, // pg_subscription
-		{6243, 6243}, // pg_parameter_acl
-	})
+	// PG 18.3's 46 shared mapped relations (pgGlobalRelMapOIDs, M0149-0001g
+	// slice 27); it used to hold 9.
+	return makeRelMapFile(identityRelMap(pgGlobalRelMapOIDs))
 }
 
 func defaultPgIdentConf() []byte {
