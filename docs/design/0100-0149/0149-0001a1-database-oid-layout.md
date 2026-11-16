@@ -757,6 +757,20 @@ Key observation: PG compatibility constrains only the **displayed** and
 - goopg's own planner is unaffected: it reads catalog sizes from the VM and
   its private stats sidecar, never from pg\_class.
 
+## Follow\-up: M0149\-0001g slice 26 — every catalog TOAST relation \(2026\-11\-16\)
+
+- `nailedToastPairs` lists all 39 DECLARE\_TOAST pairs of a PG 18.3 initdb.
+  It is the single source for:
+  - the toast relations' pg\_class and pg\_attribute rows;
+  - the parents' reltoastrelid;
+  - the empty files;
+  - the toast indexes' pg\_index rows, derived in `pgIndexInitialEntries`.
+- Mapped catalogs: PG stores relfilenode 0 and looks the file up in
+  pg\_filenode.map; goopg still stores the OID. That breaks a PG node's
+  VACUUM FULL on pg\_proc. Fixing it is the next slice.
+- Relcache init files are rebuilt by PG at every startup, so their content
+  beyond existence never reaches a PG node.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

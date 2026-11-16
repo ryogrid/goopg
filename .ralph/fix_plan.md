@@ -12424,6 +12424,40 @@ verify each at HEAD when the task starts.
     - Gates: units, postmaster, testport interop set, regress A/B on 4 cases
       \(no movement\), spotcheck, sf025 99, acceptance.
     Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 26: all 39 catalog TOAST relations of a PG 18.3 initdb.
+    - Before: goopg had 12. A PG node creating a function with a 40 KB body
+      failed with "row is too big: size 40184, maximum size 8160".
+    - nailedToastPairs gains the 27 per\-database DECLARE\_TOAST pairs:
+      pg\_proc, pg\_type, pg\_description, pg\_statistic, pg\_constraint, …
+      The existing machinery writes their pg\_class / pg\_attribute rows,
+      reltoastrelid and empty files.
+    - pgIndexInitialEntries derives the \(chunk\_id, chunk\_seq\) UNIQUE
+      PRIMARY pg\_index row for every pair not listed explicitly.
+    - pg\_class\_oid\_index now uses the multi\-level bulk loader, because
+      pg\_class outgrew one leaf.
+    - PG cold start:
+      - parent, toast and index OIDs equal a PG initdb for all 39;
+      - the 40 KB function stores 21 chunks in pg\_toast\_1255 and runs;
+      - a 12 KB COMMENT stores 7 chunks in pg\_toast\_2609.
+    - goopg restarts clean twice.
+    - Found while probing \(both pre\-existing on HEAD, still open\):
+      - goopg writes pg\_class.relfilenode = oid for all 63 mapped
+        catalogs; PG has 0 and resolves them through pg\_filenode.map.
+        On a PG node, VACUUM FULL pg\_proc leaves later backends reading
+        the truncated old file \("could not read blocks 56..56 in file
+        base/5/1255"\). This is the next slice.
+      - goopg's pg\_proc carries goopg\-private duplicates 8101 / 8102
+        of pg\_stat\_get\_ins\_since\_vacuum / mod\_since\_analyze \(PG: 5053 /
+        3177\). A PG node's REINDEX TABLE pg\_proc fails on the unique
+        pg\_proc\_proname\_args\_nsp\_index.
+      - Also: the stats stamped into relcache init files would be moot,
+        because PG deletes pg\_internal.init at every startup
+        \(StartupXLOG → RelationCacheInitFileRemove\). That edit was
+        dropped.
+    - Gates: units, initdb, postmaster, testport interop set \+ toast/amcheck
+      ports, regress A/B on 4 cases \(no movement\), spotcheck, sf025 99,
+      acceptance.
+    Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

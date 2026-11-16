@@ -6266,6 +6266,27 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// both oid_ops with no collation.
 		entry(175, 1418, []int16{2, 3}, []uint32{oidOps, oidOps}, []uint32{0, 0}, true, false), // pg_user_mapping_user_server_index
 	}
+	// M0149-0001g slice 26: every DECLARE_TOAST pair not listed above gets the
+	// same UNIQUE PRIMARY (chunk_id oid_ops, chunk_seq int4_ops) index row —
+	// create_toast_table's shape, checked against a PG 18.3 initdb.
+	listed := make(map[uint32]bool, len(shared)+len(local))
+	for _, e := range shared {
+		listed[e.IndexRelid] = true
+	}
+	for _, e := range local {
+		listed[e.IndexRelid] = true
+	}
+	for _, p := range nailedToastPairs() {
+		if listed[p.ToastIdx] {
+			continue
+		}
+		e := entry(p.ToastIdx, p.ToastRel, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true)
+		if p.Shared {
+			shared = append(shared, e)
+		} else {
+			local = append(local, e)
+		}
+	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
 	out = append(out, local...)

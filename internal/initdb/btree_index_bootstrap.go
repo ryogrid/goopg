@@ -939,15 +939,12 @@ func bootstrapPgClassOidIndex(dataDir string, tids map[uint32]heapTID) error {
 	for i, e := range entries {
 		tuples[i] = pgBuildIndexTupleOidKey(e.block, e.off, e.oid)
 	}
-	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	// Multi-level once pg_class outgrows one leaf (M0149-0001g slice 26: the
+	// 27 added TOAST pairs push it past a page, as on PG's own image).
+	file, err := pgBuildBtreeBulkLoad(tuples, 1)
 	if err != nil {
-		return fmt.Errorf("pg_class_oid_index leaf: %w", err)
+		return fmt.Errorf("pg_class_oid_index bulk-load: %w", err)
 	}
-	meta := pgBuildBtreeMetapageWithRoot(1 /* root block */, 0 /* leaf level */)
-
-	file := make([]byte, 0, 2*storage.BlockSize)
-	file = append(file, meta...)
-	file = append(file, leaf...)
 
 	for _, dir := range []string{
 		filepath.Join(dataDir, "base", "1"),

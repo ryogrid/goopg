@@ -163,6 +163,34 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		2756: {1},    // pg_amop_oid_index
 		2757: {1},    // pg_amproc_oid_index
 		3455: {9, 8}, // pg_class_tblspc_relfilenode_index
+		// M0149-0001g slice 26: the 27 added DECLARE_TOAST indexes (chunk_id, chunk_seq).
+		4144: {1, 2}, // pg_toast_826_index
+		4172: {1, 2}, // pg_toast_1247_index
+		2837: {1, 2}, // pg_toast_1255_index
+		4152: {1, 2}, // pg_toast_1417_index
+		4174: {1, 2}, // pg_toast_1418_index
+		4150: {1, 2}, // pg_toast_2328_index
+		4160: {1, 2}, // pg_toast_2600_index
+		2831: {1, 2}, // pg_toast_2604_index
+		2833: {1, 2}, // pg_toast_2606_index
+		2835: {1, 2}, // pg_toast_2609_index
+		6352: {1, 2}, // pg_toast_2610_index
+		4158: {1, 2}, // pg_toast_2612_index
+		4164: {1, 2}, // pg_toast_2615_index
+		2841: {1, 2}, // pg_toast_2619_index
+		2337: {1, 2}, // pg_toast_2620_index
+		4148: {1, 2}, // pg_toast_3079_index
+		4154: {1, 2}, // pg_toast_3118_index
+		4168: {1, 2}, // pg_toast_3256_index
+		4166: {1, 2}, // pg_toast_3350_index
+		3440: {1, 2}, // pg_toast_3381_index
+		4156: {1, 2}, // pg_toast_3394_index
+		3431: {1, 2}, // pg_toast_3429_index
+		6176: {1, 2}, // pg_toast_3456_index
+		4146: {1, 2}, // pg_toast_3466_index
+		3599: {1, 2}, // pg_toast_3596_index
+		4170: {1, 2}, // pg_toast_3600_index
+		6229: {1, 2}, // pg_toast_6106_index
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {

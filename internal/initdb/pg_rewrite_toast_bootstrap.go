@@ -87,9 +87,10 @@ type toastRelPair struct {
 	Shared bool
 }
 
-// nailedToastPairs returns every TOAST relation goopg bootstraps at initdb.
-// Exactly one today: pg_rewrite's, whose ev_action column is the only
-// bootstrap-time datum that can exceed an inline heap tuple.
+// nailedToastPairs returns every TOAST relation goopg bootstraps at initdb —
+// all 39 of a PG 18.3 initdb (M0149-0001g slice 26). Only pg_rewrite's carries
+// chunks at bootstrap: its ev_action column is the one bootstrap-time datum
+// that can exceed an inline heap tuple.
 func nailedToastPairs() []toastRelPair {
 	return []toastRelPair{
 		{Parent: 2618, ToastRel: 2838, ToastIdx: 2839, RelName: "pg_toast_2618"},
@@ -114,6 +115,38 @@ func nailedToastPairs() []toastRelPair {
 		{Parent: 6100, ToastRel: 4183, ToastIdx: 4184, RelName: "pg_toast_6100", Shared: true}, // pg_subscription
 		{Parent: 1213, ToastRel: 4185, ToastIdx: 4186, RelName: "pg_toast_1213", Shared: true}, // pg_tablespace
 		{Parent: 6243, ToastRel: 6244, ToastIdx: 6245, RelName: "pg_toast_6243", Shared: true}, // pg_parameter_acl
+		// M0149-0001g slice 26: every other per-database catalog's
+		// DECLARE_TOAST pair (postgres/src/include/catalog/pg_*.h; OIDs checked
+		// against a PG 18.3 initdb). The files are empty, as upstream's initdb
+		// leaves them; a PG node toasts an oversized catalog value (a long
+		// prosrc, a big pg_statistic array) into them.
+		{Parent: 826, ToastRel: 4143, ToastIdx: 4144, RelName: "pg_toast_826"},   // pg_default_acl
+		{Parent: 1247, ToastRel: 4171, ToastIdx: 4172, RelName: "pg_toast_1247"}, // pg_type
+		{Parent: 1255, ToastRel: 2836, ToastIdx: 2837, RelName: "pg_toast_1255"}, // pg_proc
+		{Parent: 1417, ToastRel: 4151, ToastIdx: 4152, RelName: "pg_toast_1417"}, // pg_foreign_server
+		{Parent: 1418, ToastRel: 4173, ToastIdx: 4174, RelName: "pg_toast_1418"}, // pg_user_mapping
+		{Parent: 2328, ToastRel: 4149, ToastIdx: 4150, RelName: "pg_toast_2328"}, // pg_foreign_data_wrapper
+		{Parent: 2600, ToastRel: 4159, ToastIdx: 4160, RelName: "pg_toast_2600"}, // pg_aggregate
+		{Parent: 2604, ToastRel: 2830, ToastIdx: 2831, RelName: "pg_toast_2604"}, // pg_attrdef
+		{Parent: 2606, ToastRel: 2832, ToastIdx: 2833, RelName: "pg_toast_2606"}, // pg_constraint
+		{Parent: 2609, ToastRel: 2834, ToastIdx: 2835, RelName: "pg_toast_2609"}, // pg_description
+		{Parent: 2610, ToastRel: 6351, ToastIdx: 6352, RelName: "pg_toast_2610"}, // pg_index
+		{Parent: 2612, ToastRel: 4157, ToastIdx: 4158, RelName: "pg_toast_2612"}, // pg_language
+		{Parent: 2615, ToastRel: 4163, ToastIdx: 4164, RelName: "pg_toast_2615"}, // pg_namespace
+		{Parent: 2619, ToastRel: 2840, ToastIdx: 2841, RelName: "pg_toast_2619"}, // pg_statistic
+		{Parent: 2620, ToastRel: 2336, ToastIdx: 2337, RelName: "pg_toast_2620"}, // pg_trigger
+		{Parent: 3079, ToastRel: 4147, ToastIdx: 4148, RelName: "pg_toast_3079"}, // pg_extension
+		{Parent: 3118, ToastRel: 4153, ToastIdx: 4154, RelName: "pg_toast_3118"}, // pg_foreign_table
+		{Parent: 3256, ToastRel: 4167, ToastIdx: 4168, RelName: "pg_toast_3256"}, // pg_policy
+		{Parent: 3350, ToastRel: 4165, ToastIdx: 4166, RelName: "pg_toast_3350"}, // pg_partitioned_table
+		{Parent: 3381, ToastRel: 3439, ToastIdx: 3440, RelName: "pg_toast_3381"}, // pg_statistic_ext
+		{Parent: 3394, ToastRel: 4155, ToastIdx: 4156, RelName: "pg_toast_3394"}, // pg_init_privs
+		{Parent: 3429, ToastRel: 3430, ToastIdx: 3431, RelName: "pg_toast_3429"}, // pg_statistic_ext_data
+		{Parent: 3456, ToastRel: 6175, ToastIdx: 6176, RelName: "pg_toast_3456"}, // pg_collation
+		{Parent: 3466, ToastRel: 4145, ToastIdx: 4146, RelName: "pg_toast_3466"}, // pg_event_trigger
+		{Parent: 3596, ToastRel: 3598, ToastIdx: 3599, RelName: "pg_toast_3596"}, // pg_seclabel
+		{Parent: 3600, ToastRel: 4169, ToastIdx: 4170, RelName: "pg_toast_3600"}, // pg_ts_dict
+		{Parent: 6106, ToastRel: 6228, ToastIdx: 6229, RelName: "pg_toast_6106"}, // pg_publication_rel
 	}
 }
 
