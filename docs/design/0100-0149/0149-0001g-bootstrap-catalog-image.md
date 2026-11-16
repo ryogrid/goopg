@@ -398,3 +398,18 @@ the two layouts legitimately differ.
   \_RETURN rules: pg\_settings\_u and pg\_settings\_n.
 - They join the pg\_rewrite seed. pg\_depend no longer has to leave any row
   out, so `pgDependMissingObjects` is empty.
+
+## Follow\-up: M0149\-0001g slice 33 — imported collations \(2026\-11\-16\)
+
+- `pg_collation_generated.go` \(scripts/gen\-pg\-collations.py\) is a PG 18.3
+  initdb's whole pg\_collation heap, in heap order:
+  - the bki rows as setup\_collation leaves them;
+  - the libc collations from `locale -a`;
+  - the ICU collations.
+- Unlike every other captured table, its content depends on the host's
+  locales and ICU version, as PG's own import does. goopg carries the build
+  host's.
+  - A PG node with a different ICU reports a collation version mismatch, the
+    same as a PG cluster whose ICU was upgraded.
+- goopg's own SQL catalog still exposes only the seven built\-in
+  collations; goopg has no ICU.

@@ -2645,7 +2645,7 @@ func bootstrapPgCollationOidIndex(dataDir string, tids map[uint32]heapTID) error
 // (OID 3164) — UNIQUE btree on (collname, collencoding, collnamespace) — to
 // base/{1,5}/3164.
 func bootstrapPgCollationNameEncNspIndex(dataDir string, tids map[uint32]heapTID) error {
-	entries := pgCollationInitialEntries()
+	entries := pgCollationBootstrapEntries() // slice 33: incl. the imported collations
 	type indexed struct {
 		name  string
 		enc   int32

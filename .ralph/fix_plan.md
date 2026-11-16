@@ -12615,6 +12615,35 @@ verify each at HEAD when the task starts.
       4 cases \(rules, guc, misc\_sanity, sysviews; no movement\), spotcheck,
       sf025 99, acceptance.
     Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 33: pg\_collation carries a PG 18.3 initdb's 860 rows and their 842 descriptions.
+    - Before: goopg had the 7 pg\_collation.dat rows only. A PG node had no
+      ICU collations and no libc C.utf8, and `unicode` lacked its collversion.
+    - setup\_collation \(initdb.c\) imports `locale -a` libc locales and every
+      ICU locale through pg\_import\_system\_collations.
+    - scripts/gen\-pg\-collations.py captures the resulting heap, in ctid
+      order, into pg\_collation\_generated.go:
+      - the 7 bki rows as setup\_collation leaves them, with `unicode` moved
+        to the end of that group by its collversion UPDATE;
+      - C.utf8 \(12359\) and 852 ICU collations \(12360–13211\).
+    - pgCollationBootstrapEntries drives the heap and both indexes, 3085 and
+      3164. gen\-pg\-description.py now also covers pg\_collation objects
+      below 16384.
+    - The import is host\- and ICU\-version\-dependent, as in PG. goopg carries
+      the build host's PG 18.3 import \(ICU collversion 153.121; ledgered\).
+    - PG cold start:
+      - all 860 rows and 842 descriptions equal the oracle's in heap order;
+      - "de\-x\-icu" sorts ä after a;
+      - "en\-US\-x\-icu" orders 'a' < 'B', and "C" does not;
+      - a forced index scan finds fr\-x\-icu;
+      - information\_schema.collations lists ja\-x\-icu.
+    - goopg:
+      - restarts clean twice; user collations survive;
+      - a fresh\-db pg\_dump stays identical to PG's;
+      - its own SQL pg\_collation still lists 7 \(ledgered\).
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      5 cases \(collate, collate.icu.utf8, collate.utf8, misc\_sanity, psql;
+      no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

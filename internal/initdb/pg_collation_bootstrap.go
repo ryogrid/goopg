@@ -98,12 +98,22 @@ func pgCollationInitialEntries() []pgCollationEntry {
 	}
 }
 
-// bootstrapPgCollationTuples writes all 7 pg_collation rows to
-// base/{1,5}/3456 in the 12-column PG18 layout.
-// Returns TIDs keyed by collation OID for index seeding.
+// pgCollationBootstrapEntries is what goopg's initdb writes to pg_collation:
+// every row of a PG 18.3 initdb in heap order (pgCollationInitdb,
+// scripts/gen-pg-collations.py) — the seven pg_collation.dat rows as
+// setup_collation leaves them plus the imported libc / ICU collations. The
+// import is host- and ICU-version-dependent in PG too; goopg carries the build
+// host's. M0149-0001g slice 33.
+func pgCollationBootstrapEntries() []pgCollationEntry {
+	return pgCollationInitdb
+}
+
+// bootstrapPgCollationTuples writes the pg_collation rows
+// (pgCollationBootstrapEntries) to base/{1,5}/3456 in the 12-column PG18
+// layout. Returns TIDs keyed by collation OID for index seeding.
 func bootstrapPgCollationTuples(dataDir string) (map[uint32]heapTID, error) {
 	cols := pgCollationColDefs()
-	entries := pgCollationInitialEntries()
+	entries := pgCollationBootstrapEntries()
 	rows := make([]executor.Row, len(entries))
 	for i, e := range entries {
 		rows[i] = pgCollationRow(e)
