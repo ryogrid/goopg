@@ -62,3 +62,18 @@ func TestFixedLengthGeoTidMatchesPostgresBKI(t *testing.T) {
 		}
 	}
 }
+
+// TestFixedLengthMoney pins the money capability's catalog answers: Cash is
+// typlen 8, typalign 'd' (pg_type.dat OID 790) when the cluster has
+// fixed_length_money, varlena at 'i' otherwise. M0149-0001k1.
+func TestFixedLengthMoney(t *testing.T) {
+	defer SetFixedLengthMoney(FixedLengthMoney())
+	SetFixedLengthMoney(true)
+	if PhysicalTypeIsVarlena(Type{Name: "money"}) || PhysicalTypeAlignName(Type{Name: "money"}) != 8 {
+		t.Error("capable cluster: money must be fixed-length at 'd'")
+	}
+	SetFixedLengthMoney(false)
+	if !PhysicalTypeIsVarlena(Type{Name: "money"}) || PhysicalTypeAlignName(Type{Name: "money"}) != 4 {
+		t.Error("legacy cluster: money must stay varlena at 'i'")
+	}
+}

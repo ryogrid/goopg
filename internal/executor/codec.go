@@ -13,6 +13,7 @@ import (
 	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/utils/adt/array"
+	"github.com/goopg/goopg/internal/utils/adt/cash"
 	"github.com/goopg/goopg/internal/utils/adt/fixedgeo"
 	"github.com/goopg/goopg/internal/utils/adt/datetime"
 	"github.com/goopg/goopg/internal/access/common/pglz"
@@ -1132,6 +1133,21 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 			return nil, ee
 		}
 		return varlenaTextBytes(s), nil
+	case "money":
+		// Cash: int64 cents, 8 bytes by value in a cluster with the
+		// fixed_length_money capability; otherwise goopg's older varlena text,
+		// now written as cash_out's canonical form. Either way the input goes
+		// through cash_in / the numeric and integer casts. M0149-0001k1.
+		c, err := moneyCents(d)
+		if err != nil {
+			return nil, err
+		}
+		if catalog.FixedLengthMoney() {
+			var b [8]byte
+			binary.LittleEndian.PutUint64(b[:], uint64(c))
+			return b[:], nil
+		}
+		return varlenaTextBytes(cash.Out(c)), nil
 	case "point", "lseg", "box", "line", "circle", "tid":
 		// PG's fixed-length struct images (fixedgeo) in a cluster with the
 		// fixed_length_geometric_tid capability; otherwise the varlena text of
@@ -2207,6 +2223,25 @@ func decodePhysicalPGValueLowered(t *catalog.Type, tname string, data []byte, sc
 			elem = "oid"
 		}
 		return decodeArrayValuePGStyled(catalog.Type{Name: elem, IsArray: true}, data, st)
+	case "money":
+		// Sibling of encodeValuePG's "money" arm: the 8-byte Cash in a capable
+		// cluster, else the varlena text parsed by cash_in (older rows hold
+		// whatever text was inserted; one that no longer parses is returned as
+		// text, as before). M0149-0001k1.
+		if catalog.FixedLengthMoney() {
+			if len(data) < 8 {
+				return Datum{}, 0, fmt.Errorf("truncated money")
+			}
+			return moneyDatum(int64(binary.LittleEndian.Uint64(data[:8]))), 8, nil
+		}
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, fmt.Errorf("decode money as varlena: %w", err)
+		}
+		if c, cerr := cash.In(string(payload)); cerr == nil {
+			return moneyDatum(c), n, nil
+		}
+		return NewStringDatum(string(payload)), n, nil
 	case "point", "lseg", "box", "line", "circle", "tid":
 		// Sibling of encodeValuePG's arm: the fixed-length image rendered
 		// back to the canonical text, in a capable cluster; otherwise the

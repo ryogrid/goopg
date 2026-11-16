@@ -468,3 +468,7 @@ the two layouts legitimately differ.
   goopg's in\-memory Datum stays the canonical output text.
 - Open: money \(needs a real int64 type first\), aclitem, array elements
   of these types, and their COPY BINARY send format \(M0149\-0001k1…k4\).
+- M0149\-0001k1 \(money\): the Datum is a scale\-2 numeric holding the Cash
+  count, so ordering and comparison need no money arm. cash\_in / cash\_out
+  \(internal/utils/adt/cash, C locale\) handle text. Storage is the
+  8\-byte Cash behind its own `fixed\_length\_money` capability.

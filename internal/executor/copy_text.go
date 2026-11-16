@@ -313,6 +313,10 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone, by
 		return RegOutArgVisible(t.Name, uint32(d.Int), cat, qualify, argVisible), nil
 	}
 	switch t.Name {
+	case "money":
+		// cash_out, as the SELECT renderer does (dispatch appendTypedCellText).
+		// M0149-0001k1.
+		return MoneyText(d), nil
 	case "int4", "integer", "int", "int8", "bigint":
 		if d.Kind != KindInt {
 			return "", fmt.Errorf("expected int datum for %s, got kind %d", t.Name, d.Kind)
@@ -497,6 +501,13 @@ func copyTextToDatum(t catalog.Type, raw []byte, timeZone string) (Datum, error)
 			return NewDateDatum(ts), nil
 		}
 		return NewTimeDatum(ts), nil
+	case "money":
+		// cash_in, as the INSERT path's cast does. M0149-0001k1.
+		c, err := moneyCents(NewStringDatum(string(raw)))
+		if err != nil {
+			return Datum{}, err
+		}
+		return moneyDatum(c), nil
 	case "time":
 		ts, err := parseTimeString(string(raw))
 		if err != nil {

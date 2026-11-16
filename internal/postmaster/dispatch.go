@@ -4247,6 +4247,10 @@ func rowsAffected(op executor.Operator) int64 {
 // bare-arglist behavior, so the ~30 direct-call test callers need no edit.
 func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.Type, getSetting func(name string) (string, bool), visible ...func(schema string) bool) []byte {
 	switch strings.ToLower(typ.Name) {
+	case "money":
+		// cash_out ("$1,234.56"): goopg's money Datum is a scale-2 numeric of
+		// the Cash value. M0149-0001k1.
+		return append(dst, executor.MoneyText(d)...)
 	case "float4", "real":
 		// float4/real uses float32 precision (~7 significant digits).
 		// Use strconv bit=32 so the shortest float32 round-trip representation

@@ -32,3 +32,18 @@ func isFixedGeoTidName(lower string) bool {
 	}
 	return false
 }
+
+// fixedLengthMoney is the cluster capability "money columns are stored as
+// PG's 8-byte Cash (int64 cents, typbyval, typalign 'd')" rather than goopg's
+// older varlena text. Same per-cluster marker mechanism as
+// fixedLengthGeoTid. M0149-0001k1.
+var fixedLengthMoney atomic.Bool
+
+// FixedLengthMoneyFeature is the capability's name in the marker file.
+const FixedLengthMoneyFeature = "fixed_length_money"
+
+// SetFixedLengthMoney records whether the open cluster has the capability.
+func SetFixedLengthMoney(on bool) { fixedLengthMoney.Store(on) }
+
+// FixedLengthMoney reports whether the open cluster stores money as Cash.
+func FixedLengthMoney() bool { return fixedLengthMoney.Load() }

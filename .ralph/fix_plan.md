@@ -11861,6 +11861,46 @@ verify each at HEAD when the task starts.
   - First step: a KindInt\-backed money Datum with cash\_in / cash\_out
     under lc\_monetary=C. Then put the 8\-byte image behind its own
     capability, as fixedgeo did.
+  - 2026-11-16 first slice: money is a real value with cash\_in / cash\_out and 8\-byte Cash storage.
+    - New leaf internal/utils/adt/cash: In / Out are ports of cash\_in /
+      cash\_out under the C monetary locale \(`$`, `,` grouped by 3, two
+      places, `\-$1.00`\).
+    - The Datum is a scale\-2 KindNumeric whose mantissa is the Cash count
+      \(executor money.go\), not KindInt. Ordering, comparison and
+      max / min are then exact numeric ops with no money arm.
+    - Wired:
+      - evalCast `money` \(cash\_in, numeric rounded half away from zero,
+        int × 100\);
+      - the heap codec \(8 bytes behind the new `fixed\_length\_money`
+        cluster capability; legacy clusters store the cash\_out text and
+        decode it with cash\_in\);
+      - wire output and COPY TO / FROM;
+      - the pgoutput decoder;
+      - catalog varlena / align answers;
+      - the planner: a text literal compared with a money column becomes
+        CastExpr money.
+    - Probe \(tmp/catidx/s43\):
+      - a 12\-statement script is identical to PG 18.3 except two
+        error\-cursor positions \(goopg points at `::` for every cast
+        input error, e.g. int4 and pg\_lsn too; generic, ledgered\);
+      - a PG cold start reads the 8\-byte values, sums them and inserts;
+        goopg reads PG's rows back;
+      - legacy clusters now sort money correctly too.
+    - Regress: money 216→130 \(inventory updated\); 22 other cases
+      unchanged \(plpgsql 1244→1241, its known flake band\).
+    - Still open in money.sql:
+      - arithmetic: `\+ \- \* /` are rejected with "requires numeric
+        operands" because the planner/evaluator type\-checks by name;
+      - cashlarger / cashsmaller / cash\_words;
+      - sum\(money\) typing;
+      - money::text;
+      - the numeric→money assignment cast;
+      - lc\_monetary other than C;
+      - btree cash\_ops;
+      - typed stavalues.
+    - Gates: units, fire\-set \(fires=none\), postmaster, testport interop
+      set, spotcheck, sf025 99, acceptance.
+    Movement: regress money 216→130
 - [ ] **M0149-0001k2 — aclitem column values are stored as varlena text, not PG's 16\-byte AclItem** \(filed 2026-11-16 by M0149-0001k\)
   Kind: impl
   Parent: M0149-0001k

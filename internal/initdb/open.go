@@ -355,6 +355,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		catalog.SetNullKeyedIndexEntries(features[catalog.NullKeyedIndexEntriesFeature])
 		storage.SetHeapLinePointerLifecycle(features[storage.HeapLinePointerLifecycleFeature])
 		catalog.SetFixedLengthGeoTid(features[catalog.FixedLengthGeoTidFeature])
+		catalog.SetFixedLengthMoney(features[catalog.FixedLengthMoneyFeature])
 	}
 	if err != nil {
 		return nil, fmt.Errorf("goopg: resolve %q: %w", opts.DataDir, err)

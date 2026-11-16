@@ -38,11 +38,11 @@ func TestGoopgFeaturesMarker(t *testing.T) {
 	if got := readGoopgFeatures(dir); !got[catalog.NullKeyedIndexEntriesFeature] || !got[storage.HeapLinePointerLifecycleFeature] ||
 		!got[storage.VMWALLoggedFeature] || !got[clogCompleteHistoryFeature] ||
 		!got[PostgresCatalogsAtBase5Feature] || !got[Template1AtBase1Feature] ||
-		!got[catalog.FixedLengthGeoTidFeature] || len(got) != 7 {
-		t.Fatalf("written marker: features %v, want exactly %s, %s, %s, %s, %s, %s and %s", got,
+		!got[catalog.FixedLengthGeoTidFeature] || !got[catalog.FixedLengthMoneyFeature] || len(got) != 8 {
+		t.Fatalf("written marker: features %v, want exactly %s, %s, %s, %s, %s, %s, %s and %s", got,
 			catalog.NullKeyedIndexEntriesFeature, storage.HeapLinePointerLifecycleFeature, storage.VMWALLoggedFeature,
 			clogCompleteHistoryFeature, PostgresCatalogsAtBase5Feature, Template1AtBase1Feature,
-			catalog.FixedLengthGeoTidFeature)
+			catalog.FixedLengthGeoTidFeature, catalog.FixedLengthMoneyFeature)
 	}
 	// addGoopgFeature (M0146-0063) appends once and keeps the others.
 	if err := addGoopgFeature(dir, "probe_feature"); err != nil {
@@ -51,7 +51,7 @@ func TestGoopgFeaturesMarker(t *testing.T) {
 	if err := addGoopgFeature(dir, "probe_feature"); err != nil {
 		t.Fatal(err)
 	}
-	if got := readGoopgFeatures(dir); !got["probe_feature"] || !got[storage.VMWALLoggedFeature] || len(got) != 8 {
-		t.Fatalf("after addGoopgFeature: features %v, want the seven plus probe_feature", got)
+	if got := readGoopgFeatures(dir); !got["probe_feature"] || !got[storage.VMWALLoggedFeature] || len(got) != 9 {
+		t.Fatalf("after addGoopgFeature: features %v, want the eight plus probe_feature", got)
 	}
 }

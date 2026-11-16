@@ -6417,6 +6417,19 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		default:
 			return d, nil
 		}
+	case "money":
+		// cash_in / numeric_cash / int8_cash (M0149-0001k1): the result is
+		// goopg's money Datum, a scale-2 numeric of the Cash value. Before
+		// this arm `::money` fell to the catch-all pass-through and kept the
+		// input text, so money compared and sorted as text.
+		c, err := moneyCents(d)
+		if err != nil {
+			if ee, ok := err.(*ExecError); ok {
+				ee.Pos = pos
+			}
+			return Datum{}, err
+		}
+		return moneyDatum(c), nil
 	case "pg_lsn":
 		switch d.Kind {
 		case KindString:

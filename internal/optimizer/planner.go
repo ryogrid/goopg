@@ -18890,6 +18890,12 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 				r = &CastExpr{pos: x.Pos(), Operand: r, TargetType: "name"}
 			} else if strings.EqualFold(rt.Name, "name") && !strings.EqualFold(lt.Name, "name") && isTextLikePlannerType(lt.Name) {
 				l = &CastExpr{pos: x.Pos(), Operand: l, TargetType: "name"}
+			} else if strings.EqualFold(lt.Name, "money") && !strings.EqualFold(rt.Name, "money") && isTextLikePlannerType(rt.Name) {
+				// A literal compared with a money column is cash_in'd, as PG
+				// resolves the unknown literal to money. M0149-0001k1.
+				r = &CastExpr{pos: x.Pos(), Operand: r, TargetType: "money"}
+			} else if strings.EqualFold(rt.Name, "money") && !strings.EqualFold(lt.Name, "money") && isTextLikePlannerType(lt.Name) {
+				l = &CastExpr{pos: x.Pos(), Operand: l, TargetType: "money"}
 			} else if isUserDefinedPlannerType(lt.Name) && isTextLikePlannerType(rt.Name) {
 				r = &CastExpr{pos: x.Pos(), Operand: r, TargetType: strings.ToLower(lt.Name)}
 			} else if isTextLikePlannerType(lt.Name) && isUserDefinedPlannerType(rt.Name) {
