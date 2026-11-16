@@ -492,3 +492,7 @@ the two layouts legitimately differ.
   timetz / cidr / reg\*; with 0 there, PG cannot open the table.
   money\[\] elements are the 8\-byte Cash too, and a money operand of `\|\|`
   renders through cash\_out, as anytextcat does.
+- M0149\-0001k5a \(assignment casts\): the analyzer types casts as unknown, so
+  INSERT / UPDATE targets now judge a top\-level explicit cast separately,
+  with castAssignmentError over pg\_cast's assignment families. It raises
+  PG's 42804 message and HINT. General cast typing is still open \(ledger\).
