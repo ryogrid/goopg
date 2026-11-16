@@ -195,7 +195,9 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 	// alongside TYPE/DOMAIN/DATABASE instead. M0119-0004-ACLHEAP (parameter
 	// ACL half).
 	isHeapACLObject := strings.Contains(upper, " ON TYPE ") || strings.Contains(upper, " ON DOMAIN ") ||
-		strings.Contains(upper, " ON DATABASE ") || strings.Contains(upper, " ON PARAMETER ")
+		strings.Contains(upper, " ON DATABASE ") || strings.Contains(upper, " ON PARAMETER ") ||
+		// pg_largeobject_metadata.lomacl is heap-backed (M0149-0001h1a).
+		strings.Contains(upper, " ON LARGE OBJECT")
 	// A column-level GRANT/REVOKE — `GRANT <priv>(<cols>) ON [TABLE] <name> …` —
 	// changes pg_attribute.attacl, which is heap-backed like pg_type.typacl, so it
 	// too must run through the executor (where an *executor.Context re-syncs the heap

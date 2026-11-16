@@ -439,6 +439,51 @@ func buildTypeACLChange(revoke, isDomain bool, toks []Token) *TypeACLChange {
 	return tac
 }
 
+// buildLargeObjectACLChange parses GRANT / REVOKE … ON LARGE OBJECT <oid>[,
+// …] TO|FROM <roles> … (toks: every token after GRANT/REVOKE, no ';').
+// Returns nil for an unparseable form. M0149-0001h1a.
+func buildLargeObjectACLChange(revoke bool, toks []Token) *LargeObjectACLChange {
+	onIdx := tokIndexOf(toks, 0, "on")
+	if onIdx < 0 || onIdx+3 > len(toks) {
+		return nil
+	}
+	nameStart := onIdx + 3 // ON LARGE OBJECT
+	sep := "to"
+	if revoke {
+		sep = "from"
+	}
+	sepIdx := tokIndexOf(toks, nameStart, sep)
+	if sepIdx < 0 {
+		return nil
+	}
+	roleStart := sepIdx + 1
+	roleEnd, withGrantOption, grantedBy := scanGrantTrailingClause(toks, roleStart)
+	lc := &LargeObjectACLChange{Revoke: revoke, WithGrantOption: withGrantOption, GrantedBy: grantedBy}
+	privToks := toks[:onIdx]
+	if revoke && len(privToks) >= 3 && strings.EqualFold(privToks[0].Value, "grant") &&
+		strings.EqualFold(privToks[1].Value, "option") && strings.EqualFold(privToks[2].Value, "for") {
+		lc.GrantOptionFor, privToks = true, privToks[3:]
+	}
+	lc.Privileges = splitTokPrivileges(privToks)
+	for _, run := range splitTokRuns(toks[nameStart:sepIdx]) {
+		var b strings.Builder
+		for _, tk := range run {
+			b.WriteString(tk.Value)
+		}
+		lc.Objects = append(lc.Objects, b.String())
+	}
+	lc.Grantees = splitTokRoles(toks[roleStart:roleEnd])
+	for _, tk := range toks[roleEnd:] {
+		if strings.EqualFold(tk.Value, "cascade") {
+			lc.Cascade = true
+		}
+	}
+	if len(lc.Privileges) == 0 || len(lc.Objects) == 0 || len(lc.Grantees) == 0 {
+		return nil
+	}
+	return lc
+}
+
 // buildDatabaseACLChange parses the token run of a GRANT/REVOKE … ON DATABASE …
 // statement into a DatabaseACLChange, mirroring buildTypeACLChange's shape.
 // toks is every token after the GRANT/REVOKE keyword with the trailing ';'
@@ -1251,6 +1296,7 @@ identLedStatement:
 			// captured here exactly like the heap-backed classes.
 			// M0119-0004-ACLHEAP (parameter ACL half).
 			parameterACL := false
+			largeObjectACL := false
 			// sawOn is true the moment ANY "on" token appears anywhere in the
 			// statement -- the discriminator between every privilege-GRANT variant
 			// above (which all require an ON <object> clause) and role membership
@@ -1279,6 +1325,10 @@ identLedStatement:
 					case strings.EqualFold(next.Value, "parameter"):
 						// `ON PARAMETER <names>` — GUC-level ACL (captured below).
 						parameterACL = true
+					case strings.EqualFold(next.Value, "large") && strings.EqualFold(p.peek(2).Value, "object"):
+						// `ON LARGE OBJECT <oids>` — pg_largeobject_metadata.lomacl
+						// (captured below). M0149-0001h1a.
+						largeObjectACL = true
 					case grantNonTableClass(next.Value):
 						// SCHEMA/SEQUENCE/FUNCTION/… — not a per-table ACL change.
 					default:
@@ -1301,6 +1351,8 @@ identLedStatement:
 				// which is unrelated to whether the clause parsed cleanly here.
 				// M0119-0004-ACLHEAP (datacl half).
 				ns.DatabaseACLChange = buildDatabaseACLChange(strings.EqualFold(t.Value, "revoke"), toks)
+			} else if largeObjectACL {
+				ns.LargeObjectACL = buildLargeObjectACLChange(strings.EqualFold(t.Value, "revoke"), toks)
 			} else if parameterACL {
 				// `GRANT/REVOKE … ON PARAMETER …` — pg_parameter_acl is
 				// goopg-virtual-only, so unlike TYPE/DATABASE there is no heap row to

@@ -293,6 +293,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execAlterStatistics(s)
 	case *parser.AlterSchemaStmt:
 		return nil, o.execAlterSchema(s)
+	case *parser.AlterLargeObjectOwnerStmt:
+		return nil, o.execAlterLargeObjectOwner(s)
 	case *parser.LockTableStmt:
 		return nil, o.execLockTable(s)
 	case *parser.DoStmt:
@@ -23768,6 +23770,13 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 	// executor here. M0119-0004-ACLHEAP (parameter ACL half).
 	if s.ParameterACLChange != nil {
 		if err := o.execParameterACLChange(s.ParameterACLChange); err != nil {
+			return err
+		}
+	}
+	// GRANT / REVOKE … ON LARGE OBJECT rewrites pg_largeobject_metadata.lomacl
+	// (M0149-0001h1a).
+	if s.LargeObjectACL != nil {
+		if err := o.execLargeObjectACLChange(s.LargeObjectACL); err != nil {
 			return err
 		}
 	}

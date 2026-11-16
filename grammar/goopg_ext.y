@@ -3395,6 +3395,12 @@ alter_schema_stmt:
 	| ALTER SCHEMA ColId OWNER TO alter_fn_owner
 			{ $$ = NewAlterSchemaStmt($<p>1, $3, "owner", "", $6) }
 
+/* ALTER LARGE OBJECT <oid> OWNER TO role — gram.y AlterOwnerStmt's
+   OBJECT_LARGEOBJECT arm (NumericOnly; an integer OID here). M0149-0001h1a. */
+alter_large_object_stmt:
+		ALTER LARGE_P OBJECT_P ICONST OWNER TO alter_fn_owner
+			{ $$ = NewAlterLargeObjectOwnerStmt($<p>1, int64($4), $7) }
+
 /* CREATE ACCESS METHOD — gram.y:5991 CreateAmStmt, verbatim:
    `CREATE ACCESS METHOD name TYPE_P am_type HANDLER handler_name`.
 

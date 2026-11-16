@@ -4056,6 +4056,8 @@ func ddlTag(stmt parser.Stmt) string {
 		return "ALTER STATISTICS"
 	case *parser.AlterSchemaStmt:
 		return "ALTER SCHEMA"
+	case *parser.AlterLargeObjectOwnerStmt:
+		return "ALTER LARGE OBJECT"
 	case *parser.AlterOpFamilyAddStmt, *parser.AlterOpFamilyDropStmt:
 		return "ALTER OPERATOR FAMILY"
 	case *parser.CreateOpClassStmt:

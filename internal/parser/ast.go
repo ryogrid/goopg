@@ -2392,6 +2392,8 @@ type CompatNoopStmt struct {
 	// to the in-memory ACL store, with no heap row to re-sync. Nil when the
 	// clause could not be parsed. M0119-0004-ACLHEAP (parameter ACL half).
 	ParameterACLChange *ParameterACLChange
+	// LargeObjectACL is GRANT / REVOKE … ON LARGE OBJECT … (M0149-0001h1a).
+	LargeObjectACL *LargeObjectACLChange `dump:"omitempty"`
 	// Options carries an OPTIONS (name 'value', …) clause as "name=value" elements
 	// for foreign-object DDL (CREATE SERVER, and later FDW / USER MAPPING). The
 	// executor stores them in the catalog's foreign-server registry so pg_dump
@@ -2782,6 +2784,21 @@ type ParameterACLChange struct {
 	Grantees        []string // role list after TO|FROM ("PUBLIC" preserved verbatim)
 	WithGrantOption bool     // GRANT … WITH GRANT OPTION
 	GrantedBy       string   // optional explicit grantor; "" = current session role
+}
+
+// LargeObjectACLChange carries a GRANT / REVOKE … ON LARGE OBJECT <oid>[, …]
+// statement (gram.y privilege_target LARGE_P OBJECT_P NumericOnly_list). The
+// executor rewrites each object's pg_largeobject_metadata.lomacl.
+// M0149-0001h1a.
+type LargeObjectACLChange struct {
+	Revoke          bool
+	GrantOptionFor  bool     // REVOKE GRANT OPTION FOR …
+	Privileges      []string // upper-cased; "ALL" / "ALL PRIVILEGES" unexpanded
+	Objects         []string // the OIDs as written
+	Grantees        []string // role list after TO|FROM ("PUBLIC" preserved)
+	WithGrantOption bool
+	GrantedBy       string
+	Cascade         bool // REVOKE … CASCADE
 }
 
 // AlterDefaultPrivilegesStmt represents `ALTER DEFAULT PRIVILEGES [FOR ROLE|USER
@@ -4192,3 +4209,14 @@ type DropDomainStmt struct {
 
 func (s *DropDomainStmt) Pos() int  { return s.pos }
 func (s *DropDomainStmt) stmtNode() {}
+
+// AlterLargeObjectOwnerStmt is `ALTER LARGE OBJECT <oid> OWNER TO role`
+// (gram.y AlterOwnerStmt, OBJECT_LARGEOBJECT). M0149-0001h1a.
+type AlterLargeObjectOwnerStmt struct {
+	pos      int
+	OID      int64
+	NewOwner string // "current_user" for CURRENT_USER / SESSION_USER / CURRENT_ROLE
+}
+
+func (s *AlterLargeObjectOwnerStmt) Pos() int { return s.pos }
+func (*AlterLargeObjectOwnerStmt) stmtNode()  {}

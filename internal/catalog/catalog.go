@@ -26418,7 +26418,9 @@ func PGLargeObjectMetadataColumns() []Column {
 	return []Column{
 		{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0, NotNull: true},
 		{Name: "lomowner", Type: Type{Name: "oid"}, Ordinal: 1, NotNull: true},
-		{Name: "lomacl", Type: Type{Name: "aclitem", IsArray: true}, Ordinal: 2},
+		// "aclitem[]" (not IsArray) selects the codec's catalog-ACL arm: a
+		// PG-native _aclitem blob, rendered by the scan hook.
+		{Name: "lomacl", Type: Type{Name: "aclitem[]"}, Ordinal: 2},
 	}
 }
 

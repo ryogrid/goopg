@@ -1294,6 +1294,8 @@ func renderHeapACLColumnInto(cat catalog.Catalog, tbl *catalog.Table, cols []cat
 		aclName = "attacl"
 	case catalog.PgDatabaseRelationOID:
 		aclName = "datacl"
+	case catalog.LargeObjectMetadataRelationId:
+		aclName = "lomacl" // M0149-0001h1a
 	default:
 		return
 	}
@@ -1616,10 +1618,12 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	// (execDatabaseACLChange → resyncDatabaseACLHeapRow) and rendered back to
 	// canonical aclitemout text here.
 	o.dbACLColIdx = -1
-	if o.tbl != nil && o.tbl.OID == catalog.PgDatabaseRelationOID {
+	// pg_largeobject_metadata.lomacl shares the slot: the same blob, written
+	// by GRANT … ON LARGE OBJECT (M0149-0001h1a).
+	if o.tbl != nil && (o.tbl.OID == catalog.PgDatabaseRelationOID || o.tbl.OID == catalog.LargeObjectMetadataRelationId) {
 		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 			for i, col := range o.cols {
-				if col.Name == "datacl" {
+				if col.Name == "datacl" || col.Name == "lomacl" {
 					o.dbACLColIdx = i
 					break
 				}

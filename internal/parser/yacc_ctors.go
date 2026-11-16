@@ -1063,3 +1063,7 @@ func NewRangeTableSample(pos int, method string, args []Expr, repeatable Expr) *
 		Repeatable: repeatable,
 	}
 }
+
+func NewAlterLargeObjectOwnerStmt(pos int, oid int64, newOwner string) *AlterLargeObjectOwnerStmt {
+	return &AlterLargeObjectOwnerStmt{pos: pos, OID: oid, NewOwner: newOwner}
+}

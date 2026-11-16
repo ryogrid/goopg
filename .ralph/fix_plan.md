@@ -11948,6 +11948,44 @@ verify each at HEAD when the task starts.
     - Gates: units, fire\-set \(fires=none\), spotcheck, sf025 99,
       acceptance, PG cold\-start e2e.
     Movement: regress privileges 700→692
+  - 2026-11-17 third slice \(landed\): GRANT / REVOKE ON LARGE OBJECT and ALTER LARGE OBJECT … OWNER TO.
+    - parser: LargeObjectACLChange on CompatNoopStmt \(dump:"omitempty"\);
+      alter\_large\_object\_stmt grammar rule, routed via
+      routedCreatePairs\["alter"\]\["large"\]. postmaster/query.go sends
+      `ON LARGE OBJECT` to the executor.
+    - executor largeobject\_acl.go: ExecGrant\_Largeobject
+      \(select\_best\_grantor, restrict\_and\_check\_grant, aclupdate with
+      RESTRICT / CASCADE\), AlterObjectOwner\_internal and aclnewowner. The row
+      is rewritten by an internal\-SQL DELETE plus writeHeapRowCanonical, and
+      lomacl is a PG\-native \_aclitem blob.
+    - Found:
+      - a string\-encoded aclitem\[\] column gets the text element type,
+        which PG's check\_acl rejects;
+      - PG prints "permission denied for large object large object %u"
+        \(the doubled phrase is real\).
+    - Probes identical \(GRANT 43 statements, OWNER 22\); a PG cold start
+      agrees.
+    - Regress: privileges 673→616, largeobject 46→45 \(inventory updated,
+      staged\).
+    - Gates so far: units PASS, internal/postmaster PASS, parser goldens
+      PASS, e2e TestLargeObjectMetadataSurvivesRestart PASS. The fire\-set
+      gate ran out of disk twice \(ENOSPC\) in the first attempt.
+    - Gates on the committed tree \(next loop, after the disk was
+      relieved\): fire\-set PASS \(fires=none, sf025 and sf1 99/99\),
+      spotcheck Q12=2 Q13=35, sf025 sweep PASS, acceptance arm 24 MATCH
+      against tmp/h1a1\-arm\-on.txt, units PASS.
+    Movement: regress privileges 673→616, largeobject 46→45
+    - > **ESCALATION 2026\-11\-17 \(disk\) — the root volume is 100% full
+      \(about 6.6 GB free\); the fire\-set gate's SF1 clones need more.**
+      `tmp/fireset-bin` holds about 76 GB of per\-label engine binaries from
+      earlier loops; the gate never prunes them. This loop removed only its
+      own artefacts. Owner action requested: prune `tmp/fireset-bin` \(or
+      approve the loop doing it\).
+      Mitigation 2026\-11\-17 \(loop\): Go build\-cache entries unused for
+      more than 2 days were deleted \(about 50 GB; regenerable, Go trims them
+      at 5 days anyway\), which leaves about 56 GB free. `tmp/fireset-bin`
+      \(77 GB\) and the old `tmp/*-tpcds-sf1-data-*` clones are still
+      untouched and still need an owner prune.
 - [x] **M0149-0001h1a1 — bit strings have no `\|` / `&` / `#` operators and no bit → int4 / int8 cast: `x'20000'::int` and `x'20000' \| x'40000'` fail** \(filed 2026-11-17 by M0149-0001h1a\)
   Kind: impl
   Parent: M0149-0001h1a

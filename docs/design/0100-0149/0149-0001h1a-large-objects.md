@@ -7,7 +7,10 @@
 - slice 2: pg\_largeobject data pages, the descriptor API, the bytea
   functions, and lo\_import / lo\_export.
 
-GRANT / ALTER / COMMENT ON LARGE OBJECT are next.
+- slice 3: GRANT / REVOKE ON LARGE OBJECT and ALTER LARGE OBJECT … OWNER TO.
+
+COMMENT ON LARGE OBJECT and ALTER DEFAULT PRIVILEGES … ON LARGE OBJECTS are
+next.
 
 ## Problem
 
@@ -124,6 +127,50 @@ Probe \(goopg vs PG 18.3\), identical on every result:
 A PG cold start on the goopg directory reads and updates goopg\-written pages
 through index 2683.
 
+## Slice 3 — GRANT / REVOKE and ALTER OWNER \(largeobject\_acl.go\)
+
+- **Where the ACL lives.** A large object's ACL lives only in its lomacl.
+  goopg's OID\-keyed ACL store \(relations, types, parameters\) cannot hold
+  it, because large\-object OIDs are user\-chosen and may equal any other
+  object's OID.
+- **Parser.** `GRANT` / `REVOKE … ON LARGE OBJECT <oid>, …` is captured as a
+  `LargeObjectACLChange` on CompatNoopStmt \(the field is tagged
+  `dump:"omitempty"`, so no golden moved\). `GRANT OPTION FOR` and `CASCADE`
+  are recorded. The server's GRANT fast path \(postmaster/query.go\) routes
+  `ON LARGE OBJECT` to the executor.
+- **ExecGrant\_Largeobject port:**
+  - resolution order is ExecuteGrantStmt's: objects \(42704\), grantees
+    \(42704\), then privileges \(0LP01 "invalid privilege type %s for large
+    object"\);
+  - a NULL lomacl starts as acldefault\('L'\) = owner rw;
+  - select\_best\_grantor: a role with the owner's privileges, or a
+    superuser, grants as the owner;
+  - restrict\_and\_check\_grant: with no grant option and no privilege, the
+    error is "permission denied for large object large object %u". The
+    doubled phrase is real: aclcheck\_error's format wraps
+    ExecGrant\_Largeobject's objname. Partial grants and revokes are 01007 /
+    01006 WARNINGs;
+  - merge\_acl\_with\_grant / aclupdate key items by \(grantee, grantor\),
+    drop emptied items, and on a lost grant option raise 2BP01 "dependent
+    privileges exist" under RESTRICT or recurse under CASCADE.
+- **ALTER LARGE OBJECT … OWNER TO.** A new grammar rule \(alter\_large\_object\_stmt,
+  routed via routedCreatePairs\["alter"\]\["large"\]; legacy rejected
+  every form\) ports AlterObjectOwner\_internal:
+  - "must be owner of large object %u";
+  - "must be able to SET ROLE \"%s\"";
+  - aclnewowner carries the ACL over.
+- **Row rewrite.** The row is rewritten with an internal\-SQL DELETE plus
+  writeHeapRowCanonical. lomacl is written as a PG\-native \_aclitem blob
+  \(encodeAclItemArrayText\); the string form stored the wrong element type,
+  which PG's check\_acl rejects. The column is typed `aclitem[]` so the codec's
+  catalog\-ACL arm applies, and the seq\-scan and index\-scan ACL render hooks
+  now include lomacl.
+
+**Probes \(goopg vs PG 18.3\):** identical for GRANT / REVOKE \(43
+statements, including warnings, RESTRICT / CASCADE and rollback\) and for
+ALTER OWNER \(22 statements\). A PG cold start reads the rewritten lomacl and
+answers has\_largeobject\_privilege the same way.
+
 ## Open
 
 - A read\-only descriptor reads with the statement's snapshot, not the
@@ -134,9 +181,9 @@ through index 2683.
   result, `x'20000'::int` and `x'20000' | x'40000'` fail, which blocks
   most large\-object steps in regress `privileges` and `largeobject`
   \(M0149\-0001h1a1\).
-- GRANT / REVOKE ON LARGE OBJECT \(parsed as a no\-op today\), ALTER LARGE
-  OBJECT … OWNER TO, COMMENT ON LARGE OBJECT, ALTER DEFAULT PRIVILEGES … ON
-  LARGE OBJECTS \(get\_user\_default\_acl\), and the role dependencies.
+- COMMENT ON LARGE OBJECT \(pg\_description, which psql `\lo_list` shows\),
+  ALTER DEFAULT PRIVILEGES … ON LARGE OBJECTS \(get\_user\_default\_acl at
+  lo\_create\), and the pg\_shdepend owner / ACL role dependencies.
 - goopg's pg\_proc exposes only curated builtins. libpq's lo\_initialize
   therefore fails "cannot determine OID of function lo\_open", which breaks
   psql `\lo_unlink`.

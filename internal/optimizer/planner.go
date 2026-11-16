@@ -349,6 +349,7 @@ func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet Plan
 		*parser.CreateStatisticsStmt,
 		*parser.AlterStatisticsStmt,
 		*parser.AlterSchemaStmt,
+		*parser.AlterLargeObjectOwnerStmt,
 		*parser.LockTableStmt,
 		*parser.CreateTypeStmt, *parser.AlterTypeStmt, *parser.DropTypeStmt,
 		*parser.CreateDomainStmt, *parser.DropDomainStmt, *parser.AlterDomainStmt,
