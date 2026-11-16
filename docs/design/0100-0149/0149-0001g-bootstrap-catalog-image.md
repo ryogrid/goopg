@@ -390,3 +390,11 @@ the two layouts legitimately differ.
 - A row whose depender or referenced object goopg does not bootstrap is left
   out \(`pgDependMissingObjects`: pg\_settings' two rules\). A dangling row
   would make a PG node report dependencies on objects that do not exist.
+
+## Follow\-up: M0149\-0001g slice 32 — initdb's non\-\_RETURN rules \(2026\-11\-16\)
+
+- `pg_rewrite_rules_generated.go` \(scripts/gen\-pg\-rewrite\-rules.py\)
+  carries every rewrite rule a PG 18.3 initdb creates besides the views'
+  \_RETURN rules: pg\_settings\_u and pg\_settings\_n.
+- They join the pg\_rewrite seed. pg\_depend no longer has to leave any row
+  out, so `pgDependMissingObjects` is empty.

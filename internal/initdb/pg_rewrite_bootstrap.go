@@ -120,6 +120,10 @@ func pgRewriteInitialEntries() []pgRewriteEntry {
 	// pg_rewrite heap. Appended here so a hosted PG's RULERELNAME syscache probe
 	// for information_schema.<view> resolves, exactly like the pg_catalog corpus.
 	entries = append(entries, informationSchemaViewRewriteEntries()...)
+	// M0149-0001g slice 32: system_views.sql's two CREATE RULEs on pg_settings
+	// (pg_settings_u: ON UPDATE … DO ALSO SELECT set_config; pg_settings_n:
+	// ON UPDATE DO INSTEAD NOTHING), so UPDATE pg_settings works on a PG node.
+	entries = append(entries, pgRewriteInitdbRules...)
 	return entries
 }
 

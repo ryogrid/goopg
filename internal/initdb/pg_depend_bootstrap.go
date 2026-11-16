@@ -8,12 +8,10 @@ import (
 )
 
 // pgDependMissingObjects are objects a PG 18.3 initdb creates that goopg's
-// bootstrap image does not carry yet, so their pg_depend rows are left out
-// rather than pointing at nothing: pg_settings' two rewrite rules
-// pg_settings_u (12108) and pg_settings_n (12109), created by
-// system_views.sql's CREATE RULE (the UPDATE-through-set_config rules).
-// Ledgered under M0149-0001g slice 31.
-var pgDependMissingObjects = map[uint32]bool{12108: true, 12109: true}
+// bootstrap image does not carry, so their pg_depend rows are left out rather
+// than pointing at nothing. Empty since slice 32 bootstrapped pg_settings'
+// rules pg_settings_u / pg_settings_n (12108 / 12109), the only such objects.
+var pgDependMissingObjects = map[uint32]bool{}
 
 // pgDependBootstrapRows is pgDependInitdb without the rows whose depender or
 // referenced object is in pgDependMissingObjects.

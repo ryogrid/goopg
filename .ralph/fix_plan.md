@@ -12592,6 +12592,29 @@ verify each at HEAD when the task starts.
       5 cases \(dependency, misc\_sanity, sequence, alter\_table, create\_view;
       no movement\), spotcheck, sf025 99, acceptance.
     Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 32: pg\_settings' two rewrite rules are bootstrapped; pg\_depend now equals PG 18.3 initdb's all 1725 rows.
+    - system\_views.sql creates pg\_settings\_u \(ON UPDATE … DO ALSO SELECT
+      set\_config\) and pg\_settings\_n \(ON UPDATE DO INSTEAD NOTHING\). goopg
+      lacked both, so `UPDATE pg_settings` on a PG node changed nothing.
+      Slice 31 had also left out their 6 pg\_depend rows.
+    - scripts/gen\-pg\-rewrite\-rules.py captures every non\-\_RETURN rule from
+      a throwaway initdb into pg\_rewrite\_rules\_generated.go, with ev\_qual /
+      ev\_action verbatim. pgRewriteInitialEntries appends them.
+      pgDependMissingObjects is now empty.
+    - PG cold start:
+      - both rules equal the oracle's \(md5 of ev\_qual and ev\_action\);
+      - pg\_depend equals the oracle's 1725 rows in heap order;
+      - `UPDATE pg_settings SET setting = '8MB' WHERE name = 'work_mem'`
+        sets work\_mem through set\_config and reports UPDATE 0, as on PG;
+      - pg\_rules lists both rules.
+    - goopg restarts clean twice.
+    - Found \(pre\-existing, same on HEAD, ledgered\): goopg's own SQL
+      pg\_settings has only 58 rows \(no work\_mem\), and goopg has no pg\_views
+      view.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      4 cases \(rules, guc, misc\_sanity, sysviews; no movement\), spotcheck,
+      sf025 99, acceptance.
+    Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

@@ -8,16 +8,16 @@ import (
 )
 
 // TestBootstrapPgDependHeap pins M0149-0001g slice 31: base/{1,5}/2608 holds
-// PG 18.3 initdb's pg_depend rows (1725 captured, minus the 6 that reference
-// pg_settings' not-yet-bootstrapped rules 12108/12109), including plpgsql's
-// extension-membership rows.
+// PG 18.3 initdb's pg_depend rows — all 1725 since slice 32 bootstrapped
+// pg_settings' rules 12108/12109 — including plpgsql's extension-membership
+// rows.
 func TestBootstrapPgDependHeap(t *testing.T) {
 	if len(pgDependInitdb) != 1725 {
 		t.Fatalf("pgDependInitdb has %d rows, want PG 18.3 initdb's 1725", len(pgDependInitdb))
 	}
 	want := pgDependBootstrapRows()
-	if len(want) != 1719 {
-		t.Fatalf("pgDependBootstrapRows = %d rows, want 1719", len(want))
+	if len(want) != 1725 {
+		t.Fatalf("pgDependBootstrapRows = %d rows, want all 1725 (slice 32: no missing objects)", len(want))
 	}
 	members := 0
 	for _, d := range want {
