@@ -499,3 +499,7 @@ the two layouts legitimately differ.
 - M0149\-0001k5 \(money statistics\): money samples are stamped as cash\_out
   text and typed. The optimizer folds money literals to that text and
   compares money values through cash\_in, matching PG's estimates.
+- M0149\-0001k5b \(lc\_\* validation\): lc\_monetary / numeric / time / messages
+  accept only what setlocale could load. That means the built\-ins, the
+  locale directory, locale\-archive, or LOCPATH, as check\_locale does.
+  Non\-C money formatting is k5c.

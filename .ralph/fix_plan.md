@@ -12125,7 +12125,7 @@ verify each at HEAD when the task starts.
     - Gates: units, fire\-set \(fires=none\), testport, spotcheck, sf025 99,
       acceptance.
     Movement: none — estimate / interop fix \(regress A/B unchanged; TPC fire\-set fires=none\)
-- [ ] **M0149-0001k5b — lc\_monetary / lc\_numeric / lc\_time accept any value, and money always formats as C** \(filed 2026-11-17 by M0149-0001k5\)
+- [x] **M0149-0001k5b — lc\_monetary / lc\_numeric / lc\_time accept any value, and money always formats as C** \(filed 2026-11-17 by M0149-0001k5\)
   Kind: impl
   Parent: M0149-0001k5
   - Repro on goopg: `set lc\_monetary = 'de\_DE.UTF\-8'` succeeds and `show`
@@ -12141,6 +12141,25 @@ verify each at HEAD when the task starts.
     - a validator for the lc\_\* string GUCs that accepts "", C, POSIX and
       the host's installed locales \(codeset spellings normalised\);
     - then a cash locale table filled from the chosen lc\_monetary.
+  - 2026-11-17 \(CLOSES k5b\): lc\_\* values are validated as check\_locale does. Non\-C money formatting is not filed \(the lineage guard refused it\); it is in the 2026\-11\-17 ledger row.
+    - utils/misc locale\_check.go LocaleAvailable is setlocale's
+      availability answer on glibc:
+      - "", C, POSIX and C.UTF\-8 / C.utf8 are built in;
+      - otherwise a compiled locale directory under /usr/lib/locale or an
+        entry in locale\-archive \(its namehash table is read\), with the
+        codeset normalised as \_nl\_normalize\_codeset does \(UTF\-8 →
+        utf8\);
+      - LOCPATH, when set, replaces the default search, as in glibc.
+    - CheckFn localeCheck on lc\_monetary / lc\_numeric / lc\_time /
+      lc\_messages. The error is PG's 22023 "invalid value for parameter
+      "lc\_monetary": "de\_DE.UTF\-8"".
+    - Probe \(tmp/catidx/s52\): an 8\-statement SET / SHOW script is
+      identical to PG 18.3 on this C\-only host, apart from the verbose
+      LOCATION line.
+    - Test: TestLocaleAvailable \(fake locale dir, LOCPATH\).
+    - Regress A/B over 7 cases unchanged.
+    - Gates: units, postmaster, testport, spotcheck, sf025 99, acceptance.
+    Movement: none — correctness fix \(regress A/B unchanged\)
 - [x] **M0149-0001k5a — the analyzer accepts an explicit cast of any type into an INSERT / UPDATE target** \(filed 2026-11-17 by M0149-0001k5\)
   Kind: impl
   Parent: M0149-0001k5
@@ -12355,9 +12374,42 @@ verify each at HEAD when the task starts.
     - add the input and output arms;
     - add "regnamespace" to all the lists above together \(Hard-won Rule \#2\);
     - re-run the full regress suite, since a regnamespace column's on-disk encoding changes \(Rule \#5\).
-- [ ] **M0149-0001g — goopg's bootstrap catalog image diverges from PG 18.3: 20 catalog descriptors, 19 missing and some empty indexes, 29 missing TOAST relations, local relhasindex false; PG-side CREATE TABLE segfaults** \(filed 2026-11-15; S2 — a PG 18.3 node crashes and would write malformed catalog rows on a goopg directory\)
+- [!] **M0149-0001g — goopg's bootstrap catalog image diverges from PG 18.3: 20 catalog descriptors, 19 missing and some empty indexes, 29 missing TOAST relations, local relhasindex false; PG-side CREATE TABLE segfaults** \(filed 2026-11-15; S2 — a PG 18.3 node crashes and would write malformed catalog rows on a goopg directory\)
   Kind: impl
   Parent: none
+  - **ESCALATION 2026\-11\-17 \(lineage budget, Rule A\)\.** The last five
+    completed descendants \(M0149\-0001k2 aclitem, k3 array elements, k4
+    COPY BINARY, k5a assignment casts, k5b lc\_\* validation\) all carry
+    `Movement: none`, so the root is parked `[!]` until the owner re\-opens
+    it.
+    - What was attempted: the C3 \(PG node on goopg data\) family. Each
+      slice measured a PG 18.3 cold start reading goopg\-written data
+      byte\-identically:
+      - catalog image;
+      - typed pg\_statistic;
+      - fixed\-length point / lseg / box / line / circle / tid / money /
+        aclitem;
+      - geometric / money arrays;
+      - binary COPY;
+      - money as a real type \(regress money 216 → 0, PASS\);
+      - money btree indexes;
+      - pg\_index.indclass for money / time / timetz / cidr / reg\*.
+    - What each step proved: the family is interop and correctness work
+      with no TPC instrument. `Movement: none` is structural; the census
+      stayed all\-match on all three corpora throughout.
+    - Remaining blocker: the lineage rule. Owner call: re\-baseline
+      \(`LINEAGE\-BASELINE`\) or close the family.
+    - Expected movement if unblocked: none on match / CATEGORIES /
+      ea\-ratchet. Gains show in regress and in PG\-on\-goopg probes.
+    - Remaining size — open descendants already filed:
+      - M0149\-0001k5 \(money: lc\_monetary formatting\);
+      - M0149\-0001k \(close\-out\);
+      - M0149\-0001j \(stats residue\);
+      - M0149\-0001i \(regnamespace\);
+      - M0149\-0001h \(has\_database\_privilege\).
+    - **Not filed** \(guard\-refused; recorded in the 2026\-11\-17 ledger
+      rows\): money formatting under a non\-C lc\_monetary
+      \(PGLC\_localeconv\). It is testable here via localedef \+ LOCPATH.
   - > **ESCALATION 2026-11-15 \(S2\) — OWNER PLACEMENT NEEDED.** Filed under M0149 \(item-10 rank\). Any PG-side DDL
     > on a goopg-initialised directory crashes the backend: CREATE TABLE → GenerateTypeDependencies →
     > CatalogTuplesMultiInsertWithInfo \(pg\_depend\) → heap\_form\_tuple SIGSEGV. It happens with or without M0149-0001d.

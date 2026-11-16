@@ -248,6 +248,8 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name: "lc_messages", Type: TypeString, BootVal: "",
 		Context: ContextSuset, Scope: ScopeSession | ScopeTransaction,
+		// check_locale (pg_locale.c): setlocale must accept it. M0149-0001k5b.
+		CheckFn: localeCheck("lc_messages"),
 	}))
 	// session_replication_role decides which triggers fire (trigger.c
 	// TriggerEnabled): 'O' triggers fire in origin and local, 'R' only in
@@ -260,14 +262,20 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name: "lc_monetary", Type: TypeString, BootVal: "C",
 		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		// check_locale (pg_locale.c): setlocale must accept it. M0149-0001k5b.
+		CheckFn: localeCheck("lc_monetary"),
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "lc_numeric", Type: TypeString, BootVal: "C",
 		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		// check_locale (pg_locale.c): setlocale must accept it. M0149-0001k5b.
+		CheckFn: localeCheck("lc_numeric"),
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "lc_time", Type: TypeString, BootVal: "C",
 		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		// check_locale (pg_locale.c): setlocale must accept it. M0149-0001k5b.
+		CheckFn: localeCheck("lc_time"),
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "default_text_search_config", Type: TypeString, BootVal: "pg_catalog.simple",
