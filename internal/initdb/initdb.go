@@ -1517,6 +1517,11 @@ func Init(opts Options) error {
 	if err := bootstrapPgDescription(abs); err != nil {
 		return fmt.Errorf("goopg init: pg_description: %w", err)
 	}
+	// M0149-0001g slice 20: postgres.bki's text-search rows (parser,
+	// templates, simple dictionary/configuration and its map) with indexes.
+	if err := bootstrapPgTS(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_ts_*: %w", err)
+	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
 	}
