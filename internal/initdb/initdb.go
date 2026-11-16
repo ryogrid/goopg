@@ -3118,6 +3118,24 @@ func pgProcRow(e pgProcEntry) executor.Row {
 	if kind == 0 {
 		kind = derivePgProcKind(e.HandlerName)
 	}
+	cost := e.Cost
+	if cost == 0 {
+		cost = 1
+	}
+	rows, variadic, support := e.Rows, uint32(0), e.Support
+	secDef, leakProof, strict, retSet := false, false, !e.NotStrict, e.RetSet
+	probin := executor.NullDatum
+	// M0149-0001g slice 15: a built-in's scalar attributes are PostgreSQL's
+	// own (pg_proc.dat via pgProcBKIAttrsByOID) — the seed defaulted most of
+	// them (VOLATILE, leakproof false, cost 1, no support function).
+	if bk, ok := pgProcBKIAttrsByOID[e.OID]; ok {
+		cost, rows, variadic, support = bk.Cost, bk.Rows, bk.Variadic, bk.Support
+		kind, secDef, leakProof, strict, retSet = bk.Kind, bk.SecDef, bk.LeakProof, bk.Strict, bk.RetSet
+		vol, parallel = bk.Volatile, bk.Parallel
+		if bk.Bin != "" {
+			probin = executor.NewStringDatum(bk.Bin)
+		}
+	}
 	// Step 3dk: emit OUT-arg metadata as binary ArrayType blobs when
 	// supplied. NewBytesDatum lands a KindBytes datum that codec.go's
 	// passthrough emits verbatim.
@@ -3182,20 +3200,15 @@ func pgProcRow(e pgProcEntry) executor.Row {
 			}
 			return 12 // INTERNALlanguageId
 		}()),
-		executor.NewIntDatum(func() int64 { // 6  procost (float4)
-			if e.Cost != 0 {
-				return e.Cost
-			}
-			return 1
-		}()),
-		executor.NewIntDatum(e.Rows), // 7  prorows (float4)
-		executor.NewIntDatum(0),      // 8  provariadic = 0
-		executor.NewIntDatum(int64(e.Support)), // 9  prosupport (regproc OID)
+		executor.NewIntDatum(cost),              // 6  procost (float4)
+		executor.NewIntDatum(rows),              // 7  prorows (float4)
+		executor.NewIntDatum(int64(variadic)),   // 8  provariadic
+		executor.NewIntDatum(int64(support)),    // 9  prosupport (regproc OID)
 		executor.NewStringDatum(string(kind)),            // 10 prokind
-		executor.NewBoolDatum(false),                     // 11 prosecdef
-		executor.NewBoolDatum(false),                     // 12 proleakproof
-		executor.NewBoolDatum(!e.NotStrict),              // 13 proisstrict
-		executor.NewBoolDatum(e.RetSet),                  // 14 proretset
+		executor.NewBoolDatum(secDef),                    // 11 prosecdef
+		executor.NewBoolDatum(leakProof),                 // 12 proleakproof
+		executor.NewBoolDatum(strict),                    // 13 proisstrict
+		executor.NewBoolDatum(retSet),                    // 14 proretset
 		executor.NewStringDatum(string(vol)),             // 15 provolatile
 		executor.NewStringDatum(string(parallel)),        // 16 proparallel
 		executor.NewIntDatum(int64(len(argTypes))),       // 17 pronargs
@@ -3208,7 +3221,7 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		argDefaultsDatum,                       // 24 proargdefaults (pg_node_tree)
 		executor.NullDatum,                     // 25 protrftypes
 		executor.NewStringDatum(e.HandlerName), // 26 prosrc — fmgr internal lookup key
-		executor.NullDatum,                     // 27 probin
+		probin,                                 // 27 probin
 		sqlBody,                                // 28 prosqlbody (NULL ⇒ PG executes prosrc)
 		executor.NullDatum,                     // 29 proconfig (NULL ⇒ no fmgr_security_definer)
 		pgProcBootstrapACL(e.OID),              // 30 proacl: PG initdb's REVOKE/GRANT result, else NULL (owner + PUBLIC EXECUTE)

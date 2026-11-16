@@ -58,6 +58,15 @@ func TestPgProcSeedLeavesAbsentVarlenaAttrsNull(t *testing.T) {
 			if _, hasACL := pgProcInitdbProACL[e.OID]; idx == 29 && hasACL {
 				continue
 			}
+			// probin carries pg_proc.dat's '$libdir/<module>' for the C-language
+			// conversion functions (pgProcBKIAttrsByOID, M0149-0001g slice 15) —
+			// a real path, not an empty shell.
+			if bk, ok := pgProcBKIAttrsByOID[e.OID]; idx == 26 && ok && bk.Bin != "" {
+				if got := row[idx].StringValue(); got != bk.Bin {
+					t.Fatalf("oid=%d (%s): probin %q, want pg_proc.dat's %q", e.OID, e.Name, got, bk.Bin)
+				}
+				continue
+			}
 			if !row[idx].IsNull() {
 				t.Fatalf("oid=%d (%s): %s is NOT NULL — an empty varlena shell here "+
 					"aborts a hosted PG (M0131-S13)", e.OID, e.Name, nullable[idx])
