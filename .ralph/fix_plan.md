@@ -11771,6 +11771,42 @@ verify each at HEAD when the task starts.
     text, plus the two-argument current\_user forms\), with CREATE / CONNECT / TEMP / TEMPORARY privileges.
   - First step: implement the six overloads over goopg's datacl store \(the same ACL source pg\_database.datacl
     renders\), then compare `\\l+` against the PG oracle.
+- [ ] **M0149-0001j — goopg-written pg\_statistic stavalues are unreadable on a PG node: 0-dimensional, text-typed arrays** \(filed 2026-11-16 by M0149-0001g; C3 interop, estimates only, below the item-10 rank\)
+  Kind: impl
+  Parent: M0149-0001g
+  - Repro, 2026\-11\-16, at 136ba8262:
+    - goopg: `CREATE TABLE s(i int, t text, d date)`, insert 2000 rows,
+      ANALYZE. goopg's own pg\_stats shows the right MCVs.
+    - PG 18.3 cold start on the directory: pg\_stats.most\_common\_vals is
+      `{}` and histogram\_bounds is NULL for all three columns.
+    - `EXPLAIN … WHERE i = 3` then estimates rows=1, where the true count
+      is 200.
+  - Cause 1: executor pgTextArrayBytes \(pg18\_user\_catalog\_rows.go\) never
+    writes ndim, so the ArrayType header says 0 dimensions.
+  - Cause 2: every stavalues slot is text\-element \(elemtype 25\) whatever
+    the column type. PG's update\_attstats \(analyze.c\) stores an anyarray of
+    the column's own type, and selfuncs compare its elements with the
+    column's operators.
+    - Fixing ndim alone would therefore be WORSE: int4eq / date\_lt /
+      numeric\_lt would run on text datums \(garbage selectivity; numeric
+      could crash\).
+  - Fix design:
+    - encode stavalues per column type in writeColumnStatRow: element
+      Datums from the value strings, encodeValuePG, typalign padding,
+      4\-byte varlena headers, ndim 1, elemtype = the column type's OID;
+    - decode in catalog.DecodePGStatisticRow: elemtype 25 keeps the legacy
+      path, which also reads the existing text blobs, including the TPC\-DS
+      corpora imports. Other element types go through a hook the executor
+      installs \(the RelAllVisibleFunc pattern\), formatting each element
+      exactly as ANALYZE produced it;
+    - siblings to keep in step: pg\_restore\_attribute\_stats import,
+      truncateColumnStatsToFit, the pg\_stats view.
+  - Gates: plan\-relevant through goopg's restart round\-trip. Run the census,
+    spotcheck and acceptance arm, plus a restart A/B of a goopg ANALYZE
+    \(EXPLAIN estimates must not move\). Then the PG cold\-start probe above:
+    the MCVs must be visible and the estimate rows=200.
+  - Unblocks: capturing the 412 catalog pg\_statistic rows of PG's initdb
+    \(the same typed encoder\).
 - [ ] **M0149-0001i — regnamespace has no name-resolution seam: `'public'::regnamespace::oid` errors, `99::regnamespace` prints 99** \(filed 2026-11-16 by M0149-0001g slice 24; correctness, below the item-10 rank\)
   Kind: impl
   Parent: none
