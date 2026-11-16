@@ -366,3 +366,15 @@ the two layouts legitimately differ.
   control file, the same order as PG's CreateExtension.
 - pg\_depend now carries only plpgsql's rows. The remaining initdb
   dependencies \(views, information\_schema, …\) are still to be captured.
+
+## Follow\-up: M0149\-0001g slice 30 — pg\_largeobject \(2026\-11\-16\)
+
+- pg\_largeobject \(2613\) and its UNIQUE PRIMARY index 2683 \(loid, pageno\)
+  are bootstrapped like pg\_largeobject\_metadata \(2995 / 2996\):
+  - a nailed relation with PG's three columns;
+  - an empty heap and a metapage\-only index;
+  - a pg\_index row.
+- With it, every catalog relation's relname and relfilenode equal a PG 18.3
+  initdb's.
+- The bootstrap rowtype 10025 \(captured in slice 18\) no longer names a
+  missing relation.

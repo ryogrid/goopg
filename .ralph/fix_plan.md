@@ -12541,6 +12541,32 @@ verify each at HEAD when the task starts.
       7 cases \(no movement; plpgsql's 1234–1244 is its known flake band\),
       spotcheck, sf025 99, acceptance.
     Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 30: pg\_largeobject \(2613\) and pg\_largeobject\_loid\_pn\_index \(2683\) are bootstrapped; every catalog relation's relname and relfilenode now equals a PG 18.3 initdb's.
+    - Before:
+      - a PG node's large\-object functions failed "could not open relation
+        with OID 2613";
+      - the bootstrap rowtype 10025 \(typrelid 2613\) named a pg\_class row
+        that did not exist.
+    - nailedLocalRels gains pg\_largeobject \(loid oid, pageno int4, data
+      bytea, all NOT NULL\). The index registry and the empty\-catalog index
+      list gain 2683, and pgIndexInitialEntries gains its UNIQUE PRIMARY
+      \(loid oid\_ops, pageno int4\_ops\) row.
+    - PG cold start:
+      - the pg\_class, pg\_attribute and pg\_index rows of 2613 / 2683 equal
+        a PG initdb's;
+      - the relname / relfilenode list of every catalog relation is now
+        identical;
+      - large objects round\-trip \(lo\_from\_bytea of 5000 bytes writes 3 pages; a
+        forced index scan finds them; lo\_unlink and VACUUM leave none\).
+    - goopg restarts clean twice. goopg's own SQL catalog still has no
+      pg\_largeobject relation \(ledgered\).
+    - The cold\-start test's tripwire had probed pg\_largeobject as "the one
+      PG catalog goopg never bootstraps". It now asserts pg\_largeobject is
+      readable and empty, and trips on a name that exists in neither system.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      4 cases \(largeobject, misc\_sanity, type\_sanity, oidjoins; no
+      movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

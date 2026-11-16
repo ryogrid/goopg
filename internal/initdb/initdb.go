@@ -2246,6 +2246,7 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		2675,       // pg_description_o_c_o_index
 		2699, 2702, // pg_trigger_tgconstraint_index, pg_trigger_oid_index (slice 3)
 		2996,       // pg_largeobject_metadata_oid_index (slice 3)
+		2683,       // pg_largeobject_loid_pn_index (slice 30)
 		3257, 3258, // pg_policy_oid_index, pg_policy_polrelid_polname_index (slice 3)
 		3597,       // pg_seclabel_object_index (slice 3)
 		3395,       // pg_init_privs_o_c_o_index (slice 3)
@@ -5351,6 +5352,9 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		entry(2699, 2620, []int16{11}, []uint32{oidOps}, []uint32{0}, false, false),                                                  // pg_trigger_tgconstraint_index
 		entry(2702, 2620, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                                     // pg_trigger_oid_index
 		entry(2996, 2995, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                                     // pg_largeobject_metadata_oid_index
+		// M0149-0001g slice 30: pg_largeobject_loid_pn_index, UNIQUE PRIMARY
+		// btree(loid oid_ops, pageno int4_ops) (pg_largeobject.h).
+		entry(2683, 2613, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_largeobject_loid_pn_index
 		entry(3257, 3256, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                                     // pg_policy_oid_index
 		entry(3258, 3256, []int16{3, 2}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false),                            // pg_policy_polrelid_polname_index
 		entry(3597, 3596, []int16{1, 2, 3, 4}, []uint32{oidOps, oidOps, int4Ops, textOps}, []uint32{0, 0, 0, cCollation}, true, true), // pg_seclabel_object_index

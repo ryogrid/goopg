@@ -153,6 +153,7 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		2699: {11},         // pg_trigger_tgconstraint_index
 		2702: {1},          // pg_trigger_oid_index
 		2996: {1},          // pg_largeobject_metadata_oid_index
+		2683: {1, 2},       // pg_largeobject_loid_pn_index (slice 30)
 		3257: {1},          // pg_policy_oid_index
 		3258: {3, 2},       // pg_policy_polrelid_polname_index
 		3597: {1, 2, 3, 4}, // pg_seclabel_object_index

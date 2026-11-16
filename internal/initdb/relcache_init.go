@@ -749,8 +749,8 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	// (relcache.c:4075-4083), so the Phase3 `rd_att->tdtypeid ==
 	// relp->reltype` assertion (relcache.c:4293) does not fire.
 	//
-	// pg_largeobject (2613) is deliberately NOT added even though the view
-	// names it: the reference is `l.classoid = 'pg_catalog.pg_largeobject'
+	// pg_largeobject (2613) was at first deliberately NOT added even though
+	// the view names it (it is now, M0149-0001g slice 30, below): the reference is `l.classoid = 'pg_catalog.pg_largeobject'
 	// ::regclass`, which upstream's CREATE VIEW already folded to a Const 2613
 	// inside the captured ev_action, so nothing resolves the name at run time.
 	// As with pg_policy, the declared companions are not bootstrapped either
@@ -764,6 +764,12 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	// freshly initdb'd PG 18.3's own pg_attribute.
 	{3596, "pg_seclabel", 83, 'r', 5, false, pgSecLabelAttrs()},
 	{2995, "pg_largeobject_metadata", 83, 'r', 3, false, pgLargeObjectMetadataAttrs()},
+	// M0149-0001g slice 30: pg_largeobject itself (LargeObjectRelationId 2613,
+	// pg_largeobject.h) with its index 2683. Without it a PG node's lo_create /
+	// lo_import / lo_put failed "could not open relation with OID 2613", and
+	// the bootstrap rowtype 10025 named a pg_class row that did not exist.
+	// The heap is empty, as on a fresh PG cluster.
+	{2613, "pg_largeobject", 83, 'r', 3, false, pgLargeObjectAttrs()},
 	// M0106-0010 Step 3dl: pg_stat_wal_receiver — first relkind='v' (view)
 	// entry seeded into the bootstrap pg_class heap. After Steps 3dj/3dk
 	// landed pg_proc OID 3317 (`pg_stat_get_wal_receiver`) with its 15
@@ -882,6 +888,7 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	{OID: 2699, Name: "pg_trigger_tgconstraint_index"},
 	{OID: 2702, Name: "pg_trigger_oid_index"},
 	{OID: 2996, Name: "pg_largeobject_metadata_oid_index"},
+	{OID: 2683, Name: "pg_largeobject_loid_pn_index"}, // slice 30
 	{OID: 3257, Name: "pg_policy_oid_index"},
 	{OID: 3258, Name: "pg_policy_polrelid_polname_index"},
 	{OID: 3597, Name: "pg_seclabel_object_index"},
@@ -3371,6 +3378,17 @@ func pgSecLabelAttrs() []nailedAttr {
 // It DOES have an `oid` system column, so attnum 1 is oid. `lomacl` is
 // aclitem[] (1034) and is the only nullable column — a large object with
 // default privileges stores NULL there.
+// pgLargeObjectAttrs is FormData_pg_largeobject (pg_largeobject.h): loid,
+// pageno, data — all NOT NULL; data is bytea, stored inline or TOAST-less
+// ('x' storage, no TOAST table declared). M0149-0001g slice 30.
+func pgLargeObjectAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "loid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
+		{Name: "pageno", TypeOID: 23, Num: 2, Len: 4, NotNull: true},
+		{Name: "data", TypeOID: 17, Num: 3, Len: -1, NotNull: true},
+	}
+}
+
 func pgLargeObjectMetadataAttrs() []nailedAttr {
 	return []nailedAttr{
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},        // oid (system column)
