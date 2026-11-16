@@ -17443,9 +17443,9 @@ func (c *InMemory) PGNamespaceRowsForDBOid(dbOid uint32) [][]string {
 	sort.Slice(schemas, func(i, j int) bool { return schemas[i].oid < schemas[j].oid })
 	out := make([][]string, 0, len(schemas))
 	for _, s := range schemas {
-		if s.name == "pg_toast" {
-			continue // skip internal alias
-		}
+		// pg_toast (99) is listed like every other namespace, as in PG
+		// (pg_namespace.dat). It used to be skipped as an "internal alias"
+		// while its OID still collided with public's (M0149-0001g slice 24).
 		out = append(out, []string{
 			strconv.Itoa(int(s.oid)), // oid
 			s.name,                   // nspname

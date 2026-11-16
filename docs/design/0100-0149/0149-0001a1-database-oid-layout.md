@@ -740,6 +740,12 @@ Key observation: PG compatibility constrains only the **displayed** and
 - Invariant: pg\_dump of a fresh goopg database equals pg\_dump of a fresh
   PG 18.3 database.
 
+## Follow\-up: M0149\-0001g slice 24 — pg\_toast in goopg's pg\_namespace \(2026\-11\-16\)
+
+- goopg's pg\_namespace view lists all four bootstrap namespaces with PG's
+  owner, nspacl and description. pg\_toast had been hidden since the era
+  when its OID collided with public's.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

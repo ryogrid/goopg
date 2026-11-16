@@ -136,3 +136,20 @@ func TestInitdbDescriptionsSeedComments(t *testing.T) {
 		t.Errorf("SystemCatalogOID(pg_namespace) = %d,%v, want 2615", oid, ok)
 	}
 }
+
+// TestPGNamespaceRowsListPgToast pins M0149-0001g slice 24: goopg's
+// pg_namespace lists pg_toast (OID 99, owner 10, NULL nspacl) like PG's
+// pg_namespace.dat; it was skipped as an "internal alias" while its OID still
+// collided with public's.
+func TestPGNamespaceRowsListPgToast(t *testing.T) {
+	c := NewInMemory()
+	for _, r := range c.PGNamespaceRowsForDBOid(DefaultDBOid) {
+		if r[1] == "pg_toast" {
+			if r[0] != "99" || r[2] != "10" || r[3] != "" {
+				t.Errorf("pg_toast row = %v, want [99 pg_toast 10 <NULL>]", r)
+			}
+			return
+		}
+	}
+	t.Fatal("pg_namespace has no pg_toast row")
+}

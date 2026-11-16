@@ -8671,6 +8671,22 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
     call resyncTableClassHeapRowForIndexSet after the ACL store changes — it rebuilds
     the row through userRelACLDatum — and reload relacl into the ACL store at Open,
     as reloadDatabaseACLsFromHeap does for datacl.
+- [ ] **M0146\-0161a — WRONG RESULTS: GRANT / REVOKE inside an explicit transaction or a multi\-statement query records nothing** \(filed 2026\-11\-16 by M0149\-0001g slice 24; S2\)
+  Kind: impl
+  Parent: M0146\-0161
+  - Repro on goopg \(a8252b3f9\):
+    - `CREATE TABLE t3\(a int\)`, then `BEGIN; GRANT SELECT ON t3 TO PUBLIC; COMMIT;` → relacl stays NULL;
+    - `CREATE TABLE t2\(a int\); GRANT SELECT ON t2 TO PUBLIC;` sent as one simple query → the same.
+    - pg\_dump then omits the GRANT, so a dump/restore silently drops the privilege. Autocommit GRANT works.
+  - Known since 2026\-08\-21: deferral ledger M0134\-0069 and the M0122\-0008 row. The statement reaches the executor as a CompatNoopStmt with no grantee list, and the ACL recorders \(postmaster grant\_ddl.go tryRecordTableGrant\) run only on the autocommit path. It was never filed as a task.
+  - PG: ExecuteGrantStmt \(postgres/src/backend/catalog/aclchk.c\) updates relacl transactionally; it becomes visible at COMMIT and disappears on ROLLBACK.
+  - Rank: below item 10 — correctness\-only \(S7 carve\-out\), like its parent.
+  - First step:
+    - parse GRANT/REVOKE into a typed statement \(like TypeACLChange / DatabaseACLChange\);
+    - apply it through the recorders at transactional\-DDL commit, and discard it on ROLLBACK;
+    - parser change: read the goyacc playbook §12 first.
+  > \#\# ESCALATION 2026\-11\-16 \(S2\) — M0146\-0161a drops GRANT/REVOKE issued inside BEGIN … COMMIT
+  > Filed under M0146\-0161 \(below item 10 by the 2026\-10\-13 carve\-out\). The privilege is silently lost and pg\_dump omits it. Owner placement requested.
 - [x] **M0146\-0158 — PGC\_SUSET parameters can be SET by a non\-superuser**
   (full entry archived → `completed_milestones/completed_fix_plan_015.md`)
 - [ ] **M0146\-0162 — WRONG RESULTS: a non\-superuser that logs in directly runs with superuser
@@ -11755,6 +11771,19 @@ verify each at HEAD when the task starts.
     text, plus the two-argument current\_user forms\), with CREATE / CONNECT / TEMP / TEMPORARY privileges.
   - First step: implement the six overloads over goopg's datacl store \(the same ACL source pg\_database.datacl
     renders\), then compare `\\l+` against the PG oracle.
+- [ ] **M0149-0001i — regnamespace has no name-resolution seam: `'public'::regnamespace::oid` errors, `99::regnamespace` prints 99** \(filed 2026-11-16 by M0149-0001g slice 24; correctness, below the item-10 rank\)
+  Kind: impl
+  Parent: none
+  - Repro on goopg: `select 'public'::regnamespace::oid` → "invalid input syntax for type oid"; `select 99::regnamespace` → `99`. PG 18.3: 2200 and `pg_toast`.
+  - PG: regnamespacein / regnamespaceout \(postgres/src/backend/utils/adt/regproc.c\): a single identifier \(42602 "invalid name syntax" otherwise\), resolved by get\_namespace\_oid \(3F000 when missing\); output is quote\_identifier of the name, or the numeric OID when dangling.
+  - goopg: "regnamespace" is missing from every reg\* sibling list, so it stays unresolved text:
+    - regIdentifierInput / regOutShared / isRegIdentifierTypeName \(executor/reg\_identifier.go\);
+    - the 4\-byte encode arms \(executor/codec.go 649 / 1772, copy\_binary.go, codec\_array.go, btree\_scalar\_keys.go\);
+    - postmaster/dispatch.go's wire output list, utils/adt/array/pgarray.go, xlog/pgoutput.go, optimizer/planner.go, catalog physical\_align.go.
+  - First step:
+    - add the input and output arms;
+    - add "regnamespace" to all the lists above together \(Hard-won Rule \#2\);
+    - re-run the full regress suite, since a regnamespace column's on-disk encoding changes \(Rule \#5\).
 - [ ] **M0149-0001g — goopg's bootstrap catalog image diverges from PG 18.3: 20 catalog descriptors, 19 missing and some empty indexes, 29 missing TOAST relations, local relhasindex false; PG-side CREATE TABLE segfaults** \(filed 2026-11-15; S2 — a PG 18.3 node crashes and would write malformed catalog rows on a goopg directory\)
   Kind: impl
   Parent: none
@@ -12357,6 +12386,19 @@ verify each at HEAD when the task starts.
       10 cases \(psql 766→748, others unchanged\), spotcheck, sf025 99,
       acceptance.
     Movement: regress psql 774→748 \(inventory; A/B 766→748\)
+  - 2026-11-16 slice 24: goopg's pg\_namespace lists pg\_toast; every namespace row now equals PG 18.3's.
+    - PGNamespaceRowsForDBOid skipped pg\_toast as an "internal alias", a
+      leftover from when its OID collided with public's. It now lists
+      pg\_toast \(99, owner 10, NULL nspacl, "reserved schema for TOAST tables"\).
+    - Probe: oid, nspname, nspowner, nspacl and obj\_description match PG for
+      all four namespaces. A fresh\-db pg\_dump stays identical to PG.
+    - Filed from probes:
+      - M0149\-0001i: regnamespace has no input/output seam;
+      - M0146\-0161a \(S2\): GRANT inside BEGIN or a multi\-statement query records nothing.
+    - Gates: units, postmaster, testport interop set \+ toast/amcheck ports,
+      regress A/B on 7 cases \(no movement; alter\_generic 208–210 is its
+      known flake\), spotcheck, sf025 99, acceptance.
+    Movement: none — catalog conformance \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none
