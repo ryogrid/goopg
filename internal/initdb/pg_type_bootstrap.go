@@ -776,8 +776,21 @@ func bootstrapPgTypeTuples(dataDir string) (map[uint32]heapTID, error) {
 	}
 	sort.Slice(oids, func(i, j int) bool { return oids[i] < oids[j] })
 
+	// M0149-0001g slice 18: the system relations' composite rowtypes and
+	// their array types a PG initdb holds (pgTypeRowtypeRows), merged in OID
+	// order with goopg's own rows.
+	extra := pgTypeRowtypeRows()
+	for oid := range extra {
+		oids = append(oids, oid)
+	}
+	sort.Slice(oids, func(i, j int) bool { return oids[i] < oids[j] })
+
 	rows := make([]executor.Row, 0, len(oids))
 	for _, oid := range oids {
+		if r, ok := extra[oid]; ok {
+			rows = append(rows, pgTypeFullRowDatums(r))
+			continue
+		}
 		rows = append(rows, pgTypeRow(allMap[oid]))
 	}
 	rawTIDs, err := writeMultiPageHeapRows(dataDir, "1247", cols, rows)

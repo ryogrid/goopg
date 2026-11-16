@@ -6371,10 +6371,7 @@ func pgClassColDefs() []catalog.Column {
 // pgClassRow builds a 14-col pg_class tuple matching pgClassColDefs order.
 func pgClassRow(rel nailedRel) executor.Row {
 	frozenXID, frozenMXID := executor.PGClassFrozenIDs(string(rune(rel.RelKind)))
-	relType := rel.RelType
-	if relType == 0 && !isNailedToastRel(rel) {
-		relType = rel.OID
-	}
+	relType := pgClassRelType(rel)
 	relAm := int64(0)
 	// M0131-S20.1: relkind 't' (TOAST) is heap-AM storage exactly like 'r'.
 	if rel.RelKind == 'r' || rel.RelKind == 't' {
@@ -7182,4 +7179,24 @@ func defaultPgIdentConf() []byte {
 // buildPgHBAConf(host, local) when an explicit auth method is requested.
 func defaultPgHBAConf() []byte {
 	return buildPgHBAConf("trust", "trust")
+}
+
+// pgClassRelType is pg_class.reltype for a bootstrap relation: the composite
+// rowtype a PG 18.3 initdb gives it (pgClassRowtypeOIDs, M0149-0001g slice
+// 18) — before that, most catalogs carried the placeholder 83 (pg_class's own
+// rowtype) and views their own relation OID. Falls back to the historical
+// value for a relation PG has no captured rowtype for. Shared by the heap row
+// and the relcache init file so the two agree.
+func pgClassRelType(rel nailedRel) uint32 {
+	if oid, ok := pgClassRowtypeOIDs()[rel.OID]; ok {
+		return oid
+	}
+	if rel.RelKind == 'i' || rel.RelKind == 'I' {
+		return 0 // indexes have no rowtype (heap.c: only relkinds with a tuple descriptor of their own get one)
+	}
+	relType := rel.RelType
+	if relType == 0 && !isNailedToastRel(rel) {
+		relType = rel.OID
+	}
+	return relType
 }

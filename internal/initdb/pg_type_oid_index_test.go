@@ -38,42 +38,42 @@ func TestBootstrapPgTypeOidIndexWritesPopulatedBtree(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", path, err)
 		}
-		if len(buf) != 2*storage.BlockSize {
-			t.Fatalf("%s: size=%d bytes, want %d (meta + leaf-root)", path, len(buf), 2*storage.BlockSize)
+		// Since M0149-0001g slice 18 pg_type outgrows one leaf page; walk
+		// every leaf page (BTP_LEAF in btpo_flags) in file order, skipping
+		// the high key (slot 1) of non-rightmost leaves.
+		if len(buf) < 2*storage.BlockSize || len(buf)%storage.BlockSize != 0 {
+			t.Fatalf("%s: size=%d bytes, want a metapage plus at least one leaf", path, len(buf))
 		}
-
-		leaf := buf[storage.BlockSize:]
-		pdLower := binary.LittleEndian.Uint16(leaf[12:14])
 		const pageHeaderSize = 24
 		const itemIDSize = 4
-		if pdLower < pageHeaderSize {
-			t.Fatalf("%s: pd_lower=%d < page header size", path, pdLower)
+		gotOIDs := make([]uint32, 0, len(tids))
+		for blk := 1; blk < len(buf)/storage.BlockSize; blk++ {
+			page := buf[blk*storage.BlockSize : (blk+1)*storage.BlockSize]
+			special := int(binary.LittleEndian.Uint16(page[16:18]))
+			next := binary.LittleEndian.Uint32(page[special+4 : special+8])
+			flags := binary.LittleEndian.Uint16(page[special+12 : special+14])
+			if flags&1 == 0 { // not a leaf
+				continue
+			}
+			pdLower := binary.LittleEndian.Uint16(page[12:14])
+			numItems := (int(pdLower) - pageHeaderSize) / itemIDSize
+			first := 1
+			if next != 0 {
+				first = 2 // high key
+			}
+			for slot := first; slot <= numItems; slot++ {
+				ipPos := pageHeaderSize + (slot-1)*itemIDSize
+				raw := binary.LittleEndian.Uint32(page[ipPos : ipPos+4])
+				offset := int(raw & 0x7FFF)
+				length := int((raw >> 17) & 0x7FFF)
+				if offset == 0 || length < 12 || offset+length > len(page) {
+					t.Fatalf("%s: block %d slot %d bad line pointer (off=%d len=%d)", path, blk, slot, offset, length)
+				}
+				gotOIDs = append(gotOIDs, binary.LittleEndian.Uint32(page[offset+8:offset+12]))
+			}
 		}
-		numItems := (int(pdLower) - pageHeaderSize) / itemIDSize
-		if numItems != len(tids) {
-			t.Fatalf("%s: leaf line-pointer count=%d, want %d (one per heap tuple)", path, numItems, len(tids))
-		}
-
-		gotOIDs := make([]uint32, 0, numItems)
-		for slot := 1; slot <= numItems; slot++ {
-			ipPos := pageHeaderSize + (slot-1)*itemIDSize
-			raw := binary.LittleEndian.Uint32(leaf[ipPos : ipPos+4])
-			offset := int(raw & 0x7FFF)
-			length := int((raw >> 17) & 0x7FFF)
-			if offset == 0 || length == 0 {
-				t.Fatalf("%s: slot %d empty line pointer (off=%d len=%d)", path, slot, offset, length)
-			}
-			if offset+length > len(leaf) {
-				t.Fatalf("%s: slot %d tuple past page (off=%d len=%d)", path, slot, offset, length)
-			}
-			// IndexTuple: t_tid (6) + t_info (2) + key data.
-			// hoff = MAXALIGN(sizeof(IndexTupleData)) = 8 (no-nulls).
-			const hoff = 8
-			if length < hoff+4 {
-				t.Fatalf("%s: slot %d tuple too short for oid key (len=%d)", path, slot, length)
-			}
-			oid := binary.LittleEndian.Uint32(leaf[offset+hoff : offset+hoff+4])
-			gotOIDs = append(gotOIDs, oid)
+		if len(gotOIDs) != len(tids) {
+			t.Fatalf("%s: leaf entries=%d, want %d (one per heap tuple)", path, len(gotOIDs), len(tids))
 		}
 
 		// Strictly ascending order (sorted by oid).

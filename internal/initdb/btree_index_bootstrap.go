@@ -839,15 +839,12 @@ func bootstrapPgTypeOidIndex(dataDir string, tids map[uint32]heapTID) error {
 	for i, it := range items {
 		tuples[i] = pgBuildIndexTupleOidKey(it.block, it.off, it.oid)
 	}
-	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	// Multi-level bulk load: with the system relations' rowtypes and their
+	// arrays (M0149-0001g slice 18) pg_type outgrew a single leaf page.
+	file, err := pgBuildBtreeBulkLoad(tuples, 1)
 	if err != nil {
-		return fmt.Errorf("pg_type_oid_index leaf: %w", err)
+		return fmt.Errorf("pg_type_oid_index bulk-load: %w", err)
 	}
-	meta := pgBuildBtreeMetapageWithRoot(1 /* root block */, 0 /* leaf level */)
-
-	file := make([]byte, 0, 2*storage.BlockSize)
-	file = append(file, meta...)
-	file = append(file, leaf...)
 
 	for _, dir := range []string{
 		filepath.Join(dataDir, "base", "1"),
@@ -1037,6 +1034,11 @@ func bootstrapPgTypeTypnameNspIndex(dataDir string, tids map[uint32]heapTID) err
 			nsp = v
 		}
 		entries = append(entries, entry{name: e.Name, nsp: nsp, blk: t.Block, off: t.Offset})
+	}
+	for oid, r := range pgTypeRowtypeRows() { // M0149-0001g slice 18
+		if t, ok := tids[oid]; ok {
+			entries = append(entries, entry{name: r.Name, nsp: r.Nsp, blk: t.Block, off: t.Offset})
+		}
 	}
 	// Sort by typname (NameData byte comparison), then typnamespace — the index
 	// key is (typname, typnamespace), and the domains are the first rows outside

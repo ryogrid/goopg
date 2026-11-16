@@ -678,6 +678,16 @@ Key observation: PG compatibility constrains only the **displayed** and
   helpers were corrected where it disagreed.
 - Index columns on name are a format gap: PG keys them as cstring.
 
+## Follow\-up: M0149\-0001g slice 18 — system rowtypes and reltype \(2026\-11\-16\)
+
+- The bootstrap pg\_type gains each system relation's composite rowtype and
+  its array type, as complete PG rows from `pg_type_rowtypes_generated.go`.
+  `scripts/gen-pg-type-rowtypes.py` regenerates that file.
+- `pgClassRelType` is the single source of `pg_class.reltype` for the heap
+  row and the relcache init file:
+  - the captured rowtype where one exists;
+  - 0 for indexes.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

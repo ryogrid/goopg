@@ -2102,9 +2102,9 @@ func buildPgClassBlob(rel nailedRel) []byte {
 	copy(buf[4:4+pgNameDataLen], []byte(rel.RelName))
 	// relnamespace (offset 68): PGNSP=11
 	le.PutUint32(buf[68:72], 11)
-	// reltype (offset 72)
-	if rel.RelType != 0 {
-		le.PutUint32(buf[72:76], rel.RelType)
+	// reltype (offset 72): same value as the pg_class heap row (pgClassRelType).
+	if rt := pgClassRelType(rel); rt != 0 {
+		le.PutUint32(buf[72:76], rt)
 	}
 	// relowner (offset 80): bootstrap superuser = 10
 	le.PutUint32(buf[80:84], 10)

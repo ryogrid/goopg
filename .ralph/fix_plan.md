@@ -12214,6 +12214,29 @@ verify each at HEAD when the task starts.
       - type\_sanity read 79 once and 82 in two reruns, so no stable
         movement. The stale inventory \(93\) was re\-measured to 82.
     Movement: regress type\_sanity 93→82 \(inventory catch\-up; this slice no stable movement\)
+  - 2026-11-16 slice 18: system relations' rowtypes in pg\_type; pg\_class.reltype equals PG.
+    - Added rows: the composite rowtype of every bootstrap system relation
+      that has one \(59 catalogs, 145 views\) and each rowtype's array
+      type. The rows come from pg\_type\_rowtypes\_generated.go, produced by
+      scripts/gen\-pg\-type\-rowtypes.py from a throwaway initdb. They are
+      added only where goopg bootstraps the relation under the same OID and
+      name.
+    - Index support: pg\_type\_oid\_index now uses the multi\-level bulk
+      loader, since pg\_type outgrew one leaf. pg\_type\_typname\_nsp\_index
+      includes the new rows.
+    - pg\_class.reltype: pgClassRelType, shared by the heap row and the
+      relcache init file, points at the captured rowtype; indexes get 0.
+      Before, most catalogs carried the placeholder 83 and views or indexes
+      their own OID.
+    - PG cold start:
+      - pg\_type: 618 of 619 shared rows identical, from 213 rows present
+        before. Only pg\_largeobject's rowtype and array are missing.
+      - pg\_class.reltype: 358 of 358 identical.
+      - Row casts, array\_agg over a catalog rowtype, regtype lookups of
+        catalog names and \\d\+ all work.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      7 cases \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none
