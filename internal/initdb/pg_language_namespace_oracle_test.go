@@ -21,6 +21,9 @@ func TestPgLanguageMatchesPostgresBKI(t *testing.T) {
 	}
 	got := map[string]string{}
 	for _, e := range pgLanguageInitialEntries() {
+		if e.OID == pgPlpgsqlLanguage.OID {
+			continue // created after bootstrap by CREATE EXTENSION plpgsql (slice 29)
+		}
 		got[fmt.Sprint(e.OID)] = fmt.Sprintf("%d %s %d %s %s %d %d %d", e.OID, e.LanName, e.LanOwner,
 			boolChar(e.LanIspl), boolChar(e.LanPltrusted), e.LanPlcallfoid, e.LanInline, e.LanValidator)
 	}

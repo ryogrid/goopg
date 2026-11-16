@@ -1081,16 +1081,20 @@ func TestPgLanguageBuiltinRows(t *testing.T) {
 	if len(rows) != 4 {
 		t.Fatalf("pg_language returned %d rows; want exactly 4 (internal/c/sql/plpgsql)", len(rows))
 	}
-	// oid -> expected (lanname, lanpltrusted, laninline)
+	// oid -> expected (lanname, lanispl, lanpltrusted, laninline): PG 18.3
+	// initdb's rows (M0149-0001g slice 29). plpgsql is a procedural language
+	// (lanispl t); pg_dump still skips it because it is a member of the
+	// built-in plpgsql extension (oid below FirstNormalObjectId).
 	want := map[string]struct {
 		name      string
+		ispl      string
 		pltrusted string
 		inline    string
 	}{
-		"12":    {"internal", "f", "0"},
-		"13":    {"c", "f", "0"},
-		"14":    {"sql", "t", "2511"},
-		"13627": {"plpgsql", "t", "0"},
+		"12":    {"internal", "f", "f", "0"},
+		"13":    {"c", "f", "f", "0"},
+		"14":    {"sql", "f", "t", "0"},
+		"13627": {"plpgsql", "t", "t", "13625"},
 	}
 	for _, row := range rows {
 		oid := row[colIdx["oid"]]
@@ -1102,9 +1106,8 @@ func TestPgLanguageBuiltinRows(t *testing.T) {
 		if got := row[colIdx["lanname"]]; got != w.name {
 			t.Errorf("oid %s lanname = %q; want %q", oid, got, w.name)
 		}
-		// lanispl MUST be "f" for every built-in so getProcLangs returns 0 rows.
-		if got := row[colIdx["lanispl"]]; got != "f" {
-			t.Errorf("oid %s lanispl = %q; want f (built-ins must never be dumped)", oid, got)
+		if got := row[colIdx["lanispl"]]; got != w.ispl {
+			t.Errorf("oid %s lanispl = %q; want %q", oid, got, w.ispl)
 		}
 		if got := row[colIdx["lanpltrusted"]]; got != w.pltrusted {
 			t.Errorf("oid %s lanpltrusted = %q; want %q", oid, got, w.pltrusted)

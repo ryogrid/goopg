@@ -348,3 +348,21 @@ the two layouts legitimately differ.
 - A goopg\-only function needs its own seed list with an OID outside PG's
   range, and must not duplicate a pg\_proc.dat signature.
 - `TestPgProcInitialEntriesSignaturesUnique` enforces the uniqueness.
+
+## Follow\-up: M0149\-0001g slice 29 — plpgsql at initdb \(2026\-11\-16\)
+
+- PG's initdb runs CREATE EXTENSION plpgsql \(initdb.c load\_plpgsql\).
+  `pg_plpgsql_generated.go` \(scripts/gen\-pg\-plpgsql.py\) carries what it
+  leaves:
+  - the three handler functions;
+  - the language row;
+  - the extension row;
+  - the extension's pg\_depend rows.
+- The rows join the pg\_proc and pg\_language seeds. `bootstrapPgPlpgsql`
+  writes pg\_extension and pg\_depend with their indexes.
+- goopg reloads the pg\_extension heap at startup, so its own catalog knows
+  plpgsql is installed.
+- CREATE EXTENSION checks for an existing extension before looking for a
+  control file, the same order as PG's CreateExtension.
+- pg\_depend now carries only plpgsql's rows. The remaining initdb
+  dependencies \(views, information\_schema, …\) are still to be captured.

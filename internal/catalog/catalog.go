@@ -11566,10 +11566,13 @@ func (c *InMemory) registerSystemTables() {
 	// lanname). DU-002 slice 163.
 	pgLanguage.VirtualRows = func() [][]string {
 		return [][]string{
-			{"12", "internal", "10", "f", "f", "0", "0", "0", ""},
-			{"13", "c", "10", "f", "f", "0", "0", "0", ""},
-			{"14", "sql", "10", "f", "t", "0", "2511", "0", ""},
-			{"13627", "plpgsql", "10", "f", "t", "0", "0", "0", ""},
+			// PG 18.3 initdb's rows, as goopg's bootstrap pg_language heap
+			// carries them (M0149-0001g slice 29): validators 2246/2247/2248,
+			// sql has no inline handler, plpgsql's handlers 13624-13626.
+			{"12", "internal", "10", "f", "f", "0", "0", "2246", ""},
+			{"13", "c", "10", "f", "f", "0", "0", "2247", ""},
+			{"14", "sql", "10", "f", "t", "0", "0", "2248", ""},
+			{"13627", "plpgsql", "10", "t", "t", "13624", "13625", "13626", ""},
 		}
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_language"] = pgLanguage

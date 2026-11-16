@@ -2,7 +2,7 @@
 
 package catalog
 
-// PGInitdbDescriptions holds pg_description rows of built-in objects (4451 rows).
+// PGInitdbDescriptions holds pg_description rows of built-in objects (4453 rows).
 var PGInitdbDescriptions = []InitdbDescription{
 	{2, 2601, 0, "heap table access method"},
 	{3, 1255, 0, "row-oriented heap table access method handler"},
@@ -4455,6 +4455,8 @@ var PGInitdbDescriptions = []InitdbDescription{
 	{6428, 1255, 0, "generate UUID version 4"},
 	{6429, 1255, 0, "generate UUID version 7"},
 	{6430, 1255, 0, "generate UUID version 7 with a timestamp shifted by specified interval"},
+	{13623, 3079, 0, "PL/pgSQL procedural language"},
+	{13627, 2612, 0, "PL/pgSQL procedural language"},
 }
 
 // PGInitdbShdescriptions holds every pg_shdescription row (3 rows).

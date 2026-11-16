@@ -12504,6 +12504,43 @@ verify each at HEAD when the task starts.
     - Gates: units, initdb, postmaster, testport interop set, regress A/B on
       4 cases \(no movement\), spotcheck, sf025 99, acceptance.
     Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 29: plpgsql is installed at initdb, as on PG 18.3 \(CREATE EXTENSION plpgsql\).
+    - scripts/gen\-pg\-plpgsql.py captures the extension's rows into
+      pg\_plpgsql\_generated.go:
+      - the three handlers \(pg\_proc 13624–13626, probin $libdir/plpgsql\);
+      - pg\_language 13627;
+      - pg\_extension 13623;
+      - its 7 pg\_depend rows \(4 'e' extension members, 3 'n' language →
+        handler\).
+    - The two descriptions come with gen\-pg\-description.py, whose filter
+      now also covers pg\_language / pg\_extension objects below 16384.
+    - bootstrapPgPlpgsql writes the pg\_extension heap with indexes 3080 /
+      3081, and pg\_depend with indexes 2673 / 2674. Before, goopg's
+      pg\_depend heap was empty.
+    - goopg's own SQL side:
+      - pg\_language carries PG's rows \(validators 2246–2248, sql laninline
+        0, plpgsql lanispl t and handlers 13624–13626\);
+      - pg\_extension lists plpgsql 13623 \(reloaded from the heap\);
+      - CREATE EXTENSION checks for an installed extension before the
+        control file, so `CREATE EXTENSION plpgsql` errors "already exists"
+        as on PG.
+    - PG cold start:
+      - all these rows equal a PG initdb's;
+      - a LANGUAGE plpgsql function returns 55 and a DO block runs;
+      - \\dx and \\dL match PG;
+      - forced index scans on 2673 / 2674 / 3080 / 3081 hit;
+      - DROP EXTENSION plpgsql CASCADE and CREATE EXTENSION plpgsql
+        round\-trip.
+    - goopg: restarts clean twice; a fresh\-db pg\_dump stays identical to
+      PG's; plpgsql functions work.
+    - Still open \(ledgered\):
+      - goopg's \\dx fails: pg\_available\_extensions has no
+        default\_version column;
+      - PG's initdb pg\_depend has 1725 rows; goopg writes only these 7.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      7 cases \(no movement; plpgsql's 1234–1244 is its known flake band\),
+      spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

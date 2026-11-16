@@ -2,7 +2,8 @@
 """Generate internal/catalog/pg_description_generated.go (M0149-0001g slices 19, 23):
 the pg_description rows a PostgreSQL 18.3 initdb holds for objects with fixed
 pg_*.dat OIDs (objoid < 10000) in catalogs goopg bootstraps, and every
-pg_shdescription row. Captured from a throwaway initdb. initdb writes them to
+pg_shdescription row, plus the plpgsql language / extension descriptions
+(slice 29). Captured from a throwaway initdb. initdb writes them to
 the on-disk catalogs and goopg's comment store is seeded from them.
 
 Usage: scripts/gen-pg-description.py > internal/catalog/pg_description_generated.go
@@ -36,7 +37,8 @@ try:
                                          text=True).stdout)
     local = q("select coalesce(json_agg(json_build_array(objoid::int8, classoid::int8, objsubid, description) "
               "order by objoid, classoid, objsubid), '[]') from pg_description "
-              "where objoid < 10000 and classoid in (%s)" % classes)
+              "where (objoid < 10000 and classoid in (%s)) "
+              "or (objoid < 16384 and classoid in ('pg_language'::regclass, 'pg_extension'::regclass))" % classes)
     shared = q("select coalesce(json_agg(json_build_array(objoid::int8, classoid::int8, description) "
                "order by objoid, classoid), '[]') from pg_shdescription")
 finally:

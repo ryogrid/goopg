@@ -332,6 +332,17 @@ var knownExtensions = map[string]string{
 // M0110-0003 — wires pg_amcheck's "is amcheck installed?" probe; promotes the
 // pg_amcheck 002_nonesuch TAP test.
 func (o *ddlOp) execCreateExtension(s *parser.CreateExtensionStmt) error {
+	// CreateExtension checks for an installed extension of that name before
+	// it reads any control file (commands/extension.c, get_extension_oid), so
+	// CREATE EXTENSION plpgsql — installed at initdb, no goopg control file —
+	// reports "already exists" exactly as PG does. M0149-0001g slice 29.
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && im.ExtensionOID(s.Name, o.ctx.CurrentDatabase) != 0 {
+		if s.IfNotExists {
+			o.ctx.AddNotice(fmt.Sprintf("extension %q already exists, skipping", s.Name))
+			return nil
+		}
+		return &ExecError{Code: "42710", Pos: s.Pos(), Message: fmt.Sprintf("extension %q already exists", s.Name)}
+	}
 	defaultVersion, known := knownExtensions[strings.ToLower(s.Name)]
 	if !known {
 		// PG: errcode_for_file_access on ENOENT → ERRCODE_UNDEFINED_FILE (58P01).

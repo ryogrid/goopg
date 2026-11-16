@@ -81,6 +81,8 @@ func pgLanguageInitialEntries() []pgLanguageEntry {
 		// oid=14: SQL function language (trusted; laninline=0 — sql has no inline handler, OID 2511 is pg_cursor; M0149-0001g slice 11 —
 		// lanvalidator=2248=fmgr_sql_validator)
 		{14, "sql", pguid, false, true, 0, 0, 2248},
+		// plpgsql: CREATE EXTENSION plpgsql at initdb (M0149-0001g slice 29).
+		pgPlpgsqlLanguage,
 	}
 }
 

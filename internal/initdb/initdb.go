@@ -1526,6 +1526,11 @@ func Init(opts Options) error {
 	if err := bootstrapPgInitPrivs(abs); err != nil {
 		return fmt.Errorf("goopg init: pg_init_privs: %w", err)
 	}
+	// M0149-0001g slice 29: CREATE EXTENSION plpgsql's pg_extension and
+	// pg_depend rows (its handlers and language row join the seeds above).
+	if err := bootstrapPgPlpgsql(abs); err != nil {
+		return fmt.Errorf("goopg init: plpgsql: %w", err)
+	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
 	}
@@ -3050,7 +3055,7 @@ func pgProcColDefs() []catalog.Column {
 func pgProcInitialEntries() []pgProcEntry {
 	// pgTSSnowballProcs: the dict_snowball C functions initdb's
 	// snowball_create.sql creates (M0149-0001g slice 21).
-	return append(append(pgProcAllEntries(), informationSchemaHelperProcs()...), pgTSSnowballProcs...)
+	return append(append(append(pgProcAllEntries(), informationSchemaHelperProcs()...), pgTSSnowballProcs...), pgPlpgsqlProcs...) // + plpgsql handlers (slice 29)
 }
 
 // pgProcRow materialises one pgProcEntry as the 30-column row that
