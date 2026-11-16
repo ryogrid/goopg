@@ -1526,10 +1526,14 @@ func Init(opts Options) error {
 	if err := bootstrapPgInitPrivs(abs); err != nil {
 		return fmt.Errorf("goopg init: pg_init_privs: %w", err)
 	}
-	// M0149-0001g slice 29: CREATE EXTENSION plpgsql's pg_extension and
-	// pg_depend rows (its handlers and language row join the seeds above).
+	// M0149-0001g slice 29: CREATE EXTENSION plpgsql's pg_extension row (its
+	// handlers and language row join the seeds above).
 	if err := bootstrapPgPlpgsql(abs); err != nil {
 		return fmt.Errorf("goopg init: plpgsql: %w", err)
+	}
+	// M0149-0001g slice 31: every pg_depend row of a PG 18.3 initdb.
+	if err := bootstrapPgDepend(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_depend: %w", err)
 	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)

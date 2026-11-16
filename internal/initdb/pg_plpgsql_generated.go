@@ -14,14 +14,3 @@ var pgPlpgsqlLanguage = pgLanguageEntry{13627, "plpgsql", 10, true, true, 13624,
 
 // pgPlpgsqlExtension is the plpgsql pg_extension row (extconfig / extcondition NULL).
 var pgPlpgsqlExtension = pgExtensionEntry{OID: 13623, Name: "plpgsql", Namespace: 11, Relocatable: false, Version: "1.0"}
-
-// pgPlpgsqlDepends are the extension's pg_depend rows, in heap order.
-var pgPlpgsqlDepends = []pgDependEntry{
-	{1255, 13624, 0, 3079, 13623, 0, 'e'},
-	{1255, 13625, 0, 3079, 13623, 0, 'e'},
-	{1255, 13626, 0, 3079, 13623, 0, 'e'},
-	{2612, 13627, 0, 3079, 13623, 0, 'e'},
-	{2612, 13627, 0, 1255, 13626, 0, 'n'},
-	{2612, 13627, 0, 1255, 13625, 0, 'n'},
-	{2612, 13627, 0, 1255, 13624, 0, 'n'},
-}

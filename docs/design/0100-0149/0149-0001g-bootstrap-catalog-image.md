@@ -378,3 +378,15 @@ the two layouts legitimately differ.
   initdb's.
 - The bootstrap rowtype 10025 \(captured in slice 18\) no longer names a
   missing relation.
+
+## Follow\-up: M0149\-0001g slice 31 — initdb's pg\_depend \(2026\-11\-16\)
+
+- `pg_depend_generated.go` \(scripts/gen\-pg\-depend.py\) is every pg\_depend
+  row of a PG 18.3 initdb, in heap order. `bootstrapPgDepend` writes it with
+  both indexes.
+- Bootstrap\-catalog objects are pinned by OID and need no rows. The rows
+  cover what initdb's post\-bootstrap SQL creates: system views, their rules
+  and rowtypes, information\_schema, snowball, plpgsql.
+- A row whose depender or referenced object goopg does not bootstrap is left
+  out \(`pgDependMissingObjects`: pg\_settings' two rules\). A dangling row
+  would make a PG node report dependencies on objects that do not exist.

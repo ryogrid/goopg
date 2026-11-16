@@ -12567,6 +12567,31 @@ verify each at HEAD when the task starts.
       4 cases \(largeobject, misc\_sanity, type\_sanity, oidjoins; no
       movement\), spotcheck, sf025 99, acceptance.
     Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 31: pg\_depend carries PG 18.3 initdb's dependency rows \(1719 of 1725\).
+    - Before: slice 29 wrote only plpgsql's 7 rows. On a PG node,
+      `DROP SCHEMA information_schema` silently dropped the schema and left
+      its views, functions and domains orphaned.
+    - scripts/gen\-pg\-depend.py captures every initdb pg\_depend row in
+      ctid order into pg\_depend\_generated.go. These are system views and
+      their rules and rowtypes, information\_schema, snowball and plpgsql.
+    - bootstrapPgDepend \(pg\_depend\_bootstrap.go\) writes them with
+      indexes 2673 / 2674. The plpgsql generator no longer emits its own copy.
+    - Left out: the 6 rows that reference pg\_settings' rewrite rules
+      pg\_settings\_u / pg\_settings\_n \(12108 / 12109\), which goopg does not
+      bootstrap \(pgDependMissingObjects, ledgered\).
+    - A check against the goopg image found every other depender and
+      referenced object present under PG's OID.
+    - PG cold start:
+      - the 1719 rows equal the oracle's in heap order;
+      - forced index scans hit;
+      - `DROP SCHEMA information_schema` is refused with PG's DETAIL
+        \(same as the oracle\); `DROP VIEW pg_roles` succeeds on both.
+    - goopg restarts clean twice, and serial sequences survive.
+    - goopg's own SQL pg\_depend still lists only runtime rows \(ledgered\).
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      5 cases \(dependency, misc\_sanity, sequence, alter\_table, create\_view;
+      no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none

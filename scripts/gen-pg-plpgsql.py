@@ -2,9 +2,10 @@
 """Generate internal/initdb/pg_plpgsql_generated.go (M0149-0001g slice 29):
 the rows a PostgreSQL 18.3 initdb's CREATE EXTENSION plpgsql leaves
 (postgres/src/pl/plpgsql/src/plpgsql--1.0.sql): the three handler functions
-(pg_proc), the plpgsql language (pg_language), the extension (pg_extension)
-and its pg_depend rows. The two descriptions come from
-scripts/gen-pg-description.py. Captured from a throwaway initdb.
+(pg_proc), the plpgsql language (pg_language) and the extension
+(pg_extension). Its pg_depend rows come with scripts/gen-pg-depend.py (slice
+31) and the two descriptions with scripts/gen-pg-description.py. Captured from
+a throwaway initdb.
 
 Usage: scripts/gen-pg-plpgsql.py > internal/initdb/pg_plpgsql_generated.go
 """
@@ -43,10 +44,6 @@ try:
               "p.prorows::int8) order by p.oid), '[]') from pg_proc p where p.oid in "
               "(select lanplcallfoid from pg_language where oid = %d union select laninline from pg_language where oid = %d "
               "union select lanvalidator from pg_language where oid = %d)" % (langoid, langoid, langoid))
-    deps = q("select coalesce(json_agg(json_build_array(classid::int8, objid::int8, objsubid, refclassid::int8, "
-             "refobjid::int8, refobjsubid, deptype::text) order by ctid), '[]') from pg_depend "
-             "where (refclassid = 'pg_extension'::regclass and refobjid = %d) or (classid = 'pg_language'::regclass "
-             "and objid = %d)" % (ext[0][0], langoid))
 finally:
     subprocess.run([os.path.join(bindir, "pg_ctl"), "-D", data, "-m", "immediate", "stop"], env=env,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -66,8 +63,4 @@ e = ext[0]
 o.append("\n// pgPlpgsqlExtension is the plpgsql pg_extension row (extconfig / extcondition NULL).\n"
          "var pgPlpgsqlExtension = pgExtensionEntry{OID: %d, Name: %s, Namespace: %d, Relocatable: %s, Version: %s}\n"
          % (e[0], J(e[1]), e[2], B(e[3]), J(e[4])))
-o.append("\n// pgPlpgsqlDepends are the extension's pg_depend rows, in heap order.\nvar pgPlpgsqlDepends = []pgDependEntry{\n")
-for d in deps:
-    o.append("\t{%d, %d, %d, %d, %d, %d, '%s'},\n" % tuple(d))
-o.append("}\n")
 sys.stdout.write(subprocess.run(["gofmt"], input="".join(o), capture_output=True, text=True, check=True).stdout)
