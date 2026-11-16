@@ -440,6 +440,7 @@
 #standard_conforming_strings = on
 #escape_string_warning = on            # accepted; goopg has no
                                         # deprecated-backslash-escape warning
+#lo_compat_privileges = off
 #default_with_oids = off               # removed in PG12; accepted as no-op
 
 

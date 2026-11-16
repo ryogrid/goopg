@@ -17360,8 +17360,12 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "float8"}
 		case "has_database_privilege", "has_table_privilege", "has_schema_privilege",
 			"has_column_privilege", "has_any_column_privilege", "has_sequence_privilege",
-			"has_function_privilege", "has_type_privilege":
-			return catalog.Type{Name: "bool"} // M0149-0001h / h1
+			"has_function_privilege", "has_type_privilege", "has_largeobject_privilege":
+			return catalog.Type{Name: "bool"} // M0149-0001h / h1 / h1a
+		case "lo_create", "lo_creat":
+			return catalog.Type{Name: "oid"} // M0149-0001h1a
+		case "lo_unlink":
+			return catalog.Type{Name: "int4"}
 		case "row":
 			// `row(a, b)` reaches the planner as a call named row; PG's
 			// RowExpr is an anonymous record (M0146-0053) — a VALUES column

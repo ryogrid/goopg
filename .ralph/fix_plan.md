@@ -11891,6 +11891,36 @@ verify each at HEAD when the task starts.
     lo\_unlink / lo\_from\_bytea / lo\_get, rendered as
     pg\_largeobject\_metadata; then has\_largeobject\_privilege on the shared
     evaluator \(letters rw, acldefault owner rw, no PUBLIC\).
+  - 2026-11-17 first slice: pg\_largeobject\_metadata as a real heap; lo\_create / lo\_creat / lo\_unlink; has\_largeobject\_privilege.
+    - initdb open.go registers pg\_largeobject\_metadata \(2995\) per database
+      as a real MVCC table; RegisterRealTable replaces the virtual placeholder.
+    - executor largeobject.go:
+      - lo\_create: OID 0 → fresh OID ≥ 16384; duplicate → 23505 on
+        pg\_largeobject\_metadata\_oid\_index; row via writeHeapRowCanonical;
+        catalogIndexDefs gains 2995 → 2996;
+      - lo\_unlink: 42704, 42501 "must be owner", lo\_compat\_privileges;
+        DELETE through internal SQL so rollback is MVCC;
+      - has\_largeobject\_privilege: missing → NULL even for a superuser;
+        compat → true; owner rw default, no PUBLIC;
+      - read\-only transactions → 25006.
+    - Found: stampCatalogRows sets XMAX\_COMMITTED at once, so it cannot
+      carry a transactional delete; the internal\-SQL DELETE does.
+    - New GUC lo\_compat\_privileges \(PGC\_SUSET, off; sample config\).
+    - Probe \(tmp/s56 vs PG 18.3\): identical, including non\-superuser,
+      rollback, other databases, restart, and a PG cold start reading the
+      objects through index 2996.
+    - Regress: privileges 889→700; largeobject 176→218 — the case now runs
+      past lo\_create into the missing data functions, ALTER LARGE OBJECT
+      and libpq's lo\_\* OID lookup \(inventory updated\); 7 other cases
+      unchanged.
+    - Test: TestLargeObjectMetadataSurvivesRestart \(testport\).
+    - Gates: units, fire\-set \(fires=none\), spotcheck, sf025 99,
+      acceptance \(values identical\), PG cold\-start e2e.
+    - Next slice: pg\_largeobject data pages and the descriptor API
+      \(lo\_open / loread / lowrite / lo\_lseek / lo\_tell / lo\_truncate /
+      lo\_close, lo\_get / lo\_put / lo\_from\_bytea\); then GRANT / REVOKE
+      ON LARGE OBJECT and ALTER LARGE OBJECT OWNER.
+    Movement: regress privileges 889→700
 - [ ] **M0149-0001k — WRONG RESULTS on a PG node: goopg stores money / point / lseg / box / line / circle / tid / aclitem columns as varlena, not PG's fixed\-length form** \(filed 2026-11-16 by M0149-0001g; S2\)
   Kind: impl
   Parent: M0149-0001g

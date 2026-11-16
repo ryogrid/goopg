@@ -417,7 +417,8 @@ func isHasPrivilegeBuiltin(name string) bool {
 	switch name {
 	case "has_database_privilege", "has_table_privilege", "has_schema_privilege",
 		"has_column_privilege", "has_any_column_privilege", "has_sequence_privilege",
-		"has_function_privilege", "has_type_privilege":
+		"has_function_privilege", "has_type_privilege", "has_largeobject_privilege",
+		"lo_create", "lo_creat", "lo_unlink":
 		return true
 	}
 	return false

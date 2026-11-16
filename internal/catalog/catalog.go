@@ -12491,12 +12491,8 @@ func (c *InMemory) registerSystemTables() {
 	// oid, lomowner oid, lomacl aclitem[]. M0110-0001 (DU-002 slice 29).
 	pgLargeobjectMetadata := &Table{
 		Schema: "pg_catalog", Name: "pg_largeobject_metadata", Virtual: true,
-		Columns: []Column{
-			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
-			{Name: "lomowner", Type: Type{Name: "oid"}, Ordinal: 1},
-			{Name: "lomacl", Type: Type{Name: "aclitem[]"}, Ordinal: 2},
-		},
-		OID: 2995,
+		Columns: PGLargeObjectMetadataColumns(),
+		OID:     LargeObjectMetadataRelationId,
 	}
 	pgLargeobjectMetadata.VirtualRows = func() [][]string { return nil }
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_largeobject_metadata"] = pgLargeobjectMetadata
@@ -13352,10 +13348,16 @@ func (c *InMemory) RegisterRealTable(t *Table, dbOid ...uint32) error {
 	ns := c.getOrCreateNS(resolved)
 	k := key(parser.ObjectName{Schema: t.Schema, Name: t.Name})
 	if existing, ok := ns.tables[k]; ok {
-		if existing.OID == t.OID {
+		if existing.OID == t.OID && !existing.Virtual {
 			return nil // already registered — idempotent
 		}
-		return fmt.Errorf("RegisterRealTable: %q already exists with OID %d (want %d)", k, existing.OID, t.OID)
+		if existing.OID == t.OID {
+			// A virtual placeholder for a catalog whose heap is now present
+			// (pg_largeobject_metadata, M0149-0001h1a): the heap wins.
+			delete(ns.tables, k)
+		} else {
+			return fmt.Errorf("RegisterRealTable: %q already exists with OID %d (want %d)", k, existing.OID, t.OID)
+		}
 	}
 	for i := range t.Columns {
 		t.Columns[i].Ordinal = i
@@ -26403,3 +26405,19 @@ func (c *SearchPathCatalog) IndexesOnTable(table *Table, dbOid ...uint32) []*Ind
 // Unwrap returns the underlying Catalog, allowing callers to peel the
 // search-path layer for type assertions (e.g., to *InMemory). M0097-0022.
 func (c *SearchPathCatalog) Unwrap() Catalog { return c.Catalog }
+
+// LargeObjectMetadataRelationId is pg_largeobject_metadata's OID
+// (pg_largeobject_metadata.h).
+const LargeObjectMetadataRelationId = 2995
+
+// PGLargeObjectMetadataColumns is pg_largeobject_metadata's row type: oid,
+// lomowner oid, lomacl aclitem[] (pg_largeobject_metadata.h). Without a
+// heap (an in-memory catalog) it backs an empty virtual placeholder; with
+// one, the real MVCC table (M0149-0001h1a).
+func PGLargeObjectMetadataColumns() []Column {
+	return []Column{
+		{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0, NotNull: true},
+		{Name: "lomowner", Type: Type{Name: "oid"}, Ordinal: 1, NotNull: true},
+		{Name: "lomacl", Type: Type{Name: "aclitem", IsArray: true}, Ordinal: 2},
+	}
+}

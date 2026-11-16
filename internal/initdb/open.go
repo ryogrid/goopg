@@ -3488,6 +3488,23 @@ func loadSystemCatalogsIfPresentForDB(dataDir string, cat *catalog.InMemory, hea
 		}
 	}
 
+	// pg_largeobject_metadata (OID 2995) — large-object owner and ACL
+	// (M0149-0001h1a). A real MVCC heap like PG's, so lo_create / lo_unlink
+	// rows commit and roll back with their transaction and a PG node reads
+	// them; it replaces the empty virtual placeholder.
+	pgLOMetaFile := filepath.Join(base, fmt.Sprint(catalog.LargeObjectMetadataRelationId))
+	if heapFilePresent(pgLOMetaFile) {
+		t := &catalog.Table{
+			Schema:  "pg_catalog",
+			Name:    "pg_largeobject_metadata",
+			Columns: catalog.PGLargeObjectMetadataColumns(),
+			OID:     catalog.LargeObjectMetadataRelationId,
+		}
+		if err := cat.RegisterRealTable(t, nsDBOid); err != nil {
+			return fmt.Errorf("register pg_largeobject_metadata (db %d): %w", nsDBOid, err)
+		}
+	}
+
 	return nil
 }
 

@@ -1071,6 +1071,14 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextSuset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
+	// lo_compat_privileges — skip large-object privilege checks (PG < 9.0
+	// behaviour); PGC_SUSET, default off (guc_tables.c). Consumed by the
+	// large-object functions and has_largeobject_privilege. M0149-0001h1a.
+	r.MustRegister(NewVariable(Variable{
+		Name: "lo_compat_privileges", Type: TypeBool, BootVal: "off",
+		Context: ContextSuset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
 	// seq_page_cost — planner cost estimate for sequential page fetch.
 	r.MustRegister(NewVariable(Variable{
 		Name: "seq_page_cost", Type: TypeReal, BootVal: "1.0",

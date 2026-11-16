@@ -12336,6 +12336,12 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			return evalHasFunctionPrivilege(args, ctx, x.Pos())
 		case "has_type_privilege":
 			return evalHasTypePrivilege(args, ctx, x.Pos())
+		case "has_largeobject_privilege":
+			return evalHasLargeObjectPrivilege(args, ctx, x.Pos())
+		case "lo_create", "lo_creat":
+			return evalLoCreate(name, args, ctx)
+		case "lo_unlink":
+			return evalLoUnlink(args, ctx)
 		}
 		return evalHasDatabasePrivilege(args, ctx, x.Pos())
 	}
