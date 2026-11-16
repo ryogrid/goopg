@@ -11874,6 +11874,18 @@ verify each at HEAD when the task starts.
       sf025 99 \(run twice: \+20% then −25%, timing noise, plans 99/99 same\),
       acceptance.
     Movement: none — C3 interop fix \(goopg plans unchanged: restart A/B identical\)
+  - 2026-11-16 second slice: bool stavalues are typed too.
+    - ANALYZE renders bool as t / f \(Datum.Format\), the same as boolout and
+      the bool\[\] codec, so it round\-trips exactly.
+    - name was tried and dropped: goopg's array codec does not encode
+      name\[\] here and falls back to the text blob \(ledgered\).
+    - Probe \(tmp/catidx/s38\):
+      - a PG node reads b's MCVs `{f,t}` with frequencies `{0.9,0.1}`;
+      - PG estimates WHERE b at 222 and NOT b at 2001;
+      - goopg's own estimates are identical across a restart.
+    - Gates: units, postmaster, testport interop set, spotcheck, sf025 99,
+      acceptance.
+    Movement: none — C3 interop fix \(goopg restart A/B identical\)
 - [ ] **M0149-0001i — regnamespace has no name-resolution seam: `'public'::regnamespace::oid` errors, `99::regnamespace` prints 99** \(filed 2026-11-16 by M0149-0001g slice 24; correctness, below the item-10 rank\)
   Kind: impl
   Parent: none

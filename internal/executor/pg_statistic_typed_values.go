@@ -24,6 +24,7 @@ var typedStatValueTypes = map[string]string{
 	"varchar": "varchar", "character varying": "varchar",
 	"bpchar": "bpchar", "character": "bpchar", "char": "bpchar",
 	"date": "date",
+	"bool": "bool", "boolean": "bool", // ANALYZE renders t / f, as boolout does
 }
 
 // pgStatValuesBytes renders a pg_statistic stavalues slot for a column of type

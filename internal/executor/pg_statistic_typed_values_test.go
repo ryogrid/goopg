@@ -30,6 +30,7 @@ func TestTypedStatValuesRoundTrip(t *testing.T) {
 		{"text", catalog.OIDText, []string{"v1", "a longer value", ""}, []string{"a", "bb", "ccc"}},
 		{"varchar", catalog.OIDVarChar, []string{"x", "yz"}, []string{"abc", "abcd", "abcde"}},
 		{"date", 1082, []string{"2020-01-02"}, []string{"1998-01-01", "1998-06-15", "2020-12-31"}},
+		{"bool", 16, []string{"t", "f"}, []string{"f", "t"}},
 	}
 	cols := pgStatisticColumnsPG18()
 	for _, tc := range cases {
