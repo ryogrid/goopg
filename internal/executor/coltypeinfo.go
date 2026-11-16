@@ -269,7 +269,14 @@ func resolveColTypeInfo(cols []catalog.Column) []colTypeInfo {
 // which is what an array column's stored form actually looks like here.
 func colTypeDescriptor(t catalog.Type) userTypeAttrs {
 	if t.IsArray {
-		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+		// An array's typalign is its element's ('d' for _int8, _timestamptz,
+		// …), the same rule catalog.PhysicalTypeAlign applies when the heap
+		// codec places the value (M0149-0001g slice 14).
+		align := byte('i')
+		if catalog.PhysicalTypeAlignName(t) == 8 {
+			align = 'd'
+		}
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: align, TypStorage: 'x'}
 	}
 	return userTypeAttrsForOID(catalog.TypeNameToOID(t.Name))
 }

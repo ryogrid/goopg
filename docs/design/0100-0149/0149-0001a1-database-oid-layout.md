@@ -636,6 +636,17 @@ Key observation: PG compatibility constrains only the **displayed** and
   \(`pgAttrAlignChar`\) must all agree on that. A varlena's attalign comes
   from its type, not from attlen.
 
+## Follow\-up: M0149\-0001g slice 14 — alignment pinned to pg\_type.dat \(2026\-11\-16\)
+
+- `catalog.PhysicalTypeAlign` is now tested against every pg\_type row in
+  `postgres.bki`.
+- An array's alignment is its element's.
+- `doubleAlignedVarlena` and `doubleAlignedArrayElem` hold the 'd' cases that
+  cannot be derived from the element's scalar entry.
+- The test's `knownAlignGaps` names the types whose on\-disk format must change
+  before their alignment can be PG's: fixed\-length types goopg stores as
+  varlena, and composites.
+
 ## Risks
 
 - The shipped corpora \(`:65433`, `:65436`, `:65437`\) were built with the

@@ -16,10 +16,20 @@ import "strings"
 // wire. Both callers now share this function so the two paths cannot drift
 // again (review/260831-2, new finding XL-5).
 func PhysicalTypeAlign(t Type, tname string) int {
-	// All array columns store a varlena ArrayType blob → PG 'i' (4-byte) align.
-	// M0118-0002.
+	// An array column stores a varlena ArrayType blob whose typalign is its
+	// element's: 'd' (8) for an 8-aligned element type, else 'i' (4) — e.g.
+	// _int8, _float8, _timestamptz, _interval are typalign 'd' in pg_type.dat.
+	// It had been 4 for every array (M0118-0002), which a hosted PG mis-reads
+	// whenever the pad byte lands off an 8-byte boundary. M0149-0001g slice 14
+	// (TestPhysicalTypeAlignMatchesPostgresBKI).
 	if t.IsArray {
+		if PhysicalTypeAlign(Type{Name: tname}, tname) == 8 || doubleAlignedArrayElem[tname] {
+			return 8
+		}
 		return 4
+	}
+	if doubleAlignedVarlena[tname] {
+		return 8
 	}
 	switch tname {
 	case "bool", "boolean":
@@ -161,4 +171,24 @@ func alignPhysical(off, align int) int {
 // hold the lowercased type name.
 func PhysicalTypeAlignName(t Type) int {
 	return PhysicalTypeAlign(t, strings.ToLower(t.Name))
+}
+
+// doubleAlignedVarlena lists the varlena types (typlen -1) pg_type.dat declares
+// typalign 'd', besides anyarray/_aclitem above: ranges and multiranges over
+// 8-byte subtypes, the geometric path/polygon, and the snapshot types. Their
+// arrays are 'd' too. M0149-0001g slice 14.
+var doubleAlignedVarlena = map[string]bool{
+	"int8range": true, "tsrange": true, "tstzrange": true,
+	"int8multirange": true, "tsmultirange": true, "tstzmultirange": true,
+	"path": true, "polygon": true,
+	"pg_snapshot": true, "txid_snapshot": true,
+}
+
+// doubleAlignedArrayElem lists fixed-length typalign-'d' element types whose
+// scalar goopg does not yet store in PG's fixed-length form (so the scalar's
+// alignment is left alone — see the oracle test's knownScalarGaps) but whose
+// ARRAY form is a 'd' varlena in pg_type.dat.
+var doubleAlignedArrayElem = map[string]bool{
+	"point": true, "box": true, "lseg": true, "line": true, "circle": true,
+	"money": true, "aclitem": true,
 }

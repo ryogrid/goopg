@@ -12108,6 +12108,33 @@ verify each at HEAD when the task starts.
     - Gates: units, initdb, postmaster, testport interop set, regress A/B on
       7 privilege cases \(no movement\), spotcheck, sf025 99, acceptance.
     Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 14: catalog.PhysicalTypeAlign pinned to pg\_type.dat; arrays take their element's typalign.
+    - TestPhysicalTypeAlignMatchesPostgresBKI compares the shared alignment
+      table, used by the heap codec and the pgoutput walker, with every
+      pg\_type row in postgres.bki. Out\-of\-scope rows are listed in an
+      explicit knownAlignGaps allowlist:
+      - fixed\-length types goopg stores as varlena: tid, point, lseg, box,
+        line, circle, money, scalar aclitem;
+      - composite rowtypes;
+      - pseudo\-types.
+    - Fixed:
+      - Arrays take their element's alignment. \_int8, \_float8,
+        \_timestamp\(tz\), \_interval, \_time\(tz\), \_pg\_lsn, \_xid8 and the
+        geometric arrays are 8; all arrays used to be 4.
+      - 'd' varlenas: int8/ts/tstz range and multirange, path, polygon,
+        pg\_snapshot and txid\_snapshot.
+      - The colTypeDescriptor array branch now follows the same rule.
+    - WRONG RESULTS fixed: an int8\[\] column sitting 4 bytes off an 8\-byte
+      boundary read back on a PG 18.3 node as \{1,12884901888,549755813888\}
+      instead of \{1,2,3\}. goopg's user pg\_attribute rows already declared
+      'd'; only the codec padded to 4.
+    - The new binary still reads that old\-binary table correctly.
+    - Corrected TestPgoPhysicalAlignArrayIsVarlenaAlign, which had pinned
+      the wrong "every array is 'i'" rule.
+    - Gates: units, postmaster, testport interop set \(including the logical
+      ports\), regress A/B on 7 array/range/datetime cases \(no movement\),
+      spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
 - [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
   Kind: impl
   Parent: none
