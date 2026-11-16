@@ -623,7 +623,7 @@ func pgTypeRow(e pgTypeEntry) executor.Row {
 		executor.NewStringDatum(string(e.Category)),        // 8 typcategory
 		executor.NewBoolDatum(pgTypePreferredOverlay[e.OID]), // 9 typispreferred
 		executor.NewBoolDatum(true),                        // 10 typisdefined
-		executor.NewStringDatum(","),                       // 11 typdelim
+		executor.NewStringDatum(pgTypeDelim(e.OID)),        // 11 typdelim (M0149-0001k3)
 		executor.NewIntDatum(int64(pgTypeRelidOverlay[e.OID])), // 12 typrelid (M0131-S9.3g; 0 for every non-composite)
 		executor.NewIntDatum(typsubscript),                 // 13 typsubscript (M0131-S9.3c)
 		executor.NewIntDatum(typelem),                      // 14 typelem  (M0131-S9.3c)
@@ -802,4 +802,15 @@ func bootstrapPgTypeTuples(dataDir string) (map[uint32]heapTID, error) {
 		tidMap[oid] = rawTIDs[i]
 	}
 	return tidMap, nil
+}
+
+// pgTypeDelim is pg_type.typdelim: ';' for box (603) and its array _box
+// (1020) per pg_type.dat, ',' for every other type. A PG node splits and
+// joins box[] values on it (array_in / array_out); with ',' it mis-split
+// "{(1,1),(0,0)}" into "(1" and "1),(0,0)". M0149-0001k3.
+func pgTypeDelim(oid uint32) string {
+	if oid == 603 || oid == 1020 {
+		return ";"
+	}
+	return ","
 }

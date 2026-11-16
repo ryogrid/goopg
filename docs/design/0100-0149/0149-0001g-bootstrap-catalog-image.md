@@ -480,3 +480,6 @@ the two layouts legitimately differ.
   AclItem behind `fixed\_length\_aclitem`. The aclitemout renderer lives in
   internal/utils/adt/aclitem, shared by the heap codec and pgoutput. Role
   names come from the scan's session renderer.
+- M0149\-0001k3 \(arrays\): elements of the fixedgeo types use the same
+  fixed images. box\[\] splits and joins on its typdelim `;`, and the
+  bootstrap pg\_type now carries typdelim `;` for box and \_box.

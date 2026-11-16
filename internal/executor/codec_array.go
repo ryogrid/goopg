@@ -11,6 +11,7 @@ import (
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/utils/adt/array"
+	"github.com/goopg/goopg/internal/utils/adt/fixedgeo"
 	"github.com/goopg/goopg/internal/nodes"
 )
 
@@ -68,7 +69,7 @@ func encodeArrayValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]by
 		// still round-trips (the executor never type-checks element contents).
 		oid, align, varlena = 25, 4, true
 	}
-	elems := parseTextArray(d.StringValue())
+	elems := parseTextArrayDelim(d.StringValue(), array.ElemDelim(t.Name))
 	if len(elems) == 0 {
 		return emptyArrayTypeBytes(oid), nil
 	}
@@ -168,6 +169,11 @@ func encodeArrayElem(elemName, e string, varlena bool, ctx *Context, pos int) ([
 		// element table declares (4/8/8/8/12) are exactly what those arms
 		// return, which is what keeps the array body self-describing.
 		return encodeValuePG(catalog.Type{Name: lower}, NewStringDatum(e))
+	case "point", "lseg", "box", "line", "circle", "tid":
+		// Element sibling of encodeValuePG's fixedgeo arm (reached only when
+		// pgarray.ElemTypeInfo admits the type, i.e. in a
+		// fixed_length_geometric_tid cluster). M0149-0001k3.
+		return fixedgeo.Encode(lower, e)
 	case "uuid":
 		// Sibling of encodeValuePG's "uuid" arm: pg_uuid_t, 16 raw bytes.
 		s := normalizeUUIDStr(strings.TrimSpace(e))

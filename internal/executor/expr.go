@@ -20423,6 +20423,26 @@ type textArrayElem struct {
 // parseTextArrayElems is parseTextArray's quoted-ness-preserving twin; the two
 // must stay in sync because they are the same scan.
 func parseTextArrayElems(s string) []textArrayElem {
+	return parseTextArrayElemsDelim(s, ',')
+}
+
+// parseTextArrayDelim is parseTextArray for an element type whose typdelim
+// is delim (';' for box). An unquoted element ends at delim; after a quoted
+// element either delim or ',' is accepted, because goopg's own array
+// constructor joins quoted elements with ','. M0149-0001k3.
+func parseTextArrayDelim(s string, delim byte) []string {
+	elems := parseTextArrayElemsDelim(s, delim)
+	if elems == nil {
+		return nil
+	}
+	out := make([]string, len(elems))
+	for i, e := range elems {
+		out[i] = e.Text
+	}
+	return out
+}
+
+func parseTextArrayElemsDelim(s string, delim byte) []textArrayElem {
 	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
 		return []textArrayElem{{Text: s}}
 	}
@@ -20465,14 +20485,14 @@ func parseTextArrayElems(s string) []textArrayElem {
 			}
 			elems = append(elems, textArrayElem{Text: sb.String(), Quoted: true})
 		} else {
-			// Unquoted element: read until comma or end.
+			// Unquoted element: read until the delimiter or end.
 			start := i
-			for i < len(inner) && inner[i] != ',' {
+			for i < len(inner) && inner[i] != delim {
 				i++
 			}
 			elems = append(elems, textArrayElem{Text: inner[start:i]})
 		}
-		if i < len(inner) && inner[i] == ',' {
+		if i < len(inner) && (inner[i] == delim || inner[i] == ',') {
 			i++
 		}
 	}

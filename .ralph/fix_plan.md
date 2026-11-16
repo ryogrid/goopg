@@ -11962,7 +11962,7 @@ verify each at HEAD when the task starts.
     - Gates: units, postmaster, testport interop set, spotcheck, sf025 99,
       acceptance.
     Movement: none — C3 interop fix \(regress A/B unchanged\)
-- [ ] **M0149-0001k3 — arrays of point / lseg / box / line / circle / tid still hold text elements \(elemtype 25\)** \(filed 2026-11-16 by M0149-0001k\)
+- [x] **M0149-0001k3 — arrays of point / lseg / box / line / circle / tid still hold text elements \(elemtype 25\)** \(filed 2026-11-16 by M0149-0001k\)
   Kind: impl
   Parent: M0149-0001k
   - goopg's ArrayType for `point\[\]` says elemtype 25, while
@@ -11972,6 +11972,34 @@ verify each at HEAD when the task starts.
     fixedgeo.Width\) plus encode / decode arms calling fixedgeo, gated on
     catalog.FixedLengthGeoTid. Legacy elemtype\-25 blobs keep decoding on
     the text path.
+  - 2026-11-17 \(CLOSES k3\): array elements of the six types are PG's fixed images, and box arrays use typdelim `;`.
+    - utils/adt/array ElemTypeInfo gains point / lseg / box / line /
+      circle / tid \(elemtype 600 / 601 / 603 / 628 / 718 / 27\), with sizes
+      and aligns from fixedgeo.Width, gated on catalog.FixedLengthGeoTid.
+      The encode and decode element arms call fixedgeo.
+    - box typdelim:
+      - parseTextArrayDelim splits a box\[\] literal on `;`, still taking
+        `,` after a quoted element for goopg's own constructor output;
+      - RenderTextStyled joins on ElemDelim, and QuoteTextElemDelim quotes
+        by it on both the typed and the legacy text paths.
+      - goopg's array output for box\[\] now equals PG's; `ARRAY\[box\]`
+        used to print quoted.
+    - Found and fixed on the way: goopg's bootstrap pg\_type wrote typdelim
+      `,` for every type. pgTypeDelim now gives `;` for box \(603\) and
+      \_box \(1020\). With `,`, a PG node could not even parse
+      `'\{\(1,1\),\(0,0\)\}'::box\[\]` on goopg data.
+    - Probe \(tmp/catidx/s46\):
+      - goopg's output equals PG on every column;
+      - a PG cold start reads elements and subscripts at PG's sizes
+        \(point\[2\] 56 B, box\[2\] 88 B\);
+      - PG\-inserted box\[\] rows read back on goopg;
+      - a legacy cluster also prints box\[\] as PG does.
+    - Tests: TestFixedGeoArrayElements \(capability on / off\),
+      TestPgTypeDelimBox.
+    - Regress A/B over 25 cases unchanged.
+    - Gates: units, postmaster, testport interop set, spotcheck, sf025 99,
+      acceptance.
+    Movement: none — C3 interop fix \(regress A/B unchanged\)
 - [ ] **M0149-0001k4 — COPY BINARY sends point / lseg / box / line / circle / tid as text, not their send format** \(filed 2026-11-16 by M0149-0001k\)
   Kind: impl
   Parent: M0149-0001k

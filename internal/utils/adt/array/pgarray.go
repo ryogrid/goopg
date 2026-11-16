@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/utils/adt/fixedgeo"
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/utils/adt/datetime"
 	"github.com/goopg/goopg/internal/nodes"
@@ -247,6 +248,18 @@ func ElemTypeInfo(elemName string) (oid uint32, size, align int, varlena, ok boo
 	// reading pg_attribute.atttypid = _name (1003) deforms wrongly.
 	case "name":
 		return 19, 64, 1, false, true
+	// M0149-0001k3: the fixed-length geometric types and tid, whose scalar
+	// columns store PG's struct images in a fixed_length_geometric_tid
+	// cluster (fixedgeo), have element images of the same layout
+	// (pg_type: point 600, lseg 601, box 603, line 628, circle 718, tid 27).
+	// Without the capability they keep the unknown-element fallback (elemtype
+	// 25, text bodies) older clusters wrote.
+	case "point", "lseg", "box", "line", "circle", "tid":
+		if !catalog.FixedLengthGeoTid() {
+			return 0, 0, 0, false, false
+		}
+		size, align, _ := fixedgeo.Width(strings.ToLower(elemName))
+		return fixedGeoElemOID[strings.ToLower(elemName)], size, align, false, true
 	default:
 		return 0, 0, 0, false, false
 	}
@@ -312,7 +325,7 @@ func RenderTextStyled(elemName string, payload []byte, st OutputStyle) (string, 
 			return "", err
 		}
 		if i > 0 {
-			sb.WriteByte(',')
+			sb.WriteByte(ElemDelim(elemName))
 		}
 		sb.WriteString(s)
 		off += adv
@@ -361,12 +374,21 @@ func DecodeElemStyled(elemName string, data []byte, varlena bool, size int, st O
 			// {"\\000\\001..."}-shaped under escape. M0134-0001 S12.
 			return QuoteTextElem(ByteaOutStyled(data[4:sz], st.ByteaMode)), sz, nil
 		}
-		return QuoteTextElem(string(data[4:sz])), sz, nil
+		// Quoted by the element type's own delimiter, the one RenderTextStyled
+		// joins with (';' for a legacy text-element box[]). M0149-0001k3.
+		return QuoteTextElemDelim(string(data[4:sz]), ElemDelim(lower)), sz, nil
 	}
 	if len(data) < size {
 		return "", 0, fmt.Errorf("truncated fixed array element")
 	}
 	switch lower {
+	case "point", "lseg", "box", "line", "circle", "tid":
+		// Sibling of encodeArrayElem's fixedgeo arm (M0149-0001k3).
+		txt, n, err := fixedgeo.Decode(lower, data)
+		if err != nil {
+			return "", 0, err
+		}
+		return QuoteTextElemDelim(txt, ElemDelim(lower)), n, nil
 	case "uuid":
 		// Sibling of encodeArrayElem's "uuid" arm (uuid_out's port). No array
 		// quoting: a canonical uuid rendering is hex and dashes only.
@@ -542,4 +564,41 @@ func uuidCanonical(b []byte) string {
 		out = append(out, hexdigits[b[i]>>4], hexdigits[b[i]&0x0f])
 	}
 	return string(out)
+}
+
+// fixedGeoElemOID is pg_type.oid of each fixedgeo element type.
+var fixedGeoElemOID = map[string]uint32{
+	"point": 600, "lseg": 601, "box": 603, "line": 628, "circle": 718, "tid": 27,
+}
+
+// ElemDelim is the element type's typdelim: ';' for box (pg_type.dat), ','
+// for every other type goopg stores. array_in splits and array_out joins and
+// quotes on it. M0149-0001k3.
+func ElemDelim(elemName string) byte {
+	if strings.EqualFold(elemName, "box") {
+		return ';'
+	}
+	return ','
+}
+
+// QuoteTextElemDelim is QuoteTextElem for an element type whose delimiter is
+// delim: array_out quotes an element containing the delimiter, so a box
+// element ("(1,1),(0,0)") is bare in a ';'-delimited box[].
+func QuoteTextElemDelim(s string, delim byte) string {
+	if delim == ',' {
+		return QuoteTextElem(s)
+	}
+	if s == "" || strings.EqualFold(s, "null") || strings.ContainsAny(s, "{}\"\\ \t\n\r") || strings.IndexByte(s, delim) >= 0 {
+		var sb strings.Builder
+		sb.WriteByte('"')
+		for i := 0; i < len(s); i++ {
+			if s[i] == '"' || s[i] == '\\' {
+				sb.WriteByte('\\')
+			}
+			sb.WriteByte(s[i])
+		}
+		sb.WriteByte('"')
+		return sb.String()
+	}
+	return s
 }
