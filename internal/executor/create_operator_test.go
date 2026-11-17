@@ -390,7 +390,14 @@ func pgOpfamilyVirtualRows(t *testing.T, im *catalog.InMemory) [][]string {
 	if !ok || tbl.VirtualRows == nil {
 		t.Fatal("pg_catalog.pg_opfamily virtual table/VirtualRows not found")
 	}
-	return tbl.VirtualRows()
+	// The view leads with the PG 18.3 initdb rows (M0149-0001h1a20);
+	// these tests inspect the user rows that follow.
+	rows := tbl.VirtualRows()
+	seed := catalog.SeedPgOpfamilyRowCount()
+	if len(rows) < seed {
+		t.Fatalf("pg_opfamily has %d rows, fewer than the %d seeded", len(rows), seed)
+	}
+	return rows[seed:]
 }
 
 // TestCreateOperatorFamily verifies CREATE OPERATOR FAMILY registers a
@@ -465,7 +472,14 @@ func pgOpclassVirtualRows(t *testing.T, im *catalog.InMemory) [][]string {
 	if !ok || tbl.VirtualRows == nil {
 		t.Fatal("pg_catalog.pg_opclass virtual table/VirtualRows not found")
 	}
-	return tbl.VirtualRows()
+	// The view leads with the PG 18.3 initdb rows (M0149-0001h1a20);
+	// these tests inspect the user rows that follow.
+	rows := tbl.VirtualRows()
+	seed := catalog.SeedPgOpclassRowCount()
+	if len(rows) < seed {
+		t.Fatalf("pg_opclass has %d rows, fewer than the %d seeded", len(rows), seed)
+	}
+	return rows[seed:]
 }
 
 // TestCreateOperatorClassPopulatesOpclassRow verifies CREATE OPERATOR CLASS
@@ -575,7 +589,14 @@ func pgAmopVirtualRows(t *testing.T, im *catalog.InMemory) [][]string {
 	if !ok || tbl.VirtualRows == nil {
 		t.Fatal("pg_catalog.pg_amop virtual table/VirtualRows not found")
 	}
-	return tbl.VirtualRows()
+	// The view leads with the PG 18.3 initdb rows (M0149-0001h1a20);
+	// these tests inspect the user rows that follow.
+	rows := tbl.VirtualRows()
+	seed := catalog.SeedPgAmopRowCount()
+	if len(rows) < seed {
+		t.Fatalf("pg_amop has %d rows, fewer than the %d seeded", len(rows), seed)
+	}
+	return rows[seed:]
 }
 
 func pgAmprocVirtualRows(t *testing.T, im *catalog.InMemory) [][]string {
@@ -584,7 +605,14 @@ func pgAmprocVirtualRows(t *testing.T, im *catalog.InMemory) [][]string {
 	if !ok || tbl.VirtualRows == nil {
 		t.Fatal("pg_catalog.pg_amproc virtual table/VirtualRows not found")
 	}
-	return tbl.VirtualRows()
+	// The view leads with the PG 18.3 initdb rows (M0149-0001h1a20);
+	// these tests inspect the user rows that follow.
+	rows := tbl.VirtualRows()
+	seed := catalog.SeedPgAmprocRowCount()
+	if len(rows) < seed {
+		t.Fatalf("pg_amproc has %d rows, fewer than the %d seeded", len(rows), seed)
+	}
+	return rows[seed:]
 }
 
 func pgDependVirtualRows(t *testing.T, im *catalog.InMemory) [][]string {

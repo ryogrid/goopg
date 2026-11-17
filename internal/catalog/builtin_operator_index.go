@@ -85,3 +85,12 @@ func seedOperatorViewRows() [][]string {
 	})
 	return seedOperatorView
 }
+
+// Seed row counts of the generated built-in catalog rows
+// (pg_catalog_seed_rows_generated.go), for callers that need to skip past
+// them to the user rows. M0149-0001h1a20.
+func SeedPgOpfamilyRowCount() int { return len(seedPgOpfamilyRows) }
+func SeedPgOpclassRowCount() int  { return len(seedPgOpclassRows) }
+func SeedPgAmopRowCount() int     { return len(seedPgAmopRows) }
+func SeedPgAmprocRowCount() int   { return len(seedPgAmprocRows) }
+func SeedPgCastRowCount() int     { return len(seedPgCastRows) }

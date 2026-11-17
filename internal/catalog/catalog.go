@@ -11469,10 +11469,9 @@ func (c *InMemory) registerSystemTables() {
 	// `WITH FUNCTION <ns>.<signature>` clause. DU-002 slices 395, 397.
 	pgCast.VirtualRows = func() [][]string {
 		casts := c.ListCasts()
-		if len(casts) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(casts))
+		// Built-in rows from a PG 18.3 initdb first (M0149-0001h1a20).
+		out := make([][]string, 0, len(seedPgCastRows)+len(casts))
+		out = append(out, seedPgCastRows...)
 		for _, cs := range casts {
 			out = append(out, []string{
 				strconv.FormatUint(uint64(cs.OID), 10),                       // oid
@@ -11703,24 +11702,10 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgOpclass.VirtualRows = func() [][]string {
 		classes := c.ListUserOperatorClasses()
-		var builtinRows [][]string
-		if rts := c.ListRangeTypes(); len(rts) > 0 {
-			seen := make(map[uint32]bool)
-			for _, rt := range rts {
-				if rt.OpclassOID == 0 || seen[rt.OpclassOID] {
-					continue
-				}
-				seen[rt.OpclassOID] = true
-				if row, ok := builtinOpclassRowByOID(rt.OpclassOID); ok {
-					builtinRows = append(builtinRows, row)
-				}
-			}
-		}
-		if len(classes) == 0 && len(builtinRows) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(classes)+len(builtinRows))
-		out = append(out, builtinRows...)
+		// Every built-in opclass from a PG 18.3 initdb (M0149-0001h1a20);
+		// the range-subtype subset this view used to surface is part of it.
+		out := make([][]string, 0, len(seedPgOpclassRows)+len(classes))
+		out = append(out, seedPgOpclassRows...)
 		for _, oc := range classes {
 			out = append(out, []string{
 				strconv.FormatUint(uint64(oc.OID), 10),    // oid
@@ -11761,10 +11746,9 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgOpfamily.VirtualRows = func() [][]string {
 		fams := c.ListUserOperatorFamilies()
-		if len(fams) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(fams))
+		// Built-in rows from a PG 18.3 initdb first (M0149-0001h1a20).
+		out := make([][]string, 0, len(seedPgOpfamilyRows)+len(fams))
+		out = append(out, seedPgOpfamilyRows...)
 		for _, f := range fams {
 			out = append(out, []string{
 				strconv.FormatUint(uint64(f.OID), 10),    // oid
@@ -12521,10 +12505,9 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgAmop.VirtualRows = func() [][]string {
 		members := c.ListAmOpMembers()
-		if len(members) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(members))
+		// Built-in rows from a PG 18.3 initdb first (M0149-0001h1a20).
+		out := make([][]string, 0, len(seedPgAmopRows)+len(members))
+		out = append(out, seedPgAmopRows...)
 		for _, m := range members {
 			// amoppurpose: AMOP_ORDER ('o') when the entry has a resolved
 			// sort family, else AMOP_SEARCH ('s') — mirrors opclasscmds.c's
@@ -12573,10 +12556,9 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgAmproc.VirtualRows = func() [][]string {
 		members := c.ListAmProcMembers()
-		if len(members) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(members))
+		// Built-in rows from a PG 18.3 initdb first (M0149-0001h1a20).
+		out := make([][]string, 0, len(seedPgAmprocRows)+len(members))
+		out = append(out, seedPgAmprocRows...)
 		for _, m := range members {
 			out = append(out, []string{
 				strconv.FormatUint(uint64(m.OID), 10),

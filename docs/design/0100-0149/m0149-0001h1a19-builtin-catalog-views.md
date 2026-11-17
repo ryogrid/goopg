@@ -22,6 +22,7 @@ from PG itself:
 | pg\_type | `scripts/gen-pg-type-support-procs.py` (support / collation / default columns) | h1a15 |
 | pg\_proc | `scripts/gen-pg-proc-view-rows.py` → `pg_proc_view_rows_generated.go` (3413 rows) | h1a18 |
 | pg\_operator | the existing `PGOperatorAllEntries` seed (799 rows), `seedOperatorViewRows` | h1a19 |
+| pg\_cast, pg\_opfamily, pg\_opclass, pg\_amop, pg\_amproc | `scripts/gen-pg-catalog-seed-rows.py` → `internal/catalog/pg_catalog_seed_rows_generated.go` (235 / 146 / 177 / 945 / 714 rows) | h1a20 |
 
 Each landing is checked with a column-wise diff of the view against a
 scratch PG 18.3 cluster. The generators capture from a throwaway
@@ -31,15 +32,10 @@ regproc-typed columns hold numeric OIDs. `regOutShared` renders them,
 following regprocout: an overloaded built-in name is shown as
 `pg_catalog.name` (h1a19).
 
-## Still empty or partial (measured 2026-11-17, goopg vs PG)
+## Still empty or partial (measured 2026-11-17, goopg vs PG; h1a20 removed pg\_cast and the four opclass catalogs)
 
 | catalog | goopg rows | PG rows |
 |---|---|---|
-| pg\_amop | 0 | 945 |
-| pg\_amproc | 0 | 714 |
-| pg\_opclass | 0 | 177 |
-| pg\_opfamily | 0 | 146 |
-| pg\_cast | 0 | 235 |
 | pg\_range | 0 | 6 |
 | pg\_conversion | 0 | 128 |
 | pg\_ts\_config | 0 | 30 |
@@ -55,3 +51,8 @@ following regprocout: an overloaded built-in name is shown as
 `format_type` and `regtypeout` render many built-in OIDs (pseudo-types,
 range types) as `???` or a bare number. They need the full pg\_type seed,
 which lives in the initdb package and is not reachable from the executor.
+
+The generic generator (`gen-pg-catalog-seed-rows.py`) takes a table name
+and its view column order, so another catalog is one more `TABLES` entry.
+Test helpers that inspect user rows skip the seed through
+`catalog.SeedPg*RowCount()`.

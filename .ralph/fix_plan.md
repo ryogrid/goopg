@@ -12202,7 +12202,7 @@ verify each at HEAD when the task starts.
   - Regress A/B vs HEAD over 18 cases: opr\_sanity 360→306 \(inventory
     369→315\), psql 608→601, alter\_operator 55→47; the other 15 unchanged.
   Movement: regress opr_sanity 369→315, psql 608→601, alter_operator 55→47
-- [ ] **M0149-0001h1a20 — serve the built-in rows of pg\_amop / pg\_amproc / pg\_opclass / pg\_opfamily / pg\_cast \(all empty on goopg\)** \(filed 2026-11-17 by M0149-0001h1a19\)
+- [x] **M0149-0001h1a20 — serve the built-in rows of pg\_amop / pg\_amproc / pg\_opclass / pg\_opfamily / pg\_cast \(all empty on goopg\)** \(filed 2026-11-17 by M0149-0001h1a19, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a
   - Finding: goopg 0 rows each vs PG 945 / 714 / 177 / 146 / 235; the
@@ -12213,6 +12213,27 @@ verify each at HEAD when the task starts.
     \(the gen-pg-proc-view-rows.py pattern, or the initdb seed tables
     pg\_amop\_oids\_generated.go et al.\); column-diff vs :5545; A/B
     opr\_sanity, alter\_generic, create\_operator, pg\_dump testport.
+  - Landed: scripts/gen-pg-catalog-seed-rows.py →
+    internal/catalog/pg\_catalog\_seed\_rows\_generated.go; each view leads
+    with its seed rows; pg\_opclass's range-subtype special case is
+    subsumed. Column-wise diffs of all five vs :5545 are empty.
+  - Tests: TestBuiltinCatalogViewsServeSeed; the executor test helpers
+    skip the seed via catalog.SeedPg\*RowCount\(\).
+  - Design: m0149-0001h1a19-builtin-catalog-views.md updated.
+  - Regress A/B vs HEAD over 18 cases: opr\_sanity 313→155 \(inventory
+    315→155\), psql 601→511; the other 16 unchanged.
+  Movement: regress opr_sanity 315→155, psql 601→511
+- [ ] **M0149-0001h1a21 — format\_type / regtypeout render many built-in types as ??? or a bare OID \(jsonb, anyrange, anyelement, int4range\)** \(filed 2026-11-17 by M0149-0001h1a20\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Finding: psql \\dAo prints `@>\(3802,3802\)` for `@>\(jsonb,jsonb\)`,
+    \\dAc prints `???` for anyrange; formatTypeOID is a hand list and
+    RegtypeName misses most built-ins.
+  - Resume: make the pg\_type seed \(internal/initdb pgTypeInitialEntries /
+    pg\_type\_seed\_data.go\) reachable from the executor \(move the
+    name/category table to the catalog package\) and port
+    format\_type\_extended \(utils/adt/format\_type.c\) over it, sharing
+    it with regtypeout; A/B psql, opr\_sanity, type\_sanity.
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a
