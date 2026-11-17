@@ -24350,6 +24350,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 				return &ExecError{Code: "42P06", Message: fmt.Sprintf("schema %q already exists", schemaName)}
 			}
 			im.RegisterSchema(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+			ApplySchemaDefaultACL(im, schemaName, o.ctx.CurrentDatabaseOid)
 			// B1.1 (doc 02c §1): persist the schema PG-style — a real
 			// pg_namespace heap INSERT + index entries (the WAL stream
 			// carries XLOG_HEAP_INSERT + 2× XLOG_BTREE_INSERT_LEAF, exactly
@@ -29421,4 +29422,21 @@ func applyRelationDefaultACL(ctx *Context, tbl *catalog.Table, objType byte) {
 	}
 	nsp := im.SchemaOID(schema, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	im.ApplyDefaultACL(tbl.OID, owner, nsp, objType)
+}
+
+// ApplySchemaDefaultACL is NamespaceCreate's get_user_default_acl(
+// OBJECT_SCHEMA, owner, InvalidOid): ALTER DEFAULT PRIVILEGES ... ON SCHEMAS
+// for the schema's owner (schemas take global entries only). Called right
+// after RegisterSchema by both CREATE SCHEMA paths. M0149-0001h1a8.
+func ApplySchemaDefaultACL(im *catalog.InMemory, schemaName string, dbOid uint32) {
+	db := catalog.NamespaceDBOid(dbOid)
+	oid := im.SchemaOID(schemaName, db)
+	if oid == 0 {
+		return
+	}
+	owner := im.SchemaOwnerOID(schemaName, db)
+	if owner == 0 {
+		owner = 10
+	}
+	im.ApplyDefaultACL(oid, owner, 0, catalog.DefaultACLObjTypeNamespace)
 }

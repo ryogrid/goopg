@@ -312,6 +312,20 @@ the owner\-revoked flags. CREATE TABLE and CREATE VIEW use the TABLES default
 and CREATE SEQUENCE the SEQUENCES default, each applied before the heap sync
 that writes relacl.
 
+## Slice 10: SCHEMAS defaults; schema OID reuse \(M0149\-0001h1a8\)
+
+- CREATE SCHEMA, through both the executor path and the postmaster
+  compat\-noop path, now applies get\_user\_default\_acl\(OBJECT\_SCHEMA\) via
+  ApplySchemaDefaultACL. Schemas take global entries only.
+- catalog.RegisterSchema and CreateTablespace minted OIDs by
+  pre\-incrementing nextOID, while every other site uses the value and then
+  advances it \(allocOIDLocked\). So after a CREATE SCHEMA, nextOID still
+  named the schema's OID, and the next object received the same one: the
+  schema's first table, or the pg\_default\_acl entry this work mints. Every
+  OID\-keyed store, the ACL maps included, then mixed the two objects, and a
+  GRANT USAGE ON SCHEMA materialised the table's relacl. Both sites now use
+  allocOIDLocked.
+
 ## Open
 
 - A read\-only descriptor reads with the statement's snapshot, not the

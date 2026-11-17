@@ -12038,6 +12038,29 @@ verify each at HEAD when the task starts.
     \(printtup.c SendRowDescriptionMessage\).
   - > **ESCALATION \(S2, wrong results for binary\-format clients\):** filed
     here; owner to place.
+- [x] **M0149-0001h1a8 — SCHEMAS default ACLs never applied at CREATE SCHEMA; a schema and the next object minted shared one OID** \(filed and fixed 2026-11-17 by M0149-0001h1a\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: NamespaceCreate → get\_user\_default\_acl\(OBJECT\_SCHEMA, owner,
+    InvalidOid\) \(global entries only\). OIDs come from GetNewOid and are
+    unique per catalog.
+  - Found:
+    - catalog RegisterSchema \(and CreateTablespace\) pre\-incremented
+      nextOID, so nextOID kept naming the OID just used. The next object —
+      e.g. the first table created in the schema, or a pg\_default\_acl
+      entry — got the same OID and shared its entry in every OID\-keyed store
+      \(a GRANT USAGE ON SCHEMA materialised the table's relacl\).
+    - Both now mint with allocOIDLocked \(use, then advance\).
+  - Landed: executor.ApplySchemaDefaultACL, called by both CREATE SCHEMA
+    paths \(the executor and the postmaster compat\-noop one\).
+  - Tests: TestSchemaAndNextObjectGetDistinctOIDs; catalog / initdb /
+    postmaster / units PASS; the PG cold\-start / crash\-start, pg\_dump and
+    schema testport families PASS.
+  - Regress A/B vs HEAD over 12 cases: privileges 607→604 \(inventory
+    updated\); namespace / create\_schema / alter\_table / dependency /
+    rowsecurity / create\_view / alter\_generic / object\_address /
+    tablespace / psql / largeobject unchanged.
+  Movement: regress privileges 607→604
 - [x] **M0149-0001h1a7 — default ACLs were never applied when a relation was created: ALTER DEFAULT PRIVILEGES [IN SCHEMA] ... ON TABLES / SEQUENCES only rendered in pg\_default\_acl** \(filed and fixed 2026-11-17 by M0149-0001h1a\)
   Kind: impl
   Parent: M0149-0001h1a

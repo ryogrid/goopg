@@ -14281,8 +14281,12 @@ func (c *InMemory) RegisterSchema(name string, dbOid ...uint32) {
 	}
 	n := c.getOrCreateNS(schemaDBOid(dbOid))
 	if _, ok := n.schemas[lc]; !ok {
-		c.nextOID++
-		n.schemas[lc] = c.nextOID
+		// allocOIDLocked (use, then advance): the old pre-increment left
+		// nextOID naming the schema's own OID, so the next object — e.g. the
+		// first table created in it — was minted the same OID, and the two
+		// shared one entry of every OID-keyed store (ACLs included).
+		// M0149-0001h1a8.
+		n.schemas[lc] = c.allocOIDLocked()
 	}
 }
 
@@ -17206,8 +17210,7 @@ func (c *InMemory) CreateTablespace(name, owner, location string) (uint32, error
 	if _, ok := c.tablespaces[lc]; ok {
 		return 0, fmt.Errorf("tablespace %q already exists", name)
 	}
-	c.nextOID++
-	oid := c.nextOID
+	oid := c.allocOIDLocked() // use-then-advance, like every other minting site (M0149-0001h1a8)
 	c.tablespaces[lc] = &tablespaceRow{
 		oid:      oid,
 		name:     name,
