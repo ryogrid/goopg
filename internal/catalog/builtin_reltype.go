@@ -23,3 +23,50 @@ func BuiltinRelType(relOID uint32) uint32 {
 	}
 	return 0
 }
+
+// relTypeOf is pg_class.reltype for t: its reserved rowtype, else the
+// captured system rowtype.
+func relTypeOf(t *Table) uint32 {
+	if t.RowTypeOID != 0 {
+		return t.RowTypeOID
+	}
+	return BuiltinRelType(t.OID)
+}
+
+// LookupTableByRowTypeOID finds the relation whose rowtype (or, with
+// array=true, whose rowtype's array type) is oid. OIDs come from one
+// counter, so every database namespace is searched.
+func (c *InMemory) LookupTableByRowTypeOID(oid uint32) (t *Table, array bool, ok bool) {
+	if oid < FirstUserOID {
+		return nil, false, false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, ns := range c.namespaces {
+		for _, tbl := range ns.tables {
+			if tbl.RowTypeOID == 0 {
+				continue
+			}
+			if tbl.RowTypeOID == oid {
+				return tbl, false, true
+			}
+			if tbl.RowTypeOID-1 == oid {
+				return tbl, true, true
+			}
+		}
+	}
+	return nil, false, false
+}
+
+// LookupCompositeTypeByRelOID finds a standalone composite type by the OID of
+// its implicit relation (relkind 'c'). M0149-0001h1a34.
+func (c *InMemory) LookupCompositeTypeByRelOID(oid uint32) (*CompositeType, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, ct := range c.compositeTypes {
+		if ct.RelOID == oid {
+			return ct, true
+		}
+	}
+	return nil, false
+}

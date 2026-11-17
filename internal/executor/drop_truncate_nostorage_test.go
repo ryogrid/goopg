@@ -136,8 +136,10 @@ func TestDropTableIfExistsMissingNoSideEffects(t *testing.T) {
 	if !ok {
 		t.Fatal("probe_after not in catalog")
 	}
-	if pa.OID != keep.OID+1 {
-		t.Fatalf("probe_after oid = %d, want %d (next in sequence after the drop)", pa.OID, keep.OID+1)
+	// keep took three OIDs: the relation, its array type and its rowtype
+	// (heap_create_with_catalog; M0149-0001h1a34).
+	if pa.OID != keep.OID+3 {
+		t.Fatalf("probe_after oid = %d, want %d (next in sequence after the drop)", pa.OID, keep.OID+3)
 	}
 	if _, err := os.Stat(filepath.Join(mgr.DataDir(), mgr.RelPath(cat.RelFileNode(pa)))); err != nil {
 		t.Fatalf("probe_after file missing after CREATE: %v", err)

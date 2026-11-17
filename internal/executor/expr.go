@@ -20899,6 +20899,16 @@ func userTypeNameForOID(cat catalog.Catalog, oid uint32, qualify func(schema str
 		schema := cat.SchemaNameForOID(rt.NamespaceOID)
 		return regOutQualified(schema, rt.MultirangeName, regOutQualifySchema(schema, qualify)) + "[]", true
 	}
+	// A relation's rowtype / its array (M0149-0001h1a34).
+	if im, ok := cat.(*catalog.InMemory); ok {
+		if tbl, isArr, found := im.LookupTableByRowTypeOID(oid); found {
+			name := regOutQualified(tbl.Schema, tbl.Name, regOutQualifySchema(tbl.Schema, qualify))
+			if isArr {
+				name += "[]"
+			}
+			return name, true
+		}
+	}
 	return "", false
 }
 

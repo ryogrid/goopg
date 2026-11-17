@@ -616,6 +616,9 @@ type PGClassRow struct {
 	// (the general PG-tuple decoder) and feeds it to ApplyTableReloptions.
 	// M0119-0004.
 	RelOptions string
+	// RelType is pg_class.reltype (the relation's rowtype), filled by
+	// loadUserTablesFromHeap's full decode. M0149-0001h1a34.
+	RelType uint32
 }
 
 // PGAttributeRow is the v0 on-disk shape of one pg_attribute tuple.

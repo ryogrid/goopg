@@ -19653,10 +19653,51 @@ func stampCatalogRowsTuple(ctx *Context, rel storage.RelFileNode, xmax storage.T
 	}
 }
 
+// deleteRelationRowtypeFromCatalogHeap stamps xmax on relOID's rowtype
+// pg_type row (typrelid = relOID) and its array type (typelem = that
+// rowtype), the rows syncTableToCatalogHeap writes. M0149-0001h1a34.
+func deleteRelationRowtypeFromCatalogHeap(ctx *Context, dbOid, relOID uint32, xmax storage.TransactionID) {
+	if relOID < catalog.FirstUserOID {
+		return
+	}
+	typeRel := storage.RelFileNode{DBOid: dbOid, RelOid: catalog.TypeRelationId, Fork: storage.MainFork}
+	var rowtypes []uint32
+	// pgTypeColumnsPG18 physical offsets: oid 0, typrelid 84, typelem 92.
+	stampCatalogRows(ctx, typeRel, xmax, func(data []byte) bool {
+		if len(data) < 96 || binary.LittleEndian.Uint32(data[84:88]) != relOID {
+			return false
+		}
+		rowtypes = append(rowtypes, binary.LittleEndian.Uint32(data[0:4]))
+		return true
+	})
+	if len(rowtypes) == 0 {
+		return
+	}
+	stampCatalogRows(ctx, typeRel, xmax, func(data []byte) bool {
+		if len(data) < 96 {
+			return false
+		}
+		elem := binary.LittleEndian.Uint32(data[92:96])
+		for _, rt := range rowtypes {
+			if elem == rt {
+				return true
+			}
+		}
+		return false
+	})
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		for _, rt := range rowtypes {
+			im.DeleteTypeHeapTID(rt)
+			im.DeleteTypeHeapTID(rt - 1)
+		}
+	}
+}
+
 // deleteCatalogRowsForOID stamps xmax on all live pg_class and pg_attribute
 // rows for relOID. Called from rollbackDDLCreate so that after a crash+restart
 // the startup catalog loader's xmax==0 filter skips the rolled-back rows.
 func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax storage.TransactionID) {
+	deleteRelationRowtypeFromCatalogHeap(ctx, dbOid, relOID, xmax)
 	classRel := storage.RelFileNode{
 		DBOid:  dbOid,
 		RelOid: catalog.RelationRelationId,
@@ -20210,6 +20251,19 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 	viewEvAction := tbl.ViewDef
 	if ctx.Pool != nil && tbl.ViewDef != "" && (tbl.IsMatView || tbl.View != nil) {
 		viewEvAction, tbl.RuleIsCanonical = canonicalViewEvAction(ctx, tbl, tbl.ViewDef)
+	}
+	// The relation's rowtype and its array type (AddNewRelationType) go in
+	// before the pg_class row whose reltype points at them: a PG node's
+	// typcache must find the pg_type row. M0149-0001h1a34.
+	if tbl.RowTypeOID != 0 {
+		dbArg := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
+		if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForRelationArray(ctx.Catalog, tbl, dbArg)); err != nil {
+			return fmt.Errorf("pg_type (rowtype array): %w", err)
+		}
+		if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForRelation(ctx.Catalog, tbl, dbArg)); err != nil {
+			return fmt.Errorf("pg_type (rowtype): %w", err)
+		}
+		mirrorTypeCatalogFiles(ctx)
 	}
 	classRel := storage.RelFileNode{
 		DBOid:  heapDBOid,
@@ -21437,7 +21491,7 @@ func CreateSequenceCatalogRelation(cat catalog.Catalog, seqObjName parser.Object
 		{Name: "log_cnt", Type: catalog.Type{Name: "int8"}, Ordinal: 1},
 		{Name: "is_called", Type: catalog.Type{Name: "bool"}, Ordinal: 2},
 	}
-	seqTbl, err2 := cat.CreateTable(seqObjName, seqCols, dbOid)
+	seqTbl, err2 := cat.(*catalog.InMemory).CreateSequenceRelation(seqObjName, seqCols, dbOid)
 	if err2 != nil {
 		return
 	}

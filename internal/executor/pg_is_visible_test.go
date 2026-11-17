@@ -184,3 +184,36 @@ func TestRegArgsRenderAsNames(t *testing.T) {
 		}
 	}
 }
+
+// TestCompositeTypeRelationIsVisible pins the M0149-0001h1a34 fix of an
+// h1a32 regression: a standalone composite type's relation (relkind 'c')
+// lives in the type registry, not the table map, and pg_table_is_visible
+// must still answer for it — psql's `\d <type>` filters on it (regress
+// alter_table lost every `\d test_type` block).
+func TestCompositeTypeRelationIsVisible(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	path := "public"
+	ctx.GetSetting = func(name string) (string, bool) {
+		if name == "search_path" {
+			return path, true
+		}
+		return "", false
+	}
+	if err := runDDL(t, ctx, "CREATE TYPE vis_ct AS (a int)"); err != nil {
+		t.Fatal(err)
+	}
+	ct := ctx.Catalog.(*catalog.InMemory).LookupCompositeType("vis_ct")
+	if ct == nil {
+		t.Fatal("vis_ct not registered")
+	}
+	d, _ := pgObjectIsVisible("pg_table_is_visible", NewIntDatum(int64(ct.RelOID)), ctx)
+	if d.Kind != KindBool || !d.BoolValue() {
+		t.Errorf("pg_table_is_visible(vis_ct relation) = %+v, want true", d)
+	}
+	path = "pg_catalog"
+	d, _ = pgObjectIsVisible("pg_table_is_visible", NewIntDatum(int64(ct.RelOID)), ctx)
+	if d.Kind != KindBool || d.BoolValue() {
+		t.Errorf("pg_table_is_visible(vis_ct relation) off path = %+v, want false", d)
+	}
+}

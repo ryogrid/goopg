@@ -587,7 +587,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table, dbOid ...uint3
 		NewIntDatum(int64(tbl.OID)), // oid
 		NewStringDatum(tbl.Name),    // relname (name)
 		NewIntDatum(int64(namespaceOIDForSchema(cat, tbl.Schema, dbOid...))), // relnamespace
-		NewIntDatum(0),                                  // reltype (no composite type seeded yet)
+		NewIntDatum(int64(tbl.RowTypeOID)),              // reltype (the relation's rowtype; 0 for a sequence, M0149-0001h1a34)
 		NewIntDatum(int64(tbl.OfTypeOID)),               // reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
 		NewIntDatum(tableOwnerOID(cat, tbl)),            // relowner (M0149-0001h1a26)
 		NewIntDatum(relamFor(relkind)),                  // relam (0 for sequences/views — relcache.c:1841 asserts it)
@@ -2057,6 +2057,28 @@ func buildUserPGTypeRowForComposite(ct *catalog.CompositeType) Row {
 		NullDatum,                                      // typdefault (NULL)
 		NullDatum,                                      // typacl (NULL)
 	}
+}
+
+// buildUserPGTypeRowForRelation is the pg_type row heap_create_with_catalog's
+// AddNewRelationType writes for a relation's rowtype: typtype 'c', typrelid =
+// the relation, record_in/out/recv/send, in the relation's namespace and
+// owned by its owner. M0149-0001h1a34.
+func buildUserPGTypeRowForRelation(cat catalog.Catalog, tbl *catalog.Table, dbOid ...uint32) Row {
+	ct := &catalog.CompositeType{Name: tbl.Name, OID: tbl.RowTypeOID, ArrayOID: tbl.RowTypeOID - 1, RelOID: tbl.OID}
+	row := buildUserPGTypeRowForComposite(ct)
+	row[2] = NewIntDatum(int64(namespaceOIDForSchema(cat, tbl.Schema, dbOid...)))
+	row[3] = NewIntDatum(tableOwnerOID(cat, tbl))
+	return row
+}
+
+// buildUserPGTypeRowForRelationArray is the `_name` array type of a
+// relation's rowtype (AssignTypeArrayOid's OID, typelem = the rowtype).
+func buildUserPGTypeRowForRelationArray(cat catalog.Catalog, tbl *catalog.Table, dbOid ...uint32) Row {
+	ct := &catalog.CompositeType{Name: tbl.Name, OID: tbl.RowTypeOID, ArrayOID: tbl.RowTypeOID - 1, RelOID: tbl.OID}
+	row := buildUserPGTypeRowForCompositeArray(ct)
+	row[2] = NewIntDatum(int64(namespaceOIDForSchema(cat, tbl.Schema, dbOid...)))
+	row[3] = NewIntDatum(tableOwnerOID(cat, tbl))
+	return row
 }
 
 // buildUserPGTypeRowForCompositeArray builds the pg_type row for the

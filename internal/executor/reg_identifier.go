@@ -393,6 +393,9 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 				userTypeOnPath(ctx, oid, schema) {
 				return NewIntDatum(int64(oid)), nil
 			}
+			if oid, ok := relationRowtypeForName(ctx, schema, typeName); ok {
+				return NewIntDatum(int64(oid)), nil
+			}
 		}
 		return NullDatum, &ExecError{Code: "42704", Pos: pos,
 			Message: fmt.Sprintf("type %q does not exist", regDisplayName(schema, typeName))}

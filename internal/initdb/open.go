@@ -3703,6 +3703,11 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 					if reloptionsOrdinal < len(decoded) && !decoded[reloptionsOrdinal].IsNull() {
 						row.RelOptions = decoded[reloptionsOrdinal].StringValue()
 					}
+					// reltype (attnum 4): the rowtype CreateTable reserved.
+					// M0149-0001h1a34.
+					if len(decoded) > 3 && !decoded[3].IsNull() {
+						row.RelType = uint32(decoded[3].Int)
+					}
 				}
 			}
 			// Legacy-layout rows require a locally-committed xmin
@@ -3866,6 +3871,10 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 		// reverted to defaults across every restart. M0119-0004.
 		if tr.RelOptions != "" {
 			catalog.ApplyTableReloptions(tbl, tr.RelOptions)
+		}
+		if tr.RelType >= catalog.FirstUserOID {
+			tbl.RowTypeOID = tr.RelType
+			cat.AdvanceNextOIDPast(tr.RelType)
 		}
 		if nsDBOid != 0 {
 			// Distinct-dbOid database (follow-up 39): register into the

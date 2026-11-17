@@ -85,6 +85,15 @@ func relationIsVisible(oid uint32, ctx *Context) Datum {
 	} else if _, found := im.ToastRelName(oid, dbOid); found {
 		// pg_toast is never on a search_path.
 		return NewBoolDatum(false)
+	} else if ct, found := im.LookupCompositeTypeByRelOID(oid); found {
+		// A standalone composite type's relation (relkind 'c') lives in the
+		// type registry, not the table map; visible when its schema is
+		// searched (psql's \d <type> filters on pg_table_is_visible).
+		schema := ctx.Catalog.SchemaNameForOID(ct.NamespaceOID)
+		if schema == "" {
+			schema = "public"
+		}
+		return NewBoolDatum(RegObjectSchemaVisible(ctx, schema))
 	} else {
 		return NullDatum
 	}
@@ -313,4 +322,20 @@ func regArgText(e optimizer.Expr, d Datum, ctx *Context) Datum {
 func isRegTypedExpr(e optimizer.Expr) bool {
 	t, ok := optimizer.ExprResultType(e)
 	return ok && !t.IsArray && isRegIdentifierTypeName(t.Name)
+}
+
+// relationRowtypeForName resolves a type name that names a relation to the
+// relation's rowtype (TypenameGetTypid finds it as an ordinary pg_type row
+// in the relation's schema); "name[]" is its array type. M0149-0001h1a34.
+func relationRowtypeForName(ctx *Context, schema, typeName string) (uint32, bool) {
+	base, isArr := strings.TrimSuffix(typeName, "[]"), strings.HasSuffix(typeName, "[]")
+	dbOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
+	tbl, ok := lookupTableOnSearchPath(ctx, parser.ObjectName{Schema: schema, Name: base}, dbOid)
+	if !ok || tbl == nil || tbl.RowTypeOID == 0 {
+		return 0, false
+	}
+	if isArr {
+		return tbl.RowTypeOID - 1, true
+	}
+	return tbl.RowTypeOID, true
 }

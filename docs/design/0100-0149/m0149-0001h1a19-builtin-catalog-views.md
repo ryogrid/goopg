@@ -105,12 +105,29 @@ is empty for all 3413 built-ins.
   pg\_class renders `reltype` from `catalog.BuiltinRelType`: pg\_class is 83,
   pg\_type 71, pg\_largeobject 10025, and an index or sequence is 0. It used to
   be 0 everywhere.
-- **User relations (slice 2, open).** PG's `heap_create_with_catalog`
-  allocates the relation OID N, then the array type N+1
-  (`AssignTypeArrayOid`), then the rowtype N+2 (`AddNewRelationType`), for
-  every relkind except index, sequence and TOAST. goopg allocates one OID per
-  relation and has no rowtype pg\_type rows, so `'tbl'::regtype` fails and
-  every later OID drifts from PG's. Standalone composite types already take
-  three OIDs (`CompositeType.OID / ArrayOID / RelOID`).
+- **User relations (slice 2).** `CreateTable` and `CreateView` reserve
+  OIDs as `heap_create_with_catalog` does: relation N, array type N\+1
+  (`AssignTypeArrayOid`), rowtype N\+2 (`AddNewRelationType`), stored as
+  `Table.RowTypeOID`. A sequence uses `CreateSequenceRelation` and takes one
+  OID (PG 18 sequences have no rowtype).
+  - `syncTableToCatalogHeap` writes the rowtype pg\_type row (typtype 'c',
+    typrelid, record I/O, the relation's namespace and owner) and its `_name`
+    array row before the pg\_class row whose reltype points at them, so a PG
+    node's typcache finds them. `deleteCatalogRowsForOID` stamps both rows dead
+    (typrelid / typelem match), so DROP and the ALTER re\-sync paths keep one
+    copy.
+  - The reload reads reltype from the heap pg\_class row back into
+    `RowTypeOID` and advances the OID counter past it.
+  - `'tbl'::regtype` / `'tbl[]'::regtype` resolve through search\_path to the
+    rowtype and its array (`relationRowtypeForName`); regtypeout and
+    format\_type render them (`LookupTableByRowTypeOID`).
+  - Not yet: ALTER TABLE RENAME / SET SCHEMA / OWNER do not update the rowtype
+    rows, TOAST relations and view rules take no OIDs from the counter (so
+    later user OIDs still drift from PG's), and pg\_typeof of a whole\-row
+    reference is text (filed M0149-0001h1a36).
+- **Composite relations and visibility.** `pg_table_is_visible` answers for a
+  standalone composite type's relation (relkind 'c') by its schema; the h1a32
+  port returned NULL for it, which hid every composite type from psql `\d`
+  \(regress alter\_table 717→775\); fixed in h1a34 \(now 697\).
 - **Known gap.** goopg's virtual pg\_class lists only 11 system relations,
   where PG lists 415 (filed M0149-0001h1a35).

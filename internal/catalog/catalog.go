@@ -615,6 +615,12 @@ type Table struct {
 	Name    string
 	Columns []Column
 	OID     uint32
+	// RowTypeOID is pg_class.reltype: the relation's composite rowtype, whose
+	// array type is RowTypeOID-1. heap_create_with_catalog allocates the
+	// relation OID N, the array type N+1 (AssignTypeArrayOid) and the rowtype
+	// N+2 (AddNewRelationType); CreateTable does the same. 0 for a sequence
+	// and for a relation created before M0149-0001h1a34.
+	RowTypeOID uint32
 	// RelFileNodeOID overrides the on-disk relfile identity when it differs
 	// from the catalog OID. PostgreSQL physical backups use relfilenode for
 	// storage paths; when zero, goopg falls back to OID (its native layout).
@@ -8378,7 +8384,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 			strconv.Itoa(int(t.OID)),        // 0:  oid
 			t.Name,                          // 1:  relname
 			strconv.Itoa(int(nsOID)),        // 2:  relnamespace
-			strconv.Itoa(int(BuiltinRelType(t.OID))), // 3:  reltype (system relations' rowtype; user relations M0149-0001h1a34 slice 2)
+			strconv.Itoa(int(relTypeOf(t))), // 3:  reltype (the relation's rowtype, M0149-0001h1a34)
 			relOfType,                       // 4:  reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
 			relOwner,                        // 5:  relowner (Table.Owner; bootstrap superuser when unset, M0149-0001h1a26)
 			relam,                           // 6:  relam (heap=2; 0 for sequences)
@@ -13605,6 +13611,40 @@ func (c *InMemory) CreateTable(name parser.ObjectName, cols []Column, dbOid ...u
 		DBOid:   resolveDBOid(dbOid),
 	}
 	c.nextOID++
+	c.reserveRowTypeLocked(t)
+	ns.tables[k] = t
+	return t, nil
+}
+
+// reserveRowTypeLocked allocates t's array type and rowtype OIDs right after
+// its relation OID, as heap_create_with_catalog does (M0149-0001h1a34).
+func (c *InMemory) reserveRowTypeLocked(t *Table) {
+	c.nextOID++ // array type (AssignTypeArrayOid)
+	t.RowTypeOID = c.nextOID
+	c.nextOID++
+}
+
+// CreateSequenceRelation is CreateTable for a sequence: PG 18 gives a
+// sequence no rowtype (reltype 0), so no type OIDs are reserved.
+func (c *InMemory) CreateSequenceRelation(name parser.ObjectName, cols []Column, dbOid ...uint32) (*Table, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ns := c.getOrCreateNS(resolveDBOid(dbOid))
+	k := key(name)
+	if _, exists := ns.tables[k]; exists {
+		return nil, fmt.Errorf("relation %q already exists", k)
+	}
+	for i := range cols {
+		cols[i].Ordinal = i
+	}
+	t := &Table{
+		Schema:  name.Schema,
+		Name:    name.Name,
+		Columns: append([]Column(nil), cols...),
+		OID:     c.nextOID,
+		DBOid:   resolveDBOid(dbOid),
+	}
+	c.nextOID++
 	ns.tables[k] = t
 	return t, nil
 }
@@ -13639,6 +13679,7 @@ func (c *InMemory) CreateTableReplacingPendingDrop(name parser.ObjectName, cols 
 		DBOid:   resolveDBOid(dbOid),
 	}
 	c.nextOID++
+	c.reserveRowTypeLocked(t)
 	ns.tables[k] = t
 	return t, nil
 }
@@ -13853,6 +13894,7 @@ func (c *InMemory) CreateView(name parser.ObjectName, cols []Column, aliases []s
 		DBOid: resolveDBOid(dbOid),
 	}
 	c.nextOID++
+	c.reserveRowTypeLocked(t)
 	ns.tables[k] = t
 	return t, nil
 }

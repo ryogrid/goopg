@@ -12539,7 +12539,7 @@ verify each at HEAD when the task starts.
     standalone runs; the extra lines are OUT\-parameter SRF expansion after
     a DROP / CREATE FUNCTION, unrelated to reg values\).
   Movement: probe format/concat/concat\_ws/\|\| reg rendering 0/9→9/9 vs PG 18.3
-- [ ] **M0149-0001h1a34 — pg\_class.reltype is 0 for every relation; a user table has no composite row type in pg\_type** \(filed 2026-11-18 by M0149-0001h1a33\)
+- [x] **M0149-0001h1a34 — pg\_class.reltype is 0 for every relation; a user table has no composite row type in pg\_type** \(filed 2026-11-18 by M0149-0001h1a33\)
   Kind: impl
   Parent: M0149-0001h1a
   - PG: heap\_create\_with\_catalog → AddNewRelationType creates the
@@ -12571,6 +12571,46 @@ verify each at HEAD when the task starts.
       Check which tests pin consecutive user OIDs before changing the
       allocator.
     Movement: probe pg\_class.reltype for system relations 3/11→11/11 vs PG 18.3
+  - 2026-11-18 slice 2 \(landed\): user relations get PG's rowtype and array type.
+    - CreateTable / CreateView reserve relation N, array N\+1, rowtype N\+2
+      \(Table.RowTypeOID\); sequences use CreateSequenceRelation \(one OID\).
+    - syncTableToCatalogHeap writes the rowtype and `_name` array pg\_type
+      rows before the pg\_class row; deleteCatalogRowsForOID stamps them; the
+      reload restores RowTypeOID from reltype and advances the OID counter.
+    - `'tbl'::regtype`, `'tbl[]'::regtype`, regtypeout and format\_type resolve
+      relation rowtypes.
+    - Probe vs PG 18.3: reltype offset \(\+2\), typtype / typrelid / typarray /
+      typnamespace / typlen / typalign / record\_in, the array row, regtype both
+      ways, DROP removes both rows — identical; survives a restart without OID
+      reuse. Remaining OID differences come from TOAST and view rules \(h1a36\).
+    - Found and fixed an h1a32 regression: pg\_table\_is\_visible returned NULL
+      for a composite type's relation \(relkind 'c'\), so psql `\d <type>`
+      printed nothing; regress alter\_table went 717→775 at 6462c0800
+      \(bisected 617f1f80d / 38b9618ad = 717, 6462c0800 = 775\). Now 697.
+    - The h1a32 A/B left alter\_table out; the wide check over 20 more cases
+      found no other loss \(inherit / publication / opr\_sanity differences were
+      case\-order effects of a multi\-case run, identical to HEAD on the same
+      case list\).
+    - Tests: TestRelationRowtypeOIDReservation,
+      TestPort\_RelationRowtypeSurvivesRestart,
+      TestCompositeTypeRelationIsVisible; TestDropTableIfExistsMissingNoSideEffects
+      now expects the next table at OID \+3.
+    Movement: regress alter_table 717→697
+- [ ] **M0149-0001h1a36 — relation rowtype residue: RENAME / SET SCHEMA / OWNER leave the rowtype rows stale; TOAST relations and view rules take no OIDs; pg\_typeof\(whole row\) is text** \(filed 2026-11-18 by M0149-0001h1a34\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: RenameRelationInternal → RenameTypeInternal \(and the `_name` array
+    rename, makeArrayTypeName's collision rule `__name`\); AlterTableNamespace
+    / ATExecChangeOwner move the rowtype with the relation;
+    create\_toast\_table and DefineQueryRewrite allocate OIDs from the same
+    counter, so PG's user OIDs run rel, \_rel, rel type, toast, toast index.
+  - goopg: the rowtype rows keep the old name / namespace / owner \(regress
+    alter\_table's attmp\_array / \_\_attmp\_array lines\); TOAST relations use
+    synthetic OIDs \(\+100M\) and rules none, so a later user OID differs from
+    PG's; `pg_typeof(t)` for a whole\-row reference prints text.
+  - Resume: re\-write the rowtype rows in the rename / set\-schema / owner
+    paths \(deleteRelationRowtypeFromCatalogHeap \+ the two builders\); the
+    planner's whole\-row Var type.
 - [ ] **M0149-0001h1a35 — the virtual pg\_class lists 11 system relations; PG 18.3 lists 415** \(filed 2026-11-18 by M0149-0001h1a34\)
   Kind: impl
   Parent: M0149-0001h1a
