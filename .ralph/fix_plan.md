@@ -12038,6 +12038,26 @@ verify each at HEAD when the task starts.
     \(printtup.c SendRowDescriptionMessage\).
   - > **ESCALATION \(S2, wrong results for binary\-format clients\):** filed
     here; owner to place.
+- [x] **M0149-0001h1a12 — `'name'::regrole` returned the text unresolved; to\_regrole and the other to\_reg\* functions did not exist; `col::a::b` was labelled with the type name** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG:
+    - regproc.c regrolein and to\_regclass / to\_regtype / to\_regrole /
+      to\_regcollation / to\_regproc / to\_regprocedure, which use a soft
+      error context: NULL for a missing object and \(PG 16\+\) for bad
+      syntax;
+    - parse\_target.c FigureColnameInternal T\_TypeCast: an argument's
+      column or function name survives the cast chain.
+  - Landed:
+    - the CastExpr evaluator routes string → regrole through
+      regIdentifierInput \(42704 / 42602 / '\-' / numeric OID\);
+    - the to\_reg\* family in evalFuncCall, with result types in exprType;
+    - targetMeta looks through nested casts for a named base.
+  - Tests: TestRegroleInput, TestCastChainColumnName.
+  - Regress A/B vs HEAD over 29 cases: privileges 576→553, regproc
+    288→197, update 274→267, constraints 17→16, insert 254→253 \(inventory
+    updated\); the other 24 unchanged.
+  Movement: regress privileges 576→553, regproc 288→197, update 274→267, constraints 17→16, insert 254→253
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

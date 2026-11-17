@@ -971,6 +971,15 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 				return NewStringDatum(result), nil
 			}
 		}
+		if strings.EqualFold(x.TargetType, "regrole") && v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
+			// regrolein: resolve the (possibly quoted) role name to its OID
+			// (42704 on a miss, '-' is InvalidOid, digits are an OID) through
+			// the shared reg* input port. The cast used to return the text
+			// itself, so 'nosuch'::regrole succeeded and ::oid on the result
+			// failed. The OID datum renders as the role name on output
+			// (regroleout). M0149-0001h1a12.
+			return regIdentifierInput(v, "regrole", ctx, x.Pos())
+		}
 		if strings.EqualFold(x.TargetType, "regclass") && ctx != nil && ctx.Catalog != nil {
 			// Scope every lookup below to the connection's own database
 			// namespace — mirrors every other per-dbOid site (e.g.
@@ -18536,6 +18545,22 @@ case "pg_char_to_encoding":
 	// against the stored *acl column. M0110-0001 / DU-002 slice 2.
 	case "acldefault":
 		return evalAclDefault(x, slot, ctx)
+	case "to_regclass", "to_regtype", "to_regrole", "to_regcollation", "to_regproc", "to_regprocedure":
+		// to_reg*(text): the type's input function with a soft error context
+		// — NULL instead of an error, for a missing object and (PG 16+) for
+		// bad syntax alike (regproc.c to_regclass & co). M0149-0001h1a12.
+		if len(x.Args) != 1 {
+			return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %s requires 1 argument", name)}
+		}
+		v, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || v.IsNull() {
+			return NullDatum, err
+		}
+		out, rerr := regIdentifierInput(NewStringDatum(v.StringValue()), strings.TrimPrefix(name, "to_"), ctx, x.Pos())
+		if rerr != nil || out.Kind != KindInt {
+			return NullDatum, nil
+		}
+		return out, nil
 	case "makeaclitem":
 		args := make([]Datum, 0, len(x.Args))
 		for _, a := range x.Args {

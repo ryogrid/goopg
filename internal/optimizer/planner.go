@@ -16695,6 +16695,28 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	// For column-ref casts (e.g. f1::int2), propagate the column's name.
 	// Matches PostgreSQL's FigureColname() logic. M0097-0003.
 	if cast, ok := e.(*CastExpr); ok {
+		// FigureColnameInternal's T_TypeCast keeps a strong (column or
+		// function) name from its argument through any number of casts and
+		// only falls back to the type name when the argument has none, so
+		// `member::regrole::text` is labelled `member`. Look through the
+		// whole cast chain for that base. M0149-0001h1a12.
+		base := cast.Operand
+		for inner, ok := base.(*CastExpr); ok; inner, ok = base.(*CastExpr) {
+			base = inner.Operand
+		}
+		if base != cast.Operand {
+			if cr, ok := base.(*ColumnRef); ok {
+				innerName, _ := targetMeta(cr, t)
+				return innerName, exprType(e)
+			}
+			if _, ok := base.(*TableOidExpr); ok {
+				return "tableoid", exprType(e)
+			}
+			if fc, ok := base.(*FuncCall); ok && fc.Operator == "" {
+				innerName, _ := targetMeta(fc, t)
+				return innerName, exprType(e)
+			}
+		}
 		if _, isCol := cast.Operand.(*ColumnRef); isCol {
 			innerName, _ := targetMeta(cast.Operand, t)
 			return innerName, exprType(e)
@@ -17408,6 +17430,8 @@ func exprType(e Expr) catalog.Type {
 			"has_column_privilege", "has_any_column_privilege", "has_sequence_privilege",
 			"has_function_privilege", "has_type_privilege", "has_largeobject_privilege":
 			return catalog.Type{Name: "bool"} // M0149-0001h / h1 / h1a
+		case "to_regclass", "to_regtype", "to_regrole", "to_regcollation", "to_regproc", "to_regprocedure":
+			return catalog.Type{Name: strings.TrimPrefix(strings.TrimPrefix(strings.ToLower(x.Name), "pg_catalog."), "to_")} // M0149-0001h1a12
 		case "lo_create", "lo_creat", "lo_from_bytea", "lo_import":
 			return catalog.Type{Name: "oid"} // M0149-0001h1a
 		case "lo_unlink", "lo_open", "lo_close", "lowrite", "lo_lseek", "lo_tell",
