@@ -12038,6 +12038,25 @@ verify each at HEAD when the task starts.
     \(printtup.c SendRowDescriptionMessage\).
   - > **ESCALATION \(S2, wrong results for binary\-format clients\):** filed
     here; owner to place.
+- [x] **M0149-0001h1a5 — psql `\\du` / `\\dg` failed for every user: pg\_roles was a four\-column stub \("column r.rolinherit does not exist"\)** \(filed and fixed 2026-11-17 by M0149-0001h1a\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: system\_views.sql pg\_roles \(13 columns over pg\_authid, rolpassword
+    masked, rolconfig from pg\_db\_role\_setting\); pg\_authid.dat bootstrap
+    superuser \(every flag true, rolpassword / rolvaliduntil NULL\).
+  - Landed:
+    - catalog pg\_roles is the full view, projected from pg\_authid's rows;
+    - initdb bootstrap pg\_authid rows are PG\-shaped, with a null bitmap
+      \(the "Password valid until 1970\-01\-01" and missing Create DB on the
+      superuser came from the old non\-NULL defaults\);
+    - VALID UNTIL text is normalised to timestamptz output.
+  - Tests: TestPgRolesIsPgAuthidProjection; catalog / initdb tests updated
+    for the PG layout; TestPort\_CreateRoleSurvivesRestart now reads the
+    bool column; PG cold\-start and crash\-start e2e PASS; the pg\_dump /
+    pg\_dumpall testport family PASS.
+  - Regress A/B vs HEAD over 10 role cases: psql 748→739 \(inventory
+    updated\); the rest unchanged.
+  Movement: regress psql 748→739
 - [x] **M0149-0001h1a4 — every role could SELECT pg\_authid \(password hashes\) and pg\_largeobject: the PUBLIC revokes initdb applies to six catalogs were not modelled** \(filed and fixed 2026-11-17 by M0149-0001h1a\)
   Kind: impl
   Parent: M0149-0001h1a

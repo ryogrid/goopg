@@ -108,8 +108,8 @@ func TestPort_CreateRoleSurvivesRestart(t *testing.T) {
 	// the attributes.
 	scramLogin("pre-restart")
 	if got := queryScalar(t, c,
-		"SELECT rolcanlogin FROM pg_roles WHERE rolname = 'wpuser'"); got != "t" {
-		t.Fatalf("pre-restart pg_roles.rolcanlogin(wpuser) = %q, want t", got)
+		"SELECT rolcanlogin FROM pg_roles WHERE rolname = 'wpuser'"); got != "true" {
+		t.Fatalf("pre-restart pg_roles.rolcanlogin(wpuser) = %q, want true", got)
 	}
 
 	// Clean stop -> restart. Roles are restored from the pg_authid heap file
@@ -125,12 +125,12 @@ func TestPort_CreateRoleSurvivesRestart(t *testing.T) {
 	scramLogin("post-restart")
 	// (b) Attributes survived.
 	if got := queryScalar(t, c,
-		"SELECT rolcanlogin FROM pg_roles WHERE rolname = 'wpuser'"); got != "t" {
-		t.Fatalf("post-restart pg_roles.rolcanlogin(wpuser) = %q, want t", got)
+		"SELECT rolcanlogin FROM pg_roles WHERE rolname = 'wpuser'"); got != "true" {
+		t.Fatalf("post-restart pg_roles.rolcanlogin(wpuser) = %q, want true", got)
 	}
 	if got := queryScalar(t, c,
-		"SELECT rolcanlogin FROM pg_roles WHERE rolname = 'norole'"); got != "f" {
-		t.Fatalf("post-restart pg_roles.rolcanlogin(norole) = %q, want f (NOLOGIN lost)", got)
+		"SELECT rolcanlogin FROM pg_roles WHERE rolname = 'norole'"); got != "false" {
+		t.Fatalf("post-restart pg_roles.rolcanlogin(norole) = %q, want false (NOLOGIN lost)", got)
 	}
 	// (c) The dropped role stays gone.
 	if got := queryScalar(t, c,
@@ -159,8 +159,8 @@ func TestPort_CreateRoleSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart old role name count = %q, want 0 (RENAME TO not durable)", got)
 	}
 	if got := queryScalar(t, c,
-		"SELECT rolcanlogin FROM pg_roles WHERE rolname = 'renamed_role'"); got != "f" {
-		t.Fatalf("post-restart pg_roles.rolcanlogin(renamed_role) = %q, want f (renamed role lost attrs)", got)
+		"SELECT rolcanlogin FROM pg_roles WHERE rolname = 'renamed_role'"); got != "false" {
+		t.Fatalf("post-restart pg_roles.rolcanlogin(renamed_role) = %q, want false (renamed role lost attrs)", got)
 	}
 	host, port, err := splitHostPort(c.ListenAddr())
 	if err != nil {

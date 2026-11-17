@@ -53,13 +53,13 @@ func TestRoleOIDRegistry(t *testing.T) {
 	rows := pgRoles.VirtualRows()
 	var sawPostgres, sawRole bool
 	for _, r := range rows {
-		switch r[1] {
+		switch r[0] { // pg_roles: rolname first, oid last (column 12)
 		case "postgres":
 			sawPostgres = true
 		case "pol_role":
 			sawRole = true
-			if r[0] != strconv.FormatUint(uint64(oid), 10) {
-				t.Fatalf("pg_roles pol_role oid = %s; want %d", r[0], oid)
+			if r[12] != strconv.FormatUint(uint64(oid), 10) {
+				t.Fatalf("pg_roles pol_role oid = %s; want %d", r[12], oid)
 			}
 		}
 	}

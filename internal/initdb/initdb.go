@@ -1892,8 +1892,8 @@ func bootstrapPostgresRole(dataDir, superuser string) ([]pgAuthidEntry, error) {
 // pre-encoded rolpassword verifier for the bootstrap superuser (OID 10),
 // supplied by --pwfile (upstream initdb's setup_auth ALTER USER … PASSWORD).
 // An empty rolpassword leaves the row's password empty (the no-password
-// default). The verifier is a non-NULL text value, so the bootstrap row keeps
-// HEAP_HASNULL clear and its t_hoff is unchanged.
+// default). rolvaliduntil is always NULL, so the row carries a null bitmap,
+// as PG's does.
 func bootstrapPostgresRoleWithPassword(dataDir, superuser, rolpassword string) ([]pgAuthidEntry, error) {
 	// pg_authid columns (postgres/src/include/catalog/pg_authid.h)
 	cols := []catalog.Column{
@@ -1910,29 +1910,32 @@ func bootstrapPostgresRoleWithPassword(dataDir, superuser, rolpassword string) (
 		{Name: "rolpassword", Type: catalog.Type{Name: "text"}, Ordinal: 10},
 		{Name: "rolvaliduntil", Type: catalog.Type{Name: "timestamptz"}, Ordinal: 11},
 	}
-	// Bootstrap superuser row (OID 10) and optional OS-user row (OID 16384).
-	// rolpassword/rolvaliduntil are written as empty-string/epoch for the
-	// bootstrap rows to keep HEAP_HASNULL clear (no null bitmap, t_hoff=24).
-	// The OID-10 superuser carries the --pwfile verifier (when supplied);
-	// it remains a non-NULL text value, so HEAP_HASNULL stays clear.
+	// Bootstrap superuser row (OID 10) and optional OS-user row (OID 16384),
+	// shaped like PG's: pg_authid.dat gives BOOTSTRAP_SUPERUSERID every
+	// privilege (rolcreatedb included) and leaves rolpassword and
+	// rolvaliduntil NULL, so the tuple carries a null bitmap. The OID-10
+	// superuser carries the --pwfile verifier when one is supplied (initdb's
+	// setup_auth ALTER USER ... PASSWORD); rolvaliduntil stays NULL. Writing
+	// an epoch rolvaliduntil here made psql's \du print "Password valid
+	// until 1970-01-01" for the superuser.
 	buildBootstrapRow := func(oid int64, rolname string) executor.Row {
-		pw := ""
-		if oid == 10 {
-			pw = rolpassword
+		pw := executor.NullDatum
+		if oid == 10 && rolpassword != "" {
+			pw = executor.NewStringDatum(rolpassword)
 		}
 		return executor.Row{
-			executor.NewIntDatum(oid),                    // oid
-			executor.NewStringDatum(rolname),             // rolname
-			executor.NewBoolDatum(true),                  // rolsuper
-			executor.NewBoolDatum(true),                  // rolinherit
-			executor.NewBoolDatum(true),                  // rolcreaterole
-			executor.NewBoolDatum(false),                 // rolcreatedb
-			executor.NewBoolDatum(true),                  // rolcanlogin
-			executor.NewBoolDatum(true),                  // rolreplication
-			executor.NewBoolDatum(true),                  // rolbypassrls
-			executor.NewIntDatum(-1),                     // rolconnlimit
-			executor.NewStringDatum(pw),                  // rolpassword (verifier or empty, not null)
-			executor.NewTimeDatum(time.Unix(0, 0).UTC()), // rolvaliduntil (epoch, not null)
+			executor.NewIntDatum(oid),        // oid
+			executor.NewStringDatum(rolname), // rolname
+			executor.NewBoolDatum(true),      // rolsuper
+			executor.NewBoolDatum(true),      // rolinherit
+			executor.NewBoolDatum(true),      // rolcreaterole
+			executor.NewBoolDatum(true),      // rolcreatedb
+			executor.NewBoolDatum(true),      // rolcanlogin
+			executor.NewBoolDatum(true),      // rolreplication
+			executor.NewBoolDatum(true),      // rolbypassrls
+			executor.NewIntDatum(-1),         // rolconnlimit
+			pw,                               // rolpassword (verifier or NULL)
+			executor.NullDatum,               // rolvaliduntil (NULL)
 		}
 	}
 	// Predefined-role rows: rolsuper=false, rolinherit=true, all other
@@ -1997,13 +2000,15 @@ func bootstrapPostgresRoleWithPassword(dataDir, superuser, rolpassword string) (
 	}
 	entries := make([]pgAuthidEntry, 0, len(seeds)+len(predefined))
 
-	// Bootstrap rows (no null bitmap, xmin=1).
+	// Bootstrap rows (null bitmap for the NULL rolpassword / rolvaliduntil,
+	// xmin=1).
 	for _, s := range seeds {
-		payload, err := executor.EncodeRowPG(cols, buildBootstrapRow(s.oid, s.rolname))
+		row := buildBootstrapRow(s.oid, s.rolname)
+		payload, err := executor.EncodeRowPG(cols, row)
 		if err != nil {
 			return nil, fmt.Errorf("encode %s role: %w", s.rolname, err)
 		}
-		tuple := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload)
+		tuple := storage.NewHeapTupleWithNulls(storage.TransactionID(1), storage.InvalidTransactionID, executor.NullBitmapPG(row), payload)
 		tuple.Header.SetNatts(len(cols))
 		slot, err := storage.PageAddHeapTuple(page, tuple)
 		if err != nil {

@@ -9595,66 +9595,30 @@ func (c *InMemory) registerSystemTables() {
 	pgRoles := &Table{
 		Schema: "pg_catalog",
 		Name:   "pg_roles",
+		// system_views.sql's pg_roles view: pg_authid's columns in this
+		// order, rolpassword masked as '********', rolconfig from
+		// pg_db_role_setting (setdatabase = 0), oid last. psql's \du and
+		// \dg select rolinherit / rolcreaterole / rolconnlimit /
+		// rolvaliduntil / rolbypassrls by name; pg_dump's collectRoleNames
+		// reads `oid, rolname` (pg_dump.c:10548). Rows are pg_authid's
+		// (VirtualRows set below, once pgAuthid exists).
 		Columns: []Column{
-			// oid first: pg_dump's collectRoleNames issues
-			// `SELECT oid, rolname FROM pg_catalog.pg_roles ORDER BY 1`
-			// to build its role-oid → name map (pg_dump.c:10548).
-			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
-			{Name: "rolname", Type: Type{Name: "text"}, Ordinal: 1},
-			{Name: "rolsuper", Type: Type{Name: "text"}, Ordinal: 2},
-			{Name: "rolcanlogin", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "rolname", Type: Type{Name: "name"}, Ordinal: 0},
+			{Name: "rolsuper", Type: Type{Name: "bool"}, Ordinal: 1},
+			{Name: "rolinherit", Type: Type{Name: "bool"}, Ordinal: 2},
+			{Name: "rolcreaterole", Type: Type{Name: "bool"}, Ordinal: 3},
+			{Name: "rolcreatedb", Type: Type{Name: "bool"}, Ordinal: 4},
+			{Name: "rolcanlogin", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "rolreplication", Type: Type{Name: "bool"}, Ordinal: 6},
+			{Name: "rolconnlimit", Type: Type{Name: "int4"}, Ordinal: 7},
+			{Name: "rolpassword", Type: Type{Name: "text"}, Ordinal: 8},
+			{Name: "rolvaliduntil", Type: Type{Name: "timestamptz"}, Ordinal: 9},
+			{Name: "rolbypassrls", Type: Type{Name: "bool"}, Ordinal: 10},
+			{Name: "rolconfig", Type: Type{Name: "text", IsArray: true}, Ordinal: 11},
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 12},
 		},
 		OID:     1259102, // synthetic — upstream's pg_roles is a view, no fixed low OID (1260 is pg_authid's, see below)
 		Virtual: true,
-	}
-	pgRoles.VirtualRows = func() [][]string {
-		// OID 10 = BOOTSTRAP_SUPERUSERID (postgres superuser),
-		// per postgres/src/include/catalog/pg_authid.dat.
-		out := [][]string{{"10", "postgres", "t", "t"}}
-		// User-created roles (CREATE ROLE / CREATE USER) follow, each with the
-		// OID minted at registration time, sorted by name for deterministic
-		// output. pg_dump's getPolicies resolves pg_policy.polroles OIDs back to
-		// names through this view, so named-role policies round-trip. DU-002
-		// slice 330.
-		c.mu.RLock()
-		names := make([]string, 0, len(c.roles))
-		for name := range c.roles {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			// Report the recorded attributes (root-0021); a role with no
-			// sidecar entry keeps the historical 'f'/'t' defaults so
-			// pre-existing pg_dump policy-role resolution is unchanged.
-			rolsuper, rolcanlogin := "f", "t"
-			if a := c.roleAttrs[name]; a != nil {
-				if a.Superuser {
-					rolsuper = "t"
-				}
-				if !a.CanLogin {
-					rolcanlogin = "f"
-				}
-			}
-			out = append(out, []string{fmt.Sprintf("%d", c.roles[name]), name, rolsuper, rolcanlogin})
-		}
-		c.mu.RUnlock()
-		// PG18's 16 built-in "pg_*" predefined roles (pg_authid.dat) — always
-		// rolsuper='f'/rolcanlogin='f', matching SyncPgAuthidFile's frozen
-		// predefined rows (internal/executor/pg_authid_sync.go). Needed so
-		// pg_dumpall's dumpRoleMembership query (which LEFT JOINs pg_roles to
-		// resolve a membership row's role/member name) doesn't silently drop a
-		// `GRANT pg_read_all_data TO alice`-style row when ur.rolname/
-		// um.rolname come back NULL for a predefined grantee (0119-0004ch
-		// ledger discovery (a)).
-		predefinedNames := make([]string, 0, len(predefinedRoleSeeds))
-		for _, s := range predefinedRoleSeeds {
-			predefinedNames = append(predefinedNames, s.name)
-		}
-		sort.Strings(predefinedNames)
-		for _, name := range predefinedNames {
-			out = append(out, []string{fmt.Sprintf("%d", c.predefinedRoles[name]), name, "f", "f"})
-		}
-		return out
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_roles"] = pgRoles
 
@@ -9740,7 +9704,14 @@ func (c *InMemory) registerSystemTables() {
 		}
 		c.mu.RLock()
 		defer c.mu.RUnlock()
-		out := [][]string{rowFor("10", "postgres", c.roleAttrs["postgres"])}
+		// BOOTSTRAP_SUPERUSERID's pg_authid.dat shape when no attributes
+		// were recorded for it (a catalog that never loaded the heap).
+		bootstrap := c.roleAttrs["postgres"]
+		if bootstrap == nil {
+			bootstrap = &RoleAttrs{Superuser: true, CanLogin: true, Inherit: true, CreateRole: true,
+				CreateDB: true, Replication: true, BypassRLS: true, ConnLimit: -1}
+		}
+		out := [][]string{rowFor("10", "postgres", bootstrap)}
 		names := make([]string, 0, len(c.roles))
 		for name := range c.roles {
 			names = append(names, name)
@@ -9768,6 +9739,22 @@ func (c *InMemory) registerSystemTables() {
 		return out
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_authid"] = pgAuthid
+	// pg_roles projects pg_authid's rows (oid, rolname, rolsuper, rolinherit,
+	// rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolbypassrls,
+	// rolconnlimit, rolpassword, rolvaliduntil) into the view's column order.
+	// rolconfig is NULL: per-role settings (ALTER ROLE ... SET) are not
+	// recorded in a pg_db_role_setting goopg exposes here.
+	pgRoles.VirtualRows = func() [][]string {
+		src := pgAuthid.VirtualRows()
+		out := make([][]string, 0, len(src))
+		for _, r := range src {
+			out = append(out, []string{
+				r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[9],
+				"********", r[11], r[8], VirtualNull, r[0],
+			})
+		}
+		return out
+	}
 
 	// pg_auth_members — role membership (`GRANT <role> TO <role>`), sourced
 	// from the roleMembers registry GRANT/REVOKE ROLE maintains

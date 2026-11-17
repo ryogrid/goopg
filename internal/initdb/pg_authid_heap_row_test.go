@@ -24,9 +24,10 @@ import (
 // Heap-tuple invariants pinned here (PG18 src/include/catalog/pg_authid.h
 // + src/include/access/htup_details.h):
 //
-//   - t_hoff = 24 (PG's MinHeapTupleSize when no null bitmap; pg_authid
-//     bootstrap rows have natts=12 with rolpassword/rolvaliduntil seeded
-//     to non-null defaults so HEAP_HASNULL stays clear).
+//   - t_hoff = 32 and HEAP_HASNULL set: pg_authid bootstrap rows have
+//     natts=12 with rolvaliduntil (and, without --pwfile, rolpassword)
+//     NULL, as PG's initdb leaves them, so the tuple carries a null bitmap
+//     (24-byte header + 2-byte bitmap rounded to MAXALIGN).
 //   - infomask2 low 11 bits = 12 (Natts_pg_authid).
 //   - rolname column lives at payload offset 4..67 (64-byte NameData
 //     immediately after the 4-byte oid column; NAME has typalign='c' so
@@ -104,13 +105,13 @@ func TestBootstrapPostgresRoleHeapRowRolnameByteLayout(t *testing.T) {
 		oid := le.Uint32(payload[0:4])
 
 		if want, isBootstrap := bootstrapRolname[oid]; isBootstrap {
-			// Bootstrap rows must NOT have HEAP_HASNULL — every column is
-			// seeded non-null so t_hoff stays at 24 (no null bitmap).
-			if tHoff != 24 {
-				t.Errorf("item %d (bootstrap oid=%d): t_hoff=%d, want 24", i, oid, tHoff)
+			// Bootstrap rows carry a null bitmap (rolvaliduntil NULL), so
+			// t_hoff = 32 like the predefined rows.
+			if tHoff != 32 {
+				t.Errorf("item %d (bootstrap oid=%d): t_hoff=%d, want 32", i, oid, tHoff)
 			}
-			if infomask&0x0001 != 0 {
-				t.Errorf("item %d (bootstrap oid=%d): HEAP_HASNULL set (infomask=0x%04x), want clear", i, oid, infomask)
+			if infomask&0x0001 == 0 {
+				t.Errorf("item %d (bootstrap oid=%d): HEAP_HASNULL not set (infomask=0x%04x)", i, oid, infomask)
 			}
 			// rolname NameData = payload[4..67].
 			got := string(payload[4 : 4+len(want)])

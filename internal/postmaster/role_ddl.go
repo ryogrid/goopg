@@ -424,6 +424,9 @@ func applyRoleAttrOptions(sql, norm, role string, attrs *catalog.RoleAttrs, reso
 		attrs.ConnLimit = n
 	}
 	if v, ok := extractRoleValidUntil(sql, norm); ok {
+		if v != "" {
+			v = executor.NormalizeValidUntilText(v)
+		}
 		attrs.ValidUntil = v
 	}
 	if pw, isNull, ok := extractRolePassword(sql, norm); ok {

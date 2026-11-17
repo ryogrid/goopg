@@ -170,23 +170,22 @@ func TestPgCatalogBootstrapViews(t *testing.T) {
 	// (pg_dump.c:10548), so pg_roles must expose oid as its first
 	// column carrying the postgres superuser's OID 10.
 	roles, _ := c.LookupTable(parser.ObjectName{Name: "pg_roles"})
-	if roles.Columns[0].Name != "oid" || roles.Columns[0].Type.Name != "oid" {
-		t.Errorf("pg_roles col0=%+v want {oid oid}", roles.Columns[0])
-	}
-	if roles.Columns[1].Name != "rolname" {
-		t.Errorf("pg_roles col1=%s want rolname", roles.Columns[1].Name)
+	// system_views.sql order: rolname first, oid last (column 12); pg_dump
+	// selects `oid, rolname` by name.
+	if roles.Columns[0].Name != "rolname" || roles.Columns[12].Name != "oid" || roles.Columns[12].Type.Name != "oid" {
+		t.Errorf("pg_roles col0=%+v col12=%+v want rolname / {oid oid}", roles.Columns[0], roles.Columns[12])
 	}
 	rrows := roles.VirtualRows()
 	// 1 bootstrap superuser + PG18's 16 built-in "pg_*" predefined roles
 	// (M0119-0004-ACLHEAP: pg_authid/pg_roles predefined-role rows).
-	if len(rrows) != 17 || rrows[0][0] != "10" || rrows[0][1] != "postgres" {
-		t.Errorf("pg_roles rows=%v want 17 (10,postgres,t,t first)", rrows)
+	if len(rrows) != 17 || rrows[0][12] != "10" || rrows[0][0] != "postgres" || rrows[0][1] != "t" {
+		t.Errorf("pg_roles rows=%v want 17 (postgres superuser oid 10 first)", rrows)
 	}
 	foundPredefined := false
 	for _, r := range rrows {
-		if r[1] == "pg_read_all_data" {
+		if r[0] == "pg_read_all_data" {
 			foundPredefined = true
-			if r[2] != "f" || r[3] != "f" {
+			if r[1] != "f" || r[5] != "f" {
 				t.Errorf("pg_roles pg_read_all_data row=%v want rolsuper=f rolcanlogin=f", r)
 			}
 		}
