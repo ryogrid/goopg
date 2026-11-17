@@ -384,3 +384,30 @@ HEAD-reproducible hang in `TestSeqScanFiresPrefetchesAcrossBlocks`,
 unrelated to this change — see ledger); `scripts/tpch-spotcheck.sh` PASS
 (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
 PASS (0 failed, all 3 workloads).
+
+## Follow-up: every built-in row (M0149-0001h1a18)
+
+The `pg_catalog.pg_proc` view used to serve a hand-picked subset of
+built-in rows: about 16 stubs, `catalog.BuiltinProcs()` and the 13 `lo_*`
+functions. That was 45 rows against PG 18.3's 3413. `now`, `textin` and
+nearly every other built-in were missing from catalog queries. That was
+the dominant source of divergence in opr\_sanity, type\_sanity and psql's
+`\df`.
+
+The view now serves every built-in row:
+
+- `scripts/gen-pg-proc-view-rows.py` captures each `pg_proc` row with
+  OID < 16384 from a throwaway PG 18.3 initdb (superuser `postgres`),
+  formatted as the view's text cells in column order;
+- the result is written to `internal/initdb/pg_proc_view_rows_generated.go`;
+- `rowsFor` serves those rows first and appends the user routines.
+
+The generated cells follow three conventions:
+
+- SQL NULL is written as `catalog.VirtualNull`;
+- `prosupport` and the other OID columns are numeric strings, which the
+  regproc-typed column renders by name;
+- the row slices are shared, read-only.
+
+A column-wise diff of the view against the oracle is empty. Regress
+opr\_sanity 717→369, type\_sanity 56→41, psql 739→608.

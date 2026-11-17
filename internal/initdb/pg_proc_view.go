@@ -11,7 +11,6 @@ package initdb
 import (
 	"fmt"
 	"strings"
-	"sync"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
@@ -181,43 +180,6 @@ func langNameToOIDStr(lang string) string {
 	}
 }
 
-// builtinProcRow holds the fixed values for a built-in pg_proc row.
-// proargtypes is a space-separated list of OID strings (oidvector format).
-// retType is the return type OID string.
-// namespace is the pronamespace OID string (11=pg_catalog).
-type builtinProcRow struct {
-	oid       uint32
-	name      string
-	namespace string
-	lang      string // "12" = internal
-	retType   string // OID string
-	argTypes  string // space-separated OID strings, empty for zero-arg
-	src       string
-}
-
-// builtinProcs is the subset of pg_proc built-in rows needed for parity.
-// Includes abs() variants (required for btree_index RowCompare tests) and
-// RI_FKey_* trigger functions (required for btree_index LIKE/ILIKE tests).
-var builtinProcs = []builtinProcRow{
-	// abs variants (sorted by proargtypes OID for determinism)
-	{oid: 1395, name: "abs", namespace: "11", lang: "12", retType: "20", argTypes: "20", src: "int8abs"},         // abs(int8)
-	{oid: 1396, name: "abs", namespace: "11", lang: "12", retType: "21", argTypes: "21", src: "int2abs"},         // abs(int2)
-	{oid: 1397, name: "abs", namespace: "11", lang: "12", retType: "23", argTypes: "23", src: "int4abs"},         // abs(int4)
-	{oid: 1398, name: "abs", namespace: "11", lang: "12", retType: "700", argTypes: "700", src: "float4abs"},     // abs(float4)
-	{oid: 1705, name: "abs", namespace: "11", lang: "12", retType: "701", argTypes: "701", src: "float8abs"},     // abs(float8)
-	{oid: 1704, name: "abs", namespace: "11", lang: "12", retType: "1700", argTypes: "1700", src: "numeric_abs"}, // abs(numeric)
-	// RI_FKey trigger functions (no args, return trigger)
-	{oid: 1654, name: "RI_FKey_cascade_del", namespace: "11", lang: "12", retType: "2279", argTypes: "", src: "RI_FKey_cascade_del"},
-	{oid: 1655, name: "RI_FKey_cascade_upd", namespace: "11", lang: "12", retType: "2279", argTypes: "", src: "RI_FKey_cascade_upd"},
-	{oid: 1656, name: "RI_FKey_noaction_del", namespace: "11", lang: "12", retType: "2279", argTypes: "", src: "RI_FKey_noaction_del"},
-	{oid: 1657, name: "RI_FKey_noaction_upd", namespace: "11", lang: "12", retType: "2279", argTypes: "", src: "RI_FKey_noaction_upd"},
-	{oid: 1658, name: "RI_FKey_restrict_del", namespace: "11", lang: "12", retType: "2279", argTypes: "", src: "RI_FKey_restrict_del"},
-	{oid: 1659, name: "RI_FKey_restrict_upd", namespace: "11", lang: "12", retType: "2279", argTypes: "", src: "RI_FKey_restrict_upd"},
-	{oid: 1660, name: "RI_FKey_setdefault_del", namespace: "11", lang: "12", retType: "2279", argTypes: "", src: "RI_FKey_setdefault_del"},
-	{oid: 1661, name: "RI_FKey_setdefault_upd", namespace: "11", lang: "12", retType: "2279", argTypes: "", src: "RI_FKey_setdefault_upd"},
-	{oid: 1662, name: "RI_FKey_setnull_del", namespace: "11", lang: "12", retType: "2279", argTypes: "", src: "RI_FKey_setnull_del"},
-	{oid: 1663, name: "RI_FKey_setnull_upd", namespace: "11", lang: "12", retType: "2279", argTypes: "", src: "RI_FKey_setnull_upd"},
-}
 
 // pgArgModesLiteral renders proargmodes (char[]) as a PG array literal when
 // the routine has at least one non-default mode entry (OUT/INOUT/VARIADIC);
@@ -393,42 +355,13 @@ func registerPgProcView(cat *catalog.InMemory) error {
 	// connection's database; the static VirtualRows is the default one's.
 	rowsFor := func(dbOid uint32) [][]string {
 		db := catalog.NamespaceDBOid(dbOid)
-		// Start with built-in stubs.
-		rows := make([][]string, 0, len(builtinProcs)+16)
-		for _, b := range builtinProcs {
-			rows = append(rows, []string{
-				fmt.Sprintf("%d", b.oid),
-				b.name,
-				b.namespace,
-				b.lang,
-				b.retType,
-				b.argTypes,
-				fmt.Sprintf("%d", len(strings.Fields(b.argTypes))), // pronargs
-				"",   // proacl: NULL (default privileges)
-				"10", // proowner: bootstrap superuser
-				b.src,
-				"v", // provolatile: volatile
-				"f", // prosecdef
-				"f", // proleakproof
-				"f", // proisstrict
-				"f", // prokind: function
-				"f", // proretset: built-in stubs (abs/RI_FKey) are not SRFs
-				"",  // probin: NULL (internal funcs have no on-disk binary path)
-				"",  // proconfig: NULL (no per-function GUC SET clauses)
-				"1", // procost: internal-language default (DEFAULT_FUNCTION_COST)
-				"0", // prorows: built-in stubs (abs/RI_FKey) are not SRFs
-				"",  // protrftypes: NULL (goopg supports no transforms)
-				"u", // proparallel: unsafe (PG CREATE FUNCTION default)
-				"-", // prosupport: regproc InvalidOid renders '-' (no support function)
-				"0", // provariadic: none of these stubs are variadic
-				"0", // pronargdefaults: none of these stubs have argument defaults
-				"",  // proallargtypes: NULL (no non-IN modes)
-				"",  // proargmodes: NULL (all-IN)
-				"",  // proargnames: NULL (unnamed)
-				"",  // proargdefaults: NULL (pronargdefaults=0)
-				"",  // prosqlbody: NULL (these stubs have prosrc, not an SQL body)
-			})
-		}
+		// Every built-in pg_proc row a PG 18.3 initdb holds
+		// (pg_proc_view_rows_generated.go, M0149-0001h1a18) — the view used to
+		// serve a hand-picked ~45-row subset, so `now`, `textin` and every
+		// other builtin were missing from catalog queries. The row slices are
+		// shared: consumers re-materialise cells and never write them.
+		rows := make([][]string, 0, len(pgProcInitdbViewRows)+16)
+		rows = append(rows, pgProcInitdbViewRows...)
 		// Append user-defined routines.
 		for _, r := range cat.Routines().List() {
 			if catalog.NamespaceDBOid(r.DBOid) != db {
@@ -571,54 +504,6 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"",                                          // prosqlbody: NULL (goopg stores no SQL-body node tree)
 			})
 		}
-		// Append the hand-curated built-in pg_proc table (catalog.BuiltinProcs),
-		// after user-defined routines so existing rows[len(builtinProcs):] slices
-		// in this package's tests still land on the same user-routine rows. This
-		// lets pg_dump's own catalog queries — e.g. getFuncs()'s pg_transform/
-		// pg_cast EXISTS-join, which findFuncByOid then resolves client-side into
-		// a namespace-qualified function signature — see functions like
-		// int4recv/prsd_lextype that a CREATE CAST/CONVERSION/TRANSFORM WITH
-		// FUNCTION clause references. Field defaults (provolatile aside, which the
-		// table carries explicitly) follow pg_proc.h's BKI_DEFAULT: proisstrict=t,
-		// prokind=f, proretset=f, proparallel=s, procost=1, prorows=0.
-		for _, b := range catalog.BuiltinProcs() {
-			argOIDs := make([]string, len(b.ArgTypes))
-			for i, t := range b.ArgTypes {
-				argOIDs[i] = typeNameToOIDStr(t)
-			}
-			rows = append(rows, []string{
-				fmt.Sprintf("%d", b.OID),
-				b.Name,
-				fmt.Sprintf("%d", b.Namespace),
-				"12", // prolang: internal
-				typeNameToOIDStr(b.RetType),
-				strings.Join(argOIDs, " "),
-				fmt.Sprintf("%d", len(b.ArgTypes)), // pronargs
-				"",                                 // proacl: NULL (default privileges)
-				"10",                               // proowner: bootstrap superuser
-				b.Name,
-				b.Volatile,
-				"f", // prosecdef
-				"f", // proleakproof
-				"t", // proisstrict: BKI_DEFAULT(t)
-				"f", // prokind: function
-				"f", // proretset
-				"",  // probin: NULL (internal funcs have no on-disk binary path)
-				"",  // proconfig: NULL (no per-function GUC SET clauses)
-				"1", // procost: internal-language default
-				"0", // prorows
-				"",  // protrftypes: NULL
-				"s", // proparallel: BKI_DEFAULT(s)
-				"-", // prosupport: regproc InvalidOid renders '-' (no support function)
-				"0", // provariadic: none of catalog.BuiltinProcs() are variadic
-				"0", // pronargdefaults: none of these have argument defaults
-				"",  // proallargtypes: NULL (no non-IN modes)
-				"",  // proargmodes: NULL (all-IN)
-				"",  // proargnames: NULL (unnamed)
-				"",  // proargdefaults: NULL (pronargdefaults=0)
-				"",  // prosqlbody: NULL (these entries have prosrc, not an SQL body)
-			})
-		}
 		// Append user-defined aggregates (CREATE AGGREGATE) as prokind='a' pg_proc
 		// rows, so pg_dump's getAggregates() (`pg_proc p WHERE p.prokind = 'a'`)
 		// discovers them. The matching pg_aggregate row is a live heap write
@@ -669,33 +554,6 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"",  // prosqlbody: NULL (prokind='a' rows never carry an SQL body)
 			})
 		}
-		// The large-object functions libpq's lo_initialize looks up by name
-		// in pg_catalog (fe-lobj.c) before calling them through the fast-path
-		// protocol; rendered from their pg_proc.dat entries, flags included.
-		// Appended last so the positional layout above is unchanged.
-		for _, e := range libpqLargeObjectProcEntries() {
-			args := make([]string, len(e.ArgTypes))
-			for i, a := range e.ArgTypes {
-				args[i] = fmt.Sprintf("%d", a)
-			}
-			vol, par, strict := "v", "s", "t"
-			if e.Volatile != 0 {
-				vol = string(e.Volatile)
-			}
-			if e.Parallel != 0 {
-				par = string(e.Parallel)
-			}
-			if e.NotStrict {
-				strict = "f"
-			}
-			rows = append(rows, []string{
-				fmt.Sprintf("%d", e.OID), e.Name, "11", "12",
-				fmt.Sprintf("%d", e.RetType), strings.Join(args, " "),
-				fmt.Sprintf("%d", len(args)),
-				"", "10", e.HandlerName, vol, "f", "f", strict, "f", "f",
-				"", "", "1", "0", "", par, "-", "0", "0", "", "", "", "", "",
-			})
-		}
 		return rows
 	}
 	tbl.VirtualRows = func() [][]string { return rowsFor(catalog.DefaultDBOid) }
@@ -703,33 +561,3 @@ func registerPgProcView(cat *catalog.InMemory) error {
 	return cat.RegisterVirtualTable(tbl)
 }
 
-// libpqLargeObjectProcOIDs are the functions fe-lobj.c's lo_initialize
-// resolves: lo_open, lo_close, lo_creat, lo_create, lo_unlink, lo_lseek,
-// lo_lseek64, lo_tell, lo_tell64, lo_truncate, lo_truncate64, loread,
-// lowrite.
-var libpqLargeObjectProcOIDs = []uint32{952, 953, 957, 715, 964, 956, 3170, 958, 3171, 1004, 3172, 954, 955}
-
-var (
-	libpqLOProcsOnce sync.Once
-	libpqLOProcs     []pgProcEntry
-)
-
-// libpqLargeObjectProcEntries returns those entries (computed once).
-func libpqLargeObjectProcEntries() []pgProcEntry {
-	libpqLOProcsOnce.Do(func() { libpqLOProcs = buildLibpqLargeObjectProcEntries() })
-	return libpqLOProcs
-}
-
-func buildLibpqLargeObjectProcEntries() []pgProcEntry {
-	want := make(map[uint32]bool, len(libpqLargeObjectProcOIDs))
-	for _, o := range libpqLargeObjectProcOIDs {
-		want[o] = true
-	}
-	var out []pgProcEntry
-	for _, e := range pgProcAllEntries() {
-		if want[e.OID] {
-			out = append(out, e)
-		}
-	}
-	return out
-}

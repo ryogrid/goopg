@@ -12155,7 +12155,7 @@ verify each at HEAD when the task starts.
   - Regress A/B vs HEAD over 13 cases: no movement \(those cases fail
     earlier; alter\_generic +1 is its known owner-order flake\).
   Movement: none \(correctness: `0::regproc::oid` errored\)
-- [ ] **M0149-0001h1a18 — serve the full pg\_proc \(3413 builtin rows\) instead of the 45-row curated list** \(filed 2026-11-17 by M0149-0001h1a17\)
+- [x] **M0149-0001h1a18 — serve the full pg\_proc \(3413 builtin rows\) instead of the 45-row curated list** \(filed 2026-11-17 by M0149-0001h1a17, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a
   - Finding: `select count\(\*\) from pg_proc` is 45 on goopg vs 3413 on
@@ -12168,6 +12168,22 @@ verify each at HEAD when the task starts.
     column values \(capture a column diff vs a scratch PG initdb, as
     M0149-0001h1a15 did for pg\_type\); then A/B opr\_sanity, type\_sanity,
     oidjoins, psql, pg\_dump testport.
+  - Landed:
+    - scripts/gen-pg-proc-view-rows.py →
+      internal/initdb/pg\_proc\_view\_rows\_generated.go \(3413 rows in the
+      view's column order; NULL as catalog.VirtualNull\); rowsFor serves
+      them, then user routines; the curated builtinProcs stubs, the
+      catalog.BuiltinProcs\(\) block and the lo\_\* block are gone;
+    - a column-wise diff of the view vs the :5545 oracle is empty.
+  - Tests: the pg\_proc view tests now compare built-in rows with the
+    generated table and keep the user-routine expectations.
+  - Design: docs/design/0000-0049/0015-0002-pg-proc-catalog-and-routine-registry.md
+    \(follow-up\).
+  - Regress A/B vs HEAD over 23 cases: opr\_sanity 705→360 \(inventory
+    717→369\), type\_sanity 56→41, psql 739→608, plpgsql 1221→1208 \(flaky
+    case, inventory not updated\); polymorphism equal when run alone on
+    fresh servers \(683 both\); the rest unchanged.
+  Movement: regress opr_sanity 717→369, type_sanity 56→41, psql 739→608
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a
