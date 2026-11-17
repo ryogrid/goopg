@@ -6452,6 +6452,17 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			return Datum{}, err
 		}
 		return moneyDatum(c), nil
+	case "aclitem":
+		// aclitemin: validate and canonicalise (M0149-0001h1a9).
+		if d.Kind != KindString {
+			return d, nil
+		}
+		out, err := aclitemIn(d.StringValue(), ctx)
+		if err != nil {
+			err.Pos = pos
+			return Datum{}, err
+		}
+		return NewStringDatum(out), nil
 	case "pg_lsn":
 		switch d.Kind {
 		case KindString:
@@ -13576,6 +13587,9 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				return NewBoolDatum(msg == ""), nil
 			case "uuid":
 				return NewBoolDatum(isValidUUIDStr(v)), nil
+			case "aclitem":
+				_, aerr := aclitemIn(v, ctx) // aclitemin (M0149-0001h1a9)
+				return NewBoolDatum(aerr == nil), nil
 			case "tid":
 				_, _, ok := parseTidInput(v)
 				return NewBoolDatum(ok), nil
@@ -18510,6 +18524,16 @@ case "pg_char_to_encoding":
 	// against the stored *acl column. M0110-0001 / DU-002 slice 2.
 	case "acldefault":
 		return evalAclDefault(x, slot, ctx)
+	case "makeaclitem":
+		args := make([]Datum, 0, len(x.Args))
+		for _, a := range x.Args {
+			v, err := evalExprSlot(a, slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			args = append(args, v)
+		}
+		return evalMakeAclItem(args, ctx, x.Pos())
 	// pg_get_userbyid(oid) → name: resolves a role OID to its name, or PG's
 	// literal fallback "unknown (OID=n)" when no such role exists
 	// (pg_get_userbyid, ruleutils.c). pg_dumpall's dumpRoleGUCPrivs calls it

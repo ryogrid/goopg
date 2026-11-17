@@ -12038,6 +12038,31 @@ verify each at HEAD when the task starts.
     \(printtup.c SendRowDescriptionMessage\).
   - > **ESCALATION \(S2, wrong results for binary\-format clients\):** filed
     here; owner to place.
+- [x] **M0149-0001h1a9 — makeaclitem\(\) did not exist and aclitem input did no validation: `'""=r*/""'::aclitem`, an unknown role and a bad mode letter were all accepted** \(filed and fixed 2026-11-17 by M0149-0001h1a\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: acl.c aclitemin / aclparse / getid / is\_safe\_acl\_char; makeaclitem
+    and convert\_any\_priv\_string.
+  - Landed: executor aclitem\_input.go:
+    - aclitemIn validates and canonicalises, and is wired into the
+      `::aclitem` cast, pg\_input\_is\_valid and pg\_input\_error\_info.
+      Its errors are 22P02 for a missing "/" name, a bad mode character,
+      garbage after the item or a bad key word, and 42704 for an unknown
+      role. It emits the "defaulting grantor to user ID 10" WARNING.
+    - evalMakeAclItem, with its privilege list \(22023 on an unknown
+      privilege\) and grant option.
+  - Found:
+    - `CREATE ROLE "regress_""quoted"` registers no findable role \(it is
+      missing from pg\_roles, and DROP ROLE fails\);
+    - `'name'::regrole` passes the text through without resolving it;
+    - the caret of a cast input error points at `::`, not at the literal.
+
+    All three are ledgered.
+  - Regress A/B vs HEAD: privileges 604→584 \(inventory updated\). One
+    line HEAD matched by echoing text \(the quoted\-role aclitem\) now
+    hits the quoted\-role gap. database / hash\_func / psql /
+    type\_sanity / opr\_sanity / largeobject unchanged.
+  Movement: regress privileges 604→584
 - [x] **M0149-0001h1a8 — SCHEMAS default ACLs never applied at CREATE SCHEMA; a schema and the next object minted shared one OID** \(filed and fixed 2026-11-17 by M0149-0001h1a\)
   Kind: impl
   Parent: M0149-0001h1a

@@ -326,6 +326,24 @@ that writes relacl.
   GRANT USAGE ON SCHEMA materialised the table's relacl. Both sites now use
   allocOIDLocked.
 
+## Slice 11: aclitem input and makeaclitem \(M0149\-0001h1a9\)
+
+goopg keeps an aclitem Datum as aclitemout's text. The cast accepted any
+text unchanged, and makeaclitem did not exist. executor/aclitem\_input.go
+ports aclitemin:
+- getid reads a possibly quoted name, with is\_safe\_acl\_char deciding which
+  bare characters a name may hold;
+- an optional `group` / `user` key word is accepted;
+- the mode letters come from ACL\_ALL\_RIGHTS\_STR, with `*` marking a grant
+  option;
+- the grantee and grantor are resolved to roles;
+- a missing grantor defaults to the bootstrap superuser with a WARNING;
+- trailing garbage is rejected.
+
+The result is re\-rendered canonically. The same routine serves the cast,
+pg\_input\_is\_valid and pg\_input\_error\_info. makeaclitem ports
+convert\_any\_priv\_string over its any\_priv\_map.
+
 ## Open
 
 - A read\-only descriptor reads with the statement's snapshot, not the

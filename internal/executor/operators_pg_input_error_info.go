@@ -60,6 +60,10 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 	var message, sqlCode string
 
 	switch t {
+	case "aclitem":
+		if _, e := aclitemIn(v, o.ctx); e != nil {
+			message, sqlCode = e.Message, e.Code
+		}
 	case "time":
 		// Validate time strings using the same parser as column INSERT. M0097-0004.
 		_, e := parseTimeString(v)
