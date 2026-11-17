@@ -139,3 +139,17 @@ func LookupBuiltinFunctionSignature(oid uint32) (BuiltinFunctionSignature, bool)
 	s, ok := builtinFunctionSignatures[oid]
 	return s, ok
 }
+
+// LookupBuiltinFunctionDef is pg_get_functiondef's PG 18.3 text for a
+// built-in non-aggregate function. M0149-0001h1a24.
+func LookupBuiltinFunctionDef(oid uint32) (string, bool) {
+	d, ok := builtinFunctionDefs[oid]
+	return d, ok
+}
+
+// IsBuiltinInternalFunctionSymbol reports whether name is the prosrc of a
+// LANGUAGE internal built-in — the set fmgr_internal_function searches
+// (utils/fmgr/fmgr.c), e.g. "dsin" for sin(float8). M0149-0001h1a24.
+func IsBuiltinInternalFunctionSymbol(name string) bool {
+	return builtinInternalFunctionSymbols[name]
+}

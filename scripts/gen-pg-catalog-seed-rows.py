@@ -77,6 +77,21 @@ try:
                           "-d", "postgres", "-At", "-c", q], env=env, check=True, capture_output=True,
                          text=True).stdout
     func_sigs = json.loads(out)
+    # pg_get_functiondef for every non-aggregate built-in (psql \sf), and the
+    # internal-function symbol set fmgr_internal_function resolves against
+    # (h1a24).
+    q = ("select coalesce(json_agg(json_build_array(oid::int8, pg_get_functiondef(oid)) order by oid), '[]') "
+         "from pg_proc where oid < 16384 and prokind <> 'a'")
+    out = subprocess.run([os.path.join(bindir, "psql"), "-X", "-h", "127.0.0.1", "-p", port, "-U", "postgres",
+                          "-d", "postgres", "-At", "-c", q], env=env, check=True, capture_output=True,
+                         text=True).stdout
+    func_defs = json.loads(out)
+    q = ("select coalesce(json_agg(distinct prosrc order by prosrc), '[]') from pg_proc "
+         "where oid < 16384 and prolang = 12")
+    out = subprocess.run([os.path.join(bindir, "psql"), "-X", "-h", "127.0.0.1", "-p", port, "-U", "postgres",
+                          "-d", "postgres", "-At", "-c", q], env=env, check=True, capture_output=True,
+                         text=True).stdout
+    internal_syms = json.loads(out)
 finally:
     subprocess.run([os.path.join(bindir, "pg_ctl"), "-D", data, "-m", "immediate", "stop"], env=env,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -104,5 +119,16 @@ for oid, res, args, ident in func_sigs:
     lines.append("\t%d: {Result: %s, HasResult: %s, Arguments: %s, Identity: %s},\n" % (
         oid, json.dumps(res or "", ensure_ascii=False), "false" if res is None else "true",
         json.dumps(args or "", ensure_ascii=False), json.dumps(ident or "", ensure_ascii=False)))
+lines.append("}\n")
+lines.append("\n// builtinFunctionDefs is pg_get_functiondef for the %d non-aggregate built-ins.\n" % len(func_defs))
+lines.append("var builtinFunctionDefs = map[uint32]string{\n")
+for oid, d in func_defs:
+    lines.append("\t%d: %s,\n" % (oid, json.dumps(d, ensure_ascii=False)))
+lines.append("}\n")
+lines.append("\n// builtinInternalFunctionSymbols are the %d prosrc names of LANGUAGE internal\n" % len(internal_syms))
+lines.append("// built-ins: what fmgr_internal_function resolves an AS clause against.\n")
+lines.append("var builtinInternalFunctionSymbols = map[string]bool{\n")
+for n in internal_syms:
+    lines.append("\t%s: true,\n" % json.dumps(n))
 lines.append("}\n")
 print("".join(lines), end="")

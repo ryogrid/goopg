@@ -15238,6 +15238,13 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				}
 			}
 			if r == nil {
+				// A built-in function: PG 18.3's own definition text
+				// (M0149-0001h1a24).
+				if oidArg.Kind == KindInt {
+					if d, ok := catalog.LookupBuiltinFunctionDef(uint32(oidArg.Int)); ok {
+						return NewStringDatum(d), nil
+					}
+				}
 				return NullDatum, nil
 			}
 			return NewStringDatum(buildFunctionDef(r)), nil

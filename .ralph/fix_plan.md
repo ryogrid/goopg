@@ -12285,6 +12285,36 @@ verify each at HEAD when the task starts.
     updated\); polymorphism ±1 is its known OUT-parameter variance; the
     other 12 unchanged.
   Movement: regress psql 493→399
+- [x] **M0149-0001h1a24 — pg\_get\_functiondef for built-in functions \(psql \\sf\); LANGUAGE internal validates the C symbol \(prosrc\), not the proname** \(filed 2026-11-18 by ranking psql's remaining hunks, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: ruleutils.c pg\_get\_functiondef; fmgr.c fmgr\_internal\_function
+    looks the AS clause up among the built-in C symbols.
+  - Landed: the seed generator captures pg\_get\_functiondef for every
+    non-aggregate built-in and the LANGUAGE internal prosrc set; the
+    executor arm falls back to the former, execCreateFunction validates
+    against the latter \(`AS 'dsin'` was rejected\). pg\_get\_functiondef
+    column-diff vs :5545 is empty.
+  - Finding \(filed as M0149-0001h1a25, S2\): ROLLBACK does not undo
+    CREATE FUNCTION.
+  - Tests: TestInternalFunctionSymbolsAndBuiltinDefs.
+  - Regress A/B vs HEAD over 11 cases: psql 399→361, misc\_functions
+    244→236 \(inventory 279→236\); opr\_sanity +3 in the shared-database
+    run only \(psql's rolled-back functions now leak into it — h1a25\);
+    the rest unchanged.
+  Movement: regress psql 399→361, misc_functions 279→236
+- [ ] **M0149-0001h1a25 — ROLLBACK does not undo CREATE FUNCTION: the routine stays in pg\_proc and callable** \(filed 2026-11-18 by M0149-0001h1a24; S2 — a rolled-back DDL persists\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - **ESCALATION 2026-11-18 \(S2\).** `BEGIN; CREATE FUNCTION f\(\) ...;
+    ROLLBACK;` leaves f in pg\_proc on HEAD and on this build \(probed on
+    :5533 / :5534\). In PG the pg\_proc insert is transactional. Effect:
+    catalog state diverges from what committed; regress cases leak
+    routines into later cases \(psql.sql's psql\_df\_\* reached
+    opr\_sanity\). Awaiting owner placement.
+  - Resume: the routine registry \(catalog.Routines Create\) needs the
+    RecordCatalogUndo treatment pg\_default\_acl got in M0149-0001h1a6 —
+    undo the registration and the pg\_proc heap row on abort.
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

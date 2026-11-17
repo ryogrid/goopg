@@ -84,3 +84,15 @@ They are stored in `builtinFunctionSignatures`. The three executor arms use
 them after the user-routine lookup misses, so psql's `\df` shows a
 built-in's result and argument types. A column-wise diff against the oracle
 is empty for all 3413 built-ins.
+
+## Function definitions and internal symbols (h1a24)
+
+- **Function definitions.** `builtinFunctionDefs` holds
+  `pg_get_functiondef` for every non-aggregate built-in. The executor uses it
+  when the OID is not a user routine, which backs psql's `\sf`. A
+  column-wise diff against the oracle is empty.
+- **Internal symbols.** `builtinInternalFunctionSymbols` is the prosrc of
+  every LANGUAGE internal built-in. `CREATE FUNCTION ... LANGUAGE internal
+  AS '<sym>'` validates against it, as `fmgr_internal_function` does, so
+  `dsin` (for sin) is accepted and the SQL name `sin` is rejected. Earlier it
+  validated the proname instead.

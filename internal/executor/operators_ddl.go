@@ -18185,7 +18185,10 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		if s.Body == "" {
 			return &ExecError{Code: "42601", Pos: s.Pos(), Message: "internal function requires an AS clause naming the C function"}
 		}
-		if _, ok := catalog.LookupBuiltinProcByProname(s.Body); !ok {
+		// fmgr_internal_function searches the built-in C symbols — the
+		// prosrc of every LANGUAGE internal row ("dsin" for sin), not the
+		// SQL-level proname. M0149-0001h1a24.
+		if !catalog.IsBuiltinInternalFunctionSymbol(s.Body) {
 			return &ExecError{Code: "42883", Pos: s.Pos(), Message: fmt.Sprintf("there is no built-in function named %q", s.Body)}
 		}
 	}

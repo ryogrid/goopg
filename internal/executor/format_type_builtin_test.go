@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -50,5 +51,20 @@ func TestBuiltinFunctionSignatureTexts(t *testing.T) {
 	}
 	if sig, ok := catalog.LookupBuiltinFunctionSignature(1299); !ok || sig.Result != "timestamp with time zone" || sig.Arguments != "" {
 		t.Errorf("now() signature = %+v, %v", sig, ok)
+	}
+}
+
+// TestInternalFunctionSymbolsAndBuiltinDefs pins two M0149-0001h1a24
+// behaviours: CREATE FUNCTION ... LANGUAGE internal AS '<sym>' validates the
+// C symbol (prosrc), so 'dsin' is accepted and the SQL name 'sin' is not;
+// pg_get_functiondef renders a built-in's definition as PG does.
+func TestInternalFunctionSymbolsAndBuiltinDefs(t *testing.T) {
+	if !catalog.IsBuiltinInternalFunctionSymbol("dsin") || catalog.IsBuiltinInternalFunctionSymbol("sin") {
+		t.Errorf("internal symbol set: dsin=%v sin=%v, want true/false",
+			catalog.IsBuiltinInternalFunctionSymbol("dsin"), catalog.IsBuiltinInternalFunctionSymbol("sin"))
+	}
+	d, ok := catalog.LookupBuiltinFunctionDef(1299) // now()
+	if !ok || !strings.Contains(d, "CREATE OR REPLACE FUNCTION pg_catalog.now()") {
+		t.Errorf("pg_get_functiondef(now) = %q, %v", d, ok)
 	}
 }
