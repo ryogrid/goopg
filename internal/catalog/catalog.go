@@ -11610,18 +11610,21 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "oprresult", Type: Type{Name: "oid"}, Ordinal: 9},
 			{Name: "oprcom", Type: Type{Name: "oid"}, Ordinal: 10},
 			{Name: "oprnegate", Type: Type{Name: "oid"}, Ordinal: 11},
-			{Name: "oprcode", Type: Type{Name: "oid"}, Ordinal: 12},
-			{Name: "oprrest", Type: Type{Name: "oid"}, Ordinal: 13},
-			{Name: "oprjoin", Type: Type{Name: "oid"}, Ordinal: 14},
+			{Name: "oprcode", Type: Type{Name: "regproc"}, Ordinal: 12},
+			{Name: "oprrest", Type: Type{Name: "regproc"}, Ordinal: 13},
+			{Name: "oprjoin", Type: Type{Name: "regproc"}, Ordinal: 14},
 		},
 		OID: 2617,
 	}
 	pgOperator.VirtualRows = func() [][]string {
 		ops := c.ListUserOperators()
-		if len(ops) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(ops))
+		// Every pg_operator.dat row first (M0149-0001h1a19): the view used to
+		// hold only CREATE OPERATOR rows, so opr_sanity's catalog checks saw
+		// an empty pg_operator. oprcode / oprrest / oprjoin are regproc, as
+		// in PG, and render by name.
+		seed := seedOperatorViewRows()
+		out := make([][]string, 0, len(seed)+len(ops))
+		out = append(out, seed...)
 		for _, op := range ops {
 			// A shell operator (FuncOID==0) forward-declared purely to mint an
 			// OID for another operator's COMMUTATOR/NEGATOR clause is not yet

@@ -240,7 +240,14 @@ func pgOperatorVirtualRows(t *testing.T, im *catalog.InMemory) [][]string {
 	if !ok || tbl.VirtualRows == nil {
 		t.Fatal("pg_catalog.pg_operator virtual table/VirtualRows not found")
 	}
-	return tbl.VirtualRows()
+	// The view leads with every pg_operator.dat row (M0149-0001h1a19);
+	// these tests inspect the CREATE OPERATOR rows that follow.
+	rows := tbl.VirtualRows()
+	seed := len(catalog.PGOperatorAllEntries())
+	if len(rows) < seed {
+		t.Fatalf("pg_operator has %d rows, fewer than the %d seeded", len(rows), seed)
+	}
+	return rows[seed:]
 }
 
 // TestAlterOperatorSetRestrictJoin verifies RESTRICT/JOIN can be changed

@@ -66,3 +66,17 @@ func TestRegoperInputOutput(t *testing.T) {
 		t.Fatalf("InvalidOid must render as 0")
 	}
 }
+
+// TestRegprocOutQualifiesOverloadedBuiltin pins regprocout's rule
+// (M0149-0001h1a19): a builtin whose name regprocin cannot resolve uniquely
+// renders schema-qualified (pg_operator.oprcode for jsonb - text shows
+// pg_catalog.jsonb_delete); a unique name stays bare.
+func TestRegprocOutQualifiesOverloadedBuiltin(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if got := RegOut("regproc", 3302, cat, false); got != "pg_catalog.jsonb_delete" {
+		t.Errorf("regprocout(3302) = %q, want pg_catalog.jsonb_delete", got)
+	}
+	if got := RegOut("regproc", 177, cat, false); got != "int4pl" {
+		t.Errorf("regprocout(177) = %q, want int4pl", got)
+	}
+}

@@ -1,6 +1,9 @@
 package catalog
 
-import "sync"
+import (
+	"strconv"
+	"sync"
+)
 
 // Name- and OID-keyed indexes over the full pg_operator.dat seed
 // (PGOperatorAllEntries), for the regoper / regoperator input and output
@@ -56,4 +59,29 @@ func (c *InMemory) UserOperatorsByName(name string) []*UserOperator {
 		}
 	}
 	return out
+}
+
+var (
+	seedOperatorViewOnce sync.Once
+	seedOperatorView     [][]string
+)
+
+// seedOperatorViewRows renders PGOperatorAllEntries as the virtual
+// pg_operator view's text cells (oid, oprname, oprnamespace, oprowner,
+// oprkind, oprcanmerge, oprcanhash, oprleft, oprright, oprresult, oprcom,
+// oprnegate, oprcode, oprrest, oprjoin). Built once; the rows are shared
+// and read-only. M0149-0001h1a19.
+func seedOperatorViewRows() [][]string {
+	seedOperatorViewOnce.Do(func() {
+		u := func(v uint32) string { return strconv.FormatUint(uint64(v), 10) }
+		for _, e := range PGOperatorAllEntries() {
+			seedOperatorView = append(seedOperatorView, []string{
+				u(e.OID), e.Name, u(e.Namespace), u(e.Owner), string(e.Kind),
+				boolToPGChar(e.CanMerge), boolToPGChar(e.CanHash),
+				u(e.LeftType), u(e.RightType), u(e.ResultType),
+				u(e.Commutator), u(e.Negator), u(e.Code), u(e.Restrict), u(e.Join),
+			})
+		}
+	})
+	return seedOperatorView
 }

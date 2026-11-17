@@ -12184,6 +12184,35 @@ verify each at HEAD when the task starts.
     case, inventory not updated\); polymorphism equal when run alone on
     fresh servers \(683 both\); the rest unchanged.
   Movement: regress opr_sanity 717→369, type_sanity 56→41, psql 739→608
+- [x] **M0149-0001h1a19 — the virtual pg\_operator serves all 799 pg\_operator.dat rows; regprocout qualifies an overloaded built-in name** \(filed 2026-11-17 by M0149-0001h1a18's catalog census, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: pg\_operator holds every built-in operator; oprcode / oprrest /
+    oprjoin are regproc; regprocout schema-qualifies a name regprocin would
+    not resolve uniquely.
+  - Landed: seedOperatorViewRows \(PGOperatorAllEntries\) leads the view;
+    the three function columns are regproc-typed; RegOut's regproc arm
+    qualifies an overloaded built-in. A column-wise diff of pg\_operator and
+    of pg\_type's regproc columns vs the :5545 oracle is empty.
+  - Tests: TestPgOperatorViewServesSeed,
+    TestRegprocOutQualifiesOverloadedBuiltin; pgOperatorVirtualRows \(test
+    helper\) skips the seed rows.
+  - Design: docs/design/0100-0149/m0149-0001h1a19-builtin-catalog-views.md
+    \(new; lists the catalogs still empty\).
+  - Regress A/B vs HEAD over 18 cases: opr\_sanity 360→306 \(inventory
+    369→315\), psql 608→601, alter\_operator 55→47; the other 15 unchanged.
+  Movement: regress opr_sanity 369→315, psql 608→601, alter_operator 55→47
+- [ ] **M0149-0001h1a20 — serve the built-in rows of pg\_amop / pg\_amproc / pg\_opclass / pg\_opfamily / pg\_cast \(all empty on goopg\)** \(filed 2026-11-17 by M0149-0001h1a19\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Finding: goopg 0 rows each vs PG 945 / 714 / 177 / 146 / 235; the
+    remaining opr\_sanity lines are mostly these cross-checks. Full list in
+    the h1a19 design doc.
+  - Resume: internal/catalog/catalog.go pg\_amop / pg\_amproc / pg\_opclass
+    / pg\_opfamily / pg\_cast VirtualRows — lead with initdb-captured rows
+    \(the gen-pg-proc-view-rows.py pattern, or the initdb seed tables
+    pg\_amop\_oids\_generated.go et al.\); column-diff vs :5545; A/B
+    opr\_sanity, alter\_generic, create\_operator, pg\_dump testport.
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

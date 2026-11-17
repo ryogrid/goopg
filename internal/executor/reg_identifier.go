@@ -685,9 +685,12 @@ func regOutShared(typeName string, oid uint32, cat catalog.Catalog, qualify func
 		}
 	case "regproc":
 		if name, ok := catalog.RegprocName(oid); ok {
-			// A builtin proc lives in pg_catalog, which the search path always
-			// searches implicitly, so it is never schema-qualified — only the
-			// name is quote_identifier'd, as regprocout does for every name.
+			// regprocout qualifies unless regprocin would find exactly this
+			// function: an overloaded builtin name (jsonb_delete) renders as
+			// pg_catalog.jsonb_delete, a unique one bare. M0149-0001h1a19.
+			if len(catalog.BuiltinProcSignatures(name)) > 1 {
+				return "pg_catalog." + pgQuoteIdent(name)
+			}
 			return pgQuoteIdent(name)
 		}
 		if cat != nil {
