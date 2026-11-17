@@ -12038,6 +12038,19 @@ verify each at HEAD when the task starts.
     \(printtup.c SendRowDescriptionMessage\).
   - > **ESCALATION \(S2, wrong results for binary\-format clients\):** filed
     here; owner to place.
+- [x] **M0149-0001h1a10 — CREATE / DROP ROLE with a doubled\-quote identifier: `"regress_""quoted"` registered the role `regress_`** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: scan.l quoted identifiers, where `""` inside a quoted name is one
+    literal quote.
+  - goopg: postmaster role\_ddl.go extractFirstSQLIdent cut the name at the
+    first `"`. It now unescapes doubled quotes. This covers every compat
+    role statement that uses it \(CREATE / DROP / ALTER ROLE, USER and
+    GROUP\).
+  - Test: TestExtractFirstSQLIdentQuoted.
+  - Regress A/B vs HEAD: privileges 584→576 \(inventory updated\);
+    create\_role / roleattributes / password / dependency / psql unchanged.
+  Movement: regress privileges 584→576
 - [x] **M0149-0001h1a9 — makeaclitem\(\) did not exist and aclitem input did no validation: `'""=r*/""'::aclitem`, an unknown role and a bad mode letter were all accepted** \(filed and fixed 2026-11-17 by M0149-0001h1a\)
   Kind: impl
   Parent: M0149-0001h1a
