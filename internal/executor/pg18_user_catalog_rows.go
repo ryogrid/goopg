@@ -581,7 +581,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table, dbOid ...uint3
 		NewIntDatum(int64(namespaceOIDForSchema(cat, tbl.Schema, dbOid...))), // relnamespace
 		NewIntDatum(0),                                  // reltype (no composite type seeded yet)
 		NewIntDatum(int64(tbl.OfTypeOID)),               // reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
-		NewIntDatum(bootstrapSuperuserOID),              // relowner
+		NewIntDatum(tableOwnerOID(cat, tbl)),            // relowner (M0149-0001h1a26)
 		NewIntDatum(relamFor(relkind)),                  // relam (0 for sequences/views — relcache.c:1841 asserts it)
 		NewIntDatum(relfilenode),                        // relfilenode
 		NewIntDatum(int64(tbl.Tablespace)),              // reltablespace (0 = default; explicit CREATE TABLE ... TABLESPACE otherwise, M0122-0007)
@@ -715,7 +715,7 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index, dbOid 
 		NewIntDatum(0),                        // reloftype
 		NewIntDatum(bootstrapSuperuserOID),    // relowner
 		NewIntDatum(indexRelamOID(idx)),       // relam
-		NewIntDatum(int64(idx.OID)),           // relfilenode
+		NewIntDatum(int64(catalogRelfilenodeForIndex(idx))), // relfilenode (0 for a partitioned index)
 		NewIntDatum(int64(idx.Tablespace)),    // reltablespace (0 = default; explicit CREATE/ALTER INDEX ... TABLESPACE otherwise, M0122-0007)
 		NewIntDatum(0),                        // relpages
 		NewIntDatum(0),                        // reltuples
@@ -725,7 +725,7 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index, dbOid 
 		NewBoolDatum(false),                   // relhasindex (indexes never have indexes themselves)
 		NewBoolDatum(false),                   // relisshared
 		NewStringDatum(indexPersistence(idx)), // relpersistence (follows the owning table)
-		NewStringDatum("i"),                   // relkind
+		NewStringDatum(catalog.IndexRelkind(idx)), // relkind ('I' on a partitioned table, M0149-0001h1a26)
 		NewIntDatum(natts),                    // relnatts
 		NewIntDatum(0),                        // relchecks
 		NewBoolDatum(false),                   // relhasrules
@@ -2991,4 +2991,24 @@ func domainTypsubscript(base catalog.Type) int64 {
 		return 6179
 	}
 	return 0
+}
+
+// tableOwnerOID is pg_class.relowner for tbl: the creating role (SET ROLE
+// counts — heap_create_with_catalog's ownerId = GetUserId()) or ALTER ...
+// OWNER TO's target, the bootstrap superuser when unset. Sibling of the
+// catalog's virtual pg_class row. M0149-0001h1a26.
+func tableOwnerOID(cat catalog.Catalog, tbl *catalog.Table) int64 {
+	if tbl.Owner != "" && cat != nil {
+		if oid, ok := cat.RoleOID(tbl.Owner); ok {
+			return int64(oid)
+		}
+	}
+	return bootstrapSuperuserOID
+}
+
+// catalogRelfilenodeForIndex is relfilenode for an index's pg_class row: 0
+// for a partitioned index (no storage), the index OID otherwise.
+func catalogRelfilenodeForIndex(idx *catalog.Index) uint32 {
+	n, _ := strconv.ParseUint(catalog.RelfilenodeForRelkind(catalog.IndexRelkind(idx), idx.OID), 10, 32)
+	return uint32(n)
 }

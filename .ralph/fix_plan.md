@@ -12315,6 +12315,42 @@ verify each at HEAD when the task starts.
   - Resume: the routine registry \(catalog.Routines Create\) needs the
     RecordCatalogUndo treatment pg\_default\_acl got in M0149-0001h1a6 —
     undo the registration and the pg\_proc heap row on abort.
+- [x] **M0149-0001h1a26 — pg\_class.relowner is the creating role \(SET ROLE counts\); an index on a partitioned table is relkind 'I' from creation** \(filed 2026-11-18 by ranking psql's \\dP hunks, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: heap\_create\_with\_catalog's ownerId = GetUserId\(\);
+    index\_create gives an index on a partitioned table
+    RELKIND\_PARTITIONED\_INDEX \(no storage\).
+  - Landed:
+    - the virtual pg\_class and the executor heap row render relowner from
+      Table.Owner \(set from the effective role at CREATE TABLE, and by ALTER
+      ... OWNER TO\); pg\_tables.tableowner likewise. Both used the
+      hardcoded 10. catalog.roleOIDLocked avoids a nested RLock;
+    - catalog.IndexRelkind: 'I' when the index's table is partitioned \(was:
+      only once partition children existed\); both builders use it, with
+      relfilenode 0.
+  - Findings, filed:
+    - S2 M0149-0001h1a27: INSERT ... VALUES \(srf\(\)\) inserts one row;
+    - ledger: PARTITION OF ... PARTITION BY leaves the child relkind 'r';
+      policy deparse prints Go pointers.
+  - Tests: TestPgClassOwnerAndPartitionedIndexRelkind.
+  - Regress A/B vs HEAD over 16 cases: psql 360→336 \(inventory
+    361→339\), indexing 309→299, dependency 27→26; the rest unchanged
+    \(alter\_generic ±1 flake\).
+  Movement: regress psql 361→339, indexing 309→299, dependency 27→26
+- [ ] **M0149-0001h1a27 — INSERT ... VALUES \(generate\_series\(1,5\)\) inserts ONE row \(PG: five\)** \(filed 2026-11-18 by M0149-0001h1a26; S2 — silent data loss\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - **ESCALATION 2026-11-18 \(S2\).** A set-returning function in a VALUES
+    row is evaluated as a scalar. `insert into t values
+    \(generate_series\(1,5\)\)` reports INSERT 0 1 and stores 1. PG 18.3
+    \(:5545\) reports INSERT 0 5. INSERT ... SELECT generate\_series\(1,5\)
+    is correct. It affects every regress case that seeds a table this way
+    \(psql.sql's parent\_tab\). Awaiting owner placement.
+  - Resume: the planner's VALUES → Result path must expand target-list SRFs
+    the way a SELECT target list does \(ProjectSet; PG's
+    transformValuesClause keeps the SRF, and the planner adds a ProjectSet
+    above the Values scan\).
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

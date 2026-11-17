@@ -7640,7 +7640,11 @@ func (c *InMemory) PGTablesRowsForDBOid(dbOid uint32) [][]string {
 		if schema == "" {
 			schema = "public"
 		}
-		out = append(out, []string{schema, t.Name, "postgres"})
+		owner := "postgres"
+		if t.Owner != "" {
+			owner = t.Owner
+		}
+		out = append(out, []string{schema, t.Name, owner})
 	}
 	return out
 }
@@ -8347,6 +8351,15 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		// Hoisted to a local for the same reason as relOfType above — keeping
 		// the row literal's single-token column width. M0134-0164.
 		relFilenode := RelfilenodeForRelkind(relkind, t.OID)
+		// relowner: the creating role (heap_create_with_catalog's ownerId =
+		// GetUserId(), so SET ROLE counts) or ALTER ... OWNER TO's target.
+		// M0149-0001h1a26.
+		relOwner := "10"
+		if t.Owner != "" {
+			if oid, ok := c.roleOIDLocked(t.Owner); ok {
+				relOwner = strconv.Itoa(int(oid))
+			}
+		}
 		relacl := c.relaclTextLocked(t.OID)
 		if t.IsSequence {
 			relacl = c.relaclTextLockedSeq(t.OID)
@@ -8357,7 +8370,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 			strconv.Itoa(int(nsOID)),        // 2:  relnamespace
 			"0",                             // 3:  reltype
 			relOfType,                       // 4:  reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
-			"10",                            // 5:  relowner (bootstrap superuser)
+			relOwner,                        // 5:  relowner (Table.Owner; bootstrap superuser when unset, M0149-0001h1a26)
 			relam,                           // 6:  relam (heap=2; 0 for sequences)
 			relFilenode,                     // 7:  relfilenode (0 for storage-less kinds — view/foreign/partitioned, M0134-0164)
 			strconv.Itoa(int(t.Tablespace)), // 8:  reltablespace (0 = default; explicit CREATE TABLE ... TABLESPACE otherwise, M0122-0007)
@@ -8574,12 +8587,11 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 				idxPers = "t"
 			}
 		}
-		// 'I' = partitioned index (has partition children); 'i' = regular index.
+		// 'I' = partitioned index: any index on a partitioned table
+		// (index_create's relkind choice, RELKIND_PARTITIONED_INDEX), with or
+		// without attached children yet; 'i' otherwise. M0149-0001h1a26.
 		hasIdxChildren := len(c.indexPartitionChildren[idx.OID]) > 0
-		idxRelkind := "i"
-		if hasIdxChildren {
-			idxRelkind = "I"
-		}
+		idxRelkind := IndexRelkind(idx)
 		idxHasSubclass := "f"
 		if hasIdxChildren {
 			idxHasSubclass = "t"
@@ -17831,12 +17843,29 @@ func (c *InMemory) RoleDropDependencyDescriptions(roleName string) []string {
 // role. Used by CREATE POLICY ... TO <role> to record role OIDs in
 // pg_policy.polroles. DU-002 slice 330.
 func (c *InMemory) RoleOID(name string) (uint32, bool) {
-	key := strings.ToLower(name)
-	if key == "postgres" {
+	if strings.ToLower(name) == "postgres" {
 		return 10, true
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	return c.roleOIDLocked(name)
+}
+
+// IndexRelkind is pg_class.relkind for an index: 'I' (partitioned index)
+// when its table is partitioned, 'i' otherwise. M0149-0001h1a26.
+func IndexRelkind(idx *Index) string {
+	if idx != nil && idx.Table != nil && TableRelkind(idx.Table) == "p" {
+		return "I"
+	}
+	return "i"
+}
+
+// roleOIDLocked is RoleOID for a caller already holding c.mu.
+func (c *InMemory) roleOIDLocked(name string) (uint32, bool) {
+	key := strings.ToLower(name)
+	if key == "postgres" {
+		return 10, true
+	}
 	// predefinedRoles is checked FIRST and always wins: it is a fixed,
 	// install-time fact (unlike `roles`, whose CREATE ROLE producer does not
 	// yet port PG's IsReservedName "pg_"-prefix rejection — a pre-existing,
