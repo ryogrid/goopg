@@ -1293,73 +1293,152 @@ func (p *bodyParser) parseExecute() (*ExecuteStmt, error) {
 	return stmt, nil
 }
 
-// parseRaise parses `RAISE [level] 'message' [, args...];`. M0096-0012.
-// Level defaults to "exception" when omitted.
+// parseRaise parses a RAISE statement (pl_gram.y stmt_raise):
+//
+//	RAISE ;                                          -- re-raise
+//	RAISE [level] 'format' [, expr ...] [USING ...] ;
+//	RAISE [level] condition_name [USING ...] ;
+//	RAISE [level] SQLSTATE 'xxxxx' [USING ...] ;
+//	RAISE [level] USING option = expr [, ...] ;
+//
+// Level defaults to EXCEPTION. M0096-0012, M0149-0001h1a2.
 func (p *bodyParser) parseRaise() (*RaiseStmt, error) {
 	pos := p.cur().Pos
 	p.advance() // consume "raise" ident
-	level := "exception"
-	conditionName := ""
-	// Optional level keyword or condition name.
-	if p.cur().Kind == parser.TokenIdent {
-		val := strings.ToLower(p.cur().Value)
-		isLevel := false
+	if p.cur().Kind == parser.TokenSymbol && p.cur().Value == ";" {
+		p.advance()
+		return &RaiseStmt{pos: pos, Level: "exception", ReRaise: true}, nil
+	}
+	st := &RaiseStmt{pos: pos, Level: "exception"}
+	isUsing := func(t parser.Token) bool {
+		return (t.Kind == parser.TokenIdent || t.Kind == parser.TokenKeyword) && strings.EqualFold(t.Value, "using")
+	}
+	if t := p.cur(); t.Kind == parser.TokenIdent || t.Kind == parser.TokenKeyword {
+		val := strings.ToLower(t.Value)
 		for _, lvl := range []string{"notice", "warning", "info", "log", "debug", "error", "exception"} {
 			if val == lvl {
-				isLevel = true
-				level = val
+				st.Level = val
 				p.advance()
 				break
 			}
 		}
-		if !isLevel && val != "" {
-			// Condition name: RAISE condition_name [USING MESSAGE = 'text']
-			conditionName = val
+	}
+	// Condition: SQLSTATE 'xxxxx' or a condition name (any word but USING).
+	if t := p.cur(); (t.Kind == parser.TokenIdent || t.Kind == parser.TokenKeyword) && !isUsing(t) {
+		if strings.EqualFold(t.Value, "sqlstate") && p.peek(1).Kind == parser.TokenStringLit {
+			code := p.peek(1).Value
+			if len(code) != 5 || strings.Trim(code, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") != "" {
+				return nil, p.errAtCur("invalid SQLSTATE code")
+			}
+			st.SQLState = code
+			p.advance()
+			p.advance()
+		} else {
+			st.ConditionName = strings.ToLower(t.Value)
 			p.advance()
 		}
 	}
-	// Consume everything to `;` (captures format string + USING clause).
-	msgStart := p.cur().Pos
-	for p.cur().Kind != parser.TokenEOF {
-		if p.cur().Kind == parser.TokenSymbol && p.cur().Value == ";" {
-			msg := strings.TrimSpace(p.src[msgStart:p.cur().Pos])
-			p.advance()
-			// If USING MESSAGE = 'text', extract the message.
-			if conditionName != "" {
-				msg = extractRaiseUsingMessage(msg)
+	// The rest up to `;`: an optional format + arguments, then USING.
+	start := p.cur().Pos
+	usingAt, usingEnd := -1, -1
+	depth := 0
+	for {
+		t := p.cur()
+		if t.Kind == parser.TokenEOF {
+			return nil, p.errAtCur("unterminated RAISE statement")
+		}
+		if t.Kind == parser.TokenSymbol {
+			switch t.Value {
+			case "(", "[":
+				depth++
+			case ")", "]":
+				depth--
+			case ";":
+				if depth == 0 {
+					end := t.Pos
+					if usingAt >= 0 {
+						st.Msg = strings.TrimSpace(p.src[start:usingAt])
+						opts, err := parseRaiseOptions(p.src[usingEnd:end])
+						if err != nil {
+							return nil, p.errAt(usingAt, "%s", err.Error())
+						}
+						st.Options = opts
+					} else {
+						st.Msg = strings.TrimSpace(p.src[start:end])
+					}
+					p.advance()
+					if (st.ConditionName != "" || st.SQLState != "") && st.Msg != "" {
+						return nil, p.errAt(start, "syntax error")
+					}
+					return st, nil
+				}
 			}
-			return &RaiseStmt{pos: pos, Level: level, Msg: msg, ConditionName: conditionName}, nil
+		}
+		if depth == 0 && usingAt < 0 && isUsing(t) {
+			usingAt = t.Pos
+			usingEnd = t.Pos + len(t.Value)
 		}
 		p.advance()
 	}
-	return nil, p.errAtCur("unterminated RAISE statement")
 }
 
-// extractRaiseUsingMessage extracts the message text from `USING MESSAGE = 'text'`
-// or similar USING clauses in RAISE statements. M0097-0003.
-func extractRaiseUsingMessage(s string) string {
-	s = strings.TrimSpace(s)
-	// Pattern: USING MESSAGE = 'text'
-	lower := strings.ToLower(s)
-	if idx := strings.Index(lower, "using"); idx >= 0 {
-		rest := strings.TrimSpace(s[idx+5:])
-		lowerRest := strings.ToLower(rest)
-		if strings.HasPrefix(lowerRest, "message") {
-			rest = strings.TrimSpace(rest[7:])
-			if strings.HasPrefix(rest, "=") {
-				rest = strings.TrimSpace(rest[1:])
-				if len(rest) >= 2 && rest[0] == '\'' {
-					// Strip surrounding single quotes.
-					end := strings.LastIndexByte(rest, '\'')
-					if end > 0 {
-						return strings.ReplaceAll(rest[1:end], "''", "'")
-					}
-				}
-				return rest
+// raiseOptionNames is pl_gram.y's option_value keyword set.
+var raiseOptionNames = map[string]bool{
+	"MESSAGE": true, "DETAIL": true, "HINT": true, "ERRCODE": true, "COLUMN": true,
+	"CONSTRAINT": true, "DATATYPE": true, "TABLE": true, "SCHEMA": true,
+}
+
+// parseRaiseOptions splits `name = expr, name := expr, ...` on top-level
+// commas (outside quotes and parentheses).
+func parseRaiseOptions(s string) ([]RaiseOption, error) {
+	var items []string
+	depth, inQ, last := 0, false, 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case inQ:
+			if c == '\'' {
+				inQ = false
 			}
+		case c == '\'':
+			inQ = true
+		case c == '(' || c == '[':
+			depth++
+		case c == ')' || c == ']':
+			depth--
+		case c == ',' && depth == 0:
+			items = append(items, s[last:i])
+			last = i + 1
 		}
 	}
-	return s
+	items = append(items, s[last:])
+	out := make([]RaiseOption, 0, len(items))
+	for _, it := range items {
+		it = strings.TrimSpace(it)
+		j := 0
+		for j < len(it) && (it[j] == '_' || (it[j] >= 'a' && it[j] <= 'z') || (it[j] >= 'A' && it[j] <= 'Z')) {
+			j++
+		}
+		name := strings.ToUpper(it[:j])
+		if !raiseOptionNames[name] {
+			return nil, fmt.Errorf("unrecognized RAISE statement option \"%s\"", strings.ToLower(it[:j]))
+		}
+		rest := strings.TrimSpace(it[j:])
+		switch {
+		case strings.HasPrefix(rest, ":="):
+			rest = rest[2:]
+		case strings.HasPrefix(rest, "="):
+			rest = rest[1:]
+		default:
+			return nil, fmt.Errorf("syntax error, expected \"=\"")
+		}
+		rest = strings.TrimSpace(rest)
+		if rest == "" {
+			return nil, fmt.Errorf("syntax error")
+		}
+		out = append(out, RaiseOption{Name: name, Expr: rest})
+	}
+	return out, nil
 }
 
 // parseTypeRef captures a SQL type spec — `name` or `schema.name`,

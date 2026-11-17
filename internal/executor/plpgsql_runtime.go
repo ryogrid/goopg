@@ -2235,46 +2235,11 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.RaiseStmt:
-		// RAISE EXCEPTION/ERROR: surface as an executor error.
-		// RAISE NOTICE/WARNING/INFO/LOG/DEBUG: queue via context so the server
-		// emits a NoticeResponse before the next CommandComplete. M0096-0012.
-		raiseMsgEval := func() (string, error) {
-			return evalRaiseMsg(s.Msg, frame, ctx)
-		}
-		if s.ConditionName != "" {
-			// RAISE condition_name [USING MESSAGE = 'text'] — raise named condition.
-			// Use condition name as error code for exception handler matching. M0097-0003.
-			code := conditionNameToSQLState(s.ConditionName)
-			msg, err := raiseMsgEval()
-			if err != nil {
-				return Datum{}, flowNone, err
-			}
-			if msg == "" {
-				msg = s.ConditionName
-			}
-			return Datum{}, flowNone, &ExecError{Code: code, Pos: s.Pos(), Message: msg, ConditionName: s.ConditionName}
-		}
-		switch strings.ToLower(s.Level) {
-		case "error", "exception":
-			msg, err := raiseMsgEval()
-			if err != nil {
-				return Datum{}, flowNone, err
-			}
-			return Datum{}, flowNone, &ExecError{Code: "P0001", Pos: s.Pos(), Message: msg}
-		}
-		if ctx != nil {
-			msg, err := raiseMsgEval()
-			if err != nil {
-				return Datum{}, flowNone, err
-			}
-			// RAISE WARNING surfaces at WARNING severity (vs NOTICE/INFO/LOG/DEBUG).
-			// The isolation runner echoes each message with its real protocol
-			// severity, so the level must be preserved. M0118-0009 (perm 10).
-			if strings.EqualFold(s.Level, "warning") {
-				ctx.AddWarning(msg)
-			} else {
-				ctx.AddNotice(msg)
-			}
+		// RAISE EXCEPTION/ERROR surfaces as an executor error; NOTICE / INFO /
+		// LOG / DEBUG are delivered inline, WARNING is queued. M0096-0012,
+		// M0149-0001h1a2 (USING options, exec_stmt_raise).
+		if err := execRaise(s, frame, ctx); err != nil {
+			return Datum{}, flowNone, err
 		}
 		return Datum{}, flowNone, nil
 
@@ -4078,29 +4043,12 @@ func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) (string, err
 		if err != nil {
 			return "", err
 		}
-		lowered, _ := lowerPLpgSQLExpr(parsed, frame)
 		if val.IsNull() {
 			argVals = append(argVals, "<NULL>")
-		} else if val.Kind == KindInt && isRegtypeExpr(lowered) {
-			// pg_typeof(x) / x::regtype evaluate to a KindInt Datum holding the
-			// type's pg_type OID (M0122-0005), not display text — val.Format()
-			// would print the bare OID (e.g. "25") instead of the type name
-			// ("text") the wire-output layer renders for a plain SELECT. Mirror
-			// that resolution here so RAISE NOTICE / format-arg substitution
-			// matches PG's output.
-			var cat catalog.Catalog
-			if ctx != nil {
-				cat = ctx.Catalog
-			}
-			argVals = append(argVals, RegtypeName(cat, uint32(val.Int), func(s string) bool { return !RegObjectSchemaVisible(ctx, s) }))
-		} else {
-			// DATE/TIMESTAMP/TIMESTAMPTZ args must render per the session's
-			// datestyle GUC (M-NIGHTLY DateStyle follow-up), matching every
-			// other already-fixed output path (ANALYZE MCV/histogram, CAST,
-			// array_agg/string_agg). formatDatumDateStyle falls back to
-			// Format() for every other Kind.
-			argVals = append(argVals, formatDatumDateStyle(val, ctx))
+			continue
 		}
+		lowered, _ := lowerPLpgSQLExpr(parsed, frame)
+		argVals = append(argVals, raiseDatumText(val, lowered, ctx))
 	}
 
 	// Substitute: each % (not %%) is replaced by the next arg in order.
@@ -4124,6 +4072,155 @@ func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) (string, err
 		}
 	}
 	return result.String(), nil
+}
+
+// raiseDatumText renders a RAISE argument / USING option value as text
+// (convert_value_to_string).
+func raiseDatumText(val Datum, lowered optimizer.Expr, ctx *Context) string {
+	if val.Kind == KindInt && isRegtypeExpr(lowered) {
+		// pg_typeof(x) / x::regtype evaluate to a KindInt Datum holding the
+		// type's pg_type OID (M0122-0005): render the type name, as the
+		// wire-output layer does for a plain SELECT.
+		var cat catalog.Catalog
+		if ctx != nil {
+			cat = ctx.Catalog
+		}
+		return RegtypeName(cat, uint32(val.Int), func(s string) bool { return !RegObjectSchemaVisible(ctx, s) })
+	}
+	// DATE/TIMESTAMP/TIMESTAMPTZ render per the session's datestyle
+	// (formatDatumDateStyle falls back to Format() for other kinds).
+	return formatDatumDateStyle(val, ctx)
+}
+
+// raiseOptionError is a RAISE runtime error (exec_stmt_raise).
+func raiseOptionError(code, msg string, pos int) error {
+	return &ExecError{Code: code, Pos: pos, Message: msg}
+}
+
+// recognizeRaiseCondition is plpgsql_recognize_err_condition with
+// allow_sqlstate: a five-character [0-9A-Z] string is a SQLSTATE, anything
+// else must name a plerrcodes.h condition (42704 otherwise).
+func recognizeRaiseCondition(name string) (string, error) {
+	if len(name) == 5 && strings.Trim(name, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") == "" {
+		return name, nil
+	}
+	if codes := errcodes.PLpgSQLConditionCodes(name); len(codes) > 0 {
+		return string(codes[0]), nil
+	}
+	return "", &ExecError{Code: "42704", Message: fmt.Sprintf("unrecognized exception condition \"%s\"", name)}
+}
+
+// execRaise is exec_stmt_raise (pl_exec.c) for one RAISE statement: the
+// condition / SQLSTATE sets the error code, the format string the message,
+// and each USING option its field, an option given twice being an error.
+// Without a message the condition name, else the SQLSTATE, is the message.
+// The errors carry no cursor position: PG reports a RAISE through the
+// PL/pgSQL error context, never as a position in the calling query.
+func execRaise(s *plpgsql.RaiseStmt, frame *plpgsqlFrame, ctx *Context) error {
+	if s.ReRaise {
+		if frame.caughtErr == nil {
+			return &ExecError{Code: "0Z002", Message: "RAISE without parameters cannot be used outside an exception handler"}
+		}
+		return frame.caughtErr
+	}
+	var code, condname, msg, detail, hint string
+	haveMsg, haveDetail, haveHint := false, false, false
+	if s.SQLState != "" {
+		code = s.SQLState
+	} else if s.ConditionName != "" {
+		c, err := recognizeRaiseCondition(s.ConditionName)
+		if err != nil {
+			return err
+		}
+		code, condname = c, s.ConditionName
+	}
+	if s.Msg != "" {
+		m, err := evalRaiseMsg(s.Msg, frame, ctx)
+		if err != nil {
+			return err
+		}
+		msg, haveMsg = m, true
+	}
+	for _, o := range s.Options {
+		parsed, err := parser.ParseExpr(substitutePlpgsqlArraySubscripts(o.Expr, frame))
+		if err != nil {
+			return err
+		}
+		val, err := evalPLpgSQLExpr(parsed, frame, ctx)
+		if err != nil {
+			return err
+		}
+		if val.IsNull() {
+			return raiseOptionError("22004", "RAISE statement option cannot be null", 0)
+		}
+		lowered, _ := lowerPLpgSQLExpr(parsed, frame)
+		text := raiseDatumText(val, lowered, ctx)
+		dup := raiseOptionError("42601", fmt.Sprintf("RAISE option already specified: %s", o.Name), 0)
+		switch o.Name {
+		case "ERRCODE":
+			if code != "" {
+				return dup
+			}
+			c, err := recognizeRaiseCondition(text)
+			if err != nil {
+				return err
+			}
+			code, condname = c, text
+		case "MESSAGE":
+			if haveMsg {
+				return dup
+			}
+			msg, haveMsg = text, true
+		case "DETAIL":
+			if haveDetail {
+				return dup
+			}
+			detail, haveDetail = text, true
+		case "HINT":
+			if haveHint {
+				return dup
+			}
+			hint, haveHint = text, true
+		default:
+			// COLUMN / CONSTRAINT / DATATYPE / TABLE / SCHEMA: evaluated (so a
+			// NULL still errors) but not carried — ExecError has no
+			// object-name fields (deferral ledger 2026-11-17).
+		}
+	}
+	level := strings.ToLower(s.Level)
+	isError := level == "error" || level == "exception"
+	if code == "" && isError {
+		code = "P0001"
+	}
+	if !haveMsg {
+		if condname != "" {
+			msg = condname
+		} else if code != "" {
+			msg = code
+		} else {
+			msg = "00000"
+		}
+	}
+	if isError {
+		return &ExecError{Code: code, Message: msg, Detail: detail, Hint: hint, ConditionName: s.ConditionName}
+	}
+	if ctx == nil {
+		return nil
+	}
+	if level == "warning" {
+		if code != "" || hint != "" {
+			c := code
+			if c == "" {
+				c = "01000"
+			}
+			ctx.AddWarningWithHint(c, msg, hint)
+		} else {
+			ctx.AddWarning(msg)
+		}
+		return nil
+	}
+	ctx.AddNoticeFields(code, msg, detail, hint)
+	return nil
 }
 
 // splitTopLevelCommas splits s on commas not inside parentheses, brackets, or quotes.

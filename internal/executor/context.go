@@ -608,6 +608,9 @@ type Context struct {
 	// This matches PostgreSQL's behavior where NOTICE messages arrive before
 	// any blocking point. M0100-0005.
 	NoticeFlush func(string)
+	// NoticeFieldsFlush is NoticeFlush for a NOTICE with its own SQLSTATE,
+	// DETAIL and HINT fields (AddNoticeFields).
+	NoticeFieldsFlush func(code, msg, detail, hint string)
 
 	// Warnings accumulates WARNING-severity messages emitted during statement
 	// execution (e.g. "you don't own a lock of type ExclusiveLock" from
@@ -1363,6 +1366,25 @@ func (c *Context) AddNotice(msg string) {
 		return
 	}
 	c.Notices = append(c.Notices, msg)
+}
+
+// AddNoticeFields delivers a NOTICE carrying its own SQLSTATE, DETAIL and
+// HINT (RAISE NOTICE ... USING). It goes through NoticeFieldsFlush inline,
+// like AddNotice, so it keeps its place among plain notices; with no
+// flusher wired it falls back to the buffered queues.
+func (c *Context) AddNoticeFields(code, msg, detail, hint string) {
+	if code == "" && detail == "" && hint == "" {
+		c.AddNotice(msg)
+		return
+	}
+	if c.NoticeFieldsFlush != nil {
+		if code == "" {
+			code = "00000"
+		}
+		c.NoticeFieldsFlush(code, msg, detail, hint)
+		return
+	}
+	c.AddNoticeWithDetail(msg, detail)
 }
 
 // TakeNotices returns and clears the accumulated notices.

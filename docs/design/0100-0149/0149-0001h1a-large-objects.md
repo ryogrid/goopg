@@ -260,6 +260,25 @@ grant, the owner, a superuser, or a member of pg\_read\_all\_data
 name in pg\_catalog for virtual ones. valuesOp, which serves virtual catalogs
 such as pg\_authid, applies the same check.
 
+## Slice 7: RAISE ... USING \(M0149\-0001h1a2\)
+
+Found through regress plpgsql's raise\_test, which large\-object work drove
+into. The PL/pgSQL parser kept everything after RAISE as raw text, and only a
+condition\-name RAISE looked at `USING MESSAGE = '<literal>'`. It now ports
+pl\_gram.y stmt\_raise: an optional format and its arguments, then a
+top\-level USING list of `name = expr` options, `SQLSTATE 'xxxxx'` as a
+condition, and bare `RAISE;`.
+
+execRaise ports exec\_stmt\_raise:
+- ERRCODE resolves a SQLSTATE or a condition name;
+- an option given twice is 42601, and a NULL option is 22004;
+- the default message is the condition name, else the SQLSTATE;
+- DETAIL and HINT are carried. Notices go out inline through a new
+  Context.NoticeFieldsFlush, so they keep their order among plain notices.
+
+RAISE errors no longer carry a query position: PG reports them through the
+PL/pgSQL error context, never as a caret in the calling statement.
+
 ## Open
 
 - A read\-only descriptor reads with the statement's snapshot, not the

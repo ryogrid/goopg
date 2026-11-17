@@ -12054,7 +12054,7 @@ verify each at HEAD when the task starts.
     617→616 \(inventory 616→615\); the rest unchanged apart from
     alter\_generic ±1 and polymorphism's known pg\_typeof flip.
   Movement: regress privileges 616→615
-- [ ] **M0149-0001h1a2 — RAISE without a format string ignores `USING MESSAGE = <expr>`: `raise notice using message = sqlstate` prints the expression text** \(filed 2026-11-17 by M0149-0001h1a\)
+- [x] **M0149-0001h1a2 — RAISE without a format string ignores `USING MESSAGE = <expr>`: `raise notice using message = sqlstate` prints the expression text** \(filed 2026-11-17 by M0149-0001h1a\)
   Kind: impl
   Parent: M0149-0001h1a
   - Repro: regress plpgsql raise\_test — PG prints `NOTICE:  22012`; goopg
@@ -12062,6 +12062,26 @@ verify each at HEAD when the task starts.
   - PG: pl\_gram.y stmt\_raise \(the RAISE level USING … form with no
     format string\) and exec\_stmt\_raise, which evaluates the USING option
     expressions \(pl\_exec.c\).
+  - 2026-11-17 \(landed\): RAISE ... USING ported from pl\_gram.y stmt\_raise and
+    pl\_exec.c exec\_stmt\_raise.
+    - Parser: the format and its arguments stop at a top\-level USING; the
+      options parse as `name = expr` / `name := expr`, and an unknown name is
+      "unrecognized RAISE statement option". `RAISE SQLSTATE 'xxxxx'` is a
+      condition, and a bare `RAISE;` re\-raises.
+    - Runtime \(execRaise\):
+      - ERRCODE takes a SQLSTATE or a condition name \(42704 when unknown\);
+        an option given twice is 42601 "RAISE option already specified: X";
+        a NULL option is 22004;
+      - with no message, the condition name, else the SQLSTATE, is used;
+      - level ERROR defaults to P0001;
+      - DETAIL / HINT reach errors, inline notices \(new NoticeFieldsFlush\)
+        and warnings \(hint only\);
+      - RAISE errors carry no query position, as in PG;
+      - `RAISE;` re\-throws the handled error \(0Z002 outside a handler\).
+    - Regress A/B vs HEAD over 14 cases: plpgsql 1231→1213 and triggers
+      788→784 \(inventory updated\); the rest unchanged apart from plpgsql's
+      known polymorphic f1 / pg\_typeof flake.
+    Movement: regress triggers 788→784
 - [x] **M0149-0001h1a1 — bit strings have no `\|` / `&` / `#` operators and no bit → int4 / int8 cast: `x'20000'::int` and `x'20000' \| x'40000'` fail** \(filed 2026-11-17 by M0149-0001h1a\)
   Kind: impl
   Parent: M0149-0001h1a
