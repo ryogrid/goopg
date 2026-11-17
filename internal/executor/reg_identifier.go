@@ -332,6 +332,18 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 				name = strings.TrimSpace(strings.TrimSpace(name[:open]) + " " + strings.TrimSpace(name[open+close+1:]))
 			}
 		}
+		// parseTypeString parses a full SQL type name: the multi-word
+		// spellings (double precision, timestamp with time zone[]) are
+		// pg_catalog types. M0149-0001h1a32.
+		if oid, ok := regtypeMultiWordBuiltin(name); ok {
+			return NewIntDatum(int64(oid)), nil
+		}
+		// A quoted keyword typname names the pg_catalog type format_type
+		// prints quoted: '"char"' is char (18), unlike bare char (bpchar);
+		// '"char"[]' its array. M0149-0001h1a32.
+		if oid, ok := regtypeQuotedBuiltin(name); ok {
+			return NewIntDatum(int64(oid)), nil
+		}
 		schema, typeName, nameOK := splitRegQualifiedName(name)
 		if !nameOK {
 			return NullDatum, &ExecError{Code: "42602", Pos: pos, Message: "invalid name syntax"}
@@ -370,9 +382,15 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 			if oid, ok := catalog.BuiltinTypeOIDByFormatName(strings.ToLower(typeName)); ok {
 				return NewIntDatum(int64(oid)), nil
 			}
+			// A typname: "_aclitem" (aclitem[]), a quoted keyword "any".
+			// M0149-0001h1a32.
+			if oid, ok := catalog.BuiltinTypnameOID(typeName); ok {
+				return NewIntDatum(int64(oid)), nil
+			}
 		}
 		if !strings.EqualFold(schema, "pg_catalog") {
-			if oid, ok := userTypeOIDForName(ctx.Catalog, typeName); ok {
+			if oid, ok := userTypeOIDForName(ctx.Catalog, typeName); ok &&
+				userTypeOnPath(ctx, oid, schema) {
 				return NewIntDatum(int64(oid)), nil
 			}
 		}
@@ -411,10 +429,28 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 		// above. Builtins resolve through the global pg_proc index below, which
 		// is not dbOid-scoped (pg_catalog is implicitly visible everywhere).
 		connDBOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
+		// The user routine is found through search_path and, for
+		// regprocedure, by its argument types (M0149-0001h1a32).
 		if rs := routineRegistry(ctx); rs != nil {
-			candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: fn}, connDBOid)
-			if len(candidates) > 0 {
-				return NewIntDatum(int64(candidates[0].OID)), nil
+			oid, found, err := resolveUserRoutineOnPath(rs, schema, fn, raw,
+				strings.EqualFold(typeName, "regprocedure"), ctx, connDBOid, pos)
+			if err != nil {
+				return NullDatum, err
+			}
+			if found {
+				return NewIntDatum(int64(oid)), nil
+			}
+		}
+		// regprocedurein matches the exact signature before any name-only
+		// shortcut: LookupBuiltinProc answers one overload per name, so
+		// 'exp(double precision)' must not resolve to exp(numeric)
+		// (FunctionIsVisible's round trip relies on it). M0149-0001h1a32.
+		if strings.EqualFold(typeName, "regprocedure") &&
+			(schema == "" || strings.EqualFold(schema, "pg_catalog")) {
+			if args, ok := regprocedureArgTypes(raw, ctx); ok {
+				if oid, found := builtinProcByArgs(fn, args); found {
+					return NewIntDatum(int64(oid)), nil
+				}
 			}
 		}
 		if bp, found := catalog.LookupBuiltinProc(fn); found {
@@ -611,6 +647,17 @@ func RegOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool, dbOi
 // as format_procedure's FunctionIsVisible arm.
 func RegOutArgVisible(typeName string, oid uint32, cat catalog.Catalog, qualify bool, argVisible func(schema string) bool, dbOid ...uint32) string {
 	return regOutShared(typeName, oid, cat, func(s string) bool { return qualify }, argVisible, dbOid...)
+}
+
+// RegOutVisible renders a reg* OID with regclassout / regprocout /
+// regprocedureout's PER-OBJECT rule: the name is schema-qualified iff its
+// schema is not visible on the session's search_path, and a regprocedure
+// argument type likewise. The SELECT and COPY TO paths use it whenever they
+// hold the session predicate; RegOutArgVisible's single qualify flag (all
+// names qualified once "public" is off the path) remains for callers
+// without one. M0149-0001h1a32.
+func RegOutVisible(typeName string, oid uint32, cat catalog.Catalog, visible func(schema string) bool, dbOid ...uint32) string {
+	return regOutShared(typeName, oid, cat, func(s string) bool { return !visible(s) }, visible, dbOid...)
 }
 
 // RegOutRenderer returns a closure over RegOut bound to a fixed catalog and
@@ -857,6 +904,16 @@ func regprocedureArglist(argTypes []catalog.RegprocArg, visible func(schema stri
 		name := base
 		if a.Schema == "" || a.Schema == "pg_catalog" {
 			name = catalog.ArgTypeDisplayAlias(base)
+		}
+		// A pg_proc.dat typname renders as format_type_be prints it: an
+		// "_elem" array typname is "elem[]", a keyword typname quotes
+		// ("any"). M0149-0001h1a32.
+		if a.Schema == "pg_catalog" && !isArray && name == base {
+			if oid, ok := catalog.BuiltinTypnameOID(base); ok {
+				if f, ok := catalog.BuiltinFormatTypeName(oid); ok {
+					name = f
+				}
+			}
 		}
 		if a.Schema != "" && a.Schema != "pg_catalog" && visible != nil && !visible(a.Schema) {
 			name = quoteQualifiedIdentifier(a.Schema, name)

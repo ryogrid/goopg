@@ -12473,6 +12473,48 @@ verify each at HEAD when the task starts.
     should not be listed at all \(pg\_\*\_is\_visible are constant true,
     ledgered\).
   Movement: regress foreign_key 803→796
+- [x] **M0149-0001h1a32 — pg\_table / type / function / statistics\_obj\_is\_visible follow search\_path; regproc, regprocedure and regtype input resolve through it** \(filed 2026-11-18 by M0149-0001h1a31's ledger row, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: namespace.c RelationIsVisible / TypeIsVisible / FunctionIsVisible /
+    StatisticsObjIsVisible \(NULL for a missing OID; an earlier schema's
+    same\-named object hides a later one\); regprocin / regprocedurein /
+    regtypein resolve a bare name through the path \(FuncnameGetCandidates,
+    TypenameGetTypid\).
+  - goopg before: every pg\_\*\_is\_visible returned true; regproc and
+    regprocedure took the first same\-named routine in ANY schema and
+    ignored the argument list; regtype resolved a user type in any schema;
+    SELECT / COPY qualified every reg name once public was off the path.
+  - Landed:
+    - pg\_is\_visible.go: the four \*IsVisibleExt functions, by round\-trip of
+      the bare spelling through the reg\* input functions \(statistics
+      objects walk the path\);
+    - resolveUserRoutineOnPath \(schema order, argument match for
+      regprocedure, 42725 for an ambiguous regproc\); userTypeOnPath;
+    - builtin regprocedure matches the exact signature first
+      \(builtinProcByArgs; catalog.BuiltinProcOIDsByName and
+      BuiltinTypnameOID\): the name\-only shortcut sent
+      `'exp(double precision)'` to exp\(numeric\), which hid builtins from
+      psql's \\df;
+    - regtype input: multi\-word names, quoted keyword typnames \(`"char"`,
+      `"any"`\), `_elem` array typnames;
+    - output: RegOutVisible \(per\-object qualification\) on the SELECT and
+      COPY TO paths; builtin argument typnames render as format\_type
+      \(`aclitem[]`, `"any"`\).
+  - Found:
+    - TestRegCastToTextSiblingAgreeQualify cast a bare
+      `'f_varbit(varbit)'` under search\_path='', which PG 18.3 rejects
+      with 42883; the test now casts `public.f_varbit(varbit)`;
+    - CREATE STATISTICS accepts a duplicate column \(`ON a, a`\), which PG
+      rejects \(ledgered\).
+  - Probe \(tmp/vis.sql vs PG 18.3 on :5545\): identical except error cursor
+    positions, which also differ for regclass at HEAD \(ledgered\).
+  - Tests: TestObjectVisibilityFollowsSearchPath,
+    TestBuiltinFunctionsAreVisible \(all 3397 builtins visible\).
+  - Regress A/B vs HEAD over 24 cases: opr\_sanity 112→104 and stats\_ext
+    467→440 \(inventory updated\); alter\_generic 209→208 alone \(a
+    case\-order flake in the batch run\); the rest unchanged, psql 303 = 303.
+  Movement: regress opr_sanity 112→104, stats_ext 467→440
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

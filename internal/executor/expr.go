@@ -15308,12 +15308,24 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			}
 		}
 		return NewStringDatum(""), nil
-	// pg_function_is_visible(oid) → bool: always true (no schema visibility model in v0).
+	// pg_*_is_visible(oid) → bool. Relations, types, functions and
+	// statistics objects follow namespace.c's *IsVisible rule
+	// (pg_is_visible.go, M0149-0001h1a32); the operator / opclass /
+	// opfamily / conversion / text-search kinds still answer true.
 	case "pg_function_is_visible", "pg_table_is_visible", "pg_type_is_visible",
 		"pg_operator_is_visible", "pg_opfamily_is_visible", "pg_opclass_is_visible",
 		"pg_conversion_is_visible", "pg_aggregate_is_visible", "pg_ts_parser_is_visible",
 		"pg_ts_dict_is_visible", "pg_ts_template_is_visible", "pg_ts_config_is_visible",
 		"pg_statistics_obj_is_visible":
+		if len(x.Args) == 1 {
+			arg, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if d, handled := pgObjectIsVisible(name, arg, ctx); handled {
+				return d, nil
+			}
+		}
 		return NewBoolDatum(true), nil
 	case "pg_relation_is_publishable":
 		// pg_relation_is_publishable(regclass) → bool (pg_publication.c):

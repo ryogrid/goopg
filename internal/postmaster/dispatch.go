@@ -4396,6 +4396,9 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 			if len(visible) > 0 {
 				argVisible = visible[0]
 			}
+			if argVisible != nil {
+				return append(dst, executor.RegOutVisible(typ.Name, uint32(d.Int), s.cfg.Catalog, argVisible)...)
+			}
 			return append(dst, executor.RegOutArgVisible(typ.Name, uint32(d.Int),
 				s.cfg.Catalog, !publicSchemaVisible(getSetting), argVisible)...)
 		}

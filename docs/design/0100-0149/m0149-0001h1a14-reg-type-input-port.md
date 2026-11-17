@@ -53,10 +53,51 @@ delegate to `regoperOut` / `regoperatorOut`:
 - regoperator renders `name(lefttype,righttype)`, with each type in
   `format_type_be` form and `NONE` for a missing operand.
 
+## search\_path and object visibility (M0149-0001h1a32)
+
+The input side follows the session's `search_path` the way namespace.c does:
+
+- regproc / regprocedure (`resolveUserRoutineOnPath`): a qualified name
+  searches its schema only; a bare name walks the path in order.
+  regprocedure takes the first routine whose input argument types (OUT
+  excluded) equal the parsed list. regproc keeps one routine per signature,
+  the earliest on the path, and raises 42725 when more than one remains.
+- A builtin regprocedure matches the exact signature first
+  (`builtinProcByArgs` over `catalog.BuiltinProcOIDsByName`; argument
+  typnames resolve through `catalog.BuiltinTypnameOID`). The name-only
+  `LookupBuiltinProc` shortcut used to answer one overload per name, so
+  `'exp(double precision)'` reached exp(numeric).
+- regtype: a user type found by name must sit in the qualifier's schema,
+  or for a bare name in a schema on the path (`userTypeOnPath`). Multi-word
+  names (`double precision`, `timestamp with time zone[]`), quoted keyword
+  typnames (`"char"` is char, not bpchar; `"any"`) and `_elem` array typnames
+  resolve as `parseTypeString` would.
+
+The output side qualifies per object: `RegOutVisible` passes the session
+predicate to `regOutShared` both as the qualify rule and for the
+regprocedure argument list. SELECT and COPY TO use it whenever they hold the
+predicate, instead of the single "public is off the path" flag. A builtin
+argument typname renders as `format_type_be` prints it (`aclitem[]`,
+`"any"`).
+
+`pg_table_is_visible`, `pg_type_is_visible`, `pg_function_is_visible` and
+`pg_statistics_obj_is_visible` (`pg_is_visible.go`) are the
+`*IsVisibleExt` functions: NULL for a missing OID; otherwise the object's
+bare spelling must resolve, through the same input functions, to the same
+OID, so an earlier schema's same-named object hides it. Statistics objects
+walk the path directly. All 3397 builtin functions round-trip on the default
+path (`TestBuiltinFunctionsAreVisible`).
+
 ## Not covered (deferral ledger)
 
 - regconfig and regdictionary: goopg has no text search catalog.
-- `parseTypeString` error forms in regtype: a multi-word name, a bad typmod,
-  or too many dotted names.
-- In regprocedure, the argument list is checked for syntax, and resolved
-  exactly only for builtins. User routines still resolve by name.
+- `parseTypeString` error forms in regtype: a bad typmod or too many dotted
+  names. A bare `any` is accepted, where PG raises a syntax error.
+- The implicit `pg_catalog`-first rule is not applied to user routines: a
+  user routine with a builtin's name and signature resolves before the
+  builtin.
+- `pg_operator_is_visible`, `pg_opclass_is_visible`,
+  `pg_opfamily_is_visible`, `pg_conversion_is_visible`,
+  `pg_collation_is_visible` and the text-search kinds still answer true.
+- Error cursor positions for a failed reg cast point at `::`, not at the
+  literal.

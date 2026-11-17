@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -152,4 +153,28 @@ func LookupBuiltinFunctionDef(oid uint32) (string, bool) {
 // (utils/fmgr/fmgr.c), e.g. "dsin" for sin(float8). M0149-0001h1a24.
 func IsBuiltinInternalFunctionSymbol(name string) bool {
 	return builtinInternalFunctionSymbols[name]
+}
+
+// BuiltinTypnameOID resolves a pg_catalog typname as pg_proc.dat spells
+// argument types ("float8", "_aclitem", "any", "char") to its OID, through
+// the format_type spelling: ArgTypeDisplayAlias renames (float8 → double
+// precision), a quoted keyword ("any", "char"), or the name itself; an
+// "_elem" typname is elem's array. M0149-0001h1a32.
+func BuiltinTypnameOID(tn string) (uint32, bool) {
+	if strings.HasPrefix(tn, "_") {
+		if elem, ok := BuiltinTypnameOID(tn[1:]); ok {
+			if f, ok := builtinFormatTypeNames[elem]; ok {
+				if oid, ok := BuiltinTypeOIDByFormatName(f + "[]"); ok {
+					return oid, true
+				}
+			}
+		}
+	}
+	if oid, ok := BuiltinTypeOIDByFormatName(ArgTypeDisplayAlias(tn)); ok {
+		return oid, true
+	}
+	if oid, ok := BuiltinTypeOIDByFormatName(`"` + tn + `"`); ok {
+		return oid, true
+	}
+	return BuiltinTypeOIDByFormatName(tn)
 }

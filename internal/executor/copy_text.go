@@ -310,6 +310,9 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone, by
 		if len(visible) > 0 {
 			argVisible = visible[0]
 		}
+		if argVisible != nil {
+			return RegOutVisible(t.Name, uint32(d.Int), cat, argVisible), nil
+		}
 		return RegOutArgVisible(t.Name, uint32(d.Int), cat, qualify, argVisible), nil
 	}
 	switch t.Name {

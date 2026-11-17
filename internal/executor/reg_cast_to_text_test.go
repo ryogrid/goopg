@@ -256,9 +256,11 @@ func TestRegCastToTextSiblingAgreeQualify(t *testing.T) {
 	}
 
 	// pg_dump-style search_path='' (public OFF the path): qualify=true, so both
-	// paths schema-qualify the routine NAME.
+	// paths schema-qualify the routine NAME. The input is qualified too: with
+	// an empty path regprocedurein searches pg_catalog only, so the bare
+	// spelling is 42883 on PG 18.3 (M0149-0001h1a32).
 	ctx.GetSetting = func(name string) (string, bool) { return "", true }
-	rows = runQuery(t, ctx, `SELECT 'f_varbit(varbit)'::regprocedure::text`)
+	rows = runQuery(t, ctx, `SELECT 'public.f_varbit(varbit)'::regprocedure::text`)
 	castQualified := rows[0][0].StringValue()
 	selectQualified := RegOut("regprocedure", fvb[0].OID, ctx.Catalog,
 		!RegObjectSchemaVisible(ctx, "public"))
