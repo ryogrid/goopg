@@ -385,33 +385,21 @@ func evalExpr(e optimizer.Expr, row Row, ctx *Context) (Datum, error) {
 // keys()'s fktable/pktable columns) prints as a raw integer instead of the
 // relation name.
 func regclassOIDToName(ctx *Context, connDBOid uint32, oid uint32) string {
-	// InvalidOid (0) renders as "-", matching PG's regclassout. Without this
-	// guard a `reltoastrelid::regclass` for a table with no TOAST relation
-	// (reltoastrelid = 0) matches the first virtual relation whose OID is
-	// unset (also 0), e.g. information_schema.routines. M0118-0008
-	// (reindex-concurrently-toast probing).
-	if oid == 0 {
-		return "-"
+	// One regclassout for every path (Hard-won Rule #2): the shared renderer
+	// handles InvalidOid ("-"), tables, indexes and synthetic TOAST
+	// relations, a dangling OID's number, and — what this sibling used to
+	// skip — qualification by the relation's own schema visibility
+	// (RelationIsVisible): s40.p prints qualified when s40 is not on the
+	// search_path. M0149-0001h1a31.
+	// A context without the session's GUC hook cannot know its search_path;
+	// treat every schema as visible there rather than qualifying against the
+	// "$user", public default.
+	visible := func(sc string) bool { return RegObjectSchemaVisible(ctx, sc) }
+	if ctx.GetSetting == nil {
+		visible = func(string) bool { return true }
 	}
-	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-		if tbl, found := im.LookupTableByOID(oid, connDBOid); found && tbl != nil {
-			return tbl.Name
-		}
-		// Synthetic TOAST relation OIDs (parent OID + 100M) live only in the
-		// virtual pg_class builder, not c.tables, so reconstruct the
-		// schema-qualified pg_toast.pg_toast_<oid> name PG's regclassout
-		// would emit. M0118-0008 TOAST-exposure slice 2 (0118-0084).
-		if name, found := im.ToastRelName(oid, connDBOid); found {
-			return name
-		}
-	}
-	// Also resolve index OIDs to index names. M0097-0023.
-	for _, idx := range ctx.Catalog.AllIndexes(connDBOid) {
-		if idx.OID == oid {
-			return idx.Name
-		}
-	}
-	return strconv.FormatUint(uint64(oid), 10)
+	render := RegOutRendererVisible(ctx.Catalog, visible, connDBOid)
+	return render("regclass", oid)
 }
 
 func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) {
@@ -5687,6 +5675,18 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context
 			// (TestRegclassCastScopedToConnectionDBOid). Nil ctx keeps the empty
 			// variadic → DefaultDBOid default, byte-identical to pre-scoping.
 			connDBOid = []uint32{catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)}
+		}
+		if ctx != nil {
+			// reg*out qualifies by the OBJECT's own schema visibility
+			// (RelationIsVisible & co), not by whether public is on the path:
+			// s40.p renders qualified when s40 is not searched.
+			// M0149-0001h1a31.
+			visible := func(sc string) bool { return RegObjectSchemaVisible(ctx, sc) }
+			if ctx.GetSetting == nil {
+				visible = func(string) bool { return !regCastQualify(ctx) }
+			}
+			render := RegOutRendererVisible(cat, visible, connDBOid...)
+			return NewStringDatum(render(sourceType, uint32(d.Int))), nil
 		}
 		return NewStringDatum(RegOut(sourceType, uint32(d.Int), cat, regCastQualify(ctx), connDBOid...)), nil
 	}
@@ -15058,47 +15058,25 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		if !ok {
 			return NullDatum, nil
 		}
-		relName := partitionResolveRegclass(v, im)
-		if relName == "" {
+		oid, ok := partitionResolveRegclass(v, ctx)
+		if !ok {
 			return NullDatum, nil
 		}
-		// Try table first.
-		if tbl, ok2 := im.LookupTable(parser.ObjectName{Name: relName}); ok2 {
-			// Non-partitioned table (no PartitionKey) and not a partition child → NULL.
-			if len(tbl.PartitionKey) == 0 && tbl.PartitionParentOID == 0 {
-				return NullDatum, nil
-			}
-			// Walk up to root.
-			cur := tbl
-			visited := map[uint32]bool{}
-			for cur.PartitionParentOID != 0 && !visited[cur.OID] {
-				visited[cur.OID] = true
-				parent, ok3 := im.LookupTableByOID(cur.PartitionParentOID)
-				if !ok3 {
-					break
-				}
-				cur = parent
-			}
-			return NewStringDatum(cur.Name), nil
+		// OID-based walk shared with pg_partition_ancestors (M0149-0001h1a31):
+		// the root is the last ancestor; NULL outside any partition tree.
+		pt := partitionTree{im: im, dbOid: catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)}
+		var chain []Row
+		if tbl, found := im.LookupTableByOID(oid, pt.dbOid); found {
+			chain = pt.tableAncestors(tbl)
+		} else if idx, found := im.LookupIndexByOID(oid, pt.dbOid); found {
+			chain = pt.indexAncestors(idx)
 		}
-		// Try index.
-		if idx, ok2 := im.LookupIndex(parser.ObjectName{Name: relName}); ok2 {
-			if idx.PartitionParentOID == 0 && len(im.IndexPartitionChildren(idx.OID)) == 0 {
-				return NullDatum, nil
-			}
-			cur := idx
-			visited := map[uint32]bool{}
-			for cur.PartitionParentOID != 0 && !visited[cur.OID] {
-				visited[cur.OID] = true
-				parent, ok3 := im.LookupIndexByOID(cur.PartitionParentOID)
-				if !ok3 {
-					break
-				}
-				cur = parent
-			}
-			return NewStringDatum(cur.Name), nil
+		if len(chain) == 0 {
+			return NullDatum, nil
 		}
-		return NullDatum, nil
+		rootOID := uint32(chain[len(chain)-1][0].Int)
+		render := RegOutRendererVisible(ctx.Catalog, func(s string) bool { return RegObjectSchemaVisible(ctx, s) }, pt.dbOid)
+		return NewStringDatum(render("regclass", rootOID)), nil
 	case "satisfies_hash_partition":
 		// satisfies_hash_partition(tableoid, modulus, remainder, val...) → bool
 		// Full implementation: Jenkins Bob hash + hash_combine64. M0097-0027.

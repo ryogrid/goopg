@@ -12424,6 +12424,32 @@ verify each at HEAD when the task starts.
     718→717\); the rest unchanged \(indexing / foreign\_key now report
     42P01 for children an earlier failure never created — same count\).
   Movement: regress alter_table 718→717
+- [x] **M0149-0001h1a31 — pg\_partition\_tree / pg\_partition\_ancestors / pg\_partition\_root walk OIDs; regclassout qualifies by the relation's own schema visibility** \(filed 2026-11-18 by M0149-0001h1a30's ledger row, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: partfuncs.c takes a regclass and walks find\_all\_inheritors /
+    get\_partition\_ancestors by OID; regclassout qualifies unless
+    RelationIsVisible.
+  - Landed:
+    - operators\_pg\_partition\_tree.go rewritten OID-based: the argument
+      through regclassin \(search\_path\), parents from PartitionParentOID or
+      the live registry \(ATTACHed partitions\), detach-pending partitions
+      as one-node trees; pg\_partition\_root shares the walk and renders via
+      regclassout;
+    - regclassOIDToName \(the `<oid>::regclass` cast\) delegates to the
+      shared regOutShared renderer with per-object visibility — it returned
+      bare names and was a divergent sibling; the reg\* → text cast uses the
+      same per-object rule. A context with no GUC hook keeps the old
+      unqualified output.
+  - Tests: TestPartitionTreeByOIDAcrossSchemas; partition isolation specs
+    \(detach-concurrently-3 caught a first-cut regression on detach-pending
+    roots\), pg\_dump / psql / pg\_amcheck testport pass.
+  - Regress A/B vs HEAD over 22 cases: foreign\_key 803→796 \(inventory
+    updated\); the rest unchanged. stats\_ext now qualifies a stats object's
+    table in a \\dX whose search\_path excludes it — correct, but the row
+    should not be listed at all \(pg\_\*\_is\_visible are constant true,
+    ledgered\).
+  Movement: regress foreign_key 803→796
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

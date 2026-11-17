@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // TestPgClassOwnerAndPartitionedIndexRelkind pins two pg_class columns
@@ -123,5 +124,46 @@ func TestAttachAndRegclassFollowSearchPath(t *testing.T) {
 	err = runDDL(t, ctx, "ALTER TABLE sp1.spp ATTACH PARTITION nosuch FOR VALUES FROM (10) TO (20)")
 	if ee, ok := err.(*ExecError); !ok || ee.Code != "42P01" {
 		t.Errorf("ATTACH of a missing table: %v, want 42P01", err)
+	}
+}
+
+// TestPartitionTreeByOIDAcrossSchemas pins M0149-0001h1a31:
+// pg_partition_tree / pg_partition_ancestors / pg_partition_root walk OIDs,
+// so a hierarchy in a non-default schema (including an ATTACHed partition)
+// is found, and regclassout qualifies a relation whose schema is not on the
+// search_path.
+func TestPartitionTreeByOIDAcrossSchemas(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.GetSetting = func(name string) (string, bool) {
+		if name == "search_path" {
+			return "public", true
+		}
+		return "", false
+	}
+	for _, ddl := range []string{
+		"CREATE SCHEMA pt9",
+		"CREATE TABLE pt9.p (id int) PARTITION BY RANGE (id)",
+		"CREATE TABLE pt9.c1 PARTITION OF pt9.p FOR VALUES FROM (0) TO (10)",
+		"CREATE TABLE pt9.c2 (id int)",
+		"ALTER TABLE pt9.p ATTACH PARTITION pt9.c2 FOR VALUES FROM (10) TO (20)",
+	} {
+		if err := runDDL(t, ctx, ddl); err != nil {
+			t.Fatalf("%s: %v", ddl, err)
+		}
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+	p, _ := im.LookupTable(parser.ObjectName{Schema: "pt9", Name: "p"})
+	c2, _ := im.LookupTable(parser.ObjectName{Schema: "pt9", Name: "c2"})
+	pt := partitionTree{im: im, dbOid: catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)}
+	if rows := pt.tableTree(p); len(rows) != 3 {
+		t.Errorf("pg_partition_tree(pt9.p) rows = %d, want 3", len(rows))
+	}
+	anc := pt.tableAncestors(c2)
+	if len(anc) != 2 || uint32(anc[1][0].Int) != p.OID {
+		t.Errorf("pg_partition_ancestors(pt9.c2) = %+v, want c2, p", anc)
+	}
+	if got := regclassOIDToName(ctx, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid), p.OID); got != "pt9.p" {
+		t.Errorf("regclassout(pt9.p) off search_path = %q, want pt9.p", got)
 	}
 }
