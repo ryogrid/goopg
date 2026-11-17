@@ -2500,48 +2500,80 @@ func formatPgLSN(v uint64) string {
 //
 // M0097-0003.
 func isValidUUIDStr(s string) bool {
-	if len(s) == 38 && s[0] == '{' && s[37] == '}' {
-		s = s[1:37] // strip braces
+	_, ok := parseUUIDText(s)
+	return ok
+}
+
+// parseUUIDText is uuid_in's string_to_uuid (utils/adt/uuid.c): an optional
+// '{' ... '}' wrapper, then 16 hex byte pairs, each pair after an odd byte
+// index optionally followed by one '-' (not after the last). Every caller
+// that decides whether text is a uuid — input casts, storage, COPY,
+// comparisons — goes through here so they accept the same set.
+// M0149-0001h1a11.
+func parseUUIDText(src string) ([16]byte, bool) {
+	var out [16]byte
+	braces := false
+	if strings.HasPrefix(src, "{") {
+		src = src[1:]
+		braces = true
 	}
-	if len(s) == 32 {
-		// No-hyphen: all must be hex.
-		for _, c := range []byte(s) {
-			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-				return false
-			}
+	hexv := func(c byte) (byte, bool) {
+		switch {
+		case c >= '0' && c <= '9':
+			return c - '0', true
+		case c >= 'a' && c <= 'f':
+			return c - 'a' + 10, true
+		case c >= 'A' && c <= 'F':
+			return c - 'A' + 10, true
 		}
-		return true
+		return 0, false
 	}
-	if len(s) != 36 {
-		return false
-	}
-	for i, c := range []byte(s) {
-		switch i {
-		case 8, 13, 18, 23:
-			if c != '-' {
-				return false
-			}
-		default:
-			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-				return false
-			}
+	for i := 0; i < 16; i++ {
+		if len(src) < 2 {
+			return out, false
+		}
+		hi, ok1 := hexv(src[0])
+		lo, ok2 := hexv(src[1])
+		if !ok1 || !ok2 {
+			return out, false
+		}
+		out[i] = hi<<4 | lo
+		src = src[2:]
+		if len(src) > 0 && src[0] == '-' && i%2 == 1 && i < 15 {
+			src = src[1:]
 		}
 	}
-	return true
+	if braces {
+		if !strings.HasPrefix(src, "}") {
+			return out, false
+		}
+		src = src[1:]
+	}
+	return out, src == ""
+}
+
+// formatUUID is uuid_out: lowercase 8-4-4-4-12.
+func formatUUID(b [16]byte) string {
+	const h = "0123456789abcdef"
+	buf := make([]byte, 0, 36)
+	for i, v := range b {
+		if i == 4 || i == 6 || i == 8 || i == 10 {
+			buf = append(buf, '-')
+		}
+		buf = append(buf, h[v>>4], h[v&0xf])
+	}
+	return string(buf)
 }
 
 // normalizeUUIDStr converts a UUID in any accepted format to the canonical
 // lowercase xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx format. M0097-0003.
 func normalizeUUIDStr(s string) string {
-	s = strings.ToLower(s)
-	if len(s) == 38 && s[0] == '{' && s[37] == '}' {
-		s = s[1:37]
+	// Any form string_to_uuid accepts renders as uuid_out's canonical text;
+	// other input is returned lower-cased, as before (callers validate).
+	if b, ok := parseUUIDText(s); ok {
+		return formatUUID(b)
 	}
-	if len(s) == 32 {
-		// No-hyphen: insert hyphens at 8, 12, 16, 20.
-		return s[0:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:32]
-	}
-	return s
+	return strings.ToLower(s)
 }
 
 // uuidBytesFromCanonical packs the canonical lowercase-with-dashes rendering

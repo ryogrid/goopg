@@ -12038,6 +12038,27 @@ verify each at HEAD when the task starts.
     \(printtup.c SendRowDescriptionMessage\).
   - > **ESCALATION \(S2, wrong results for binary\-format clients\):** filed
     here; owner to place.
+- [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: uuid.c string\_to\_uuid. Braces are optional, and a hyphen may
+    follow any odd byte index except the last; the result is uuid\_out's
+    lowercase 8\-4\-4\-4\-12.
+  - goopg:
+    - evalCast had no uuid arm;
+    - isValidUUIDStr, uuidToBytes and normalizeUUIDStr each accepted only
+      the 32\-digit and canonical 36\-character forms. INSERT therefore
+      rejected `a0ee-bc99-…`, which PG accepts.
+
+    All of them now share parseUUIDText \(a string\_to\_uuid port\) and
+    formatUUID, and the cast raises 22P02 like uuid\_in.
+  - Test: TestParseUUIDTextPG.
+  - Regress A/B vs HEAD over 10 cases \(uuid, btree\_index, create\_index,
+    hash\_func, hash\_index, brin\_bloom, brin\_multi, gin, opr\_sanity,
+    type\_sanity\): no change. The rest of uuid's 21 lines are INSERT error
+    carets, EXPLAIN rendering of uuid constants without `::uuid`, and
+    uuidv7 timestamps.
+  Movement: none \(correctness: invalid uuid input rejected; PG\-accepted forms stored\)
 - [x] **M0149-0001h1a10 — CREATE / DROP ROLE with a doubled\-quote identifier: `"regress_""quoted"` registered the role `regress_`** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

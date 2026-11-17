@@ -6452,6 +6452,18 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			return Datum{}, err
 		}
 		return moneyDatum(c), nil
+	case "uuid":
+		// uuid_in: string_to_uuid, then the canonical uuid_out text.
+		// M0149-0001h1a11 ('x'::uuid used to come back unchanged).
+		if d.Kind != KindString {
+			return d, nil
+		}
+		b, ok := parseUUIDText(d.StringValue())
+		if !ok {
+			return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+				Message: fmt.Sprintf("invalid input syntax for type uuid: \"%s\"", d.StringValue())}
+		}
+		return NewStringDatum(formatUUID(b)), nil
 	case "aclitem":
 		// aclitemin: validate and canonicalise (M0149-0001h1a9).
 		if d.Kind != KindString {
@@ -21438,21 +21450,7 @@ func formatTypeOID(typeOID, typmod int64) string {
 
 // uuidToBytes parses a UUID string (any PG-accepted format) into 16 bytes.
 func uuidToBytes(s string) ([16]byte, bool) {
-	s = strings.ToLower(s)
-	if len(s) == 38 && s[0] == '{' && s[37] == '}' {
-		s = s[1:37]
-	}
-	var clean string
-	if len(s) == 32 {
-		clean = s
-	} else if len(s) == 36 && s[8] == '-' && s[13] == '-' && s[18] == '-' && s[23] == '-' {
-		clean = s[0:8] + s[9:13] + s[14:18] + s[19:23] + s[24:36]
-	} else {
-		return [16]byte{}, false
-	}
-	var b [16]byte
-	_, err := hex.Decode(b[:], []byte(clean))
-	return b, err == nil
+	return parseUUIDText(s) // string_to_uuid, shared with isValidUUIDStr
 }
 
 // genUUIDv4 generates a random RFC 4122 version-4 UUID.
