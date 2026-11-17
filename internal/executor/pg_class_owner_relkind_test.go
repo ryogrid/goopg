@@ -56,3 +56,35 @@ func TestPgClassOwnerAndPartitionedIndexRelkind(t *testing.T) {
 }
 
 func catalogIndexRelkindProbe() string { return catalog.IndexRelkind(nil) }
+
+// TestIndexPartitionsAreLinked pins M0149-0001h1a29: an index cloned onto a
+// new partition and a matching index on an ATTACHed table are partitions of
+// the parent index (pg_inherits row, relispartition), as DefineIndex /
+// AttachPartitionEnsureIndexes record them; an ATTACHed table is
+// relispartition too.
+func TestIndexPartitionsAreLinked(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	for _, ddl := range []string{
+		"CREATE TABLE lp (id int) PARTITION BY RANGE (id)",
+		"CREATE INDEX lpi ON lp (id)",
+		"CREATE TABLE lp1 PARTITION OF lp FOR VALUES FROM (0) TO (10)",
+		"CREATE TABLE lp2 (id int)",
+		"CREATE INDEX lp2i ON lp2 (id)",
+		"ALTER TABLE lp ATTACH PARTITION lp2 FOR VALUES FROM (10) TO (20)",
+		"CREATE TABLE lp3 (id int)",
+		"ALTER TABLE lp ATTACH PARTITION lp3 FOR VALUES FROM (20) TO (30)",
+	} {
+		if err := runDDL(t, ctx, ddl); err != nil {
+			t.Fatalf("%s: %v", ddl, err)
+		}
+	}
+	rows := runQueryRows(t, ctx, "SELECT count(*) FROM pg_catalog.pg_inherits")
+	if len(rows) != 1 || rows[0][0].Int != 6 {
+		t.Fatalf("pg_inherits rows = %+v, want 6 (3 tables + 3 indexes)", rows)
+	}
+	parts := runQueryRows(t, ctx, "SELECT count(*) FROM pg_catalog.pg_class WHERE relispartition")
+	if len(parts) != 1 || parts[0][0].Int != 6 {
+		t.Errorf("relispartition rows = %+v, want 6", parts)
+	}
+}

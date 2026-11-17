@@ -524,6 +524,14 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table, dbOid ...uint3
 		relfilenode = int64(tbl.OID)
 	}
 	isPartition := tbl.PartitionParentOID != 0
+	if !isPartition {
+		// ATTACH PARTITION registers the link without setting
+		// PartitionParentOID (catalog sibling: partitionParentsLocked).
+		// M0149-0001h1a29.
+		if im, ok := cat.(*catalog.InMemory); ok {
+			_, isPartition = im.PartitionParentOf(tbl.OID)
+		}
+	}
 	// relpersistence: 'u' for UNLOGGED tables, 't' for TEMP, 'p' for
 	// permanent. pg_dump keys `CREATE UNLOGGED TABLE` off relpersistence ==
 	// RELPERSISTENCE_UNLOGGED, so hardcoding 'p' silently demoted an UNLOGGED
@@ -735,7 +743,7 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index, dbOid 
 		NewBoolDatum(false),                   // relforcerowsecurity
 		NewBoolDatum(true),                    // relispopulated
 		NewStringDatum("n"),                   // relreplident
-		NewBoolDatum(false),                   // relispartition
+		NewBoolDatum(idx.PartitionParentOID != 0), // relispartition (M0149-0001h1a29)
 		NewIntDatum(0),                        // relrewrite
 		NewIntDatum(0),                        // relfrozenxid (InvalidTransactionId: indexes have no table AM)
 		NewIntDatum(0),                        // relminmxid

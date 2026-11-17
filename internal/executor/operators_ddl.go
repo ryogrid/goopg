@@ -6244,6 +6244,13 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 					idx.ColExprStrings[i] = s
 				}
 			}
+			// The clone is a partition of the parent index (DefineIndex's
+			// IndexSetParentIndex: pg_inherits row, relispartition), as the
+			// unique-index clone loop above already records. M0149-0001h1a29.
+			idx.PartitionParentOID = parentIdx.OID
+			if im, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {
+				im.RegisterIndexPartitionChild(parentIdx.OID, idx.OID)
+			}
 		}
 	}
 	// Inherit named CHECK constraints from parent (non-NoInherit only). M0097-0023.
@@ -10526,27 +10533,57 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// miss live duplicates. Only create when the child doesn't already
 			// have a matching index. M0097-0028.
 			for _, parentIdx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
-				if parentIdx.Method != "btree" || (!parentIdx.Primary && !parentIdx.Unique) {
+				if parentIdx.Method != "btree" {
 					continue
 				}
-				alreadyHas := false
+				// AttachPartitionEnsureIndexes (tablecmds.c): a child index
+				// matching the parent's (CompareIndexInfo — columns,
+				// uniqueness, expressions, predicate) that is not yet a
+				// partition of another index is ATTACHED to it
+				// (IndexSetParentIndex); otherwise a clone is built. goopg used
+				// to skip a match without linking it, and to ignore non-unique
+				// parent indexes entirely. M0149-0001h1a29.
+				var matched *catalog.Index
 				for _, childIdx := range o.ctx.Catalog.IndexesOnTable(childTbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
-					if len(childIdx.Columns) != len(parentIdx.Columns) {
+					if childIdx.PartitionParentOID != 0 || !attachIndexMatches(parentIdx, childIdx) {
 						continue
 					}
-					match := true
-					for k := range childIdx.Columns {
-						if !strings.EqualFold(childIdx.Columns[k], parentIdx.Columns[k]) {
-							match = false
-							break
+					matched = childIdx
+					break
+				}
+				if matched != nil {
+					matched.PartitionParentOID = parentIdx.OID
+					if im2, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {
+						im2.RegisterIndexPartitionChild(parentIdx.OID, matched.OID)
+					}
+					continue
+				}
+				if !parentIdx.Primary && !parentIdx.Unique {
+					nameCols := indexNameColumnsPtr(parentIdx.Columns, parentIdx.ColExprs)
+					cloneName := parser.ObjectName{Schema: childTbl.Schema, Name: o.autoIndexNameWithIncludes(childTbl, nameCols, nil, "idx")}
+					var colExprs []parser.Expr
+					if len(parentIdx.ColExprs) > 0 {
+						colExprs = make([]parser.Expr, len(parentIdx.ColExprs))
+						for i, ep := range parentIdx.ColExprs {
+							if ep != nil {
+								colExprs[i] = *ep
+							}
 						}
 					}
-					if match {
-						alreadyHas = true
-						break
+					if err := o.createBTreeIndex(act.Pos(), cloneName, childTbl, parentIdx.Columns, colExprs, false, false, false, nil, nil); err != nil {
+						return err
 					}
-				}
-				if alreadyHas {
+					if clone, ok2 := o.ctx.Catalog.LookupIndex(cloneName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok2 {
+						if parentIdx.HasPredicate {
+							clone.HasPredicate = parentIdx.HasPredicate
+							clone.Predicate = parentIdx.Predicate
+							clone.PredicateString = parentIdx.PredicateString
+						}
+						clone.PartitionParentOID = parentIdx.OID
+						if im2, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {
+							im2.RegisterIndexPartitionChild(parentIdx.OID, clone.OID)
+						}
+					}
 					continue
 				}
 				var childIdxName parser.ObjectName
@@ -29442,4 +29479,31 @@ func ApplySchemaDefaultACL(im *catalog.InMemory, schemaName string, dbOid uint32
 		owner = 10
 	}
 	im.ApplyDefaultACL(oid, owner, 0, catalog.DefaultACLObjTypeNamespace)
+}
+
+// attachIndexMatches is CompareIndexInfo's test for ATTACH PARTITION: same
+// key columns (and expression texts), same uniqueness / primary-ness and the
+// same predicate. M0149-0001h1a29.
+func attachIndexMatches(parent, child *catalog.Index) bool {
+	if child.Method != parent.Method || child.Unique != parent.Unique || child.Primary != parent.Primary ||
+		len(child.Columns) != len(parent.Columns) || child.HasPredicate != parent.HasPredicate ||
+		child.PredicateString != parent.PredicateString {
+		return false
+	}
+	for k := range child.Columns {
+		if !strings.EqualFold(child.Columns[k], parent.Columns[k]) {
+			return false
+		}
+		var ce, pe string
+		if k < len(child.ColExprStrings) {
+			ce = child.ColExprStrings[k]
+		}
+		if k < len(parent.ColExprStrings) {
+			pe = parent.ColExprStrings[k]
+		}
+		if ce != pe {
+			return false
+		}
+	}
+	return true
 }

@@ -12315,6 +12315,9 @@ verify each at HEAD when the task starts.
   - Resume: the routine registry \(catalog.Routines Create\) needs the
     RecordCatalogUndo treatment pg\_default\_acl got in M0149-0001h1a6 —
     undo the registration and the pg\_proc heap row on abort.
+  - 2026-11-18 \(h1a29\): CREATE SCHEMA inside a rolled-back transaction
+    also persists — the same class; scope the fix to transactional DDL in
+    general.
 - [x] **M0149-0001h1a26 — pg\_class.relowner is the creating role \(SET ROLE counts\); an index on a partitioned table is relkind 'I' from creation** \(filed 2026-11-18 by ranking psql's \\dP hunks, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12371,6 +12374,36 @@ verify each at HEAD when the task starts.
     122→119, indexing 299→282, insert 253→249 \(inventory updated\); the
     other 10 unchanged.
   Movement: regress psql 339→324, create_table 122→119, indexing 299→282, insert 253→249
+- [x] **M0149-0001h1a29 — index partitions are linked \(pg\_inherits, relispartition\) on PARTITION OF and ATTACH; an ATTACHed table is relispartition** \(filed 2026-11-18 by M0149-0001h1a28's ledger row, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: DefineIndex / IndexSetParentIndex record the clone as a partition
+    of the parent index; AttachPartitionEnsureIndexes attaches a matching
+    child index \(CompareIndexInfo\) or builds a clone, for every parent
+    index; pg\_inherits and relispartition cover attached partitions.
+  - Landed:
+    - the non-unique index clone at CREATE TABLE ... PARTITION OF records
+      PartitionParentOID and registers the child;
+    - ATTACH links a matching child index \(attachIndexMatches\) for every
+      btree parent index, and clones the non-unique ones \(was:
+      unique / primary only, and a match was skipped unlinked\);
+    - pg\_inherits and table relispartition read the live partition
+      registry \(partitionParentsLocked / PartitionParentOf\), because
+      ATTACH leaves PartitionParentOID 0; index relispartition from
+      PartitionParentOID, in both pg\_class builders.
+  - Findings, filed:
+    - h1a25 class: CREATE SCHEMA also survives ROLLBACK;
+    - ledger: ATTACH and `'x'::regclass` resolve unqualified names without
+      the session search\_path \(ATTACH then silently does nothing\);
+      an ATTACH inside BEGIN is not visible to its own session until
+      COMMIT; conparentid of cloned FKs \(foreign\_key +2\).
+  - Tests: TestIndexPartitionsAreLinked; partition isolation specs
+    \(concurrent attach, detach 1-4, fk-partitioned 1-2, key-update\) pass.
+  - Regress A/B vs HEAD over 14 cases: psql 324→306, indexing 282→241,
+    alter\_table 726→720, tablespace 172→171; foreign\_key 801→803 \(a \\d
+    FK listing now takes the partition branch and exposes the conparentid
+    gap\); the rest unchanged. Inventory updated.
+  Movement: regress psql 324→306, indexing 282→241, alter_table 732→718, tablespace 177→171, foreign_key 801→803
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

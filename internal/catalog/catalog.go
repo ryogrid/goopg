@@ -8190,6 +8190,7 @@ func (c *InMemory) PGIndexRowsForDBOid(dbOid uint32) [][]string {
 func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	partParents := c.partitionParentsLocked()
 	keys := make([]string, 0, len(c.ns(dbOid).tables))
 	for k := range c.ns(dbOid).tables {
 		keys = append(keys, k)
@@ -8255,6 +8256,10 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		}
 		isPartition := "f"
 		if t.PartitionParentOID != 0 {
+			isPartition = "t"
+		} else if _, ok := partParents[t.OID]; ok {
+			// ATTACH PARTITION registers the link without setting
+			// PartitionParentOID. M0149-0001h1a29.
 			isPartition = "t"
 		}
 		// Build relpartbound: "FOR VALUES ..." string for partition children.
@@ -8596,6 +8601,10 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		// (index_create's relkind choice, RELKIND_PARTITIONED_INDEX), with or
 		// without attached children yet; 'i' otherwise. M0149-0001h1a26.
 		hasIdxChildren := len(c.indexPartitionChildren[idx.OID]) > 0
+		idxIsPartition := "f"
+		if idx.PartitionParentOID != 0 {
+			idxIsPartition = "t"
+		}
 		idxRelkind := IndexRelkind(idx)
 		idxHasSubclass := "f"
 		if hasIdxChildren {
@@ -8652,7 +8661,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 			"f",                         // 24: relforcerowsecurity
 			"t",                         // 25: relispopulated
 			"n",                         // 26: relreplident
-			"f",                         // 27: relispartition
+			idxIsPartition,              // 27: relispartition (M0149-0001h1a29)
 			"0",                         // 28: relrewrite
 			"0",                         // 29: relfrozenxid
 			"1",                         // 30: relminmxid
@@ -16860,17 +16869,23 @@ func (c *InMemory) PGInheritsRowsForDBOid(dbOid uint32) [][]string {
 	defer c.mu.RUnlock()
 	var out [][]string
 	parentSeq := make(map[uint32]int)
+	partParentsInh := c.partitionParentsLocked()
 	for _, tbl := range c.ns(dbOid).tables {
 		if tbl.Virtual {
 			continue
 		}
-		// Partition children: one row per child → its partition parent.
-		if tbl.PartitionParentOID != 0 {
-			parentSeq[tbl.PartitionParentOID]++
-			seq := parentSeq[tbl.PartitionParentOID]
+		// Partition children: one row per child → its partition parent,
+		// whether created PARTITION OF or ATTACHed (M0149-0001h1a29).
+		parentOID := tbl.PartitionParentOID
+		if parentOID == 0 {
+			parentOID = partParentsInh[tbl.OID]
+		}
+		if parentOID != 0 {
+			parentSeq[parentOID]++
+			seq := parentSeq[parentOID]
 			out = append(out, []string{
 				fmt.Sprintf("%d", tbl.OID),
-				fmt.Sprintf("%d", tbl.PartitionParentOID),
+				fmt.Sprintf("%d", parentOID),
 				fmt.Sprintf("%d", seq),
 				"f",
 			})
@@ -17870,6 +17885,19 @@ func IndexRelkind(idx *Index) string {
 		return "I"
 	}
 	return "i"
+}
+
+// partitionParentsLocked maps each partition (created PARTITION OF or
+// ATTACHed) to its parent, from the live partitionChildren registry. Caller
+// holds c.mu. M0149-0001h1a29.
+func (c *InMemory) partitionParentsLocked() map[uint32]uint32 {
+	rev := make(map[uint32]uint32)
+	for parent, kids := range c.partitionChildren {
+		for _, k := range kids {
+			rev[k] = parent
+		}
+	}
+	return rev
 }
 
 // roleOIDLocked is RoleOID for a caller already holding c.mu.
