@@ -77,7 +77,12 @@ func (e *ExecError) Error() string {
 // slot.Get(col) without materializing a Row per emitted match.
 // oidToBuiltinTypeName converts a PostgreSQL built-in type OID to its canonical
 // type name (e.g. 16 → "boolean"). Returns "" if the OID is unknown.
+// Every pg_catalog type resolves through format_type_be's PG 18.3 spelling
+// first (M0149-0001h1a21); the switch below covers the rest.
 func oidToBuiltinTypeName(oid uint32) string {
+	if name, ok := catalog.BuiltinFormatTypeName(oid); ok {
+		return name
+	}
 	switch oid {
 	case 16:
 		return "boolean"
@@ -18176,6 +18181,13 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				}
 			}
 			name := formatTypeOID(typeOID, typmod)
+			if name == "???" && typmod < 0 {
+				// format_type_be over the full pg_catalog type set
+				// (M0149-0001h1a21); the switch above is a hand list.
+				if n, ok := catalog.BuiltinFormatTypeName(uint32(typeOID)); ok {
+					name = n
+				}
+			}
 			if name == "???" && ctx != nil && ctx.Catalog != nil {
 				// A user-defined type's pg_type OID is dynamically allocated,
 				// so formatTypeOID (built-ins only) returns the unknown

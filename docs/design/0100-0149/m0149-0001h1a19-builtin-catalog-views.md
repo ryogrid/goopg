@@ -48,9 +48,16 @@ following regprocout: an overloaded built-in name is shown as
 | pg\_attribute | 3161 | 5085 |
 | pg\_depend | 1725 | 2800 |
 
-`format_type` and `regtypeout` render many built-in OIDs (pseudo-types,
-range types) as `???` or a bare number. They need the full pg\_type seed,
-which lives in the initdb package and is not reachable from the executor.
+`format_type` and `regtypeout` used to render many built-in OIDs
+\(pseudo-types, range types, jsonb\) as `???` or a bare number. Since h1a21,
+the same generator also captures `format_type\(oid, NULL\)` for the 473
+pg\_catalog types into `builtinFormatTypeNames`:
+
+- `catalog.BuiltinFormatTypeName` is the first lookup in
+  `oidToBuiltinTypeName`, so every `::regtype` display path goes through it;
+- it is also `formatTypeOID`'s fallback for an untypmodded unknown OID.
+
+Both functions now match the oracle for every pg\_catalog type.
 
 The generic generator (`gen-pg-catalog-seed-rows.py`) takes a table name
 and its view column order, so another catalog is one more `TABLES` entry.

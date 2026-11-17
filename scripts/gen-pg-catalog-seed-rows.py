@@ -4,6 +4,7 @@
 pg_cast, pg_opfamily, pg_opclass, pg_amop and pg_amproc, rendered as each
 virtual view's text cells in its column order (catalog.go). SQL NULL is
 catalog.VirtualNull, booleans 't' / 'f', regproc columns numeric OIDs.
+Also format_type(oid, NULL) for every pg_catalog type (M0149-0001h1a21).
 Captured from a throwaway initdb whose superuser is "postgres".
 
 Usage: scripts/gen-pg-catalog-seed-rows.py | gofmt > internal/catalog/pg_catalog_seed_rows_generated.go
@@ -48,6 +49,14 @@ try:
                               "-d", "postgres", "-At", "-c", q], env=env, check=True, capture_output=True,
                              text=True).stdout
         results[var] = (table, cols, json.loads(out))
+    # format_type(oid, NULL) — what regtypeout / format_type_be print — for
+    # every pg_catalog type (always visible, so never schema-qualified).
+    q = ("select coalesce(json_agg(json_build_array(oid::int8, format_type(oid, NULL)) order by oid), '[]') "
+         "from pg_type where oid < 16384 and typnamespace = 11")
+    out = subprocess.run([os.path.join(bindir, "psql"), "-X", "-h", "127.0.0.1", "-p", port, "-U", "postgres",
+                          "-d", "postgres", "-At", "-c", q], env=env, check=True, capture_output=True,
+                         text=True).stdout
+    format_names = json.loads(out)
 finally:
     subprocess.run([os.path.join(bindir, "pg_ctl"), "-D", data, "-m", "immediate", "stop"], env=env,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -62,4 +71,9 @@ for var, table, cols in TABLES:
     for r in rows:
         lines.append("\t{" + ", ".join(cell(v) for v in r) + "},\n")
     lines.append("}\n")
+lines.append("\n// builtinFormatTypeNames is format_type(oid, NULL) for the %d pg_catalog types.\n" % len(format_names))
+lines.append("var builtinFormatTypeNames = map[uint32]string{\n")
+for oid, name in format_names:
+    lines.append("\t%d: %s,\n" % (oid, json.dumps(name)))
+lines.append("}\n")
 print("".join(lines), end="")

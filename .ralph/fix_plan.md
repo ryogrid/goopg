@@ -12223,7 +12223,7 @@ verify each at HEAD when the task starts.
   - Regress A/B vs HEAD over 18 cases: opr\_sanity 313→155 \(inventory
     315→155\), psql 601→511; the other 16 unchanged.
   Movement: regress opr_sanity 315→155, psql 601→511
-- [ ] **M0149-0001h1a21 — format\_type / regtypeout render many built-in types as ??? or a bare OID \(jsonb, anyrange, anyelement, int4range\)** \(filed 2026-11-17 by M0149-0001h1a20\)
+- [x] **M0149-0001h1a21 — format\_type / regtypeout render many built-in types as ??? or a bare OID \(jsonb, anyrange, anyelement, int4range\)** \(filed 2026-11-17 by M0149-0001h1a20, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a
   - Finding: psql \\dAo prints `@>\(3802,3802\)` for `@>\(jsonb,jsonb\)`,
@@ -12234,6 +12234,17 @@ verify each at HEAD when the task starts.
     name/category table to the catalog package\) and port
     format\_type\_extended \(utils/adt/format\_type.c\) over it, sharing
     it with regtypeout; A/B psql, opr\_sanity, type\_sanity.
+  - Landed: gen-pg-catalog-seed-rows.py also captures format\_type\(oid,
+    NULL\) for the 473 pg\_catalog types \(builtinFormatTypeNames\);
+    catalog.BuiltinFormatTypeName is oidToBuiltinTypeName's first lookup
+    \(every ::regtype path\) and formatTypeOID's untypmodded fallback.
+    `oid::regtype` and `format_type\(oid, NULL\)` now equal the oracle for
+    all 473.
+  - Tests: TestBuiltinTypeNamesFollowFormatTypeBe.
+  - Regress A/B vs HEAD over 19 cases: psql 510→504 \(inventory 511→505\),
+    opr\_sanity 149→137 \(inventory 155→146\), polymorphism 683→677
+    \(inventory 683→680\); 16 unchanged.
+  Movement: regress psql 511→505, opr_sanity 155→146, polymorphism 683→680
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

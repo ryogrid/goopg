@@ -94,3 +94,10 @@ func SeedPgOpclassRowCount() int  { return len(seedPgOpclassRows) }
 func SeedPgAmopRowCount() int     { return len(seedPgAmopRows) }
 func SeedPgAmprocRowCount() int   { return len(seedPgAmprocRows) }
 func SeedPgCastRowCount() int     { return len(seedPgCastRows) }
+
+// BuiltinFormatTypeName is format_type(oid, NULL) for a pg_catalog type, as a
+// PG 18.3 initdb prints it (regtypeout / format_type_be). M0149-0001h1a21.
+func BuiltinFormatTypeName(oid uint32) (string, bool) {
+	n, ok := builtinFormatTypeNames[oid]
+	return n, ok
+}
