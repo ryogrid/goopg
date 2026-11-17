@@ -301,7 +301,7 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone, by
 	// fall-through does. This must sit BEFORE the type-name switch: the switch
 	// has no reg* case, so a regrole OID would otherwise hit the default arm
 	// and render numerically.
-	if isRegIdentifierTypeName(t.Name) && d.Kind == KindInt {
+	if (isRegIdentifierTypeName(t.Name) || strings.EqualFold(t.Name, "regnamespace")) && d.Kind == KindInt {
 		// visible is the regprocedure arglist's per-arg visibility predicate
 		// (73rd slice, deferral row 1342); an empty variadic keeps RegOut's
 		// bare-arglist behavior (RegOut == RegOutArgVisible with a nil

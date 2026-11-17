@@ -645,56 +645,10 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		if strings.EqualFold(x.TargetType, "regproc") || strings.EqualFold(x.TargetType, "regprocedure") {
 			isProcedure := strings.EqualFold(x.TargetType, "regprocedure")
 			if v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
-				funcName := strings.TrimSpace(v.StringValue())
-				raw := funcName
-				// regprocedurein (regproc.c:244) splits the arg list off the name
-				// (parseNameAndArgTypes) before parsing; regprocin does not. Both
-				// feed the name through stringToQualifiedNameList, so a quoted
-				// routine name must be unquoted before the lookups, and the 42883
-				// keeps the RAW input (regprocin/regprocedurein's errmsg). This is
-				// the input half of RegOut's quote-emission (the 71st slice) — the
-				// two casts are sibling renderers and must agree (Hard-won Rule
-				// #2). M0119-0006 (72nd slice, deferral row 1341).
-				if isProcedure {
-					funcName = regprocedureNamePart(funcName)
-				}
-				schema, name, nameOK := splitRegQualifiedName(funcName)
-				if !nameOK {
-					return NullDatum, &ExecError{Code: "42602", Pos: x.Pos(), Message: "invalid name syntax"}
-				}
-				if rs := routineRegistry(ctx); rs != nil {
-					// Thread the connection's dbOid like regIdentifierInput's
-					// regproc/regprocedure arm does — an unscoped LookupByName
-					// resolves DefaultDBOid and leaks another database's
-					// same-named routine (deferral row 1348). Builtins fall
-					// through to the global pg_proc index below (pg_catalog is
-					// implicitly visible everywhere).
-					candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: name}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
-					if len(candidates) > 0 {
-						return NewIntDatum(int64(candidates[0].OID)), nil
-					}
-				}
-				// Not a user-created CREATE FUNCTION routine — fall back to the
-				// curated builtin pg_proc table (the same two-tier lookup
-				// resolveOpClassFunction uses for CREATE OPERATOR CLASS's own
-				// FUNCTION clause), so `'int4eq'::regproc` resolves like real PG
-				// instead of erroring on any bare builtin name. M0119-0006
-				// (005_opclass_damage UPDATE-path prerequisite).
-				if bp, found := catalog.LookupBuiltinProc(name); found {
-					return NewIntDatum(int64(bp.OID)), nil
-				}
-				// CREATE AGGREGATE routines never land in the Routines()
-				// registry (they live in their own userAggregates map — see
-				// InMemory.RegisterUserAggregate) even though
-				// writeAggregateCatalogRows gives them a real pg_proc heap
-				// row with prokind='a'. Sibling of regIdentifierInput's
-				// identical fallback (Hard-won Rule #2) — without it
-				// `'myavg'::regproc` misses despite the pg_proc row being
-				// visible to a plain SELECT. M0134-0108.
-				if agg, ok := ctx.Catalog.LookupUserAggregateByName(name); ok {
-					return NewIntDatum(int64(agg.OID)), nil
-				}
-				return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %q does not exist", raw)}
+				// One input port for both forms (Hard-won Rule #2): the cast
+				// and the regproc()/regprocedure() call share regIdentifierInput.
+				_ = isProcedure
+				return regIdentifierInput(v, strings.ToLower(x.TargetType), ctx, x.Pos())
 			}
 			// An OID input (oid→regproc/regprocedure) renders via
 			// regprocout/regprocedureout: InvalidOid (0) becomes "-", matching
@@ -971,14 +925,14 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 				return NewStringDatum(result), nil
 			}
 		}
-		if strings.EqualFold(x.TargetType, "regrole") && v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
+		if (strings.EqualFold(x.TargetType, "regrole") || strings.EqualFold(x.TargetType, "regnamespace")) && v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
 			// regrolein: resolve the (possibly quoted) role name to its OID
 			// (42704 on a miss, '-' is InvalidOid, digits are an OID) through
 			// the shared reg* input port. The cast used to return the text
 			// itself, so 'nosuch'::regrole succeeded and ::oid on the result
 			// failed. The OID datum renders as the role name on output
 			// (regroleout). M0149-0001h1a12.
-			return regIdentifierInput(v, "regrole", ctx, x.Pos())
+			return regIdentifierInput(v, strings.ToLower(x.TargetType), ctx, x.Pos())
 		}
 		if strings.EqualFold(x.TargetType, "regclass") && ctx != nil && ctx.Catalog != nil {
 			// Scope every lookup below to the connection's own database
@@ -5756,7 +5710,7 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context
 	// resolved name. regOut degrades to "-" for OID 0 and to the numeric OID for a
 	// dangling/nil-catalog object, unchanged. `char` (CHAROID) is deliberately
 	// excluded from the targets (charin/charout first-byte semantics).
-	if isRegIdentifierTypeName(sourceType) && isStringTargetType(targetType) && d.Kind == KindInt {
+	if (isRegIdentifierTypeName(sourceType) || strings.EqualFold(sourceType, "regnamespace")) && isStringTargetType(targetType) && d.Kind == KindInt {
 		var cat catalog.Catalog
 		var connDBOid []uint32
 		if ctx != nil {
@@ -13611,6 +13565,11 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			case "aclitem":
 				_, aerr := aclitemIn(v, ctx) // aclitemin (M0149-0001h1a9)
 				return NewBoolDatum(aerr == nil), nil
+			case "regclass", "regtype", "regrole", "regnamespace", "regcollation", "regproc", "regprocedure":
+				// the reg* input functions with a soft error context
+				// (M0149-0001h1a13)
+				d, rerr := regIdentifierInput(NewStringDatum(v), t, ctx, 0)
+				return NewBoolDatum(rerr == nil && d.Kind == KindInt), nil
 			case "tid":
 				_, _, ok := parseTidInput(v)
 				return NewBoolDatum(ok), nil
@@ -15416,13 +15375,11 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			!tbl.Temp && !tbl.Unlogged && tbl.OID >= 16384), nil
 	case "pg_proc":
 		return NullDatum, nil
-	case "regproc", "regprocedure", "regclass", "regtype", "regnamespace":
-		// Type cast functions. For regclass specifically, resolve a
-		// text relation name to the table's numeric OID via the
-		// catalog (matches PG semantics post M0103-0008 rung 16,
-		// after pg_class.oid was flipped from text-name to numeric).
-		// Numeric inputs pass through. Other reg* casts remain
-		// stubs returning the argument as-is.
+	case "regproc", "regprocedure", "regclass", "regtype", "regnamespace", "regrole", "regcollation":
+		// A one-argument call named after a type is a cast
+		// (func_get_detail's FUNCDETAIL_COERCION): regrole('x') is
+		// 'x'::regrole. Text goes through the shared reg* input port, with
+		// the error position at the argument. M0149-0001h1a13.
 		if len(x.Args) != 1 {
 			return NullDatum, nil
 		}
@@ -15430,22 +15387,8 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		if err != nil || v.IsNull() {
 			return v, err
 		}
-		if name == "regclass" && v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
-			s := v.StringValue()
-			// Shared SplitIdentifierString port (sibling of the CastExpr arm and
-			// regIdentifierInput): a quoted relation name unquotes before the
-			// lookup, a syntax error raises regclassin's 42602. M0119-0006
-			// (72nd slice).
-			schema, rel, nameOK := splitRegQualifiedName(s)
-			if !nameOK {
-				return NullDatum, &ExecError{Code: "42602", Pos: x.Pos(), Message: "invalid name syntax"}
-			}
-			// Scoped to the connection's own dbOid — see the CastExpr
-			// regclass arm's identical fix (M0122-0007 4e follow-up 33).
-			tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Schema: schema, Name: rel}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
-			if ok && tbl != nil {
-				return NewIntDatum(int64(tbl.OID)), nil
-			}
+		if v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
+			return regIdentifierInput(v, name, ctx, x.Args[0].Pos())
 		}
 		return v, nil
 
@@ -18545,7 +18488,20 @@ case "pg_char_to_encoding":
 	// against the stored *acl column. M0110-0001 / DU-002 slice 2.
 	case "acldefault":
 		return evalAclDefault(x, slot, ctx)
-	case "to_regclass", "to_regtype", "to_regrole", "to_regcollation", "to_regproc", "to_regprocedure":
+	case "to_regtypemod":
+		// to_regtypemod(text): parseTypeString's typmod, NULL when the type
+		// does not resolve. The grammar's implicit lengths apply to the
+		// unquoted keywords: bit is bit(1), char / character is character(1).
+		// M0149-0001h1a13.
+		if len(x.Args) != 1 {
+			return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: "function to_regtypemod requires 1 argument"}
+		}
+		v, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || v.IsNull() {
+			return NullDatum, err
+		}
+		return toRegTypmod(v.StringValue(), ctx), nil
+	case "to_regclass", "to_regtype", "to_regrole", "to_regcollation", "to_regproc", "to_regprocedure", "to_regnamespace":
 		// to_reg*(text): the type's input function with a soft error context
 		// — NULL instead of an error, for a missing object and (PG 16+) for
 		// bad syntax alike (regproc.c to_regclass & co). M0149-0001h1a12.
@@ -22612,4 +22568,34 @@ func padOuterRow(row Row, pad int) Row {
 	}
 	copy(out[pad:], row)
 	return out
+}
+
+// toRegTypmod is to_regtypemod: resolve the type through regtypein and
+// encode its parenthesised modifiers with the type's typmodin (pgAttTypmod).
+func toRegTypmod(s string, ctx *Context) Datum {
+	base := strings.TrimSpace(s)
+	var args []int64
+	if open := strings.IndexByte(base, '('); open > 0 && strings.HasSuffix(base, ")") {
+		for _, a := range strings.Split(base[open+1:len(base)-1], ",") {
+			n, err := strconv.ParseInt(strings.TrimSpace(a), 10, 64)
+			if err != nil {
+				return NullDatum
+			}
+			args = append(args, n)
+		}
+	}
+	d, err := regIdentifierInput(NewStringDatum(s), "regtype", ctx, 0)
+	if err != nil || d.Kind != KindInt {
+		return NullDatum
+	}
+	oid := uint32(d.Int)
+	if len(args) == 0 {
+		switch strings.ToLower(base) {
+		case "bit":
+			args = []int64{1}
+		case "char", "character":
+			args = []int64{1}
+		}
+	}
+	return NewIntDatum(pgAttTypmod(oid, args))
 }

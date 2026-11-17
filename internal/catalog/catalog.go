@@ -24556,6 +24556,12 @@ func (e *RangeTypeOptionError) Error() string { return e.Message }
 // Matching is case-sensitive, mirroring real PostgreSQL identifier semantics
 // (`collation = "C"` requires the exact case; there is no unquoted `c`
 // built-in). DU-002 (M0110-0001, slice 429 follow-up sub-item (a)).
+// BuiltinCollationOIDByName is builtinCollationOIDByName for callers outside
+// the package (regcollationin's pg_catalog-qualified lookup).
+func BuiltinCollationOIDByName(name string) (uint32, bool) {
+	return builtinCollationOIDByName(name)
+}
+
 func builtinCollationOIDByName(name string) (uint32, bool) {
 	switch name {
 	case "default":

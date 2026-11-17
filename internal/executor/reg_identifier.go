@@ -335,6 +335,16 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 		// text's OID and the 42704 miss-path below would be dead. The established
 		// idiom (castKeyTypeName, pgTypeofOIDForName) treats the fallback as a
 		// miss unless the name really is `text`.
+		//
+		// parseTypeString accepts a type modifier and ignores it for regtypein
+		// (`'varchar(32)'::regtype` is character varying); drop a trailing
+		// parenthesised clause, keeping what follows it (`timestamp(4) with
+		// time zone`). M0149-0001h1a13.
+		if open := strings.IndexByte(name, '('); open > 0 && !strings.ContainsRune(name[:open], '"') {
+			if close := strings.IndexByte(name[open:], ')'); close > 0 {
+				name = strings.TrimSpace(strings.TrimSpace(name[:open]) + " " + strings.TrimSpace(name[open+close+1:]))
+			}
+		}
 		schema, typeName, nameOK := splitRegQualifiedName(name)
 		if !nameOK {
 			return NullDatum, &ExecError{Code: "42602", Pos: pos, Message: "invalid name syntax"}
@@ -408,6 +418,24 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 		if bp, found := catalog.LookupBuiltinProc(fn); found {
 			return NewIntDatum(int64(bp.OID)), nil
 		}
+		// The full pg_proc.dat seed (M0149-0001h1a13): regprocedurein matches
+		// the exact signature (LookupFuncWithArgs over the parsed arg types);
+		// regprocin needs a unique name (42725 "more than one function named").
+		if schema == "" || strings.EqualFold(schema, "pg_catalog") {
+			if strings.EqualFold(typeName, "regprocedure") {
+				if args, ok := regprocedureArgTypes(raw, ctx); ok {
+					if oid, found := catalog.LookupProcForNode(strings.ToLower(fn), args); found {
+						return NewIntDatum(int64(oid)), nil
+					}
+				}
+			} else if oid, found := catalog.LookupBuiltinProcByProname(fn); found {
+				if len(catalog.BuiltinProcSignatures(fn)) > 1 {
+					return NullDatum, &ExecError{Code: "42725", Pos: pos,
+						Message: fmt.Sprintf("more than one function named %q", raw)}
+				}
+				return NewIntDatum(int64(oid)), nil
+			}
+		}
 		// CREATE AGGREGATE routines never land in the Routines() registry
 		// (they live in their own userAggregates map — see
 		// InMemory.RegisterUserAggregate) even though writeAggregateCatalogRows
@@ -440,6 +468,21 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 		}
 		return NullDatum, &ExecError{Code: "42704", Pos: pos,
 			Message: fmt.Sprintf("role %q does not exist", roleName)}
+	case "regnamespace":
+		// regnamespacein (regproc.c): a single identifier, then
+		// get_namespace_oid(name, false) — 3F000 "schema \"%s\" does not exist"
+		// with the parsed (case-folded or quoted) name. M0149-0001h1a13.
+		segs, nameOK := splitRegIdentifiers(name)
+		if !nameOK || len(segs) != 1 {
+			return NullDatum, &ExecError{Code: "42602", Pos: pos, Message: "invalid name syntax"}
+		}
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			if oid := im.SchemaOID(segs[0], catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)); oid != 0 {
+				return NewIntDatum(int64(oid)), nil
+			}
+		}
+		return NullDatum, &ExecError{Code: "3F000", Pos: pos,
+			Message: fmt.Sprintf("schema \"%s\" does not exist", segs[0])}
 	case "regcollation":
 		// regcollationin (regproc.c:1026): possibly schema-qualified; a bare
 		// name resolves builtin-then-user through the search path
@@ -459,6 +502,10 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 				if uc := im.FindCollation(coll, schema, ctx.CurrentDatabaseOid); uc != nil {
 					oid = uc.OID
 				}
+			}
+			// The seeded collations live in pg_catalog.
+			if oid == 0 && strings.EqualFold(schema, "pg_catalog") {
+				oid, _ = catalog.BuiltinCollationOIDByName(coll)
 			}
 		} else if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 			oid = im.CollationOIDByName(coll)
@@ -698,6 +745,14 @@ func regOutShared(typeName string, oid uint32, cat catalog.Catalog, qualify func
 		}
 	case "regtype":
 		return RegtypeName(cat, oid, qualify)
+	case "regnamespace":
+		// regnamespaceout (regproc.c): quote_identifier(schema name), the
+		// OID itself for a dangling one. M0149-0001h1a13.
+		if hasIM {
+			if n := im.SchemaNameForOID(oid); n != "" {
+				return pgQuoteIdent(n)
+			}
+		}
 	case "regrole":
 		if hasIM {
 			// regroleout (regproc.c:1609) quote_identifiers the REAL role name
@@ -835,4 +890,27 @@ func isRegIdentifierTypeName(name string) bool {
 		return true
 	}
 	return false
+}
+
+// regprocedureArgTypes parses the "(type, ...)" part of a regprocedure input
+// and resolves each argument through regtypein; ok is false when the list is
+// absent or a type does not resolve.
+func regprocedureArgTypes(s string, ctx *Context) ([]uint32, bool) {
+	open := strings.IndexByte(s, '(')
+	if open < 0 || !strings.HasSuffix(strings.TrimSpace(s), ")") {
+		return nil, false
+	}
+	inner := strings.TrimSpace(strings.TrimSpace(s)[open+1 : len(strings.TrimSpace(s))-1])
+	if inner == "" {
+		return []uint32{}, true
+	}
+	var out []uint32
+	for _, a := range splitTopLevelCommas(inner) {
+		d, err := regIdentifierInput(NewStringDatum(strings.TrimSpace(a)), "regtype", ctx, 0)
+		if err != nil || d.Kind != KindInt {
+			return nil, false
+		}
+		out = append(out, uint32(d.Int))
+	}
+	return out, true
 }

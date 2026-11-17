@@ -17430,7 +17430,12 @@ func exprType(e Expr) catalog.Type {
 			"has_column_privilege", "has_any_column_privilege", "has_sequence_privilege",
 			"has_function_privilege", "has_type_privilege", "has_largeobject_privilege":
 			return catalog.Type{Name: "bool"} // M0149-0001h / h1 / h1a
-		case "to_regclass", "to_regtype", "to_regrole", "to_regcollation", "to_regproc", "to_regprocedure":
+		case "to_regtypemod":
+			return catalog.Type{Name: "int4"} // M0149-0001h1a13
+		case "regproc", "regprocedure", "regclass", "regtype", "regnamespace", "regrole", "regcollation":
+			// a one-argument call named after a type is that cast
+			return catalog.Type{Name: strings.TrimPrefix(strings.ToLower(x.Name), "pg_catalog.")}
+		case "to_regclass", "to_regtype", "to_regrole", "to_regcollation", "to_regproc", "to_regprocedure", "to_regnamespace":
 			return catalog.Type{Name: strings.TrimPrefix(strings.TrimPrefix(strings.ToLower(x.Name), "pg_catalog."), "to_")} // M0149-0001h1a12
 		case "lo_create", "lo_creat", "lo_from_bytea", "lo_import":
 			return catalog.Type{Name: "oid"} // M0149-0001h1a

@@ -12058,6 +12058,29 @@ verify each at HEAD when the task starts.
     288→197, update 274→267, constraints 17→16, insert 254→253 \(inventory
     updated\); the other 24 unchanged.
   Movement: regress privileges 576→553, regproc 288→197, update 274→267, constraints 17→16, insert 254→253
+- [x] **M0149-0001h1a13 — `'pg_catalog'::regnamespace`, the reg\* function-call forms, to\_regtypemod / to\_regnamespace, and builtin names in regprocin / regprocedurein** \(filed 2026-11-17 by M0149-0001h1a12, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG:
+    - regproc.c regnamespacein, regprocin \(42725 when the name is not
+      unique\), regprocedurein \(exact signature\) and regcollationin;
+    - to\_regtypemod and to\_regnamespace; pg\_input\_is\_valid /
+      pg\_input\_error\_info over the reg types.
+  - Landed:
+    - reg\_identifier.go: a regnamespace arm \(3F000 / 42602\) and output;
+      regproc / regprocedure fall back to the full pg\_proc seed; a
+      pg\_catalog-qualified seeded collation resolves; a regtype input with
+      a typmod clause resolves the base type;
+    - the regproc / regprocedure cast shares regIdentifierInput with the
+      function form; regclass\(\) / regtype\(\) / regnamespace\(\) / regrole\(\)
+      / regcollation\(\) calls exist;
+    - to\_regtypemod and to\_regnamespace; soft-error arms for the reg types.
+  - Tests: TestRegnamespaceAndRegprocInput.
+  - Regress A/B vs HEAD over 13 cases: regproc 197→72, misc\_sanity 15→7
+    \(inventory updated\); type\_sanity and misc\_sanity now run queries that
+    errored before and show catalog-seed gaps \(ledger row\); the other 11
+    unchanged.
+  Movement: regress regproc 197→72, misc_sanity 15→7
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

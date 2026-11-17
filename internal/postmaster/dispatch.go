@@ -4376,7 +4376,7 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 			return append(dst, array.ByteaOutStyled(d.BytesValue(), mode)...)
 		}
 		return d.AppendValueText(dst)
-	case "regclass", "regproc", "regprocedure", "regtype", "regrole", "regcollation":
+	case "regclass", "regproc", "regprocedure", "regtype", "regrole", "regcollation", "regnamespace":
 		// OID values of the reg* family display as the object's name
 		// (regclassout/regprocout/regprocedureout/regtypeout/regroleout/
 		// regcollationout) — a direct SELECT of a reg* column, pg_authid.rolname,
