@@ -228,12 +228,13 @@ func TestRegInputSyntaxErrors(t *testing.T) {
 		}
 	}
 
-	// The regprocedure arm strips `(…)` FIRST, so a mismatched quote inside the
-	// NAME part is still 42602 — the strip must not hide it.
+	// parseNameAndArgTypes scans for an UNQUOTED left paren first: with the
+	// quote left open, the '(' is inside it, so PG 18.3 answers 22P02
+	// "expected a left parenthesis" (verified on the oracle), not 42602.
 	if _, err := regIdentifierInput(NewStringDatum(`"MyFunc(integer)`), "regprocedure", ctx, 0); err == nil {
-		t.Error("regIdentifierInput(\"MyFunc(integer), regprocedure) should raise 42602")
-	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "42602" {
-		t.Errorf("regIdentifierInput(\"MyFunc(integer), regprocedure) err = %v, want 42602", err)
+		t.Error("regIdentifierInput(\"MyFunc(integer), regprocedure) should raise 22P02")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "22P02" {
+		t.Errorf("regIdentifierInput(\"MyFunc(integer), regprocedure) err = %v, want 22P02", err)
 	}
 }
 

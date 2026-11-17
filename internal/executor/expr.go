@@ -727,75 +727,21 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			return v, nil
 		}
 		if strings.EqualFold(x.TargetType, "regoper") || strings.EqualFold(x.TargetType, "regoperator") {
-			// An OID input renders via regoperout/regoperatorout: InvalidOid
-			// (0) becomes the literal "0" (unlike regproc/regtype's "-" —
-			// regproc.c's regoperout/regoperatorout both special-case
-			// InvalidOid to "0"). regoperator additionally renders the
-			// (lefttype,righttype) pair ("NONE" for a missing/unary side,
-			// format_operator) so dumpOpclass/dumpOpfamily's
-			// amopopr::pg_catalog.regoperator cast resolves to a real name
-			// instead of a bare OID. Only user-defined operators are
-			// resolvable (goopg has no builtin-operator catalog — deferred,
-			// see the ledger). DU-002 (M0119-0004) slice 411.
-			// A `'name(left,right)'::regoperator` STRING input is the reverse
-			// direction — regoperatorin (regproc.c) — and must resolve to the
-			// operator's numeric OID (not a rendered name string) so
-			// `WHERE objid = '===(bool,bool)'::regoperator` compares
-			// correctly against an oid-typed column; mirrors the `regclass`
-			// CastExpr arm's identical asymmetry (KindInt to name string,
-			// KindString to raw OID), confirmed against a live PG 18.3 oracle
-			// via alter_operator.sql. Only the 2-arg `name(a,b)` shape is
-			// handled (regoperatorNameAndArgs) — a bare name with no parens
-			// falls through to the unresolved `return v, nil` below
-			// unchanged, same as before this fix. `regoper` (no arg list at
-			// all) is NOT handled here; it stays on the pre-fix pass-through
-			// path — a bare-name lookup would still need ambiguity detection
-			// this slice doesn't add. M0134-0089.
-			if v.Kind == KindString && strings.EqualFold(x.TargetType, "regoperator") && ctx != nil && ctx.Catalog != nil {
-				raw := strings.TrimSpace(v.StringValue())
-				if oid, perr := strconv.ParseUint(raw, 10, 32); perr == nil {
-					return NewIntDatum(int64(oid)), nil
-				}
-				if name, leftType, rightType, ok := regoperatorNameAndArgs(raw); ok {
-					if im, ok2 := ctx.Catalog.(*catalog.InMemory); ok2 {
-						var leftOID, rightOID uint32
-						if leftType != "" {
-							leftOID = catalog.TypeNameToOID(leftType)
-						}
-						if rightType != "" {
-							rightOID = catalog.TypeNameToOID(rightType)
-						}
-						if op, found := im.LookupUserOperatorByNameAndTypeOIDs(name, leftOID, rightOID); found {
-							return NewIntDatum(int64(op.OID)), nil
-						}
-					}
-					if bop, found := catalog.LookupBuiltinOperator(name, leftType, rightType); found {
-						return NewIntDatum(int64(bop.OID)), nil
-					}
-					return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("operator does not exist: %s", raw)}
-				}
+			// regoperin / regoperatorin on text, regoperout /
+			// regoperatorout on an OID — the shared port the regoper() /
+			// to_regoper() forms and the output paths use. M0149-0001h1a14.
+			if ctx == nil || ctx.Catalog == nil {
+				return v, nil
 			}
-			if v.Kind == KindInt {
-				oid := v.Int
-				if oid == 0 {
-					return NewStringDatum("0"), nil
+			isOperator := strings.EqualFold(x.TargetType, "regoperator")
+			switch v.Kind {
+			case KindString:
+				return regIdentifierInput(v, strings.ToLower(x.TargetType), ctx, x.Pos())
+			case KindInt:
+				if isOperator {
+					return NewStringDatum(regoperatorOut(uint32(v.Int), ctx)), nil
 				}
-				if ctx != nil && ctx.Catalog != nil {
-					if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-						if strings.EqualFold(x.TargetType, "regoperator") {
-							if schema, sig, found := im.RegoperatorNameAndSchema(uint32(oid)); found {
-								if !RegObjectSchemaVisible(ctx, schema) {
-									return NewStringDatum(schema + "." + sig), nil
-								}
-								return NewStringDatum(sig), nil
-							}
-						} else if op := im.LookupUserOperatorByOID(uint32(oid)); op != nil {
-							return NewStringDatum(op.Name), nil
-						} else if bop, found := catalog.LookupBuiltinOperatorByOID(uint32(oid)); found {
-							return NewStringDatum(bop.Name), nil
-						}
-					}
-				}
+				return NewStringDatum(regoperOut(uint32(v.Int), ctx)), nil
 			}
 			return v, nil
 		}
@@ -5710,7 +5656,7 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context
 	// resolved name. regOut degrades to "-" for OID 0 and to the numeric OID for a
 	// dangling/nil-catalog object, unchanged. `char` (CHAROID) is deliberately
 	// excluded from the targets (charin/charout first-byte semantics).
-	if (isRegIdentifierTypeName(sourceType) || strings.EqualFold(sourceType, "regnamespace")) && isStringTargetType(targetType) && d.Kind == KindInt {
+	if isRegIdentifierTypeName(sourceType) && isStringTargetType(targetType) && d.Kind == KindInt {
 		var cat catalog.Catalog
 		var connDBOid []uint32
 		if ctx != nil {
@@ -13565,7 +13511,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			case "aclitem":
 				_, aerr := aclitemIn(v, ctx) // aclitemin (M0149-0001h1a9)
 				return NewBoolDatum(aerr == nil), nil
-			case "regclass", "regtype", "regrole", "regnamespace", "regcollation", "regproc", "regprocedure":
+			case "regclass", "regtype", "regrole", "regnamespace", "regcollation", "regproc", "regprocedure", "regoper", "regoperator":
 				// the reg* input functions with a soft error context
 				// (M0149-0001h1a13)
 				d, rerr := regIdentifierInput(NewStringDatum(v), t, ctx, 0)
@@ -15375,7 +15321,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			!tbl.Temp && !tbl.Unlogged && tbl.OID >= 16384), nil
 	case "pg_proc":
 		return NullDatum, nil
-	case "regproc", "regprocedure", "regclass", "regtype", "regnamespace", "regrole", "regcollation":
+	case "regproc", "regprocedure", "regclass", "regtype", "regnamespace", "regrole", "regcollation", "regoper", "regoperator":
 		// A one-argument call named after a type is a cast
 		// (func_get_detail's FUNCDETAIL_COERCION): regrole('x') is
 		// 'x'::regrole. Text goes through the shared reg* input port, with
@@ -18501,7 +18447,7 @@ case "pg_char_to_encoding":
 			return NullDatum, err
 		}
 		return toRegTypmod(v.StringValue(), ctx), nil
-	case "to_regclass", "to_regtype", "to_regrole", "to_regcollation", "to_regproc", "to_regprocedure", "to_regnamespace":
+	case "to_regclass", "to_regtype", "to_regrole", "to_regcollation", "to_regproc", "to_regprocedure", "to_regnamespace", "to_regoper", "to_regoperator":
 		// to_reg*(text): the type's input function with a soft error context
 		// — NULL instead of an error, for a missing object and (PG 16+) for
 		// bad syntax alike (regproc.c to_regclass & co). M0149-0001h1a12.

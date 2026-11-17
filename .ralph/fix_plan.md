@@ -12081,6 +12081,30 @@ verify each at HEAD when the task starts.
     errored before and show catalog-seed gaps \(ledger row\); the other 11
     unchanged.
   Movement: regress regproc 197→72, misc_sanity 15→7
+- [x] **M0149-0001h1a14 — regoper / regoperator inputs and to\_regoper / to\_regoperator over the full pg\_operator seed; regprocedurein syntax errors** \(filed 2026-11-17 by M0149-0001h1a13, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: regproc.c regoperin \(parseNumericOid, OpernameGetCandidates,
+    42883 / 42725\), regoperatorin \(parseNameAndArgTypes with NONE, 42P02
+    missing argument, 54023 too many arguments, OpernameGetOprid\),
+    regoperout / regoperatorout \(format\_operator\).
+  - Landed:
+    - catalog: name / OID indexes over PGOperatorAllEntries and
+      InMemory.UserOperatorsByName;
+    - executor regoper\_input.go: regoperIn / regoperatorIn /
+      regParseNameAndArgTypes / regoperOut / regoperatorOut, reached from
+      regIdentifierInput, the CastExpr arm \(its curated-table copy is
+      gone\), the regoper\(\) / regoperator\(\) / to\_regoper\(\) /
+      to\_regoperator\(\) forms, the soft-error arms and regOutShared;
+    - isRegIdentifierTypeName now includes regnamespace / regoper /
+      regoperator, so column coercion and COPY agree with the cast;
+    - regprocedurein reports parseNameAndArgTypes' 22P02 syntax errors.
+  - Tests: TestRegoperInputOutput; TestRegInputSyntaxErrors corrected to the
+    oracle's 22P02 for an unterminated quoted regprocedure name.
+  - Design: docs/design/0100-0149/m0149-0001h1a14-reg-type-input-port.md.
+  - Regress A/B vs HEAD over 14 cases: regproc 72→14 \(inventory
+    updated\); the other 13 unchanged \(psql table-size jitter only\).
+  Movement: regress regproc 72→14
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

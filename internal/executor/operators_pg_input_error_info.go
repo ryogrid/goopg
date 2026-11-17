@@ -64,7 +64,7 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 		if _, e := aclitemIn(v, o.ctx); e != nil {
 			message, sqlCode = e.Message, e.Code
 		}
-	case "regclass", "regtype", "regrole", "regnamespace", "regcollation", "regproc", "regprocedure":
+	case "regclass", "regtype", "regrole", "regnamespace", "regcollation", "regproc", "regprocedure", "regoper", "regoperator":
 		// reg* input functions, soft errors (M0149-0001h1a13)
 		if _, e := regIdentifierInput(NewStringDatum(v), t, o.ctx, 0); e != nil {
 			if ee, ok := e.(*ExecError); ok {

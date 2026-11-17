@@ -214,41 +214,6 @@ func regprocedureNamePart(s string) string {
 	return s
 }
 
-// regoperatorNameAndArgs splits a `'name(left,right)'::regoperator` input
-// into its operator symbol and two argument-type spellings, mirroring
-// parseNameAndArgTypes' 2-arg case for regoperatorin (postgres/src/backend/
-// utils/adt/regproc.c:639-676) — unlike regprocedureNamePart's deliberate
-// name-only leniency, the operator's (left,right) pair is REQUIRED here to
-// disambiguate an overloaded symbol (alter_operator.sql declares both
-// `=== (boolean, boolean)` and `=== (boolean, real)`; resolving by name alone
-// would pick the wrong one). `NONE` denotes a missing operand of a unary
-// operator (leftType=="" / rightType==""), matching format_operator's own
-// output spelling. ok=false for anything not shaped like `name(a,b)` — a bare
-// name (no parens) or a single-argument list falls through to the caller's
-// existing numeric-OID/unresolved handling, matching regoperatorin's
-// "missing argument" case loosely (goopg does not special-case that error
-// message). M0134-0089.
-func regoperatorNameAndArgs(s string) (name, leftType, rightType string, ok bool) {
-	open := strings.IndexByte(s, '(')
-	if open < 0 || !strings.HasSuffix(s, ")") {
-		return "", "", "", false
-	}
-	argsPart := s[open+1 : len(s)-1]
-	parts := strings.Split(argsPart, ",")
-	if len(parts) != 2 {
-		return "", "", "", false
-	}
-	leftType = strings.TrimSpace(parts[0])
-	rightType = strings.TrimSpace(parts[1])
-	if strings.EqualFold(leftType, "NONE") {
-		leftType = ""
-	}
-	if strings.EqualFold(rightType, "NONE") {
-		rightType = ""
-	}
-	return strings.TrimSpace(s[:open]), leftType, rightType, true
-}
-
 // schemaExistsForReg reports whether a schema name is registered, so the reg*
 // input functions can raise PG's 3F000 for a qualifier that names nothing. A
 // catalog that is not the in-memory one cannot be asked, and answers "yes" so
@@ -267,6 +232,17 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 		return v, nil
 	}
 	name := strings.TrimSpace(v.StringValue())
+	// regoperin / regoperatorin take digits as an OID but no "-" shorthand
+	// (parseNumericOid). M0149-0001h1a14.
+	if lt := strings.ToLower(typeName); lt == "regoper" || lt == "regoperator" {
+		if ctx == nil || ctx.Catalog == nil {
+			return v, nil
+		}
+		if lt == "regoper" {
+			return regoperIn(name, ctx, pos)
+		}
+		return regoperatorIn(name, ctx, pos)
+	}
 	// parseDashOrOid first, for every reg* type — upstream reg*in (regproc.c)
 	// runs it before ANY name resolution: a literal "-" is OID 0 (InvalidOid)
 	// and a pure-digit string is a numeric OID via oidin (IsOidString), never a
@@ -394,6 +370,13 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 		// :279) — so the message below uses `raw`, not the parsed form.
 		raw := name
 		if strings.EqualFold(typeName, "regprocedure") {
+			// parseNameAndArgTypes' syntax errors (22P02: a missing paren, an
+			// empty or unbalanced type name) come before any lookup.
+			if _, _, _, perr := regParseNameAndArgTypes(raw, false, ctx, pos); perr != nil {
+				if ee, ok := perr.(*ExecError); ok && ee.Code == "22P02" {
+					return NullDatum, ee
+				}
+			}
 			name = regprocedureNamePart(name)
 		}
 		schema, fn, nameOK := splitRegQualifiedName(name)
@@ -664,6 +647,12 @@ func RegOutRendererVisible(cat catalog.Catalog, visible func(schema string) bool
 // arglist, the base-RegOut behavior). dbOid scopes the database-local relation
 // lookups (see RegOut).
 func regOutShared(typeName string, oid uint32, cat catalog.Catalog, qualify func(schema string) bool, argVisible func(schema string) bool, dbOid ...uint32) string {
+	switch strings.ToLower(typeName) {
+	case "regoper":
+		return regoperOut(oid, &Context{Catalog: cat})
+	case "regoperator":
+		return regoperatorOut(oid, &Context{Catalog: cat})
+	}
 	if oid == 0 {
 		return "-"
 	}
@@ -886,7 +875,8 @@ func splitArraySuffix(name string) (base string, isArray bool) {
 // slice).
 func isRegIdentifierTypeName(name string) bool {
 	switch strings.ToLower(name) {
-	case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation":
+	case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation",
+		"regnamespace", "regoper", "regoperator":
 		return true
 	}
 	return false
