@@ -88,3 +88,40 @@ func TestIndexPartitionsAreLinked(t *testing.T) {
 		t.Errorf("relispartition rows = %+v, want 6", parts)
 	}
 }
+
+// TestAttachAndRegclassFollowSearchPath pins M0149-0001h1a30: with
+// search_path set to a schema, an unqualified ATTACH PARTITION child and an
+// unqualified '<name>'::regclass resolve there (RangeVarGetRelid), and a
+// missing ATTACH child is 42P01 instead of a silent no-op.
+func TestAttachAndRegclassFollowSearchPath(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.GetSetting = func(name string) (string, bool) {
+		if name == "search_path" {
+			return "sp1", true
+		}
+		return "", false
+	}
+	for _, ddl := range []string{
+		"CREATE SCHEMA sp1",
+		"CREATE TABLE sp1.spp (id int) PARTITION BY RANGE (id)",
+		"CREATE TABLE sp1.spc (id int)",
+		"ALTER TABLE sp1.spp ATTACH PARTITION spc FOR VALUES FROM (0) TO (10)",
+	} {
+		if err := runDDL(t, ctx, ddl); err != nil {
+			t.Fatalf("%s: %v", ddl, err)
+		}
+	}
+	rows := runQueryRows(t, ctx, "SELECT count(*) FROM pg_catalog.pg_inherits")
+	if len(rows) != 1 || rows[0][0].Int != 1 {
+		t.Errorf("pg_inherits rows = %+v, want 1 (spc attached under search_path)", rows)
+	}
+	d, err := regIdentifierInput(NewStringDatum("spc"), "regclass", ctx, 0)
+	if err != nil || d.Kind != KindInt || d.Int == 0 {
+		t.Errorf("'spc'::regclass = %+v, %v", d, err)
+	}
+	err = runDDL(t, ctx, "ALTER TABLE sp1.spp ATTACH PARTITION nosuch FOR VALUES FROM (10) TO (20)")
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42P01" {
+		t.Errorf("ATTACH of a missing table: %v, want 42P01", err)
+	}
+}

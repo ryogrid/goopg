@@ -10310,7 +10310,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// for catalog purposes (partition child must be registered so DROP
 			// TABLE parent CASCADE can find and drop it). M0100-0005.
 			if act.AttachPartitionOf.Default {
-				childTbl, ok := o.ctx.Catalog.LookupTable(act.AttachPartitionOf.Parent, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+				childTbl, ok := lookupTableOnSearchPath(o.ctx, act.AttachPartitionOf.Parent, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 				if ok {
 					childTbl.PartitionParentOID = tbl.OID
 					// Mark child as DEFAULT so checkDefaultPartitionDataConflict can find it.
@@ -10323,9 +10323,15 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 			poc := act.AttachPartitionOf
 			// poc.Parent contains the child table name here (set in parser).
-			childTbl, ok := o.ctx.Catalog.LookupTable(poc.Parent, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+			// The child is a RangeVar resolved through search_path, like
+			// the target table (M0149-0001h1a30): unqualified, the bare
+			// lookup missed a table created in a search_path schema and
+			// ATTACH silently did nothing.
+			childTbl, ok := lookupTableOnSearchPath(o.ctx, poc.Parent, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if !ok {
-				break // child doesn't exist yet, skip
+				// RangeVarGetRelid's miss: 42P01, not a silent no-op.
+				return &ExecError{Code: "42P01", Pos: act.Pos(),
+					Message: fmt.Sprintf("relation %q does not exist", poc.Parent.Name)}
 			}
 			// M0134-0002 C9 residual (S4): reject a circular attach — the table
 			// being attached (attachrel) is the ALTER target (the prospective

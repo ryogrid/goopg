@@ -12404,6 +12404,26 @@ verify each at HEAD when the task starts.
     FK listing now takes the partition branch and exposes the conparentid
     gap\); the rest unchanged. Inventory updated.
   Movement: regress psql 324→306, indexing 282→241, alter_table 732→718, tablespace 177→171, foreign_key 801→803
+- [x] **M0149-0001h1a30 — unqualified ATTACH PARTITION children and '\<name\>'::regclass resolve through the session search\_path; a missing ATTACH child is 42P01; partition pg\_inherits rows carry inhseqno 1** \(filed 2026-11-18 by M0149-0001h1a29's ledger row, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: RangeVarGetRelid walks the search\_path for any unqualified
+    relation \(table or index\); a partition's single parent gets inhseqno 1.
+  - Landed:
+    - lookupTableOnSearchPath \(executor\): the planner's
+      catalog.SearchPathCatalog over the session search\_path;
+    - the regclass input arm and both ATTACH child lookups use it; the
+      regclass index fallback walks the path too;
+    - ATTACH of a missing child raises 42P01 \(was `break` — a silent
+      no-op, which is how search\_path misses went unnoticed\);
+    - pg\_inherits partition / index-partition rows: inhseqno 1 \(was a
+      per-parent counter\).
+  - Tests: TestAttachAndRegclassFollowSearchPath; partition isolation
+    specs, pg\_dump / psql testport pass.
+  - Regress A/B vs HEAD over 19 cases: alter\_table 720→719 \(inventory
+    718→717\); the rest unchanged \(indexing / foreign\_key now report
+    42P01 for children an earlier failure never created — same count\).
+  Movement: regress alter_table 718→717
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

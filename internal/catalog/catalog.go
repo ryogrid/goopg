@@ -16868,7 +16868,6 @@ func (c *InMemory) PGInheritsRowsForDBOid(dbOid uint32) [][]string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	var out [][]string
-	parentSeq := make(map[uint32]int)
 	partParentsInh := c.partitionParentsLocked()
 	for _, tbl := range c.ns(dbOid).tables {
 		if tbl.Virtual {
@@ -16881,12 +16880,13 @@ func (c *InMemory) PGInheritsRowsForDBOid(dbOid uint32) [][]string {
 			parentOID = partParentsInh[tbl.OID]
 		}
 		if parentOID != 0 {
-			parentSeq[parentOID]++
-			seq := parentSeq[parentOID]
+			// A partition has exactly one parent, so its inhseqno is 1
+			// (StoreCatalogInheritance1 numbers a child's own parents, not
+			// the parent's children). M0149-0001h1a30.
 			out = append(out, []string{
 				fmt.Sprintf("%d", tbl.OID),
 				fmt.Sprintf("%d", parentOID),
-				fmt.Sprintf("%d", seq),
+				"1",
 				"f",
 			})
 			continue
@@ -16907,17 +16907,14 @@ func (c *InMemory) PGInheritsRowsForDBOid(dbOid uint32) [][]string {
 	// partition child of its parent index. These rows enable the join pattern:
 	//   pg_index LEFT JOIN pg_inherits ON (indexrelid = inhrelid)
 	// used by indexing.sql to discover partitioned-index parent/child chains.
-	idxParentSeq := make(map[uint32]int)
 	for _, idx := range c.ns(dbOid).indexes {
 		if idx.PartitionParentOID == 0 {
 			continue
 		}
-		idxParentSeq[idx.PartitionParentOID]++
-		seq := idxParentSeq[idx.PartitionParentOID]
 		out = append(out, []string{
 			fmt.Sprintf("%d", idx.OID),
 			fmt.Sprintf("%d", idx.PartitionParentOID),
-			fmt.Sprintf("%d", seq),
+			"1", // an index partition's single parent (IndexSetParentIndex)
 			"f",
 		})
 	}

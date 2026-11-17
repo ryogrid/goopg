@@ -292,12 +292,23 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 			schema, rel = segs[0], segs[1]
 		}
 		objName := parser.ObjectName{Schema: schema, Name: rel}
-		if tbl, found := ctx.Catalog.LookupTable(objName, connDBOid); found && tbl != nil {
+		// An unqualified name walks the session's search_path
+		// (RangeVarGetRelid), not just the bare-name default. M0149-0001h1a30.
+		if tbl, found := lookupTableOnSearchPath(ctx, objName, connDBOid); found && tbl != nil {
 			return NewIntDatum(int64(tbl.OID)), nil
 		}
 		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 			if idx, found := im.LookupIndex(objName, connDBOid); found && idx != nil {
 				return NewIntDatum(int64(idx.OID)), nil
+			}
+			// An unqualified index name walks search_path too
+			// (RangeVarGetRelid covers every relkind). M0149-0001h1a30.
+			if schema == "" {
+				for _, sc := range searchPathSchemas(ctx) {
+					if idx, found := im.LookupIndex(parser.ObjectName{Schema: sc, Name: rel}, connDBOid); found && idx != nil {
+						return NewIntDatum(int64(idx.OID)), nil
+					}
+				}
 			}
 		}
 		// Miss message uses the STRIPPED parsed name — regclassin's
@@ -914,4 +925,20 @@ func regprocedureArgTypes(s string, ctx *Context) ([]uint32, bool) {
 		out = append(out, uint32(d.Int))
 	}
 	return out, true
+}
+
+// lookupTableOnSearchPath is RangeVarGetRelid for executor-time lookups: an
+// unqualified name is resolved through the session's search_path (temp and
+// pg_catalog first, then the listed schemas), via the same
+// catalog.SearchPathCatalog the planner uses. A qualified name, or a context
+// without a catalog, falls back to the plain lookup. M0149-0001h1a30.
+func lookupTableOnSearchPath(ctx *Context, name parser.ObjectName, dbOid uint32) (*catalog.Table, bool) {
+	if ctx == nil || ctx.Catalog == nil {
+		return nil, false
+	}
+	if name.Schema != "" {
+		return ctx.Catalog.LookupTable(name, dbOid)
+	}
+	wrapped := catalog.WithSearchPath(ctx.Catalog, func() []string { return searchPathSchemas(ctx) })
+	return wrapped.LookupTable(name, dbOid)
 }
