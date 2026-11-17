@@ -245,6 +245,21 @@ answers has\_largeobject\_privilege the same way.
   TestPort\_RegressSuite/largeobject. The Go harness now exports
   PG\_ABS\_BUILDDIR, as pg\_regress does. opr\_sanity 733→717.
 
+## Slice 6: catalogs PG revokes from PUBLIC \(M0149\-0001h1a4\)
+
+The privileges regress case reads pg\_largeobject as an unprivileged role,
+expecting "permission denied for table pg\_largeobject". goopg granted SELECT
+on every system relation \(standing in for PG's initdb\-time PUBLIC grants\),
+including the six catalogs PG explicitly revokes: pg\_authid, pg\_largeobject,
+pg\_statistic, pg\_statistic\_ext\_data, pg\_user\_mapping and pg\_subscription.
+Any role could therefore read pg\_authid's password hashes.
+
+dmlPrivilegePermittedAs now treats these six like user tables: an explicit
+grant, the owner, a superuser, or a member of pg\_read\_all\_data
+\(pg\_class\_aclmask\_ext\) can read them. They are matched by OID, or by
+name in pg\_catalog for virtual ones. valuesOp, which serves virtual catalogs
+such as pg\_authid, applies the same check.
+
 ## Open
 
 - A read\-only descriptor reads with the statement's snapshot, not the

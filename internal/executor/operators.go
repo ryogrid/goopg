@@ -2,6 +2,7 @@ package executor
 
 import (
 	"container/heap"
+	"fmt"
 	"io"
 	"os"
 	"sort"
@@ -85,6 +86,11 @@ func (o *valuesOp) Open(ctx *Context) error {
 	o.idx = 0
 	if o.plan != nil && o.plan.VirtualSource != nil {
 		tbl := o.plan.VirtualSource
+		// A virtual catalog PG revokes from PUBLIC (pg_authid) is checked
+		// like a heap scan of it would be.
+		if isPublicRevokedCatalog(tbl) && !dmlPrivilegePermitted(ctx, tbl, "SELECT") {
+			return &ExecError{Code: "42501", Pos: o.plan.Pos(), Message: fmt.Sprintf("permission denied for table %s", tbl.Name)}
+		}
 		// pg_prepared_statements is session-specific: use the per-connection
 		// lister when available rather than the static empty VirtualRows.
 		if tbl.Name == "pg_prepared_statements" && ctx != nil && ctx.PrepStmtsRows != nil {

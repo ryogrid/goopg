@@ -12038,6 +12038,22 @@ verify each at HEAD when the task starts.
     \(printtup.c SendRowDescriptionMessage\).
   - > **ESCALATION \(S2, wrong results for binary\-format clients\):** filed
     here; owner to place.
+- [x] **M0149-0001h1a4 — every role could SELECT pg\_authid \(password hashes\) and pg\_largeobject: the PUBLIC revokes initdb applies to six catalogs were not modelled** \(filed and fixed 2026-11-17 by M0149-0001h1a\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: initdb.c `REVOKE ALL ON pg_authid FROM public` and
+    `... ON pg_largeobject FROM PUBLIC`; system\_views.sql revokes
+    pg\_statistic, pg\_statistic\_ext\_data, pg\_user\_mapping and
+    pg\_subscription.
+  - goopg: dmlPrivilegePermittedAs granted SELECT on every system relation.
+    These six are now checked like a user table \(explicit grant, owner,
+    superuser, or pg\_read\_all\_data membership, as in
+    pg\_class\_aclmask\_ext\). The virtual\-catalog scan
+    \(valuesOp, e.g. pg\_authid\) applies the same check.
+  - Regress A/B vs HEAD over 16 cases that read these catalogs: privileges
+    617→616 \(inventory 616→615\); the rest unchanged apart from
+    alter\_generic ±1 and polymorphism's known pg\_typeof flip.
+  Movement: regress privileges 616→615
 - [ ] **M0149-0001h1a2 — RAISE without a format string ignores `USING MESSAGE = <expr>`: `raise notice using message = sqlstate` prints the expression text** \(filed 2026-11-17 by M0149-0001h1a\)
   Kind: impl
   Parent: M0149-0001h1a

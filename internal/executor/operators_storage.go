@@ -2702,12 +2702,62 @@ func dmlPrivilegePermitted(ctx *Context, tbl *catalog.Table, priv string) bool {
 // implicit default ACL (IsOwnerACLRevoked), the owner's remaining rights
 // come from the materialized owner ACL entry instead of an automatic true.
 // M0134-0069 bucket 7.
+// publicRevokedCatalogs are the system tables PG's initdb strips PUBLIC's
+// SELECT from: pg_authid (initdb.c setup_auth), pg_largeobject
+// (setup_privileges), and system_views.sql's REVOKE ALL ... FROM public on
+// pg_statistic, pg_statistic_ext_data, pg_user_mapping and pg_subscription.
+var publicRevokedCatalogs = map[uint32]bool{
+	1260: true, // pg_authid
+	2613: true, // pg_largeobject
+	2619: true, // pg_statistic
+	3429: true, // pg_statistic_ext_data
+	1418: true, // pg_user_mapping
+	6100: true, // pg_subscription
+}
+
+// publicRevokedCatalogNames covers the same catalogs by name: some are
+// virtual tables that carry no relation OID.
+var publicRevokedCatalogNames = map[string]bool{
+	"pg_authid": true, "pg_largeobject": true, "pg_statistic": true,
+	"pg_statistic_ext_data": true, "pg_user_mapping": true, "pg_subscription": true,
+}
+
+func isPublicRevokedCatalog(tbl *catalog.Table) bool {
+	if tbl == nil {
+		return false
+	}
+	if publicRevokedCatalogs[tbl.OID] {
+		return true
+	}
+	return (tbl.OID == 0 || catalog.IsSystemRelation(tbl.OID)) &&
+		strings.EqualFold(tbl.Schema, "pg_catalog") && publicRevokedCatalogNames[strings.ToLower(tbl.Name)]
+}
+
+// roleOIDPgReadAllData is ROLE_PG_READ_ALL_DATA.
+const roleOIDPgReadAllData = 6181
+
 func dmlPrivilegePermittedAs(ctx *Context, tbl *catalog.Table, priv, checkRole string) bool {
 	if ctx.NonSuperuserRole == "" {
 		return true // bootstrap superuser session: full privileges
 	}
 	if checkRole == "" {
 		return true // effective role is the bootstrap superuser (e.g. a superuser-owned view)
+	}
+	if priv == "SELECT" && isPublicRevokedCatalog(tbl) {
+		// initdb / system_views.sql REVOKE ALL ... FROM PUBLIC on these
+		// catalogs (pg_authid's password hashes, pg_largeobject's data,
+		// pg_statistic's sampled values, ...). Only an explicit grant, the
+		// owner (the bootstrap superuser) or pg_read_all_data
+		// (pg_class_aclmask_ext) reads them.
+		if ctx.Catalog.HasTablePrivilege(tbl.OID, checkRole, priv) {
+			return true
+		}
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			if m, ok := im.RoleOID(checkRole); ok && im.HasPrivsOfRole(m, roleOIDPgReadAllData) {
+				return true
+			}
+		}
+		return false
 	}
 	if priv == "SELECT" && tbl != nil && catalog.IsSystemRelation(tbl.OID) {
 		// PostgreSQL seeds every system catalog/view with an implicit PUBLIC
