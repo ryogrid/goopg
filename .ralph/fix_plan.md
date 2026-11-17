@@ -1848,6 +1848,29 @@ heuristic stays live.)
     \(c\) UPDATE pg\_class \-1 sidecar persistence, \(d\) index relstats reset on TRUNCATE → ledger
     2026\-10\-31 "post\-TRUNCATE cost" row\. No M\-NIGHTLY items remain from the 20261031 run\.
 
+- [ ] **testport/TestPort\_PgoutputInteropGoopgToGoopgRefreshData — subscriber table u held 6 rows after DROP PUBLICATION p2, want 3** \(AI\-20261118\-010916\-001; repro: `go test \-v \-run '^TestPort\_PgoutputInteropGoopgToGoopgRefreshData$' \./internal/testport/`\) \(S2 — possible duplicate primary\-key rows on a logical\-replication subscriber\)
+  Kind: impl
+  Parent: none
+  - **ESCALATION 2026\-11\-18 \(S2\).** On the publisher, u \(id int PRIMARY KEY\) only ever holds ids 1–3,
+    inserted before CREATE PUBLICATION p2. In the 2026\-11\-18 01:09 nightly \(18\.2 s run, host disk full at
+    the time\), the subscriber's `count\(*\) FROM u` was 6 after DROP PUBLICATION p2
+    \(pgoutput\_interop\_test\.go:3733\). Six rows in a primary\-keyed table whose source has three ids means
+    duplicate keys were stored: unique enforcement was bypassed on the subscriber's apply or COPY path.
+    Awaiting owner placement; not self\-selected.
+  - Unverified lead: the ADD PUBLICATION p2 COPY lands ids 1–3, and the walsender, still lagging behind the
+    pre\-p2 INSERT under load, decodes that INSERT against the *current* publication set rather than the
+    historic snapshot PG's pgoutput uses. Streaming then delivers the same ids again, and the apply insert
+    does not raise the unique violation PG would \(23505, worker restart\).
+  - 2026\-11\-18: 6/6 passes on an idle host \(5–6 s each\); intermittent, not reproduced. The cluster dirs were
+    not kept: the stale tmp/pubsubclusters/pgoutput\_g2g\_refreshdata had to be removed before rerunning.
+  - Separate harness defect, fixed the same loop: `pubsubcluster.NewMixed` reused the fixed default base dir
+    tmp/pubsubclusters/<name> without clearing it, so any rerun of the 26 pgoutput interop tests failed in
+    0\.1 s with `goopg init: directory ... already exists and is not empty`. NewMixed now removes the stale
+    default dir first.
+  - Resume: reproduce under synthetic CPU load \(the stress approach from AI\-20261019\-001758\-003\), keeping
+    the cluster dirs; then check u for duplicate ids and the walsender's publication filter for the
+    historic\-snapshot rule.
+
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
 

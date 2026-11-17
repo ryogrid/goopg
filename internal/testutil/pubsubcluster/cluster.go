@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -137,6 +138,13 @@ func NewMixed(t *testing.T, name string, opts Options) *PubSubCluster {
 	baseDir := strings.TrimSpace(opts.BaseDir)
 	if baseDir == "" {
 		baseDir = filepath.Join(opts.RepoRoot, "tmp", "pubsubclusters", name)
+		// The default base dir is fixed per test name and survives the
+		// run (kept for post-mortem). A rerun would otherwise die in
+		// `goopg init: directory ... already exists and is not empty`,
+		// so the previous run's leftovers are cleared here.
+		if err := os.RemoveAll(baseDir); err != nil {
+			t.Fatalf("pubsubcluster: clear stale %s: %v", baseDir, err)
+		}
 	}
 	if opts.PublicationName == "" {
 		opts.PublicationName = "p"
