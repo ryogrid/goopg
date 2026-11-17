@@ -88,6 +88,18 @@ OID, so an earlier schema's same-named object hides it. Statistics objects
 walk the path directly. All 3397 builtin functions round-trip on the default
 path (`TestBuiltinFunctionsAreVisible`).
 
+## reg values inside text functions (M0149-0001h1a33)
+
+`concat`, `concat_ws` and `format` take `"any"` arguments and print each
+through its type's output function (`concat_internal`, `text_format`), and
+`||` with a non-text operand is `anytextcat` / `textanycat`. goopg carries a
+reg value as its OID, so these printed the number. `regArgText` checks the
+argument expression's static type (`optimizer.ExprResultType`) and renders
+a reg-typed scalar through the reg to text cast, with the same per-object
+qualification. The compiled expression twin has no payload bit left for this,
+so a `||` with a reg operand compiles to the adapter and takes the
+interpreted path (`exprnode.go`).
+
 ## Not covered (deferral ledger)
 
 - regconfig and regdictionary: goopg has no text search catalog.
@@ -101,3 +113,6 @@ path (`TestBuiltinFunctionsAreVisible`).
   `pg_collation_is_visible` and the text-search kinds still answer true.
 - Error cursor positions for a failed reg cast point at `::`, not at the
   literal.
+- A reg array (`array['pt'::regclass]`) prints its elements as OIDs:
+  array output does not call the element type's output function for reg
+  types.

@@ -12515,6 +12515,44 @@ verify each at HEAD when the task starts.
     467→440 \(inventory updated\); alter\_generic 209→208 alone \(a
     case\-order flake in the batch run\); the rest unchanged, psql 303 = 303.
   Movement: regress opr_sanity 112→104, stats_ext 467→440
+- [x] **M0149-0001h1a33 — a reg value inside concat / concat\_ws / format / \|\| printed its OID, not its name** \(filed 2026-11-18 from M0149-0001h1a31's ledger row, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: concat\_internal and text\_format call each "any" argument's type
+    output function; `||` with a non-text operand is anytextcat /
+    textanycat. `format('%s', 'pt'::regclass)` is `pt`.
+  - goopg printed the OID \(Datum.Format of the KindInt\) in all four.
+  - Landed:
+    - regArgText: an argument whose static type \(ExprResultType\) is a
+      scalar reg type renders through the reg to text cast \(per\-object
+      qualification\), in concat, concat\_ws, format and the interpreted
+      `||`;
+    - the compiled twin sends a `||` with a reg operand to the adapter
+      \(payload\[16\] has no free bit\).
+  - Probe vs PG 18.3: identical for literals, per\-row `oid::regclass`
+    columns and search\_path changes. Remaining differences belong to other
+    gaps: a reg array prints OIDs \(ledgered\); `reltype::regtype` is `-`
+    because pg\_class.reltype is 0 \(filed M0149\-0001h1a34\).
+  - Test: TestRegArgsRenderAsNames.
+  - Regress A/B vs HEAD over 18 cases: no movement. plpgsql moved within
+    its known nondeterminism \(HEAD 1209–1220, new 1216–1221 over three
+    standalone runs; the extra lines are OUT\-parameter SRF expansion after
+    a DROP / CREATE FUNCTION, unrelated to reg values\).
+  Movement: probe format/concat/concat\_ws/\|\| reg rendering 0/9→9/9 vs PG 18.3
+- [ ] **M0149-0001h1a34 — pg\_class.reltype is 0 for every relation; a user table has no composite row type in pg\_type** \(filed 2026-11-18 by M0149-0001h1a33\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: heap\_create\_with\_catalog → AddNewRelationType creates the
+    relation's composite type \(typtype 'c', typrelid = the relation\) and
+    its array type, and stores the type OID in pg\_class.reltype; views,
+    sequences, foreign and partitioned tables get one too, indexes and
+    TOAST tables do not \(reltype 0\).
+  - goopg: `select reltype from pg_class` is 0 for user tables and for
+    pg\_class itself, and `pg_type where typrelid = <table>` is empty for a
+    user table; `reltype::regtype` renders `-`.
+  - Resume: the pg\_class renderer and the user pg\_type rows
+    \(pg18\_user\_catalog\_rows.go\); check how ROW types of tables are typed
+    today \(composite type registry\) before allocating new OIDs.
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

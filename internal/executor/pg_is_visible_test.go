@@ -151,3 +151,36 @@ func TestBuiltinFunctionsAreVisible(t *testing.T) {
 		t.Errorf("%d of %d built-in functions not visible: %v", len(failed), total, failed)
 	}
 }
+
+// TestRegArgsRenderAsNames pins M0149-0001h1a33 against PG 18.3: a reg*
+// value handed to an "any"-taking text function (concat, concat_ws,
+// format) or to || contributes its output-function text, qualified only
+// when its schema is off the search_path — not its OID.
+func TestRegArgsRenderAsNames(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.GetSetting = func(name string) (string, bool) {
+		if name == "search_path" {
+			return "public", true
+		}
+		return "", false
+	}
+	for _, ddl := range []string{"CREATE SCHEMA ra", "CREATE TABLE ra.t (a int)", "CREATE TABLE rpt (a int)"} {
+		if err := runDDL(t, ctx, ddl); err != nil {
+			t.Fatalf("%s: %v", ddl, err)
+		}
+	}
+	for _, c := range []struct{ sql, want string }{
+		{`SELECT format('%s|%I|%L', 'pg_class'::regclass, 'ra.t'::regclass, 'rpt'::regclass)`, `pg_class|"ra.t"|'rpt'`},
+		{`SELECT format('%s %s', 'int4'::regtype, 'lower(text)'::regprocedure)`, `integer lower(text)`},
+		{`SELECT concat('x', 'rpt'::regclass, 'int4'::regtype)`, `xrptinteger`},
+		{`SELECT concat_ws(',', 'ra.t'::regclass, 1)`, `ra.t,1`},
+		{`SELECT 'a' || 'rpt'::regclass`, `arpt`},
+		{`SELECT relname || ':' || oid::regclass FROM pg_class WHERE relname = 't' AND relnamespace = 'ra'::regnamespace`, `t:ra.t`},
+	} {
+		rows := runQueryRows(t, ctx, c.sql)
+		if len(rows) != 1 || rows[0][0].StringValue() != c.want {
+			t.Errorf("%s = %+v, want %q", c.sql, rows, c.want)
+		}
+	}
+}

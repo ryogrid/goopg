@@ -1288,6 +1288,12 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		// gone by then) and reads them from the node payload instead — see
 		// exprnode.go's ExprBinaryOp arm. Both then apply the same helpers.
 		lbp, rbp := declaredBpcharTypmod(x.Left), declaredBpcharTypmod(x.Right)
+		if x.Op == parser.OpConcat {
+			// anytextcat / textanycat call the non-text operand's output
+			// function: a reg* operand contributes its name. The compiled
+			// twin sends this shape here (exprnode.go). M0149-0001h1a33.
+			left, right = regArgText(x.Left, left, ctx), regArgText(x.Right, right, ctx)
+		}
 		left, right = concatOperandsAsText(x.Op, left, right, lbp, rbp)
 		left, right = comparisonOperandsAsBpchar(x.Op, left, right, lbp, rbp,
 			isBareStringLit(x.Left), isBareStringLit(x.Right))
@@ -15867,6 +15873,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || v.IsNull() {
 				continue
 			}
+			v = regArgText(arg, v, ctx)
 			buf.WriteString(v.Format())
 		}
 		return NewStringDatum(buf.String()), nil
@@ -15907,6 +15914,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				if verr != nil || v.IsNull() {
 					continue
 				}
+				v = regArgText(arg, v, ctx)
 				parts = append(parts, v.Format())
 			}
 			return NewStringDatum(strings.Join(parts, sep)), nil
@@ -16262,7 +16270,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 					if e != nil {
 						return Datum{}, e
 					}
-					args = append(args, v)
+					args = append(args, regArgText(a, v, ctx))
 				}
 			}
 

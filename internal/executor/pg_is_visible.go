@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -286,4 +287,30 @@ func regtypeQuotedBuiltin(name string) (uint32, bool) {
 		return 0, false
 	}
 	return catalog.BuiltinTypeOIDByFormatName(n)
+}
+
+// regArgText renders a reg*-typed argument of an "any"-taking text function
+// (concat, concat_ws, format) through its output function, as PG does
+// (concat_internal / text_format call the argument type's typoutput):
+// 'pt'::regclass contributes "pt", not its OID. Other values pass through.
+// M0149-0001h1a33.
+func regArgText(e optimizer.Expr, d Datum, ctx *Context) Datum {
+	if d.Kind != KindInt {
+		return d
+	}
+	t, ok := optimizer.ExprResultType(e)
+	if !ok || t.IsArray || !isRegIdentifierTypeName(t.Name) {
+		return d
+	}
+	out, err := evalCastTyped(d, "text", t.Name, 0, ctx)
+	if err != nil || out.Kind != KindString {
+		return d
+	}
+	return out
+}
+
+// isRegTypedExpr reports a statically reg*-typed scalar expression.
+func isRegTypedExpr(e optimizer.Expr) bool {
+	t, ok := optimizer.ExprResultType(e)
+	return ok && !t.IsArray && isRegIdentifierTypeName(t.Name)
 }
