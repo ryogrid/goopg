@@ -362,3 +362,92 @@ func (c *InMemory) SnapshotACLEntry(aclOID uint32) func() {
 		}
 	}
 }
+
+// ApplyDefaultACL gives a newly created object relOID the ACL
+// get_user_default_acl (aclchk.c) computes for (ownerOID, schemaOID,
+// objType): the owner's global pg_default_acl entry — or acldefault when it
+// has none — merged with the schema-scoped entry (aclmerge). It reports
+// false, leaving relOID at its hardwired default, when neither entry exists.
+// Both entries live in the same per-OID ACL maps a table's relacl does, so
+// the global entry's state (grants, their order and grantors, and an
+// owner-side REVOKE) is copied over and the schema entry's grants are OR-ed
+// in.
+func (c *InMemory) ApplyDefaultACL(relOID, ownerOID, schemaOID uint32, objType byte) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	live := func(roleOID, nsp uint32) (uint32, bool) {
+		oid, ok := c.defaultACLOIDs[defaultACLKey{RoleOID: roleOID, SchemaOID: nsp, ObjType: objType}]
+		return oid, ok && len(c.tableACLs[oid]) > 0
+	}
+	gOID, gOK := live(ownerOID, 0)
+	var sOID uint32
+	sOK := false
+	if schemaOID != 0 {
+		sOID, sOK = live(ownerOID, schemaOID)
+	}
+	if !gOK && !sOK {
+		return false
+	}
+	delete(c.tableACLs, relOID)
+	delete(c.tableACLOrder, relOID)
+	delete(c.tableACLGrantor, relOID)
+	delete(c.relACLEmptied, relOID)
+	delete(c.relACLOwnerRevoked, relOID)
+	merge := func(src uint32) {
+		srcACL := c.tableACLs[src]
+		roles := append([]string(nil), c.tableACLOrder[src]...)
+		seen := map[string]bool{}
+		for _, r := range roles {
+			seen[r] = true
+		}
+		var rest []string
+		for r := range srcACL {
+			if !seen[r] {
+				rest = append(rest, r)
+			}
+		}
+		sort.Strings(rest)
+		roles = append(roles, rest...)
+		dst := c.tableACLs[relOID]
+		if dst == nil {
+			dst = make(map[string]map[string]bool)
+			c.tableACLs[relOID] = dst
+		}
+		for _, role := range roles {
+			privs, ok := srcACL[role]
+			if !ok {
+				continue
+			}
+			d := dst[role]
+			if d == nil {
+				d = make(map[string]bool, len(privs))
+				dst[role] = d
+				if role != aclOwnerRole {
+					c.tableACLOrder[relOID] = append(c.tableACLOrder[relOID], role)
+				}
+			}
+			for p, wgo := range privs {
+				d[p] = d[p] || wgo
+			}
+			if g, ok := c.tableACLGrantor[src][role]; ok {
+				if c.tableACLGrantor[relOID] == nil {
+					c.tableACLGrantor[relOID] = make(map[string]string)
+				}
+				c.tableACLGrantor[relOID][role] = g
+			}
+		}
+	}
+	if gOK {
+		merge(gOID)
+		if v, ok := c.relACLEmptied[gOID]; ok {
+			c.relACLEmptied[relOID] = v
+		}
+		if v, ok := c.relACLOwnerRevoked[gOID]; ok {
+			c.relACLOwnerRevoked[relOID] = v
+		}
+	}
+	if sOK {
+		merge(sOID)
+	}
+	return true
+}

@@ -297,6 +297,21 @@ PL/pgSQL error context, never as a caret in the calling statement.
   rolled\-back `GRANT ALL ON LARGE OBJECTS` leaked into the largeobject case,
   where it granted PUBLIC UPDATE on an object.
 
+## Slice 9: default ACLs applied at relation creation \(M0149\-0001h1a7\)
+
+Before this, ALTER DEFAULT PRIVILEGES entries for TABLES and SEQUENCES were
+stored and shown in pg\_default\_acl but never used. InMemory.ApplyDefaultACL
+is get\_user\_default\_acl for relations:
+- it starts from the owner's global entry, or acldefault when there is none;
+- it ORs in the schema\-scoped entry's grants \(aclmerge\);
+- it returns false, leaving the hardwired default, when neither exists.
+
+Both kinds of entry live in the same per\-OID ACL maps a relation's relacl
+does, so applying an entry copies its grants, their order and grantors, and
+the owner\-revoked flags. CREATE TABLE and CREATE VIEW use the TABLES default
+and CREATE SEQUENCE the SEQUENCES default, each applied before the heap sync
+that writes relacl.
+
 ## Open
 
 - A read\-only descriptor reads with the statement's snapshot, not the

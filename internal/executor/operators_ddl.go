@@ -4670,6 +4670,11 @@ afterExistsCheck:
 	// relation's size at plan time (internal/planner/small_dimension.go), which
 	// is the only point where a size is knowable: a table being CREATEd is
 	// empty, so this site never had the information it was guessing at.
+	// heap_create_with_catalog stamps relacl from get_user_default_acl
+	// (OBJECT_TABLE for every relkind but sequences): ALTER DEFAULT
+	// PRIVILEGES [IN SCHEMA] ... ON TABLES for the owner. Before the heap
+	// sync, which writes relacl. M0149-0001h1a7.
+	applyRelationDefaultACL(o.ctx, tbl, catalog.DefaultACLObjTypeRelation)
 	// Record for rollback before heap sync — if heap sync fails the catalog
 	// entry is already live and must be cleaned up on ROLLBACK.
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
@@ -7201,6 +7206,11 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	// (relkind='v', buildUserPGClassRow) and the RecordKindCreateView WAL
 	// snapshot of the defining query (replayed by
 	// internal/initdb/view_ddl_recovery.go).
+	// A view takes the TABLES default ACL (heap_create_with_catalog's
+	// OBJECT_TABLE for relkind 'v'). M0149-0001h1a7.
+	if vt != nil {
+		applyRelationDefaultACL(o.ctx, vt, catalog.DefaultACLObjTypeRelation)
+	}
 	if vt != nil && catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncTableToCatalogHeap(o.ctx, vt); syncErr != nil {
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
@@ -21361,6 +21371,9 @@ func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string,
 		if o.ctx.NonSuperuserRole != "" {
 			seqTbl.Owner = o.ctx.NonSuperuserRole
 		}
+		// get_user_default_acl(OBJECT_SEQUENCE, ...) — ALTER DEFAULT
+		// PRIVILEGES ... ON SEQUENCES. M0149-0001h1a7.
+		applyRelationDefaultACL(o.ctx, seqTbl, catalog.DefaultACLObjTypeSequence)
 		syncTableToCatalogHeap(o.ctx, seqTbl)
 	}
 }
@@ -29384,4 +29397,28 @@ func int64SlicesEqual(a, b []int64) bool {
 		}
 	}
 	return true
+}
+
+// applyRelationDefaultACL applies get_user_default_acl for a new relation
+// tbl (objType 'r' or 'S'): the owner is the creating role (the bootstrap
+// superuser, OID 10, when tbl.Owner is unset) and the namespace is tbl's.
+func applyRelationDefaultACL(ctx *Context, tbl *catalog.Table, objType byte) {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok || tbl == nil || tbl.OID == 0 {
+		return
+	}
+	owner := uint32(10)
+	if tbl.Owner != "" {
+		oid, ok := im.RoleOID(tbl.Owner)
+		if !ok {
+			return
+		}
+		owner = oid
+	}
+	schema := tbl.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	nsp := im.SchemaOID(schema, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
+	im.ApplyDefaultACL(tbl.OID, owner, nsp, objType)
 }

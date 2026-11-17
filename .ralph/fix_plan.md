@@ -12038,6 +12038,19 @@ verify each at HEAD when the task starts.
     \(printtup.c SendRowDescriptionMessage\).
   - > **ESCALATION \(S2, wrong results for binary\-format clients\):** filed
     here; owner to place.
+- [x] **M0149-0001h1a7 — default ACLs were never applied when a relation was created: ALTER DEFAULT PRIVILEGES [IN SCHEMA] ... ON TABLES / SEQUENCES only rendered in pg\_default\_acl** \(filed and fixed 2026-11-17 by M0149-0001h1a\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: heap\_create\_with\_catalog → get\_user\_default\_acl \(aclchk.c\):
+    the global entry \(or acldefault\) aclmerge'd with the schema entry,
+    NULL when equal to acldefault. OBJECT\_SEQUENCE for sequences,
+    OBJECT\_TABLE for every other relkind.
+  - Landed: InMemory.ApplyDefaultACL plus applyRelationDefaultACL, called by
+    CREATE TABLE, CREATE VIEW \(TABLES default\) and CREATE SEQUENCE
+    \(SEQUENCES default\) before the heap sync writes relacl.
+  - Regress A/B vs HEAD over 7 cases: privileges 611→607 \(inventory
+    updated\); the rest unchanged.
+  Movement: regress privileges 611→607
 - [x] **M0149-0001h1a6 — ALTER DEFAULT PRIVILEGES ... ON LARGE OBJECTS was accepted and dropped; lo\_create never applied a default ACL; pg\_default\_acl changes did not roll back** \(filed and fixed 2026-11-17 by M0149-0001h1a\)
   Kind: impl
   Parent: M0149-0001h1a
