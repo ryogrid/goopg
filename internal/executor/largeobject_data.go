@@ -207,7 +207,9 @@ func loRead(ctx *Context, loid uint32, off int64, n int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := make([]byte, 0, n)
+	// Grow with the data actually read: n is the caller's request, which
+	// may be far larger than the object (loread(fd, 2147483647)).
+	out := make([]byte, 0, min(n, 1<<20))
 	pos := off
 	for _, p := range pages {
 		if int64(len(out)) >= n {
@@ -438,7 +440,10 @@ func evalLargeObjectFunc(name string, args []Datum, ctx *Context) (Datum, error)
 		if !d.write {
 			return Datum{}, &ExecError{Code: "55000", Message: fmt.Sprintf("large object descriptor %d was not opened for writing", fd)}
 		}
-		buf := args[1].BytesValue()
+		buf, err := loByteaArg(args[1])
+		if err != nil {
+			return Datum{}, err
+		}
 		if err := loWrite(ctx, d.loid, d.offset, buf); err != nil {
 			return Datum{}, err
 		}
@@ -523,6 +528,12 @@ func evalLargeObjectFunc(name string, args []Datum, ctx *Context) (Datum, error)
 				length = n
 			}
 		}
+		// lo_get_fragment_internal: a result that cannot fit a varlena
+		// (MaxAllocSize - VARHDRSZ) is refused before anything is read —
+		// a hole up to a 4 GB offset would otherwise be zero-filled.
+		if length > 0x3fffffff-4 {
+			return Datum{}, &ExecError{Code: "54000", Message: "large object read request is too large"}
+		}
 		b, err := loRead(ctx, loid, off, length)
 		if err != nil {
 			return Datum{}, err
@@ -536,7 +547,11 @@ func evalLargeObjectFunc(name string, args []Datum, ctx *Context) (Datum, error)
 		if err := loOpenCheck(ctx, loid, true); err != nil {
 			return Datum{}, err
 		}
-		if err := loWrite(ctx, loid, loIntArg(args[1]), args[2].BytesValue()); err != nil {
+		buf, err := loByteaArg(args[2])
+		if err != nil {
+			return Datum{}, err
+		}
+		if err := loWrite(ctx, loid, loIntArg(args[1]), buf); err != nil {
 			return Datum{}, err
 		}
 		return NullDatum, nil
@@ -548,7 +563,11 @@ func evalLargeObjectFunc(name string, args []Datum, ctx *Context) (Datum, error)
 		if err != nil {
 			return Datum{}, err
 		}
-		if err := loWrite(ctx, uint32(d.Int), 0, args[1].BytesValue()); err != nil {
+		buf, err := loByteaArg(args[1])
+		if err != nil {
+			return Datum{}, err
+		}
+		if err := loWrite(ctx, uint32(d.Int), 0, buf); err != nil {
 			return Datum{}, err
 		}
 		return d, nil
@@ -646,6 +665,16 @@ func loFileError(format, path string, err error) error {
 		}
 	}
 	return &ExecError{Code: code, Message: fmt.Sprintf(format, path, msg)}
+}
+
+// loByteaArg is a bytea argument: a string-kind value is an untyped literal
+// (`lo_from_bytea(0, E'\\xdeadbeef')`) that PG's coercion runs through
+// byteain, invalid input included.
+func loByteaArg(d Datum) ([]byte, error) {
+	if d.Kind == KindString {
+		return byteaIn(d.StringValue(), 0)
+	}
+	return d.BytesValue(), nil
 }
 
 // isLargeObjectDataFunc reports the be-fsstubs.c functions above.

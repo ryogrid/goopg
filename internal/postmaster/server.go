@@ -2010,6 +2010,18 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 				return
 			}
 			copyIn = nextCopyIn
+		case msgFunctionCall:
+			// Fast-path function call (PostgresMain's PqMsg_FunctionCall arm;
+			// libpq PQfn, used by the lo_* client API). See fastpath.go.
+			queryCtx, queryCancel := context.WithCancel(ctx)
+			entry.setQueryCancel(queryCancel)
+			ferr := s.handleFunctionCall(queryCtx, r, w, sess, f.Payload, connTx, prepStmts)
+			entry.clearQueryCancel()
+			queryCancel()
+			if ferr != nil {
+				logger.Info("function call write error", "err", ferr)
+				return
+			}
 		case libpq.MsgParse:
 			em := s.handleParseFrame(extended, f.Payload)
 			if em != nil {

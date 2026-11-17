@@ -203,6 +203,48 @@ answers has\_largeobject\_privilege the same way.
   returned nothing. loRead now zero\-fills up to the object size, as
   inv\_read does.
 
+## Slice 5: the fast\-path FunctionCall protocol \(libpq lo\_\*\)
+
+- libpq's large\-object API resolves the lo\_\* function OIDs once
+  \(fe\-lobj.c lo\_initialize, a pg\_proc query restricted to pg\_catalog\)
+  and then calls them with PQfn: the FunctionCall \('F'\) message.
+  - goopg's pg\_proc is a virtual view of selected builtins. The 13 functions
+    lo\_initialize looks up are now appended to it, rendered from their
+    pg\_proc.dat entries \(OIDs, argument types, strict, proparallel 'u'\).
+  - internal/postmaster/fastpath.go answers 'F' \(fastpath.c
+    HandleFunctionRequest\). goopg has no fmgr, so the call is lowered:
+    1. resolve the OID with catalog.RegprocedureNameParts \(42883 "function
+       with OID %u does not exist"\);
+    2. decode the arguments \(parse\_fcall\_arguments: format codes, binary
+       int2 / int4 / int8 / oid / bool / float / bytea / text, NULLs\) into
+       typed literals;
+    3. run `SELECT pg_catalog.f(...)` through the ordinary simple\-query
+       path against a capture writer.
+
+    That path supplies the implicit\-transaction and transaction\-block
+    handling, the 25P02 refusal in an aborted block, snapshots, and
+    error / notice reporting. The capture is then rewritten: notices and
+    errors pass through, the result cell becomes the FunctionCallResponse
+    \('V'\), and the captured ReadyForQuery closes the exchange.
+  - The result is encoded with the function's prorettype
+    \(SendFunctionResult\), not the RowDescription. goopg advertises bytea and
+    void columns as text on the wire \(M0149\-0001h1a3\), and using that type
+    returned loread's `\x…` text as data. libpq's lo\_export loop then
+    never saw an empty read.
+- **Found along the way:**
+  - exprType typed every `pg_catalog.f\(...\)` call as the text fallback,
+    because its switch keyed on the qualified name. It now strips the
+    qualifier, as the executor already did.
+  - lo\_get over a 4 GB hole zero\-filled the whole range \(23 GB RSS\).
+    lo\_get\_fragment\_internal's MaxAllocSize check \(54000 "large object
+    read request is too large"\) is ported, and loRead no longer
+    preallocates the caller's full request.
+  - Untyped literals passed to lowrite / lo\_put / lo\_from\_bytea now go
+    through byteain \(`E'\\\\xdeadbeef'`\).
+- Regress largeobject passes \(0 / 496\), and so does
+  TestPort\_RegressSuite/largeobject. The Go harness now exports
+  PG\_ABS\_BUILDDIR, as pg\_regress does. opr\_sanity 733→717.
+
 ## Open
 
 - A read\-only descriptor reads with the statement's snapshot, not the
@@ -215,12 +257,10 @@ answers has\_largeobject\_privilege the same way.
   \(M0149\-0001h1a1\).
 - ALTER DEFAULT PRIVILEGES … ON LARGE OBJECTS \(get\_user\_default\_acl at
   lo\_create\), and the pg\_shdepend owner / ACL role dependencies.
-- goopg's pg\_proc exposes only curated builtins. libpq's lo\_initialize
-  therefore fails "cannot determine OID of function lo\_open", which breaks
-  psql `\lo_unlink`, `\lo_import` and `\lo_export`. Behind that lookup,
-  libpq calls the functions through the fast\-path FunctionCall \('F'\)
-  protocol message, which goopg's postmaster does not handle at all. These
-  are the remaining 35 largeobject mismatch lines.
+- The fast path is a lowering to SQL, not an fmgr call. Binary arguments and
+  results cover only the types listed above \(others are 0A000\), and
+  log\_statement / log\_duration do not print PG's "fastpath function call"
+  lines.
 - Comments \(all kinds\) live in an in\-memory map. They are neither
   transactional nor per\-database, so a large object's comment key
   \(2613, oid\) is shared across databases.

@@ -17382,7 +17382,10 @@ func exprType(e Expr) catalog.Type {
 		if x.ReturnType != "" {
 			return catalog.Type{Name: x.ReturnType}
 		}
-		switch strings.ToLower(x.Name) {
+		// A pg_catalog-qualified call names the same builtin (the executor
+		// strips the qualifier too); without this every
+		// `pg_catalog.f(...)` typed as the text fallback below.
+		switch strings.TrimPrefix(strings.ToLower(x.Name), "pg_catalog.") {
 		case "cash_pl", "cash_mi", "cashlarger", "cashsmaller",
 			"cash_mul_flt8", "cash_mul_flt4", "cash_mul_int8", "cash_mul_int4", "cash_mul_int2",
 			"flt8_mul_cash", "flt4_mul_cash", "int8_mul_cash", "int4_mul_cash", "int2_mul_cash",

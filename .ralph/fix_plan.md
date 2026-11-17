@@ -12006,6 +12006,38 @@ verify each at HEAD when the task starts.
     - The remaining 35 lines are all libpq lo\_\*: pg\_proc OID lookup plus
       the fast\-path FunctionCall protocol — next slice.
     Movement: regress largeobject 45→35
+  - 2026-11-17 fifth slice \(landed\): fast\-path FunctionCall protocol; libpq lo\_\* client calls work; regress largeobject PASSES.
+    - postmaster fastpath.go: 'F' → lowered `SELECT pg_catalog.f\(…\)` over
+      the simple\-query path with a capture writer → 'V' + ReadyForQuery.
+      The result is encoded with prorettype.
+    - The virtual pg\_proc gains the 13 lo\_\* rows lo\_initialize looks up,
+      from pg\_proc.dat.
+    - Found:
+      - exprType typed every pg\_catalog\-qualified call as text \(fixed\);
+      - lo\_get over a 4 GB hole tried to zero\-fill it \(23 GB RSS\) —
+        PG's MaxAllocSize check is ported;
+      - untyped literals to lowrite / lo\_put / lo\_from\_bytea now go
+        through byteain;
+      - goopg's wire RowDescription advertises bytea / void / other unlisted
+        types as text \(filed M0149\-0001h1a3\).
+    - Regress: largeobject 35→0 \(status pass, pass\_required yes;
+      TestPort\_RegressSuite/largeobject PASS after the harness exports
+      PG\_ABS\_BUILDDIR\); opr\_sanity 733→717. A/B against HEAD over 15
+      cases: no other movement \(alter\_generic ±2, a known flaky case\).
+    Movement: regress largeobject 35→0, opr\_sanity 733→717
+- [ ] **M0149-0001h1a3 — the wire RowDescription advertises bytea, void and every other type typeOIDFor does not list as text \(OID 25\)** \(filed 2026-11-17 by M0149-0001h1a\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Repro: `create table tb\(b bytea\); select b from tb \\gdesc` → text
+    \(PG: bytea\); `select decode\('00','hex'\)`, `lo_put\(…\)` likewise.
+  - A client that asks for binary results \(or keys its decoding on the
+    type OID — JDBC, psycopg, libpq PQftype users\) decodes bytea's text
+    form as data.
+  - goopg: internal/postmaster/dispatch.go typeOIDFor falls back to 25 for
+    every type name it does not list. PG sends the column's real type OID
+    \(printtup.c SendRowDescriptionMessage\).
+  - > **ESCALATION \(S2, wrong results for binary\-format clients\):** filed
+    here; owner to place.
 - [ ] **M0149-0001h1a2 — RAISE without a format string ignores `USING MESSAGE = <expr>`: `raise notice using message = sqlstate` prints the expression text** \(filed 2026-11-17 by M0149-0001h1a\)
   Kind: impl
   Parent: M0149-0001h1a

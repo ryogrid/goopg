@@ -24,7 +24,7 @@ func TestPgProcViewEmptyByDefault(t *testing.T) {
 	// Built-in stubs + the hand-curated catalog.BuiltinProcs() table are
 	// always present; without user-defined routines we should see exactly
 	// their combined row count.
-	wantLen := len(builtinProcs) + len(catalog.BuiltinProcs())
+	wantLen := len(builtinProcs) + len(catalog.BuiltinProcs()) + len(libpqLargeObjectProcOIDs)
 	if len(rows) != wantLen {
 		t.Errorf("rows = %d, want %d (only built-in stubs)", len(rows), wantLen)
 	}
@@ -53,7 +53,7 @@ func TestPgProcViewRendersRoutine(t *testing.T) {
 	rows := tbl.VirtualRows()
 	// Built-in stubs + 1 user routine + the hand-curated catalog.BuiltinProcs()
 	// table (appended after user routines).
-	wantLen := len(builtinProcs) + 1 + len(catalog.BuiltinProcs())
+	wantLen := len(builtinProcs) + 1 + len(catalog.BuiltinProcs()) + len(libpqLargeObjectProcOIDs)
 	if len(rows) != wantLen {
 		t.Fatalf("rows = %d, want %d", len(rows), wantLen)
 	}
@@ -475,7 +475,15 @@ func TestPgProcViewProparallel(t *testing.T) {
 			t.Errorf("row %q proparallel = %q, want u (unsafe)", legacyRows[i][1], legacyRows[i][proparallel])
 		}
 	}
-	for _, row := range rows[len(builtinProcs)+1:] {
+	// The trailing libpq large-object rows carry their pg_proc.dat
+	// proparallel ('u', marked explicitly there).
+	nLO := len(libpqLargeObjectProcOIDs)
+	for _, row := range rows[len(rows)-nLO:] {
+		if row[proparallel] != "u" {
+			t.Errorf("large-object %q proparallel = %q, want u (pg_proc.dat)", row[1], row[proparallel])
+		}
+	}
+	for _, row := range rows[len(builtinProcs)+1 : len(rows)-nLO] {
 		if row[proparallel] != "s" {
 			t.Errorf("built-in %q proparallel = %q, want s (safe, BKI_DEFAULT)", row[1], row[proparallel])
 		}
@@ -602,7 +610,7 @@ func TestPgProcViewOrdering(t *testing.T) {
 	rows := tbl.VirtualRows()
 	// Built-in stubs + 3 user routines + the hand-curated catalog.BuiltinProcs()
 	// table (appended after user routines).
-	wantLen := len(builtinProcs) + 3 + len(catalog.BuiltinProcs())
+	wantLen := len(builtinProcs) + 3 + len(catalog.BuiltinProcs()) + len(libpqLargeObjectProcOIDs)
 	if len(rows) != wantLen {
 		t.Fatalf("rows = %d, want %d", len(rows), wantLen)
 	}
@@ -688,7 +696,7 @@ func TestPgProcViewIsPerDatabase(t *testing.T) {
 		}
 		return m
 	}
-	builtins := len(builtinProcs) + len(catalog.BuiltinProcs())
+	builtins := len(builtinProcs) + len(catalog.BuiltinProcs()) + len(libpqLargeObjectProcOIDs)
 	for _, c := range []struct {
 		label string
 		rows  [][]string

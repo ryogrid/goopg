@@ -11,6 +11,7 @@ package initdb
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
@@ -668,9 +669,67 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"",  // prosqlbody: NULL (prokind='a' rows never carry an SQL body)
 			})
 		}
+		// The large-object functions libpq's lo_initialize looks up by name
+		// in pg_catalog (fe-lobj.c) before calling them through the fast-path
+		// protocol; rendered from their pg_proc.dat entries, flags included.
+		// Appended last so the positional layout above is unchanged.
+		for _, e := range libpqLargeObjectProcEntries() {
+			args := make([]string, len(e.ArgTypes))
+			for i, a := range e.ArgTypes {
+				args[i] = fmt.Sprintf("%d", a)
+			}
+			vol, par, strict := "v", "s", "t"
+			if e.Volatile != 0 {
+				vol = string(e.Volatile)
+			}
+			if e.Parallel != 0 {
+				par = string(e.Parallel)
+			}
+			if e.NotStrict {
+				strict = "f"
+			}
+			rows = append(rows, []string{
+				fmt.Sprintf("%d", e.OID), e.Name, "11", "12",
+				fmt.Sprintf("%d", e.RetType), strings.Join(args, " "),
+				fmt.Sprintf("%d", len(args)),
+				"", "10", e.HandlerName, vol, "f", "f", strict, "f", "f",
+				"", "", "1", "0", "", par, "-", "0", "0", "", "", "", "", "",
+			})
+		}
 		return rows
 	}
 	tbl.VirtualRows = func() [][]string { return rowsFor(catalog.DefaultDBOid) }
 	tbl.VirtualRowsForDB = rowsFor
 	return cat.RegisterVirtualTable(tbl)
+}
+
+// libpqLargeObjectProcOIDs are the functions fe-lobj.c's lo_initialize
+// resolves: lo_open, lo_close, lo_creat, lo_create, lo_unlink, lo_lseek,
+// lo_lseek64, lo_tell, lo_tell64, lo_truncate, lo_truncate64, loread,
+// lowrite.
+var libpqLargeObjectProcOIDs = []uint32{952, 953, 957, 715, 964, 956, 3170, 958, 3171, 1004, 3172, 954, 955}
+
+var (
+	libpqLOProcsOnce sync.Once
+	libpqLOProcs     []pgProcEntry
+)
+
+// libpqLargeObjectProcEntries returns those entries (computed once).
+func libpqLargeObjectProcEntries() []pgProcEntry {
+	libpqLOProcsOnce.Do(func() { libpqLOProcs = buildLibpqLargeObjectProcEntries() })
+	return libpqLOProcs
+}
+
+func buildLibpqLargeObjectProcEntries() []pgProcEntry {
+	want := make(map[uint32]bool, len(libpqLargeObjectProcOIDs))
+	for _, o := range libpqLargeObjectProcOIDs {
+		want[o] = true
+	}
+	var out []pgProcEntry
+	for _, e := range pgProcAllEntries() {
+		if want[e.OID] {
+			out = append(out, e)
+		}
+	}
+	return out
 }

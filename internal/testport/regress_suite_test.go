@@ -307,7 +307,7 @@ var regressExcluded = map[string]string{
 	// External / infra features
 	"async": "LISTEN/NOTIFY; out of scope for goopg v0.", "compression": "TOAST compression; out of scope for goopg v0.",
 	"foreign_data": "FDW; out of scope for goopg v0.", "indirect_toast": "Indirect TOAST; out of scope for goopg v0.",
-	"largeobject": "Large objects; out of scope for goopg v0.", "maintain_every": "Maintenance scheduling; out of scope for goopg v0.",
+	"maintain_every": "Maintenance scheduling; out of scope for goopg v0.",
 	"numa": "NUMA; out of scope for goopg v0.", "object_address": "pg_get_object_address; out of scope for goopg v0.",
 	"tablesample": "TABLESAMPLE; out of scope for goopg v0.", "tablespace": "Tablespace DDL; not implemented in goopg v0.",
 	// XML / advanced JSON
@@ -415,6 +415,13 @@ func (e *ClusterRegressExecutor) psqlEnv() []string {
 	if e.RepoRoot != "" {
 		absSrcDir := filepath.Join(e.RepoRoot, "postgres", "src", "test", "regress")
 		env = append(env, "PG_ABS_SRCDIR="+absSrcDir)
+	}
+	// pg_regress.c also exports PG_ABS_BUILDDIR (its outputdir): cases such
+	// as largeobject write and re-read :abs_builddir/results/*. Kept out of
+	// the read-only postgres/ tree.
+	buildDir := filepath.Join(os.TempDir(), "goopg-regress-builddir")
+	if err := os.MkdirAll(filepath.Join(buildDir, "results"), 0o755); err == nil {
+		env = append(env, "PG_ABS_BUILDDIR="+buildDir)
 	}
 	return env
 }
