@@ -12129,6 +12129,20 @@ verify each at HEAD when the task starts.
     oidjoins, arrays, opr\_sanity, misc\_sanity, psql, alter\_table,
     regproc unchanged.
   Movement: regress type_sanity 82→62, create_type 115→112
+- [x] **M0149-0001h1a16 — pg\_class.relam follows RELKIND\_HAS\_TABLE\_AM: TOAST rows carry heap, views / partitioned tables / composite / foreign rows InvalidOid** \(filed 2026-11-17 by M0149-0001h1a15's type\_sanity residue, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: pg\_class.h RELKIND\_HAS\_TABLE\_AM \(r, t, m\); heap\_create gives
+    every other relkind relam = InvalidOid unless an explicit ACCESS METHOD
+    is set on a partitioned table.
+  - Landed: the virtual pg\_class builder \(catalog\) and relamFor
+    \(executor heap rows\) share the rule; the virtual TOAST rows say 2.
+  - Tests: TestPgClassRelamFollowsRelkindHasTableAM; the pg\_amcheck and
+    pg\_dump testport families pass with TOAST rows now heap-verified.
+  - Regress A/B vs HEAD over 13 cases: type\_sanity 59→56 \(inventory
+    62→56\), create\_am 148→145; the other 11 unchanged \(psql: a view's
+    access-method column now blank, as in PG\).
+  Movement: regress type_sanity 62→56, create_am 148→145
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

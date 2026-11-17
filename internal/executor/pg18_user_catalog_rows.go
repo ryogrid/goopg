@@ -482,11 +482,13 @@ func collationNameToOID(name string) uint32 {
 // ASSERTS relam == InvalidOid for RELKIND_SEQUENCE (relcache.c:1841; it
 // installs the heap AM routine itself) and views have no storage at all.
 func relamFor(relkind string) int64 {
+	// RELKIND_HAS_TABLE_AM: only tables, TOAST tables and matviews carry
+	// the heap AM. M0149-0001h1a16.
 	switch relkind {
-	case "S", "v":
-		return 0
-	default:
+	case "r", "t", "m":
 		return pgHeapAccessMethodOID
+	default:
+		return 0
 	}
 }
 

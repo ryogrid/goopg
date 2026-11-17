@@ -8208,9 +8208,13 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		// relam=HEAP_TABLE_AM_OID for heap verification, so relam=0 keeps the
 		// storage-less virtual sequence out of verify_heapam (which would fail).
 		// M0110-0001 (DU-002 slice 116).
-		relam := "2"
-		if t.IsSequence {
-			relam = "0"
+		// RELKIND_HAS_TABLE_AM (pg_class.h): only r / t / m carry the heap
+		// AM; views, sequences, composite types, foreign and partitioned
+		// tables (no explicit ACCESS METHOD) are InvalidOid. M0149-0001h1a16.
+		relam := "0"
+		switch relkind {
+		case "r", "t", "m":
+			relam = "2"
 		}
 		populated := "t"
 		if t.IsMatView && !t.IsPopulated {
@@ -8412,7 +8416,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 				"0",                    // 3:  reltype
 				"0",                    // 4:  reloftype
 				"10",                   // 5:  relowner
-				"0",                    // 6:  relam
+				"2",                    // 6:  relam (heap: RELKIND_TOASTVALUE has a table AM)
 				strconv.Itoa(toastOID), // 7:  relfilenode
 				"0",                    // 8:  reltablespace
 				"0",                    // 9:  relpages
