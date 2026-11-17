@@ -18,6 +18,8 @@ func TestPgClassOwnerAndPartitionedIndexRelkind(t *testing.T) {
 		"CREATE TABLE pt (id int) PARTITION BY RANGE (id)",
 		"CREATE INDEX pti ON pt (id)",
 		"CREATE TABLE plain (a int)",
+		"CREATE TABLE sub PARTITION OF pt FOR VALUES FROM (0) TO (10) PARTITION BY RANGE (id)",
+		"CREATE TABLE leaf PARTITION OF sub FOR VALUES FROM (0) TO (5)",
 	} {
 		if err := runDDL(t, ctx, ddl); err != nil {
 			t.Fatalf("%s: %v", ddl, err)
@@ -26,6 +28,12 @@ func TestPgClassOwnerAndPartitionedIndexRelkind(t *testing.T) {
 	rows := runQueryRows(t, ctx, "SELECT relname, relkind, relfilenode FROM pg_catalog.pg_class WHERE relname IN ('pt', 'pti') ORDER BY relname")
 	if len(rows) != 2 || rows[1][1].StringValue() != "I" || rows[1][2].Int != 0 {
 		t.Fatalf("partitioned index row = %+v, want relkind I, relfilenode 0", rows)
+	}
+	// A sub-partitioned partition is itself RELKIND_PARTITIONED_TABLE; its
+	// own partition is an ordinary table (M0149-0001h1a28).
+	kinds := runQueryRows(t, ctx, "SELECT relname, relkind FROM pg_catalog.pg_class WHERE relname IN ('sub', 'leaf') ORDER BY relname")
+	if len(kinds) != 2 || kinds[0][1].StringValue() != "r" || kinds[1][1].StringValue() != "p" {
+		t.Errorf("leaf / sub relkind = %+v, want r / p", kinds)
 	}
 	im, ok := ctx.Catalog.(*catalog.InMemory)
 	if !ok {

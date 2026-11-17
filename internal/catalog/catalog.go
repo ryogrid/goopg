@@ -1393,7 +1393,10 @@ func TableRelkind(t *Table) string {
 		return "v"
 	case t.IsMatView:
 		return "m"
-	case t.PartitionMethod != "" && t.PartitionParentOID == 0:
+	case t.PartitionMethod != "":
+		// A sub-partitioned table (PARTITION OF parent ... PARTITION BY) is
+		// RELKIND_PARTITIONED_TABLE too; PartitionMethod is only ever set from
+		// the table's own PARTITION BY clause. M0149-0001h1a28.
 		return "p"
 	case t.ForeignServerName != "":
 		return "f"
@@ -1410,7 +1413,9 @@ func (c *InMemory) IndexRelkind(idx *Index) string {
 	if len(c.indexPartitionChildren[idx.OID]) > 0 {
 		return "I"
 	}
-	return "i"
+	// An index on a partitioned table is 'I' before any child attaches
+	// (package-level IndexRelkind). M0149-0001h1a28.
+	return IndexRelkind(idx)
 }
 
 // RelfilenodeForRelkind renders the pg_class.relfilenode cell for a relation of
@@ -8612,13 +8617,20 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		// (relkind 'I'), which has no storage of its own. Hoisted for the
 		// same column-width reason as idxTablespace. M0134-0164.
 		idxFilenode := RelfilenodeForRelkind(idxRelkind, idx.OID)
+		// relowner: an index is owned by its table's owner (index_create).
+		idxOwner := "10"
+		if idx.Table != nil && idx.Table.Owner != "" {
+			if oid, ok := c.roleOIDLocked(idx.Table.Owner); ok {
+				idxOwner = strconv.Itoa(int(oid))
+			}
+		}
 		out = append(out, []string{
 			strconv.Itoa(int(idx.OID)),  // 0:  oid
 			idx.Name,                    // 1:  relname
 			strconv.Itoa(int(idxNsOID)), // 2:  relnamespace
 			"0",                         // 3:  reltype
 			"0",                         // 4:  reloftype
-			"10",                        // 5:  relowner
+			idxOwner,                        // 5:  relowner (the table owner's, M0149-0001h1a28)
 			idxRelam,                    // 6:  relam
 			idxFilenode,                 // 7:  relfilenode (0 for a partitioned index, relkind 'I' — M0134-0164)
 			idxTablespace,               // 8:  reltablespace

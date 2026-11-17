@@ -12351,6 +12351,26 @@ verify each at HEAD when the task starts.
     the way a SELECT target list does \(ProjectSet; PG's
     transformValuesClause keeps the SRF, and the planner adds a ProjectSet
     above the Values scan\).
+- [x] **M0149-0001h1a28 — a sub-partitioned partition \(PARTITION OF ... PARTITION BY\) is relkind 'p'; an index's relowner is its table's owner** \(filed 2026-11-18 by M0149-0001h1a26's ledger row, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: heap\_create\_with\_catalog gives any table with a PARTITION BY
+    RELKIND\_PARTITIONED\_TABLE, partition or not; index\_create's
+    relowner is the heap's.
+  - Landed:
+    - catalog.TableRelkind drops its `PartitionParentOID == 0` guard;
+      PartitionMethod is only set from the table's own PARTITION BY, and
+      the executor sibling already treated it so;
+    - InMemory.IndexRelkind follows the package rule \('I' on a
+      partitioned table\);
+    - index relowner = the table owner in both builders \(indexOwnerOID /
+      idxOwner\).
+  - Tests: TestPgClassOwnerAndPartitionedIndexRelkind \(sub / leaf
+    relkind\).
+  - Regress A/B vs HEAD over 14 cases: psql 339→324, create\_table
+    122→119, indexing 299→282, insert 253→249 \(inventory updated\); the
+    other 10 unchanged.
+  Movement: regress psql 339→324, create_table 122→119, indexing 299→282, insert 253→249
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

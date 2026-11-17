@@ -713,7 +713,7 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index, dbOid 
 		NewIntDatum(int64(namespaceOIDForSchema(cat, idx.Schema, dbOid...))),
 		NewIntDatum(0),                        // reltype
 		NewIntDatum(0),                        // reloftype
-		NewIntDatum(bootstrapSuperuserOID),    // relowner
+		NewIntDatum(indexOwnerOID(cat, idx)),  // relowner (the table owner's, M0149-0001h1a28)
 		NewIntDatum(indexRelamOID(idx)),       // relam
 		NewIntDatum(int64(catalogRelfilenodeForIndex(idx))), // relfilenode (0 for a partitioned index)
 		NewIntDatum(int64(idx.Tablespace)),    // reltablespace (0 = default; explicit CREATE/ALTER INDEX ... TABLESPACE otherwise, M0122-0007)
@@ -3011,4 +3011,13 @@ func tableOwnerOID(cat catalog.Catalog, tbl *catalog.Table) int64 {
 func catalogRelfilenodeForIndex(idx *catalog.Index) uint32 {
 	n, _ := strconv.ParseUint(catalog.RelfilenodeForRelkind(catalog.IndexRelkind(idx), idx.OID), 10, 32)
 	return uint32(n)
+}
+
+// indexOwnerOID is an index's pg_class.relowner: its table's owner
+// (index_create). M0149-0001h1a28.
+func indexOwnerOID(cat catalog.Catalog, idx *catalog.Index) int64 {
+	if idx != nil && idx.Table != nil {
+		return tableOwnerOID(cat, idx.Table)
+	}
+	return bootstrapSuperuserOID
 }
