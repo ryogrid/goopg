@@ -8378,7 +8378,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 			strconv.Itoa(int(t.OID)),        // 0:  oid
 			t.Name,                          // 1:  relname
 			strconv.Itoa(int(nsOID)),        // 2:  relnamespace
-			"0",                             // 3:  reltype
+			strconv.Itoa(int(BuiltinRelType(t.OID))), // 3:  reltype (system relations' rowtype; user relations M0149-0001h1a34 slice 2)
 			relOfType,                       // 4:  reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
 			relOwner,                        // 5:  relowner (Table.Owner; bootstrap superuser when unset, M0149-0001h1a26)
 			relam,                           // 6:  relam (heap=2; 0 for sequences)
@@ -8732,7 +8732,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		"1259",     // 0:  oid
 		"pg_class", // 1:  relname
 		"11",       // 2:  relnamespace (pg_catalog OID=11)
-		"0",        // 3:  reltype
+		strconv.Itoa(int(BuiltinRelType(RelationRelationId))), // 3:  reltype
 		"0",        // 4:  reloftype
 		"10",       // 5:  relowner
 		"2",        // 6:  relam (heap)

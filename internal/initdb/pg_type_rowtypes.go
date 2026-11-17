@@ -3,6 +3,7 @@ package initdb
 import (
 	"sync"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
 )
 
@@ -85,3 +86,7 @@ func pgTypeFullRowDatums(r pgTypeFullRow) executor.Row {
 		i(int64(r.Collation)), executor.NullDatum, executor.NullDatum, executor.NullDatum,
 	}
 }
+
+// Register the system relation → rowtype map for the virtual pg_class
+// renderer's reltype column. M0149-0001h1a34.
+func init() { catalog.SetBuiltinRelTypes(pgClassRowtypeOIDs()) }

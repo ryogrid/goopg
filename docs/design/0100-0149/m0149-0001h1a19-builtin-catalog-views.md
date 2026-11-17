@@ -96,3 +96,21 @@ is empty for all 3413 built-ins.
   AS '<sym>'` validates against it, as `fmgr_internal_function` does, so
   `dsin` (for sin) is accepted and the SQL name `sin` is rejected. Earlier it
   validated the proname instead.
+
+## pg\_class.reltype (h1a34)
+
+- **System relations (slice 1).** `initdb` registers PG 18.3's relation →
+  rowtype map (`pgClassRowtypeOIDs`, from the captured initdb pg\_type rows)
+  through `catalog.SetBuiltinRelTypes` at package init. The virtual
+  pg\_class renders `reltype` from `catalog.BuiltinRelType`: pg\_class is 83,
+  pg\_type 71, pg\_largeobject 10025, and an index or sequence is 0. It used to
+  be 0 everywhere.
+- **User relations (slice 2, open).** PG's `heap_create_with_catalog`
+  allocates the relation OID N, then the array type N+1
+  (`AssignTypeArrayOid`), then the rowtype N+2 (`AddNewRelationType`), for
+  every relkind except index, sequence and TOAST. goopg allocates one OID per
+  relation and has no rowtype pg\_type rows, so `'tbl'::regtype` fails and
+  every later OID drifts from PG's. Standalone composite types already take
+  three OIDs (`CompositeType.OID / ArrayOID / RelOID`).
+- **Known gap.** goopg's virtual pg\_class lists only 11 system relations,
+  where PG lists 415 (filed M0149-0001h1a35).

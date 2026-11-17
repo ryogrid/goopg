@@ -12553,6 +12553,37 @@ verify each at HEAD when the task starts.
   - Resume: the pg\_class renderer and the user pg\_type rows
     \(pg18\_user\_catalog\_rows.go\); check how ROW types of tables are typed
     today \(composite type registry\) before allocating new OIDs.
+  - 2026-11-18 slice 1 \(landed\): reltype for system relations.
+    - catalog.SetBuiltinRelTypes / BuiltinRelType; initdb registers
+      pgClassRowtypeOIDs \(captured PG 18.3 rowtypes\) at package init; the
+      virtual pg\_class table arm and the hard\-coded pg\_class row read it.
+    - All 11 system relations goopg's pg\_class lists equal PG 18.3's
+      reltype \(pg\_type 71, pg\_attribute 75, pg\_class 83, pg\_largeobject
+      10025, pg\_largeobject\_metadata 10023, indexes 0\).
+    - Found: goopg's pg\_class lists only 11 system relations against PG's
+      415 \(filed M0149\-0001h1a35\).
+    - Test: TestBuiltinRelTypesRegistered.
+    - Next slice \(2\): user relations. Reserve OIDs as
+      heap\_create\_with\_catalog does \(relation N, array N\+1, rowtype N\+2,
+      except index / sequence / TOAST\), carry them on catalog.Table and
+      persist them with the pg\_class row, render the rowtype and array rows
+      in pg\_type, and resolve `'tbl'::regtype` / pg\_typeof\(row\) to them.
+      Check which tests pin consecutive user OIDs before changing the
+      allocator.
+    Movement: probe pg\_class.reltype for system relations 3/11→11/11 vs PG 18.3
+- [ ] **M0149-0001h1a35 — the virtual pg\_class lists 11 system relations; PG 18.3 lists 415** \(filed 2026-11-18 by M0149-0001h1a34\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Probe: `select count(*) from pg_class where oid < 16384` is 11 on goopg
+    \(pg\_type, pg\_attribute, pg\_class, pg\_largeobject\[\_metadata\] and a
+    few indexes\), 415 on PG 18.3: pg\_namespace, pg\_proc, the other
+    catalogs, their indexes, TOAST tables and the system views are absent,
+    so psql `\dS`, `\dtS` and `pg_class` joins over system objects miss them.
+  - PG: genbki writes every catalog's pg\_class row; system\_views.sql and
+    information\_schema.sql add the views.
+  - Resume: catalog.go's virtual pg\_class renderer; the captured relation
+    list initdb already has \(pgBootstrapRelNameByOID, relcache\_init.go, the
+    system view OID pins\) as the row source.
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a
