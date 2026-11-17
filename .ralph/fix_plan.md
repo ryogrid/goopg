@@ -12143,6 +12143,31 @@ verify each at HEAD when the task starts.
     62→56\), create\_am 148→145; the other 11 unchanged \(psql: a view's
     access-method column now blank, as in PG\).
   Movement: regress type_sanity 62→56, create_am 148→145
+- [x] **M0149-0001h1a17 — `<oid>::regproc::oid` \(and every reg\* type\) returns the OID instead of oidin's 22P02 on the rendered name** \(found 2026-11-17 by the pg\_proc column-diff probe, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: pg\_cast reg\* → oid / int is binary-coercible \(castmethod 'b'\);
+    `prosupport::oid` on a '\-' regproc is 0.
+  - Landed: evalCastTyped resolves a reg\*-typed datum that the
+    `<oid>::reg*` arm already rendered as a name back through
+    regIdentifierInput before an oid / int4 / int8 cast.
+  - Tests: TestRegCastBackToOid.
+  - Regress A/B vs HEAD over 13 cases: no movement \(those cases fail
+    earlier; alter\_generic +1 is its known owner-order flake\).
+  Movement: none \(correctness: `0::regproc::oid` errored\)
+- [ ] **M0149-0001h1a18 — serve the full pg\_proc \(3413 builtin rows\) instead of the 45-row curated list** \(filed 2026-11-17 by M0149-0001h1a17\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Finding: `select count\(\*\) from pg_proc` is 45 on goopg vs 3413 on
+    PG 18.3 \(oid < 16384\); `now` \(1299\) is absent, so every
+    opr\_sanity / type\_sanity / oidjoins / psql \\df query over builtins
+    diverges. Ledger row 2026-11-17 M0149-0001h1a "virtual pg\_proc gains
+    the 13 lo\_\* functions".
+  - Resume: internal/initdb/pg\_proc\_view.go registerPgProcView rowsFor —
+    render every pgProcInitialEntries / PGProcAllEntries row with the PG
+    column values \(capture a column diff vs a scratch PG initdb, as
+    M0149-0001h1a15 did for pg\_type\); then A/B opr\_sanity, type\_sanity,
+    oidjoins, psql, pg\_dump testport.
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

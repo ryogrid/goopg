@@ -5626,6 +5626,20 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context
 	// goopg used to satisfy this by accident, because the stored datum was
 	// already trimmed. Since the storage flip it is padded, so the cast has to
 	// do what upstream's does.
+	// A reg* value can reach a cast already rendered as its name (the
+	// `<oid>::regproc` arm renders eagerly). reg* → oid / int is binary
+	// coercible in PG (pg_cast castmethod 'b'), so the OID comes back
+	// through the type's input function: `0::regproc::oid` is 0 and
+	// `1299::regproc::oid` 1299 — not an oidin error on "-" / "now".
+	// M0149-0001h1a17.
+	if d.Kind == KindString && isRegIdentifierTypeName(sourceType) && ctx != nil && ctx.Catalog != nil {
+		switch strings.ToLower(targetType) {
+		case "oid", "int4", "integer", "int8", "bigint":
+			if out, err := regIdentifierInput(d, strings.ToLower(sourceType), ctx, pos); err == nil && out.Kind == KindInt {
+				return evalCast(out, targetType, pos, ctx)
+			}
+		}
+	}
 	if d.Kind == KindString && isBpcharTypeName(sourceType) && isTextTargetTypeName(targetType) {
 		return NewStringDatum(bcTrimRight(d.StringValue())), nil
 	}
