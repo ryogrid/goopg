@@ -12245,6 +12245,31 @@ verify each at HEAD when the task starts.
     opr\_sanity 149→137 \(inventory 155→146\), polymorphism 683→677
     \(inventory 683→680\); 16 unchanged.
   Movement: regress psql 511→505, opr_sanity 155→146, polymorphism 683→680
+- [x] **M0149-0001h1a22 — pg\_conversion / pg\_range serve their built-in rows; oidvector / int2vector subscripts are 0-based OIDs; regtypein resolves every built-in name** \(filed 2026-11-18 by M0149-0001h1a21's next-step list, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: pg\_conversion \(128 rows\) and pg\_range \(6\) at initdb;
+    oidvector is a 0-based array of oid \(int2vector of int2\); regtypein
+    resolves any visible type name.
+  - Landed:
+    - gen-pg-catalog-seed-rows.py gains pg\_conversion and pg\_range \(KEY
+      map for pg\_range's rngtypid\); PGConversionRowsForDBOid and the
+      pg\_range view lead with the seed; column-wise diffs vs :5545 empty;
+    - the array\_subscript element type for an oidvector / int2vector base
+      is oid / int2 \(planner\), and the executor splits the
+      space-separated value 0-based — `proargtypes[0]` was the first
+      CHARACTER;
+    - regIdentifierInput's regtype arm falls back to
+      catalog.BuiltinTypeOIDByFormatName \(`'cstring'::regtype` was 42704\).
+  - Tests: TestOidvectorSubscriptIsZeroBasedOid,
+    TestRegtypeInputResolvesEveryBuiltin; the catalog conversion tests skip
+    the seed rows.
+  - Design: m0149-0001h1a19-builtin-catalog-views.md updated.
+  - Regress A/B vs HEAD: opr\_sanity 146→112, type\_sanity 41→20, psql
+    505→493 \(inventory updated\); conversion, rangetypes,
+    multirangetypes, oidjoins, alter\_generic, create\_type, misc\_sanity,
+    dependency, object\_address, create\_index, indexing unchanged.
+  Movement: regress opr_sanity 146→112, type_sanity 41→20, psql 505→493
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

@@ -101,3 +101,24 @@ func BuiltinFormatTypeName(oid uint32) (string, bool) {
 	n, ok := builtinFormatTypeNames[oid]
 	return n, ok
 }
+func SeedPgConversionRowCount() int { return len(seedPgConversionRows) }
+func SeedPgRangeRowCount() int      { return len(seedPgRangeRows) }
+
+var (
+	builtinFormatTypeOIDsOnce sync.Once
+	builtinFormatTypeOIDs     map[string]uint32
+)
+
+// BuiltinTypeOIDByFormatName is the reverse of BuiltinFormatTypeName: the
+// pg_catalog type whose format_type spelling is name (cstring, anyelement,
+// int4range, character varying, integer[]). M0149-0001h1a22.
+func BuiltinTypeOIDByFormatName(name string) (uint32, bool) {
+	builtinFormatTypeOIDsOnce.Do(func() {
+		builtinFormatTypeOIDs = make(map[string]uint32, len(builtinFormatTypeNames))
+		for oid, n := range builtinFormatTypeNames {
+			builtinFormatTypeOIDs[n] = oid
+		}
+	})
+	oid, ok := builtinFormatTypeOIDs[name]
+	return oid, ok
+}

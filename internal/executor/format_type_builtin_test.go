@@ -24,3 +24,17 @@ func TestBuiltinTypeNamesFollowFormatTypeBe(t *testing.T) {
 		}
 	}
 }
+
+// TestRegtypeInputResolvesEveryBuiltin pins regtypein over the full
+// pg_catalog type set (M0149-0001h1a22): 'cstring'::regtype raised 42704
+// because TypeNameToOID knows only a subset, which broke opr_sanity's
+// conproc signature check.
+func TestRegtypeInputResolvesEveryBuiltin(t *testing.T) {
+	ctx := &Context{Catalog: catalog.NewInMemory()}
+	for in, want := range map[string]int64{"cstring": 2275, "anyelement": 2283, "int4range": 3904, "internal": 2281, "int4": 23} {
+		d, err := regIdentifierInput(NewStringDatum(in), "regtype", ctx, 0)
+		if err != nil || d.Kind != KindInt || d.Int != want {
+			t.Errorf("%s::regtype = %+v, %v; want %d", in, d, err, want)
+		}
+	}
+}

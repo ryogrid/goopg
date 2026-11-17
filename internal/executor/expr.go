@@ -13122,6 +13122,19 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 					return NullDatum, nil
 				}
 			}
+			// oidvector / int2vector are 0-based arrays whose text form is
+			// space-separated (pg_proc.proargtypes, pg_index.indkey): the
+			// planner stamps their element type. M0149-0001h1a22.
+			if (x.ReturnType == "oid" || x.ReturnType == "int2") && (len(sv) == 0 || sv[0] != '{') {
+				f := strings.Fields(sv)
+				if n < 0 || int(n) >= len(f) {
+					return NullDatum, nil
+				}
+				if iv, perr := strconv.ParseInt(f[n], 10, 64); perr == nil {
+					return NewIntDatum(iv), nil
+				}
+				return NullDatum, nil
+			}
 			if len(sv) < 2 || sv[0] != '{' {
 				// Not an array literal: a fixed-length pseudo-array type — most
 				// importantly `name` — is being subscripted. PostgreSQL indexes

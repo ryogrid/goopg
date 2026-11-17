@@ -12249,10 +12249,10 @@ func (c *InMemory) registerSystemTables() {
 	// sub-item (a)).
 	pgRange.VirtualRows = func() [][]string {
 		rts := c.ListRangeTypes()
-		if len(rts) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(rts))
+		// The six built-in range types from a PG 18.3 initdb first
+		// (M0149-0001h1a22); user range types follow.
+		out := make([][]string, 0, len(seedPgRangeRows)+len(rts))
+		out = append(out, seedPgRangeRows...)
 		for _, rt := range rts {
 			subtypeOID := TypeNameToOID(rt.SubtypeName)
 			out = append(out, []string{
@@ -15240,10 +15240,10 @@ func (c *InMemory) FindDefaultConversionProc(forEnc, toEnc int32, dbOid ...uint3
 // M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
 func (c *InMemory) PGConversionRowsForDBOid(dbOid uint32) [][]string {
 	convs := c.ListUserConversionsForDBOid(dbOid)
-	if len(convs) == 0 {
-		return nil
-	}
-	out := make([][]string, 0, len(convs))
+	// The 128 built-in conversions from a PG 18.3 initdb first
+	// (M0149-0001h1a22); user conversions follow.
+	out := make([][]string, 0, len(seedPgConversionRows)+len(convs))
+	out = append(out, seedPgConversionRows...)
 	for _, cv := range convs {
 		condefault := "f"
 		if cv.Default {

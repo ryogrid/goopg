@@ -23,6 +23,7 @@ from PG itself:
 | pg\_proc | `scripts/gen-pg-proc-view-rows.py` → `pg_proc_view_rows_generated.go` (3413 rows) | h1a18 |
 | pg\_operator | the existing `PGOperatorAllEntries` seed (799 rows), `seedOperatorViewRows` | h1a19 |
 | pg\_cast, pg\_opfamily, pg\_opclass, pg\_amop, pg\_amproc | `scripts/gen-pg-catalog-seed-rows.py` → `internal/catalog/pg_catalog_seed_rows_generated.go` (235 / 146 / 177 / 945 / 714 rows) | h1a20 |
+| pg\_conversion, pg\_range | same generator (128 / 6 rows; pg\_range keyed by rngtypid) | h1a22 |
 
 Each landing is checked with a column-wise diff of the view against a
 scratch PG 18.3 cluster. The generators capture from a throwaway
@@ -36,8 +37,6 @@ following regprocout: an overloaded built-in name is shown as
 
 | catalog | goopg rows | PG rows |
 |---|---|---|
-| pg\_range | 0 | 6 |
-| pg\_conversion | 0 | 128 |
 | pg\_ts\_config | 0 | 30 |
 | pg\_ts\_dict | 1 | 30 |
 | pg\_collation | 7 | 860 |
@@ -63,3 +62,12 @@ The generic generator (`gen-pg-catalog-seed-rows.py`) takes a table name
 and its view column order, so another catalog is one more `TABLES` entry.
 Test helpers that inspect user rows skip the seed through
 `catalog.SeedPg*RowCount()`.
+
+Seeding these views made catalog queries that used to return nothing run
+for real. That surfaced two executor bugs, both fixed in h1a22:
+
+- `oidvector` / `int2vector` subscripts indexed the text form's characters
+  (`proargtypes[0]` of `23 23 2275` was `2`). The planner now stamps the
+  element type (oid / int2), and the executor splits the value 0-based.
+- regtypein did not know most built-in names (`'cstring'::regtype` raised
+  42704). It now falls back to the reverse of `builtinFormatTypeNames`.

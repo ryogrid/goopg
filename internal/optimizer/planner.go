@@ -17648,6 +17648,15 @@ func exprType(e Expr) catalog.Type {
 				if strings.HasSuffix(arrT.Name, "[]") {
 					return catalog.Type{Name: arrT.Name[:len(arrT.Name)-2]}
 				}
+				// oidvector / int2vector subscripts are 0-based arrays of
+				// oid / int2 (pg_proc.proargtypes[0], pg_index.indkey[0]).
+				// M0149-0001h1a22.
+				if strings.EqualFold(arrT.Name, "oidvector") {
+					return catalog.Type{Name: "oid"}
+				}
+				if strings.EqualFold(arrT.Name, "int2vector") {
+					return catalog.Type{Name: "int2"}
+				}
 				// point[i] (0-based) yields the i-th coordinate as float8.
 				if strings.EqualFold(arrT.Name, "point") {
 					return catalog.Type{Name: "float8"}

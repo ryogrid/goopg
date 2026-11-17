@@ -352,6 +352,14 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 			(oid != catalog.OIDText || strings.EqualFold(typeName, "text")) {
 			return NewIntDatum(int64(oid)), nil
 		}
+		// Every other pg_catalog type by its format_type spelling (cstring,
+		// anyelement, int4range — TypeNameToOID knows only a subset).
+		// M0149-0001h1a22.
+		if builtinVisible {
+			if oid, ok := catalog.BuiltinTypeOIDByFormatName(strings.ToLower(typeName)); ok {
+				return NewIntDatum(int64(oid)), nil
+			}
+		}
 		if !strings.EqualFold(schema, "pg_catalog") {
 			if oid, ok := userTypeOIDForName(ctx.Catalog, typeName); ok {
 				return NewIntDatum(int64(oid)), nil
