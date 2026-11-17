@@ -472,6 +472,11 @@ func ProcessRollbackUndos(ctx *Context, sess *BasicSession) {
 	// leaves the inheritance state untouched (and clears the catalog pending-change
 	// marks that bypass the plan cache). M0118-0008 (alter-table-4).
 	DiscardPendingInheritanceChanges(ctx, sess)
+	// In-memory catalog changes (pg_default_acl entries), newest first.
+	undos := sess.TakePendingCatalogUndos()
+	for i := len(undos) - 1; i >= 0; i-- {
+		undos[i]()
+	}
 }
 
 func (o *transactionOp) clearCtxTransaction() {

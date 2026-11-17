@@ -18484,6 +18484,16 @@ var schemaACLPrivOrder = []aclPrivLetter{
 // DU-002 slice 335.
 const ownerSchemaACLString = "UC"
 
+// largeObjectACLPrivOrder lists the large-object privileges in aclitemout
+// order: SELECT ('r') and UPDATE ('w'), ACL_ALL_RIGHTS_LARGEOBJECT.
+var largeObjectACLPrivOrder = []aclPrivLetter{
+	{"SELECT", 'r'},
+	{"UPDATE", 'w'},
+}
+
+// ownerLargeObjectACLString is acldefault('L', owner)'s owner item, "rw".
+const ownerLargeObjectACLString = "rw"
+
 // functionACLPrivOrder lists the function (pg_proc) privileges in PostgreSQL's
 // canonical aclitemout order. A function has a single privilege, EXECUTE('X').
 // pg_dump's getFuncs diffs a routine's proacl against acldefault('f', proowner)

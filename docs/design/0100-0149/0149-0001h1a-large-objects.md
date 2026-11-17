@@ -279,6 +279,24 @@ execRaise ports exec\_stmt\_raise:
 RAISE errors no longer carry a query position: PG reports them through the
 PL/pgSQL error context, never as a caret in the calling statement.
 
+## Slice 8: ALTER DEFAULT PRIVILEGES ... ON LARGE OBJECTS \(M0149\-0001h1a6\)
+
+- pg\_default\_acl entries for defaclobjtype 'L' are now stored and
+  rendered. The privileges are SELECT 'r' and UPDATE 'w', the owner baseline
+  is "rw", and there is no PUBLIC world default. Before this, the executor
+  accepted and dropped them, because large objects had no storage.
+- lo\_create stamps get\_user\_default\_acl\(OBJECT\_LARGEOBJECT, owner,
+  InvalidOid\) into lomacl \(loDefaultACLText\): the owner's global entry, or
+  NULL when there is none or it equals acldefault\('L', owner\). goopg's
+  renderer writes a global entry's implicit owner item and grantors as
+  postgres; for another owner they are re\-pointed at the owner.
+- pg\_default\_acl changes are now transactional. ALTER DEFAULT PRIVILEGES
+  snapshots each entry it touches \(InMemory.SnapshotACLEntry\) onto the
+  session's catalog\-undo list \(RecordCatalogUndo\), and ProcessRollbackUndos
+  restores them newest first. Without this, the privileges case's
+  rolled\-back `GRANT ALL ON LARGE OBJECTS` leaked into the largeobject case,
+  where it granted PUBLIC UPDATE on an object.
+
 ## Open
 
 - A read\-only descriptor reads with the statement's snapshot, not the
@@ -289,8 +307,8 @@ PL/pgSQL error context, never as a caret in the calling statement.
   result, `x'20000'::int` and `x'20000' | x'40000'` fail, which blocks
   most large\-object steps in regress `privileges` and `largeobject`
   \(M0149\-0001h1a1\).
-- ALTER DEFAULT PRIVILEGES … ON LARGE OBJECTS \(get\_user\_default\_acl at
-  lo\_create\), and the pg\_shdepend owner / ACL role dependencies.
+- The pg\_shdepend owner / ACL role dependencies of large objects and of
+  pg\_default\_acl rows.
 - The fast path is a lowering to SQL, not an fmgr call. Binary arguments and
   results cover only the types listed above \(others are 0A000\), and
   log\_statement / log\_duration do not print PG's "fastpath function call"

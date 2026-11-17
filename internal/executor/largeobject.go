@@ -157,7 +157,17 @@ func evalLoCreate(fn string, args []Datum, ctx *Context) (Datum, error) {
 			Message: "duplicate key value violates unique constraint \"pg_largeobject_metadata_oid_index\"",
 			Detail:  fmt.Sprintf("Key (oid)=(%d) already exists.", loid)}
 	}
-	row := Row{NewIntDatum(int64(loid)), NewIntDatum(int64(currentRoleOID(im, ctx))), NullDatum}
+	// LargeObjectCreate stamps get_user_default_acl's result into lomacl.
+	owner := currentRoleOID(im, ctx)
+	aclText, err := loDefaultACLText(im, owner)
+	if err != nil {
+		return Datum{}, err
+	}
+	acl, err := loACLDatum(ctx, aclText)
+	if err != nil {
+		return Datum{}, err
+	}
+	row := Row{NewIntDatum(int64(loid)), NewIntDatum(int64(owner)), acl}
 	if _, err := writeHeapRowCanonical(ctx, ctx.Catalog.RelFileNode(tbl), tbl.Columns, row); err != nil {
 		return Datum{}, err
 	}

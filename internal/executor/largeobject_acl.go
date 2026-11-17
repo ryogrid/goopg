@@ -304,28 +304,71 @@ func loRewriteMetadata(ctx *Context, tbl *catalog.Table, loid, owner uint32, acl
 		"DELETE FROM pg_catalog.pg_largeobject_metadata WHERE oid = %d::oid", loid)); err != nil {
 		return err
 	}
-	acl := NullDatum
-	if aclText != "" {
-		// A PG-native aclitem[] (element type aclitem, 1033) — the string
-		// form would be stored with the wrong element type, which PG's
-		// check_acl rejects ("ACL array contains wrong data type").
-		im, _ := ctx.Catalog.(*catalog.InMemory)
-		blob, err := encodeAclItemArrayText(aclText, func(roleName string) uint32 {
-			if im != nil {
-				if oid, ok := im.RoleOID(roleName); ok {
-					return oid
-				}
-			}
-			return 0
-		})
-		if err != nil {
-			return err
-		}
-		acl = NewBytesDatum(blob)
+	acl, err := loACLDatum(ctx, aclText)
+	if err != nil {
+		return err
 	}
 	row := Row{NewIntDatum(int64(loid)), NewIntDatum(int64(owner)), acl}
-	_, err := writeHeapRowCanonical(ctx, ctx.Catalog.RelFileNode(tbl), tbl.Columns, row)
+	_, err = writeHeapRowCanonical(ctx, ctx.Catalog.RelFileNode(tbl), tbl.Columns, row)
 	return err
+}
+
+// loACLDatum is the lomacl cell for aclText ("" = NULL): a PG-native
+// aclitem[] (element type aclitem, 1033) — the string form would be stored
+// with the wrong element type, which PG's check_acl rejects ("ACL array
+// contains wrong data type").
+func loACLDatum(ctx *Context, aclText string) (Datum, error) {
+	if aclText == "" {
+		return NullDatum, nil
+	}
+	im, _ := ctx.Catalog.(*catalog.InMemory)
+	blob, err := encodeAclItemArrayText(aclText, func(roleName string) uint32 {
+		if im != nil {
+			if oid, ok := im.RoleOID(roleName); ok {
+				return oid
+			}
+		}
+		return 0
+	})
+	if err != nil {
+		return Datum{}, err
+	}
+	return NewBytesDatum(blob), nil
+}
+
+// loDefaultACLText is get_user_default_acl(OBJECT_LARGEOBJECT, owner,
+// InvalidOid) (aclchk.c): the owner's global pg_default_acl entry for
+// LARGE OBJECTS, or "" (NULL lomacl) when there is none or it equals
+// acldefault('L', owner). goopg renders a global entry's implicit owner
+// item and grantors as "postgres" (DefaultACLText); for another owner those
+// are re-pointed at the owner, as SetDefaultACL would have recorded them.
+func loDefaultACLText(im *catalog.InMemory, owner uint32) (string, error) {
+	if !im.HasDefaultACL(owner, 0, catalog.DefaultACLObjTypeLargeObject) {
+		return "", nil
+	}
+	text := im.DefaultACLText(im.DefaultACLOID(owner, 0, catalog.DefaultACLObjTypeLargeObject), catalog.DefaultACLObjTypeLargeObject)
+	if text == "" {
+		return "", nil
+	}
+	items, err := loParseACL(im, text, owner)
+	if err != nil {
+		return "", err
+	}
+	if owner != 10 {
+		for i := range items {
+			if items[i].grantor == 10 {
+				items[i].grantor = owner
+			}
+			if !items[i].public && items[i].grantee == 10 && i == 0 {
+				items[i].grantee = owner
+			}
+		}
+	}
+	if len(items) == 1 && !items[0].public && items[0].grantee == owner && items[0].grantor == owner &&
+		items[0].privs == loPrivAll && items[0].goptions == 0 {
+		return "", nil // equal to acldefault: the hardwired default (NULL)
+	}
+	return loFormatACL(im, items), nil
 }
 
 // execAlterLargeObjectOwner is AlterObjectOwner_internal for a large object:

@@ -112,11 +112,12 @@ func TestExecAlterDefaultPrivilegesInSchemaWithLargeObjectsRejected(t *testing.T
 	}
 }
 
-// TestExecAlterDefaultPrivilegesLargeObjectsGloballyAcceptedNoop confirms
-// goopg's documented scope boundary: LARGE OBJECTS with no IN SCHEMA is
-// syntactically accepted (goopg has no pg_largeobject subsystem to describe
-// a resulting row) and never materializes a pg_default_acl entry.
-func TestExecAlterDefaultPrivilegesLargeObjectsGloballyAcceptedNoop(t *testing.T) {
+// TestExecAlterDefaultPrivilegesLargeObjectsMaterialize pins LARGE OBJECTS
+// as a stored pg_default_acl class (defaclobjtype 'L'): a global GRANT
+// materialises a row whose ACL lo_create stamps into lomacl
+// (get_user_default_acl). M0149-0001h1a; until then the default was accepted
+// and dropped because large objects had no storage.
+func TestExecAlterDefaultPrivilegesLargeObjectsMaterialize(t *testing.T) {
 	cat := catalog.NewInMemory()
 	op := &ddlOp{ctx: &Context{Catalog: cat}}
 
@@ -126,10 +127,14 @@ func TestExecAlterDefaultPrivilegesLargeObjectsGloballyAcceptedNoop(t *testing.T
 		Grantees:   []string{"alice"},
 	}
 	if err := op.execAlterDefaultPrivileges(s); err != nil {
-		t.Fatalf("bare LARGE OBJECTS default should be accepted as a no-op, got %v", err)
+		t.Fatalf("LARGE OBJECTS default: %v", err)
 	}
-	if got := cat.DefaultACLEntries(); len(got) != 0 {
-		t.Fatalf("LARGE OBJECTS has no backing storage, must not materialize a row, got %+v", got)
+	got := cat.DefaultACLEntries()
+	if len(got) != 1 || got[0].ObjType != catalog.DefaultACLObjTypeLargeObject || got[0].RoleOID != 10 {
+		t.Fatalf("pg_default_acl entries = %+v, want one 'L' row for role 10", got)
+	}
+	if text := cat.DefaultACLText(got[0].OID, catalog.DefaultACLObjTypeLargeObject); text != "{postgres=rw/postgres,alice=r/postgres}" {
+		t.Fatalf("defaclacl = %q", text)
 	}
 }
 

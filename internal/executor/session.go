@@ -284,6 +284,7 @@ type BasicSession struct {
 	pendingAlterIndex   []AlterIndexUndoEntry      // ALTER TABLE ADD CONSTRAINT ... USING INDEX field mutations pending rollback (P0-E5/M0143-0008)
 	pendingNotNullAlter []NotNullUndoEntry         // PRIMARY KEY NOT-NULL synthesis pending rollback (P0-E5/M0143-0008)
 	pendingRelStats     []RelStatsUndoEntry        // pg_class reltuples/relpages UPDATEs pending rollback (M0146-0064)
+	pendingCatalogUndos []func()                // in-memory catalog changes to reverse on ROLLBACK, newest last (M0149-0001h1a)
 	pendingDropConstAlt []DropConstraintUndoEntry  // ALTER TABLE DROP CONSTRAINT (CHECK/FK/NOT NULL) field mutations pending rollback (M0143-0008b)
 }
 
@@ -430,6 +431,7 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.pendingTruncates = nil
 	s.pendingSeqRestores = nil
 	s.pendingRelStats = nil // committed (or already restored by ROLLBACK)
+	s.pendingCatalogUndos = nil
 	s.savepointDDLDrops = nil
 	s.pendingIndexDrops = nil
 	s.pendingPartAttaches = nil
@@ -890,6 +892,20 @@ func (s *BasicSession) TakePendingNotNullUndos() []NotNullUndoEntry {
 // replaced them, for ROLLBACK (M0146-0064).
 func (s *BasicSession) RecordRelStatsUndo(e RelStatsUndoEntry) {
 	s.pendingRelStats = append(s.pendingRelStats, e)
+}
+
+// RecordCatalogUndo queues fn to run if the transaction rolls back: an
+// in-memory catalog change with no heap row of its own (a pg_default_acl
+// entry) whose PG counterpart would vanish with the aborted transaction.
+func (s *BasicSession) RecordCatalogUndo(fn func()) {
+	s.pendingCatalogUndos = append(s.pendingCatalogUndos, fn)
+}
+
+// TakePendingCatalogUndos drains the queued catalog undos.
+func (s *BasicSession) TakePendingCatalogUndos() []func() {
+	p := s.pendingCatalogUndos
+	s.pendingCatalogUndos = nil
+	return p
 }
 
 // TakePendingRelStatsUndos drains and returns the pending relation-stats undo

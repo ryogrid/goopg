@@ -12038,6 +12038,23 @@ verify each at HEAD when the task starts.
     \(printtup.c SendRowDescriptionMessage\).
   - > **ESCALATION \(S2, wrong results for binary\-format clients\):** filed
     here; owner to place.
+- [x] **M0149-0001h1a6 — ALTER DEFAULT PRIVILEGES ... ON LARGE OBJECTS was accepted and dropped; lo\_create never applied a default ACL; pg\_default\_acl changes did not roll back** \(filed and fixed 2026-11-17 by M0149-0001h1a\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: aclchk.c SetDefaultACL \(DEFACLOBJ\_LARGEOBJECT\), get\_user\_default\_acl
+    at LargeObjectCreate \(pg\_largeobject\_metadata.c\); the catalog row is
+    transactional.
+  - Landed:
+    - catalog: 'L' privilege table and owner string;
+    - executor: the large\-object early return is removed, and
+      loDefaultACLText stamps lomacl at lo\_create;
+    - BasicSession.RecordCatalogUndo plus InMemory.SnapshotACLEntry make
+      pg\_default\_acl edits roll back.
+  - Regress A/B vs HEAD: privileges 615→611, largeobject stays PASS \(it
+    regressed to 1 before the rollback undo existed, because of the leaked
+    default\); dependency / event\_trigger / matview / object\_address /
+    select\_into / init\_privs unchanged on fresh servers.
+  Movement: regress privileges 615→611
 - [x] **M0149-0001h1a5 — psql `\\du` / `\\dg` failed for every user: pg\_roles was a four\-column stub \("column r.rolinherit does not exist"\)** \(filed and fixed 2026-11-17 by M0149-0001h1a\)
   Kind: impl
   Parent: M0149-0001h1a
