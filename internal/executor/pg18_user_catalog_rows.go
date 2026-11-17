@@ -1982,7 +1982,7 @@ func buildUserPGTypeRowForEnumArray(et *catalog.EnumType) Row {
 		NewBoolDatum(true),                             // typisdefined
 		NewStringDatum(","),                            // typdelim
 		NewIntDatum(0),                                 // typrelid
-		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(6179),                              // typsubscript: array_subscript_handler
 		NewIntDatum(int64(et.OID)),                     // typelem = the enum element type
 		NewIntDatum(0),                                 // typarray
 		NewIntDatum(750),                               // typinput (array_in/out/recv/send; B2.1c)
@@ -1991,7 +1991,7 @@ func buildUserPGTypeRowForEnumArray(et *catalog.EnumType) Row {
 		NewIntDatum(2401),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
-		NewIntDatum(0),                                 // typanalyze
+		NewIntDatum(3816),                              // typanalyze: array_typanalyze
 		NewStringDatum("i"),                            // typalign = 'i' (matches 4-byte enum element)
 		NewStringDatum("x"),                            // typstorage = 'x' (extended)
 		NewBoolDatum(false),                            // typnotnull
@@ -2066,7 +2066,7 @@ func buildUserPGTypeRowForCompositeArray(ct *catalog.CompositeType) Row {
 		NewBoolDatum(true),                             // typisdefined
 		NewStringDatum(","),                            // typdelim
 		NewIntDatum(0),                                 // typrelid
-		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(6179),                              // typsubscript: array_subscript_handler
 		NewIntDatum(int64(ct.OID)),                     // typelem = the composite element type
 		NewIntDatum(0),                                 // typarray
 		NewIntDatum(750),                               // typinput (array_in/out/recv/send; B2.1c)
@@ -2075,7 +2075,7 @@ func buildUserPGTypeRowForCompositeArray(ct *catalog.CompositeType) Row {
 		NewIntDatum(2401),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
-		NewIntDatum(0),                                 // typanalyze
+		NewIntDatum(3816),                              // typanalyze: array_typanalyze
 		NewStringDatum("d"),                            // typalign = 'd' (matches composite element)
 		NewStringDatum("x"),                            // typstorage = 'x' (extended)
 		NewBoolDatum(false),                            // typnotnull
@@ -2517,7 +2517,7 @@ func buildUserPGTypeRowForDomain(d *catalog.Domain) Row {
 		NewBoolDatum(true),                             // typisdefined
 		NewStringDatum(","),                            // typdelim
 		NewIntDatum(0),                                 // typrelid
-		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(domainTypsubscript(d.Base)),        // typsubscript: the base type's (DefineDomain)
 		NewIntDatum(0),                                 // typelem
 		NewIntDatum(int64(d.ArrayOID)),                 // typarray (auto-generated `_name` array type, slice 251)
 		NewIntDatum(domIn),                             // typinput (base type's — DefineDomain copies them; B2.1b)
@@ -2526,7 +2526,7 @@ func buildUserPGTypeRowForDomain(d *catalog.Domain) Row {
 		NewIntDatum(domSend),                           // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
-		NewIntDatum(0),                                 // typanalyze
+		NewIntDatum(domainTypanalyze(baseOID, d.Base)), // typanalyze: the base type's (DefineDomain)
 		NewStringDatum(string(attrs.TypAlign)),         // typalign (inherit base)
 		NewStringDatum(string(attrs.TypStorage)),       // typstorage (inherit base)
 		NewBoolDatum(d.NotNull),                        // typnotnull (declared NOT NULL)
@@ -2572,7 +2572,7 @@ func buildUserPGTypeRowForDomainArray(d *catalog.Domain) Row {
 		NewBoolDatum(true),                             // typisdefined
 		NewStringDatum(","),                            // typdelim
 		NewIntDatum(0),                                 // typrelid
-		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(6179),                              // typsubscript: array_subscript_handler
 		NewIntDatum(int64(d.OID)),                      // typelem = the domain element type
 		NewIntDatum(0),                                 // typarray
 		NewIntDatum(750),                               // typinput (array_in/out/recv/send; B2.1c)
@@ -2581,7 +2581,7 @@ func buildUserPGTypeRowForDomainArray(d *catalog.Domain) Row {
 		NewIntDatum(2401),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
-		NewIntDatum(0),                                 // typanalyze
+		NewIntDatum(3816),                              // typanalyze: array_typanalyze
 		NewStringDatum(string(typalign)),               // typalign (matches base element alignment)
 		NewStringDatum("x"),                            // typstorage = 'x' (extended)
 		NewBoolDatum(false),                            // typnotnull
@@ -2631,7 +2631,7 @@ func buildUserPGTypeRowForRange(rt *catalog.RangeType) Row {
 		NewIntDatum(3837),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
-		NewIntDatum(0),                                 // typanalyze
+		NewIntDatum(3916),                              // typanalyze: range_typanalyze
 		NewStringDatum(string(align)),                  // typalign
 		NewStringDatum("x"),                            // typstorage = 'x' (extended)
 		NewBoolDatum(false),                            // typnotnull
@@ -2679,7 +2679,7 @@ func buildUserPGTypeRowForMultirange(rt *catalog.RangeType) Row {
 		NewIntDatum(4234),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
-		NewIntDatum(0),                                 // typanalyze
+		NewIntDatum(4242),                              // typanalyze: multirange_typanalyze
 		NewStringDatum(string(align)),                  // typalign
 		NewStringDatum("x"),                            // typstorage = 'x' (extended)
 		NewBoolDatum(false),                            // typnotnull
@@ -2717,7 +2717,7 @@ func buildUserPGTypeRowForRangeArray(rt *catalog.RangeType) Row {
 		NewBoolDatum(true),                             // typisdefined
 		NewStringDatum(","),                            // typdelim
 		NewIntDatum(0),                                 // typrelid
-		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(6179),                              // typsubscript: array_subscript_handler
 		NewIntDatum(int64(rt.OID)),                     // typelem = the range element type
 		NewIntDatum(0),                                 // typarray
 		NewIntDatum(750),                               // typinput (array_in/out/recv/send; B2.1c)
@@ -2726,7 +2726,7 @@ func buildUserPGTypeRowForRangeArray(rt *catalog.RangeType) Row {
 		NewIntDatum(2401),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
-		NewIntDatum(0),                                 // typanalyze
+		NewIntDatum(3816),                              // typanalyze: array_typanalyze
 		NewStringDatum(string(align)),                  // typalign (matches the range element's alignment)
 		NewStringDatum("x"),                            // typstorage = 'x' (extended)
 		NewBoolDatum(false),                            // typnotnull
@@ -2763,7 +2763,7 @@ func buildUserPGTypeRowForMultirangeArray(rt *catalog.RangeType) Row {
 		NewBoolDatum(true),                             // typisdefined
 		NewStringDatum(","),                            // typdelim
 		NewIntDatum(0),                                 // typrelid
-		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(6179),                              // typsubscript: array_subscript_handler
 		NewIntDatum(int64(rt.MultirangeOID)),           // typelem = the multirange element type
 		NewIntDatum(0),                                 // typarray
 		NewIntDatum(750),                               // typinput (array_in/out/recv/send; B2.1c)
@@ -2772,7 +2772,7 @@ func buildUserPGTypeRowForMultirangeArray(rt *catalog.RangeType) Row {
 		NewIntDatum(2401),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
-		NewIntDatum(0),                                 // typanalyze
+		NewIntDatum(3816),                              // typanalyze: array_typanalyze
 		NewStringDatum(string(align)),                  // typalign (matches the multirange element's alignment)
 		NewStringDatum("x"),                            // typstorage = 'x' (extended)
 		NewBoolDatum(false),                            // typnotnull
@@ -2959,4 +2959,34 @@ func userRelACLDatum(cat catalog.Catalog, relOID uint32, relkind string) Datum {
 		return NullDatum
 	}
 	return NewBytesDatum(blob)
+}
+
+// domainTypanalyze is the typanalyze DefineDomain copies from the base type
+// (typecmds.c: analyzeProcedure = baseType->typanalyze): array_typanalyze for
+// an array base, range_typanalyze / multirange_typanalyze for the built-in
+// range and multirange types, ts_typanalyze for tsvector, 0 otherwise.
+// M0149-0001h1a15.
+func domainTypanalyze(baseOID uint32, base catalog.Type) int64 {
+	if base.IsArray {
+		return 3816
+	}
+	switch baseOID {
+	case 3904, 3906, 3908, 3910, 3912, 3926:
+		return 3916
+	case 4451, 4532, 4533, 4534, 4535, 4536:
+		return 4242
+	case 3614:
+		return 3688
+	}
+	return 0
+}
+
+// domainTypsubscript is the typsubscript DefineDomain copies from the base
+// type (subscriptProcedure = baseType->typsubscript): array_subscript_handler
+// for an array base. M0149-0001h1a15.
+func domainTypsubscript(base catalog.Type) int64 {
+	if base.IsArray {
+		return 6179
+	}
+	return 0
 }

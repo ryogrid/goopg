@@ -612,6 +612,22 @@ func pgTypeRow(e pgTypeEntry) executor.Row {
 	if v, ok := pgTypeTypModOverlay[e.OID]; ok {
 		typtypmod = v
 	}
+	// typmodin / typmodout / typanalyze, typcollation, a typarray the
+	// elem/array triple lacks (record's _record) and typdefault come from a
+	// PG 18.3 initdb (pg_type_support_generated.go, M0149-0001h1a15): genbki
+	// gives every true array array_typanalyze and its element's typmod I/O.
+	sup := pgTypeInitdbSupport[e.OID]
+	typcollation := pgTypeCollationForOID(e.OID)
+	if sup.Collation != 0 {
+		typcollation = int64(sup.Collation)
+	}
+	if typarray == 0 {
+		typarray = int64(sup.Array)
+	}
+	typdefault := executor.NullDatum
+	if sup.HasDefault {
+		typdefault = executor.NewStringDatum(sup.Default)
+	}
 	return executor.Row{
 		executor.NewIntDatum(int64(e.OID)),                 // 1 oid
 		executor.NewStringDatum(e.Name),                    // 2 typname
@@ -632,18 +648,18 @@ func pgTypeRow(e pgTypeEntry) executor.Row {
 		executor.NewIntDatum(int64(e.Output)),              // 17 typoutput
 		executor.NewIntDatum(int64(e.Receive)),             // 18 typreceive
 		executor.NewIntDatum(int64(e.Send)),                // 19 typsend
-		executor.NewIntDatum(0),                            // 20 typmodin
-		executor.NewIntDatum(0),                            // 21 typmodout
-		executor.NewIntDatum(0),                            // 22 typanalyze
+		executor.NewIntDatum(int64(sup.ModIn)),             // 20 typmodin
+		executor.NewIntDatum(int64(sup.ModOut)),            // 21 typmodout
+		executor.NewIntDatum(int64(sup.Analyze)),           // 22 typanalyze
 		executor.NewStringDatum(string(e.Align)),           // 23 typalign  ← load-bearing
 		executor.NewStringDatum(string(e.Storage)),         // 24 typstorage
 		executor.NewBoolDatum(false),                       // 25 typnotnull
 		executor.NewIntDatum(int64(typbasetype)),           // 26 typbasetype
 		executor.NewIntDatum(typtypmod),                    // 27 typtypmod
 		executor.NewIntDatum(0),                            // 28 typndims
-		executor.NewIntDatum(pgTypeCollationForOID(e.OID)), // 29 typcollation (PG-canonical; must match attcollation, slice 188)
+		executor.NewIntDatum(typcollation),                 // 29 typcollation (PG-canonical; must match attcollation, slice 188)
 		executor.NullDatum,                                 // 30 typdefaultbin
-		executor.NullDatum,                                 // 31 typdefault
+		typdefault,                                         // 31 typdefault
 		executor.NullDatum,                                 // 32 typacl
 	}
 }

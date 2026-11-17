@@ -12105,6 +12105,30 @@ verify each at HEAD when the task starts.
   - Regress A/B vs HEAD over 14 cases: regproc 72→14 \(inventory
     updated\); the other 13 unchanged \(psql table-size jitter only\).
   Movement: regress regproc 72→14
+- [x] **M0149-0001h1a15 — pg\_type typmodin / typmodout / typanalyze \(and typcollation, record's typarray, time\_stamp's typdefault\) match a PG 18.3 initdb; user arrays carry array\_typanalyze / array\_subscript\_handler** \(filed 2026-11-17 by M0149-0001h1a13's type\_sanity exposure, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: genbki assigns array\_typanalyze and the element's typmod I/O to
+    every array type; typecmds.c DefineRange / DefineDomain / DefineEnum and
+    heap.c AddNewRelationType choose typanalyze / typsubscript per kind.
+  - Landed:
+    - scripts/gen-pg-type-support-procs.py →
+      internal/initdb/pg\_type\_support\_generated.go \(621 rows\); pgTypeRow
+      reads it — every pg\_type column for OID < 16384 now equals the
+      oracle;
+    - user array rows: typanalyze 3816, typsubscript 6179; range 3916,
+      multirange 4242; a domain copies its base's \(domainTypanalyze /
+      domainTypsubscript\).
+  - Tests: TestPgTypeRowSupportProcsMatchInitdb,
+    TestUserPGTypeRowSupportProcs; TestPgTypeRowCanonicalTypcollation
+    extended with the four newly collatable types.
+  - Design: docs/design/0100-0149/0106-0010-step3da-pg-type-io-regproc-oids.md
+    \(follow-up section\).
+  - Regress A/B vs HEAD: type\_sanity 75→62 \(inventory 82→62\),
+    create\_type 115→112; domain, rangetypes, multirangetypes, enum,
+    oidjoins, arrays, opr\_sanity, misc\_sanity, psql, alter\_table,
+    regproc unchanged.
+  Movement: regress type_sanity 82→62, create_type 115→112
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a
