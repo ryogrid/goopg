@@ -68,6 +68,15 @@ try:
                           "-d", "postgres", "-At", "-c", q], env=env, check=True, capture_output=True,
                          text=True).stdout
     format_names = json.loads(out)
+    # pg_get_function_result / _arguments / _identity_arguments for every
+    # built-in function (h1a23): psql's \df and pg_dump read them.
+    q = ("select coalesce(json_agg(json_build_array(oid::int8, pg_get_function_result(oid), "
+         "pg_get_function_arguments(oid), pg_get_function_identity_arguments(oid)) order by oid), '[]') "
+         "from pg_proc where oid < 16384")
+    out = subprocess.run([os.path.join(bindir, "psql"), "-X", "-h", "127.0.0.1", "-p", port, "-U", "postgres",
+                          "-d", "postgres", "-At", "-c", q], env=env, check=True, capture_output=True,
+                         text=True).stdout
+    func_sigs = json.loads(out)
 finally:
     subprocess.run([os.path.join(bindir, "pg_ctl"), "-D", data, "-m", "immediate", "stop"], env=env,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -86,5 +95,14 @@ lines.append("\n// builtinFormatTypeNames is format_type(oid, NULL) for the %d p
 lines.append("var builtinFormatTypeNames = map[uint32]string{\n")
 for oid, name in format_names:
     lines.append("\t%d: %s,\n" % (oid, json.dumps(name)))
+lines.append("}\n")
+lines.append("\n// builtinFunctionSignatures is pg_get_function_result / _arguments /\n")
+lines.append("// _identity_arguments for the %d built-in functions; HasResult is false when\n" % len(func_sigs))
+lines.append("// pg_get_function_result is NULL (procedures).\n")
+lines.append("var builtinFunctionSignatures = map[uint32]BuiltinFunctionSignature{\n")
+for oid, res, args, ident in func_sigs:
+    lines.append("\t%d: {Result: %s, HasResult: %s, Arguments: %s, Identity: %s},\n" % (
+        oid, json.dumps(res or "", ensure_ascii=False), "false" if res is None else "true",
+        json.dumps(args or "", ensure_ascii=False), json.dumps(ident or "", ensure_ascii=False)))
 lines.append("}\n")
 print("".join(lines), end="")

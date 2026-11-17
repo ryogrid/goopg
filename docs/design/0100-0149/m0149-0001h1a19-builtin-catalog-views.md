@@ -71,3 +71,16 @@ for real. That surfaced two executor bugs, both fixed in h1a22:
   element type (oid / int2), and the executor splits the value 0-based.
 - regtypein did not know most built-in names (`'cstring'::regtype` raised
   42704). It now falls back to the reverse of `builtinFormatTypeNames`.
+
+## Function signature texts (h1a23)
+
+The same generator captures what PG 18.3 prints for every built-in function:
+
+- `pg_get_function_result` (NULL for a procedure);
+- `pg_get_function_arguments`;
+- `pg_get_function_identity_arguments`.
+
+They are stored in `builtinFunctionSignatures`. The three executor arms use
+them after the user-routine lookup misses, so psql's `\df` shows a
+built-in's result and argument types. A column-wise diff against the oracle
+is empty for all 3413 built-ins.

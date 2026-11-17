@@ -12270,6 +12270,21 @@ verify each at HEAD when the task starts.
     multirangetypes, oidjoins, alter\_generic, create\_type, misc\_sanity,
     dependency, object\_address, create\_index, indexing unchanged.
   Movement: regress opr_sanity 146→112, type_sanity 41→20, psql 505→493
+- [x] **M0149-0001h1a23 — pg\_get\_function\_result / \_arguments / \_identity\_arguments return PG's text for built-in functions \(psql \\df showed blank types\)** \(filed 2026-11-18 by M0149-0001h1a22's ledger row, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: ruleutils.c pg\_get\_function\_result / print\_function\_arguments
+    over every pg\_proc row.
+  - Landed: gen-pg-catalog-seed-rows.py captures the three texts for all
+    3413 built-ins \(builtinFunctionSignatures\);
+    catalog.LookupBuiltinFunctionSignature backs the three executor arms
+    after the user-routine lookup; NULL result for a procedure. A
+    column-wise diff vs :5545 is empty.
+  - Tests: TestBuiltinFunctionSignatureTexts.
+  - Regress A/B vs HEAD over 14 cases: psql 493→399 \(inventory
+    updated\); polymorphism ±1 is its known OUT-parameter variance; the
+    other 12 unchanged.
+  Movement: regress psql 493→399
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

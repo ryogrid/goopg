@@ -15250,6 +15250,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				if r := routineOrAggregateArgs(ctx.Catalog, uint32(oidArg.Int)); r != nil {
 					return NewStringDatum(buildFunctionArguments(r, true)), nil
 				}
+				// A built-in function: PG 18.3's own text (M0149-0001h1a23).
+				if sig, ok := catalog.LookupBuiltinFunctionSignature(uint32(oidArg.Int)); ok {
+					return NewStringDatum(sig.Arguments), nil
+				}
 			}
 		}
 		return NewStringDatum(""), nil
@@ -15265,6 +15269,9 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
 				if r := routineOrAggregateArgs(ctx.Catalog, uint32(oidArg.Int)); r != nil {
 					return NewStringDatum(buildFunctionArguments(r, false)), nil
+				}
+				if sig, ok := catalog.LookupBuiltinFunctionSignature(uint32(oidArg.Int)); ok {
+					return NewStringDatum(sig.Identity), nil
 				}
 			}
 		}
@@ -15304,6 +15311,14 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 						}
 						return NewStringDatum(ret), nil
 					}
+				}
+				// A built-in function: PG 18.3's own text; NULL for a
+				// procedure (M0149-0001h1a23).
+				if sig, ok := catalog.LookupBuiltinFunctionSignature(uint32(oidArg.Int)); ok {
+					if !sig.HasResult {
+						return NullDatum, nil
+					}
+					return NewStringDatum(sig.Result), nil
 				}
 			}
 		}

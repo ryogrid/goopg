@@ -38,3 +38,17 @@ func TestRegtypeInputResolvesEveryBuiltin(t *testing.T) {
 		}
 	}
 }
+
+// TestBuiltinFunctionSignatureTexts pins pg_get_function_result /
+// _arguments / _identity_arguments for built-in functions (M0149-0001h1a23):
+// they returned "" for every built-in, so psql's \df printed blank result
+// and argument columns.
+func TestBuiltinFunctionSignatureTexts(t *testing.T) {
+	sig, ok := catalog.LookupBuiltinFunctionSignature(177) // int4pl
+	if !ok || sig.Result != "integer" || sig.Arguments != "integer, integer" || sig.Identity != "integer, integer" {
+		t.Errorf("int4pl signature = %+v, %v", sig, ok)
+	}
+	if sig, ok := catalog.LookupBuiltinFunctionSignature(1299); !ok || sig.Result != "timestamp with time zone" || sig.Arguments != "" {
+		t.Errorf("now() signature = %+v, %v", sig, ok)
+	}
+}

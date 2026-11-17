@@ -122,3 +122,20 @@ func BuiltinTypeOIDByFormatName(name string) (uint32, bool) {
 	oid, ok := builtinFormatTypeOIDs[name]
 	return oid, ok
 }
+
+// BuiltinFunctionSignature is what PG 18.3's pg_get_function_result,
+// pg_get_function_arguments and pg_get_function_identity_arguments print for
+// a built-in function. M0149-0001h1a23.
+type BuiltinFunctionSignature struct {
+	Result    string
+	HasResult bool // false: pg_get_function_result is NULL (a procedure)
+	Arguments string
+	Identity  string
+}
+
+// LookupBuiltinFunctionSignature returns the captured signature texts of a
+// built-in function OID.
+func LookupBuiltinFunctionSignature(oid uint32) (BuiltinFunctionSignature, bool) {
+	s, ok := builtinFunctionSignatures[oid]
+	return s, ok
+}
