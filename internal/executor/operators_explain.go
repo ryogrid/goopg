@@ -1709,6 +1709,9 @@ func resolveKeySourceDepth(expr optimizer.Expr, node optimizer.Node, reg *subPla
 				if sc.Step != nil {
 					args = append(args, sc.Step)
 				}
+				if sc.Zone != nil {
+					args = append(args, sc.Zone)
+				}
 				return &optimizer.FuncCall{Name: "generate_series", Args: args}, true
 			}
 			if j < 0 || j >= len(n.OtherExprs) {
@@ -8233,6 +8236,9 @@ func srfFunctionCallArgs(n optimizer.Node) (string, []optimizer.Expr) {
 		args := []optimizer.Expr{p.Start, p.Stop}
 		if p.Step != nil {
 			args = append(args, p.Step)
+		}
+		if p.Zone != nil {
+			args = append(args, p.Zone)
 		}
 		return "generate_series", args
 	case *optimizer.GenerateSubscripts:

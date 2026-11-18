@@ -116,31 +116,45 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 		type seriesResult struct {
 			colIdx  int
 			vals    []int64
-			wrapped bool // raw value goes into the eval row, not the output row
+			datums  []Datum // the numeric and timestamp forms
+			wrapped bool    // raw value goes into the eval row, not the output row
 		}
 		genResults := make([]seriesResult, len(o.plan.SrfCols))
 		maxLen := 0
 		for k, sc := range o.plan.SrfCols {
-			startD, err := evalExpr(sc.Start, childRow, ctx)
+			args, isNull, err := evalSeriesArgs(sc.Start, sc.Stop, sc.Step, sc.Zone, slot, ctx)
 			if err != nil {
 				return err
 			}
-			stopD, err := evalExpr(sc.Stop, childRow, ctx)
-			if err != nil {
-				return err
+			if isNull { // the functions are strict: an empty series
+				genResults[k] = seriesResult{colIdx: sc.ColIdx, wrapped: sc.Wrapped}
+				continue
 			}
-			start, _ := datumInt64(startD)
-			stop, _ := datumInt64(stopD)
-			step := int64(1)
-			if sc.Step != nil {
-				stepD, err := evalExpr(sc.Step, childRow, ctx)
+			if !seriesIsInteger(sc.Type) {
+				series, err := newDatumSeries(sc.Type, args, sc.Step != nil, sc.Zone != nil, ctx)
 				if err != nil {
 					return err
 				}
-				s, ok := datumInt64(stepD)
-				if ok {
-					step = s
+				var datums []Datum
+				for {
+					val, ok, err := series.next()
+					if err != nil {
+						return err
+					}
+					if !ok {
+						break
+					}
+					datums = append(datums, val)
 				}
+				genResults[k] = seriesResult{colIdx: sc.ColIdx, datums: datums, wrapped: sc.Wrapped}
+				maxLen = max(maxLen, len(datums))
+				continue
+			}
+			start, _ := datumInt64(args[0])
+			stop, _ := datumInt64(args[1])
+			step := int64(1)
+			if sc.Step != nil {
+				step, _ = datumInt64(args[2])
 			}
 			// review/260831-2 EO2-3: a zero step used to yield an empty
 			// series instead of PG's error, and `v += step` wraps at the
@@ -287,7 +301,9 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 			}
 			for _, sr := range genResults {
 				var val Datum
-				if step < len(sr.vals) {
+				if step < len(sr.datums) {
+					val = sr.datums[step]
+				} else if step < len(sr.vals) {
 					val = NewIntDatum(sr.vals[step])
 				} else {
 					val = Datum{} // NULL

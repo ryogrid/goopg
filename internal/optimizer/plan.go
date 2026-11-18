@@ -2594,6 +2594,7 @@ type GenerateSeries struct {
 	Start  Expr
 	Stop   Expr
 	Step   Expr // nil means step=1
+	Zone   Expr // generate_series(timestamptz, timestamptz, interval, text); else nil
 	// Alias is the FROM-clause alias; defaults to the function name when
 	// not specified. Consumed by the EXPLAIN Function Scan label.
 	Alias  string
@@ -2724,6 +2725,9 @@ type SrfCol struct {
 	Start  Expr // generate_series start arg
 	Stop   Expr // generate_series stop arg
 	Step   Expr // generate_series step arg (nil → step 1)
+	Zone   Expr // generate_series time zone arg, or nil
+	// Type is the series' type, from generateSeriesType.
+	Type string
 	// Wrapped marks an SRF that feeds an enclosing scalar expression (e.g.
 	// `generate_series(1,n) % 4`). When true the executor writes the raw
 	// per-step SRF value into the eval row at ColIdx (a temp slot beyond the

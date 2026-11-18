@@ -8,6 +8,7 @@ package executor
 
 import (
 	"math"
+	"strings"
 
 	"github.com/goopg/goopg/internal/optimizer"
 )
@@ -20,6 +21,10 @@ type generateSeriesOp struct {
 	step    int64
 	started bool
 	done    bool
+	// stepper runs the numeric and timestamp forms; nil for the integer ones.
+	stepper *datumSeries
+	// outerSlot carries the outer row for arguments of a LATERAL call.
+	outerSlot SlotView
 
 	// row and slot are reused across emissions (review/260831 EO1-10): the
 	// series used to allocate a one-column Row AND a MaterializedSlot per
@@ -45,36 +50,48 @@ func (o *generateSeriesOp) Open(ctx *Context) error {
 
 func (o *generateSeriesOp) Close() error { return nil }
 
+// BindLateralOuter binds the outer row's slot for correlated arguments.
+func (o *generateSeriesOp) BindLateralOuter(slot SlotView) { o.outerSlot = slot }
+
 func (o *generateSeriesOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}
 	if !o.started {
 		// Evaluate start, stop, step expressions on first call.
-		start, err := evalExpr(o.plan.Start, nil, o.ctx)
-		if err != nil {
-			return nil, err
-		}
-		stop, err := evalExpr(o.plan.Stop, nil, o.ctx)
-		if err != nil {
-			return nil, err
-		}
-		step := int64(1)
-		if o.plan.Step != nil {
-			sv, serr := evalExpr(o.plan.Step, nil, o.ctx)
-			if serr != nil {
-				return nil, serr
-			}
-			if sv.Kind == KindInt {
-				step = sv.Int
-			}
-		}
-		startI, _ := datumInt64(start)
-		stopI, _ := datumInt64(stop)
-		o.current = startI
-		o.stop = stopI
-		o.step = step
 		o.started = true
+		o.stepper = nil
+		args, isNull, err := evalSeriesArgs(o.plan.Start, o.plan.Stop, o.plan.Step, o.plan.Zone, o.outerSlot, o.ctx)
+		if err != nil {
+			return nil, err
+		}
+		if isNull { // the functions are strict
+			o.done = true
+			return nil, EOF
+		}
+		typeName := o.plan.Output()[0].Type.Name
+		if seriesIsInteger(typeName) {
+			o.current, _ = datumInt64(args[0])
+			o.stop, _ = datumInt64(args[1])
+			o.step = 1
+			if o.plan.Step != nil {
+				o.step, _ = datumInt64(args[2])
+			}
+		} else if o.stepper, err = newDatumSeries(typeName, args, o.plan.Step != nil, o.plan.Zone != nil, o.ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	if o.stepper != nil {
+		val, ok, err := o.stepper.next()
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			o.done = true
+			return nil, EOF
+		}
+		return o.emit(val), nil
 	}
 
 	if o.step > 0 && o.current > o.stop {
@@ -103,12 +120,157 @@ func (o *generateSeriesOp) Next() (TupleSlot, error) {
 	} else {
 		o.current += o.step
 	}
+	return o.emit(val), nil
+}
+
+func (o *generateSeriesOp) emit(val Datum) TupleSlot {
 	if o.row == nil {
 		o.row = make(Row, 1)
 	}
 	o.row[0] = val
 	o.slot.row = o.row
-	return &o.slot, nil
+	return &o.slot
+}
+
+func seriesIsInteger(typeName string) bool {
+	switch strings.ToLower(typeName) {
+	case "numeric", "timestamp", "timestamptz":
+		return false
+	}
+	return true
+}
+
+// evalSeriesArgs evaluates the arguments of generate_series. isNull reports a NULL
+// among those present.
+func evalSeriesArgs(start, stop, step, zone optimizer.Expr, slot SlotView, ctx *Context) (args [4]Datum, isNull bool, err error) {
+	for i, e := range [...]optimizer.Expr{start, stop, step, zone} {
+		if e == nil {
+			continue
+		}
+		if args[i], err = evalExprSlot(e, slot, ctx); err != nil {
+			return args, false, err
+		}
+		isNull = isNull || args[i].IsNull()
+	}
+	return args, isNull, nil
+}
+
+// datumSeries is generate_series_step_numeric, generate_series_timestamp and
+// generate_series_timestamptz_internal.
+type datumSeries struct {
+	numeric       bool
+	current, stop Datum
+	step          Datum
+	descending    bool
+	zone          string
+}
+
+func seriesParamError(message string) error {
+	return &ExecError{Code: "22023", Message: message}
+}
+
+// seriesFiniteNumeric casts to numeric and rejects NaN and the infinities, which
+// are carried as text.
+func seriesFiniteNumeric(d Datum, what string, ctx *Context) (Datum, error) {
+	v, err := evalCast(d, "numeric", 0, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if v.Kind == KindString {
+		if v.StringValue() == "NaN" {
+			return Datum{}, seriesParamError(what + " cannot be NaN")
+		}
+		return Datum{}, seriesParamError(what + " cannot be infinity")
+	}
+	return v, nil
+}
+
+func newDatumSeries(typeName string, args [4]Datum, hasStep, hasZone bool, ctx *Context) (*datumSeries, error) {
+	s := &datumSeries{}
+	var err error
+	if strings.EqualFold(typeName, "numeric") {
+		s.numeric = true
+		if s.current, err = seriesFiniteNumeric(args[0], "start value", ctx); err != nil {
+			return nil, err
+		}
+		if s.stop, err = seriesFiniteNumeric(args[1], "stop value", ctx); err != nil {
+			return nil, err
+		}
+		s.step = NewNumericInt64Datum(1, 0)
+		if hasStep {
+			if s.step, err = seriesFiniteNumeric(args[2], "step size", ctx); err != nil {
+				return nil, err
+			}
+		}
+		sign, err := numericCmp(s.step, NewNumericInt64Datum(0, 0))
+		if err != nil {
+			return nil, err
+		}
+		if sign == 0 {
+			return nil, seriesParamError("step size cannot equal zero")
+		}
+		s.descending = sign < 0
+		return s, nil
+	}
+	target := strings.ToLower(typeName)
+	if s.current, err = evalCast(args[0], target, 0, ctx); err != nil {
+		return nil, err
+	}
+	if s.stop, err = evalCast(args[1], target, 0, ctx); err != nil {
+		return nil, err
+	}
+	if s.step, err = evalCast(args[2], "interval", 0, ctx); err != nil {
+		return nil, err
+	}
+	if target == "timestamptz" {
+		s.zone = timeZoneFromCtx(ctx)
+		if hasZone {
+			if s.zone, err = lookupTimeZoneName(args[3].StringValue()); err != nil {
+				return nil, err
+			}
+		}
+	}
+	sign, err := compareDatum(s.step, NewIntervalDatumFull(0, 0, 0), 0)
+	if err != nil {
+		return nil, err
+	}
+	if sign == 0 {
+		return nil, seriesParamError("step size cannot equal zero")
+	}
+	if s.step.IsIntervalNoBegin() || s.step.IsIntervalNoEnd() {
+		return nil, seriesParamError("step size cannot be infinite")
+	}
+	s.descending = sign < 0
+	return s, nil
+}
+
+// next returns the current value and moves on, as the per-call half of the C
+// functions does, so an overflow in that step is raised with the value unsent.
+func (s *datumSeries) next() (Datum, bool, error) {
+	var cmp int
+	var err error
+	if s.numeric {
+		if cmp, err = numericCmp(s.current, s.stop); err != nil {
+			return Datum{}, false, err
+		}
+	} else if s.current.Int < s.stop.Int {
+		cmp = -1
+	} else if s.current.Int > s.stop.Int {
+		cmp = 1
+	}
+	if (!s.descending && cmp > 0) || (s.descending && cmp < 0) {
+		return Datum{}, false, nil
+	}
+	result := s.current
+	if s.numeric {
+		s.current, err = numericAdd(s.current, s.step)
+	} else {
+		s.current, err = addTimeIntervalInZone(s.current, s.step, false, 0, s.zone)
+	}
+	if err != nil {
+		return Datum{}, false, err
+	}
+	return result, true, nil
 }
 
 // generateSubscriptsOp implements generate_subscripts(arr, dim[, rev]) SRF.

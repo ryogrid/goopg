@@ -1026,6 +1026,9 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		if n.Step != nil {
 			walkExprTree(n.Step, visit)
 		}
+		if n.Zone != nil {
+			walkExprTree(n.Zone, visit)
+		}
 	case *FromUnnest:
 		walkExprTree(n.ArrExpr, visit)
 	case *PgInputErrorInfo:
@@ -1096,6 +1099,7 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 			walkExprTree(sc.Start, visit)
 			walkExprTree(sc.Stop, visit)
 			walkExprTree(sc.Step, visit)
+			walkExprTree(sc.Zone, visit)
 		}
 		for _, rc := range n.RegexpMatchesCols {
 			walkExprTree(rc.StringExpr, visit)

@@ -322,6 +322,9 @@ func foldPlanConstantsInner(node Node) {
 		if n.Step != nil {
 			n.Step = FoldConstants(n.Step)
 		}
+		if n.Zone != nil {
+			n.Zone = FoldConstants(n.Zone)
+		}
 	case *FromUnnest:
 		n.ArrExpr = FoldConstants(n.ArrExpr)
 	case *PgInputErrorInfo:

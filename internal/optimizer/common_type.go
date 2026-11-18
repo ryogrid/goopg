@@ -2,6 +2,8 @@ package optimizer
 
 import (
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 )
 
@@ -255,4 +257,93 @@ func coerceCommonTypeArgs(fc *FuncCall) error {
 		fc.Args[i] = &CastExpr{pos: a.Pos(), Operand: a, TargetType: ptype, SourceType: source}
 	}
 	return nil
+}
+
+// generateSeriesType is the overload function resolution picks for
+// generate_series: its int4, int8, numeric, timestamp or timestamptz form. An
+// interval step or a zone argument selects the timestamp forms, where a timestamp
+// argument wins unless a timestamptz is present or a zone is given, and otherwise
+// the preferred type timestamptz applies, dates and unknown literals included.
+func generateSeriesType(args []Expr) string {
+	var plain, zoned, datetime, numeric, wide bool
+	for i, a := range args {
+		if isUnknownTypedArg(a) {
+			continue
+		}
+		if c, ok := a.(*IntegerConst); ok {
+			wide = wide || c.Value > math.MaxInt32 || c.Value < math.MinInt32
+			continue
+		}
+		switch commonTypeCanonical(exprType(a).Name) {
+		case "timestamp":
+			plain, datetime = true, true
+		case "timestamptz":
+			zoned, datetime = true, true
+		case "date":
+			datetime = true
+		case "interval":
+			datetime = datetime || i == 2
+		case "numeric", "float4", "float8":
+			numeric = true
+		case "int8":
+			wide = true
+		}
+	}
+	switch {
+	case datetime || len(args) == 4:
+		if plain && !zoned && len(args) != 4 {
+			return "timestamp"
+		}
+		return "timestamptz"
+	case numeric:
+		return "numeric"
+	case wide:
+		return "int8"
+	}
+	return "int4"
+}
+
+// checkGenerateSeriesArgs rejects the call function resolution cannot settle:
+// three untyped literals fit both timestamp forms and nothing prefers one.
+func checkGenerateSeriesArgs(args []Expr, pos int) error {
+	if len(args) != 3 {
+		return nil
+	}
+	for _, a := range args {
+		if _, ok := a.(*StringConst); !ok {
+			return nil
+		}
+	}
+	return &PlanError{Pos: pos, Code: "42725",
+		Message: "function generate_series(unknown, unknown, unknown) is not unique",
+		Hint:    "Could not choose a best candidate function. You might need to add explicit type casts."}
+}
+
+// coerceGenerateSeriesLiteral gives a literal argument the parameter's type, as
+// parse analysis does, so EXPLAIN shows it that way.
+func coerceGenerateSeriesLiteral(e Expr, argIdx int, typeName string) Expr {
+	if x, ok := e.(*StringConst); ok && (typeName == "numeric" || (argIdx < 2 && castTargetTakesStringLiteral(typeName))) {
+		return &TypedStringLit{pos: x.Pos(), Type: typeName, Value: x.Value}
+	}
+	if x, ok := e.(*IntegerConst); ok && typeName == "numeric" {
+		return &TypedStringLit{pos: x.Pos(), Type: typeName, Value: strconv.FormatInt(x.Value, 10)}
+	}
+	return e
+}
+
+// newGenerateSeriesCol builds the target-list form from resolved arguments.
+func newGenerateSeriesCol(colIdx int, args []Expr) SrfCol {
+	typeName := generateSeriesType(args)
+	args = append([]Expr(nil), args...)
+	for i, a := range args {
+		args[i] = coerceGenerateSeriesLiteral(a, i, typeName)
+	}
+	sc := SrfCol{ColIdx: colIdx, Start: args[0], Stop: args[1], Type: typeName}
+	if len(args) > 2 {
+		sc.Step = args[2]
+	}
+	if len(args) > 3 {
+		sc.Zone = args[3]
+	}
+	return sc
 }

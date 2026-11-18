@@ -56,3 +56,29 @@ func TestCoerceValuesColumnRejectsMixedCategories(t *testing.T) {
 		t.Errorf("got %v", err)
 	}
 }
+
+// TestGenerateSeriesType pins the overload PG's function resolution picks.
+func TestGenerateSeriesType(t *testing.T) {
+	lit := func(typeName string) Expr { return &TypedStringLit{Type: typeName, Value: "x"} }
+	text := &StringConst{Value: "x"}
+	one := &IntegerConst{Value: 1}
+	for _, tc := range []struct {
+		args []Expr
+		want string
+	}{
+		{[]Expr{one, one}, "int4"},
+		{[]Expr{one, &IntegerConst{Value: 1 << 40}}, "int8"},
+		{[]Expr{one, lit("int8")}, "int8"},
+		{[]Expr{one, lit("numeric")}, "numeric"},
+		{[]Expr{one, lit("float8")}, "numeric"},
+		{[]Expr{lit("timestamp"), text, lit("interval")}, "timestamp"},
+		{[]Expr{lit("timestamp"), lit("timestamptz"), lit("interval")}, "timestamptz"},
+		{[]Expr{lit("date"), lit("date"), lit("interval")}, "timestamptz"},
+		{[]Expr{text, text, lit("interval")}, "timestamptz"},
+		{[]Expr{lit("timestamp"), text, lit("interval"), text}, "timestamptz"},
+	} {
+		if got := generateSeriesType(tc.args); got != tc.want {
+			t.Errorf("%d args: got %s, want %s", len(tc.args), got, tc.want)
+		}
+	}
+}

@@ -12291,15 +12291,30 @@ verify each at HEAD when the task starts.
     Movement: yes — regress numeric 995→980, rangetypes 837→832, window 1082→1081
   > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a57: VALUES rows are not converted to the column type
   > Values print and compare as text. Found while checking to\_char in regress numeric and timestamp.
-- [ ] **M0149-0001h1a60 — WRONG RESULTS: generate\_series over timestamps returns zeros or fails** (filed 2026-11-19 by M0149-0001h1a51; S2)
+- [x] **M0149-0001h1a60 — WRONG RESULTS: generate\_series over timestamps returns zeros or fails** (filed 2026-11-19 by M0149-0001h1a51; S2)
   Kind: impl
   Parent: M0149-0001h1a
   - `select * from generate_series('2020-03-07 12:00'::timestamp, '2020-03-09 12:00', '1 day')` returns one row holding 0;
     PG 18.3 returns three timestamps. The four\-argument timestamptz form fails with `generate_series requires 2 or 3 arguments`.
   - PG: generate\_series\_timestamp and generate\_series\_timestamptz\_internal \(timestamp.c\).
   - Resume: internal/executor/operators\_generate\_series.go, stepping with addTimeIntervalInZone.
+  - 2026\-11\-19 \(landed\):
+    - The numeric, timestamp and timestamptz forms work in FROM and in the target list, including the zone argument, with PG's
+      argument errors. The result column has the resolved type.
+    - A NULL argument gives no rows.
+    - A LATERAL call can use columns of earlier FROM items; this failed for integers too.
+    - Regress, all 165 failed cases on HEAD and this build: 79624→79379 mismatch lines. polymorphism +3 is the known flake.
+    Movement: yes — regress rangefuncs 895→802, numeric 980→929, timestamptz 1999→1949, timestamp 1426→1392, stats\_ext 440→432, misc\_functions 236→231
   > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a60: generate\_series over timestamps returns wrong rows
   > The rows differ from PG 18.3. Found while checking timestamptz arithmetic.
+- [ ] **M0149-0001h1a63 — WRONG RESULTS: a timestamptz compared with an untyped literal reads the literal in UTC** (filed 2026-11-19 by M0149-0001h1a60; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - With `set timezone='America/New_York'`, `select t from yz where t = '2020-01-01'` misses a row holding `2020-01-01 00:00-05`,
+    and `t > '2020-01-01'` returns it. PG 18.3 reads the literal in the session zone. `IN`, `BETWEEN` and `CASE` are affected too.
+  - Resume: the comparison's literal coercion \(coerceUnknownLit and its interpreted twin\) must use the session zone for timestamptz.
+  > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a63: timestamptz filters return different rows
+  > WHERE clauses return different rows from PG 18.3 outside UTC. Found while checking generate\_series.
 - [ ] **M0149-0001h1a56 — most PG date and timestamp input spellings are rejected** (filed 2026-11-18 by M0149-0001h1a48e)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12344,6 +12359,21 @@ verify each at HEAD when the task starts.
   - `var_pop(x::numeric)` over `1e30`, `2e30` and `3` prints 12 fractional digits; PG 18.3 prints none, because
     numeric\_stddev\_internal uses select\_div\_scale. stddev goes through 15 significant digits instead of sqrt\_var.
   - Resume: exactNumericVariance in internal/executor/operators\_join\_agg.go; the state must keep the input display scale.
+- [ ] **M0149-0001h1a64 — a set\-returning call inside pg\_typeof returns one row** (filed 2026-11-19 by M0149-0001h1a60)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select pg_typeof(generate_series(1,2))` returns one row; PG 18.3 returns two.
+- [ ] **M0149-0001h1a65 — a number times an interval is rejected** (filed 2026-11-19 by M0149-0001h1a60)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select 2 * interval '1 day'` fails with `operator * requires numeric operands`; PG gives `2 days` \(mul\_d\_interval\).
+    Swapping the operands in evalBinary was not enough, so another path rejects it first.
+  - `interval * interval` should raise `operator does not exist: interval * interval` with PG's hint.
+- [ ] **M0149-0001h1a66 — compare generate\_series row estimates for numeric and timestamps with PG** (filed 2026-11-19 by M0149-0001h1a60)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG has planner support functions for these forms \(generate\_series\_numeric\_support, generate\_series\_timestamp\_support\).
+    goopg's estimates for them have not been compared.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a

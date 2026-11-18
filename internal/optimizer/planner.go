@@ -4495,6 +4495,15 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog, ps PlannerSe
 // with their own walker.
 func nodeReferencesOuter(n Node) bool {
 	switch x := n.(type) {
+	case *GenerateSeries:
+		// `FROM t, LATERAL generate_series(1, t.n)`: the arguments are plain
+		// *ColumnRefs against the left sibling, bound per outer row.
+		for _, a := range [...]Expr{x.Start, x.Stop, x.Step, x.Zone} {
+			if a != nil && exprContainsColumnRef(a) {
+				return true
+			}
+		}
+		return false
 	case *PgGetPublicationTables:
 		for _, a := range x.Args {
 			if exprContainsColumnRef(a) {
@@ -6748,9 +6757,8 @@ func replaceExprNode(e Expr, target Expr, repl Expr) Expr {
 func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveContext, agg *aggregateSurface) (*ProjectSet, error) {
 	type srfEntry struct {
 		colIdx int
-		start  parser.Expr
-		stop   parser.Expr
-		step   parser.Expr // may be nil
+		pos    int
+		args   []parser.Expr
 	}
 	type userSrfEntry struct {
 		colIdx  int
@@ -6791,14 +6799,11 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			continue
 		}
 		if strings.EqualFold(fc.Name.Name, "generate_series") {
-			if len(fc.Args) < 2 || len(fc.Args) > 3 {
+			if len(fc.Args) < 2 || len(fc.Args) > 4 {
 				return nil, &PlanError{Pos: fc.Pos(), Code: "42883",
-					Message: "generate_series requires 2 or 3 arguments"}
+					Message: "generate_series requires 2 to 4 arguments"}
 			}
-			e := srfEntry{colIdx: i, start: fc.Args[0], stop: fc.Args[1]}
-			if len(fc.Args) == 3 {
-				e.step = fc.Args[2]
-			}
+			e := srfEntry{colIdx: i, pos: fc.Pos(), args: fc.Args}
 			srfs = append(srfs, e)
 			continue
 		}
@@ -6891,7 +6896,7 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		if srfNode == nil {
 			continue
 		}
-		if len(srfNode.Args) < 2 || len(srfNode.Args) > 3 { // generate_series arity
+		if len(srfNode.Args) < 2 || len(srfNode.Args) > 4 { // generate_series arity
 			continue
 		}
 		slotIdx := childWidth + wrapSlot
@@ -7009,22 +7014,19 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 	// Resolve generate_series SRF args against ctx.
 	srfCols := make([]SrfCol, len(srfs))
 	for k, e := range srfs {
-		start, err := resolveExpr(e.start, ctx)
-		if err != nil {
-			return nil, err
-		}
-		stop, err := resolveExpr(e.stop, ctx)
-		if err != nil {
-			return nil, err
-		}
-		var step Expr
-		if e.step != nil {
-			step, err = resolveExpr(e.step, ctx)
+		args := make([]Expr, len(e.args))
+		for j, a := range e.args {
+			r, err := resolveExpr(a, ctx)
 			if err != nil {
 				return nil, err
 			}
+			args[j] = r
 		}
-		srfCols[k] = SrfCol{ColIdx: e.colIdx, Start: start, Stop: stop, Step: step}
+		if err := checkGenerateSeriesArgs(args, e.pos); err != nil {
+			return nil, err
+		}
+		srfCols[k] = newGenerateSeriesCol(e.colIdx, args)
+		schema[e.colIdx].Type = catalog.Type{Name: srfCols[k].Type}
 	}
 
 	// canonicalScalarTypeName folds a scalar type's spellings (int/integer/
@@ -7145,10 +7147,8 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 	// output row) and applies the enclosing scalar expression. M0118-0008.
 	wrappers := make([]SrfWrapper, 0, len(wrapped))
 	for i, w := range wrapped {
-		sc := SrfCol{ColIdx: w.slotIdx, Start: w.srfNode.Args[0], Stop: w.srfNode.Args[1], Wrapped: true}
-		if len(w.srfNode.Args) == 3 {
-			sc.Step = w.srfNode.Args[2]
-		}
+		sc := newGenerateSeriesCol(w.slotIdx, w.srfNode.Args)
+		sc.Wrapped = true
 		srfCols = append(srfCols, sc)
 		wrappers = append(wrappers, SrfWrapper{OutCol: i, Expr: w.expr})
 	}
@@ -7421,9 +7421,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "0A000",
 			Message: fmt.Sprintf("table-valued function %q not supported", tf.Name)}
 	}
-	if len(tf.Args) < 2 || len(tf.Args) > 3 {
+	if len(tf.Args) < 2 || len(tf.Args) > 4 {
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
-			Message: "generate_series requires 2 or 3 arguments"}
+			Message: "generate_series requires 2 to 4 arguments"}
 	}
 	// Build arg context: lateral siblings + outer-scope parent chain so
 	// correlated references like pr.prattrs in generate_series args resolve.
@@ -7438,21 +7438,17 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 			argCtx = lateralCtx
 		}
 	}
-	start, err := resolveExpr(tf.Args[0], argCtx)
-	if err != nil {
-		return nil, rangeBinding{}, err
-	}
-	stop, err := resolveExpr(tf.Args[1], argCtx)
-	if err != nil {
-		return nil, rangeBinding{}, err
-	}
-	var step Expr
-	if len(tf.Args) == 3 {
-		step, err = resolveExpr(tf.Args[2], argCtx)
-		if err != nil {
+	seriesArgs := make([]Expr, len(tf.Args))
+	for i, a := range tf.Args {
+		var err error
+		if seriesArgs[i], err = resolveExpr(a, argCtx); err != nil {
 			return nil, rangeBinding{}, err
 		}
 	}
+	if err := checkGenerateSeriesArgs(seriesArgs, tf.Pos()); err != nil {
+		return nil, rangeBinding{}, err
+	}
+	series := newGenerateSeriesCol(0, seriesArgs)
 	alias := rv.Alias
 	if alias == "" {
 		alias = "generate_series"
@@ -7466,13 +7462,7 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if len(gsColAliases) > 0 {
 		colName = gsColAliases[0]
 	}
-	// Use int4 when args are integer literals or int4-typed (PG overload resolution). M0097-0122.
-	seriesType := "int8"
-	if _, ok := start.(*IntegerConst); ok {
-		seriesType = "int4"
-	} else if t := exprType(start); t.Name == "int4" || t.Name == "integer" || t.Name == "int" {
-		seriesType = "int4"
-	}
+	seriesType := series.Type
 	tbl := &catalog.Table{
 		Name: alias,
 		Columns: []catalog.Column{
@@ -7480,7 +7470,7 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		},
 	}
 	schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: seriesType}, SourceTableIdx: sourceIdx}}
-	node := &GenerateSeries{pos: tf.Pos(), Start: start, Stop: stop, Step: step, Alias: alias, schema: schema}
+	node := &GenerateSeries{pos: tf.Pos(), Start: series.Start, Stop: series.Stop, Step: series.Step, Zone: series.Zone, Alias: alias, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	if tf.WithOrdinality {
 		node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
@@ -12986,14 +12976,9 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 			// (createplan.c's MinMaxAggPath tlist keeps the funcexpr; the
 			// ProjectSet expands it against the childless Result's single
 			// row). goopg's SrfCol carries the resolved args instead.
-			sc := SrfCol{ColIdx: i, Start: fc.Args[0], Stop: fc.Args[1]}
-			if len(fc.Args) == 3 {
-				sc.Step = fc.Args[2]
-			}
+			sc := newGenerateSeriesCol(i, fc.Args)
 			srfCols = append(srfCols, sc)
-			// Element type: the select-list SRF mode's int8 (the builder's
-			// generate_series default at ~6808) — the zip emits int64 datums.
-			psSchema[i] = SchemaColumn{Name: name, Type: catalog.Type{Name: "int8"}}
+			psSchema[i] = SchemaColumn{Name: name, Type: catalog.Type{Name: sc.Type}}
 			continue
 		}
 		other[i] = &ColumnRef{pos: pos, Index: len(resTargets), Name: name, Type: exprType(e)}
@@ -13869,7 +13854,7 @@ func minmaxTListSurvivor(e parser.Expr, ctx *resolveContext) (Expr, bool) {
 		// FuncCall: it recurses on the args only, so a 0-arg call —
 		// `count(*)`, an aggregate the rewrite must never swallow — reads
 		// "constant".
-		if !strings.EqualFold(fc.Name, "generate_series") || len(fc.Args) < 2 || len(fc.Args) > 3 {
+		if !strings.EqualFold(fc.Name, "generate_series") || len(fc.Args) < 2 || len(fc.Args) > 4 {
 			return nil, false
 		}
 		for _, a := range fc.Args {
@@ -17927,19 +17912,7 @@ func exprType(e Expr) catalog.Type {
 			// output even though the runtime value is correct. M0134-0091.
 			return catalog.Type{Name: "float8"}
 		case "generate_series":
-			// generate_series returns int4 for int4 args or integer literals (PG overload rules).
-			if len(x.Args) >= 1 {
-				argT := exprType(x.Args[0]).Name
-				switch argT {
-				case "int4", "integer", "int":
-					return catalog.Type{Name: "int4"}
-				}
-				// Integer literals (untyped) default to int4 overload, matching PG's overload resolution.
-				if _, ok := x.Args[0].(*IntegerConst); ok {
-					return catalog.Type{Name: "int4"}
-				}
-			}
-			return catalog.Type{Name: "int8"}
+			return catalog.Type{Name: generateSeriesType(x.Args)}
 		case "unnest":
 			// unnest(array) returns the element type. M0097-0106.
 			// Strip ALL [] suffixes to handle 2D arrays (e.g. int[][] → int). M0097-0125.

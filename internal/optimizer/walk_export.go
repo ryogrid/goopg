@@ -400,6 +400,9 @@ func nodeOwnExprs(n Node) []Expr {
 		if t.Step != nil {
 			exprs = append(exprs, t.Step)
 		}
+		if t.Zone != nil {
+			exprs = append(exprs, t.Zone)
+		}
 	case *GenerateSubscripts:
 		if t.ArrExpr != nil {
 			exprs = append(exprs, t.ArrExpr)
