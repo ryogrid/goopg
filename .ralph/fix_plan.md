@@ -12180,13 +12180,19 @@ verify each at HEAD when the task starts.
   - Also fixed: `'infinity'::date` and `'\-infinity'::date` printed 2262\-04\-11 and 1677\-09\-21.
   - Tests: TestTimeCarrierRoundTrip, TestTimeTZCompareKey, TestInfinityCellText.
   Movement: yes — regress date 407→405
-- [ ] **M0149-0001h1a48b — KindTime holds microseconds since 2000** (filed 2026-11-18 by M0149-0001h1a48)
+- [x] **M0149-0001h1a48b — KindTime holds microseconds since 2000** (filed 2026-11-18 by M0149-0001h1a48)
   Kind: impl
   Parent: M0149-0001h1a48
-  - Change the helpers in datum.go. Keep the input range as it is. TimeValue must split seconds with floor division
-    and keep returning today's instants for the infinity sentinels, because index key encoders derive from them.
-  - time and timetz are anchored at 1970\-01\-01, with 24:00 on 1970\-01\-02; check they survive the new epoch.
-  - Update TestExecCurrentTimestamp for microsecond precision; check whether ctx.Now carries finer digits.
+  - 2026\-11\-18 \(landed\): Datum.Int is PG's Timestamp value. The accepted input range is unchanged.
+    - The heap codec reads and writes it directly. Infinity stays at the int64 extremes and survives a trip
+      through time.Time.
+    - Precision below a microsecond is dropped when a Datum is built, as in PG.
+    - Audit result: the only persisted use of the raw value was the hash partition fallback.
+      hashPartitionFallbackWord keeps the old word, so stored rows stay reachable; PG's hash is filed as h1a50.
+    - Regress, all 165 failed cases on HEAD and this build, same list: 80402→80391 mismatch lines.
+    - Measure horology after timestamp's sibling cases: alone it needs their tables and reads 2606.
+    - Tests: TestTimeCarrierIsPGMicroseconds, TestHashPartitionWordIsStableForTimeValues.
+    Movement: yes — regress uuid 21→18, horology 2576→2574, timestamp 1595→1594
 - [ ] **M0149-0001h1a48c — date and time arithmetic that overflows past 292 years** (filed 2026-11-18 by M0149-0001h1a48)
   Kind: impl
   Parent: M0149-0001h1a48
@@ -12204,6 +12210,14 @@ verify each at HEAD when the task starts.
     and decoded values; then replace checkTimeCarrierRange's bounds \(copy\_text.go\).
   - Decide how to hold dates past 294276 AD, which PG allows up to 5874897 AD.
   - Afterwards re\-measure regress timestamp and timestamptz, whose column widths depend on these dates.
+- [ ] **M0149-0001h1a50 — hash partitioning on date, timestamp and other non\-int4, non\-text keys does not use PG's hash** (filed 2026-11-18 by M0149-0001h1a48b)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - computeHashPartitionRowHash hashes the low 32 bits of a value for every type it does not list. PG calls the type's
+    extended hash function \(hashint8extended for timestamp, hashint4extended for date, and so on\), so a row lands in
+    a different partition from PG's, which breaks physical compatibility.
+  - Changing it moves rows between partitions, so a cluster with such tables needs a rewrite or a compatibility rule.
+  - Resume: internal/executor/hash\_partition.go, then satisfies\_hash\_partition and partition pruning.
 - [ ] **M0149-0001h1a49 — WRONG RESULTS: `AT TIME ZONE '+05'` on timetz uses the opposite sign** (filed 2026-11-18 by M0149-0001h1a48; S2)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12266,6 +12280,7 @@ verify each at HEAD when the task starts.
     operands`; PG returns the timestamp.
   - `ts + interval '1 s'` returns `2020-01-01 00:00:01.000000`; PG prints `2020-01-01 00:00:01`.
   - Resume: the analyzer's BinaryOp operand check for a CastExpr to interval, and the result's output formatter.
+  - `date\_trunc('hour', ts)` also prints `.000000`, so the formatter problem is wider than interval arithmetic: the result column's type is not timestamp there.
   > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a43: timestamp arithmetic prints a different value text
   > Valid queries fail, and a result row differs from PG's output.
 - [ ] **M0149-0001h1a44 — regress polymorphism and plpgsql vary between runs on one build: `column "x" does not exist`** (filed 2026-11-18 by M0149-0001h1a38)

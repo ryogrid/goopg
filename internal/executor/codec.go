@@ -708,7 +708,7 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 		case d.IsTimestampNegInf():
 			micros = math.MinInt64
 		default:
-			micros = d.TimeValue().UnixMicro() - pgEpochUnixMicros
+			micros = d.Int // the carrier is PG's on-disk value
 			if prec := timeColumnPrecision(t); prec >= 0 {
 				micros = datetime.AdjustTimestampForTypmod(micros, int32(prec))
 			}
@@ -1332,12 +1332,8 @@ func roundTimestampDatumToPrecision(d Datum, prec int64) Datum {
 	if d.Kind != KindTime || prec < 0 || prec > 6 || d.IsTimestampPosInf() || d.IsTimestampNegInf() {
 		return d
 	}
-	micros := datetime.AdjustTimestampForTypmod(d.TimeValue().UnixMicro()-pgEpochUnixMicros, int32(prec))
-	ts := time.UnixMicro(micros + pgEpochUnixMicros).UTC()
-	if d.IsTimestampTZ() {
-		return NewTimestampTZDatum(ts)
-	}
-	return NewTimeDatum(ts)
+	d.Int = datetime.AdjustTimestampForTypmod(d.Int, int32(prec))
+	return d
 }
 
 // timeColumnPrecision returns the declared fractional-second precision of a
@@ -1887,17 +1883,17 @@ func decodePhysicalPGValueLowered(t *catalog.Type, tname string, data []byte, sc
 		// literal in the type-agnostic paths (Datum.Format(), CAST-to-text,
 		// string concat). The wire path re-derives the type from the column and
 		// is unaffected either way.
-		ts := time.UnixMicro(micros + pgEpochUnixMicros).UTC()
 		// tname, not isTimestampTZTypeName(t.Name): this arm is only reached
 		// via `case "timestamp", "timestamptz"`, so tname is already exactly
 		// one of those two literals and the general predicate — which
 		// TrimSpaces and ToLowers the raw name on every value — can only
 		// return the same answer. Removing it is the last of the three
 		// per-value string scans colTypeInfo exists to eliminate.
+		// The on-disk value is the carrier.
 		if tname == "timestamptz" {
-			return NewTimestampTZDatum(ts), 8, nil
+			return Datum{Kind: KindTime, Int: micros, TimeSub: TimeSubTimestampTZ}, 8, nil
 		}
-		return NewTimeDatum(ts), 8, nil
+		return Datum{Kind: KindTime, Int: micros}, 8, nil
 	case "date":
 		// encodeValuePG stores 4-byte LE days since the PG epoch. M0111-0004.
 		if len(data) < 4 {

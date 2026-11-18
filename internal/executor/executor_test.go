@@ -413,7 +413,7 @@ func TestExecCurrentTimestamp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rows[0][0].Kind != KindTime || !rows[0][0].TimeValue().Equal(ctx.Now) {
+	if rows[0][0].Kind != KindTime || !rows[0][0].TimeValue().Equal(ctx.Now.Truncate(1000)) {
 		t.Errorf("got %+v", rows[0][0])
 	}
 }

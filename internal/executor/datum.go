@@ -256,17 +256,52 @@ func (d Datum) TimeValue() time.Time {
 	return timeFromCarrier(d.Int)
 }
 
-// A KindTime Datum keeps its instant in Int. The functions below and this
-// constant are the only code that knows the unit, so the carrier can change
-// without touching its users (M0149-0001h1a48). Comparing or hashing Int needs
-// no conversion: order and equality hold in any unit.
-const timeCarrierUnitsPerSecond int64 = 1_000_000_000
+// A KindTime Datum keeps its instant in Int as microseconds since 2000-01-01
+// UTC, PostgreSQL's own Timestamp representation, with the int64 extremes as
+// infinity (M0149-0001h1a48). The functions below and this constant are the only
+// code that knows this. Comparing or hashing Int needs no conversion.
+const timeCarrierUnitsPerSecond int64 = 1_000_000
 
-// timeToCarrier is the Int of a KindTime Datum holding t.
-func timeToCarrier(t time.Time) int64 { return t.UTC().UnixNano() }
+// pgEpochUnixSeconds is 2000-01-01 00:00:00 UTC as a Unix time.
+const pgEpochUnixSeconds int64 = 946684800
+
+// The infinity sentinels convert to these instants, the ends of the former
+// nanosecond carrier. Code that has not been taught about infinity, index key
+// encoders among them, derives values from them, and a value converted to
+// time.Time and back must stay infinite.
+var (
+	timeCarrierPosInfInstant = time.Unix(0, math.MaxInt64).UTC()
+	timeCarrierNegInfInstant = time.Unix(0, math.MinInt64).UTC()
+)
+
+// timeToCarrier is the Int of a KindTime Datum holding t, truncated to the
+// microsecond.
+func timeToCarrier(t time.Time) int64 {
+	sec := t.Unix()
+	switch {
+	case sec == timeCarrierPosInfInstant.Unix() && t.Equal(timeCarrierPosInfInstant):
+		return math.MaxInt64
+	case sec == timeCarrierNegInfInstant.Unix() && t.Equal(timeCarrierNegInfInstant):
+		return math.MinInt64
+	}
+	return (sec-pgEpochUnixSeconds)*timeCarrierUnitsPerSecond + int64(t.Nanosecond())/1000
+}
 
 // timeFromCarrier is the instant a KindTime Datum's Int stands for.
-func timeFromCarrier(carrier int64) time.Time { return time.Unix(0, carrier).UTC() }
+func timeFromCarrier(carrier int64) time.Time {
+	switch carrier {
+	case math.MaxInt64:
+		return timeCarrierPosInfInstant
+	case math.MinInt64:
+		return timeCarrierNegInfInstant
+	}
+	sec, micros := carrier/timeCarrierUnitsPerSecond, carrier%timeCarrierUnitsPerSecond
+	if micros < 0 {
+		micros += timeCarrierUnitsPerSecond
+		sec--
+	}
+	return time.Unix(sec+pgEpochUnixSeconds, micros*1000).UTC()
+}
 
 // timeTZCompareKey is a timetz Datum's position in UTC, which timetz comparison
 // orders by. The offset lives in Scale, in minutes east of UTC.
@@ -327,9 +362,8 @@ func NewIntervalInfinity(positive bool) Datum {
 // IsTimestampPosInf / IsTimestampNegInf report whether a KindTime Datum
 // carries PostgreSQL's +infinity / -infinity timestamp sentinel. Upstream
 // (postgres/src/include/datatype/timestamp.h) uses TIMESTAMP_END/BEGIN =
-// PG_INT64_MAX/MIN in its micros-since-2000 domain; goopg stores KindTime as
-// Unix nanoseconds, so the same INT64 extremes are used as sentinels — a real
-// timestamp saturates ~year 2262, far below MaxInt64 ns, so they never collide.
+// PG_INT64_MAX/MIN in its micros-since-2000 domain, and KindTime is that domain,
+// so the same INT64 extremes are the sentinels here.
 // IsTimestampNotFinite is the union. (unimplemented_feat #5(d-iv))
 func (d Datum) IsTimestampPosInf() bool {
 	return d.Kind == KindTime && d.Int == math.MaxInt64

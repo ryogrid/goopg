@@ -18,7 +18,7 @@ extremes, which are also PG's values.
 | task | content | state |
 |---|---|---|
 | h1a48a | every unit\-dependent read goes through helpers in `datum.go` | done |
-| h1a48b | switch the unit and epoch, keeping today's accepted range | open |
+| h1a48b | switch the unit and epoch, keeping today's accepted range | done |
 | h1a48c | replace `time.Duration` arithmetic that overflows past 292 years | open |
 | h1a48d | BC and long\-year output in every formatter | open |
 | h1a48e | parse long years, apply PG's bounds and errors, range\-check results, open the gate | open |
@@ -35,6 +35,21 @@ To test that nothing else depends on the unit, the helpers were switched to micr
 throwaway worktree. Every executor, postmaster, optimizer and catalog test passed except
 `TestExecCurrentTimestamp`, which compares `now()` at nanosecond precision and is expected to
 change. The compiler cannot find such sites, because `Int` remains an int64.
+
+## Slice h1a48b
+
+`Datum.Int` is now microseconds since 2000\-01\-01, the value PG stores, so the heap codec
+copies it directly instead of converting through `time.Time`. Digits below a microsecond are
+dropped when a `time.Time` becomes a Datum. `timeFromCarrier` splits seconds with floor division
+so an instant before 2000 keeps a non\-negative fraction.
+
+The infinity sentinels stay at the int64 extremes. They convert to the same instants as before,
+and those instants convert back to the sentinels, so code that passes an infinity through
+`time.Time` still gets an infinity.
+
+Hash partitioning was the one persisted use of the raw value: its fallback hashed the low 32 bits
+of `Int`. `hashPartitionFallbackWord` keeps the former nanosecond word for time values, so rows
+already stored stay in the partition a lookup computes. This is not PG's hash \(M0149\-0001h1a50\).
 
 ## Risks for later slices
 

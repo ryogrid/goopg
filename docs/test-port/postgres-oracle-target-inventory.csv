@@ -83,7 +83,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale,mismatch_l
 ,regress-sql,regress,postgres/src/test/regress/sql/hash_func.sql,failed,no,-,Attempted via pg-regress-runner; M0134-0128 — 447/317 diff lines before/after wiring the hashint2/4/8/oid/char/float4/float8/name/text/bpchar scalar hash-function pair + integer::bit(n) cast; ~18 composite/typed hash functions (hash_numeric/array/record/range/multirange/aclitem/macaddr[8]/inet/uuid/pg_lsn/time*/interval/timestamp/enum/jsonb/oidvector) still unimplemented,66,341
 ,regress-sql,regress,postgres/src/test/regress/sql/hash_index.sql,pass,yes,,Passes under TestPort_RegressSuite as of M0134-0017 (partial-index predicate proof); must stay passing,,
 ,regress-sql,regress,postgres/src/test/regress/sql/hash_part.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,,
-,regress-sql,regress,postgres/src/test/regress/sql/horology.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,2576,3593
+,regress-sql,regress,postgres/src/test/regress/sql/horology.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,2574,3593
 ,regress-sql,regress,postgres/src/test/regress/sql/identity.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,318,871
 ,regress-sql,regress,postgres/src/test/regress/sql/incremental_sort.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,184,1662
 ,regress-sql,regress,postgres/src/test/regress/sql/index_including.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,,
@@ -202,7 +202,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale,mismatch_l
 ,regress-sql,regress,postgres/src/test/regress/sql/tidrangescan.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,71,265
 ,regress-sql,regress,postgres/src/test/regress/sql/tidscan.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,63,263
 ,regress-sql,regress,postgres/src/test/regress/sql/time.sql,pass,yes,-,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13),,
-,regress-sql,regress,postgres/src/test/regress/sql/timestamp.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,1595,2133
+,regress-sql,regress,postgres/src/test/regress/sql/timestamp.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,1594,2133
 ,regress-sql,regress,postgres/src/test/regress/sql/timestamptz.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,2223,3131
 ,regress-sql,regress,postgres/src/test/regress/sql/timetz.sql,pass,yes,-,TestPort_RegressSuite/timetz passes — M0097-0004: AT LOCAL/AT TIME ZONE/timezone()/timetz comparison/TABLE shorthand,,
 ,regress-sql,regress,postgres/src/test/regress/sql/transactions.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,257,1101
@@ -220,7 +220,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale,mismatch_l
 ,regress-sql,regress,postgres/src/test/regress/sql/union.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,,
 ,regress-sql,regress,postgres/src/test/regress/sql/updatable_views.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,1313,3820
 ,regress-sql,regress,postgres/src/test/regress/sql/update.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,267,982
-,regress-sql,regress,postgres/src/test/regress/sql/uuid.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,21,275
+,regress-sql,regress,postgres/src/test/regress/sql/uuid.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,18,275
 ,regress-sql,regress,postgres/src/test/regress/sql/vacuum.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,64,662
 ,regress-sql,regress,postgres/src/test/regress/sql/vacuum_parallel.sql,pass,yes,TestPort_RegressSuite/vacuum_parallel,"Sized+fixed live 2026-09-01 (M0134-0185). Sole break: VACUUM (PARALLEL 4, INDEX_CLEANUP ON) t -- syntax error at ON. gram.y's opt_boolean_or_string accepts bare ON (reserved keyword, can't lex as a ColId/NonReservedWord) alongside TRUE_P/FALSE_P; goopg's vacuum_opt opt_opt_value only had TRUE_P/FALSE_P/ColId/SCONST/signed_iconst, so ON (unlike OFF, a plain identifier) never reduced. Added ON to opt_opt_value (grammar/goopg_ext.y) and, for symmetry, wired the OFF spelling into isFalseWord and the index_cleanup on/off cases in vacuumNamedOpt (internal/parser/support.go) -- OFF already parsed but its value word fell through to the no-op default. No conflict-count change (ON already in the known S/R set). 100% parity, 0 diff lines.",,
 ,regress-sql,regress,postgres/src/test/regress/sql/varchar.sql,pass,yes,-,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13),,
