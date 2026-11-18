@@ -12307,14 +12307,28 @@ verify each at HEAD when the task starts.
     Movement: yes — regress rangefuncs 895→802, numeric 980→929, timestamptz 1999→1949, timestamp 1426→1392, stats\_ext 440→432, misc\_functions 236→231
   > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a60: generate\_series over timestamps returns wrong rows
   > The rows differ from PG 18.3. Found while checking timestamptz arithmetic.
-- [ ] **M0149-0001h1a63 — WRONG RESULTS: a timestamptz compared with an untyped literal reads the literal in UTC** (filed 2026-11-19 by M0149-0001h1a60; S2)
+- [x] **M0149-0001h1a63 — WRONG RESULTS: a timestamptz compared with an untyped literal reads the literal in UTC** (filed 2026-11-19 by M0149-0001h1a60; S2)
   Kind: impl
   Parent: M0149-0001h1a
   - With `set timezone='America/New_York'`, `select t from yz where t = '2020-01-01'` misses a row holding `2020-01-01 00:00-05`,
     and `t > '2020-01-01'` returns it. PG 18.3 reads the literal in the session zone. `IN`, `BETWEEN` and `CASE` are affected too.
   - Resume: the comparison's literal coercion \(coerceUnknownLit and its interpreted twin\) must use the session zone for timestamptz.
+  - 2026\-11\-19 \(landed\):
+    - The planner types a bare literal opposite a timestamp or timestamptz in comparisons, row comparisons, IS DISTINCT FROM,
+      NULLIF, IN lists and simple CASE, so timestamptz reads it in the session zone and timestamp discards its zone.
+    - Only spellings the executor can read are typed, until h1a56 ports the input parser.
+    - Regress, all 165 failed cases on HEAD and this build: 79382→79368 mismatch lines, none worse apart from the known flakes.
+    Movement: yes — regress horology 2482→2480
   > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a63: timestamptz filters return different rows
   > WHERE clauses return different rows from PG 18.3 outside UTC. Found while checking generate\_series.
+- [ ] **M0149-0001h1a67 — WRONG RESULTS: timestamp array literals keep their text** (filed 2026-11-19 by M0149-0001h1a63; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - With `set timezone='America/New_York'`, `'{2020-07-01}'::timestamptz[]` prints `{2020-07-01}`; PG prints
+    `{"2020-07-01 00:00:00-04"}`. `t = ANY ('{2020-07-01}'::timestamptz[])` misses the matching row.
+  - Resume: the array input path must run each element through the element type's input function \(array\_in\).
+  > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a67: timestamp arrays print and compare differently
+  > Output and matched rows differ from PG 18.3. Found while checking timestamp literal comparison.
 - [ ] **M0149-0001h1a56 — most PG date and timestamp input spellings are rejected** (filed 2026-11-18 by M0149-0001h1a48e)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12323,6 +12337,8 @@ verify each at HEAD when the task starts.
   - This is the largest remaining cause in regress timestamp \(58 errors\), timestamptz \(153\) and date \(54\).
   - Resume: port ParseDateTime, DecodeDateTime and DecodeDate \(datetime.c\) with the zone abbreviation table, in place
     of the layout list in copy\_text.go.
+  - When this lands, remove timestampLiteralIsReadable \(internal/optimizer/common\_type.go\), so every untyped literal opposite
+    a timestamp is typed and a bad one raises PG's input error.
 - [ ] **M0149-0001h1a55 — date and timestamp literal errors: caret and DateStyle hint** (filed 2026-11-18 by M0149-0001h1a48e)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12369,11 +12385,18 @@ verify each at HEAD when the task starts.
   - `select 2 * interval '1 day'` fails with `operator * requires numeric operands`; PG gives `2 days` \(mul\_d\_interval\).
     Swapping the operands in evalBinary was not enough, so another path rejects it first.
   - `interval * interval` should raise `operator does not exist: interval * interval` with PG's hint.
+  - `t - '2020-01-01'` and `t + '1 day'` on a timestamptz fail the same way, with `operator - requires numeric operands`.
 - [ ] **M0149-0001h1a66 — compare generate\_series row estimates for numeric and timestamps with PG** (filed 2026-11-19 by M0149-0001h1a60)
   Kind: impl
   Parent: M0149-0001h1a
   - PG has planner support functions for these forms \(generate\_series\_numeric\_support, generate\_series\_timestamp\_support\).
     goopg's estimates for them have not been compared.
+- [ ] **M0149-0001h1a68 — timestamp literals are read at execution instead of parse time** (filed 2026-11-19 by M0149-0001h1a63)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - A prepared statement or view with `t = '2020-01-01'` follows the zone in force when it runs. PG fixes the value when the
+    statement is parsed, so it keeps the earlier zone, and pg\_get\_viewdef shows the resolved instant.
+  - Resume: the planner needs the session TimeZone to fold these literals; views need their stored text rewritten.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a

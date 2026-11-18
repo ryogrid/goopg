@@ -82,3 +82,35 @@ func TestGenerateSeriesType(t *testing.T) {
 		}
 	}
 }
+
+// TestCoerceTimestampOperands pins coerce_type for an unknown literal opposite a
+// timestamp or timestamptz, on either side and inside row comparisons. Other
+// operand types keep the literal.
+func TestCoerceTimestampOperands(t *testing.T) {
+	col := func(typeName string) Expr { return &ColumnRef{Name: "c", Type: catalog.Type{Name: typeName}} }
+	lit := func() Expr { return &StringConst{Value: "2020-01-01"} }
+	typeOf := func(e Expr) string {
+		if l, ok := e.(*TypedStringLit); ok {
+			return l.Type
+		}
+		return ""
+	}
+	if _, r := coerceTimestampOperands(col("timestamptz"), lit()); typeOf(r) != "timestamptz" {
+		t.Errorf("right literal: %T", r)
+	}
+	if l, _ := coerceTimestampOperands(lit(), col("timestamp with time zone")); typeOf(l) != "timestamptz" {
+		t.Errorf("left literal: %T", l)
+	}
+	if _, r := coerceTimestampOperands(col("timestamp"), lit()); typeOf(r) != "timestamp" {
+		t.Errorf("timestamp column: %T", r)
+	}
+	if _, r := coerceTimestampOperands(col("date"), lit()); typeOf(r) != "" {
+		t.Errorf("date column must keep the literal: %T", r)
+	}
+	left := &RowExpr{Elems: []Expr{col("timestamptz"), col("int4")}, Types: make([]catalog.Type, 2)}
+	right := &RowExpr{Elems: []Expr{lit(), lit()}, Types: make([]catalog.Type, 2)}
+	coerceTimestampOperands(left, right)
+	if typeOf(right.Elems[0]) != "timestamptz" || typeOf(right.Elems[1]) != "" {
+		t.Errorf("row elements: %T, %T", right.Elems[0], right.Elems[1])
+	}
+}

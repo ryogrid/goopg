@@ -211,6 +211,11 @@ func checkCommonTypeCoercion(context string, e Expr, from, to string) error {
 func coerceCommonTypeArgs(fc *FuncCall) error {
 	var context string
 	switch strings.ToLower(fc.Name) {
+	case "nullif":
+		if len(fc.Args) == 2 {
+			fc.Args[0], fc.Args[1] = coerceTimestampOperands(fc.Args[0], fc.Args[1])
+		}
+		return nil
 	case "coalesce":
 		context = "COALESCE"
 	case "greatest":
@@ -346,4 +351,58 @@ func newGenerateSeriesCol(colIdx int, args []Expr) SrfCol {
 		sc.Zone = args[3]
 	}
 	return sc
+}
+
+// timestampLiteralType is the type a bare literal takes opposite e: timestamp or
+// timestamptz, or "" for any other operand. Those two need it at plan time. Left as
+// text, a literal would be read without the session zone for timestamptz and with
+// its own zone for timestamp, where PG reads and discards that zone.
+func timestampLiteralType(e Expr) string {
+	et := exprType(e)
+	if et.IsArray {
+		return ""
+	}
+	switch t := commonTypeCanonical(et.Name); t {
+	case "timestamp", "timestamptz":
+		return t
+	}
+	return ""
+}
+
+// typedTimestampLiteral is coerce_type for an unknown literal of that type. Only
+// spellings the executor's timestamp input can read are typed: until DecodeDateTime
+// is ported (M0149-0001h1a56), typing the others would turn a comparison that runs
+// today into an input error.
+func typedTimestampLiteral(e Expr, typeName string) Expr {
+	lit, ok := e.(*StringConst)
+	if !ok || typeName == "" || !timestampLiteralIsReadable(lit.Value) {
+		return e
+	}
+	return &TypedStringLit{pos: lit.Pos(), Type: typeName, Value: lit.Value}
+}
+
+func timestampLiteralIsReadable(v string) bool {
+	v = strings.ToLower(strings.TrimSpace(v))
+	switch v {
+	case "infinity", "+infinity", "-infinity", "epoch", "now", "today", "tomorrow", "yesterday":
+		return true
+	}
+	return v != "" && v[0] >= '0' && v[0] <= '9'
+}
+
+// coerceTimestampOperands types a bare literal opposite a timestamp or timestamptz.
+func coerceTimestampOperands(l, r Expr) (Expr, Expr) {
+	if lr, ok := l.(*RowExpr); ok {
+		if rr, ok := r.(*RowExpr); ok && len(lr.Elems) == len(rr.Elems) {
+			for i := range lr.Elems {
+				lr.Elems[i], rr.Elems[i] = coerceTimestampOperands(lr.Elems[i], rr.Elems[i])
+				lr.Types[i], rr.Types[i] = exprType(lr.Elems[i]), exprType(rr.Elems[i])
+			}
+		}
+		return l, r
+	}
+	if t := timestampLiteralType(l); t != "" {
+		return l, typedTimestampLiteral(r, t)
+	}
+	return typedTimestampLiteral(l, timestampLiteralType(r)), r
 }

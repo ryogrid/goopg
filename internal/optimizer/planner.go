@@ -10639,6 +10639,7 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		if err != nil {
 			return nil, err
 		}
+		lv, rv = coerceTimestampOperands(lv, rv)
 		return &IsDistinctFromExpr{pos: x.Pos(), Left: lv, Right: rv, Negated: x.Negated}, nil
 	case *parser.ExtractExpr:
 		src, err := resolveExpr(x.Source, agg.input)
@@ -11100,6 +11101,7 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
+		lv, rv = coerceTimestampOperands(lv, rv)
 		return &IsDistinctFromExpr{pos: x.Pos(), Left: lv, Right: rv, Negated: x.Negated}, nil
 	}
 	return resolveExprForWindowInput(e, win.input, win.agg)
@@ -18403,6 +18405,14 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 			if err != nil {
 				return nil, err
 			}
+			if t := timestampLiteralType(op); t != "" {
+				switch lit, isLit := r.(*StringConst); {
+				case !x.Quantified:
+					r = typedTimestampLiteral(r, t)
+				case isLit && !x.SplicedArray:
+					r = &CastExpr{pos: lit.Pos(), Operand: lit, TargetType: t + "[]", SourceType: "unknown"}
+				}
+			}
 			out.List[i] = r
 		}
 		if err := checkAnyAllArrayOperand(x, out.List); err != nil {
@@ -19042,6 +19052,9 @@ func resolveCaseExpr(x *parser.CaseExpr, ctx *resolveContext) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
+		if out.Operand != nil {
+			when = typedTimestampLiteral(when, timestampLiteralType(out.Operand))
+		}
 		then, err := resolveExpr(w.Then, ctx)
 		if err != nil {
 			return nil, err
@@ -19212,6 +19225,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		// of by declaration order. M0097-enum-cmp.
 		switch x.Op {
 		case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+			l, r = coerceTimestampOperands(l, r)
 			lt, rt := exprType(l), exprType(r)
 			if strings.EqualFold(lt.Name, "name") && !strings.EqualFold(rt.Name, "name") && isTextLikePlannerType(rt.Name) {
 				r = &CastExpr{pos: x.Pos(), Operand: r, TargetType: "name"}
@@ -19502,6 +19516,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
+		lv, rv = coerceTimestampOperands(lv, rv)
 		return &IsDistinctFromExpr{pos: x.Pos(), Left: lv, Right: rv, Negated: x.Negated}, nil
 	case *parser.ArraySubscriptExpr:
 		if x.IsSlice {
