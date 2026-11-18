@@ -687,9 +687,9 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 				// either way. The real INSERT/UPDATE row encoder
 				// (operators_storage.go's EncodeRowPGCtx call sites) DOES pass
 				// a live session ctx.
-				ts, err := parseCopyTimestampZoneSession(d.StringValue(), tsZoneModeForType(t.Name), timeZoneFromCtx(ctx))
+				ts, _, err := decodeTimestampText(d.StringValue(), tsZoneModeForType(t.Name), dateInputFromCtx(ctx))
 				if err != nil {
-					return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type timestamp: %q", d.StringValue())}
+					return nil, dateTimeInputError(err, timestampInputTypeName(isTimestampTZTypeName(t.Name)), d.StringValue(), 0)
 				}
 				d = NewTimeDatum(ts.UTC())
 			}
@@ -725,9 +725,9 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 				// date_in never looks at the decoded zone, nor at an hour-24 /
 				// leap-second day carry, so the wall clock as written picks the
 				// day (parseDateInputText).
-				ts, err := parseDateInputText(d.StringValue())
+				ts, err := decodeDateText(d.StringValue(), dateInputFromCtx(ctx))
 				if err != nil {
-					return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type date: %q", d.StringValue())}
+					return nil, dateTimeInputError(err, "date", d.StringValue(), 0)
 				}
 				d = NewTimeDatum(ts.UTC())
 			}

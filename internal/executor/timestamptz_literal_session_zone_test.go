@@ -121,21 +121,18 @@ func TestTimestampLiteralIgnoresSessionTimeZone(t *testing.T) {
 	}
 }
 
-// TestTimestamptzZoneNameLiteralStillUnsupported documents (not asserts a
-// fix for) a pre-existing, unrelated gap this slice's guard test surfaced
-// while capturing the design doc's "literal with a zone name" oracle case:
-// goopg's pgTimestampLayouts has no named-zone layout, only numeric-offset
-// ("Z07*") ones, so '2006-08-13 12:34:56 Europe/London'::timestamptz 22007s
-// where PG 18.3 answers 2006-08-13 11:34:56 UTC. This is unaffected by
-// M0134-0026 (still errors identically before and after).
-func TestTimestamptzZoneNameLiteralStillUnsupported(t *testing.T) {
+// TestTimestamptzZoneNameLiteral pins PG 18.3: a zone name in the literal decides
+// the offset, whatever the session zone is.
+func TestTimestamptzZoneNameLiteral(t *testing.T) {
 	t.Parallel()
 	ctx := tzCtx("ISO, MDY", "America/Los_Angeles")
 	x := &optimizer.TypedStringLit{Type: "timestamptz", Value: "2006-08-13 12:34:56 Europe/London"}
-	if _, err := evalTypedStringLit(x, ctx); err == nil {
-		t.Errorf("evalTypedStringLit(zone-name literal) unexpectedly succeeded — " +
-			"if named-zone parsing was added, promote this to a real assertion " +
-			"(PG 18.3: 2006-08-13 11:34:56 UTC) instead of documenting the gap")
+	got, err := evalTypedStringLit(x, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := time.Date(2006, 8, 13, 11, 34, 56, 0, time.UTC); !got.TimeValue().Equal(want) {
+		t.Errorf("got %v, want %v", got.TimeValue(), want)
 	}
 }
 

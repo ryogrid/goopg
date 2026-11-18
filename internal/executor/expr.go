@@ -5081,20 +5081,20 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		if inf, ok := parseDateSpecialLiteral(x.Value, nowFromCtx(ctx)); ok {
 			return inf, nil
 		}
-		// M0125-0007 / M0119-0006: PG's DecodeDate reads each numeric field on
-		// its own ('2002-5-1' is '2002-05-01') and accepts a trailing era token
-		// ('2020-01-01 BC'); parsePGDateText applies both around the fixed Go
-		// layout, which can express neither.
-		t, err := parsePGDateText(x.Value)
+		// A spelling whose meaning depends on DateStyle must not stay cached on
+		// the plan node.
+		t, usedSession, err := decodeDateTextSession(x.Value, dateInputFromCtx(ctx))
 		if err != nil {
 			return Datum{}, dateTimeInputError(err, "date", x.Value, x.Pos())
 		}
-		x.CachedTime = t.UTC()
-		x.CacheValid = true
+		if !usedSession {
+			x.CachedTime = t.UTC()
+			x.CacheValid = true
+		}
 		// A DATE datum (date_in), not a timestamp: date ± integer
 		// (date_pli / date_mii) and date - date (date_mi) dispatch on it.
 		// M0146-0040.
-		return NewDateDatum(x.CachedTime), nil
+		return NewDateDatum(t.UTC()), nil
 	case "time":
 		// 'now' is the only RESERV token DecodeTimeOnly accepts (#5(d-iv), M0134-0182).
 		if inf, ok := parseTimeSpecialLiteral(x.Value, nowFromCtx(ctx)); ok {
@@ -5167,7 +5167,7 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		// arm above — it must not be written to x.CachedTime/x.CacheValid, or a
 		// different session with a different TimeZone reusing this plan node
 		// would get the wrong instant.
-		t, usedSession, err := parsePGTimestampTextZoneSession(x.Value, tsZoneModeForType(x.Type), timeZoneFromCtx(ctx))
+		t, usedSession, err := decodeTimestampText(x.Value, tsZoneModeForType(x.Type), dateInputFromCtx(ctx))
 		if err != nil {
 			return Datum{}, dateTimeInputError(err, timestampInputTypeName(isTimestampTZTypeName(x.Type)), x.Value, x.Pos())
 		}
@@ -6594,7 +6594,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			// is 2020-01-02, not the previous day (tsZoneMode). It likewise never
 			// composes date with time, so an hour-24 / leap-second day carry is
 			// dropped too — '2020-01-01 24:00:00'::date is the 1st.
-			t, err := parseDateInputText(s)
+			t, err := decodeDateText(s, dateInputFromCtx(ctx))
 			if err != nil {
 				// M0119-0006: a range failure (no year zero, or a value the
 				// KindTime carrier cannot hold) keeps its own 22008 wording —
@@ -6669,7 +6669,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			// must be threaded through here too, not just the typed-literal
 			// arm (evalTypedStringLit). No caching hazard here: evalCast does
 			// not cache its result on a plan node.
-			ts, err := parseCopyTimestampZoneSession(d.StringValue(), tsZoneModeForType(targetType), timeZoneFromCtx(ctx))
+			ts, _, err := decodeTimestampText(d.StringValue(), tsZoneModeForType(targetType), dateInputFromCtx(ctx))
 			if err != nil {
 				return Datum{}, dateTimeInputError(err, timestampInputTypeName(tz), d.StringValue(), pos)
 			}

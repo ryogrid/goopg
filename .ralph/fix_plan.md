@@ -12336,7 +12336,7 @@ verify each at HEAD when the task starts.
     Movement: yes — regress interval 756→662
   > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a67: timestamp arrays print and compare differently
   > Output and matched rows differ from PG 18.3. Found while checking timestamp literal comparison.
-- [ ] **M0149-0001h1a56 — most PG date and timestamp input spellings are rejected** (filed 2026-11-18 by M0149-0001h1a48e)
+- [x] **M0149-0001h1a56 — most PG date and timestamp input spellings are rejected** (filed 2026-11-18 by M0149-0001h1a48e)
   Kind: impl
   Parent: M0149-0001h1a
   - `'Feb 10 17:32:01 1997'`, `'Mon Feb 10 17:32:01 1997 PST'`, `'19970210 173201 PST'`, `'1997/02/10 17:32:01-0800'`,
@@ -12346,14 +12346,21 @@ verify each at HEAD when the task starts.
     of the layout list in copy\_text.go.
   - When this lands, remove timestampLiteralIsReadable \(internal/optimizer/common\_type.go\), so every untyped literal opposite
     a timestamp is typed and a bad one raises PG's input error.
-  - `'10:00+05:30:15'::timetz` loses its offset; PG reads an offset with seconds.
+  - 2026\-11\-19 \(landed\):
+    - ParseDateTime, DecodeDateTime and their helpers are ported, with the Default zone abbreviation table. date, timestamp and
+      timestamptz input from literals, casts, COPY and row encoding all use them, and follow DateStyle.
+    - timestampLiteralIsReadable is gone: every untyped literal opposite a timestamp is typed.
+    - Errors follow DateTimeParseError, including the DateStyle hint and the time zone errors.
+    - About 2,000 inputs under three field orders match PG 18.3, apart from dates past 294276 AD \(h1a54\).
+    - Regress, all 165 failed cases on HEAD and this build: 79283→76077 mismatch lines. subscription +3 now raises PG's error
+      for an empty `stats_reset` value, which an earlier gap in that case produces.
+    Movement: yes — regress timestamp 1392→213, timestamptz 1949→343, date 294→56, horology 2480→2360, merge 759→431, interval 662→654, copy2 254→249
 - [ ] **M0149-0001h1a55 — date and timestamp literal errors: caret and DateStyle hint** (filed 2026-11-18 by M0149-0001h1a48e)
   Kind: impl
   Parent: M0149-0001h1a
   - `date 'x'` and `timestamp 'x'` put the caret on the type name. PG puts it on the string \(makeStringConstCast\).
     The position comes from the grammar \(NewTypedStringLit\).
-  - `'2020-13-01'::date` lacks PG's `HINT:  Perhaps you need a different "DateStyle" setting.`
-    \(DTERR\_MD\_FIELD\_OVERFLOW, DateTimeParseError\).
+  - 2026\-11\-19: the DateStyle hint landed with h1a56; the caret remains.
 - [ ] **M0149-0001h1a54 — dates from 294277 to 5874897 AD are rejected** (filed 2026-11-18 by M0149-0001h1a48e)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12413,6 +12420,12 @@ verify each at HEAD when the task starts.
   - `'3 mons ago'::interval` fails with `invalid input syntax`, and `interval '3 mons ago'` with a syntax error. PG gives `-3 mons`
     \(DecodeInterval negates every field\).
   - Resume: decodeIntervalFields in internal/parser/interval.go.
+- [ ] **M0149-0001h1a70 — time and timetz input do not use PG's parser** (filed 2026-11-19 by M0149-0001h1a56)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `'10:00+05:30:15'::timetz` loses its offset, because parseTimeString and parseTimeTZString are separate from DecodeTimeOnly.
+  - timezone\_abbreviations is not honoured: input always uses the Default set.
+  - Resume: port DecodeTimeOnly onto internal/utils/adt/datetime/decode.go; load the abbreviation set the setting names.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a

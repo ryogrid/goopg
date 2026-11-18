@@ -122,12 +122,9 @@ func TestParseCopyTimestampUnpaddedFields(t *testing.T) {
 	}
 }
 
-// TestParseCopyTimestampStillRejectsForeignSpellings is the other half: the
-// normaliser must not have widened acceptance beyond the ISO numeric subset.
-// Each of these is still a gap versus PG (see the M0125-0007 deferral rows),
-// and each must keep failing LOUDLY rather than decode to some invented date.
+// TestParseCopyTimestampStillRejectsForeignSpellings pins inputs PG 18.3 rejects.
 func TestParseCopyTimestampStillRejectsForeignSpellings(t *testing.T) {
-	for _, in := range []string{"2002-5-32", "2002-13-1", "2002-2-30", "2002-005-01", "2002/5/1", "02-5-1", "garbage"} {
+	for _, in := range []string{"2002-5-32", "2002-13-1", "2002-2-30", "2002-005-01", "garbage"} {
 		if got, err := parseCopyTimestamp(in); err == nil {
 			t.Errorf("parseCopyTimestamp(%q) unexpectedly succeeded with %v", in, got)
 		}

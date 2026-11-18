@@ -90,7 +90,7 @@ func TestDateTimeInputErrorSeparatesRangeFromSyntax(t *testing.T) {
 		// astronomical year 0 (1 BC), which 0%400==0 makes leap — PG 18.3
 		// accepts it — but literal year 1 is not leap, so time.Parse's own
 		// day-out-of-range check rejects it a layer below
-		// validateDateTokenFull's (correct) astronomical-year check. Must
+		// the (correct) astronomical-year check. Must
 		// be accepted, not reported as a syntax miss.
 		{"0001-02-29 BC", ""},
 		{"0002-02-29 BC", "22008"}, // 2 BC is not a leap year
@@ -201,32 +201,26 @@ func TestBCLeapDayTimestampDecodesAtTheAstronomicalYear(t *testing.T) {
 		// 5 BC is astronomical -4: divisible by 4, so leap as well.
 		{"0005-02-29 10:00:00 BC", tsDiscardZone, time.Date(-4, 2, 29, 10, 0, 0, 0, time.UTC)},
 	} {
-		got, carry, err := parsePGTimestampTextParts(c.in, c.zone)
+		got, _, err := decodeTimestampText(c.in, c.zone, dateInput{})
 		if err != nil {
-			t.Errorf("parsePGTimestampTextParts(%q) failed: %v — PG 18.3 accepts this", c.in, err)
+			t.Errorf("decodeTimestampText(%q) failed: %v — PG 18.3 accepts this", c.in, err)
 			continue
 		}
-		if carry != 0 {
-			t.Errorf("parsePGTimestampTextParts(%q) carry = %d, want 0", c.in, carry)
-		}
 		if !got.Equal(c.want) {
-			t.Errorf("parsePGTimestampTextParts(%q) = %v, want %v", c.in, got, c.want)
+			t.Errorf("decodeTimestampText(%q) = %v, want %v", c.in, got, c.want)
 		}
 	}
 	// The whole-day carry composes on top of the rebuilt date, so an hour-24 /
 	// leap-second time of day on the BC leap day rolls into March 1st exactly
 	// as it does upstream.
 	for _, in := range []string{"0001-02-29 24:00:00 BC", "0001-02-29 23:59:60 BC"} {
-		got, carry, err := parsePGTimestampTextParts(in, tsDiscardZone)
+		got, _, err := decodeTimestampText(in, tsDiscardZone, dateInput{})
 		if err != nil {
-			t.Errorf("parsePGTimestampTextParts(%q) failed: %v", in, err)
+			t.Errorf("decodeTimestampText(%q) failed: %v", in, err)
 			continue
 		}
-		if carry != 1 {
-			t.Errorf("parsePGTimestampTextParts(%q) carry = %d, want 1 (the whole day)", in, carry)
-		}
-		if want := time.Date(0, 3, 1, 0, 0, 0, 0, time.UTC); !got.AddDate(0, 0, carry).Equal(want) {
-			t.Errorf("parsePGTimestampTextParts(%q)+carry = %v, want %v", in, got.AddDate(0, 0, carry), want)
+		if want := time.Date(0, 3, 1, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+			t.Errorf("decodeTimestampText(%q) = %v, want %v", in, got, want)
 		}
 	}
 }

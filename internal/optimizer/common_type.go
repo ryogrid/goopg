@@ -369,25 +369,12 @@ func timestampLiteralType(e Expr) string {
 	return ""
 }
 
-// typedTimestampLiteral is coerce_type for an unknown literal of that type. Only
-// spellings the executor's timestamp input can read are typed: until DecodeDateTime
-// is ported (M0149-0001h1a56), typing the others would turn a comparison that runs
-// today into an input error.
+// typedTimestampLiteral is coerce_type for an unknown literal of that type.
 func typedTimestampLiteral(e Expr, typeName string) Expr {
-	lit, ok := e.(*StringConst)
-	if !ok || typeName == "" || !timestampLiteralIsReadable(lit.Value) {
-		return e
+	if lit, ok := e.(*StringConst); ok && typeName != "" {
+		return &TypedStringLit{pos: lit.Pos(), Type: typeName, Value: lit.Value}
 	}
-	return &TypedStringLit{pos: lit.Pos(), Type: typeName, Value: lit.Value}
-}
-
-func timestampLiteralIsReadable(v string) bool {
-	v = strings.ToLower(strings.TrimSpace(v))
-	switch v {
-	case "infinity", "+infinity", "-infinity", "epoch", "now", "today", "tomorrow", "yesterday":
-		return true
-	}
-	return v != "" && v[0] >= '0' && v[0] <= '9'
+	return e
 }
 
 // coerceDatetimeArrayOperands casts a bare literal opposite a date or time array to

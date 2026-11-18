@@ -278,6 +278,22 @@ func ZoneLocation(zone string) *time.Location {
 	return sessionLocation(zone)
 }
 
+// ZoneByName is pg_tzset: the zone for a name in any letter case, or a POSIX TZ
+// specification.
+func ZoneByName(name string) (*time.Location, bool) {
+	canonical, ok := zoneName(name)
+	if !ok {
+		return nil, false
+	}
+	return sessionLocation(canonical), true
+}
+
+// WallClockWestOffset is DetermineTimeZoneOffset: the seconds west of UTC that a
+// wall clock, given as UTC-tagged fields, has in loc.
+func WallClockWestOffset(wall time.Time, loc *time.Location) int {
+	return int(resolveLocalWallClock(wall, loc).Unix() - wall.Unix())
+}
+
 // ZoneKnown reports whether zone names a tz database zone or is a POSIX TZ
 // specification, which are the two forms ZoneLocation resolves.
 func ZoneKnown(zone string) bool {

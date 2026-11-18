@@ -486,7 +486,7 @@ func (c *CopyFromExecutor) PushLine(line []byte) error {
 		return c.pushCsvLine(line)
 	}
 	c.lineLen = len(trimCopyLineCR(line))
-	src, err := DecodeCopyTextRow(line, c.listedColumns(), c.format.nullStr, timeZoneFromCtx(c.ctx))
+	src, err := DecodeCopyTextRow(line, c.listedColumns(), c.format.nullStr, timeZoneFromCtx(c.ctx), dateInputFromCtx(c.ctx).order)
 	if err != nil {
 		return &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: fmt.Sprintf("COPY: %v", err), Context: c.copyContext()}
 	}
