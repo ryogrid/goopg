@@ -616,6 +616,18 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		}
 		return evalUnary(x.Op, operand, x.Pos())
 	case *optimizer.CastExpr:
+		if dom, base := domainCastWithTypmod(ctx, x); dom != nil {
+			// The domain's typmod applies as a cast to the base type would
+			// apply it, then the domain's own checks run on the result.
+			result, err := evalExprSlot(base, slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			if err := checkDomainInValues(result, dom, x.Pos()); err != nil {
+				return Datum{}, err
+			}
+			return result, nil
+		}
 		v, err := evalExprSlot(x.Operand, slot, ctx)
 		if err != nil {
 			return Datum{}, err
@@ -1056,34 +1068,11 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			return Datum{}, err
 		}
 		// Domain CHECK constraint enforcement: VALUE IN (...). M0097-domain-check.
-		// A domain may carry several CHECK (VALUE IN (...)) constraints; each must
-		// admit the value. DU-002 slice 385 (multi-CHECK).
 		if ctx != nil && ctx.Catalog != nil {
 			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 				if dom, isDomain := im.LookupDomain(x.TargetType, ctx.CurrentDatabaseOid); isDomain {
-					// Get the string label of the value being cast. Format()
-					// (not StringValue(), which only extracts KindString's Buf
-					// payload) renders every Kind's canonical text form, e.g.
-					// KindInt's Int field as a decimal string. M0122-0005.
-					label := result.Format()
-					for _, ck := range dom.Checks {
-						if len(ck.InValues) == 0 {
-							continue
-						}
-						found := false
-						for _, allowed := range ck.InValues {
-							if strings.EqualFold(label, allowed) {
-								found = true
-								break
-							}
-						}
-						if !found {
-							return Datum{}, &ExecError{
-								Code:    "23514",
-								Pos:     x.Pos(),
-								Message: fmt.Sprintf("value for domain %s violates check constraint %q", strings.ToLower(dom.Name), ck.Name),
-							}
-						}
+					if err := checkDomainInValues(result, dom, x.Pos()); err != nil {
+						return Datum{}, err
 					}
 				}
 			}
@@ -20834,6 +20823,73 @@ func pgFormatTypeName(t string) string {
 		return "numeric"
 	}
 	return t
+}
+
+// checkDomainInValues enforces a domain's CHECK (VALUE IN (...)) constraints on
+// a cast result. A domain may carry several; each must admit the value. Format()
+// (not StringValue(), which only extracts KindString's Buf payload) renders every
+// Kind's canonical text form. DU-002 slice 385, M0122-0005.
+func checkDomainInValues(result Datum, dom *catalog.Domain, pos int) error {
+	label := result.Format()
+	for _, ck := range dom.Checks {
+		if len(ck.InValues) == 0 {
+			continue
+		}
+		found := false
+		for _, allowed := range ck.InValues {
+			if strings.EqualFold(label, allowed) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return &ExecError{
+				Code:    "23514",
+				Pos:     pos,
+				Message: fmt.Sprintf("value for domain %s violates check constraint %q", strings.ToLower(dom.Name), ck.Name),
+			}
+		}
+	}
+	return nil
+}
+
+// domainCastWithTypmod reports a cast to a domain whose base type has a typmod,
+// with the equivalent cast to that base type. Built-in target names return at
+// once, so ordinary casts pay no catalog lookup.
+func domainCastWithTypmod(ctx *Context, x *optimizer.CastExpr) (*catalog.Domain, *optimizer.CastExpr) {
+	if x.Typmod != 0 || ctx == nil || ctx.Catalog == nil || x.TargetType == "" ||
+		catalog.TypeNameToOID(x.TargetType) != catalog.OIDText || strings.EqualFold(x.TargetType, "text") {
+		return nil, nil
+	}
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil, nil
+	}
+	dom, ok := im.LookupDomain(x.TargetType, ctx.CurrentDatabaseOid)
+	if !ok {
+		return nil, nil
+	}
+	base, ok := im.DomainBaseType(x.TargetType, ctx.CurrentDatabaseOid)
+	if !ok || len(base.Args) == 0 {
+		return nil, nil
+	}
+	// Input to the base type first, then the explicit length coercion, as PG
+	// coerces to a domain: an over-long bit string is truncated, not rejected.
+	input := *x
+	input.TargetType = base.Name
+	cast := *x
+	cast.Operand = &input
+	cast.TargetType = base.Name
+	cast.SourceType = base.Name
+	cast.Explicit = true
+	cast.Typmod = base.Args[0]
+	switch {
+	case len(base.Args) == 2:
+		cast.Typmod = base.Args[0]<<16 | base.Args[1]
+	case strings.EqualFold(base.Name, "numeric") || strings.EqualFold(base.Name, "decimal"):
+		cast.Typmod = base.Args[0] << 16 // numeric(p) has scale 0
+	}
+	return dom, &cast
 }
 
 // userTypeNameForOID resolves a dynamically-allocated pg_type OID (one goopg

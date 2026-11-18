@@ -3000,21 +3000,15 @@ afterExistsCheck:
 			if err := checkTypeUsage(o.ctx, c.Type.Name); err != nil {
 				return err
 			}
-			typeName := strings.ToLower(c.Type.Name)
-			declaredTypeName := "" // non-empty only when a domain is resolved
-			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-				if resolved := im.ResolveColumnType(typeName); resolved != typeName {
-					declaredTypeName = typeName
-					typeName = resolved
-				}
-			}
+			resolvedType, declaredTypeName := resolveDomainColumnType(o.ctx, catalog.Type{Name: strings.ToLower(c.Type.Name), Args: c.Type.Args})
+			typeName, columnArgs := resolvedType.Name, resolvedType.Args
 			serialTyp := strings.ToLower(c.Type.Name)
 			isSerialCol := serialTyp == "serial" || serialTyp == "serial4" ||
 				serialTyp == "bigserial" || serialTyp == "serial8" ||
 				serialTyp == "smallserial" || serialTyp == "serial2"
 			col := catalog.Column{
 				Name:              c.Name,
-				Type:              catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...), IsArray: c.Type.IsArray},
+				Type:              catalog.Type{Name: typeName, Args: append([]int64(nil), columnArgs...), IsArray: c.Type.IsArray},
 				DeclaredTypeName:  declaredTypeName,
 				NotNull:           c.NotNull || c.IdentityColumn || isSerialCol,
 				GeneratedExpr:     c.GeneratedExpr,
@@ -12393,6 +12387,19 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if err := o.execAlterColumnType(tbl, act, s.Only); err != nil {
 				return err
 			}
+			// pg_attribute is a heap row: the new atttypid / atttypmod must
+			// replace it, as for the other column alterations above.
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					xmax := o.ctx.Tx.XID
+					for _, dbOid := range tableCatalogDBOids(o.ctx) {
+						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+					}
+				}
+				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+					return fmt.Errorf("DDL catalog sync: %w", syncErr)
+				}
+			}
 		case parser.AlterTableDropColumn:
 			if err := o.execAlterDropColumn(tbl, act, s.Only); err != nil {
 				return err
@@ -12802,11 +12809,13 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 				Message: fmt.Sprintf("constraint %q for relation %q already exists", col.NotNullConstraintName, tbl.Name)}
 		}
 	}
+	newColType, newColDeclared := resolveDomainColumnType(o.ctx, colTypeForDefault)
 	newCol := catalog.Column{
-		Name:        col.Name,
-		Type:        colTypeForDefault,
-		NotNull:     col.NotNull,
-		DefaultExpr: col.DefaultExpr,
+		Name:             col.Name,
+		Type:             newColType,
+		DeclaredTypeName: newColDeclared,
+		NotNull:          col.NotNull,
+		DefaultExpr:      col.DefaultExpr,
 	}
 	// "Fast default" backfill (mirrors PostgreSQL's attmissingval): when the
 	// new column has a constant DEFAULT, evaluate it once at ALTER time and
@@ -23565,6 +23574,27 @@ func (o *ddlOp) isUserTypeName(name string) bool {
 	return isKnownUserType(im, base)
 }
 
+// resolveDomainColumnType gives the storage type of a column declared with type
+// t. A domain column is stored as its base type and obeys the domain's typmod
+// (domain_in, coerce_to_domain), with the domain's name kept as the second result
+// for pg_attribute.atttypid. Any other type is returned unchanged.
+func resolveDomainColumnType(ctx *Context, t catalog.Type) (catalog.Type, string) {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return t, ""
+	}
+	name := strings.ToLower(t.Name)
+	resolved := im.ResolveColumnType(name)
+	if resolved == name {
+		return t, ""
+	}
+	t.Name = resolved
+	if base, isDomain := im.DomainBaseType(name, ctx.CurrentDatabaseOid); isDomain && len(t.Args) == 0 {
+		t.Args = append([]int64(nil), base.Args...)
+	}
+	return t, name
+}
+
 // castDomainBase returns the base type name of the domain named name, or ""
 // when name is not a domain (or im is nil).
 func castDomainBase(im *catalog.InMemory, name string) string {
@@ -28705,7 +28735,8 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 	if err := checkTypeUsage(o.ctx, act.NewType.Name); err != nil {
 		return err
 	}
-	newCatalogType := catalog.Type{Name: strings.ToLower(act.NewType.Name), Args: append([]int64(nil), act.NewType.Args...)}
+	declaredCatalogType := catalog.Type{Name: strings.ToLower(act.NewType.Name), Args: append([]int64(nil), act.NewType.Args...)}
+	newCatalogType, newDeclaredType := resolveDomainColumnType(o.ctx, declaredCatalogType)
 
 	// Resolve the USING expression against the OLD column schema BEFORE any
 	// mutation, so ColumnRefs still resolve to old-column positions (PG
@@ -28744,6 +28775,7 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 	// If no storage pool is available, just update the catalog type.
 	if o.ctx.Pool == nil {
 		tbl.Columns[colIdx].Type = newCatalogType
+		tbl.Columns[colIdx].DeclaredTypeName = newDeclaredType
 		return nil
 	}
 
@@ -28756,6 +28788,7 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 	// If the table is empty, just update the catalog — nothing to rewrite.
 	if nBlocks == 0 {
 		tbl.Columns[colIdx].Type = newCatalogType
+		tbl.Columns[colIdx].DeclaredTypeName = newDeclaredType
 		return nil
 	}
 
@@ -28850,6 +28883,15 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 					}
 					break
 				}
+				// A value the new type's typmod rejects (`value too long`) must
+				// fail here: Phase 4 runs after the heap has been truncated, so
+				// an error there would lose every row.
+				if !converted.IsNull() {
+					if _, encErr := encodeValuePGCtx(newCatalogType, converted, o.ctx, 0); encErr != nil {
+						convErr = encErr
+						break
+					}
+				}
 				row[colIdx] = converted
 			}
 			// Deep-copy the row so arena-backed string Datums survive
@@ -28869,6 +28911,7 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 
 	// Phase 2: update the catalog column type.
 	tbl.Columns[colIdx].Type = newCatalogType
+	tbl.Columns[colIdx].DeclaredTypeName = newDeclaredType
 
 	// Phase 3: truncate the heap and all indexes.
 	o.ctx.Pool.InvalidateRel(rel)

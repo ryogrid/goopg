@@ -26268,6 +26268,18 @@ func (c *InMemory) ResolveColumnType(typeName string) string {
 	return typeName
 }
 
+// DomainBaseType follows the domain name down to its non-domain base type and
+// returns that type with the typmod the innermost domain declared, as PG's
+// getBaseTypeAndTypmod does. ok is false when name is not a domain.
+func (c *InMemory) DomainBaseType(name string, dbOid ...uint32) (base Type, ok bool) {
+	d, found := c.LookupDomain(name, dbOid...)
+	for depth := 0; found && depth < 64; depth++ {
+		base, ok = d.Base, true
+		d, found = c.LookupDomain(d.Base.Name, dbOid...)
+	}
+	return base, ok
+}
+
 // resolveColumnTypeLocked is the lock-free recursive helper for ResolveColumnType.
 func (c *InMemory) resolveColumnTypeLocked(typeName string) string {
 	k := strings.ToLower(typeName)

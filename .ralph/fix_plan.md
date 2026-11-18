@@ -1511,6 +1511,7 @@ heuristic stays live.)
     CREATE TABLE does; prove with a two\-restart test per type kind\.
   - Expected instrument: Movement: none — correctness fix — no plan instrument \(the repro matches PG after two
     restarts\)\.
+  - 2026\-11\-18 \(M0149\-0001h1a39\): a domain column now carries the domains typmod on the live catalog; after a restart it is lost with the rest of the columns type, so this reload must also restore `DeclaredTypeName` and the base typmod \(catalog.InMemory.DomainBaseType\).
 - [ ] **P0\-E26 — after a server restart, every composite type is gone from the type registry: field selection
   fails, new columns of it become `text`, `DROP TYPE` says it does not exist** \(filed 2026\-11\-11 by the loop, found
   while probing M0148\-0001j4 item 2; S2 — wrong results and unvalidated data\)\.
@@ -12112,21 +12113,60 @@ verify each at HEAD when the task starts.
     - Residual filed: h1a39, h1a40, h1a41; found while probing: h1a42, h1a43, h1a44.
     - Tests: TestWireFieldDescription, TestExprTypeTypmod.
     Movement: yes — regress create\_view 1189→1148, expressions 48→44, psql 299→297
-- [ ] **M0149-0001h1a39 — WRONG RESULTS: a domain's typmod is dropped, so `varchar(5)` and `numeric(4,1)` domains are not enforced** (filed 2026-11-18 by M0149-0001h1a38; S2)
+- [x] **M0149-0001h1a39 — WRONG RESULTS: a domain's typmod is dropped, so `varchar(5)` and `numeric(4,1)` domains are not enforced** (filed 2026-11-18 by M0149-0001h1a38; S2)
   Kind: impl
   Parent: M0149-0001h1a
   - Repro: `create domain d5 as varchar(5); create domain dn as numeric(4,1); create table td(a d5, b dn);`
-    - `insert into td values ('123456', 1)` succeeds; PG raises `value too long for type character varying(5)`.
-    - `insert into td values ('12345', 123.456)` stores 123.456; PG stores 123.5.
-    - `select 'abcdefg'::d5` returns abcdefg, PG abcde; `select 1.26::dn` returns 1.26, PG 1.3.
-    - RowDescription therefore reports typmod \-1 for such a column; PG reports 9 and 262149 style values.
-  - Cause: execCreateDomain keeps only the base type name \(CreateDomainStmt.BaseType\), and
-    catalog.ResolveColumnType returns a name, so Domain.Base and resolved table columns have no Args.
-  - PG: DefineDomain stores typtypmod; domain\_in and coerce\_to\_domain apply it \(domains.c, parse\_coerce.c\).
-  - Resume: carry the typmod through CreateDomainStmt into Domain.Base.Args, resolve table columns with it,
-    apply it in the domain cast path; pg\_type.typtypmod and pg\_dump's domain text must follow.
-  > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a39: domain length and precision are not enforced
-  > Over\-long values are stored and numeric values are not rounded. Found while comparing RowDescription typmods with PG 18.3.
+    - `insert into td values ('123456', 1)` succeeded; PG raises `value too long for type character varying(5)`.
+    - `insert into td values ('12345', 123.456)` stored 123.456; PG stores 123.5.
+    - `select 'abcdefg'::d5` returned abcdefg, PG abcde; `select 1.26::dn` returned 1.26, PG 1.3.
+  - Cause, corrected from the filing: Domain.Base did keep the typmod, and pg\_type.typtypmod was right. Table
+    columns took only the base type's name, and casts never applied the base typmod.
+  - 2026\-11\-18 \(landed\):
+    - CREATE TABLE, ADD COLUMN and ALTER COLUMN TYPE resolve a domain through resolveDomainColumnType. ADD COLUMN
+      and ALTER COLUMN TYPE did not resolve domains at all before.
+    - A cast to a domain converts to the base type and then applies an explicit length cast
+      \(domainCastWithTypmod\), so it truncates and rounds as PG does.
+    - Data loss fixed on the way: ALTER COLUMN TYPE truncated the heap before a too\-long value failed, leaving
+      the table empty, for plain types too. Values are now encoded before the truncate.
+    - ALTER COLUMN TYPE now replaces the pg\_attribute row, which kept the old type.
+    - Probe against PG 18.3 covers varchar, char, numeric, bit, varbit, interval and domains over domains.
+    - Regress, all 165 failed cases on HEAD and this build, same list: 80405→80371 mismatch lines; polymorphism
+      and plpgsql moved within their known variation \(h1a44\).
+    - Not covered \(ledgered\): after a restart the column reloads as text \(P0\-E25\), so the typmod stops
+      applying until that is fixed; h1a45, h1a46 and h1a47 hold the differences found alongside.
+    - Tests: TestDomainTypmodIsEnforced, TestAlterColumnTypeFailureKeepsRows.
+    Movement: yes — regress alter\_table 697→685, domain 419→404, fast\_default 117→88, replica\_identity 20→14, compression 90→87, identity 320→318
+- [ ] **M0149-0001h1a45 — WRONG RESULTS: `timestamp(p)` is not applied: columns and casts keep all fractional digits** (filed 2026-11-18 by M0149-0001h1a39; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `create table t(ts timestamp(0)); insert into t values ('2020-01-01 00:00:01.6')` stores `00:00:01.6`; PG stores
+    `00:00:02`. `select '2020-01-01 00:00:01.6'::timestamp(0)` shows the same difference. `time(p)` is applied.
+  - PG: AdjustTimestampForTypmod \(timestamp.c\), used by timestamp\_in, timestamp\_scale and timestamptz\_scale.
+  - Resume: the time arm next to it in the CastExpr evaluator \(roundTimeDatumToPrecision\) and the column encoder.
+  > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a45: `timestamp(p)` values are stored and returned unrounded
+  > Stored values differ from PG 18.3. Found while testing domains over timestamp.
+- [ ] **M0149-0001h1a46 — WRONG RESULTS: array elements and CREATE TABLE AS columns ignore their typmod** (filed 2026-11-18 by M0149-0001h1a39; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `create table t(a varchar(5)[]); insert into t values ('{123456}')` succeeds; PG raises value too long. A
+    `d5[]` column behaves the same.
+  - `create table c as select 'abc'::varchar(5) a, 1.26::numeric(4,1) b`, then inserting `'123456'` into a and
+    1.26 into b: goopg accepts and stores them unchanged; PG raises and rounds to 1.3.
+  - Resume: encodeArrayValuePGCtx for element typmods; execCreateTableAs for the column Args.
+  > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a46: declared lengths are not enforced for arrays and CREATE TABLE AS
+  > Over\-long values are stored. Found while testing domain typmods.
+- [ ] **M0149-0001h1a47 — remaining domain differences from PG 18.3** (filed 2026-11-18 by M0149-0001h1a39)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - A cast to a domain over time or timestamp prints as a timestamp with six fractional digits
+    \(`'00:00:01.26'::dtm` is `1970-01-01 00:00:01.300000`, PG `00:00:01.3`\): the output formatter sees the domain
+    name, not the base type.
+  - `length('a'::dc)` for a `char(3)` domain is 3; PG returns 1.
+  - On INSERT the domain's CHECK runs before the typmod, so an over\-long value reports the check; PG reports
+    value too long.
+  - `format_type(oid, typtypmod)` of a domain prints `dn`; PG prints `dn(262149)`.
+  - Resume: exprType for casts to domains needs the catalog; operators\_fk.go's domain check runs before encoding.
 - [ ] **M0149-0001h1a40 — RowDescription sends table OID 0 and column 0 for every field** (filed 2026-11-18 by M0149-0001h1a38)
   Kind: impl
   Parent: M0149-0001h1a
