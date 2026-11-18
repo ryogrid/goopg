@@ -1466,7 +1466,7 @@ heuristic stays live.)
     RegressWedgeProbe\); TestPort\_RegressSuite \+ RegressWedgeProbe PASS\.
   Movement: none — test\-only \(harness port allocation\)\.
 
-- [ ] **M\-NIGHTLY\-race\-parallel\-hash\-cancel — race/internal/executor: TestParallelHashPathModelWinner failed "parallel hash join: build abandoned \(parallel group cancelled\)"** \(AI\-20261115\-011812\-001; repro: `go test \-race \-timeout 45m \./internal/executor/`; evidence: ci/logs/20261115\-011812/race/go\-test\.log\)\.
+- [x] **M\-NIGHTLY\-race\-parallel\-hash\-cancel — race/internal/executor: TestParallelHashPathModelWinner failed "parallel hash join: build abandoned \(parallel group cancelled\)"** \(AI\-20261115\-011812\-001; repro: `go test \-race \-timeout 45m \./internal/executor/`; evidence: ci/logs/20261115\-011812/race/go\-test\.log\)\.
   Kind: impl
   Parent: none
   - Filed 2026\-11\-15 by the loop \(nightly triage\)\. New tonight; the units lane passed the same package\.
@@ -1475,6 +1475,21 @@ heuristic stays live.)
     detector with the host loaded \(load average ~16 during the batch\)\.
   - Resume: rerun under `\-race` in a quiet host; if it reproduces, trace who cancels the parallel group before the
     build finishes \(a worker error or a timeout firing early under race slowdown\)\.
+  - 2026\-11\-18 \(fixed\): a real intermittent query error, not a test artefact, and not a race\-detector finding.
+    - Cause: ParallelGroup.Wait cancels the group context after every worker returned normally, and
+      gatherOp's channel closer calls Wait. A leader reaching the build barrier after that saw `ph.done` and
+      `groupDone` both closed, and parallelHashBuild.wait's select picked one at random.
+    - Two ways in: workers finish the whole query before a slow leader opens its share \(the nightly case\),
+      and a Gather that launched no worker, whose group ends at once \(any zero\-worker Parallel Hash join\).
+    - Reproduced before the fix: the barrier unit test failed on its first wait, and the zero\-worker query
+      failed on run 52 of 64.
+    - Fix: a completed build always wins in wait, which still reports abandoned when the build cannot
+      complete. Same barrier for Gather and Gather Merge.
+    - Found alongside: a genuine abandon reached the client as `build abandoned` instead of the worker's
+      error, because both Gathers returned the leader's Open error as it stood.
+      parallelLeaderOpenError now returns the group's first failure. Pinned at helper level only.
+    - Tests: parallel\_hash\_barrier\_cancel\_test.go.
+    Movement: none — correctness fix — no plan instrument
 
 - [ ] **P0\-E25 — after a server restart, columns of user\-defined types \(enum, composite, domain\) reload as `text`**
   \(filed 2026\-11\-04 by the loop, found while probing M0148\-0001j2; S2 — wrong results and unvalidated data\)\.
