@@ -20,7 +20,7 @@ extremes, which are also PG's values.
 | h1a48a | every unit\-dependent read goes through helpers in `datum.go` | done |
 | h1a48b | switch the unit and epoch, keeping today's accepted range | done |
 | h1a48c | replace `time.Duration` arithmetic that overflows past 292 years | done |
-| h1a48d | BC and long\-year output in every formatter | open |
+| h1a48d | BC and long\-year output in every formatter | done |
 | h1a48e | parse long years, apply PG's bounds and errors, range\-check results, open the gate | open |
 
 The gate opens last, so a value that cannot be handled correctly is never accepted.
@@ -69,10 +69,21 @@ of range` or `interval out of range`.
 An index built before this change holds infinity under its old finite key. Such an index needs
 `REINDEX` if the table contains `infinity` or `\-infinity` in an indexed date or timestamp column.
 
+## Slice h1a48d
+
+The DateStyle formatters take month, day and clock from the value and only the year digits from
+`eraYear`. They used to rebuild a `time.Time` with the display year, which turned a BC leap day into
+March 1. `Datum.Format` and `AppendValueText` print ` BC` instead of a negative year.
+
+`to_char` for dates and times is now a port of `DCH_to_char` and its template parser
+\(`to_char_datetime.go`\), replacing a translation to Go layouts that handled few patterns. A
+timestamptz is broken down in the session zone, and a date is midnight in that zone, because PG
+resolves `to_char(date, text)` to the timestamptz form. Its tests compare with output captured from
+PG 18.3 for every pattern, on BC dates, BC leap days, five\-digit years and ordinary dates.
+
 ## Risks for later slices
 
 These come from reading the code and have not been executed.
 
-- `eraDisplay` rebuilds a date with the display year, which looks wrong for a BC leap day.
 - Dates after 294276 AD, which PG allows up to 5874897 AD, do not fit in microseconds. Slice h1a48e
   has to decide how to treat them.

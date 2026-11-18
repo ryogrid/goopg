@@ -11,8 +11,9 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/utils/adt/datetime"
+	"github.com/goopg/goopg/internal/utils/misc"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 )
 
 // DatumKind discriminates the value carrier in a Datum.
@@ -903,10 +904,25 @@ func (d Datum) AppendValueText(dst []byte) []byte {
 		if d.Int == math.MinInt64 {
 			return append(dst, "-infinity"...)
 		}
-		return d.TimeValue().AppendFormat(dst, "2006-01-02 15:04:05.000000")
+		t := d.TimeValue()
+		if t.Year() <= 0 {
+			return append(dst, formatBCTimeDatum(d, t)...)
+		}
+		return t.AppendFormat(dst, "2006-01-02 15:04:05.000000")
 	}
 	// Fallback for KindInterval / KindNumeric / unknown kinds.
 	return append(dst, d.Format()...)
+}
+
+// formatBCTimeDatum is the type-agnostic text of a value before 1 AD: the usual
+// shape with PG's year digits and era marker. Go would print a negative year.
+func formatBCTimeDatum(d Datum, t time.Time) string {
+	year, era := misc.EraYear(t)
+	if d.TimeSub == TimeSubDate {
+		return fmt.Sprintf("%02d-%02d-%04d%s", int(t.Month()), t.Day(), year, era)
+	}
+	return fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d.%06d%s", year, int(t.Month()), t.Day(),
+		t.Hour(), t.Minute(), t.Second(), t.Nanosecond()/1000, era)
 }
 
 func isTimeOnlyValue(t time.Time) bool {
@@ -983,11 +999,15 @@ func (d Datum) Format() string {
 		if d.Int == math.MinInt64 {
 			return "-infinity"
 		}
+		t := d.TimeValue()
+		if t.Year() <= 0 {
+			return formatBCTimeDatum(d, t)
+		}
 		if d.TimeSub == TimeSubDate {
 			// DATE type: render as Postgres MDY style "MM-DD-YYYY". M0097-0063.
-			return d.TimeValue().Format("01-02-2006")
+			return t.Format("01-02-2006")
 		}
-		return d.TimeValue().Format("2006-01-02 15:04:05.000000")
+		return t.Format("2006-01-02 15:04:05.000000")
 	case KindInterval:
 		return formatInterval(d.IntervalMonthsValue(), d.IntervalDaysValue(), d.IntervalMicrosValue())
 	case KindNumeric:

@@ -12208,10 +12208,17 @@ verify each at HEAD when the task starts.
       plpgsql and polymorphism moved within their known variation.
     - Tests: TestAddMonthsClamped, TestTimeArithmeticBeyondDurationRange, TestPGDaysOfDatum, TestDateBinFollowsTimestampBin.
     Movement: yes — regress timestamp 1594→1580, interval 764→760, timestamptz 2223→2222
-- [ ] **M0149-0001h1a48d — BC and long\-year output in every formatter** (filed 2026-11-18 by M0149-0001h1a48)
+- [x] **M0149-0001h1a48d — BC and long\-year output in every formatter** (filed 2026-11-18 by M0149-0001h1a48)
   Kind: impl
   Parent: M0149-0001h1a48
-  - Datum.Format, AppendValueText and to\_char have no era handling. Check misc.eraDisplay for BC leap days.
+  - 2026\-11\-18 \(landed\):
+    - DateStyle output keeps the value's own month and day, so a BC leap day no longer prints as March 1.
+    - Datum.Format and AppendValueText print ` BC`, not a negative year.
+    - to\_char for dates and times is a port of DCH\_to\_char: every template pattern, FM, TM, TH, quoting, the session
+      zone for timestamptz and for dates.
+    - Tests compare with output captured from PG 18.3 for BC dates, BC leap days, five\-digit years and ordinary dates.
+    - Regress, all 165 failed cases on HEAD and this build, same list: 80383→80111 mismatch lines, none worse.
+    Movement: yes — regress timestamptz 2222→2060, timestamp 1580→1482, horology 2574→2566
 - [ ] **M0149-0001h1a48e — accept PG's full timestamp and date range** (filed 2026-11-18 by M0149-0001h1a48)
   Kind: impl
   Parent: M0149-0001h1a48
@@ -12219,6 +12226,15 @@ verify each at HEAD when the task starts.
     and decoded values; then replace checkTimeCarrierRange's bounds \(copy\_text.go\).
   - Decide how to hold dates past 294276 AD, which PG allows up to 5874897 AD.
   - Afterwards re\-measure regress timestamp and timestamptz, whose column widths depend on these dates.
+- [ ] **M0149-0001h1a53 — WRONG RESULTS: to\_char on numbers truncates instead of rounding; to\_char\(interval\) is not ported** (filed 2026-11-18 by M0149-0001h1a48d; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select to_char(12345.678, '99999.99')` returns ` 12345.67`; PG 18.3 returns ` 12345.68`.
+  - An interval argument reaches toCharNumericFormat, because only KindTime takes the date path. PG formats it with
+    DCH\_to\_char and is\_interval set \(interval\_to\_char, formatting.c\). The output has not been compared yet.
+  - Resume: toCharNumericFormat in expr.go, then an interval dchValue in to\_char\_datetime.go.
+  > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a53: to\_char prints a different number
+  > The formatted value differs from PG 18.3. Found while checking the to\_char port.
 - [ ] **M0149-0001h1a51 — WRONG RESULTS: timestamptz plus an interval ignores the session time zone and loses its type** (filed 2026-11-18 by M0149-0001h1a48c; S2)
   Kind: impl
   Parent: M0149-0001h1a

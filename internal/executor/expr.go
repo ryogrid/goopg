@@ -8250,13 +8250,11 @@ func evalToChar(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, erro
 	if err != nil || fmtArg.IsNull() {
 		return NullDatum, nil
 	}
-	fmtStr := strings.TrimSpace(fmtArg.StringValue())
-	// to_char(timestamp/time, fmt) — time/date formatting.
+	// to_char(timestamp/date/time, fmt): the template is used exactly as written.
 	if srcArg.Kind == KindTime {
-		t := srcArg.TimeValue().UTC()
-		goFmt := pgToCharToGoFormat(fmtStr)
-		return NewStringDatum(t.Format(goFmt)), nil
+		return toCharDatetime(srcArg, fmtArg.StringValue(), ctx), nil
 	}
+	fmtStr := strings.TrimSpace(fmtArg.StringValue())
 	// to_char(numeric, fmt) — number formatting. M0097-0105.
 	return NewStringDatum(toCharNumericFormat(srcArg, fmtStr)), nil
 }
@@ -8919,62 +8917,6 @@ func toCharOrdinalSuffix(n int64) string {
 	default:
 		return "TH"
 	}
-}
-
-func pgToCharToGoFormat(pg string) string {
-	replacer := strings.NewReplacer(
-		"YYYY", "2006",
-		"YYY", "006",
-		"YY", "06",
-		"Y", "6",
-		"IYYY", "2006", // ISO year — approximate
-		"IYY", "006",
-		"IY", "06",
-		"I", "6",
-		"MM", "01",
-		"MON", "Jan",
-		"Mon", "Jan",
-		"mon", "jan",
-		"MONTH", "January",
-		"Month", "January",
-		"month", "january",
-		"DD", "02",
-		"D", "1", // day of week 1=Sun PostgreSQL, Go: Mon=1
-		"DAY", "Monday",
-		"Day", "Monday",
-		"day", "monday",
-		"DY", "Mon",
-		"Dy", "Mon",
-		"dy", "mon",
-		"HH24", "15",
-		"HH12", "03",
-		"HH", "03",
-		"MI", "04",
-		"SS", "05",
-		"MS", "000", // milliseconds
-		"US", "000000", // microseconds
-		"TZ", "UTC", // always UTC in v0
-		"tz", "utc",
-		"TZH", "-07",
-		"TZM", "00",
-		"AM", "PM",
-		"PM", "PM",
-		"am", "pm",
-		"pm", "pm",
-		"A.M.", "PM",
-		"P.M.", "PM",
-		"Q", "", // quarter — not supported in Go format
-		"WW", "", // week of year — not directly supported
-		"IW", "", // ISO week
-		"CC", "", // century
-		"J", "", // Julian day
-		"SSSSS", "", // seconds past midnight
-		"SSSS", "",
-		"Y,YYY", "", // year with comma
-		"OF", "-07:00",
-		"TZO", "-07:00",
-	)
-	return replacer.Replace(pg)
 }
 
 // evalDateTrunc implements date_trunc(field, source) → timestamp.
