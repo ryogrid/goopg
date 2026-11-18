@@ -58,6 +58,9 @@ type dchValue struct {
 	isoYear, isoWeek, isoYearDay                   int
 	zoneName                                       string
 	zoneOffset                                     int
+	// interval marks a value from interval_to_char: fields are as stored, may be
+	// negative, and the year is not adjusted for BC.
+	interval bool
 }
 
 func newDCHValue(t time.Time, zoneName string, zoneOffset int) dchValue {
@@ -80,6 +83,80 @@ func newDCHValue(t time.Time, zoneName string, zoneOffset int) dchValue {
 		julian: int(days) + 2440588, isoYear: isoYear, isoWeek: isoWeek,
 		isoYearDay: (isoWeek-1)*7 + isoWeekday, zoneName: zoneName, zoneOffset: zoneOffset,
 	}
+}
+
+// dchJ2Day is j2day.
+func dchJ2Day(date int) int {
+	date = (date + 1) % 7
+	if date < 0 {
+		date += 7
+	}
+	return date
+}
+
+// dchISOWeekStart is the Julian day of the Monday of ISO week 1 of year.
+func dchISOWeekStart(year int) int {
+	day4 := date2j(year, 1, 4)
+	return day4 - dchJ2Day(day4-1)
+}
+
+// dchISOYearWeek is date2isoyear and date2isoweek. It takes raw fields, because
+// an interval's month and day need not form a calendar date.
+func dchISOYearWeek(year, month, day int) (int, int) {
+	dayn := date2j(year, month, day)
+	start := dchISOWeekStart(year)
+	if dayn < start {
+		year--
+		start = dchISOWeekStart(year)
+	}
+	week := (dayn-start)/7 + 1
+	if week >= 52 {
+		if next := dchISOWeekStart(year + 1); dayn >= next {
+			year++
+			week = (dayn-next)/7 + 1
+		}
+	}
+	return year, week
+}
+
+// newIntervalDCHValue is the field setup of interval_to_char (interval2itm).
+func newIntervalDCHValue(d Datum) dchValue {
+	const usecsPerSecond = int64(1000000)
+	months := int(d.IntervalMonthsValue())
+	micros := d.IntervalMicrosValue()
+	v := dchValue{
+		interval: true,
+		year:     months / 12, month: months % 12, day: int(d.IntervalDaysValue()),
+		hour:   int(micros / (3600 * usecsPerSecond)),
+		minute: int(micros % (3600 * usecsPerSecond) / (60 * usecsPerSecond)),
+		second: int(micros % (60 * usecsPerSecond) / usecsPerSecond),
+		micros: int(micros % usecsPerSecond),
+	}
+	// PG's comment: yday approximates the total span in days.
+	v.yearDay = (v.year*12+v.month)*30 + v.day
+	v.julian = date2j(v.year, v.month, v.day)
+	v.isoYear, v.isoWeek = dchISOYearWeek(v.year, v.month, v.day)
+	v.isoYearDay = v.julian - dchISOWeekStart(v.isoYear) + 1
+	return v
+}
+
+// timeOfDayAsInterval is time_interval.
+func timeOfDayAsInterval(d Datum) Datum {
+	t := d.TimeValue().UTC()
+	hh, mi, ss := t.Clock()
+	micros := (int64(hh)*3600+int64(mi)*60+int64(ss))*1000000 + int64(t.Nanosecond()/1000)
+	return NewIntervalDatumFull(0, 0, micros)
+}
+
+// dchInvalidForInterval lists the patterns under INVALID_FOR_INTERVAL.
+func dchInvalidForInterval(id string) bool {
+	switch id {
+	case "tz", "TZ", "TZH", "TZM", "OF", "A_D", "B_C", "AD", "BC", "a_d", "b_c", "ad", "bc",
+		"MONTH", "Month", "month", "MON", "Mon", "mon",
+		"DAY", "Day", "day", "DY", "Dy", "dy", "D", "ID":
+		return true
+	}
+	return false
 }
 
 // dchDisplayYear is ADJUST_YEAR for a non-interval: BC years count from 1.
@@ -132,6 +209,13 @@ func dchField(id string, s dchSuffix, v dchValue) string {
 		}
 		return fmt.Sprintf("%0*d", width, n)
 	}
+	// signed widens a field by one for its minus sign, as the "%0*d" calls do.
+	signed := func(width, n int) string {
+		if n < 0 {
+			width++
+		}
+		return zero(width, n)
+	}
 	pm := v.hour%24 >= 12
 	pick := func(cond bool, yes, no string) string {
 		if cond {
@@ -139,8 +223,17 @@ func dchField(id string, s dchSuffix, v dchValue) string {
 		}
 		return no
 	}
-	year := dchDisplayYear(v.year)
-	isoYear := dchDisplayYear(v.isoYear)
+	year, isoYear := v.year, v.isoYear
+	if !v.interval {
+		year, isoYear = dchDisplayYear(v.year), dchDisplayYear(v.isoYear)
+	}
+	// The year patterns all take their width from the year itself.
+	yearField := func(width, n int) string {
+		if year < 0 {
+			width++
+		}
+		return zero(width, n)
+	}
 	offset := v.zoneOffset
 	sign := "+"
 	if offset < 0 {
@@ -149,6 +242,10 @@ func dchField(id string, s dchSuffix, v dchValue) string {
 	hour12 := v.hour % 12
 	if hour12 == 0 {
 		hour12 = 12
+	}
+	hourWidth := 2
+	if v.hour < 0 {
+		hourWidth = 3
 	}
 	switch id {
 	case "A_M", "P_M":
@@ -160,13 +257,13 @@ func dchField(id string, s dchSuffix, v dchValue) string {
 	case "am", "pm":
 		return pick(pm, "pm", "am")
 	case "HH", "HH12":
-		return zero(2, hour12)
+		return zero(hourWidth, hour12)
 	case "HH24":
-		return zero(2, v.hour)
+		return zero(hourWidth, v.hour)
 	case "MI":
-		return zero(2, v.minute)
+		return signed(2, v.minute)
 	case "SS":
-		return zero(2, v.second)
+		return signed(2, v.second)
 	case "FF1":
 		return fmt.Sprintf("%01d", v.micros/100000)
 	case "FF2":
@@ -216,7 +313,7 @@ func dchField(id string, s dchSuffix, v dchValue) string {
 	case "mon":
 		return dchName(dchMonths[v.month-1][:3], s, false, true, false)
 	case "MM":
-		return zero(2, v.month)
+		return signed(2, v.month)
 	case "DAY":
 		return dchName(dchDays[v.weekday], s, true, false, true)
 	case "Day":
@@ -247,10 +344,15 @@ func dchField(id string, s dchSuffix, v dchValue) string {
 	case "IW":
 		return zero(2, v.isoWeek)
 	case "Q":
+		if v.month == 0 {
+			return ""
+		}
 		return strconv.Itoa((v.month-1)/3 + 1)
 	case "CC":
 		var century int
-		if v.year > 0 {
+		if v.interval {
+			century = v.year / 100
+		} else if v.year > 0 {
 			century = (v.year-1)/100 + 1
 		} else {
 			century = v.year/100 - 1
@@ -264,25 +366,38 @@ func dchField(id string, s dchSuffix, v dchValue) string {
 		}
 		return strconv.Itoa(century)
 	case "Y_YYY":
-		return fmt.Sprintf("%d,%03d", year/1000, year%1000)
+		return fmt.Sprintf("%d,%03d", year/1000, year-year/1000*1000)
 	case "YYYY":
-		return zero(4, year)
+		return yearField(4, year)
 	case "IYYY":
-		return zero(4, isoYear)
+		return yearField(4, isoYear)
 	case "YYY":
-		return zero(3, year%1000)
+		return yearField(3, year%1000)
 	case "IYY":
-		return zero(3, isoYear%1000)
+		return yearField(3, isoYear%1000)
 	case "YY":
-		return zero(2, year%100)
+		return yearField(2, year%100)
 	case "IY":
-		return zero(2, isoYear%100)
+		return yearField(2, isoYear%100)
 	case "Y":
 		return strconv.Itoa(year % 10)
 	case "I":
 		return strconv.Itoa(isoYear % 10)
 	case "RM", "rm":
-		roman := dchRomanUpper[v.month-1]
+		if v.month == 0 && v.year == 0 {
+			return ""
+		}
+		// A whole number of interval years, or a negative month, still names one.
+		index := v.month - 1
+		switch {
+		case v.month == 0 && v.year >= 0:
+			index = 11
+		case v.month == 0:
+			index = 0
+		case v.month < 0:
+			index = 12 + v.month
+		}
+		roman := dchRomanUpper[index]
 		if id == "rm" {
 			roman = strings.ToLower(roman)
 		}
@@ -310,7 +425,7 @@ func dchNumericField(id string) bool {
 }
 
 // formatDCH is to_char's formatter: it walks the template as parse_format does.
-func formatDCH(format string, v dchValue) string {
+func formatDCH(format string, v dchValue) (string, error) {
 	var out strings.Builder
 	for i := 0; i < len(format); {
 		var s dchSuffix
@@ -347,8 +462,13 @@ func formatDCH(format string, v dchValue) string {
 			case strings.HasPrefix(rest, "SP"):
 				i += 2
 			}
+			if v.interval && dchInvalidForInterval(id) {
+				return "", &ExecError{Code: "22007",
+					Message: "invalid format specification for an interval value",
+					Hint:    "Intervals are not tied to specific calendar dates."}
+			}
 			field := dchField(id, s, v)
-			if (s.thUpper || s.thLower) && dchNumericField(id) {
+			if (s.thUpper || s.thLower) && dchNumericField(id) && field != "" {
 				field += dchNumberSuffix(field, s.thUpper)
 			}
 			out.WriteString(field)
@@ -379,7 +499,31 @@ func formatDCH(format string, v dchValue) string {
 		out.WriteByte(format[i])
 		i++
 	}
-	return out.String()
+	return out.String(), nil
+}
+
+// toCharDatetimeTypeName reports whether a to_char argument of this type is
+// formatted as a date, time or interval, not as a number.
+func toCharDatetimeTypeName(typeName string) bool {
+	switch typeName {
+	case "date", "time", "time without time zone", "timestamp", "timestamp without time zone",
+		"timestamptz", "timestamp with time zone", "interval":
+		return true
+	}
+	return false
+}
+
+// toCharInterval is interval_to_char. The result is NULL for an infinite value or
+// an empty template.
+func toCharInterval(d Datum, format string) (Datum, error) {
+	if format == "" || d.IsIntervalNoEnd() || d.IsIntervalNoBegin() {
+		return NullDatum, nil
+	}
+	text, err := formatDCH(format, newIntervalDCHValue(d))
+	if err != nil {
+		return Datum{}, err
+	}
+	return NewStringDatum(text), nil
 }
 
 // toCharDatetime is timestamp_to_char / timestamptz_to_char. The result is NULL
@@ -387,9 +531,9 @@ func formatDCH(format string, v dchValue) string {
 // session time zone. A date resolves to to_char(timestamptz, text) in PG, so it
 // is midnight in that zone. A timestamp has no zone: TZ prints nothing and the
 // offset is zero.
-func toCharDatetime(d Datum, format string, ctx *Context) Datum {
+func toCharDatetime(d Datum, format string, ctx *Context) (Datum, error) {
 	if format == "" || d.IsTimestampNotFinite() {
-		return NullDatum
+		return NullDatum, nil
 	}
 	t := d.TimeValue()
 	zoneName, zoneOffset := "", 0
@@ -402,5 +546,9 @@ func toCharDatetime(d Datum, format string, ctx *Context) Datum {
 		t = time.Date(y, mo, day, 0, 0, 0, 0, misc.SessionLocation(timeZoneFromCtx(ctx)))
 		zoneName, zoneOffset = t.Zone()
 	}
-	return NewStringDatum(formatDCH(format, newDCHValue(t, zoneName, zoneOffset)))
+	text, err := formatDCH(format, newDCHValue(t, zoneName, zoneOffset))
+	if err != nil {
+		return Datum{}, err
+	}
+	return NewStringDatum(text), nil
 }

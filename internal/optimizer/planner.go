@@ -17287,6 +17287,10 @@ func typeWithCommonTypmod(t catalog.Type, exprs []Expr) catalog.Type {
 	return t
 }
 
+// ExprType is the SQL type of a planned expression, for executor functions whose
+// behaviour depends on the argument type PG resolved.
+func ExprType(e Expr) catalog.Type { return exprType(e) }
+
 func exprType(e Expr) catalog.Type {
 	switch x := e.(type) {
 	case *ColumnRef:

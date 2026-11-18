@@ -244,7 +244,7 @@ func TestToCharMatchesPostgres(t *testing.T) {
 	for _, tc := range dchOracleCases {
 		ts := time.Date(tc.y, time.Month(tc.mo), tc.d, tc.h, tc.mi, tc.s, tc.us*1000, time.UTC)
 		for i, format := range dchOracleFormats {
-			if got := formatDCH(format, newDCHValue(ts, "", 0)); got != tc.toChar[i] {
+			if got, err := formatDCH(format, newDCHValue(ts, "", 0)); err != nil || got != tc.toChar[i] {
 				t.Errorf("%v %q:\n got %q\nwant %q", ts, format, got, tc.toChar[i])
 			}
 		}
@@ -292,7 +292,7 @@ func TestToCharDateUsesSessionZone(t *testing.T) {
 		}
 		return "", false
 	}}
-	got := toCharDatetime(d, "YYYY-MM-DD HH24 TZ OF", ctx)
+	got, _ := toCharDatetime(d, "YYYY-MM-DD HH24 TZ OF", ctx)
 	if want := "2020-07-05 00 EDT -04"; got.StringValue() != want {
 		t.Errorf("to_char(date) = %q, want %q", got.StringValue(), want)
 	}

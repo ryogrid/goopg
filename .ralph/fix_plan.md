@@ -12237,13 +12237,21 @@ verify each at HEAD when the task starts.
     - Regress, all 165 failed cases on HEAD and this build: 80106→79870 mismatch lines. polymorphism +2 is the known
       flake \(`column "x" does not exist`, seen in plpgsql on the other build\).
     Movement: yes — regress date 405→294, horology 2566→2517, timestamp 1482→1441, timestamptz 2060→2030
-- [ ] **M0149-0001h1a53 — WRONG RESULTS: to\_char on numbers truncates instead of rounding; to\_char\(interval\) is not ported** (filed 2026-11-18 by M0149-0001h1a48d; S2)
+- [x] **M0149-0001h1a53 — WRONG RESULTS: to\_char on numbers truncates instead of rounding; to\_char\(interval\) is not ported** (filed 2026-11-18 by M0149-0001h1a48d; S2)
   Kind: impl
   Parent: M0149-0001h1a
   - `select to_char(12345.678, '99999.99')` returns ` 12345.67`; PG 18.3 returns ` 12345.68`.
   - An interval argument reaches toCharNumericFormat, because only KindTime takes the date path. PG formats it with
     DCH\_to\_char and is\_interval set \(interval\_to\_char, formatting.c\). The output has not been compared yet.
   - Resume: toCharNumericFormat in expr.go, then an interval dchValue in to\_char\_datetime.go.
+  - 2026\-11\-18 \(landed\):
+    - to\_char for numbers is a port of NUM\_processor and the int4, int8, float4, float8 and numeric entry points, with
+      PG's template errors. The argument's SQL type selects the entry point; int2 resolves to float8.
+    - to\_char\(interval\) and to\_char\(time\) use the date formatter with interval rules.
+    - An error in an argument is raised, not turned into NULL.
+    - About 7,800 statements give the same output and errors as PG 18.3; a sample is kept as a test.
+    - Regress, all 165 failed cases on HEAD and this build: 79879→79726 mismatch lines, none worse.
+    Movement: yes — regress numeric 1139→995, timestamp 1441→1438, timestamptz 2030→2027
   > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a53: to\_char prints a different number
   > The formatted value differs from PG 18.3. Found while checking the to\_char port.
 - [ ] **M0149-0001h1a51 — WRONG RESULTS: timestamptz plus an interval ignores the session time zone and loses its type** (filed 2026-11-18 by M0149-0001h1a48c; S2)
@@ -12256,6 +12264,15 @@ verify each at HEAD when the task starts.
   - Resume: addTimeInterval in expr.go needs the session zone and must keep TimeSubTimestampTZ; exprType for the result.
   > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a51: timestamptz arithmetic gives a different instant across DST
   > The returned instant differs from PG 18.3. Found while porting month arithmetic.
+- [ ] **M0149-0001h1a57 — WRONG RESULTS: later rows of a VALUES list keep their literal text instead of the column type** (filed 2026-11-18 by M0149-0001h1a53; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `with v(x) as (values ('0'::numeric),('4.2e9')) select x from v` prints `4.2e9`; PG 18.3 prints `4200000000`.
+  - `select d + interval '1 day' from (values ('2018-11-02'::timestamp),('2019-01-01')) v(d)` fails with `operator + requires
+    integer operands`. pg\_typeof reports the right type, so the column is typed but the values are not converted.
+  - Resume: coerce each VALUES cell to the column type that transformValuesClause resolves \(select\_common\_type\).
+  > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a57: VALUES rows are not converted to the column type
+  > Values print and compare as text. Found while checking to\_char in regress numeric and timestamp.
 - [ ] **M0149-0001h1a56 — most PG date and timestamp input spellings are rejected** (filed 2026-11-18 by M0149-0001h1a48e)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12277,6 +12294,11 @@ verify each at HEAD when the task starts.
   - `'294276-12-31'::date + 1` and `date '294277-01-01'` fail with `date out of range`. PG accepts dates up to 5874897 AD.
   - Cause: KindDate shares the KindTime carrier, microseconds since 2000, which ends at 294277 AD.
   - Resume: hold a date as PG's day count, then the formatter, comparison, arithmetic and codec paths.
+- [ ] **M0149-0001h1a58 — to\_char ignores lc\_numeric and lc\_monetary** (filed 2026-11-18 by M0149-0001h1a53)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `L`, `G`, `D` and `S` print the C locale's values. PG takes them from localeconv \(NUM\_prepare\_locale, PGLC\_localeconv\).
+  - Resume: numProcess in internal/executor/to\_char\_number.go.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a
