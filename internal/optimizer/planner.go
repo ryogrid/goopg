@@ -16738,6 +16738,12 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 			return innerName, exprType(e)
 		}
 		if cast.TargetType != "" {
+			// Quoted "char" (OID 18) carries no typmod; bare CHAR always
+			// does (parser-synthesised length 1) and is named bpchar.
+			// Sibling of parser.figureColnameInternal's CastExpr case.
+			if cast.TargetType == "char" && cast.Typmod == 0 {
+				return "char", exprType(e)
+			}
 			// Use PostgreSQL's canonical short type names for column labels.
 			label := castTargetLabel(cast.TargetType)
 			return label, exprType(e)

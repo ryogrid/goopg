@@ -21,6 +21,12 @@ func TestCastChainColumnName(t *testing.T) {
 		"select member::text from t":          "member",
 		"select 'x'::text::varchar from t":    "varchar",
 		"select now()::date::text from t":     "now",
+		// Quoted "char" is the one-byte type (column char); bare CHAR is
+		// bpchar (regress char.sql).
+		`select 'a'::"char" from t`:         "char",
+		`select cast('a' as "char") from t`: "char",
+		"select 'a'::char from t":           "bpchar",
+		"select 'a'::char(3) from t":        "bpchar",
 	}
 	for q, want := range cases {
 		stmts, err := parser.Parse(q)

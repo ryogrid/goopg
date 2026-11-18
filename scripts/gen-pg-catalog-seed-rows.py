@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate internal/catalog/pg_catalog_seed_rows_generated.go
 (M0149-0001h1a20): the built-in rows a PostgreSQL 18.3 initdb holds in
-pg_cast, pg_opfamily, pg_opclass, pg_amop, pg_amproc, pg_conversion and pg_range
-(h1a22), rendered as each
+pg_cast, pg_opfamily, pg_opclass, pg_amop, pg_amproc, pg_conversion, pg_range
+(h1a22) and pg_class (h1a35), rendered as each
 virtual view's text cells in its column order (catalog.go). SQL NULL is
 catalog.VirtualNull, booleans 't' / 'f', regproc columns numeric OIDs.
 Also format_type(oid, NULL) for every pg_catalog type (M0149-0001h1a21).
@@ -31,12 +31,27 @@ TABLES = [
                                                "contoencoding", "conproc", "condefault"]),
     ("seedPgRangeRows", "pg_range", ["rngtypid", "rngsubtype", "rngmultitypid", "rngcollation", "rngsubopc",
                                      "rngcanonical", "rngsubdiff"]),
+    # h1a35: every system relation's pg_class row, in the 34-column order of
+    # PGClassRowsForDBOid (bool 't'/'f', NULL relacl / reloptions /
+    # relpartbound as "", as that builder renders them).
+    ("seedPgClassRows", "pg_class", ["oid", "relname", "relnamespace", "reltype", "reloftype", "relowner", "relam",
+                                     "relfilenode", "reltablespace", "relpages", "reltuples", "relallvisible",
+                                     "relallfrozen", "reltoastrelid", "relhasindex", "relisshared",
+                                     "relpersistence", "relkind", "relnatts", "relchecks", "relhasrules",
+                                     "relhastriggers", "relhassubclass", "relrowsecurity", "relforcerowsecurity",
+                                     "relispopulated", "relreplident", "relispartition", "relrewrite",
+                                     "relfrozenxid", "relminmxid", "relacl", "reloptions", "relpartbound"]),
 ]
 # Key column per table (pg_range has no oid); default "oid".
 KEY = {"pg_range": "rngtypid"}
 SPECIAL = {"opcdefault": "case when opcdefault then 't' else 'f' end", "amproc": "amproc::oid::int8::text",
            "conproc": "conproc::oid::int8::text", "condefault": "case when condefault then 't' else 'f' end",
            "rngcanonical": "rngcanonical::oid::int8::text", "rngsubdiff": "rngsubdiff::oid::int8::text"}
+for _b in ("relhasindex", "relisshared", "relhasrules", "relhastriggers", "relhassubclass", "relrowsecurity",
+           "relforcerowsecurity", "relispopulated", "relispartition"):
+    SPECIAL[_b] = "case when %s then 't' else 'f' end" % _b
+for _n in ("relacl", "reloptions", "relpartbound"):
+    SPECIAL[_n] = "coalesce(%s::text, '')" % _n
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 bindir = os.path.join(root, "postgres", "local_install", "bin")

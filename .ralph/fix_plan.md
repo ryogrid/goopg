@@ -12596,6 +12596,29 @@ verify each at HEAD when the task starts.
       TestCompositeTypeRelationIsVisible; TestDropTableIfExistsMissingNoSideEffects
       now expects the next table at OID \+3.
     Movement: regress alter_table 717→697
+- [ ] **M0149-0001h1a37 — WRONG TYPE: schema\-qualified `pg_catalog."char"` resolves to character\(1\), not the one\-byte `"char"`** \(filed 2026-11-18 by M0149-0001h1a35; S2\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Repro on goopg vs PG 18.3:
+    - `pg_typeof('a'::pg_catalog."char")` is `character`; PG says `"char"`.
+      `pg_catalog.char` \(unquoted\) and `cast('a' as pg_catalog."char")` do
+      the same. `"pg_catalog"."char"` and bare `"char"` are right.
+    - `octet_length('é'::pg_catalog."char"::text)` is 2; PG returns 4.
+    - `create table t(c pg_catalog."char")` stores atttypid character with
+      atttypmod 5; PG stores `"char"` with \-1.
+    - The column label is also wrong: `bpchar`, PG `char`.
+  - Cause: parser/select.go synthesizeBareCharTypmod's two callers pass
+    `firstTok.Kind == TokenQuotedIdent`. For a qualified name the first token
+    is the schema, so the quoted type name counts as the bare CHAR keyword and
+    gets typmod 1.
+  - PG: gram.y maps only the keyword CHAR to SystemTypeName\("bpchar"\); any
+    qualified name goes through GenericType and looks up pg\_type.char.
+  - Resume: apply the synthesised typmod only to an unqualified, unquoted
+    name \(both callers, plus parseColumnType's sibling path for column
+    definitions\); then parser.figureColnameInternal's and the planner's
+    `"char"` tests cover the qualified form.
+  > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a37: `pg_catalog."char"` is treated as character\(1\)
+  > Wrong type and wrong values for casts and for columns declared with the qualified name. Found while verifying h1a35's column\-label fix against PG 18.3. Owner placement requested \(below item 10 per the S7 carve\-out unless placed\).
 - [ ] **M0149-0001h1a36 — relation rowtype residue: RENAME / SET SCHEMA / OWNER leave the rowtype rows stale; TOAST relations and view rules take no OIDs; pg\_typeof\(whole row\) is text** \(filed 2026-11-18 by M0149-0001h1a34\)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12611,7 +12634,7 @@ verify each at HEAD when the task starts.
   - Resume: re\-write the rowtype rows in the rename / set\-schema / owner
     paths \(deleteRelationRowtypeFromCatalogHeap \+ the two builders\); the
     planner's whole\-row Var type.
-- [ ] **M0149-0001h1a35 — the virtual pg\_class lists 11 system relations; PG 18.3 lists 415** \(filed 2026-11-18 by M0149-0001h1a34\)
+- [x] **M0149-0001h1a35 — the virtual pg\_class lists 11 system relations; PG 18.3 lists 415** \(filed 2026-11-18 by M0149-0001h1a34\)
   Kind: impl
   Parent: M0149-0001h1a
   - Probe: `select count(*) from pg_class where oid < 16384` is 11 on goopg
@@ -12624,6 +12647,33 @@ verify each at HEAD when the task starts.
   - Resume: catalog.go's virtual pg\_class renderer; the captured relation
     list initdb already has \(pgBootstrapRelNameByOID, relcache\_init.go, the
     system view OID pins\) as the row source.
+  - 2026-11-18 \(landed\): pg\_class lists all 415 system relations, identical to PG 18.3.
+    - gen\-pg\-catalog\-seed\-rows.py captures the 415 rows as seedPgClassRows
+      \(34 columns in PGClassRowsForDBOid's order\); the builder appends the
+      ones it did not produce and replaces its bootstrap facsimiles of the 11
+      live ones \(relhasindex, relisshared, index namespace and relnatts were
+      wrong\), keeping a live non\-empty relacl.
+    - Probe: a 17\-column diff of `pg_class where oid < 16384` vs the oracle
+      is empty \(415 = 415 rows\).
+    - Regress, same 24\-case list on HEAD and this build: psql 306→299,
+      misc\_sanity 7→2, privileges 553→543 \(inventory updated\); no case
+      worse. Five cases sit above their pins on both builds \(case\-order
+      effects of a multi\-case run\).
+    - Test: TestPGClassListsEverySystemRelation.
+    - Not covered \(ledgered\): pg\_attribute / pg\_index rows for most system
+      relations \(psql `\d pg_namespace` lists no columns\); the captured
+      relpages / reltuples / relfrozenxid are the initdb's.
+    - pg\_amcheck walks pg\_class, so it now reaches captured relations with
+      no goopg storage: verify\_heapam and bt\_index\_check report no findings
+      for them \(catalog.IsCapturedSystemRelation; ledgered, PG really checks
+      those relations\).
+    - The full TestPort\_ run exposed an older must\-pass failure, regress
+      `char`: a cast to quoted `"char"` was named `bpchar` \(same at HEAD\).
+      Fixed in both namers, parser.figureColnameInternal and the planner's
+      targetMeta; the schema\-qualified spelling is filed as h1a37.
+    - Re\-measured on the committed build: psql 299/6452, misc\_sanity 2/93,
+      privileges 543/3144, char PASS.
+    Movement: regress psql 306→299, misc_sanity 7→2, privileges 553→543
 - [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

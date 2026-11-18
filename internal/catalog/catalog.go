@@ -8770,6 +8770,32 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		"",         // 32: reloptions (NULL)
 		"",         // 33: relpartbound
 	})
+	// Every system relation as a PG 18.3 initdb lists it (catalogs, their
+	// indexes and TOAST tables, system views). goopg models a few of them as
+	// live objects whose rows above are bootstrap facsimiles (relhasindex,
+	// relisshared, an index's namespace and relnatts were wrong), so the
+	// captured row replaces them; a live relacl is kept, as a GRANT on a
+	// system catalog changes it. M0149-0001h1a35.
+	seedIdx := make(map[string]int, len(seedPgClassRows))
+	for i, r := range seedPgClassRows {
+		seedIdx[r[0]] = i
+	}
+	have := make(map[string]bool, len(out))
+	for i, r := range out {
+		have[r[0]] = true
+		if si, ok := seedIdx[r[0]]; ok {
+			row := append([]string(nil), seedPgClassRows[si]...)
+			if r[31] != "" {
+				row[31] = r[31]
+			}
+			out[i] = row
+		}
+	}
+	for _, r := range seedPgClassRows {
+		if !have[r[0]] {
+			out = append(out, append([]string(nil), r...))
+		}
+	}
 	return out
 }
 

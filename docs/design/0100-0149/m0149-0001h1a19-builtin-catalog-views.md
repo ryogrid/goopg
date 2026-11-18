@@ -131,3 +131,35 @@ is empty for all 3413 built-ins.
   \(regress alter\_table 717→775\); fixed in h1a34 \(now 697\).
 - **Known gap.** goopg's virtual pg\_class lists only 11 system relations,
   where PG lists 415 (filed M0149-0001h1a35).
+
+## System relations in pg\_class (h1a35)
+
+`scripts/gen-pg-catalog-seed-rows.py` captures every pg\_class row a PG 18.3
+initdb holds below OID 16384 (415: catalogs, their indexes and TOAST tables,
+system views) as `seedPgClassRows`, in `PGClassRowsForDBOid`'s 34\-column order
+\(booleans `t` / `f`; NULL relacl / reloptions / relpartbound as `""`\). The
+builder appends every captured row it did not produce itself, and for the few
+system relations goopg models live it replaces the bootstrap facsimile with the
+captured row \(relhasindex, relisshared, an index's namespace and relnatts were
+wrong\), keeping a non\-empty live relacl so a GRANT on a system catalog still
+shows. A 17\-column diff of `pg_class where oid < 16384` against the oracle is
+empty.
+
+Listing a relation no longer implies goopg can open it. pg\_amcheck walks
+pg\_class, so `verify_heapam` and `bt_index_check` now receive OIDs with no goopg
+heap or index behind them; `catalog.IsCapturedSystemRelation` identifies those
+and both functions report no findings, where PG reads the real relation.
+
+Not covered: relpages / reltuples / relfrozenxid of the captured rows are the
+initdb's, not goopg's own, and pg\_attribute / pg\_index still lack most system
+relations' rows \(psql `\d pg_namespace` lists no columns\).
+
+### Column label of a cast to `"char"`
+
+The grammar folds quoted `"char"` and the keyword `CHAR` into the type name
+`char`; only the keyword gets a synthesised length\-1 typmod. Both column
+namers use that difference: `parser.figureColnameInternal` \(no typmods\) and
+the planner's `targetMeta` \(`Typmod == 0`\) answer `char`, and the keyword stays
+`bpchar`, as in PG's FigureColname. The typmod synthesis misreads
+schema\-qualified names, so `pg_catalog."char"` is still character\(1\) \(filed
+M0149\-0001h1a37\).

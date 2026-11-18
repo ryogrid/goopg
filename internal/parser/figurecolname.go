@@ -36,6 +36,13 @@ func figureColnameInternal(e Expr) (string, int) {
 	case *CastExpr:
 		name, strength := figureColnameInternal(x.Operand)
 		if strength <= 1 && x.Type.Name != "" {
+			// Quoted "char" is the one-byte type, named char; the bare
+			// keyword CHAR is SystemTypeName("bpchar"). The grammar folds
+			// both into Name "char" and tells them apart only by the bare
+			// keyword's implicit length-1 typmod (typmodsFor).
+			if x.Type.Schema == "" && x.Type.Name == "char" && len(x.Typmods) == 0 {
+				return "char", 1
+			}
 			return systemTypeColname(x.Type), 1
 		}
 		return name, strength

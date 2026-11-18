@@ -14,6 +14,7 @@ func TestFigureIndexColname(t *testing.T) {
 		{"abs(b), lower(a), (a::int)", "abs lower a"},
 		{"(1::int), (1::integer), (1::bigint), (1::double precision), (1::varchar(3)), (1::boolean)", "int4 int4 int8 float8 varchar bool"},
 		{"(1::real), (1::numeric(3,1)), (1::char(2)), (1::timestamptz), (1::int4), (1::float)", "float4 numeric bpchar timestamptz int4 float8"},
+		{"('a'::\"char\"), ('a'::char), (cast('a' as \"char\")), ('a'::character)", "char bpchar char bpchar"},
 		{"coalesce(a,b), nullif(a,b), greatest(a,b), (current_date), (case when a then 1 end), (case when a then 1 else b end)", "coalesce nullif greatest current_date case b"},
 		{"(a + b), (row(a,b)), (array[a]), (a collate \"C\")", " row array a"},
 	} {
