@@ -3807,16 +3807,9 @@ func (s *Server) executeOneSimpleStmt(w *libpq.FrameWriter, ctx *executor.Contex
 	if schema != nil {
 		fields := make([]libpq.FieldDescription, len(schema))
 		for i, sc := range schema {
-			oid := typeOIDFor(sc.Type)
-			// Array column (e.g. `p int4[]`): advertise the array pg_type OID
-			// (_int4 = 1007) so the client parses the "{1,2}" text as an array
-			// rather than a scalar int4. M0118-0002.
-			if sc.Type.IsArray {
-				oid = catalog.ArrayOIDForBase(oid)
-			}
 			fields[i] = libpq.FieldDescription{
 				Name:         sc.Name,
-				TypeOID:      oid,
+				TypeOID:      wireTypeOID(ctx.Catalog, ctx.CurrentDatabaseOid, sc.Type),
 				TypeSize:     -1,
 				TypeModifier: -1,
 				Format:       0,
@@ -4596,9 +4589,9 @@ func appendTimeTZOffset(dst []byte, offsetSecs int) []byte {
 	return dst
 }
 
-// typeOIDFor maps a goopg type name to a pg_type.oid the wire
-// protocol can advertise. Unknown types fall back to text (25),
-// which is wire-compatible with libpq's text-format reader.
+// typeOIDFor maps a built-in goopg type name to the pg_type.oid the wire
+// protocol advertises. A name no built-in type carries falls back to text
+// (25); wireTypeOID resolves those against the user-defined types first.
 func typeOIDFor(t catalog.Type) uint32 {
 	switch strings.ToLower(t.Name) {
 	case "int2", "smallint", "smallserial":
@@ -4660,7 +4653,7 @@ func typeOIDFor(t catalog.Type) uint32 {
 		// `<name>::regtype` casts. M0122-0005 pg_typeof()::oid follow-up.
 		return catalog.OIDRegtype
 	}
-	return 25
+	return builtinWireTypeOID(strings.ToLower(t.Name))
 }
 
 // executeFetch executes or resumes a cursor fetch. It materialises the cursor's
@@ -4679,16 +4672,9 @@ func (s *Server) executeFetch(_ context.Context, w *libpq.FrameWriter, ectx *exe
 	if schema != nil {
 		fields := make([]libpq.FieldDescription, len(schema))
 		for i, sc := range schema {
-			oid := typeOIDFor(sc.Type)
-			// Array column (e.g. `p int4[]`): advertise the array pg_type OID
-			// (_int4 = 1007) so the client parses the "{1,2}" text as an array
-			// rather than a scalar int4. M0118-0002.
-			if sc.Type.IsArray {
-				oid = catalog.ArrayOIDForBase(oid)
-			}
 			fields[i] = libpq.FieldDescription{
 				Name:         sc.Name,
-				TypeOID:      oid,
+				TypeOID:      wireTypeOID(ectx.Catalog, ectx.CurrentDatabaseOid, sc.Type),
 				TypeSize:     -1,
 				TypeModifier: -1,
 				Format:       0,

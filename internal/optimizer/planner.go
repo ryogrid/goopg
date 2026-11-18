@@ -17709,6 +17709,25 @@ func exprType(e Expr) catalog.Type {
 		case "bt_index_check", "bt_index_parent_check":
 			// amcheck verification functions RETURN void (slice S4 of 0110-0008).
 			return catalog.Type{Name: "void"}
+		case "pg_sleep", "pg_sleep_for", "pg_sleep_until",
+			"pg_advisory_lock", "pg_advisory_lock_shared", "pg_advisory_unlock_all",
+			"pg_advisory_xact_lock", "pg_advisory_xact_lock_shared",
+			"pg_notify", "setseed", "brin_desummarize_range",
+			"pg_stat_clear_snapshot", "pg_stat_force_next_flush", "pg_stat_reset",
+			"pg_stat_reset_backend_stats", "pg_stat_reset_replication_slot",
+			"pg_stat_reset_shared", "pg_stat_reset_single_function_counters",
+			"pg_stat_reset_single_table_counters", "pg_stat_reset_slru",
+			"pg_stat_reset_subscription_stats",
+			"pg_drop_replication_slot", "pg_sync_replication_slots",
+			"pg_replication_origin_advance", "pg_replication_origin_drop",
+			"pg_replication_origin_session_reset", "pg_replication_origin_session_setup",
+			"pg_replication_origin_xact_reset", "pg_replication_origin_xact_setup",
+			"pg_wal_replay_pause", "pg_wal_replay_resume",
+			"pg_clear_attribute_stats", "pg_clear_relation_stats",
+			"pg_extension_config_dump":
+			// Every pg_proc overload of these returns void, so RowDescription
+			// reports void (M0149-0001h1a3).
+			return catalog.Type{Name: "void"}
 		case "pg_my_temp_schema":
 			// Returns the OID of the session's temporary namespace (0 if none).
 			// M0118-0009 (temp-schema-cleanup).

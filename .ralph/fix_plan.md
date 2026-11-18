@@ -12063,7 +12063,7 @@ verify each at HEAD when the task starts.
       PG\_ABS\_BUILDDIR\); opr\_sanity 733→717. A/B against HEAD over 15
       cases: no other movement \(alter\_generic ±2, a known flaky case\).
     Movement: regress largeobject 35→0, opr\_sanity 733→717
-- [ ] **M0149-0001h1a3 — the wire RowDescription advertises bytea, void and every other type typeOIDFor does not list as text \(OID 25\)** \(filed 2026-11-17 by M0149-0001h1a\)
+- [x] **M0149-0001h1a3 — the wire RowDescription advertises bytea, void and every other type typeOIDFor does not list as text \(OID 25\)** \(filed 2026-11-17 by M0149-0001h1a\)
   Kind: impl
   Parent: M0149-0001h1a
   - Repro: `create table tb\(b bytea\); select b from tb \\gdesc` → text
@@ -12076,6 +12076,39 @@ verify each at HEAD when the task starts.
     \(printtup.c SendRowDescriptionMessage\).
   - > **ESCALATION \(S2, wrong results for binary\-format clients\):** filed
     here; owner to place.
+  - 2026\-11\-18 \(landed\): RowDescription carries the column's real pg\_type OID on every path.
+    - Selected in M0149 depth\-first order; the entry's S2 note asked for placement, and the banner's item 10
+      rule already reaches this task.
+    - internal/postmaster/wire\_type\_oid.go: wireTypeOID resolves built\-ins \(typeOIDFor, TypeNameToOID, captured
+      format\_type names\), arrays, and the connection database's enums, domains \(sent as their base type,
+      printtup.c\), composites, ranges, multiranges and relation rowtypes.
+    - Simple query, FETCH, extended Execute and Describe share it. The two extended paths had also dropped
+      IsArray, reporting an array column as its element type.
+    - Functions whose every overload returns void are typed void in exprType.
+    - Client impact is narrower than the entry says: Bind refuses binary result formats \(0A000\), so no client
+      can receive binary values under a wrong OID.
+    - Probe: a protocol client compared reported types with PG 18.3 for about 60 table column types and expressions;
+      the remaining differences are planner or catalog\-stub types, filed as h1a38.
+    - Regress, all 165 failed cases on HEAD and this build, same list: 80454→80425 mismatch lines, 5 better,
+      alter\_generic \+1 from tied\-row order \(a known flaky case\). Inventory re\-measured for the moved cases.
+    - Tests: TestWireTypeOID, TestExprTypeWireTypeOID.
+    Movement: yes — regress groupingsets 468→454, domain 431→419, xid 212→211
+- [ ] **M0149-0001h1a38 — RowDescription residue: result types the planner and catalog stubs get wrong; typlen, typmod and source column are not sent** (filed 2026-11-18 by M0149-0001h1a3)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Compared with PG 18.3 through a protocol client, after h1a3:
+    - `select wt from wt` is record; PG sends the table's rowtype.
+    - A `wdom[]` column is `integer[]`; PG sends the domain's array type.
+    - `current_user` and `current_schema()` are text; PG sends name.
+    - `generate_series(1,1)` is bigint; PG sends integer.
+    - `now()` is timestamp, already filed as M0146\-0163.
+    - Catalog stubs differ from PG: pg\_proc.proname and provolatile are text, pg\_attribute.attoptions,
+      attfdwoptions and attmissingval are text, and other catalogs have similar gaps.
+  - `order by` and `distinct` on a void column succeed; PG raises 42883.
+  - Every field sends TypeSize \-1, TypeModifier \-1, table OID 0 and column 0. PG sends typlen, atttypmod and
+    the source table and attribute \(printtup.c SendRowDescriptionMessage\), so psql `\gdesc` shows no
+    `varchar(3)` length.
+  - Resume: internal/postmaster/wire\_type\_oid.go for the field values; optimizer exprType for the expression types.
 - [x] **M0149-0001h1a12 — `'name'::regrole` returned the text unresolved; to\_regrole and the other to\_reg\* functions did not exist; `col::a::b` was labelled with the type name** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

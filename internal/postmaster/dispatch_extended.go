@@ -547,7 +547,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 		for i, sc := range schema {
 			res.Fields[i] = libpq.FieldDescription{
 				Name:         sc.Name,
-				TypeOID:      typeOIDFor(sc.Type),
+				TypeOID:      wireTypeOID(s.cfg.Catalog, connDBOid, sc.Type),
 				TypeSize:     -1,
 				TypeModifier: -1,
 				Format:       0,

@@ -786,7 +786,7 @@ func (s *Server) describeViaPlanner(query string, sess *misc.SessionRegistry, db
 	for i, sc := range schema {
 		fields[i] = libpq.FieldDescription{
 			Name:         sc.Name,
-			TypeOID:      typeOIDFor(sc.Type),
+			TypeOID:      wireTypeOID(s.cfg.Catalog, connDBOid, sc.Type),
 			TypeSize:     -1,
 			TypeModifier: -1,
 			Format:       0,

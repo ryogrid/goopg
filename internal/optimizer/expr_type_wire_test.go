@@ -21,6 +21,9 @@ func TestExprTypeWireTypeOID(t *testing.T) {
 		{"crc32('abc'::bytea)", "int8"},
 		{"crc32c('abc'::bytea)", "int8"},
 		{"bit_count('abc'::bytea)", "int8"},
+		{"pg_sleep(0)", "void"},
+		{"pg_advisory_lock(1)", "void"},
+		{"pg_notify('c', 'p')", "void"},
 	} {
 		t.Run(tc.sql, func(t *testing.T) {
 			got := exprType(resolveForTest(t, tc.sql))
