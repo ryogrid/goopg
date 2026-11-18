@@ -5017,8 +5017,7 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		return floatInDatumOrErr(x.Value, bits, x.Pos())
 
 	case "numeric", "decimal":
-		// Return as string — goopg v0 stores numerics as text.
-		return NewStringDatum(strings.TrimSpace(x.Value)), nil
+		return evalCast(NewStringDatum(x.Value), "numeric", x.Pos(), ctx)
 
 	case "text", "bpchar", "char", "varchar":
 		return NewStringDatum(x.Value), nil
@@ -6784,14 +6783,13 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			if strings.EqualFold(s, "-inf") || strings.EqualFold(s, "-infinity") {
 				return NewStringDatum("-Infinity"), nil
 			}
-			_, _, err := parseNumeric(s)
+			mantissa, scale, err := parseNumeric(s)
 			if err != nil {
 				return Datum{}, &ExecError{Code: "22P02", Pos: pos,
 					Message: fmt.Sprintf("invalid input syntax for type numeric: %q", d.StringValue())}
 			}
-			// Re-use the string datum rather than allocating a big.Int when fast
-			// path would suffice; the string form is already the canonical form.
-			return d, nil
+			// numeric_in's value, so '4.2e9' prints as 4200000000.
+			return newNumeric(mantissa, int(scale)), nil
 		default:
 			return Datum{}, &ExecError{Code: "22P02", Pos: pos,
 				Message: fmt.Sprintf("cannot cast type %v to numeric", d.Kind)}
@@ -8386,12 +8384,6 @@ func evalToChar(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, erro
 	}
 	format := fmtArg.StringValue()
 	typeName := strings.ToLower(optimizer.ExprType(x.Args[0]).Name)
-	if srcArg.Kind == KindString && toCharDatetimeTypeName(typeName) {
-		// Later rows of a VALUES list reach here still as text.
-		if srcArg, err = evalCastTyped(srcArg, typeName, "text", x.Pos(), ctx); err != nil {
-			return Datum{}, err
-		}
-	}
 	switch {
 	case srcArg.Kind == KindInterval:
 		return toCharInterval(srcArg, format)

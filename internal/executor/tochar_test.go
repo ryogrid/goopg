@@ -59,3 +59,14 @@ func TestToCharNumericFormat(t *testing.T) {
 		}
 	}
 }
+
+// TestNumericCastHoldsTheValue pins numeric_in: the cast yields the number, so an
+// exponent is gone from its text and trailing fractional zeros stay.
+func TestNumericCastHoldsTheValue(t *testing.T) {
+	for in, want := range map[string]string{"4.2e9": "4200000000", "1.50": "1.50", "1e-3": "0.001", " 7 ": "7"} {
+		got, err := evalCast(NewStringDatum(in), "numeric", 0, nil)
+		if err != nil || got.Kind != KindNumeric || numericText(got) != want {
+			t.Errorf("%q::numeric = %v, %v; want %s", in, got, err, want)
+		}
+	}
+}

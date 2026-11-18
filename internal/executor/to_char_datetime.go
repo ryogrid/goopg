@@ -502,17 +502,6 @@ func formatDCH(format string, v dchValue) (string, error) {
 	return out.String(), nil
 }
 
-// toCharDatetimeTypeName reports whether a to_char argument of this type is
-// formatted as a date, time or interval, not as a number.
-func toCharDatetimeTypeName(typeName string) bool {
-	switch typeName {
-	case "date", "time", "time without time zone", "timestamp", "timestamp without time zone",
-		"timestamptz", "timestamp with time zone", "interval":
-		return true
-	}
-	return false
-}
-
 // toCharInterval is interval_to_char. The result is NULL for an infinite value or
 // an empty template.
 func toCharInterval(d Datum, format string) (Datum, error) {

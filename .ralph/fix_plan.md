@@ -12273,13 +12273,22 @@ verify each at HEAD when the task starts.
     Movement: yes — regress timestamptz 2027→1999, horology 2517→2482, timestamp 1438→1426, interval 760→756
   > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a51: timestamptz arithmetic gives a different instant across DST
   > The returned instant differs from PG 18.3. Found while porting month arithmetic.
-- [ ] **M0149-0001h1a57 — WRONG RESULTS: later rows of a VALUES list keep their literal text instead of the column type** (filed 2026-11-18 by M0149-0001h1a53; S2)
+- [x] **M0149-0001h1a57 — WRONG RESULTS: later rows of a VALUES list keep their literal text instead of the column type** (filed 2026-11-18 by M0149-0001h1a53; S2)
   Kind: impl
   Parent: M0149-0001h1a
   - `with v(x) as (values ('0'::numeric),('4.2e9')) select x from v` prints `4.2e9`; PG 18.3 prints `4200000000`.
   - `select d + interval '1 day' from (values ('2018-11-02'::timestamp),('2019-01-01')) v(d)` fails with `operator + requires
     integer operands`. pg\_typeof reports the right type, so the column is typed but the values are not converted.
   - Resume: coerce each VALUES cell to the column type that transformValuesClause resolves \(select\_common\_type\).
+  - 2026\-11\-19 \(landed\):
+    - Every cell takes the column's common type, in both VALUES planners, with PG's `cannot be matched` errors.
+    - select\_common\_type is shared with COALESCE, GREATEST and LEAST.
+    - A cast to numeric and `numeric 'x'` yield a value, so `'4.2e9'::numeric` prints 4200000000.
+    - var\_pop, var\_samp and the stddev aggregates give NaN when a group mixes finite values and an infinity.
+    - to\_char no longer needs its own text cast.
+    - Regress, all 165 failed cases on HEAD and this build: 79650→79621 mismatch lines. polymorphism moves with the known
+      flake.
+    Movement: yes — regress numeric 995→980, rangetypes 837→832, window 1082→1081
   > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a57: VALUES rows are not converted to the column type
   > Values print and compare as text. Found while checking to\_char in regress numeric and timestamp.
 - [ ] **M0149-0001h1a60 — WRONG RESULTS: generate\_series over timestamps returns zeros or fails** (filed 2026-11-19 by M0149-0001h1a51; S2)
@@ -12329,6 +12338,12 @@ verify each at HEAD when the task starts.
   Parent: M0149-0001h1a
   - PG finds zone names without regard to case \(pg\_tzset\). lookupTimeZoneName uses time.LoadLocation, which follows the file
     system. This comes from reading the code and has not been run.
+- [ ] **M0149-0001h1a62 — numeric variance and stddev use a fixed result scale** (filed 2026-11-19 by M0149-0001h1a57)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `var_pop(x::numeric)` over `1e30`, `2e30` and `3` prints 12 fractional digits; PG 18.3 prints none, because
+    numeric\_stddev\_internal uses select\_div\_scale. stddev goes through 15 significant digits instead of sqrt\_var.
+  - Resume: exactNumericVariance in internal/executor/operators\_join\_agg.go; the state must keep the input display scale.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a

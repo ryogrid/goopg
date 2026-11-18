@@ -6106,6 +6106,10 @@ func planStandaloneValuesSelect(s *parser.SelectStmt, cat catalog.Catalog, ps Pl
 	for i := 0; i < nCols; i++ {
 		name := fmt.Sprintf("column%d", i+1)
 		typ := resolveValuesColumnType(planRows, i)
+		typ, err := coerceValuesColumn(planRows, i, typ)
+		if err != nil {
+			return nil, err
+		}
 		schema[i] = SchemaColumn{Name: name, Type: typ}
 	}
 	var node Node = &Values{pos: s.Pos(), Rows: planRows, schema: schema}
@@ -6267,6 +6271,10 @@ func planValuesSubquery(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16
 		// `(VALUES ('2015-01-02'), ('2015-04-01'::date))` must resolve to date
 		// whichever row carries the cast. M0134-0156.
 		typ := resolveValuesColumnType(planRows, i)
+		typ, err := coerceValuesColumn(planRows, i, typ)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
 		cols[i] = catalog.Column{Name: name, Type: typ}
 		schema[i] = SchemaColumn{Name: name, Type: typ}
 	}
@@ -18133,6 +18141,76 @@ func resolveValuesColumnType(planRows [][]Expr, col int) catalog.Type {
 	return typ
 }
 
+// valuesNumericRank orders the numeric types as unifyValueTypes does; 0 means the
+// type is not numeric.
+func valuesNumericRank(name string) int {
+	switch strings.ToLower(name) {
+	case "int2", "smallint", "smallserial":
+		return 1
+	case "int4", "integer", "int", "serial":
+		return 2
+	case "int8", "bigint", "bigserial":
+		return 3
+	case "numeric", "decimal":
+		return 4
+	case "float4", "real":
+		return 5
+	case "float8", "double precision", "double", "float":
+		return 6
+	}
+	return 0
+}
+
+// coerceValuesColumn is the select_common_type and coerce_to_common_type step of
+// transformValuesClause for one column, and returns the column's type. Every cell
+// takes that type: a string literal goes through the type's input function and a
+// value of another type is cast. Integer widths are left alone, because they share
+// one representation. Types select_common_type does not model keep typ.
+func coerceValuesColumn(planRows [][]Expr, col int, typ catalog.Type) (catalog.Type, error) {
+	cells := make([]Expr, len(planRows))
+	for r := range planRows {
+		cells[r] = planRows[r][col]
+	}
+	common, types, modelled, err := selectCommonType("VALUES", cells)
+	if err != nil {
+		return typ, err
+	}
+	if modelled && common != "" {
+		for i, cell := range cells {
+			if err := checkCommonTypeCoercion("VALUES", cell, types[i], common); err != nil {
+				return typ, err
+			}
+		}
+		if commonTypeCanonical(typ.Name) != common {
+			typ = catalog.Type{Name: common}
+		}
+	}
+	target := strings.ToLower(typ.Name)
+	if typ.IsArray && !strings.HasSuffix(target, "[]") {
+		target += "[]"
+	}
+	for r, cell := range cells {
+		if lit, ok := cell.(*StringConst); ok {
+			switch {
+			case target == "text" || target == "unknown" || target == "":
+			case castTargetTakesStringLiteral(target):
+				planRows[r][col] = &TypedStringLit{pos: lit.Pos(), Type: target, Value: lit.Value}
+			default:
+				planRows[r][col] = &CastExpr{pos: lit.Pos(), Operand: lit, TargetType: target, SourceType: "unknown"}
+			}
+			continue
+		}
+		if !modelled || types[r] == "" || types[r] == common {
+			continue
+		}
+		if isIntegerLikeType(types[r]) && isIntegerLikeType(common) {
+			continue
+		}
+		planRows[r][col] = &CastExpr{pos: cell.Pos(), Operand: cell, TargetType: target, SourceType: types[r]}
+	}
+	return typ, nil
+}
+
 // unifyValueTypes returns the "wider" of two types for VALUES column type inference.
 // Follows PostgreSQL's type unification rules for VALUES: integer types promote
 // to numeric when a non-integer numeric appears, and numeric/float types dominate.
@@ -18151,24 +18229,7 @@ func unifyValueTypes(a, b catalog.Type) catalog.Type {
 		return a
 	}
 	// Numeric type hierarchy: int2 < int4 < int8 < numeric < float4 < float8
-	numericRank := func(n string) int {
-		switch n {
-		case "int2", "smallint", "smallserial":
-			return 1
-		case "int4", "integer", "int", "serial":
-			return 2
-		case "int8", "bigint", "bigserial":
-			return 3
-		case "numeric", "decimal":
-			return 4
-		case "float4", "real":
-			return 5
-		case "float8", "double precision", "double", "float":
-			return 6
-		}
-		return 0
-	}
-	ra, rb := numericRank(an), numericRank(bn)
+	ra, rb := valuesNumericRank(an), valuesNumericRank(bn)
 	if ra > 0 && rb > 0 {
 		if ra >= rb {
 			return a

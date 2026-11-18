@@ -4904,7 +4904,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call *optimizer.AggregateCall, sl
 						st.numericSx = new(big.Rat)
 						st.numericSxx = new(big.Rat)
 					}
-					numStr := formatNumeric(arg.NumericMantissaValue(), arg.NumericScaleValue())
+					numStr := numericText(arg)
 					x := new(big.Rat)
 					if _, ok := x.SetString(numStr); ok {
 						st.numericSx.Add(st.numericSx, x)
@@ -4919,7 +4919,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call *optimizer.AggregateCall, sl
 				case KindInt:
 					f = float64(arg.Int)
 				case KindNumeric:
-					f, _ = strconv.ParseFloat(formatNumeric(arg.NumericMantissaValue(), arg.NumericScaleValue()), 64)
+					f, _ = strconv.ParseFloat(numericText(arg), 64)
 				case KindString:
 					f, _ = strconv.ParseFloat(arg.StringValue(), 64)
 				}
@@ -5503,7 +5503,7 @@ func aggDatumToFloat64(d Datum) float64 {
 	case KindInt:
 		return float64(d.Int)
 	case KindNumeric:
-		f, _ := strconv.ParseFloat(formatNumeric(d.NumericMantissaValue(), d.NumericScaleValue()), 64)
+		f, _ := strconv.ParseFloat(numericText(d), 64)
 		return f
 	case KindString:
 		f, _ := strconv.ParseFloat(d.StringValue(), 64)
@@ -5906,7 +5906,7 @@ func (o *aggregateOp) finishBuiltinAgg(st *aggRuntime, call *optimizer.Aggregate
 		if st.intExact {
 			return st.intVariance(false, false)
 		}
-		if st.numericExact {
+		if st.numericExact && !math.IsNaN(st.floatM2) { // NaN: an infinity or NaN was seen
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, false, false)
 		}
 		varPop := st.floatM2 / float64(st.count)
@@ -5919,7 +5919,7 @@ func (o *aggregateOp) finishBuiltinAgg(st *aggRuntime, call *optimizer.Aggregate
 		if st.intExact {
 			return st.intVariance(true, false)
 		}
-		if st.numericExact {
+		if st.numericExact && !math.IsNaN(st.floatM2) { // NaN: an infinity or NaN was seen
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, true, false)
 		}
 		varSamp := st.floatM2 / float64(st.count-1)
@@ -5931,7 +5931,7 @@ func (o *aggregateOp) finishBuiltinAgg(st *aggRuntime, call *optimizer.Aggregate
 		if st.intExact {
 			return st.intVariance(false, true)
 		}
-		if st.numericExact {
+		if st.numericExact && !math.IsNaN(st.floatM2) { // NaN: an infinity or NaN was seen
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, false, true)
 		}
 		varPop := st.floatM2 / float64(st.count)
@@ -5946,7 +5946,7 @@ func (o *aggregateOp) finishBuiltinAgg(st *aggRuntime, call *optimizer.Aggregate
 		if st.intExact {
 			return st.intVariance(true, true)
 		}
-		if st.numericExact {
+		if st.numericExact && !math.IsNaN(st.floatM2) { // NaN: an infinity or NaN was seen
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, true, true)
 		}
 		varSamp := st.floatM2 / float64(st.count-1)

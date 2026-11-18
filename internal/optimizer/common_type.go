@@ -131,6 +131,65 @@ func isUnknownTypedArg(e Expr) bool {
 	return ok
 }
 
+// selectCommonType is select_common_type (parse_coerce.c) over exprs. It returns
+// the common type, "" when every expression is untyped, and each expression's
+// canonical type. modelled is false when a type lies outside the categories goopg
+// models, in which case the caller keeps its own behaviour.
+func selectCommonType(context string, exprs []Expr) (ptype string, types []string, modelled bool, err error) {
+	types = make([]string, len(exprs))
+	var pcategory byte
+	ppreferred := false
+	for i, a := range exprs {
+		if isUnknownTypedArg(a) {
+			continue
+		}
+		et := exprType(a)
+		if et.IsArray {
+			return "", nil, false, nil // arrays: unmodelled
+		}
+		t := commonTypeCanonical(et.Name)
+		cat, pref, ok := commonTypeCategory(t)
+		if !ok {
+			return "", nil, false, nil
+		}
+		types[i] = t
+		if ptype == "" {
+			ptype, pcategory, ppreferred = t, cat, pref
+			continue
+		}
+		if t == ptype {
+			continue
+		}
+		if cat != pcategory {
+			return "", nil, false, &PlanError{Pos: exprStartPos(a), Code: "42804",
+				Message: fmt.Sprintf("%s types %s and %s cannot be matched", context,
+					commonTypeDisplayName(ptype), commonTypeDisplayName(t))}
+		}
+		if !ppreferred && implicitlyCoercible(ptype, t) && !implicitlyCoercible(t, ptype) {
+			ptype, ppreferred = t, pref
+		}
+	}
+	return ptype, types, true, nil
+}
+
+// exprStartPos is exprLocation for a cast, which reports its operand's start.
+func exprStartPos(e Expr) int {
+	if c, ok := e.(*CastExpr); ok {
+		return exprStartPos(c.Operand)
+	}
+	return e.Pos()
+}
+
+// checkCommonTypeCoercion is the failure arm of coerce_to_common_type.
+func checkCommonTypeCoercion(context string, e Expr, from, to string) error {
+	if from == "" || from == to || implicitlyCoercible(from, to) {
+		return nil
+	}
+	return &PlanError{Pos: exprStartPos(e), Code: "42846",
+		Message: fmt.Sprintf("%s could not convert type %s to %s", context,
+			commonTypeDisplayName(from), commonTypeDisplayName(to))}
+}
+
 // coerceCommonTypeArgs is transformCoalesceExpr / transformMinMaxExpr
 // (parse_expr.c) for COALESCE, GREATEST and LEAST: select_common_type
 // (parse_coerce.c) over the arguments, then coerce_to_common_type on each
@@ -159,39 +218,9 @@ func coerceCommonTypeArgs(fc *FuncCall) error {
 	default:
 		return nil
 	}
-	types := make([]string, len(fc.Args))
-	ptype := ""
-	var pcategory byte
-	ppreferred := false
-	for i, a := range fc.Args {
-		if isUnknownTypedArg(a) {
-			continue
-		}
-		et := exprType(a)
-		if et.IsArray {
-			return nil // arrays: unmodelled
-		}
-		t := commonTypeCanonical(et.Name)
-		cat, pref, ok := commonTypeCategory(t)
-		if !ok {
-			return nil // unmodelled type: keep goopg's previous behaviour
-		}
-		types[i] = t
-		if ptype == "" {
-			ptype, pcategory, ppreferred = t, cat, pref
-			continue
-		}
-		if t == ptype {
-			continue
-		}
-		if cat != pcategory {
-			return &PlanError{Pos: a.Pos(), Code: "42804",
-				Message: fmt.Sprintf("%s types %s and %s cannot be matched", context,
-					commonTypeDisplayName(ptype), commonTypeDisplayName(t))}
-		}
-		if !ppreferred && implicitlyCoercible(ptype, t) && !implicitlyCoercible(t, ptype) {
-			ptype, ppreferred = t, pref
-		}
+	ptype, types, modelled, err := selectCommonType(context, fc.Args)
+	if err != nil || !modelled {
+		return err
 	}
 	if ptype == "" {
 		// Every argument untyped: select_common_type picks text. With only
@@ -216,11 +245,8 @@ func coerceCommonTypeArgs(fc *FuncCall) error {
 		if types[i] == ptype {
 			continue
 		}
-		if types[i] != "" && !implicitlyCoercible(types[i], ptype) {
-			// coerce_to_common_type: "COALESCE could not convert type %s to %s".
-			return &PlanError{Pos: a.Pos(), Code: "42846",
-				Message: fmt.Sprintf("%s could not convert type %s to %s", context,
-					commonTypeDisplayName(types[i]), commonTypeDisplayName(ptype))}
+		if err := checkCommonTypeCoercion(context, a, types[i], ptype); err != nil {
+			return err
 		}
 		source := types[i]
 		if source == "" {
