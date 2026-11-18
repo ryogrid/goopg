@@ -709,6 +709,9 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 			micros = math.MinInt64
 		default:
 			micros = d.TimeValue().UnixMicro() - pgEpochUnixMicros
+			if prec := timeColumnPrecision(t); prec >= 0 {
+				micros = datetime.AdjustTimestampForTypmod(micros, int32(prec))
+			}
 		}
 		var buf [8]byte
 		binary.LittleEndian.PutUint64(buf[:], uint64(micros))
@@ -1320,6 +1323,21 @@ func roundTimeDatumToPrecision(d Datum, prec int64) Datum {
 		return NewTimeTZDatum(tv, d.TimeTZOffsetSecs())
 	}
 	return NewTimeDatum(tv)
+}
+
+// roundTimestampDatumToPrecision rounds a timestamp or timestamptz Datum to the
+// declared precision (AdjustTimestampForTypmod). The infinities and a precision
+// outside [0,6] pass through; the Datum's timestamp subtype is preserved.
+func roundTimestampDatumToPrecision(d Datum, prec int64) Datum {
+	if d.Kind != KindTime || prec < 0 || prec > 6 || d.IsTimestampPosInf() || d.IsTimestampNegInf() {
+		return d
+	}
+	micros := datetime.AdjustTimestampForTypmod(d.TimeValue().UnixMicro()-pgEpochUnixMicros, int32(prec))
+	ts := time.UnixMicro(micros + pgEpochUnixMicros).UTC()
+	if d.IsTimestampTZ() {
+		return NewTimestampTZDatum(ts)
+	}
+	return NewTimeDatum(ts)
 }
 
 // timeColumnPrecision returns the declared fractional-second precision of a

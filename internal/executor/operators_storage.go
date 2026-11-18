@@ -2869,8 +2869,14 @@ func coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i
 			coerced, cerr = evalCast(row[i], "date", pos, ctx)
 		case "timestamp":
 			coerced, cerr = evalCast(row[i], "timestamp", pos, ctx)
+			if cerr == nil {
+				coerced = roundTimestampDatumToPrecision(coerced, timeColumnPrecision(col.Type))
+			}
 		case "timestamptz":
 			coerced, cerr = evalCast(row[i], "timestamptz", pos, ctx)
+			if cerr == nil {
+				coerced = roundTimestampDatumToPrecision(coerced, timeColumnPrecision(col.Type))
+			}
 		case "time", "time without time zone":
 			// M0119-0006 (62nd slice): `time` joins the list so its declared
 			// precision reaches the value — before this, a `time(2)` column's value

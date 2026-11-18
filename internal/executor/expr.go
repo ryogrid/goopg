@@ -1135,10 +1135,12 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		// zero via AdjustTimeForTypmod (date.c:1710), so `'23:59:59.999999'::time(2)`
 		// is 24:00:00, not the truncated 23:59:59.99 the old ns-division here
 		// produced. M0119-0006 (62nd slice).
-		if x.Typmod > 0 {
-			switch x.TargetType {
-			case "time", "timetz", "time with time zone":
-				result = roundTimeDatumToPrecision(result, x.Typmod)
+		if prec, ok := x.FractionalPrecision(); ok {
+			switch strings.ToLower(x.TargetType) {
+			case "time", "timetz", "time without time zone", "time with time zone":
+				result = roundTimeDatumToPrecision(result, prec)
+			default:
+				result = roundTimestampDatumToPrecision(result, prec)
 			}
 		}
 		return result, nil
@@ -20882,11 +20884,8 @@ func domainCastWithTypmod(ctx *Context, x *optimizer.CastExpr) (*catalog.Domain,
 	cast.TargetType = base.Name
 	cast.SourceType = base.Name
 	cast.Explicit = true
-	cast.Typmod = base.Args[0]
-	switch {
-	case len(base.Args) == 2:
-		cast.Typmod = base.Args[0]<<16 | base.Args[1]
-	case strings.EqualFold(base.Name, "numeric") || strings.EqualFold(base.Name, "decimal"):
+	cast.Typmod = optimizer.EncodeCastTypmod(base.Name, base.Args)
+	if len(base.Args) == 1 && (strings.EqualFold(base.Name, "numeric") || strings.EqualFold(base.Name, "decimal")) {
 		cast.Typmod = base.Args[0] << 16 // numeric(p) has scale 0
 	}
 	return dom, &cast

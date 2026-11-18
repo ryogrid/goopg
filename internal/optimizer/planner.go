@@ -16843,10 +16843,51 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 
 // castTargetLabel maps a cast target type name to the PostgreSQL column label
 // used for that type when the cast result has no explicit alias. M0097-0003.
+// castTypmodZeroPrecision is CastExpr.Typmod for `time(0)` and `timestamp(0)`.
+// Typmod 0 means "no modifier", and precision 0 is a real one that rounds to
+// whole seconds.
+const castTypmodZeroPrecision = -1
+
+// isFractionalSecondsType reports the types whose typmod is a fractional-second
+// precision.
+func isFractionalSecondsType(typeName string) bool {
+	switch strings.ToLower(typeName) {
+	case "time", "timetz", "timestamp", "timestamptz",
+		"time without time zone", "time with time zone",
+		"timestamp without time zone", "timestamp with time zone":
+		return true
+	}
+	return false
+}
+
+// FractionalPrecision is the declared precision of a cast to a time or timestamp
+// type, if it has one.
+func (c *CastExpr) FractionalPrecision() (int64, bool) {
+	if !isFractionalSecondsType(c.TargetType) {
+		return 0, false
+	}
+	switch {
+	case c.Typmod == castTypmodZeroPrecision:
+		return 0, true
+	case c.Typmod > 0:
+		return c.Typmod, true
+	}
+	return 0, false
+}
+
+// EncodeCastTypmod is CastExpr.Typmod for a cast to typeName with the declared
+// type arguments.
+func EncodeCastTypmod(typeName string, args []int64) int64 {
+	return encodeTypmod(typeName, args)
+}
+
 // encodeTypmod encodes the typmod for a cast target type.
 // For numeric(P,S), returns (P<<16)|S so the executor can decode both.
 // For other types, returns Typmods[0] if present (existing behaviour).
 func encodeTypmod(typeName string, typmods []int64) int64 {
+	if len(typmods) > 0 && typmods[0] == 0 && isFractionalSecondsType(typeName) {
+		return castTypmodZeroPrecision
+	}
 	switch strings.ToLower(typeName) {
 	case "numeric", "decimal":
 		if len(typmods) >= 2 {
@@ -17193,8 +17234,14 @@ func sumResultType(t catalog.Type) catalog.Type {
 // declared arguments, so a cast's result column keeps its typmod as PG's
 // exprTypmod reports it for a length-coercion. Types with no typmod get none.
 func castTypmodArgs(typeName string, typmod int64) []int64 {
+	if typmod == castTypmodZeroPrecision && isFractionalSecondsType(typeName) {
+		return []int64{0}
+	}
 	if typmod <= 0 {
 		return nil
+	}
+	if isFractionalSecondsType(typeName) {
+		return []int64{typmod}
 	}
 	switch strings.ToLower(typeName) {
 	case "numeric", "decimal":
@@ -17209,8 +17256,7 @@ func castTypmodArgs(typeName string, typmod int64) []int64 {
 			return []int64{0x7fff<<16 | typmod}
 		}
 		return []int64{typmod}
-	case "varchar", "character varying", "bpchar", "character", "bit", "varbit", "bit varying",
-		"time", "timetz", "timestamp", "timestamptz":
+	case "varchar", "character varying", "bpchar", "character", "bit", "varbit", "bit varying":
 		return []int64{typmod}
 	}
 	return nil

@@ -12137,15 +12137,38 @@ verify each at HEAD when the task starts.
       applying until that is fixed; h1a45, h1a46 and h1a47 hold the differences found alongside.
     - Tests: TestDomainTypmodIsEnforced, TestAlterColumnTypeFailureKeepsRows.
     Movement: yes — regress alter\_table 697→685, domain 419→404, fast\_default 117→88, replica\_identity 20→14, compression 90→87, identity 320→318
-- [ ] **M0149-0001h1a45 — WRONG RESULTS: `timestamp(p)` is not applied: columns and casts keep all fractional digits** (filed 2026-11-18 by M0149-0001h1a39; S2)
+- [x] **M0149-0001h1a45 — WRONG RESULTS: `timestamp(p)` is not applied: columns and casts keep all fractional digits** (filed 2026-11-18 by M0149-0001h1a39; S2)
   Kind: impl
   Parent: M0149-0001h1a
-  - `create table t(ts timestamp(0)); insert into t values ('2020-01-01 00:00:01.6')` stores `00:00:01.6`; PG stores
-    `00:00:02`. `select '2020-01-01 00:00:01.6'::timestamp(0)` shows the same difference. `time(p)` is applied.
+  - `create table t(ts timestamp(0)); insert into t values ('2020-01-01 00:00:01.6')` stored `00:00:01.6`; PG stores
+    `00:00:02`. `select '2020-01-01 00:00:01.6'::timestamp(0)` showed the same difference.
   - PG: AdjustTimestampForTypmod \(timestamp.c\), used by timestamp\_in, timestamp\_scale and timestamptz\_scale.
-  - Resume: the time arm next to it in the CastExpr evaluator \(roundTimeDatumToPrecision\) and the column encoder.
-  > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a45: `timestamp(p)` values are stored and returned unrounded
-  > Stored values differ from PG 18.3. Found while testing domains over timestamp.
+  - 2026\-11\-18 \(landed\):
+    - Columns round on INSERT, UPDATE, COPY and defaults; `RETURNING` shows the rounded value. Casts round too.
+    - `::timestamp(0)` and `::time(0)` were no\-ops because Typmod 0 means no modifier. encodeTypmod now stores \-1
+      for an explicit precision 0 on these types; CastExpr.FractionalPrecision reads it.
+    - `infinity` and `\-infinity` printed as dates in 2262 and 1677 for every timestamp column and cast. Fixed in
+      the wire formatter.
+    - EXPLAIN prints `'2020\-01\-01 00:00:00'::timestamp(0) without time zone`, as PG does.
+    - A probe of columns, casts, RETURNING, UPDATE, COPY, ALTER COLUMN TYPE and infinity matches PG 18.3, except
+      the two items under Not covered.
+    - Regress, all 165 failed cases on HEAD and this build, same list: 80405→80374 mismatch lines.
+    - `timestamp` 1570→1595 and `timestamptz` 2191→2223 got worse only in column padding. 18 and 20 real lines
+      were fixed, but the expected tables are as wide as BC and far\-future dates goopg rejects \(h1a48\), and the
+      old wrong infinity text happened to produce that width.
+    - Not covered \(ledgered\): EXPLAIN literals ignore DateStyle; a cast to a domain over a time type prints six
+      fractional digits \(h1a47\).
+    - Tests: TestTimestampPrecisionIsApplied, TestExprTypeTypmod.
+    Movement: yes — regress window 1112→1082, interval 771→764
+- [ ] **M0149-0001h1a48 — timestamps outside 1677 to 2262 are rejected** (filed 2026-11-18 by M0149-0001h1a45)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `'4714-11-23 23:59:59 BC'::timestamp` and `'0055-06-10 15:44:17.71393 BC'::timestamp` fail with `date/time value out
+    of range for timestamp`, and the message says goopg's range. PG accepts 4713 BC to 294276 AD.
+  - Cause: KindTime keeps nanoseconds since 1970 in an int64 \(Datum.Int\). The on\-disk format is already PG's
+    microseconds, so the limit is in the in\-memory value.
+  - This also sets the column width of most tables in regress timestamp and timestamptz.
+  - Resume: carry timestamps as PG\-epoch microseconds in the Datum, then the parser, formatter and arithmetic.
 - [ ] **M0149-0001h1a46 — WRONG RESULTS: array elements and CREATE TABLE AS columns ignore their typmod** (filed 2026-11-18 by M0149-0001h1a39; S2)
   Kind: impl
   Parent: M0149-0001h1a

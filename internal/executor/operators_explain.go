@@ -15,6 +15,7 @@ import (
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/utils/adt/cash"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // explainOp renders the inner plan tree as a single-column
@@ -6754,8 +6755,45 @@ func castLiteralConstText(lit optimizer.Expr, target string, typmod int64, typ s
 		v = d
 	case "bool", "boolean":
 		return "", false
+	case "timestamp", "timestamp without time zone":
+		// The literal is a Const of the target type, printed by timestamp_out
+		// after its precision was applied.
+		if ts, err := parseCopyTimestampZoneSession(v, tsZoneModeForType("timestamp"), ""); err == nil {
+			d := NewTimeDatum(ts)
+			prec := int64(-1)
+			switch {
+			case typmod == -1:
+				prec = 0
+			case typmod > 0:
+				prec = typmod
+			}
+			v = misc.FormatTimestamp(roundTimestampDatumToPrecision(d, prec).TimeValue(), "ISO", "MDY")
+		}
 	}
 	return quoteLiteral(v) + "::" + typ, true
+}
+
+// fractionalCastTypeName is format_type_with_typemod's spelling of a time or
+// timestamp type with a precision: `timestamp(0) without time zone`. A typmod of
+// -1 is the cast encoding of precision 0.
+func fractionalCastTypeName(name string, typmod int64) (string, bool) {
+	if typmod == -1 {
+		typmod = 0
+	}
+	var base, zone string
+	switch strings.ToLower(name) {
+	case "timestamp", "timestamp without time zone":
+		base, zone = "timestamp", "without"
+	case "timestamptz", "timestamp with time zone":
+		base, zone = "timestamp", "with"
+	case "time", "time without time zone":
+		base, zone = "time", "without"
+	case "timetz", "time with time zone":
+		base, zone = "time", "with"
+	default:
+		return "", false
+	}
+	return fmt.Sprintf("%s(%d) %s time zone", base, typmod, zone), true
 }
 
 // castTypeName is format_type_with_typemod's spelling for the cast targets
@@ -6783,7 +6821,7 @@ func castTypeName(name string, typmod int64) (string, bool) {
 		return "bpchar", true
 	}
 	if typmod != 0 {
-		return "", false
+		return fractionalCastTypeName(name, typmod)
 	}
 	switch strings.ToLower(name) {
 	case "int", "int4", "integer":

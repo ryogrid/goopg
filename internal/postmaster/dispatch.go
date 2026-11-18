@@ -4304,7 +4304,7 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 		// order), matching PostgreSQL's EncodeDateTime with print_tz=false.
 		// Previously hardcoded ISO regardless of `SET datestyle`. M-NIGHTLY
 		// (run 20260714-011651) DateStyle output-rendering follow-up.
-		if d.Kind == executor.KindTime {
+		if d.Kind == executor.KindTime && !d.IsTimestampNotFinite() {
 			style, order := "ISO", "MDY"
 			if getSetting != nil {
 				if v, ok := getSetting("datestyle"); ok {
@@ -4321,7 +4321,7 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 		// before that, goopg printed a timestamptz with no zone at all and
 		// never left UTC, so under `SET TimeZone` the text READ as a different
 		// instant than the one stored.
-		if d.Kind == executor.KindTime {
+		if d.Kind == executor.KindTime && !d.IsTimestampNotFinite() {
 			style, order := "ISO", "MDY"
 			zone := ""
 			if getSetting != nil {

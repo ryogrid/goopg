@@ -23,6 +23,15 @@ func AdjustTimeForTypmod(micros int64, typmod int32) int64 {
 	return -((((-micros) + offset) / scale) * scale)
 }
 
+// AdjustTimestampForTypmod rounds a timestamp (microseconds since the PG epoch)
+// to the declared precision, as PostgreSQL's AdjustTimestampForTypmod does
+// (postgres/src/backend/utils/adt/timestamp.c): the same scales and the same
+// half-away-from-zero rule as time, so a value before 2000 rounds away from the
+// epoch. The caller keeps the infinities out.
+func AdjustTimestampForTypmod(micros int64, typmod int32) int64 {
+	return AdjustTimeForTypmod(micros, typmod)
+}
+
 const maxTimePrecision = 6
 
 // timeTypmodScales[p] = 10^(6-p): the quantum a time(N) precision rounds the
