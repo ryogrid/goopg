@@ -436,8 +436,8 @@ func (l *lexerState) next() lexResult {
 		// col_name_keywords, so a `char_lit_name` nonterminal was 3
 		// reduce/reduce conflicts against col_name_keyword.
 		if cur.term > 0 && charTypmodFamily[lower] {
-			if s2, ok := l.peekCharTypmodLit(); ok {
-				return lexResult{term: termTYPEDLIT, str: knownTypeNames[lower] + "\x1f" + s2, pos: cur.pos, text: cur.text}
+			if s2, litPos, ok := l.peekCharTypmodLit(); ok {
+				return lexResult{term: termTYPEDLIT, str: knownTypeNames[lower] + "\x1f" + s2, pos: cur.pos, ival: litPos, text: cur.text}
 			}
 		}
 		if cur.term > 0 {
@@ -446,7 +446,7 @@ func (l *lexerState) next() lexResult {
 				// Fold to one synthetic terminal so c_expr can build a
 				// TypedStringLit (legacy parity) instead of a bare string —
 				// `date 'X' + interval 'Y'` needs the type for + resolution.
-				return lexResult{term: termTYPEDLIT, str: knownTypeNames[lower] + "\x1f" + nxt.str, pos: cur.pos, text: cur.text + " " + nxt.text}
+				return lexResult{term: termTYPEDLIT, str: knownTypeNames[lower] + "\x1f" + nxt.str, pos: cur.pos, ival: nxt.pos, text: cur.text + " " + nxt.text}
 			}
 		}
 	}
@@ -508,20 +508,20 @@ var charTypmodFamily = map[string]bool{"char": true, "bpchar": true, "varchar": 
 // peekCharTypmodLit matches `( ICONST ) SCONST` after a type name and consumes
 // it, returning the string. The typmod itself is discarded: legacy stores only
 // the raw literal.
-func (l *lexerState) peekCharTypmodLit() (string, bool) {
+func (l *lexerState) peekCharTypmodLit() (string, int, bool) {
 	i := l.i
 	if i+3 >= len(l.toks) {
-		return "", false
+		return "", 0, false
 	}
 	open, num, close_, str := l.toks[i], l.toks[i+1], l.toks[i+2], l.toks[i+3]
 	if open.Kind != TokenSymbol || open.Value != "(" ||
 		num.Kind != TokenIntLit ||
 		close_.Kind != TokenSymbol || close_.Value != ")" ||
 		str.Kind != TokenStringLit {
-		return "", false
+		return "", 0, false
 	}
 	l.i = i + 4
-	return str.Value, true
+	return str.Value, str.Pos, true
 }
 
 // peek maps the next raw token WITHOUT consuming it (a pure function of the

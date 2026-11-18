@@ -1143,7 +1143,7 @@ const yyEofCode = 1
 const yyErrCode = 2
 const yyInitialStackSize = 16
 
-//line ../../tmp/goopg_grammar.y:9566
+//line ../../tmp/goopg_grammar.y:9568
 
 //line yacctab:1
 var yyExca = [...]int16{
@@ -14570,43 +14570,45 @@ yydefault:
 		yyDollar = yyS[yypt-1 : yypt+1]
 //line ../../tmp/goopg_grammar.y:3128
 		{
+			/* $<ival>1 is the string's position: coerce_type reports a bad
+			   literal there (makeStringConstCast), not at the type name. */
 			typ, val := typedLitParts(yyDollar[1].str)
-			yyVAL.expr = NewTypedStringLit(yyDollar[1].p, typ, val)
+			yyVAL.expr = NewTypedStringLit(yyDollar[1].ival, typ, val)
 		}
 	case 539:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3138
+//line ../../tmp/goopg_grammar.y:3140
 		{
-			yyVAL.expr = NewTypedStringLit(yyDollar[1].p, "timestamptz", yyDollar[5].str)
+			yyVAL.expr = NewTypedStringLit(yyDollar[5].p, "timestamptz", yyDollar[5].str)
 		}
 	case 540:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3140
+//line ../../tmp/goopg_grammar.y:3142
 		{
-			yyVAL.expr = NewTypedStringLit(yyDollar[1].p, "timestamp", yyDollar[5].str)
+			yyVAL.expr = NewTypedStringLit(yyDollar[5].p, "timestamp", yyDollar[5].str)
 		}
 	case 541:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3142
+//line ../../tmp/goopg_grammar.y:3144
 		{
-			yyVAL.expr = NewTypedStringLit(yyDollar[1].p, "timetz", yyDollar[5].str)
+			yyVAL.expr = NewTypedStringLit(yyDollar[5].p, "timetz", yyDollar[5].str)
 		}
 	case 542:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3144
+//line ../../tmp/goopg_grammar.y:3146
 		{
-			yyVAL.expr = NewTypedStringLit(yyDollar[1].p, "time", yyDollar[5].str)
+			yyVAL.expr = NewTypedStringLit(yyDollar[5].p, "time", yyDollar[5].str)
 		}
 	case 543:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3149
+//line ../../tmp/goopg_grammar.y:3151
 		{
 			// An empty ARRAY[] carries a NIL element list, as legacy does.
 			yyVAL.expr = NewArrayConstructorExpr(yyDollar[1].p, yyDollar[2].exprs)
 		}
 	case 544:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3156
+//line ../../tmp/goopg_grammar.y:3158
 		{
 			sub, _ := yyDollar[3].stmt.(*SelectStmt)
 			if sub == nil {
@@ -14616,115 +14618,115 @@ yydefault:
 		}
 	case 545:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3164
+//line ../../tmp/goopg_grammar.y:3166
 		{
 			yyVAL.expr = buildIntervalQualified(yyDollar[1].p, yyDollar[2].str, "year", "", -1)
 		}
 	case 546:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3166
+//line ../../tmp/goopg_grammar.y:3168
 		{
 			yyVAL.expr = buildIntervalQualified(yyDollar[1].p, yyDollar[2].str, "month", "", -1)
 		}
 	case 547:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3168
+//line ../../tmp/goopg_grammar.y:3170
 		{
 			yyVAL.expr = buildIntervalQualified(yyDollar[1].p, yyDollar[2].str, "day", "", -1)
 		}
 	case 548:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3170
+//line ../../tmp/goopg_grammar.y:3172
 		{
 			yyVAL.expr = buildIntervalQualified(yyDollar[1].p, yyDollar[2].str, "hour", "", -1)
 		}
 	case 549:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3172
+//line ../../tmp/goopg_grammar.y:3174
 		{
 			yyVAL.expr = buildIntervalQualified(yyDollar[1].p, yyDollar[2].str, "minute", "", -1)
 		}
 	case 550:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3174
+//line ../../tmp/goopg_grammar.y:3176
 		{
 			yyVAL.expr = buildIntervalQualified(yyDollar[1].p, yyDollar[2].str, "second", "", -1)
 		}
 	case 551:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3176
+//line ../../tmp/goopg_grammar.y:3178
 		{
 			yyVAL.expr = buildIntervalQualified(yyDollar[1].p, yyDollar[2].str, "year", "month", -1)
 		}
 	case 552:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3178
+//line ../../tmp/goopg_grammar.y:3180
 		{
 			yyVAL.expr = buildIntervalQualified(yyDollar[1].p, yyDollar[2].str, "day", "hour", -1)
 		}
 	case 553:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3180
+//line ../../tmp/goopg_grammar.y:3182
 		{
 			yyVAL.expr = buildIntervalQualified(yyDollar[1].p, yyDollar[2].str, "day", "minute", -1)
 		}
 	case 554:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3182
+//line ../../tmp/goopg_grammar.y:3184
 		{
 			yyVAL.expr = buildIntervalQualified(yyDollar[1].p, yyDollar[2].str, "day", "second", -1)
 		}
 	case 555:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3184
+//line ../../tmp/goopg_grammar.y:3186
 		{
 			yyVAL.expr = buildIntervalQualified(yyDollar[1].p, yyDollar[2].str, "hour", "minute", -1)
 		}
 	case 556:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3186
+//line ../../tmp/goopg_grammar.y:3188
 		{
 			yyVAL.expr = buildIntervalQualified(yyDollar[1].p, yyDollar[2].str, "hour", "second", -1)
 		}
 	case 557:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3188
+//line ../../tmp/goopg_grammar.y:3190
 		{
 			yyVAL.expr = buildIntervalQualified(yyDollar[1].p, yyDollar[2].str, "minute", "second", -1)
 		}
 	case 558:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3190
+//line ../../tmp/goopg_grammar.y:3192
 		{
 			yyVAL.expr = buildIntervalQualified(yyDollar[1].p, yyDollar[2].str, "second", "", yyDollar[5].ival)
 		}
 	case 559:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3194
+//line ../../tmp/goopg_grammar.y:3196
 		{
 			yyVAL.expr = buildIntervalQualified(yyDollar[1].p, yyDollar[2].str, "day", "second", yyDollar[7].ival)
 		}
 	case 560:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3196
+//line ../../tmp/goopg_grammar.y:3198
 		{
 			yyVAL.expr = buildIntervalQualified(yyDollar[1].p, yyDollar[2].str, "hour", "second", yyDollar[7].ival)
 		}
 	case 561:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3198
+//line ../../tmp/goopg_grammar.y:3200
 		{
 			yyVAL.expr = buildIntervalQualified(yyDollar[1].p, yyDollar[2].str, "minute", "second", yyDollar[7].ival)
 		}
 	case 562:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3200
+//line ../../tmp/goopg_grammar.y:3202
 		{
 			yyVAL.expr = NewExtractExpr(yyDollar[1].p, yyDollar[3].str, yyDollar[5].expr)
 		}
 	case 563:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3210
+//line ../../tmp/goopg_grammar.y:3212
 		{
 			sub, _ := yyDollar[1].stmt.(*SelectStmt)
 			if sub == nil {
@@ -14737,404 +14739,404 @@ yydefault:
 		}
 	case 564:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3222
+//line ../../tmp/goopg_grammar.y:3224
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
 	case 565:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3226
+//line ../../tmp/goopg_grammar.y:3228
 		{
 			yyVAL.expr = castTo(yylex, yyDollar[3].expr, yyDollar[5].ct, nil, yyDollar[5].p, yyDollar[1].p)
 		}
 	case 566:
 		yyDollar = yyS[yypt-9 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3236
+//line ../../tmp/goopg_grammar.y:3238
 		{
 			yyVAL.expr = castTo(yylex, yyDollar[3].expr, yyDollar[5].ct, []int64{int64(yyDollar[7].ival)}, yyDollar[5].p, yyDollar[1].p)
 		}
 	case 567:
 		yyDollar = yyS[yypt-11 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3240
+//line ../../tmp/goopg_grammar.y:3242
 		{
 			tm := typmodsFor(yyDollar[5].ct.name, []int64{int64(yyDollar[7].ival), int64(yyDollar[9].ival)}, 2)
 			yyVAL.expr = NewCastExpr(yyDollar[1].p, yyDollar[3].expr, ObjectName{Schema: yyDollar[5].ct.schema, Name: yyDollar[5].ct.name}, tm)
 		}
 	case 568:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3245
+//line ../../tmp/goopg_grammar.y:3247
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
 	case 569:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3277
+//line ../../tmp/goopg_grammar.y:3279
 		{
 			yyVAL.expr = substringCall(yylex, yyDollar[1].p, yyDollar[3].exprs)
 		}
 	case 570:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3279
+//line ../../tmp/goopg_grammar.y:3281
 		{
 			yyVAL.expr = substringSimilar(yylex, yyDollar[1].p, yyDollar[3].expr, yyDollar[5].expr, yyDollar[7].expr)
 		}
 	case 571:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3281
+//line ../../tmp/goopg_grammar.y:3283
 		{
 			yyVAL.expr = specialFormCall(yyDollar[1].p, "overlay", yyDollar[3].exprs)
 		}
 	case 572:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3283
+//line ../../tmp/goopg_grammar.y:3285
 		{
 			yyVAL.expr = specialFormCall(yyDollar[1].p, "position", yyDollar[3].exprs)
 		}
 	case 573:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3292
+//line ../../tmp/goopg_grammar.y:3294
 		{
 			yyVAL.expr = specialFormCall(yyDollar[1].p, "btrim", yyDollar[4].exprs)
 		}
 	case 574:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3296
+//line ../../tmp/goopg_grammar.y:3298
 		{
 			yyVAL.expr = specialFormCall(yyDollar[1].p, "ltrim", yyDollar[4].exprs)
 		}
 	case 575:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3300
+//line ../../tmp/goopg_grammar.y:3302
 		{
 			yyVAL.expr = specialFormCall(yyDollar[1].p, "rtrim", yyDollar[4].exprs)
 		}
 	case 576:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3304
+//line ../../tmp/goopg_grammar.y:3306
 		{
 			yyVAL.expr = specialFormCall(yyDollar[1].p, "btrim", yyDollar[3].exprs)
 		}
 	case 577:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3311
+//line ../../tmp/goopg_grammar.y:3313
 		{
 			yyVAL.expr = specialFormCall(yyDollar[1].p, "normalize", []Expr{yyDollar[3].expr})
 		}
 	case 578:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3315
+//line ../../tmp/goopg_grammar.y:3317
 		{
 			yyVAL.expr = specialFormCall(yyDollar[1].p, "normalize", []Expr{yyDollar[3].expr, NewStringConst(yyDollar[5].p, yyDollar[5].str)})
 		}
 	case 579:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3319
+//line ../../tmp/goopg_grammar.y:3321
 		{
 			yyVAL.expr = NewFuncCall(yyDollar[1].p, ObjectName{pos: yyDollar[1].p, Name: yyDollar[1].str}, nil, false)
 		}
 	case 580:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3323
+//line ../../tmp/goopg_grammar.y:3325
 		{
 			yyVAL.expr = NewFuncCall(yyDollar[1].p, ObjectName{pos: yyDollar[1].p, Name: yyDollar[1].str}, yyDollar[3].exprs, false)
 		}
 	case 581:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3338
+//line ../../tmp/goopg_grammar.y:3340
 		{
 			yyVAL.exprs = append(yyDollar[3].exprs, yyDollar[1].expr)
 		}
 	case 582:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3339
+//line ../../tmp/goopg_grammar.y:3341
 		{
 			yyVAL.exprs = yyDollar[2].exprs
 		}
 	case 583:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3345
+//line ../../tmp/goopg_grammar.y:3347
 		{
 			yyVAL.str = "NFC"
 		}
 	case 584:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3346
+//line ../../tmp/goopg_grammar.y:3348
 		{
 			yyVAL.str = "NFD"
 		}
 	case 585:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3347
+//line ../../tmp/goopg_grammar.y:3349
 		{
 			yyVAL.str = "NFKC"
 		}
 	case 586:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3348
+//line ../../tmp/goopg_grammar.y:3350
 		{
 			yyVAL.str = "NFKD"
 		}
 	case 587:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3351
+//line ../../tmp/goopg_grammar.y:3353
 		{
 			yyVAL.str = "current_timestamp"
 		}
 	case 588:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3352
+//line ../../tmp/goopg_grammar.y:3354
 		{
 			yyVAL.str = "current_date"
 		}
 	case 589:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3353
+//line ../../tmp/goopg_grammar.y:3355
 		{
 			yyVAL.str = "current_time"
 		}
 	case 590:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3354
+//line ../../tmp/goopg_grammar.y:3356
 		{
 			yyVAL.str = "localtimestamp"
 		}
 	case 591:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3355
+//line ../../tmp/goopg_grammar.y:3357
 		{
 			yyVAL.str = "localtime"
 		}
 	case 592:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3356
+//line ../../tmp/goopg_grammar.y:3358
 		{
 			yyVAL.str = "current_user"
 		}
 	case 593:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3357
+//line ../../tmp/goopg_grammar.y:3359
 		{
 			yyVAL.str = "session_user"
 		}
 	case 594:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3358
+//line ../../tmp/goopg_grammar.y:3360
 		{
 			yyVAL.str = "user"
 		}
 	case 595:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3359
+//line ../../tmp/goopg_grammar.y:3361
 		{
 			yyVAL.str = "current_role"
 		}
 	case 596:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3360
+//line ../../tmp/goopg_grammar.y:3362
 		{
 			yyVAL.str = "current_catalog"
 		}
 	case 597:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3361
+//line ../../tmp/goopg_grammar.y:3363
 		{
 			yyVAL.str = "current_schema"
 		}
 	case 598:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3368
+//line ../../tmp/goopg_grammar.y:3370
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
 	case 599:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3372
+//line ../../tmp/goopg_grammar.y:3374
 		{
 			yyVAL.expr = NewBinaryOp(yyDollar[2].p, OpAdd, yyDollar[1].expr, yyDollar[3].expr)
 		}
 	case 600:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3376
+//line ../../tmp/goopg_grammar.y:3378
 		{
 			yyVAL.expr = NewBinaryOp(yyDollar[2].p, OpSub, yyDollar[1].expr, yyDollar[3].expr)
 		}
 	case 601:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3380
+//line ../../tmp/goopg_grammar.y:3382
 		{
 			yyVAL.expr = NewBinaryOp(yyDollar[2].p, OpMul, yyDollar[1].expr, yyDollar[3].expr)
 		}
 	case 602:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3384
+//line ../../tmp/goopg_grammar.y:3386
 		{
 			yyVAL.expr = NewBinaryOp(yyDollar[2].p, OpDiv, yyDollar[1].expr, yyDollar[3].expr)
 		}
 	case 603:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3388
+//line ../../tmp/goopg_grammar.y:3390
 		{
 			yyVAL.expr = NewBinaryOp(yyDollar[2].p, OpMod, yyDollar[1].expr, yyDollar[3].expr)
 		}
 	case 604:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3392
+//line ../../tmp/goopg_grammar.y:3394
 		{
 			yyVAL.expr = NewBinaryOp(yyDollar[2].p, OpLt, yyDollar[1].expr, yyDollar[3].expr)
 		}
 	case 605:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3396
+//line ../../tmp/goopg_grammar.y:3398
 		{
 			yyVAL.expr = NewBinaryOp(yyDollar[2].p, OpGt, yyDollar[1].expr, yyDollar[3].expr)
 		}
 	case 606:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3400
+//line ../../tmp/goopg_grammar.y:3402
 		{
 			yyVAL.expr = NewBinaryOp(yyDollar[2].p, OpEq, yyDollar[1].expr, yyDollar[3].expr)
 		}
 	case 607:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3404
+//line ../../tmp/goopg_grammar.y:3406
 		{
 			yyVAL.expr = NewBinaryOp(yyDollar[2].p, OpLe, yyDollar[1].expr, yyDollar[3].expr)
 		}
 	case 608:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3408
+//line ../../tmp/goopg_grammar.y:3410
 		{
 			yyVAL.expr = NewBinaryOp(yyDollar[2].p, OpGe, yyDollar[1].expr, yyDollar[3].expr)
 		}
 	case 609:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3412
+//line ../../tmp/goopg_grammar.y:3414
 		{
 			yyVAL.expr = NewBinaryOp(yyDollar[2].p, OpNe, yyDollar[1].expr, yyDollar[3].expr)
 		}
 	case 610:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3420
+//line ../../tmp/goopg_grammar.y:3422
 		{
 			yyVAL.expr = foldNegate(yyDollar[1].p, yyDollar[2].expr)
 		}
 	case 611:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3424
+//line ../../tmp/goopg_grammar.y:3426
 		{
 			yyVAL.expr = NewUnaryOp(yyDollar[1].p, OpUnaryPos, yyDollar[2].expr)
 		}
 	case 612:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3430
+//line ../../tmp/goopg_grammar.y:3432
 		{
 			yyVAL.expr = castTo(yylex, yyDollar[1].expr, yyDollar[3].ct, nil, yyDollar[3].p, yyDollar[2].p)
 		}
 	case 613:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3434
+//line ../../tmp/goopg_grammar.y:3436
 		{
 			yyVAL.expr = NewBinaryOp(yyDollar[2].p, OpPow, yyDollar[1].expr, yyDollar[3].expr)
 		}
 	case 614:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3438
+//line ../../tmp/goopg_grammar.y:3440
 		{
 			yyVAL.expr = NewBinaryOp(yyDollar[2].p, binOp(yylex, yyDollar[2].str), yyDollar[1].expr, yyDollar[3].expr)
 		}
 	case 615:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3442
+//line ../../tmp/goopg_grammar.y:3444
 		{
 			yyVAL.expr = NewUnaryOp(yyDollar[1].p, prefixOp(yylex, yyDollar[1].str), yyDollar[2].expr)
 		}
 	case 616:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3449
+//line ../../tmp/goopg_grammar.y:3451
 		{
 			yyVAL.expr = NewBinaryOp(yyDollar[2].qn.pos, binOp(yylex, qualOpName(yyDollar[2].qn)), yyDollar[1].expr, yyDollar[3].expr)
 		}
 	case 617:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3453
+//line ../../tmp/goopg_grammar.y:3455
 		{
 			yyVAL.expr = qualPrefixExpr(yylex, yyDollar[1].qn, yyDollar[2].expr)
 		}
 	case 618:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3458
+//line ../../tmp/goopg_grammar.y:3460
 		{
 			yyVAL.exprs = nil
 		}
 	case 619:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3459
+//line ../../tmp/goopg_grammar.y:3461
 		{
 			yyVAL.exprs = yyDollar[1].exprs
 		}
 	case 620:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3465
+//line ../../tmp/goopg_grammar.y:3467
 		{
 			yyVAL.node = (*callArgs)(nil)
 		}
 	case 621:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3466
+//line ../../tmp/goopg_grammar.y:3468
 		{
 			yyVAL.node = yyDollar[1].node
 		}
 	case 622:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3469
+//line ../../tmp/goopg_grammar.y:3471
 		{
 			yyVAL.node = appendCallArg(nil, yyDollar[1].node.(callArg))
 		}
 	case 623:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3470
+//line ../../tmp/goopg_grammar.y:3472
 		{
 			yyVAL.node = appendCallArg(yyDollar[1].node.(*callArgs), yyDollar[3].node.(callArg))
 		}
 	case 624:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3473
+//line ../../tmp/goopg_grammar.y:3475
 		{
 			yyVAL.node = callArg{expr: yyDollar[1].expr}
 		}
 	case 625:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3474
+//line ../../tmp/goopg_grammar.y:3476
 		{
 			yyVAL.node = callArg{expr: yyDollar[2].expr, variadic: true}
 		}
 	case 626:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3480
+//line ../../tmp/goopg_grammar.y:3482
 		{
 			yyVAL.node = callArg{expr: yyDollar[3].expr}
 		}
 	case 627:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3481
+//line ../../tmp/goopg_grammar.y:3483
 		{
 			yyVAL.node = callArg{expr: yyDollar[3].expr}
 		}
 	case 628:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3501
+//line ../../tmp/goopg_grammar.y:3503
 		{
 			yyVAL.expr = callFuncExpr(yyDollar[1].p, ObjectName{pos: yyDollar[1].p, Name: lowerIdent(yyDollar[1].str)}, yyDollar[3].node.(*callArgs))
 		}
 	case 629:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3505
+//line ../../tmp/goopg_grammar.y:3507
 		{
 			yyVAL.expr = columnRefFromParts(yyDollar[1].qn)
 		}
 	case 630:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3509
+//line ../../tmp/goopg_grammar.y:3511
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			// Pass $3 through NIL. Legacy's parseFuncCallTail returns on the
@@ -15146,7 +15148,7 @@ yydefault:
 		}
 	case 631:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3519
+//line ../../tmp/goopg_grammar.y:3521
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			_ = ft
@@ -15154,7 +15156,7 @@ yydefault:
 		}
 	case 632:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3525
+//line ../../tmp/goopg_grammar.y:3527
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := NewFuncCall(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, nil, true)
@@ -15163,7 +15165,7 @@ yydefault:
 		}
 	case 633:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3532
+//line ../../tmp/goopg_grammar.y:3534
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := NewFuncCall(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, nil, true)
@@ -15173,7 +15175,7 @@ yydefault:
 		}
 	case 634:
 		yyDollar = yyS[yypt-9 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3540
+//line ../../tmp/goopg_grammar.y:3542
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := NewFuncCall(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, nil, true)
@@ -15183,7 +15185,7 @@ yydefault:
 		}
 	case 635:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3548
+//line ../../tmp/goopg_grammar.y:3550
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := NewFuncCall(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, nil, true)
@@ -15192,7 +15194,7 @@ yydefault:
 		}
 	case 636:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3555
+//line ../../tmp/goopg_grammar.y:3557
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := NewFuncCall(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, nil, true)
@@ -15201,7 +15203,7 @@ yydefault:
 		}
 	case 637:
 		yyDollar = yyS[yypt-9 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3562
+//line ../../tmp/goopg_grammar.y:3564
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := NewFuncCall(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, yyDollar[4].exprs, false)
@@ -15211,7 +15213,7 @@ yydefault:
 		}
 	case 638:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3570
+//line ../../tmp/goopg_grammar.y:3572
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			_ = ft
@@ -15221,7 +15223,7 @@ yydefault:
 		}
 	case 639:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3578
+//line ../../tmp/goopg_grammar.y:3580
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := NewFuncCall(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, yyDollar[4].exprs, false)
@@ -15231,7 +15233,7 @@ yydefault:
 		}
 	case 640:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3586
+//line ../../tmp/goopg_grammar.y:3588
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := NewFuncCall(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, yyDollar[4].exprs, false)
@@ -15241,7 +15243,7 @@ yydefault:
 		}
 	case 641:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3594
+//line ../../tmp/goopg_grammar.y:3596
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := callFuncExpr(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, yyDollar[3].node.(*callArgs))
@@ -15250,7 +15252,7 @@ yydefault:
 		}
 	case 642:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3606
+//line ../../tmp/goopg_grammar.y:3608
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := callFuncExpr(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, yyDollar[3].node.(*callArgs))
@@ -15259,7 +15261,7 @@ yydefault:
 		}
 	case 643:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3613
+//line ../../tmp/goopg_grammar.y:3615
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := callFuncExpr(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, yyDollar[3].node.(*callArgs))
@@ -15268,7 +15270,7 @@ yydefault:
 		}
 	case 644:
 		yyDollar = yyS[yypt-11 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3624
+//line ../../tmp/goopg_grammar.y:3626
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := callFuncExpr(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, yyDollar[3].node.(*callArgs))
@@ -15278,7 +15280,7 @@ yydefault:
 		}
 	case 645:
 		yyDollar = yyS[yypt-9 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3632
+//line ../../tmp/goopg_grammar.y:3634
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := callFuncExpr(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, yyDollar[3].node.(*callArgs))
@@ -15288,7 +15290,7 @@ yydefault:
 		}
 	case 646:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3642
+//line ../../tmp/goopg_grammar.y:3644
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := NewFuncCall(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, yyDollar[4].exprs, false)
@@ -15298,7 +15300,7 @@ yydefault:
 		}
 	case 647:
 		yyDollar = yyS[yypt-9 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3656
+//line ../../tmp/goopg_grammar.y:3658
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := NewFuncCall(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, yyDollar[4].exprs, false)
@@ -15309,7 +15311,7 @@ yydefault:
 		}
 	case 648:
 		yyDollar = yyS[yypt-11 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3665
+//line ../../tmp/goopg_grammar.y:3667
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := NewFuncCall(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, yyDollar[4].exprs, false)
@@ -15321,7 +15323,7 @@ yydefault:
 		}
 	case 649:
 		yyDollar = yyS[yypt-13 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3675
+//line ../../tmp/goopg_grammar.y:3677
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := NewFuncCall(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, yyDollar[4].exprs, false)
@@ -15333,7 +15335,7 @@ yydefault:
 		}
 	case 650:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3685
+//line ../../tmp/goopg_grammar.y:3687
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			_ = ft
@@ -15343,7 +15345,7 @@ yydefault:
 		}
 	case 651:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3693
+//line ../../tmp/goopg_grammar.y:3695
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			_ = ft
@@ -15354,7 +15356,7 @@ yydefault:
 		}
 	case 652:
 		yyDollar = yyS[yypt-9 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3702
+//line ../../tmp/goopg_grammar.y:3704
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			_ = ft
@@ -15365,7 +15367,7 @@ yydefault:
 		}
 	case 653:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3713
+//line ../../tmp/goopg_grammar.y:3715
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := callFuncExpr(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, yyDollar[3].node.(*callArgs))
@@ -15375,7 +15377,7 @@ yydefault:
 		}
 	case 654:
 		yyDollar = yyS[yypt-10 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3721
+//line ../../tmp/goopg_grammar.y:3723
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := callFuncExpr(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, yyDollar[3].node.(*callArgs))
@@ -15386,7 +15388,7 @@ yydefault:
 		}
 	case 655:
 		yyDollar = yyS[yypt-12 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3730
+//line ../../tmp/goopg_grammar.y:3732
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			fc := callFuncExpr(yyDollar[1].qn.pos, ObjectName{pos: yyDollar[1].qn.pos, Schema: ft.schema, Name: ft.name}, yyDollar[3].node.(*callArgs))
@@ -15397,7 +15399,7 @@ yydefault:
 		}
 	case 656:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3739
+//line ../../tmp/goopg_grammar.y:3741
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			_ = ft
@@ -15409,7 +15411,7 @@ yydefault:
 		}
 	case 657:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3749
+//line ../../tmp/goopg_grammar.y:3751
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			_ = ft
@@ -15422,7 +15424,7 @@ yydefault:
 		}
 	case 658:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3764
+//line ../../tmp/goopg_grammar.y:3766
 		{
 			ft := splitFuncName(yyDollar[1].qn)
 			_ = ft
@@ -15435,7 +15437,7 @@ yydefault:
 		}
 	case 659:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3779
+//line ../../tmp/goopg_grammar.y:3781
 		{
 			raiseErr(yylex, &SyntaxError{
 				Pos:     yyDollar[8].p,
@@ -15449,13 +15451,13 @@ yydefault:
 		}
 	case 660:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3794
+//line ../../tmp/goopg_grammar.y:3796
 		{
 			yyVAL.node = yyDollar[4].expr
 		}
 	case 661:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3800
+//line ../../tmp/goopg_grammar.y:3802
 		{
 			/* $6, not $5: WITHIN=1 GROUP=2 '('=3 ORDER=4 BY=5 list=6.
 			   $5 is the BY keyword, so the type assertion at every call
@@ -15468,353 +15470,353 @@ yydefault:
 		}
 	case 662:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3819
+//line ../../tmp/goopg_grammar.y:3821
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 663:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3820
+//line ../../tmp/goopg_grammar.y:3822
 		{
 			yyVAL.str = qualOpName(yyDollar[1].qn)
 		}
 	case 664:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3821
+//line ../../tmp/goopg_grammar.y:3823
 		{
 			yyVAL.str = "="
 		}
 	case 665:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3822
+//line ../../tmp/goopg_grammar.y:3824
 		{
 			yyVAL.str = "<"
 		}
 	case 666:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3823
+//line ../../tmp/goopg_grammar.y:3825
 		{
 			yyVAL.str = ">"
 		}
 	case 667:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3824
+//line ../../tmp/goopg_grammar.y:3826
 		{
 			yyVAL.str = "<="
 		}
 	case 668:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3825
+//line ../../tmp/goopg_grammar.y:3827
 		{
 			yyVAL.str = ">="
 		}
 	case 669:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3826
+//line ../../tmp/goopg_grammar.y:3828
 		{
 			yyVAL.str = "<>"
 		}
 	case 670:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3848
+//line ../../tmp/goopg_grammar.y:3850
 		{
 			yyVAL.qn = qname{parts: yyDollar[3].qn.parts, pos: yyDollar[1].p}
 		}
 	case 671:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3856
+//line ../../tmp/goopg_grammar.y:3858
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 672:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3860
+//line ../../tmp/goopg_grammar.y:3862
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 673:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3864
+//line ../../tmp/goopg_grammar.y:3866
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 674:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3870
+//line ../../tmp/goopg_grammar.y:3872
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 675:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3874
+//line ../../tmp/goopg_grammar.y:3876
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 676:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3878
+//line ../../tmp/goopg_grammar.y:3880
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 677:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3882
+//line ../../tmp/goopg_grammar.y:3884
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 678:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3898
+//line ../../tmp/goopg_grammar.y:3900
 		{
 			yyVAL.ival = int(OpLike)
 		}
 	case 679:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3899
+//line ../../tmp/goopg_grammar.y:3901
 		{
 			yyVAL.ival = int(OpILike)
 		}
 	case 680:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3900
+//line ../../tmp/goopg_grammar.y:3902
 		{
 			yyVAL.ival = int(OpNotLike)
 		}
 	case 681:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3901
+//line ../../tmp/goopg_grammar.y:3903
 		{
 			yyVAL.ival = int(OpNotILike)
 		}
 	case 682:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3905
+//line ../../tmp/goopg_grammar.y:3907
 		{
 		}
 	case 683:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3906
+//line ../../tmp/goopg_grammar.y:3908
 		{
 		}
 	case 684:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3917
+//line ../../tmp/goopg_grammar.y:3919
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 685:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3918
+//line ../../tmp/goopg_grammar.y:3920
 		{
 			yyVAL.str = yyDollar[3].str
 		}
 	case 686:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3921
+//line ../../tmp/goopg_grammar.y:3923
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 687:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3922
+//line ../../tmp/goopg_grammar.y:3924
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 688:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3926
+//line ../../tmp/goopg_grammar.y:3928
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 689:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3930
+//line ../../tmp/goopg_grammar.y:3932
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 690:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3938
+//line ../../tmp/goopg_grammar.y:3940
 		{
 			yyVAL.str = lowerIdent(yyDollar[1].str)
 		}
 	case 691:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3939
+//line ../../tmp/goopg_grammar.y:3941
 		{
 			yyVAL.str = "year"
 		}
 	case 692:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3940
+//line ../../tmp/goopg_grammar.y:3942
 		{
 			yyVAL.str = "month"
 		}
 	case 693:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3941
+//line ../../tmp/goopg_grammar.y:3943
 		{
 			yyVAL.str = "day"
 		}
 	case 694:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3942
+//line ../../tmp/goopg_grammar.y:3944
 		{
 			yyVAL.str = "hour"
 		}
 	case 695:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3943
+//line ../../tmp/goopg_grammar.y:3945
 		{
 			yyVAL.str = "minute"
 		}
 	case 696:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3944
+//line ../../tmp/goopg_grammar.y:3946
 		{
 			yyVAL.str = "second"
 		}
 	case 697:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3956
+//line ../../tmp/goopg_grammar.y:3958
 		{
 			yyVAL.ivq = ivQual{hi: yyDollar[1].str, prec: -1}
 		}
 	case 698:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3959
+//line ../../tmp/goopg_grammar.y:3961
 		{
 			yyVAL.ivq = ivQual{hi: yyDollar[1].str, prec: yyDollar[3].ival}
 		}
 	case 699:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3960
+//line ../../tmp/goopg_grammar.y:3962
 		{
 			yyVAL.ivq = ivQual{hi: yyDollar[1].str, lo: yyDollar[3].str, prec: -1}
 		}
 	case 700:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3961
+//line ../../tmp/goopg_grammar.y:3963
 		{
 			yyVAL.ivq = ivQual{hi: yyDollar[1].str, lo: yyDollar[3].str, prec: yyDollar[5].ival}
 		}
 	case 701:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3964
+//line ../../tmp/goopg_grammar.y:3966
 		{
 			yyVAL.str = "year"
 		}
 	case 702:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3965
+//line ../../tmp/goopg_grammar.y:3967
 		{
 			yyVAL.str = "month"
 		}
 	case 703:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3966
+//line ../../tmp/goopg_grammar.y:3968
 		{
 			yyVAL.str = "day"
 		}
 	case 704:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3967
+//line ../../tmp/goopg_grammar.y:3969
 		{
 			yyVAL.str = "hour"
 		}
 	case 705:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3968
+//line ../../tmp/goopg_grammar.y:3970
 		{
 			yyVAL.str = "minute"
 		}
 	case 706:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3969
+//line ../../tmp/goopg_grammar.y:3971
 		{
 			yyVAL.str = "second"
 		}
 	case 707:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3973
+//line ../../tmp/goopg_grammar.y:3975
 		{
 			yyVAL.ct = castType{name: yyDollar[1].str}
 		}
 	case 708:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3975
+//line ../../tmp/goopg_grammar.y:3977
 		{
 			yyVAL.ct = castType{name: "float8"}
 		}
 	case 709:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3977
+//line ../../tmp/goopg_grammar.y:3979
 		{
 			yyVAL.ct = castType{name: "varchar"}
 		}
 	case 710:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3979
+//line ../../tmp/goopg_grammar.y:3981
 		{
 			yyVAL.ct = castType{name: "varchar"}
 		}
 	case 711:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3981
+//line ../../tmp/goopg_grammar.y:3983
 		{
 			yyVAL.ct = castType{name: lowerIdent(yyDollar[1].str)}
 		}
 	case 712:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3983
+//line ../../tmp/goopg_grammar.y:3985
 		{
 			yyVAL.ct = castType{name: "character"}
 		}
 	case 713:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3985
+//line ../../tmp/goopg_grammar.y:3987
 		{
 			yyVAL.ct = castType{name: "varbit"}
 		}
 	case 714:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3987
+//line ../../tmp/goopg_grammar.y:3989
 		{
 			yyVAL.ct = castType{name: "bit"}
 		}
 	case 715:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3989
+//line ../../tmp/goopg_grammar.y:3991
 		{
 			yyVAL.ct = castType{name: tzJoin("time", yyDollar[2].str)}
 		}
 	case 716:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3991
+//line ../../tmp/goopg_grammar.y:3993
 		{
 			yyVAL.ct = castType{name: tzJoin("timestamp", yyDollar[2].str)}
 		}
 	case 717:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3996
+//line ../../tmp/goopg_grammar.y:3998
 		{
 			yyVAL.ct = castType{name: tzJoin("time", yyDollar[5].str), args: []int64{int64(yyDollar[3].ival)}}
 		}
 	case 718:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:3998
+//line ../../tmp/goopg_grammar.y:4000
 		{
 			yyVAL.ct = castType{name: tzJoin("timestamp", yyDollar[5].str), args: []int64{int64(yyDollar[3].ival)}}
 		}
 	case 719:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4000
+//line ../../tmp/goopg_grammar.y:4002
 		{
 			yyVAL.ct = castType{schema: yyDollar[1].str, name: yyDollar[3].str}
 		}
 	case 720:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4006
+//line ../../tmp/goopg_grammar.y:4008
 		{
 			c, cl, ok := IntervalQualTypmods(yyDollar[2].ivq.hi, yyDollar[2].ivq.lo, yyDollar[2].ivq.prec)
 			if !ok {
@@ -15825,223 +15827,223 @@ yydefault:
 		}
 	case 721:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4019
+//line ../../tmp/goopg_grammar.y:4021
 		{
 			yyVAL.ct = yyDollar[1].ct.withArrays(yyDollar[2].ival)
 		}
 	case 722:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4024
+//line ../../tmp/goopg_grammar.y:4026
 		{
 			yyVAL.ival = 0
 		}
 	case 723:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4025
+//line ../../tmp/goopg_grammar.y:4027
 		{
 			yyVAL.ival = yyDollar[3].ival + 1
 		}
 	case 724:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4028
+//line ../../tmp/goopg_grammar.y:4030
 		{
 			yyVAL.str = "character"
 		}
 	case 725:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4029
+//line ../../tmp/goopg_grammar.y:4031
 		{
 			yyVAL.str = "char"
 		}
 	case 726:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4030
+//line ../../tmp/goopg_grammar.y:4032
 		{
 			yyVAL.str = "character"
 		}
 	case 727:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4033
+//line ../../tmp/goopg_grammar.y:4035
 		{
 			yyVAL.str = "double"
 		}
 	case 728:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4034
+//line ../../tmp/goopg_grammar.y:4036
 		{
 			yyVAL.str = "precision"
 		}
 	case 729:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4037
+//line ../../tmp/goopg_grammar.y:4039
 		{
 			yyVAL.str = ""
 		}
 	case 730:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4038
+//line ../../tmp/goopg_grammar.y:4040
 		{
 			yyVAL.str = "tz"
 		}
 	case 731:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4039
+//line ../../tmp/goopg_grammar.y:4041
 		{
 			yyVAL.str = ""
 		}
 	case 732:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4046
+//line ../../tmp/goopg_grammar.y:4048
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 733:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4047
+//line ../../tmp/goopg_grammar.y:4049
 		{
 			yyVAL.str = "varchar"
 		}
 	case 734:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4048
+//line ../../tmp/goopg_grammar.y:4050
 		{
 			yyVAL.str = "text"
 		}
 	case 735:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4049
+//line ../../tmp/goopg_grammar.y:4051
 		{
 			yyVAL.str = "name"
 		}
 	case 736:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4050
+//line ../../tmp/goopg_grammar.y:4052
 		{
 			yyVAL.str = "bigint"
 		}
 	case 737:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4051
+//line ../../tmp/goopg_grammar.y:4053
 		{
 			yyVAL.str = "int"
 		}
 	case 738:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4052
+//line ../../tmp/goopg_grammar.y:4054
 		{
 			yyVAL.str = "integer"
 		}
 	case 739:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4053
+//line ../../tmp/goopg_grammar.y:4055
 		{
 			yyVAL.str = "smallint"
 		}
 	case 740:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4054
+//line ../../tmp/goopg_grammar.y:4056
 		{
 			yyVAL.str = "float"
 		}
 	case 741:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4055
+//line ../../tmp/goopg_grammar.y:4057
 		{
 			yyVAL.str = "real"
 		}
 	case 742:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4056
+//line ../../tmp/goopg_grammar.y:4058
 		{
 			yyVAL.str = "numeric"
 		}
 	case 743:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4057
+//line ../../tmp/goopg_grammar.y:4059
 		{
 			yyVAL.str = "decimal"
 		}
 	case 744:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4058
+//line ../../tmp/goopg_grammar.y:4060
 		{
 			yyVAL.str = "boolean"
 		}
 	case 745:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4059
+//line ../../tmp/goopg_grammar.y:4061
 		{
 			yyVAL.str = "interval"
 		}
 	case 746:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4060
+//line ../../tmp/goopg_grammar.y:4062
 		{
 			yyVAL.str = "unknown"
 		}
 	case 747:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4066
+//line ../../tmp/goopg_grammar.y:4068
 		{
 			yyVAL.str = "json"
 		}
 	case 748:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4067
+//line ../../tmp/goopg_grammar.y:4069
 		{
 			yyVAL.str = "xml"
 		}
 	case 749:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4068
+//line ../../tmp/goopg_grammar.y:4070
 		{
 			yyVAL.str = "path"
 		}
 	case 750:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4076
+//line ../../tmp/goopg_grammar.y:4078
 		{
 			yyVAL.str = "label"
 		}
 	case 751:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4083
+//line ../../tmp/goopg_grammar.y:4085
 		{
 			yyVAL.vrows = [][]Expr{yyDollar[2].exprs}
 		}
 	case 752:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4087
+//line ../../tmp/goopg_grammar.y:4089
 		{
 			yyVAL.vrows = append(yyDollar[1].vrows, yyDollar[4].exprs)
 		}
 	case 753:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4094
+//line ../../tmp/goopg_grammar.y:4096
 		{
 			yyVAL.exprs = []Expr{yyDollar[1].expr}
 		}
 	case 754:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4095
+//line ../../tmp/goopg_grammar.y:4097
 		{
 			yyVAL.exprs = append(yyDollar[1].exprs, yyDollar[3].expr)
 		}
 	case 755:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4098
+//line ../../tmp/goopg_grammar.y:4100
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
 	case 756:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4099
+//line ../../tmp/goopg_grammar.y:4101
 		{
 			yyVAL.expr = NewDefaultMarker(yyDollar[1].p)
 		}
 	case 757:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4108
+//line ../../tmp/goopg_grammar.y:4110
 		{
 			is := yyDollar[1].stmt.(*InsertStmt)
 			is.OnConflict = yyDollar[2].oc
@@ -16052,7 +16054,7 @@ yydefault:
 		}
 	case 758:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4126
+//line ../../tmp/goopg_grammar.y:4128
 		{
 			src := yyDollar[5].node.(*insRest)
 			rv, cols := insertTarget(yyDollar[3].qn, yyDollar[4].str, src.cols)
@@ -16067,7 +16069,7 @@ yydefault:
 		}
 	case 759:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4139
+//line ../../tmp/goopg_grammar.y:4141
 		{
 			src := yyDollar[6].node.(*insRest)
 			rv, cols := insertTarget(yyDollar[4].qn, yyDollar[5].str, src.cols)
@@ -16085,37 +16087,37 @@ yydefault:
 		}
 	case 760:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4159
+//line ../../tmp/goopg_grammar.y:4161
 		{
 			yyVAL.oc = nil
 		}
 	case 761:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4161
+//line ../../tmp/goopg_grammar.y:4163
 		{
 			yyVAL.oc = NewOnConflictClauseAt(yyDollar[1].p, yyDollar[3].oct, OnConflictNothing, nil, nil)
 		}
 	case 762:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4163
+//line ../../tmp/goopg_grammar.y:4165
 		{
 			yyVAL.oc = NewOnConflictClauseAt(yyDollar[1].p, yyDollar[3].oct, OnConflictUpdate, yyDollar[7].ualist, yyDollar[8].expr)
 		}
 	case 763:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4166
+//line ../../tmp/goopg_grammar.y:4168
 		{
 			yyVAL.oct = nil
 		}
 	case 764:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4167
+//line ../../tmp/goopg_grammar.y:4169
 		{
 			yyVAL.oct = arbiterAt(arbiterFromExprs(yyDollar[2].exprs), yyDollar[2].p)
 		}
 	case 765:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4169
+//line ../../tmp/goopg_grammar.y:4171
 		{
 			t := arbiterAt(arbiterFromExprs(yyDollar[2].exprs), yyDollar[2].p)
 			t.Where = yyDollar[5].expr
@@ -16123,109 +16125,109 @@ yydefault:
 		}
 	case 766:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4174
+//line ../../tmp/goopg_grammar.y:4176
 		{
 			yyVAL.oct = arbiterAt(NewOnConflictTarget(nil, yyDollar[3].str, nil), yyDollar[1].p)
 		}
 	case 767:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4177
+//line ../../tmp/goopg_grammar.y:4179
 		{
 			yyVAL.ualist = []UpdateAssign{yyDollar[1].ua}
 		}
 	case 768:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4178
+//line ../../tmp/goopg_grammar.y:4180
 		{
 			yyVAL.ualist = append(yyDollar[1].ualist, yyDollar[3].ua)
 		}
 	case 769:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4182
+//line ../../tmp/goopg_grammar.y:4184
 		{
 			yyVAL.ua = *NewUpdateAssignAt(yyDollar[1].p, yyDollar[1].str, "", nil, yyDollar[3].expr)
 		}
 	case 770:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4185
+//line ../../tmp/goopg_grammar.y:4187
 		{
 			yyVAL.ua = *NewUpdateAssignAt(yyDollar[1].p, yyDollar[1].str, "", nil, NewDefaultMarker(yyDollar[3].p))
 		}
 	case 771:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4187
+//line ../../tmp/goopg_grammar.y:4189
 		{
 			yyVAL.ua = *NewUpdateAssignAt(yyDollar[1].p, yyDollar[3].str, yyDollar[1].str, nil, yyDollar[5].expr)
 		}
 	case 772:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4196
+//line ../../tmp/goopg_grammar.y:4198
 		{
 			yyVAL.ua = *NewUpdateAssignAt(yyDollar[1].p, "", "", yyDollar[2].strs, multiSetRHS(yylex, yyDollar[5].expr, yyDollar[5].p))
 		}
 	case 773:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4199
+//line ../../tmp/goopg_grammar.y:4201
 		{
 			yyVAL.expr = nil
 		}
 	case 774:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4200
+//line ../../tmp/goopg_grammar.y:4202
 		{
 			yyVAL.expr = yyDollar[2].expr
 		}
 	case 775:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4204
+//line ../../tmp/goopg_grammar.y:4206
 		{
 			yyVAL.targets = nil
 		}
 	case 776:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4208
+//line ../../tmp/goopg_grammar.y:4210
 		{
 			yyVAL.targets = yyDollar[2].targets
 		}
 	case 777:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4213
+//line ../../tmp/goopg_grammar.y:4215
 		{
 			yyVAL.str = ""
 		}
 	case 778:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4214
+//line ../../tmp/goopg_grammar.y:4216
 		{
 			yyVAL.str = yyDollar[2].str
 		}
 	case 779:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4217
+//line ../../tmp/goopg_grammar.y:4219
 		{
 			yyVAL.node = &insRest{src: yyDollar[1].isrc}
 		}
 	case 780:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4218
+//line ../../tmp/goopg_grammar.y:4220
 		{
 			yyVAL.node = &insRest{cols: yyDollar[2].strs, src: yyDollar[4].isrc}
 		}
 	case 781:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4221
+//line ../../tmp/goopg_grammar.y:4223
 		{
 			yyVAL.strs = []string{yyDollar[1].str}
 		}
 	case 782:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4222
+//line ../../tmp/goopg_grammar.y:4224
 		{
 			yyVAL.strs = append(yyDollar[1].strs, yyDollar[3].str)
 		}
 	case 783:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4226
+//line ../../tmp/goopg_grammar.y:4228
 		{
 			// Upstream parses INSERT's source as a full select_stmt; a
 			// bare VALUES select converts to Rows here so analyzer/
@@ -16242,14 +16244,14 @@ yydefault:
 		}
 	case 784:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4241
+//line ../../tmp/goopg_grammar.y:4243
 		{
 			i := &insSrc{def: true}
 			yyVAL.isrc = i
 		}
 	case 785:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4249
+//line ../../tmp/goopg_grammar.y:4251
 		{
 			u := yyDollar[1].stmt.(*UpdateStmt)
 			if len(yyDollar[2].targets) > 0 {
@@ -16259,7 +16261,7 @@ yydefault:
 		}
 	case 786:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4259
+//line ../../tmp/goopg_grammar.y:4261
 		{
 			rv := rangeVarFromName(yyDollar[2].qn, yyDollar[3].str)
 			w := yyDollar[7].node.(*updWhere)
@@ -16273,7 +16275,7 @@ yydefault:
 		}
 	case 787:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4273
+//line ../../tmp/goopg_grammar.y:4275
 		{
 			rv := rangeVarFromName(yyDollar[3].qn, yyDollar[4].str)
 			rv.Only = true
@@ -16288,7 +16290,7 @@ yydefault:
 		}
 	case 788:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4286
+//line ../../tmp/goopg_grammar.y:4288
 		{
 			rv := rangeVarFromName(yyDollar[3].qn, yyDollar[4].str)
 			w := yyDollar[8].node.(*updWhere)
@@ -16304,67 +16306,67 @@ yydefault:
 		}
 	case 789:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4303
+//line ../../tmp/goopg_grammar.y:4305
 		{
 			yyVAL.str = ""
 		}
 	case 790:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4304
+//line ../../tmp/goopg_grammar.y:4306
 		{
 			yyVAL.str = yyDollar[2].str
 		}
 	case 791:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4305
+//line ../../tmp/goopg_grammar.y:4307
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 792:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4308
+//line ../../tmp/goopg_grammar.y:4310
 		{
 			yyVAL.rvars = nil
 		}
 	case 793:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4309
+//line ../../tmp/goopg_grammar.y:4311
 		{
 			yyVAL.rvars = yyDollar[2].rvars
 		}
 	case 794:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4319
+//line ../../tmp/goopg_grammar.y:4321
 		{
 			yyVAL.rvars = []RangeVar{yyDollar[1].rvar}
 		}
 	case 795:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4320
+//line ../../tmp/goopg_grammar.y:4322
 		{
 			yyVAL.rvars = append(yyDollar[1].rvars, yyDollar[3].rvar)
 		}
 	case 796:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4326
+//line ../../tmp/goopg_grammar.y:4328
 		{
 			yyVAL.node = &updWhere{}
 		}
 	case 797:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4327
+//line ../../tmp/goopg_grammar.y:4329
 		{
 			yyVAL.node = &updWhere{expr: yyDollar[2].expr}
 		}
 	case 798:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4328
+//line ../../tmp/goopg_grammar.y:4330
 		{
 			yyVAL.node = &updWhere{currentOf: yyDollar[4].str}
 		}
 	case 799:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4336
+//line ../../tmp/goopg_grammar.y:4338
 		{
 			d := yyDollar[1].stmt.(*DeleteStmt)
 			if len(yyDollar[2].targets) > 0 {
@@ -16374,7 +16376,7 @@ yydefault:
 		}
 	case 800:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4346
+//line ../../tmp/goopg_grammar.y:4348
 		{
 			rv := rangeVarFromName(yyDollar[3].qn, yyDollar[4].str)
 			w := yyDollar[6].node.(*updWhere)
@@ -16388,7 +16390,7 @@ yydefault:
 		}
 	case 801:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4358
+//line ../../tmp/goopg_grammar.y:4360
 		{
 			rv := rangeVarFromName(yyDollar[4].qn, yyDollar[5].str)
 			rv.Only = true
@@ -16403,7 +16405,7 @@ yydefault:
 		}
 	case 802:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4371
+//line ../../tmp/goopg_grammar.y:4373
 		{
 			rv := rangeVarFromName(yyDollar[4].qn, yyDollar[5].str)
 			w := yyDollar[7].node.(*updWhere)
@@ -16419,43 +16421,43 @@ yydefault:
 		}
 	case 803:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4386
+//line ../../tmp/goopg_grammar.y:4388
 		{
 			yyVAL.rvars = nil
 		}
 	case 804:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4387
+//line ../../tmp/goopg_grammar.y:4389
 		{
 			yyVAL.rvars = yyDollar[2].rvars
 		}
 	case 805:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4390
+//line ../../tmp/goopg_grammar.y:4392
 		{
 			yyVAL.node = &updWhere{}
 		}
 	case 806:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4391
+//line ../../tmp/goopg_grammar.y:4393
 		{
 			yyVAL.node = &updWhere{expr: yyDollar[2].expr}
 		}
 	case 807:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4392
+//line ../../tmp/goopg_grammar.y:4394
 		{
 			yyVAL.node = &updWhere{currentOf: yyDollar[4].str}
 		}
 	case 808:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4396
+//line ../../tmp/goopg_grammar.y:4398
 		{
 			yyVAL.node = &colConstraints{}
 		}
 	case 809:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4398
+//line ../../tmp/goopg_grammar.y:4400
 		{
 			cc := yyDollar[1].node.(*colConstraints)
 			k := yyDollar[2].node.(*colConstraint)
@@ -16552,19 +16554,19 @@ yydefault:
 		}
 	case 810:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4494
+//line ../../tmp/goopg_grammar.y:4496
 		{
 			yyVAL.node = &colConstraint{kind: "nn"}
 		}
 	case 811:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4495
+//line ../../tmp/goopg_grammar.y:4497
 		{
 			yyVAL.node = &colConstraint{kind: "nn_noinh"}
 		}
 	case 812:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4500
+//line ../../tmp/goopg_grammar.y:4502
 		{
 			c := yyDollar[3].node.(*colConstraint)
 			c.name = yyDollar[2].str
@@ -16572,43 +16574,43 @@ yydefault:
 		}
 	case 813:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4509
+//line ../../tmp/goopg_grammar.y:4511
 		{
 			yyVAL.node = &colConstraint{kind: "collate", text: yyDollar[2].str}
 		}
 	case 814:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4510
+//line ../../tmp/goopg_grammar.y:4512
 		{
 			yyVAL.node = &colConstraint{kind: "compression", text: yyDollar[2].str}
 		}
 	case 815:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4519
+//line ../../tmp/goopg_grammar.y:4521
 		{
 			yyVAL.node = &colConstraint{kind: "pk"}
 		}
 	case 816:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4520
+//line ../../tmp/goopg_grammar.y:4522
 		{
 			yyVAL.node = &colConstraint{kind: "uq"}
 		}
 	case 817:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4521
+//line ../../tmp/goopg_grammar.y:4523
 		{
 			yyVAL.node = &colConstraint{kind: "uq_nnd"}
 		}
 	case 818:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4522
+//line ../../tmp/goopg_grammar.y:4524
 		{
 			yyVAL.node = &colConstraint{kind: "uq"}
 		}
 	case 819:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4536
+//line ../../tmp/goopg_grammar.y:4538
 		{
 			k := "gen"
 			if yyDollar[7].b {
@@ -16618,7 +16620,7 @@ yydefault:
 		}
 	case 820:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4545
+//line ../../tmp/goopg_grammar.y:4547
 		{
 			k := "gen"
 			if yyDollar[8].b {
@@ -16628,49 +16630,49 @@ yydefault:
 		}
 	case 821:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4553
+//line ../../tmp/goopg_grammar.y:4555
 		{
 			yyVAL.node = &colConstraint{kind: "identity_always", seq: yyDollar[5].node.(*identityOpts)}
 		}
 	case 822:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4555
+//line ../../tmp/goopg_grammar.y:4557
 		{
 			yyVAL.node = &colConstraint{kind: "identity_default", seq: yyDollar[6].node.(*identityOpts)}
 		}
 	case 823:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4556
+//line ../../tmp/goopg_grammar.y:4558
 		{
 			yyVAL.node = &colConstraint{kind: "attr_deferrable"}
 		}
 	case 824:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4557
+//line ../../tmp/goopg_grammar.y:4559
 		{
 			yyVAL.node = &colConstraint{kind: "attr_not_deferrable"}
 		}
 	case 825:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4558
+//line ../../tmp/goopg_grammar.y:4560
 		{
 			yyVAL.node = &colConstraint{kind: "attr_initially_deferred"}
 		}
 	case 826:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4559
+//line ../../tmp/goopg_grammar.y:4561
 		{
 			yyVAL.node = &colConstraint{kind: "attr_initially_immediate"}
 		}
 	case 827:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4563
+//line ../../tmp/goopg_grammar.y:4565
 		{
 			yyVAL.node = &colConstraint{kind: "def", expr: yyDollar[2].expr}
 		}
 	case 828:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4569
+//line ../../tmp/goopg_grammar.y:4571
 		{
 			k := "check"
 			if yyDollar[2].b {
@@ -16680,37 +16682,37 @@ yydefault:
 		}
 	case 829:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4580
+//line ../../tmp/goopg_grammar.y:4582
 		{
 			yyVAL.node = &colConstraint{kind: "attr_not_enforced"}
 		}
 	case 830:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4581
+//line ../../tmp/goopg_grammar.y:4583
 		{
 			yyVAL.node = &colConstraint{kind: "attr_enforced"}
 		}
 	case 831:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4584
+//line ../../tmp/goopg_grammar.y:4586
 		{
 			yyVAL.node = &colConstraint{kind: "attr_not_valid"}
 		}
 	case 832:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4585
+//line ../../tmp/goopg_grammar.y:4587
 		{
 			yyVAL.node = &colConstraint{kind: "null"}
 		}
 	case 833:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4586
+//line ../../tmp/goopg_grammar.y:4588
 		{
 			yyVAL.node = &colConstraint{kind: "storage", text: yyDollar[2].str}
 		}
 	case 834:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4588
+//line ../../tmp/goopg_grammar.y:4590
 		{
 			i := &colConstraint{kind: "fk"}
 			acts := yyDollar[5].node.(*fkActs)
@@ -16719,50 +16721,50 @@ yydefault:
 		}
 	case 835:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4596
+//line ../../tmp/goopg_grammar.y:4598
 		{
 			yyVAL.strs = nil
 		}
 	case 836:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4597
+//line ../../tmp/goopg_grammar.y:4599
 		{
 			yyVAL.strs = yyDollar[2].strs
 		}
 	case 837:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4600
+//line ../../tmp/goopg_grammar.y:4602
 		{
 			yyVAL.node = &fkActs{}
 		}
 	case 838:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4601
+//line ../../tmp/goopg_grammar.y:4603
 		{
 			yyVAL.node = yyDollar[1].node
 		}
 	case 839:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4604
+//line ../../tmp/goopg_grammar.y:4606
 		{
 			i := &fkActs{}
 			yyVAL.node = applyFkAction(i, yyDollar[1].node.(*namedFkAct))
 		}
 	case 840:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4605
+//line ../../tmp/goopg_grammar.y:4607
 		{
 			yyVAL.node = applyFkAction(yyDollar[1].node.(*fkActs), yyDollar[2].node.(*namedFkAct))
 		}
 	case 841:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4608
+//line ../../tmp/goopg_grammar.y:4610
 		{
 			yyVAL.node = &namedFkAct{del: true, act: yyDollar[3].node.(FKAction)}
 		}
 	case 842:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4610
+//line ../../tmp/goopg_grammar.y:4612
 		{
 			sa := yyDollar[3].node.(*namedFkAct)
 			sa.del = true
@@ -16770,19 +16772,19 @@ yydefault:
 		}
 	case 843:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4615
+//line ../../tmp/goopg_grammar.y:4617
 		{
 			yyVAL.node = &namedFkAct{up: true, act: yyDollar[4].node.(FKAction)}
 		}
 	case 844:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4616
+//line ../../tmp/goopg_grammar.y:4618
 		{
 			yyVAL.node = &namedFkAct{up: true, act: yyDollar[3].node.(FKAction)}
 		}
 	case 845:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4618
+//line ../../tmp/goopg_grammar.y:4620
 		{
 			sa := yyDollar[3].node.(*namedFkAct)
 			sa.up = true
@@ -16790,109 +16792,109 @@ yydefault:
 		}
 	case 846:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4628
+//line ../../tmp/goopg_grammar.y:4630
 		{
 			yyVAL.node = &namedFkAct{act: FKActionSetNull, setCols: yyDollar[3].strs}
 		}
 	case 847:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4629
+//line ../../tmp/goopg_grammar.y:4631
 		{
 			yyVAL.node = &namedFkAct{act: FKActionSetDefault, setCols: yyDollar[3].strs}
 		}
 	case 848:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4632
+//line ../../tmp/goopg_grammar.y:4634
 		{
 			yyVAL.strs = nil
 		}
 	case 849:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4633
+//line ../../tmp/goopg_grammar.y:4635
 		{
 			yyVAL.strs = yyDollar[2].strs
 		}
 	case 850:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4636
+//line ../../tmp/goopg_grammar.y:4638
 		{
 			yyVAL.b = false
 		}
 	case 851:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4637
+//line ../../tmp/goopg_grammar.y:4639
 		{
 			yyVAL.b = true
 		}
 	case 852:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4638
+//line ../../tmp/goopg_grammar.y:4640
 		{
 			yyVAL.b = false
 		}
 	case 853:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4639
+//line ../../tmp/goopg_grammar.y:4641
 		{
 			yyVAL.b = false
 		}
 	case 854:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4642
+//line ../../tmp/goopg_grammar.y:4644
 		{
 			yyVAL.b = false
 		}
 	case 855:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4643
+//line ../../tmp/goopg_grammar.y:4645
 		{
 			yyVAL.b = false
 		}
 	case 856:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4644
+//line ../../tmp/goopg_grammar.y:4646
 		{
 			yyVAL.b = true
 		}
 	case 857:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4647
+//line ../../tmp/goopg_grammar.y:4649
 		{
 			yyVAL.b = true
 		}
 	case 858:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4648
+//line ../../tmp/goopg_grammar.y:4650
 		{
 			yyVAL.b = false
 		}
 	case 859:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4649
+//line ../../tmp/goopg_grammar.y:4651
 		{
 			yyVAL.b = true
 		}
 	case 860:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4652
+//line ../../tmp/goopg_grammar.y:4654
 		{
 			yyVAL.node = FKActionCascade
 		}
 	case 861:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4653
+//line ../../tmp/goopg_grammar.y:4655
 		{
 			yyVAL.node = FKActionRestrict
 		}
 	case 862:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:4654
+//line ../../tmp/goopg_grammar.y:4656
 		{
 			yyVAL.node = FKActionNoAction
 		}
 	case 1851:
 		yyDollar = yyS[yypt-10 : yypt+1]
-//line ../../tmp/goopg_grammar.y:5683
+//line ../../tmp/goopg_grammar.y:5685
 		{
 			elems := yyDollar[7].node.([]*tableElem)
 			var cols []ColumnDef
@@ -17097,7 +17099,7 @@ yydefault:
 		}
 	case 1852:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:5886
+//line ../../tmp/goopg_grammar.y:5888
 		{
 			tbl := objectNameFromQn(yyDollar[5].qn)
 			ct := NewCreateTableStmt(0, tbl, nil, nil)
@@ -17133,7 +17135,7 @@ yydefault:
 		}
 	case 1853:
 		yyDollar = yyS[yypt-9 : yypt+1]
-//line ../../tmp/goopg_grammar.y:5925
+//line ../../tmp/goopg_grammar.y:5927
 		{
 			src := yyDollar[8].node.(*ctasSrc)
 			ct := NewCreateTableStmt(0, objectNameFromQn(yyDollar[5].qn), nil, nil)
@@ -17148,7 +17150,7 @@ yydefault:
 		}
 	case 1854:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:5940
+//line ../../tmp/goopg_grammar.y:5942
 		{
 			ct := NewCreateTableStmt(0, objectNameFromQn(yyDollar[5].qn), nil, nil)
 			if pfx := yyDollar[2].node.(*createPrefix); pfx != nil {
@@ -17163,19 +17165,19 @@ yydefault:
 		}
 	case 1855:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:5955
+//line ../../tmp/goopg_grammar.y:5957
 		{
 			yyVAL.node = &partBound{inVals: yyDollar[5].exprs}
 		}
 	case 1856:
 		yyDollar = yyS[yypt-10 : yypt+1]
-//line ../../tmp/goopg_grammar.y:5962
+//line ../../tmp/goopg_grammar.y:5964
 		{
 			yyVAL.node = &partBound{from: partBoundValues(yylex, yyDollar[5].exprs), to: partBoundValues(yylex, yyDollar[9].exprs)}
 		}
 	case 1857:
 		yyDollar = yyS[yypt-10 : yypt+1]
-//line ../../tmp/goopg_grammar.y:5968
+//line ../../tmp/goopg_grammar.y:5970
 		{
 			m, r := int64(yyDollar[6].ival), int64(yyDollar[9].ival)
 			if !eqFold(yyDollar[5].str, "modulus") || !eqFold(yyDollar[8].str, "remainder") {
@@ -17185,73 +17187,73 @@ yydefault:
 		}
 	case 1858:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:5976
+//line ../../tmp/goopg_grammar.y:5978
 		{
 			yyVAL.node = &partBound{isDefault: true}
 		}
 	case 1859:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:5982
+//line ../../tmp/goopg_grammar.y:5984
 		{
 			yyVAL.node = (*createPrefix)(nil)
 		}
 	case 1860:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:5983
+//line ../../tmp/goopg_grammar.y:5985
 		{
 			yyVAL.node = &createPrefix{temporary: true}
 		}
 	case 1861:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:5984
+//line ../../tmp/goopg_grammar.y:5986
 		{
 			yyVAL.node = &createPrefix{temporary: true}
 		}
 	case 1862:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:5985
+//line ../../tmp/goopg_grammar.y:5987
 		{
 			yyVAL.node = &createPrefix{unlogged: true}
 		}
 	case 1863:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:5988
+//line ../../tmp/goopg_grammar.y:5990
 		{
 			yyVAL.b = false
 		}
 	case 1864:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:5989
+//line ../../tmp/goopg_grammar.y:5991
 		{
 			yyVAL.b = true
 		}
 	case 1865:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:5994
+//line ../../tmp/goopg_grammar.y:5996
 		{
 			yyVAL.node = []*tableElem(nil)
 		}
 	case 1866:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:5995
+//line ../../tmp/goopg_grammar.y:5997
 		{
 			yyVAL.node = yyDollar[1].node
 		}
 	case 1867:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:5998
+//line ../../tmp/goopg_grammar.y:6000
 		{
 			yyVAL.node = []*tableElem{yyDollar[1].node.(*tableElem)}
 		}
 	case 1868:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:5999
+//line ../../tmp/goopg_grammar.y:6001
 		{
 			yyVAL.node = append(yyDollar[1].node.([]*tableElem), yyDollar[3].node.(*tableElem))
 		}
 	case 1869:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6003
+//line ../../tmp/goopg_grammar.y:6005
 		{
 			cs := &colSpec{name: yyDollar[1].str, namePos: yyDollar[1].p, typePos: yyDollar[2].p}
 			tw := yyDollar[2].node.(*typeWithArgs)
@@ -17291,42 +17293,42 @@ yydefault:
 		}
 	case 1870:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6041
+//line ../../tmp/goopg_grammar.y:6043
 		{
 			a, _ := yyDollar[5].node.(*constrAttrs)
 			yyVAL.node = &tableElem{pk: yyDollar[3].strs, pkIncl: yyDollar[4].strs, pkAttrs: a}
 		}
 	case 1871:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6043
+//line ../../tmp/goopg_grammar.y:6045
 		{
 			a, _ := yyDollar[5].node.(*constrAttrs)
 			yyVAL.node = &tableElem{uq: [][]string{yyDollar[3].strs}, uqNND: yyDollar[2].b, uqIncl: yyDollar[4].strs, uqAttrs: a}
 		}
 	case 1872:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6045
+//line ../../tmp/goopg_grammar.y:6047
 		{
 			a, _ := yyDollar[7].node.(*constrAttrs)
 			yyVAL.node = &tableElem{pk: yyDollar[5].strs, namedPk: namedTableConstraint(yyDollar[2].str, yyDollar[5].strs, true, yyDollar[6].strs, false, a)}
 		}
 	case 1873:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6050
+//line ../../tmp/goopg_grammar.y:6052
 		{
 			a, _ := yyDollar[7].node.(*constrAttrs)
 			yyVAL.node = &tableElem{namedUq: namedTableConstraint(yyDollar[2].str, yyDollar[5].strs, false, yyDollar[6].strs, yyDollar[4].b, a)}
 		}
 	case 1874:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6059
+//line ../../tmp/goopg_grammar.y:6061
 		{
 			n := objectNameFromQn(yyDollar[2].qn)
 			yyVAL.node = &tableElem{like: &n, likeOpts: yyDollar[3].str}
 		}
 	case 1875:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6068
+//line ../../tmp/goopg_grammar.y:6070
 		{
 			a, _ := yyDollar[8].node.(*constrAttrs)
 			w, _ := yyDollar[7].node.(Expr) // opt_exclude_where boxes an untyped nil
@@ -17334,7 +17336,7 @@ yydefault:
 		}
 	case 1876:
 		yyDollar = yyS[yypt-10 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6074
+//line ../../tmp/goopg_grammar.y:6076
 		{
 			a, _ := yyDollar[10].node.(*constrAttrs)
 			w, _ := yyDollar[9].node.(Expr)
@@ -17342,33 +17344,33 @@ yydefault:
 		}
 	case 1877:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6087
+//line ../../tmp/goopg_grammar.y:6089
 		{
 			yyVAL.node = &tableElem{notNull: &tableNotNull{col: yyDollar[3].str, noInherit: yyDollar[4].b}}
 		}
 	case 1878:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6089
+//line ../../tmp/goopg_grammar.y:6091
 		{
 			yyVAL.node = &tableElem{notNull: &tableNotNull{name: yyDollar[2].str, col: yyDollar[5].str, noInherit: yyDollar[6].b}}
 		}
 	case 1879:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6091
+//line ../../tmp/goopg_grammar.y:6093
 		{
 			t := yyDollar[4].node.(*tblCheckTail)
 			yyVAL.node = &tableElem{check: yyDollar[3].str, checkName: yyDollar[2].str, checkNoInh: t.noInherit, checkNotEnf: t.notEnforced}
 		}
 	case 1880:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6099
+//line ../../tmp/goopg_grammar.y:6101
 		{
 			t := yyDollar[2].node.(*tblCheckTail)
 			yyVAL.node = &tableElem{check: yyDollar[1].str, checkNoInh: t.noInherit, checkNotEnf: t.notEnforced}
 		}
 	case 1881:
 		yyDollar = yyS[yypt-11 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6103
+//line ../../tmp/goopg_grammar.y:6105
 		{
 			fk := &TableForeignKeyDef{
 				Columns:         yyDollar[4].strs,
@@ -17387,7 +17389,7 @@ yydefault:
 		}
 	case 1882:
 		yyDollar = yyS[yypt-13 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6120
+//line ../../tmp/goopg_grammar.y:6122
 		{
 			fk := &TableForeignKeyDef{
 				Name:            yyDollar[2].str,
@@ -17407,139 +17409,139 @@ yydefault:
 		}
 	case 1883:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6145
+//line ../../tmp/goopg_grammar.y:6147
 		{
 			yyVAL.str = ""
 		}
 	case 1884:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6146
+//line ../../tmp/goopg_grammar.y:6148
 		{
 			yyVAL.str = yyDollar[1].str + yyDollar[2].str
 		}
 	case 1885:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6149
+//line ../../tmp/goopg_grammar.y:6151
 		{
 			yyVAL.str = likeAllOpts
 		}
 	case 1886:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6150
+//line ../../tmp/goopg_grammar.y:6152
 		{
 			yyVAL.str = ":+" + lowerIdent(yyDollar[2].str)
 		}
 	case 1887:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6151
+//line ../../tmp/goopg_grammar.y:6153
 		{
 			yyVAL.str = ""
 		}
 	case 1888:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6152
+//line ../../tmp/goopg_grammar.y:6154
 		{
 			yyVAL.str = ""
 		}
 	case 1889:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6155
+//line ../../tmp/goopg_grammar.y:6157
 		{
 			yyVAL.node = []excludeElem{yyDollar[1].node.(excludeElem)}
 		}
 	case 1890:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6156
+//line ../../tmp/goopg_grammar.y:6158
 		{
 			yyVAL.node = append(yyDollar[1].node.([]excludeElem), yyDollar[3].node.(excludeElem))
 		}
 	case 1891:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6159
+//line ../../tmp/goopg_grammar.y:6161
 		{
 			yyVAL.node = excludeElem{col: yyDollar[1].str, op: yyDollar[3].str}
 		}
 	case 1892:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6160
+//line ../../tmp/goopg_grammar.y:6162
 		{
 			yyVAL.node = parenExcludeElem(yylex, yyDollar[2].p, yyDollar[3].p, yyDollar[5].str)
 		}
 	case 1893:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6165
+//line ../../tmp/goopg_grammar.y:6167
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 1894:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6166
+//line ../../tmp/goopg_grammar.y:6168
 		{
 			yyVAL.str = "="
 		}
 	case 1895:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6167
+//line ../../tmp/goopg_grammar.y:6169
 		{
 			yyVAL.str = "<"
 		}
 	case 1896:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6168
+//line ../../tmp/goopg_grammar.y:6170
 		{
 			yyVAL.str = ">"
 		}
 	case 1897:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6169
+//line ../../tmp/goopg_grammar.y:6171
 		{
 			yyVAL.str = "<="
 		}
 	case 1898:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6170
+//line ../../tmp/goopg_grammar.y:6172
 		{
 			yyVAL.str = ">="
 		}
 	case 1899:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6171
+//line ../../tmp/goopg_grammar.y:6173
 		{
 			yyVAL.str = "<>"
 		}
 	case 1900:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6174
+//line ../../tmp/goopg_grammar.y:6176
 		{
 			yyVAL.node = (Expr)(nil)
 		}
 	case 1901:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6175
+//line ../../tmp/goopg_grammar.y:6177
 		{
 			yyVAL.node = yyDollar[3].expr
 		}
 	case 1902:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6178
+//line ../../tmp/goopg_grammar.y:6180
 		{
 			yyVAL.strs = yyDollar[2].strs
 		}
 	case 1903:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6181
+//line ../../tmp/goopg_grammar.y:6183
 		{
 			yyVAL.strs = yyDollar[2].strs
 		}
 	case 1904:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6185
+//line ../../tmp/goopg_grammar.y:6187
 		{
 			yyVAL.strs = append(yyDollar[2].strs, "without", "overlaps")
 		}
 	case 1905:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6191
+//line ../../tmp/goopg_grammar.y:6193
 		{
 			/* Bare char / character / nchar / national character default to
 			   an implicit length of 1 (gram.y CharacterWithoutLength ->
@@ -17555,7 +17557,7 @@ yydefault:
 		}
 	case 1906:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6206
+//line ../../tmp/goopg_grammar.y:6208
 		{
 			tw := yyDollar[1].node.(*typeWithArgs)
 			tw.args = colTypmodArgs(tw, int64(yyDollar[3].ival))
@@ -17564,7 +17566,7 @@ yydefault:
 		}
 	case 1907:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6207
+//line ../../tmp/goopg_grammar.y:6209
 		{
 			tw := yyDollar[1].node.(*typeWithArgs)
 			tw.args = []int64{int64(yyDollar[3].ival), int64(yyDollar[5].ival)}
@@ -17573,7 +17575,7 @@ yydefault:
 		}
 	case 1908:
 		yyDollar = yyS[yypt-9 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6211
+//line ../../tmp/goopg_grammar.y:6213
 		{
 			tw := yyDollar[1].node.(*typeWithArgs)
 			tw.args = []int64{int64(yyDollar[3].ival), int64(yyDollar[5].ival), int64(yyDollar[7].ival)}
@@ -17582,7 +17584,7 @@ yydefault:
 		}
 	case 1909:
 		yyDollar = yyS[yypt-12 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6224
+//line ../../tmp/goopg_grammar.y:6226
 		{
 			src := yyDollar[11].node.(*ctasSrc)
 			tbl := objectNameFromQn(yyDollar[5].qn)
@@ -17600,74 +17602,74 @@ yydefault:
 		}
 	case 1910:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6246
+//line ../../tmp/goopg_grammar.y:6248
 		{
 			sel, _ := yyDollar[1].stmt.(*SelectStmt)
 			yyVAL.node = &ctasSrc{sel: sel}
 		}
 	case 1911:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6251
+//line ../../tmp/goopg_grammar.y:6253
 		{
 			yyVAL.node = &ctasSrc{exec: NewExecuteStmt(yyDollar[1].p, yyDollar[2].str, yyDollar[3].exprs)}
 		}
 	case 1912:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6256
+//line ../../tmp/goopg_grammar.y:6258
 		{
 			yyVAL.exprs = nil
 		}
 	case 1913:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6257
+//line ../../tmp/goopg_grammar.y:6259
 		{
 			yyVAL.exprs = yyDollar[2].exprs
 		}
 	case 1914:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6263
+//line ../../tmp/goopg_grammar.y:6265
 		{
 			_ = 0
 		}
 	case 1915:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6264
+//line ../../tmp/goopg_grammar.y:6266
 		{
 			_ = 0
 		}
 	case 1916:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6270
+//line ../../tmp/goopg_grammar.y:6272
 		{
 			yyVAL.b = false
 		}
 	case 1917:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6271
+//line ../../tmp/goopg_grammar.y:6273
 		{
 			yyVAL.b = false
 		}
 	case 1918:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6272
+//line ../../tmp/goopg_grammar.y:6274
 		{
 			yyVAL.b = true
 		}
 	case 1919:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6275
+//line ../../tmp/goopg_grammar.y:6277
 		{
 			yyVAL.node = []*partOfElem{yyDollar[1].node.(*partOfElem)}
 		}
 	case 1920:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6276
+//line ../../tmp/goopg_grammar.y:6278
 		{
 			yyVAL.node = append(yyDollar[1].node.([]*partOfElem), yyDollar[3].node.(*partOfElem))
 		}
 	case 1921:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6280
+//line ../../tmp/goopg_grammar.y:6282
 		{
 			// Legacy stores the check as a LOWER-CASED token join here (unlike
 			// a column check's join, which keeps string quotes).
@@ -17675,13 +17677,13 @@ yydefault:
 		}
 	case 1922:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6286
+//line ../../tmp/goopg_grammar.y:6288
 		{
 			yyVAL.node = &partOfElem{hasCheck: true}
 		}
 	case 1923:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6288
+//line ../../tmp/goopg_grammar.y:6290
 		{
 			el := yyDollar[3].node.(*partOfElem)
 			el.col = yyDollar[1].str
@@ -17689,25 +17691,25 @@ yydefault:
 		}
 	case 1924:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6295
+//line ../../tmp/goopg_grammar.y:6297
 		{
 			_ = 0
 		}
 	case 1925:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6296
+//line ../../tmp/goopg_grammar.y:6298
 		{
 			_ = 0
 		}
 	case 1926:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6299
+//line ../../tmp/goopg_grammar.y:6301
 		{
 			yyVAL.node = &partOfElem{}
 		}
 	case 1927:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6300
+//line ../../tmp/goopg_grammar.y:6302
 		{
 			el := yyDollar[1].node.(*partOfElem)
 			el.notNull = true
@@ -17715,7 +17717,7 @@ yydefault:
 		}
 	case 1928:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6301
+//line ../../tmp/goopg_grammar.y:6303
 		{
 			el := yyDollar[1].node.(*partOfElem)
 			el.unique = true
@@ -17723,7 +17725,7 @@ yydefault:
 		}
 	case 1929:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6302
+//line ../../tmp/goopg_grammar.y:6304
 		{
 			el := yyDollar[1].node.(*partOfElem)
 			el.def, el.hasDef = yyDollar[3].expr, true
@@ -17731,7 +17733,7 @@ yydefault:
 		}
 	case 1930:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6304
+//line ../../tmp/goopg_grammar.y:6306
 		{
 			el := yyDollar[1].node.(*partOfElem)
 			el.genExpr, el.hasGen = tokenJoinLower(yylex, yyDollar[6].p, yyDollar[7].p), true
@@ -17739,86 +17741,86 @@ yydefault:
 		}
 	case 1931:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6310
+//line ../../tmp/goopg_grammar.y:6312
 		{
 			yyVAL.node = yyDollar[1].node
 		}
 	case 1932:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6311
+//line ../../tmp/goopg_grammar.y:6313
 		{
 			yyVAL.node = yyDollar[1].node
 		}
 	case 1933:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6312
+//line ../../tmp/goopg_grammar.y:6314
 		{
 			yyVAL.node = yyDollar[1].node
 		}
 	case 1934:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6313
+//line ../../tmp/goopg_grammar.y:6315
 		{
 			yyVAL.node = yyDollar[1].node
 		}
 	case 1935:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6314
+//line ../../tmp/goopg_grammar.y:6316
 		{
 			yyVAL.node = yyDollar[1].node
 		}
 	case 1936:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6315
+//line ../../tmp/goopg_grammar.y:6317
 		{
 			yyVAL.node = yyDollar[1].node
 		}
 	case 1937:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6322
+//line ../../tmp/goopg_grammar.y:6324
 		{
 			yyVAL.telems = []*tableElem(nil)
 		}
 	case 1938:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6323
+//line ../../tmp/goopg_grammar.y:6325
 		{
 			yyVAL.telems = []*tableElem{}
 		}
 	case 1939:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6324
+//line ../../tmp/goopg_grammar.y:6326
 		{
 			yyVAL.telems = yyDollar[2].telems
 		}
 	case 1940:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6327
+//line ../../tmp/goopg_grammar.y:6329
 		{
 			yyVAL.telems = []*tableElem{yyDollar[1].node.(*tableElem)}
 		}
 	case 1941:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6328
+//line ../../tmp/goopg_grammar.y:6330
 		{
 			yyVAL.telems = append(yyDollar[1].telems, yyDollar[3].node.(*tableElem))
 		}
 	case 1942:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6331
+//line ../../tmp/goopg_grammar.y:6333
 		{
 			cd := yyDollar[1].node.(ColumnDef)
 			yyVAL.node = &tableElem{ofCol: &cd}
 		}
 	case 1943:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6332
+//line ../../tmp/goopg_grammar.y:6334
 		{
 			yyVAL.node = yyDollar[1].node
 		}
 	case 1944:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6336
+//line ../../tmp/goopg_grammar.y:6338
 		{
 			cc := yyDollar[4].node.(*colConstraints)
 			cd := NewColumnDef(yyDollar[1].str, NewColumnType("", "", nil, false))
@@ -17829,104 +17831,104 @@ yydefault:
 		}
 	case 1945:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6348
+//line ../../tmp/goopg_grammar.y:6350
 		{
 			_ = 0
 		}
 	case 1946:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6349
+//line ../../tmp/goopg_grammar.y:6351
 		{
 			_ = 0
 		}
 	case 1947:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6352
+//line ../../tmp/goopg_grammar.y:6354
 		{
 			yyVAL.str = ""
 		}
 	case 1948:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6353
+//line ../../tmp/goopg_grammar.y:6355
 		{
 			yyVAL.str = yyDollar[2].str
 		}
 	case 1949:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6356
+//line ../../tmp/goopg_grammar.y:6358
 		{
 			yyVAL.str = ""
 		}
 	case 1950:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6357
+//line ../../tmp/goopg_grammar.y:6359
 		{
 			yyVAL.str = yyDollar[2].str
 		}
 	case 1951:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6361
+//line ../../tmp/goopg_grammar.y:6363
 		{
 			yyVAL.stmt = NewDropTableStmt(0, yyDollar[3].b, yyDollar[4].onames, dropBehavior(yyDollar[5].str))
 		}
 	case 1952:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6366
+//line ../../tmp/goopg_grammar.y:6368
 		{
 			yyVAL.b = false
 		}
 	case 1953:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6367
+//line ../../tmp/goopg_grammar.y:6369
 		{
 			yyVAL.b = true
 		}
 	case 1954:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6370
+//line ../../tmp/goopg_grammar.y:6372
 		{
 			yyVAL.onames = []ObjectName{objectNameFromQn(yyDollar[1].qn)}
 		}
 	case 1955:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6371
+//line ../../tmp/goopg_grammar.y:6373
 		{
 			yyVAL.onames = append(yyDollar[1].onames, objectNameFromQn(yyDollar[3].qn))
 		}
 	case 1956:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6374
+//line ../../tmp/goopg_grammar.y:6376
 		{
 			yyVAL.str = ""
 		}
 	case 1957:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6375
+//line ../../tmp/goopg_grammar.y:6377
 		{
 			yyVAL.str = "cascade"
 		}
 	case 1958:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6376
+//line ../../tmp/goopg_grammar.y:6378
 		{
 			yyVAL.str = "restrict"
 		}
 	case 1959:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6380
+//line ../../tmp/goopg_grammar.y:6382
 		{
 			tt := yyDollar[3].node.(*truncTargets)
 			yyVAL.stmt = NewTruncateStmt(0, tt.names, tt.only, dropBehavior(yyDollar[5].str), yyDollar[4].b)
 		}
 	case 1960:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6390
+//line ../../tmp/goopg_grammar.y:6392
 		{
 			yyVAL.node = yyDollar[1].node
 		}
 	case 1961:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6394
+//line ../../tmp/goopg_grammar.y:6396
 		{
 			a, b := yyDollar[1].node.(*truncTargets), yyDollar[3].node.(*truncTargets)
 			a.names = append(a.names, b.names...)
@@ -17935,211 +17937,211 @@ yydefault:
 		}
 	case 1962:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6403
+//line ../../tmp/goopg_grammar.y:6405
 		{
 			yyVAL.node = &truncTargets{names: []ObjectName{objectNameFromQn(yyDollar[1].qn)}, only: []bool{false}}
 		}
 	case 1963:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6407
+//line ../../tmp/goopg_grammar.y:6409
 		{
 			yyVAL.node = &truncTargets{names: []ObjectName{objectNameFromQn(yyDollar[2].qn)}, only: []bool{true}}
 		}
 	case 1964:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6415
+//line ../../tmp/goopg_grammar.y:6417
 		{
 			yyVAL.node = (*PartitionByClause)(nil)
 		}
 	case 1965:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6417
+//line ../../tmp/goopg_grammar.y:6419
 		{
 			yyVAL.node = partitionByFrom(yyDollar[1].p, yyDollar[3].str, yyDollar[3].p, yyDollar[5].node.([]partKey))
 		}
 	case 1966:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6437
+//line ../../tmp/goopg_grammar.y:6439
 		{
 			yyVAL.node = newPartKey(yyDollar[1].expr, yyDollar[1].p, yyDollar[2].str, yyDollar[3].str)
 		}
 	case 1967:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6439
+//line ../../tmp/goopg_grammar.y:6441
 		{
 			yyVAL.node = newPartKey(yyDollar[2].expr, 0, yyDollar[4].str, yyDollar[5].str)
 		}
 	case 1968:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6442
+//line ../../tmp/goopg_grammar.y:6444
 		{
 			yyVAL.node = []partKey{yyDollar[1].node.(partKey)}
 		}
 	case 1969:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6443
+//line ../../tmp/goopg_grammar.y:6445
 		{
 			yyVAL.node = append(yyDollar[1].node.([]partKey), yyDollar[3].node.(partKey))
 		}
 	case 1970:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6447
+//line ../../tmp/goopg_grammar.y:6449
 		{
 			yyVAL.str = ""
 		}
 	case 1971:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6448
+//line ../../tmp/goopg_grammar.y:6450
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 1972:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6451
+//line ../../tmp/goopg_grammar.y:6453
 		{
 			yyVAL.b = false
 		}
 	case 1973:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6452
+//line ../../tmp/goopg_grammar.y:6454
 		{
 			yyVAL.b = true
 		}
 	case 1974:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6455
+//line ../../tmp/goopg_grammar.y:6457
 		{
 			yyVAL.b = true
 		}
 	case 1975:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6456
+//line ../../tmp/goopg_grammar.y:6458
 		{
 			yyVAL.b = false
 		}
 	case 1976:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6461
+//line ../../tmp/goopg_grammar.y:6463
 		{
 			yyVAL.strs = []string{yyDollar[1].str}
 		}
 	case 1977:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6462
+//line ../../tmp/goopg_grammar.y:6464
 		{
 			yyVAL.strs = append(yyDollar[1].strs, yyDollar[3].str)
 		}
 	case 1978:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6465
+//line ../../tmp/goopg_grammar.y:6467
 		{
 			yyVAL.strs = []string{yyDollar[1].str}
 		}
 	case 1979:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6466
+//line ../../tmp/goopg_grammar.y:6468
 		{
 			yyVAL.strs = append(yyDollar[1].strs, yyDollar[3].str)
 		}
 	case 1980:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6469
+//line ../../tmp/goopg_grammar.y:6471
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 1981:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6470
+//line ../../tmp/goopg_grammar.y:6472
 		{
 			yyVAL.str = yyDollar[3].str
 		}
 	case 1982:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6477
+//line ../../tmp/goopg_grammar.y:6479
 		{
 			yyVAL.node = &tblCheckTail{}
 		}
 	case 1983:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6478
+//line ../../tmp/goopg_grammar.y:6480
 		{
 			yyVAL.node = &tblCheckTail{noInherit: true}
 		}
 	case 1984:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6479
+//line ../../tmp/goopg_grammar.y:6481
 		{
 			yyVAL.node = &tblCheckTail{noInherit: true}
 		}
 	case 1985:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6480
+//line ../../tmp/goopg_grammar.y:6482
 		{
 			yyVAL.node = &tblCheckTail{noInherit: true, notEnforced: true}
 		}
 	case 1986:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6481
+//line ../../tmp/goopg_grammar.y:6483
 		{
 			yyVAL.node = &tblCheckTail{noInherit: true}
 		}
 	case 1987:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6482
+//line ../../tmp/goopg_grammar.y:6484
 		{
 			yyVAL.node = &tblCheckTail{notEnforced: true}
 		}
 	case 1988:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6483
+//line ../../tmp/goopg_grammar.y:6485
 		{
 			yyVAL.node = &tblCheckTail{}
 		}
 	case 1989:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6486
+//line ../../tmp/goopg_grammar.y:6488
 		{
 			_ = 0
 		}
 	case 1990:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6487
+//line ../../tmp/goopg_grammar.y:6489
 		{
 			_ = 0
 		}
 	case 1991:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6490
+//line ../../tmp/goopg_grammar.y:6492
 		{
 			yyVAL.b = false
 		}
 	case 1992:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6491
+//line ../../tmp/goopg_grammar.y:6493
 		{
 			yyVAL.b = true
 		}
 	case 1993:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6492
+//line ../../tmp/goopg_grammar.y:6494
 		{
 			yyVAL.b = false
 		}
 	case 1994:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6503
+//line ../../tmp/goopg_grammar.y:6505
 		{
 			yyVAL.ctt = &ctTail{}
 		}
 	case 1995:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6504
+//line ../../tmp/goopg_grammar.y:6506
 		{
 			yyVAL.ctt = mergeCtTail(yyDollar[1].ctt, yyDollar[2].ctt)
 		}
 	case 1996:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6508
+//line ../../tmp/goopg_grammar.y:6510
 		{
 			i := &ctTail{}
 			i.withKv = yyDollar[3].strs
@@ -18147,7 +18149,7 @@ yydefault:
 		}
 	case 1997:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6510
+//line ../../tmp/goopg_grammar.y:6512
 		{
 			i := &ctTail{}
 			i.inherits = yyDollar[3].onames
@@ -18155,19 +18157,19 @@ yydefault:
 		}
 	case 1998:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6512
+//line ../../tmp/goopg_grammar.y:6514
 		{
 			yyVAL.ctt = &ctTail{}
 		}
 	case 1999:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6514
+//line ../../tmp/goopg_grammar.y:6516
 		{
 			yyVAL.ctt = &ctTail{}
 		}
 	case 2000:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6516
+//line ../../tmp/goopg_grammar.y:6518
 		{
 			i := &ctTail{}
 			i.onCommit = "delete rows"
@@ -18175,7 +18177,7 @@ yydefault:
 		}
 	case 2001:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6518
+//line ../../tmp/goopg_grammar.y:6520
 		{
 			i := &ctTail{}
 			i.onCommit = "drop"
@@ -18183,13 +18185,13 @@ yydefault:
 		}
 	case 2002:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6522
+//line ../../tmp/goopg_grammar.y:6524
 		{
 			yyVAL.ctt = &ctTail{}
 		}
 	case 2003:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6524
+//line ../../tmp/goopg_grammar.y:6526
 		{
 			i := &ctTail{}
 			i.partition = partitionByFrom(yyDollar[1].p, yyDollar[3].str, yyDollar[3].p, yyDollar[5].node.([]partKey))
@@ -18197,7 +18199,7 @@ yydefault:
 		}
 	case 2004:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6528
+//line ../../tmp/goopg_grammar.y:6530
 		{
 			par := objectNameFromQn(yyDollar[3].qn)
 			i := &ctTail{}
@@ -18209,7 +18211,7 @@ yydefault:
 		}
 	case 2005:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6544
+//line ../../tmp/goopg_grammar.y:6546
 		{
 			i := &ctTail{}
 			i.partOf = objectNameFromQn(yyDollar[3].qn)
@@ -18221,91 +18223,91 @@ yydefault:
 		}
 	case 2006:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6555
+//line ../../tmp/goopg_grammar.y:6557
 		{
 			yyVAL.strs = []string{yyDollar[1].str}
 		}
 	case 2007:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6556
+//line ../../tmp/goopg_grammar.y:6558
 		{
 			yyVAL.strs = append(yyDollar[1].strs, yyDollar[3].str)
 		}
 	case 2008:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6559
+//line ../../tmp/goopg_grammar.y:6561
 		{
 			yyVAL.str = yyDollar[1].str + "=" + yyDollar[3].str
 		}
 	case 2009:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6560
+//line ../../tmp/goopg_grammar.y:6562
 		{
 			yyVAL.str = yyDollar[1].str + "." + yyDollar[3].str + "=" + yyDollar[5].str
 		}
 	case 2010:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6561
+//line ../../tmp/goopg_grammar.y:6563
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2011:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6564
+//line ../../tmp/goopg_grammar.y:6566
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2012:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6565
+//line ../../tmp/goopg_grammar.y:6567
 		{
 			yyVAL.str = yylex.(*lexerState).lastText
 		}
 	case 2013:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6567
+//line ../../tmp/goopg_grammar.y:6569
 		{
 			yyVAL.str = yylex.(*lexerState).lastText
 		}
 	case 2014:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6569
+//line ../../tmp/goopg_grammar.y:6571
 		{
 			yyVAL.str = "true"
 		}
 	case 2015:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6570
+//line ../../tmp/goopg_grammar.y:6572
 		{
 			yyVAL.str = "false"
 		}
 	case 2016:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6571
+//line ../../tmp/goopg_grammar.y:6573
 		{
 			yyVAL.str = "on"
 		}
 	case 2017:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6572
+//line ../../tmp/goopg_grammar.y:6574
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2018:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6573
+//line ../../tmp/goopg_grammar.y:6575
 		{
 			yyVAL.str = "-" + yyDollar[2].str
 		}
 	case 2019:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6578
+//line ../../tmp/goopg_grammar.y:6580
 		{
 			yyVAL.str = yyDollar[2].str
 		}
 	case 2020:
 		yyDollar = yyS[yypt-16 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6586
+//line ../../tmp/goopg_grammar.y:6588
 		{
 			tbl := objectNameFromQn(yyDollar[9].qn)
 			elems := yyDollar[12].node.([]indexElem)
@@ -18338,237 +18340,237 @@ yydefault:
 		}
 	case 2021:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6623
+//line ../../tmp/goopg_grammar.y:6625
 		{
 			yyVAL.node = (*indexOpts)(nil)
 		}
 	case 2022:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6624
+//line ../../tmp/goopg_grammar.y:6626
 		{
 			yyVAL.node = indexOptsFrom(yyDollar[3].strs)
 		}
 	case 2023:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6632
+//line ../../tmp/goopg_grammar.y:6634
 		{
 			yyVAL.node = &idxTail{}
 		}
 	case 2024:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6633
+//line ../../tmp/goopg_grammar.y:6635
 		{
 			yyVAL.node = mergeIdxTail(yyDollar[1].node.(*idxTail), yyDollar[2].node.(*idxTail))
 		}
 	case 2025:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6636
+//line ../../tmp/goopg_grammar.y:6638
 		{
 			yyVAL.node = &idxTail{}
 		}
 	case 2026:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6637
+//line ../../tmp/goopg_grammar.y:6639
 		{
 			yyVAL.node = &idxTail{nnd: true}
 		}
 	case 2027:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6638
+//line ../../tmp/goopg_grammar.y:6640
 		{
 			yyVAL.node = &idxTail{opts: indexOptsFrom(yyDollar[3].strs)}
 		}
 	case 2028:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6639
+//line ../../tmp/goopg_grammar.y:6641
 		{
 			yyVAL.node = &idxTail{tablespace: yyDollar[2].str}
 		}
 	case 2029:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6644
+//line ../../tmp/goopg_grammar.y:6646
 		{
 			yyVAL.str = ""
 		}
 	case 2030:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6645
+//line ../../tmp/goopg_grammar.y:6647
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2031:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6648
+//line ../../tmp/goopg_grammar.y:6650
 		{
 			yyVAL.node = (Expr)(nil)
 		}
 	case 2032:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6649
+//line ../../tmp/goopg_grammar.y:6651
 		{
 			yyVAL.node = yyDollar[2].expr
 		}
 	case 2033:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6652
+//line ../../tmp/goopg_grammar.y:6654
 		{
 			yyVAL.b = false
 		}
 	case 2034:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6653
+//line ../../tmp/goopg_grammar.y:6655
 		{
 			yyVAL.b = true
 		}
 	case 2035:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6656
+//line ../../tmp/goopg_grammar.y:6658
 		{
 			yyVAL.str = ""
 		}
 	case 2036:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6657
+//line ../../tmp/goopg_grammar.y:6659
 		{
 			yyVAL.str = yyDollar[2].str
 		}
 	case 2037:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6660
+//line ../../tmp/goopg_grammar.y:6662
 		{
 			yyVAL.node = []indexElem{yyDollar[1].node.(indexElem)}
 		}
 	case 2038:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6661
+//line ../../tmp/goopg_grammar.y:6663
 		{
 			yyVAL.node = append(yyDollar[1].node.([]indexElem), yyDollar[3].node.(indexElem))
 		}
 	case 2039:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6669
+//line ../../tmp/goopg_grammar.y:6671
 		{
 			yyVAL.node = newIndexElem(yyDollar[1].expr, yyDollar[2].str, yyDollar[3].node.(opClassRef), yyDollar[4].b, yyDollar[5].node.(*bool))
 		}
 	case 2040:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6673
+//line ../../tmp/goopg_grammar.y:6675
 		{
 			yyVAL.node = newIndexElem(yyDollar[2].expr, yyDollar[4].str, yyDollar[5].node.(opClassRef), yyDollar[6].b, yyDollar[7].node.(*bool))
 		}
 	case 2041:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6686
+//line ../../tmp/goopg_grammar.y:6688
 		{
 			yyVAL.str = ""
 		}
 	case 2042:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6687
+//line ../../tmp/goopg_grammar.y:6689
 		{
 			yyVAL.str = yyDollar[2].str
 		}
 	case 2043:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6694
+//line ../../tmp/goopg_grammar.y:6696
 		{
 			yyVAL.node = opClassRef{}
 		}
 	case 2044:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6695
+//line ../../tmp/goopg_grammar.y:6697
 		{
 			yyVAL.node = opClassRef{name: yyDollar[1].str}
 		}
 	case 2045:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6698
+//line ../../tmp/goopg_grammar.y:6700
 		{
 			yyVAL.node = opClassRef{name: yyDollar[1].str, withOptions: true}
 		}
 	case 2046:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6701
+//line ../../tmp/goopg_grammar.y:6703
 		{
 			yyVAL.ival = 0
 		}
 	case 2047:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6702
+//line ../../tmp/goopg_grammar.y:6704
 		{
 			yyVAL.ival = 0
 		}
 	case 2048:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6705
+//line ../../tmp/goopg_grammar.y:6707
 		{
 			yyVAL.ival = 0
 		}
 	case 2049:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6706
+//line ../../tmp/goopg_grammar.y:6708
 		{
 			yyVAL.ival = 0
 		}
 	case 2050:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6709
+//line ../../tmp/goopg_grammar.y:6711
 		{
 			yyVAL.b = false
 		}
 	case 2051:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6710
+//line ../../tmp/goopg_grammar.y:6712
 		{
 			yyVAL.b = false
 		}
 	case 2052:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6711
+//line ../../tmp/goopg_grammar.y:6713
 		{
 			yyVAL.b = true
 		}
 	case 2053:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6714
+//line ../../tmp/goopg_grammar.y:6716
 		{
 			yyVAL.node = (*bool)(nil)
 		}
 	case 2054:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6715
+//line ../../tmp/goopg_grammar.y:6717
 		{
 			v := true
 			yyVAL.node = &v
 		}
 	case 2055:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6716
+//line ../../tmp/goopg_grammar.y:6718
 		{
 			v := false
 			yyVAL.node = &v
 		}
 	case 2056:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6720
+//line ../../tmp/goopg_grammar.y:6722
 		{
 			yyVAL.stmt = NewDropIndexStmt(0, yyDollar[3].b, yyDollar[4].b, yyDollar[5].onames, dropBehavior(yyDollar[6].str))
 		}
 	case 2057:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6725
+//line ../../tmp/goopg_grammar.y:6727
 		{
 			yyVAL.b = false
 		}
 	case 2058:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6726
+//line ../../tmp/goopg_grammar.y:6728
 		{
 			yyVAL.b = true
 		}
 	case 2059:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6734
+//line ../../tmp/goopg_grammar.y:6736
 		{
 			m := yyDollar[4].node.(*txModes)
 			b := NewBeginStmt(yyDollar[3].p)
@@ -18577,7 +18579,7 @@ yydefault:
 		}
 	case 2060:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6741
+//line ../../tmp/goopg_grammar.y:6743
 		{
 			m := yyDollar[4].node.(*txModes)
 			b := NewBeginStmt(yyDollar[3].p)
@@ -18586,43 +18588,43 @@ yydefault:
 		}
 	case 2061:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6749
+//line ../../tmp/goopg_grammar.y:6751
 		{
 			yyVAL.p = yylex.(*lexerState).lastConsumedPos()
 		}
 	case 2062:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6752
+//line ../../tmp/goopg_grammar.y:6754
 		{
 			yyVAL.node = &txModes{}
 		}
 	case 2063:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6753
+//line ../../tmp/goopg_grammar.y:6755
 		{
 			yyVAL.node = yyDollar[1].node
 		}
 	case 2064:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6756
+//line ../../tmp/goopg_grammar.y:6758
 		{
 			yyVAL.node = yyDollar[1].node
 		}
 	case 2065:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6757
+//line ../../tmp/goopg_grammar.y:6759
 		{
 			yyVAL.node = mergeTxModes(yyDollar[1].node.(*txModes), yyDollar[3].node.(*txModes))
 		}
 	case 2066:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6760
+//line ../../tmp/goopg_grammar.y:6762
 		{
 			yyVAL.node = mergeTxModes(yyDollar[1].node.(*txModes), yyDollar[2].node.(*txModes))
 		}
 	case 2067:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6763
+//line ../../tmp/goopg_grammar.y:6765
 		{
 			i := &txModes{}
 			i.iso = yyDollar[3].node.(string)
@@ -18630,7 +18632,7 @@ yydefault:
 		}
 	case 2068:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6764
+//line ../../tmp/goopg_grammar.y:6766
 		{
 			i := &txModes{}
 			i.ro = true
@@ -18638,13 +18640,13 @@ yydefault:
 		}
 	case 2069:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6765
+//line ../../tmp/goopg_grammar.y:6767
 		{
 			yyVAL.node = &txModes{}
 		}
 	case 2070:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6766
+//line ../../tmp/goopg_grammar.y:6768
 		{
 			i := &txModes{}
 			i.def = true
@@ -18652,121 +18654,121 @@ yydefault:
 		}
 	case 2071:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6767
+//line ../../tmp/goopg_grammar.y:6769
 		{
 			yyVAL.node = &txModes{}
 		}
 	case 2072:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6770
+//line ../../tmp/goopg_grammar.y:6772
 		{
 			yyVAL.node = "serializable"
 		}
 	case 2073:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6771
+//line ../../tmp/goopg_grammar.y:6773
 		{
 			yyVAL.node = "repeatable read"
 		}
 	case 2074:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6772
+//line ../../tmp/goopg_grammar.y:6774
 		{
 			yyVAL.node = "read committed"
 		}
 	case 2075:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6773
+//line ../../tmp/goopg_grammar.y:6775
 		{
 			yyVAL.node = "read uncommitted"
 		}
 	case 2076:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6779
+//line ../../tmp/goopg_grammar.y:6781
 		{
 			yyVAL.stmt = NewCommitStmt(0)
 		}
 	case 2077:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6780
+//line ../../tmp/goopg_grammar.y:6782
 		{
 			yyVAL.stmt = NewCommitStmt(0)
 		}
 	case 2078:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6781
+//line ../../tmp/goopg_grammar.y:6783
 		{
 			yyVAL.stmt = NewCommitPreparedStmt(0, yyDollar[3].str)
 		}
 	case 2079:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6784
+//line ../../tmp/goopg_grammar.y:6786
 		{
 			yyVAL.stmt = NewRollbackStmt(0)
 		}
 	case 2080:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6785
+//line ../../tmp/goopg_grammar.y:6787
 		{
 			yyVAL.stmt = NewRollbackStmt(0)
 		}
 	case 2081:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6786
+//line ../../tmp/goopg_grammar.y:6788
 		{
 			yyVAL.stmt = NewRollbackPreparedStmt(0, yyDollar[3].str)
 		}
 	case 2082:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6788
+//line ../../tmp/goopg_grammar.y:6790
 		{
 			yyVAL.stmt = NewRollbackToSavepointStmt(0, yyDollar[5].str)
 		}
 	case 2083:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6796
+//line ../../tmp/goopg_grammar.y:6798
 		{
 			yyVAL.b = false
 		}
 	case 2084:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6797
+//line ../../tmp/goopg_grammar.y:6799
 		{
 			yyVAL.b = false
 		}
 	case 2085:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6798
+//line ../../tmp/goopg_grammar.y:6800
 		{
 			yyVAL.b = false
 		}
 	case 2086:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6801
+//line ../../tmp/goopg_grammar.y:6803
 		{
 			yyVAL.b = false
 		}
 	case 2087:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6802
+//line ../../tmp/goopg_grammar.y:6804
 		{
 			yyVAL.b = false
 		}
 	case 2088:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6817
+//line ../../tmp/goopg_grammar.y:6819
 		{
 			yyVAL.stmt = NewSetConstraintsStmt(0, true, nil, yyDollar[4].b)
 		}
 	case 2089:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6819
+//line ../../tmp/goopg_grammar.y:6821
 		{
 			yyVAL.stmt = NewSetConstraintsStmt(0, false, yyDollar[3].strs, yyDollar[4].b)
 		}
 	case 2090:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6821
+//line ../../tmp/goopg_grammar.y:6823
 		{
 			// One alternative, not two: `SET x = DEFAULT` differs from
 			// `SET x = 'default'` only by token KIND, which the grammar
@@ -18780,37 +18782,37 @@ yydefault:
 		}
 	case 2091:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6837
+//line ../../tmp/goopg_grammar.y:6839
 		{
 			yyVAL.stmt = sessionAuthzStmt(yylex.(*lexerState), yyDollar[2].b, yyDollar[4].str)
 		}
 	case 2092:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6841
+//line ../../tmp/goopg_grammar.y:6843
 		{
 			yyVAL.stmt = sessionAuthzStmt(yylex.(*lexerState), true, yyDollar[5].str)
 		}
 	case 2093:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6847
+//line ../../tmp/goopg_grammar.y:6849
 		{
 			yyVAL.stmt = roleSetStmt(yyDollar[2].b, yyDollar[4].str, isDefaultKeywordAt(yylex, yyDollar[4].p))
 		}
 	case 2094:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6853
+//line ../../tmp/goopg_grammar.y:6855
 		{
 			yyVAL.stmt = tzSetStmt(yyDollar[2].b, yyDollar[5].str)
 		}
 	case 2095:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6859
+//line ../../tmp/goopg_grammar.y:6861
 		{
 			yyVAL.stmt = NewSetStmt(0, yyDollar[2].b, "timezone", tzIntervalValue(yyDollar[6].str, ivQual{prec: -1}), false)
 		}
 	case 2096:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6861
+//line ../../tmp/goopg_grammar.y:6863
 		{
 			q := yyDollar[7].ivq
 			if !tzIntervalQualOK(q) {
@@ -18821,176 +18823,176 @@ yydefault:
 		}
 	case 2097:
 		yyDollar = yyS[yypt-9 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6870
+//line ../../tmp/goopg_grammar.y:6872
 		{
 			yyVAL.stmt = NewSetStmt(0, yyDollar[2].b, "timezone", tzIntervalValue(yyDollar[9].str, ivQual{prec: yyDollar[7].ival}), false)
 		}
 	case 2098:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6877
+//line ../../tmp/goopg_grammar.y:6879
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2099:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6878
+//line ../../tmp/goopg_grammar.y:6880
 		{
 			yyVAL.str = yyDollar[1].str + "." + yyDollar[3].str
 		}
 	case 2100:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6886
+//line ../../tmp/goopg_grammar.y:6888
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2101:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6887
+//line ../../tmp/goopg_grammar.y:6889
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2102:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6890
+//line ../../tmp/goopg_grammar.y:6892
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2103:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6895
+//line ../../tmp/goopg_grammar.y:6897
 		{
 			yyVAL.str = "on"
 		}
 	case 2104:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6896
+//line ../../tmp/goopg_grammar.y:6898
 		{
 			yyVAL.str = "default"
 		}
 	case 2105:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6897
+//line ../../tmp/goopg_grammar.y:6899
 		{
 			yyVAL.str = "true"
 		}
 	case 2106:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6898
+//line ../../tmp/goopg_grammar.y:6900
 		{
 			yyVAL.str = "false"
 		}
 	case 2107:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6899
+//line ../../tmp/goopg_grammar.y:6901
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2108:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6903
+//line ../../tmp/goopg_grammar.y:6905
 		{
 			yyVAL.str = strconv.FormatInt(int64(yyDollar[1].ival), 10)
 		}
 	case 2109:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6904
+//line ../../tmp/goopg_grammar.y:6906
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2110:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6905
+//line ../../tmp/goopg_grammar.y:6907
 		{
 			yyVAL.str = "-" + strconv.FormatInt(int64(yyDollar[2].ival), 10)
 		}
 	case 2111:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6906
+//line ../../tmp/goopg_grammar.y:6908
 		{
 			yyVAL.str = yyDollar[2].str
 		}
 	case 2112:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6913
+//line ../../tmp/goopg_grammar.y:6915
 		{
 			m := yyDollar[4].node.(*txModes)
 			yyVAL.stmt = NewSetTransactionStmt(0, m.iso, yyDollar[2].b)
 		}
 	case 2113:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6919
+//line ../../tmp/goopg_grammar.y:6921
 		{
 			yyVAL.b = false
 		}
 	case 2114:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6920
+//line ../../tmp/goopg_grammar.y:6922
 		{
 			yyVAL.b = false
 		}
 	case 2115:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6921
+//line ../../tmp/goopg_grammar.y:6923
 		{
 			yyVAL.b = true
 		}
 	case 2116:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6924
+//line ../../tmp/goopg_grammar.y:6926
 		{
 			yyVAL.str = "="
 		}
 	case 2117:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6925
+//line ../../tmp/goopg_grammar.y:6927
 		{
 			yyVAL.str = "to"
 		}
 	case 2118:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6928
+//line ../../tmp/goopg_grammar.y:6930
 		{
 			yyVAL.stmt = NewShowStmt(0, true, "")
 		}
 	case 2119:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6929
+//line ../../tmp/goopg_grammar.y:6931
 		{
 			yyVAL.stmt = NewShowStmt(0, false, yyDollar[2].str)
 		}
 	case 2120:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6930
+//line ../../tmp/goopg_grammar.y:6932
 		{
 			yyVAL.stmt = NewShowStmt(0, false, "timezone")
 		}
 	case 2121:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6933
+//line ../../tmp/goopg_grammar.y:6935
 		{
 			yyVAL.stmt = NewResetStmt(0, true, "")
 		}
 	case 2122:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6934
+//line ../../tmp/goopg_grammar.y:6936
 		{
 			yyVAL.stmt = NewResetStmt(0, false, yyDollar[2].str)
 		}
 	case 2123:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6935
+//line ../../tmp/goopg_grammar.y:6937
 		{
 			yyVAL.stmt = NewResetStmt(0, false, "timezone")
 		}
 	case 2124:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6940
+//line ../../tmp/goopg_grammar.y:6942
 		{
 			yyVAL.stmt = NewResetStmt(0, false, "session_authorization")
 		}
 	case 2125:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6951
+//line ../../tmp/goopg_grammar.y:6953
 		{
 			l := yylex.(*lexerState)
 			s := NewAlterSystemStmt(0, yyDollar[4].str, l.setValueAtoms(), l.setValueIsDefault(), false, false)
@@ -18999,19 +19001,19 @@ yydefault:
 		}
 	case 2126:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6958
+//line ../../tmp/goopg_grammar.y:6960
 		{
 			yyVAL.stmt = NewAlterSystemStmt(0, yyDollar[4].str, "", false, true, false)
 		}
 	case 2127:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6960
+//line ../../tmp/goopg_grammar.y:6962
 		{
 			yyVAL.stmt = NewAlterSystemStmt(0, "", "", false, true, true)
 		}
 	case 2128:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6968
+//line ../../tmp/goopg_grammar.y:6970
 		{
 			acts := yyDollar[7].node.([]AlterTableAction)
 			st := NewAlterTableStmt(0, objectNameFromQn(yyDollar[5].qn))
@@ -19022,7 +19024,7 @@ yydefault:
 		}
 	case 2129:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6980
+//line ../../tmp/goopg_grammar.y:6982
 		{
 			st := NewAlterTableStmt(0, objectNameFromQn(yyDollar[5].qn))
 			st.IfExists = yyDollar[3].b
@@ -19034,7 +19036,7 @@ yydefault:
 		}
 	case 2130:
 		yyDollar = yyS[yypt-9 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6990
+//line ../../tmp/goopg_grammar.y:6992
 		{
 			st := NewAlterTableStmt(0, objectNameFromQn(yyDollar[5].qn))
 			st.IfExists = yyDollar[3].b
@@ -19044,7 +19046,7 @@ yydefault:
 		}
 	case 2131:
 		yyDollar = yyS[yypt-9 : yypt+1]
-//line ../../tmp/goopg_grammar.y:6998
+//line ../../tmp/goopg_grammar.y:7000
 		{
 			st := NewAlterTableStmt(0, objectNameFromQn(yyDollar[5].qn))
 			st.IfExists = yyDollar[3].b
@@ -19054,7 +19056,7 @@ yydefault:
 		}
 	case 2132:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7006
+//line ../../tmp/goopg_grammar.y:7008
 		{
 			st := NewAlterTableStmt(0, objectNameFromQn(yyDollar[5].qn))
 			st.IfExists = yyDollar[3].b
@@ -19063,7 +19065,7 @@ yydefault:
 		}
 	case 2133:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7013
+//line ../../tmp/goopg_grammar.y:7015
 		{
 			st := NewAlterTableStmt(0, objectNameFromQn(yyDollar[5].qn))
 			st.IfExists = yyDollar[3].b
@@ -19072,7 +19074,7 @@ yydefault:
 		}
 	case 2134:
 		yyDollar = yyS[yypt-10 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7020
+//line ../../tmp/goopg_grammar.y:7022
 		{
 			st := NewAlterTableStmt(0, objectNameFromQn(yyDollar[5].qn))
 			st.IfExists = yyDollar[3].b
@@ -19090,31 +19092,31 @@ yydefault:
 		}
 	case 2135:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7038
+//line ../../tmp/goopg_grammar.y:7040
 		{
 			yyVAL.node = []AlterTableAction{*(yyDollar[1].node.(*AlterTableAction))}
 		}
 	case 2136:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7042
+//line ../../tmp/goopg_grammar.y:7044
 		{
 			yyVAL.node = append(yyVAL.node.([]AlterTableAction), *(yyDollar[3].node.(*AlterTableAction)))
 		}
 	case 2137:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7047
+//line ../../tmp/goopg_grammar.y:7049
 		{
 			yyVAL.b = false
 		}
 	case 2138:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7048
+//line ../../tmp/goopg_grammar.y:7050
 		{
 			yyVAL.b = true
 		}
 	case 2139:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7057
+//line ../../tmp/goopg_grammar.y:7059
 		{
 			cc := yyDollar[4].node.(*colConstraints)
 			ct := yyDollar[3].node.(*typeWithArgs)
@@ -19146,7 +19148,7 @@ yydefault:
 		}
 	case 2140:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7093
+//line ../../tmp/goopg_grammar.y:7095
 		{
 			cc := yyDollar[5].node.(*colConstraints)
 			ct := yyDollar[4].node.(*typeWithArgs)
@@ -19178,7 +19180,7 @@ yydefault:
 		}
 	case 2141:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7129
+//line ../../tmp/goopg_grammar.y:7131
 		{
 			cc := yyDollar[7].node.(*colConstraints)
 			ct := yyDollar[6].node.(*typeWithArgs)
@@ -19211,7 +19213,7 @@ yydefault:
 		}
 	case 2142:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7166
+//line ../../tmp/goopg_grammar.y:7168
 		{
 			cc := yyDollar[8].node.(*colConstraints)
 			ct := yyDollar[7].node.(*typeWithArgs)
@@ -19244,13 +19246,13 @@ yydefault:
 		}
 	case 2143:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7206
+//line ../../tmp/goopg_grammar.y:7208
 		{
 			yyVAL.node = yyDollar[2].node
 		}
 	case 2144:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7208
+//line ../../tmp/goopg_grammar.y:7210
 		{
 			a := atActionAt(yyDollar[4].node, yyDollar[2].p)
 			a.ConstraintName = yyDollar[3].str
@@ -19258,7 +19260,7 @@ yydefault:
 		}
 	case 2145:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7214
+//line ../../tmp/goopg_grammar.y:7216
 		{
 			a := NewATActionAt(AlterTableDropColumn, yyDollar[3].p)
 			a.ColumnName = yyDollar[3].str // CASCADE / RESTRICT: parsed and dropped, as legacy
@@ -19266,7 +19268,7 @@ yydefault:
 		}
 	case 2146:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7220
+//line ../../tmp/goopg_grammar.y:7222
 		{
 			a := NewATActionAt(AlterTableDropColumn, yyDollar[5].p)
 			a.ColumnName = yyDollar[5].str
@@ -19275,7 +19277,7 @@ yydefault:
 		}
 	case 2147:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7227
+//line ../../tmp/goopg_grammar.y:7229
 		{
 			ct := yyDollar[5].node.(*typeWithArgs)
 			a := NewATActionAt(AlterTableAlterColumnType, yyDollar[3].p)
@@ -19286,7 +19288,7 @@ yydefault:
 		}
 	case 2148:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7236
+//line ../../tmp/goopg_grammar.y:7238
 		{
 			a := NewATActionAt(AlterTableRenameTable, yyDollar[3].p)
 			a.NewName = yyDollar[3].str
@@ -19294,7 +19296,7 @@ yydefault:
 		}
 	case 2149:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7242
+//line ../../tmp/goopg_grammar.y:7244
 		{
 			// ConstraintName, NOT OldConstraintName — the latter is
 			// RENAME CONSTRAINT's field and is the only one the executor
@@ -19309,7 +19311,7 @@ yydefault:
 		}
 	case 2150:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7255
+//line ../../tmp/goopg_grammar.y:7257
 		{
 			a := NewATAction(AlterTableSetDefault)
 			a.ColumnName = yyDollar[3].str
@@ -19318,7 +19320,7 @@ yydefault:
 		}
 	case 2151:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7262
+//line ../../tmp/goopg_grammar.y:7264
 		{
 			a := NewATAction(AlterTableDropDefault)
 			a.ColumnName = yyDollar[3].str
@@ -19326,7 +19328,7 @@ yydefault:
 		}
 	case 2152:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7268
+//line ../../tmp/goopg_grammar.y:7270
 		{
 			a := NewATAction(AlterTableSetNotNull)
 			a.ColumnName = yyDollar[3].str
@@ -19334,7 +19336,7 @@ yydefault:
 		}
 	case 2153:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7274
+//line ../../tmp/goopg_grammar.y:7276
 		{
 			a := NewATAction(AlterTableDropNotNull)
 			a.ColumnName = yyDollar[3].str
@@ -19342,7 +19344,7 @@ yydefault:
 		}
 	case 2154:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7280
+//line ../../tmp/goopg_grammar.y:7282
 		{
 			a := NewATActionAt(AlterTableRenameColumn, yyDollar[3].p)
 			a.OldColumnName = yyDollar[3].str
@@ -19351,7 +19353,7 @@ yydefault:
 		}
 	case 2155:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7287
+//line ../../tmp/goopg_grammar.y:7289
 		{
 			// ConstraintName, not OldConstraintName (legacy ddl.go:9960).
 			a := NewATActionAt(AlterTableValidateConstraint, yyDollar[3].p)
@@ -19360,7 +19362,7 @@ yydefault:
 		}
 	case 2156:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7294
+//line ../../tmp/goopg_grammar.y:7296
 		{
 			a := NewATActionAt(AlterTableReplicaIdentity, yyDollar[2].p)
 			a.ReplicaIdentityMode = "f"
@@ -19368,7 +19370,7 @@ yydefault:
 		}
 	case 2157:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7300
+//line ../../tmp/goopg_grammar.y:7302
 		{
 			a := NewATActionAt(AlterTableReplicaIdentity, yyDollar[2].p)
 			a.ReplicaIdentityMode = "n"
@@ -19376,7 +19378,7 @@ yydefault:
 		}
 	case 2158:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7306
+//line ../../tmp/goopg_grammar.y:7308
 		{
 			a := NewATActionAt(AlterTableReplicaIdentity, yyDollar[2].p)
 			a.ReplicaIdentityMode = "d"
@@ -19384,7 +19386,7 @@ yydefault:
 		}
 	case 2159:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7312
+//line ../../tmp/goopg_grammar.y:7314
 		{
 			a := NewATActionAt(AlterTableReplicaIdentity, yyDollar[2].p)
 			a.ReplicaIdentityMode = "i"
@@ -19393,7 +19395,7 @@ yydefault:
 		}
 	case 2160:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7326
+//line ../../tmp/goopg_grammar.y:7328
 		{
 			a := NewATAction(AlterTableSetStatistics)
 			a.ColumnName = yyDollar[3].str
@@ -19402,7 +19404,7 @@ yydefault:
 		}
 	case 2161:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7333
+//line ../../tmp/goopg_grammar.y:7335
 		{
 			a := NewATAction(AlterTableSetStorage)
 			a.ColumnName, a.StorageType = yyDollar[3].str, yyDollar[6].str
@@ -19410,7 +19412,7 @@ yydefault:
 		}
 	case 2162:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7339
+//line ../../tmp/goopg_grammar.y:7341
 		{
 			a := NewATAction(AlterTableSetCompression)
 			a.ColumnName, a.CompressionType = yyDollar[3].str, yyDollar[6].str
@@ -19418,7 +19420,7 @@ yydefault:
 		}
 	case 2163:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7346
+//line ../../tmp/goopg_grammar.y:7348
 		{
 			a := NewATAction(AlterTableSetCompression)
 			a.ColumnName = yyDollar[3].str
@@ -19426,7 +19428,7 @@ yydefault:
 		}
 	case 2164:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7352
+//line ../../tmp/goopg_grammar.y:7354
 		{
 			a := NewATAction(AlterTableAlterColumnSet)
 			a.ColumnName, a.SetOptions = yyDollar[3].str, yyDollar[6].strs
@@ -19434,7 +19436,7 @@ yydefault:
 		}
 	case 2165:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7358
+//line ../../tmp/goopg_grammar.y:7360
 		{
 			a := NewATAction(AlterTableAlterColumnReset)
 			a.ColumnName, a.SetOptions = yyDollar[3].str, yyDollar[6].strs
@@ -19442,67 +19444,67 @@ yydefault:
 		}
 	case 2166:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7364
+//line ../../tmp/goopg_grammar.y:7366
 		{
 			yyVAL.node = NewATAction(AlterTableNoOp)
 		}
 	case 2167:
 		yyDollar = yyS[yypt-9 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7369
+//line ../../tmp/goopg_grammar.y:7371
 		{
 			yyVAL.node = NewATAction(AlterTableNoOp)
 		}
 	case 2168:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7371
+//line ../../tmp/goopg_grammar.y:7373
 		{
 			yyVAL.node = NewATAction(AlterTableNoOp)
 		}
 	case 2169:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7373
+//line ../../tmp/goopg_grammar.y:7375
 		{
 			yyVAL.node = NewATAction(AlterTableNoOp)
 		}
 	case 2170:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7375
+//line ../../tmp/goopg_grammar.y:7377
 		{
 			yyVAL.node = NewATAction(AlterTableNoOp)
 		}
 	case 2171:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7377
+//line ../../tmp/goopg_grammar.y:7379
 		{
 			yyVAL.node = NewATAction(AlterTableNoOp)
 		}
 	case 2172:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7379
+//line ../../tmp/goopg_grammar.y:7381
 		{
 			yyVAL.node = NewATAction(AlterTableNoOp)
 		}
 	case 2173:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7381
+//line ../../tmp/goopg_grammar.y:7383
 		{
 			yyVAL.node = NewATAction(AlterTableNoOp)
 		}
 	case 2174:
 		yyDollar = yyS[yypt-9 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7383
+//line ../../tmp/goopg_grammar.y:7385
 		{
 			yyVAL.node = NewATAction(AlterTableNoOp)
 		}
 	case 2175:
 		yyDollar = yyS[yypt-10 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7385
+//line ../../tmp/goopg_grammar.y:7387
 		{
 			yyVAL.node = NewATAction(AlterTableNoOp)
 		}
 	case 2176:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7389
+//line ../../tmp/goopg_grammar.y:7391
 		{
 			a := NewATActionAt(AlterTableAlterConstraint, yyDollar[3].p)
 			a.ConstraintName = yyDollar[3].str
@@ -19520,7 +19522,7 @@ yydefault:
 		}
 	case 2177:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7410
+//line ../../tmp/goopg_grammar.y:7412
 		{
 			a := NewATActionAt(AlterTableResetReloptions, yyDollar[1].p)
 			a.With = strPairMap(yyDollar[3].strs)
@@ -19528,7 +19530,7 @@ yydefault:
 		}
 	case 2178:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7416
+//line ../../tmp/goopg_grammar.y:7418
 		{
 			a := NewATActionAt(AlterTableSetAccessMethod, yyDollar[1].p)
 			a.AccessMethodName = yyDollar[4].str
@@ -19536,7 +19538,7 @@ yydefault:
 		}
 	case 2179:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7422
+//line ../../tmp/goopg_grammar.y:7424
 		{
 			/* ddl.go:10012 records the SET keyword here; ALTER INDEX's own
 			   arm (:8049) records the TABLESPACE NAME instead. */
@@ -19546,19 +19548,19 @@ yydefault:
 		}
 	case 2180:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7430
+//line ../../tmp/goopg_grammar.y:7432
 		{
 			yyVAL.node = NewATActionAt(AlterTableNoOp, yyDollar[1].p)
 		}
 	case 2181:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7432
+//line ../../tmp/goopg_grammar.y:7434
 		{
 			yyVAL.node = NewATActionAt(AlterTableSetWithoutCluster, yyDollar[1].p)
 		}
 	case 2182:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7434
+//line ../../tmp/goopg_grammar.y:7436
 		{
 			a := NewATActionAt(AlterTableClusterOn, yyDollar[2].p)
 			a.ClusterIndexName = yyDollar[3].str
@@ -19566,7 +19568,7 @@ yydefault:
 		}
 	case 2183:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7440
+//line ../../tmp/goopg_grammar.y:7442
 		{
 			a := NewATActionAt(AlterTableRenameConstraint, yyDollar[3].p)
 			a.OldConstraintName, a.NewName = yyDollar[3].str, yyDollar[5].str
@@ -19574,7 +19576,7 @@ yydefault:
 		}
 	case 2184:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7446
+//line ../../tmp/goopg_grammar.y:7448
 		{
 			a := NewATAction(AlterTableInherit)
 			a.InheritParent = objectNameFromQn(yyDollar[2].qn)
@@ -19582,7 +19584,7 @@ yydefault:
 		}
 	case 2185:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7452
+//line ../../tmp/goopg_grammar.y:7454
 		{
 			a := NewATAction(AlterTableNoInherit)
 			a.InheritParent = objectNameFromQn(yyDollar[3].qn)
@@ -19590,7 +19592,7 @@ yydefault:
 		}
 	case 2186:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7458
+//line ../../tmp/goopg_grammar.y:7460
 		{
 			a := NewATAction(AlterTableAddOf)
 			a.OfType = objectNameFromQn(yyDollar[2].qn)
@@ -19598,13 +19600,13 @@ yydefault:
 		}
 	case 2187:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7464
+//line ../../tmp/goopg_grammar.y:7466
 		{
 			yyVAL.node = NewATAction(AlterTableDropOf)
 		}
 	case 2188:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7466
+//line ../../tmp/goopg_grammar.y:7468
 		{
 			a := NewATAction(AlterTableEnableDisableRule)
 			a.RuleName, a.RuleEnabledState = yyDollar[4].str, byte(yyDollar[2].ival)
@@ -19612,7 +19614,7 @@ yydefault:
 		}
 	case 2189:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7472
+//line ../../tmp/goopg_grammar.y:7474
 		{
 			a := NewATAction(AlterTableEnableDisableRule)
 			a.RuleName, a.RuleEnabledState = yyDollar[3].str, byte('D')
@@ -19620,31 +19622,31 @@ yydefault:
 		}
 	case 2190:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7478
+//line ../../tmp/goopg_grammar.y:7480
 		{
 			yyVAL.node = NewATAction(AlterTableEnableRowSecurity)
 		}
 	case 2191:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7480
+//line ../../tmp/goopg_grammar.y:7482
 		{
 			yyVAL.node = NewATAction(AlterTableDisableRowSecurity)
 		}
 	case 2192:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7482
+//line ../../tmp/goopg_grammar.y:7484
 		{
 			yyVAL.node = NewATAction(AlterTableForceRowSecurity)
 		}
 	case 2193:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7484
+//line ../../tmp/goopg_grammar.y:7486
 		{
 			yyVAL.node = NewATAction(AlterTableNoForceRowSecurity)
 		}
 	case 2194:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7486
+//line ../../tmp/goopg_grammar.y:7488
 		{
 			b := yyDollar[4].node.(*partBound)
 			a := NewATAttachPartition(yyDollar[3].p, objectNameFromQn(yyDollar[3].qn), b.from, b.to, b.inVals, b.isDefault)
@@ -19653,7 +19655,7 @@ yydefault:
 		}
 	case 2195:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7493
+//line ../../tmp/goopg_grammar.y:7495
 		{
 			a := NewATDetachPartition(0, objectNameFromQn(yyDollar[3].qn))
 			a.DetachConcurrently = yyDollar[4].b
@@ -19661,7 +19663,7 @@ yydefault:
 		}
 	case 2196:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7503
+//line ../../tmp/goopg_grammar.y:7505
 		{
 			a := NewATActionAt(AlterTableAddPrimaryKey, yyDollar[1].p)
 			a.Columns, a.IncludeColumns = yyDollar[3].strs, yyDollar[4].strs
@@ -19669,7 +19671,7 @@ yydefault:
 		}
 	case 2197:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7509
+//line ../../tmp/goopg_grammar.y:7511
 		{
 			a := NewATActionAt(AlterTableAddPrimaryKey, yyDollar[1].p)
 			a.UsingIndexName = yyDollar[5].str
@@ -19677,7 +19679,7 @@ yydefault:
 		}
 	case 2198:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7515
+//line ../../tmp/goopg_grammar.y:7517
 		{
 			a := NewATActionAt(AlterTableAddUnique, yyDollar[1].p)
 			a.Columns, a.IncludeColumns = yyDollar[2].strs, yyDollar[3].strs
@@ -19685,7 +19687,7 @@ yydefault:
 		}
 	case 2199:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7521
+//line ../../tmp/goopg_grammar.y:7523
 		{
 			a := NewATActionAt(AlterTableAddUnique, yyDollar[1].p)
 			a.UsingIndexName = yyDollar[4].str
@@ -19693,7 +19695,7 @@ yydefault:
 		}
 	case 2200:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7527
+//line ../../tmp/goopg_grammar.y:7529
 		{
 			/* $<ival>1, not $<p>1: CHECKBODY's pos is the OPENING
 			   PAREN (joinCheckTokens spans from there) and its ival
@@ -19705,7 +19707,7 @@ yydefault:
 		}
 	case 2201:
 		yyDollar = yyS[yypt-11 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7537
+//line ../../tmp/goopg_grammar.y:7539
 		{
 			a := NewATActionAt(AlterTableAddForeignKey, yyDollar[1].p)
 			a.Columns = yyDollar[4].strs
@@ -19717,7 +19719,7 @@ yydefault:
 		}
 	case 2202:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7547
+//line ../../tmp/goopg_grammar.y:7549
 		{
 			a := NewATActionAt(AlterTableAddExclude, yyDollar[1].p)
 			d := newExclusionConstraint("", yyDollar[2].str, yyDollar[4].node.([]excludeElem), yyDollar[6].strs, nil, nil)
@@ -19727,7 +19729,7 @@ yydefault:
 		}
 	case 2203:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7555
+//line ../../tmp/goopg_grammar.y:7557
 		{
 			a := NewATActionAt(AlterTableAddNotNull, yyDollar[1].p)
 			a.ColumnName = yyDollar[3].str
@@ -19735,325 +19737,325 @@ yydefault:
 		}
 	case 2204:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7567
+//line ../../tmp/goopg_grammar.y:7569
 		{
 			_ = 0
 		}
 	case 2205:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7568
+//line ../../tmp/goopg_grammar.y:7570
 		{
 			_ = 0
 		}
 	case 2206:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7571
+//line ../../tmp/goopg_grammar.y:7573
 		{
 			yyVAL.strs = []string{yyDollar[2].str, yyDollar[4].strs[0], yyDollar[4].strs[1]}
 		}
 	case 2207:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7572
+//line ../../tmp/goopg_grammar.y:7574
 		{
 			yyVAL.strs = []string{"D", yyDollar[3].strs[0], yyDollar[3].strs[1]}
 		}
 	case 2208:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7577
+//line ../../tmp/goopg_grammar.y:7579
 		{
 			yyVAL.str = "O"
 		}
 	case 2209:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7578
+//line ../../tmp/goopg_grammar.y:7580
 		{
 			yyVAL.str = "A"
 		}
 	case 2210:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7579
+//line ../../tmp/goopg_grammar.y:7581
 		{
 			yyVAL.str = "R"
 		}
 	case 2211:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7582
+//line ../../tmp/goopg_grammar.y:7584
 		{
 			yyVAL.strs = []string{"name", yyDollar[1].str}
 		}
 	case 2212:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7583
+//line ../../tmp/goopg_grammar.y:7585
 		{
 			yyVAL.strs = []string{"all", ""}
 		}
 	case 2213:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7584
+//line ../../tmp/goopg_grammar.y:7586
 		{
 			yyVAL.strs = []string{"user", ""}
 		}
 	case 2214:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7589
+//line ../../tmp/goopg_grammar.y:7591
 		{
 			yyVAL.ival = int('O')
 		}
 	case 2215:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7590
+//line ../../tmp/goopg_grammar.y:7592
 		{
 			yyVAL.ival = int('A')
 		}
 	case 2216:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7591
+//line ../../tmp/goopg_grammar.y:7593
 		{
 			yyVAL.ival = int('R')
 		}
 	case 2217:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7594
+//line ../../tmp/goopg_grammar.y:7596
 		{
 			_ = 0
 		}
 	case 2218:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7595
+//line ../../tmp/goopg_grammar.y:7597
 		{
 			_ = 0
 		}
 	case 2219:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7596
+//line ../../tmp/goopg_grammar.y:7598
 		{
 			_ = 0
 		}
 	case 2220:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7597
+//line ../../tmp/goopg_grammar.y:7599
 		{
 			_ = 0
 		}
 	case 2221:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7600
+//line ../../tmp/goopg_grammar.y:7602
 		{
 			_ = 0
 		}
 	case 2222:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7601
+//line ../../tmp/goopg_grammar.y:7603
 		{
 			_ = 0
 		}
 	case 2223:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7602
+//line ../../tmp/goopg_grammar.y:7604
 		{
 			_ = 0
 		}
 	case 2224:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7605
+//line ../../tmp/goopg_grammar.y:7607
 		{
 			yyVAL.b = false
 		}
 	case 2225:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7606
+//line ../../tmp/goopg_grammar.y:7608
 		{
 			yyVAL.b = true
 		}
 	case 2226:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7607
+//line ../../tmp/goopg_grammar.y:7609
 		{
 			yyVAL.b = false
 		}
 	case 2227:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7610
+//line ../../tmp/goopg_grammar.y:7612
 		{
 			yyVAL.expr = (Expr)(nil)
 		}
 	case 2228:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7611
+//line ../../tmp/goopg_grammar.y:7613
 		{
 			yyVAL.expr = yyDollar[2].expr
 		}
 	case 2229:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7614
+//line ../../tmp/goopg_grammar.y:7616
 		{
 			yyVAL.node = (*atConstrTail)(nil)
 		}
 	case 2230:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7615
+//line ../../tmp/goopg_grammar.y:7617
 		{
 			yyVAL.node = mergeATTail(mustATTail(yyDollar[1].node), "deferrable")
 		}
 	case 2231:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7616
+//line ../../tmp/goopg_grammar.y:7618
 		{
 			yyVAL.node = mergeATTail(mustATTail(yyDollar[1].node), "not_deferrable")
 		}
 	case 2232:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7617
+//line ../../tmp/goopg_grammar.y:7619
 		{
 			yyVAL.node = mergeATTail(mustATTail(yyDollar[1].node), "initially_deferred")
 		}
 	case 2233:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7618
+//line ../../tmp/goopg_grammar.y:7620
 		{
 			yyVAL.node = mergeATTail(mustATTail(yyDollar[1].node), "initially_immediate")
 		}
 	case 2234:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7622
+//line ../../tmp/goopg_grammar.y:7624
 		{
 			yyVAL.node = mergeATTailAt(mustATTail(yyDollar[1].node), "not_valid", yyDollar[2].p)
 		}
 	case 2235:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7623
+//line ../../tmp/goopg_grammar.y:7625
 		{
 			yyVAL.node = mergeATTail(mustATTail(yyDollar[1].node), "not_enforced")
 		}
 	case 2236:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7624
+//line ../../tmp/goopg_grammar.y:7626
 		{
 			yyVAL.node = mergeATTail(mustATTail(yyDollar[1].node), "enforced")
 		}
 	case 2237:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7625
+//line ../../tmp/goopg_grammar.y:7627
 		{
 			yyVAL.node = mergeATTail(mustATTail(yyDollar[1].node), "no_inherit")
 		}
 	case 2238:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7626
+//line ../../tmp/goopg_grammar.y:7628
 		{
 			yyVAL.node = mergeATTail(mustATTail(yyDollar[1].node), "inherit")
 		}
 	case 2239:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7629
+//line ../../tmp/goopg_grammar.y:7631
 		{
 			_ = 0
 		}
 	case 2240:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7630
+//line ../../tmp/goopg_grammar.y:7632
 		{
 			_ = 0
 		}
 	case 2241:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7640
+//line ../../tmp/goopg_grammar.y:7642
 		{
 			yylex.(*lexerState).markSpanStart()
 		}
 	case 2242:
 		yyDollar = yyS[yypt-10 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7641
+//line ../../tmp/goopg_grammar.y:7643
 		{
 			yyVAL.stmt = buildView(yylex, false, yyDollar[2].node, yyDollar[4].qn, yyDollar[5].strs, yyDollar[6].strs, yyDollar[9].stmt, yyDollar[10].node)
 		}
 	case 2243:
 		yyDollar = yyS[yypt-9 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7642
+//line ../../tmp/goopg_grammar.y:7644
 		{
 			yylex.(*lexerState).markSpanStart()
 		}
 	case 2244:
 		yyDollar = yyS[yypt-12 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7643
+//line ../../tmp/goopg_grammar.y:7645
 		{
 			yyVAL.stmt = buildView(yylex, true, yyDollar[4].node, yyDollar[6].qn, yyDollar[7].strs, yyDollar[8].strs, yyDollar[11].stmt, yyDollar[12].node)
 		}
 	case 2245:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7648
+//line ../../tmp/goopg_grammar.y:7650
 		{
 			yyVAL.node = &checkOpt{pos: -1}
 		}
 	case 2246:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7649
+//line ../../tmp/goopg_grammar.y:7651
 		{
 			yyVAL.node = &checkOpt{opt: "cascaded", pos: yyDollar[1].p}
 		}
 	case 2247:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7650
+//line ../../tmp/goopg_grammar.y:7652
 		{
 			yyVAL.node = &checkOpt{opt: "cascaded", pos: yyDollar[1].p}
 		}
 	case 2248:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7651
+//line ../../tmp/goopg_grammar.y:7653
 		{
 			yyVAL.node = &checkOpt{opt: "local", pos: yyDollar[1].p}
 		}
 	case 2249:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7654
+//line ../../tmp/goopg_grammar.y:7656
 		{
 			yyVAL.strs = []string(nil)
 		}
 	case 2250:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7655
+//line ../../tmp/goopg_grammar.y:7657
 		{
 			yyVAL.strs = yyDollar[3].strs
 		}
 	case 2251:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7658
+//line ../../tmp/goopg_grammar.y:7660
 		{
 			yyVAL.b = false
 		}
 	case 2252:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7659
+//line ../../tmp/goopg_grammar.y:7661
 		{
 			yyVAL.b = true
 		}
 	case 2253:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7662
+//line ../../tmp/goopg_grammar.y:7664
 		{
 			yyVAL.strs = []string(nil)
 		}
 	case 2254:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7663
+//line ../../tmp/goopg_grammar.y:7665
 		{
 			yyVAL.strs = yyDollar[2].strs
 		}
 	case 2255:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7668
+//line ../../tmp/goopg_grammar.y:7670
 		{
 			yyVAL.stmt = NewDropViewStmt(0, yyDollar[3].b, yyDollar[4].onames, dropBehavior(yyDollar[5].str))
 		}
 	case 2256:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7676
+//line ../../tmp/goopg_grammar.y:7678
 		{
 			yylex.(*lexerState).markSpanStart()
 		}
 	case 2257:
 		yyDollar = yyS[yypt-11 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7677
+//line ../../tmp/goopg_grammar.y:7679
 		{
 			v := objectNameFromQn(yyDollar[5].qn)
 			sel := yyDollar[10].stmt.(*SelectStmt)
@@ -20065,7 +20067,7 @@ yydefault:
 		}
 	case 2258:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7700
+//line ../../tmp/goopg_grammar.y:7702
 		{
 			st := NewRefreshMatViewStmt(0, objectNameFromQn(yyDollar[5].qn))
 			st.Concurrently = yyDollar[4].b
@@ -20074,43 +20076,43 @@ yydefault:
 		}
 	case 2259:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7708
+//line ../../tmp/goopg_grammar.y:7710
 		{
 			yyVAL.b = false
 		}
 	case 2260:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7709
+//line ../../tmp/goopg_grammar.y:7711
 		{
 			yyVAL.b = true
 		}
 	case 2261:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7713
+//line ../../tmp/goopg_grammar.y:7715
 		{
 			yyVAL.stmt = NewDropCompatStmt(0, "materialized view", yyDollar[4].b, yyDollar[5].onames, dropBehavior(yyDollar[6].str))
 		}
 	case 2262:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7718
+//line ../../tmp/goopg_grammar.y:7720
 		{
 			yyVAL.b = false
 		}
 	case 2263:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7719
+//line ../../tmp/goopg_grammar.y:7721
 		{
 			yyVAL.b = false
 		}
 	case 2264:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7720
+//line ../../tmp/goopg_grammar.y:7722
 		{
 			yyVAL.b = true
 		}
 	case 2265:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7726
+//line ../../tmp/goopg_grammar.y:7728
 		{
 			// The WITH token's own START is the body's exclusive end, and
 			// unlike prevPos+len(prevText) it is quote-safe: prevText is the
@@ -20122,7 +20124,7 @@ yydefault:
 		}
 	case 2266:
 		yyDollar = yyS[yypt-10 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7753
+//line ../../tmp/goopg_grammar.y:7755
 		{
 			a := mustFnAttrs(yyDollar[10].node)
 			if msg, raw, at := fnAttrsCheck(yylex, a, "FUNCTION"); msg != "" {
@@ -20139,7 +20141,7 @@ yydefault:
 		}
 	case 2267:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7773
+//line ../../tmp/goopg_grammar.y:7775
 		{
 			a := mustFnAttrs(yyDollar[8].node)
 			if msg, raw, at := fnAttrsCheck(yylex, a, "FUNCTION"); msg != "" {
@@ -20151,7 +20153,7 @@ yydefault:
 		}
 	case 2268:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7783
+//line ../../tmp/goopg_grammar.y:7785
 		{
 			a := mustFnAttrs(yyDollar[8].node)
 			if msg, raw, at := fnAttrsCheck(yylex, a, "PROCEDURE"); msg != "" {
@@ -20163,145 +20165,145 @@ yydefault:
 		}
 	case 2269:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7795
+//line ../../tmp/goopg_grammar.y:7797
 		{
 			yyVAL.node = &fnReturn{typ: colTypeOf(yylex, yyDollar[1].node.(*typeWithArgs), yyDollar[1].p)}
 		}
 	case 2270:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7797
+//line ../../tmp/goopg_grammar.y:7799
 		{
 			yyVAL.node = &fnReturn{typ: colTypeOf(yylex, yyDollar[2].node.(*typeWithArgs), yyDollar[2].p), setof: true}
 		}
 	case 2271:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7801
+//line ../../tmp/goopg_grammar.y:7803
 		{
 			yyVAL.node = &fnReturn{typ: NewColumnType("", "record", nil, false), setof: true, table: true, cols: yyDollar[3].fargs}
 		}
 	case 2272:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7806
+//line ../../tmp/goopg_grammar.y:7808
 		{
 			yyVAL.fargs = []FunctionArg{}
 		}
 	case 2273:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7807
+//line ../../tmp/goopg_grammar.y:7809
 		{
 			yyVAL.fargs = yyDollar[1].fargs
 		}
 	case 2274:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7810
+//line ../../tmp/goopg_grammar.y:7812
 		{
 			yyVAL.fargs = []FunctionArg{yyDollar[1].node.(FunctionArg)}
 		}
 	case 2275:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7811
+//line ../../tmp/goopg_grammar.y:7813
 		{
 			yyVAL.fargs = append(yyDollar[1].fargs, yyDollar[3].node.(FunctionArg))
 		}
 	case 2276:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7819
+//line ../../tmp/goopg_grammar.y:7821
 		{
 			yyVAL.node = NewFunctionArgAt(yyDollar[1].p, "", FuncArgIn, false, colTypeOf(yylex, yyDollar[1].node.(*typeWithArgs), yyDollar[1].p), yyDollar[2].expr)
 		}
 	case 2277:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7821
+//line ../../tmp/goopg_grammar.y:7823
 		{
 			yyVAL.node = NewFunctionArgAt(yyDollar[1].p, yyDollar[1].str, FuncArgIn, false, colTypeOf(yylex, yyDollar[2].node.(*typeWithArgs), yyDollar[2].p), yyDollar[3].expr)
 		}
 	case 2278:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7823
+//line ../../tmp/goopg_grammar.y:7825
 		{
 			yyVAL.node = NewFunctionArgAt(yyDollar[1].p, "", FuncArgMode(yyDollar[1].ival), true, colTypeOf(yylex, yyDollar[2].node.(*typeWithArgs), yyDollar[2].p), yyDollar[3].expr)
 		}
 	case 2279:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7825
+//line ../../tmp/goopg_grammar.y:7827
 		{
 			yyVAL.node = NewFunctionArgAt(yyDollar[1].p, yyDollar[2].str, FuncArgMode(yyDollar[1].ival), true, colTypeOf(yylex, yyDollar[3].node.(*typeWithArgs), yyDollar[3].p), yyDollar[4].expr)
 		}
 	case 2280:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7829
+//line ../../tmp/goopg_grammar.y:7831
 		{
 			yyVAL.node = NewFunctionArgAt(yyDollar[1].p, yyDollar[1].str, FuncArgMode(yyDollar[2].ival), true, colTypeOf(yylex, yyDollar[3].node.(*typeWithArgs), yyDollar[3].p), yyDollar[4].expr)
 		}
 	case 2281:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7835
+//line ../../tmp/goopg_grammar.y:7837
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2282:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7836
+//line ../../tmp/goopg_grammar.y:7838
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2283:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7843
+//line ../../tmp/goopg_grammar.y:7845
 		{
 			yyVAL.node = yyDollar[1].node
 		}
 	case 2284:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7844
+//line ../../tmp/goopg_grammar.y:7846
 		{
 			yyVAL.node = &typeWithArgs{ct: castType{name: "trigger"}}
 		}
 	case 2285:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7847
+//line ../../tmp/goopg_grammar.y:7849
 		{
 			yyVAL.ival = int(FuncArgIn)
 		}
 	case 2286:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7848
+//line ../../tmp/goopg_grammar.y:7850
 		{
 			yyVAL.ival = int(FuncArgOut)
 		}
 	case 2287:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7849
+//line ../../tmp/goopg_grammar.y:7851
 		{
 			yyVAL.ival = int(FuncArgInout)
 		}
 	case 2288:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7850
+//line ../../tmp/goopg_grammar.y:7852
 		{
 			yyVAL.ival = int(FuncArgVariadic)
 		}
 	case 2289:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7853
+//line ../../tmp/goopg_grammar.y:7855
 		{
 			yyVAL.expr = nil
 		}
 	case 2290:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7856
+//line ../../tmp/goopg_grammar.y:7858
 		{
 			yyVAL.expr = yyDollar[2].expr
 		}
 	case 2291:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7859
+//line ../../tmp/goopg_grammar.y:7861
 		{
 			yyVAL.node = newFnAttrs()
 		}
 	case 2292:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7860
+//line ../../tmp/goopg_grammar.y:7862
 		{
 			a := mustFnAttrs(yyDollar[1].node)
 			yyDollar[2].node.(func(*fnAttrs))(a)
@@ -20309,7 +20311,7 @@ yydefault:
 		}
 	case 2293:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7863
+//line ../../tmp/goopg_grammar.y:7865
 		{
 			a := newFnAttrs()
 			yyDollar[1].node.(func(*fnAttrs))(a)
@@ -20317,7 +20319,7 @@ yydefault:
 		}
 	case 2294:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7864
+//line ../../tmp/goopg_grammar.y:7866
 		{
 			a := mustFnAttrs(yyDollar[1].node)
 			yyDollar[2].node.(func(*fnAttrs))(a)
@@ -20325,7 +20327,7 @@ yydefault:
 		}
 	case 2295:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7868
+//line ../../tmp/goopg_grammar.y:7870
 		{
 			s, at := yyDollar[2].str, yyDollar[1].p
 			yyVAL.node = func(a *fnAttrs) {
@@ -20338,7 +20340,7 @@ yydefault:
 		}
 	case 2296:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7879
+//line ../../tmp/goopg_grammar.y:7881
 		{
 			s, two, at := yyDollar[2].str, twoItemAS(yylex, yyDollar[2].p), yyDollar[1].p
 			yyVAL.node = func(a *fnAttrs) {
@@ -20354,7 +20356,7 @@ yydefault:
 		}
 	case 2297:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7898
+//line ../../tmp/goopg_grammar.y:7900
 		{
 			p, at := yyDollar[2].p, yyDollar[1].p
 			yyVAL.node = func(a *fnAttrs) {
@@ -20367,112 +20369,112 @@ yydefault:
 		}
 	case 2298:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7908
+//line ../../tmp/goopg_grammar.y:7910
 		{
 			yyVAL.node = func(a *fnAttrs) { a.volatility = "i" }
 		}
 	case 2299:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7909
+//line ../../tmp/goopg_grammar.y:7911
 		{
 			yyVAL.node = func(a *fnAttrs) { a.volatility = "s" }
 		}
 	case 2300:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7910
+//line ../../tmp/goopg_grammar.y:7912
 		{
 			yyVAL.node = func(a *fnAttrs) { a.volatility = "v" }
 		}
 	case 2301:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7911
+//line ../../tmp/goopg_grammar.y:7913
 		{
 			yyVAL.node = func(a *fnAttrs) { a.strict = true }
 		}
 	case 2302:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7912
+//line ../../tmp/goopg_grammar.y:7914
 		{
 			yyVAL.node = func(a *fnAttrs) { a.strict = false }
 		}
 	case 2303:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7913
+//line ../../tmp/goopg_grammar.y:7915
 		{
 			yyVAL.node = func(a *fnAttrs) { a.strict = true }
 		}
 	case 2304:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7914
+//line ../../tmp/goopg_grammar.y:7916
 		{
 			yyVAL.node = func(a *fnAttrs) { a.leakproof = true }
 		}
 	case 2305:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7915
+//line ../../tmp/goopg_grammar.y:7917
 		{
 			yyVAL.node = func(a *fnAttrs) { a.leakproof = false }
 		}
 	case 2306:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7916
+//line ../../tmp/goopg_grammar.y:7918
 		{
 			yyVAL.node = func(a *fnAttrs) { a.window = true }
 		}
 	case 2307:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7917
+//line ../../tmp/goopg_grammar.y:7919
 		{
 			yyVAL.node = func(a *fnAttrs) { a.securityDefiner = true }
 		}
 	case 2308:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7918
+//line ../../tmp/goopg_grammar.y:7920
 		{
 			yyVAL.node = func(a *fnAttrs) { a.securityDefiner = false }
 		}
 	case 2309:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7919
+//line ../../tmp/goopg_grammar.y:7921
 		{
 			yyVAL.node = func(a *fnAttrs) { a.securityDefiner = true }
 		}
 	case 2310:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7920
+//line ../../tmp/goopg_grammar.y:7922
 		{
 			yyVAL.node = func(a *fnAttrs) { a.securityDefiner = false }
 		}
 	case 2311:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7921
+//line ../../tmp/goopg_grammar.y:7923
 		{
 			s := parallelCode(yyDollar[2].str)
 			yyVAL.node = func(a *fnAttrs) { a.parallel = s }
 		}
 	case 2312:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7923
+//line ../../tmp/goopg_grammar.y:7925
 		{
 			s := yyDollar[2].str
 			yyVAL.node = func(a *fnAttrs) { a.cost = s }
 		}
 	case 2313:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7924
+//line ../../tmp/goopg_grammar.y:7926
 		{
 			s := yyDollar[2].str
 			yyVAL.node = func(a *fnAttrs) { a.rows = s }
 		}
 	case 2314:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7926
+//line ../../tmp/goopg_grammar.y:7928
 		{
 			yyVAL.node = func(a *fnAttrs) {}
 		}
 	case 2315:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7928
+//line ../../tmp/goopg_grammar.y:7930
 		{
 			n, cv := yyDollar[2].str, fnConfigOf(yyDollar[3].node)
 			yyVAL.node = func(a *fnAttrs) {
@@ -20486,74 +20488,74 @@ yydefault:
 		}
 	case 2316:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7939
+//line ../../tmp/goopg_grammar.y:7941
 		{
 			yyVAL.node = func(a *fnAttrs) { a.configOps = append(a.configOps, NewFunctionConfigOp(false, true, "", "")) }
 		}
 	case 2317:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7940
+//line ../../tmp/goopg_grammar.y:7942
 		{
 			n := yyDollar[2].str
 			yyVAL.node = func(a *fnAttrs) { a.configOps = append(a.configOps, NewFunctionConfigOp(true, false, n, "")) }
 		}
 	case 2318:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7943
+//line ../../tmp/goopg_grammar.y:7945
 		{
 			yyVAL.str = atStatValue(yyDollar[1].i64)
 		}
 	case 2319:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7944
+//line ../../tmp/goopg_grammar.y:7946
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2320:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7945
+//line ../../tmp/goopg_grammar.y:7947
 		{
 			yyVAL.str = "-" + yyDollar[2].str
 		}
 	case 2321:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7948
+//line ../../tmp/goopg_grammar.y:7950
 		{
 			yyVAL.str = lowerIdent(yyDollar[1].str)
 		}
 	case 2322:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7949
+//line ../../tmp/goopg_grammar.y:7951
 		{
 			yyVAL.str = lowerIdent(yyDollar[1].str)
 		}
 	case 2323:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7954
+//line ../../tmp/goopg_grammar.y:7956
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2324:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7955
+//line ../../tmp/goopg_grammar.y:7957
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2325:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7958
+//line ../../tmp/goopg_grammar.y:7960
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2326:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7959
+//line ../../tmp/goopg_grammar.y:7961
 		{
 			yyVAL.str = yyDollar[1].str + "." + yyDollar[3].str
 		}
 	case 2327:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7966
+//line ../../tmp/goopg_grammar.y:7968
 		{
 			if isDefaultKeywordAt(yylex, yyDollar[2].p) {
 				yyVAL.node = nil
@@ -20563,47 +20565,47 @@ yydefault:
 		}
 	case 2328:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7973
+//line ../../tmp/goopg_grammar.y:7975
 		{
 			yyVAL.node = nil
 		}
 	case 2329:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7980
+//line ../../tmp/goopg_grammar.y:7982
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2330:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7981
+//line ../../tmp/goopg_grammar.y:7983
 		{
 			yyVAL.str = yyDollar[1].str + "," + yyDollar[3].str
 		}
 	case 2331:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7984
+//line ../../tmp/goopg_grammar.y:7986
 		{
 		}
 	case 2332:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7985
+//line ../../tmp/goopg_grammar.y:7987
 		{
 		}
 	case 2333:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7986
+//line ../../tmp/goopg_grammar.y:7988
 		{
 		}
 	case 2334:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7990
+//line ../../tmp/goopg_grammar.y:7992
 		{
 			it := yyDollar[4].node.(*DropFunctionItem)
 			yyVAL.stmt = NewDropFunctionStmt(yyDollar[1].p, yyDollar[3].b, it.Name, it.Args, fnDropBehavior(yyDollar[6].str), yyDollar[5].fitems)
 		}
 	case 2335:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:7995
+//line ../../tmp/goopg_grammar.y:7997
 		{
 			it := yyDollar[4].node.(*DropFunctionItem)
 			/* ObjKind is set for ROUTINE only; DROP PROCEDURE leaves it empty
@@ -20612,225 +20614,225 @@ yydefault:
 		}
 	case 2336:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8002
+//line ../../tmp/goopg_grammar.y:8004
 		{
 			it := yyDollar[4].node.(*DropFunctionItem)
 			yyVAL.stmt = NewDropProcedureStmt(yyDollar[1].p, yyDollar[3].b, it.Name, dropProcNames(yyDollar[5].fitems), it.Args, fnDropBehavior(yyDollar[6].str), "routine")
 		}
 	case 2337:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8009
+//line ../../tmp/goopg_grammar.y:8011
 		{
 			yyVAL.node = &DropFunctionItem{Name: objectNameFromQn(yyDollar[1].qn)}
 		}
 	case 2338:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8011
+//line ../../tmp/goopg_grammar.y:8013
 		{
 			yyVAL.node = &DropFunctionItem{Name: objectNameFromQn(yyDollar[1].qn), Args: yyDollar[3].fargs}
 		}
 	case 2339:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8014
+//line ../../tmp/goopg_grammar.y:8016
 		{
 			yyVAL.fitems = []DropFunctionItem(nil)
 		}
 	case 2340:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8015
+//line ../../tmp/goopg_grammar.y:8017
 		{
 			yyVAL.fitems = append(yyDollar[1].fitems, *yyDollar[3].node.(*DropFunctionItem))
 		}
 	case 2341:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8019
+//line ../../tmp/goopg_grammar.y:8021
 		{
 			yyVAL.stmt = NewCallStmt(yyDollar[1].p, objectNameFromQn(yyDollar[2].qn), nil, nil)
 		}
 	case 2342:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8021
+//line ../../tmp/goopg_grammar.y:8023
 		{
 			ca := yyDollar[4].node.(*namedCallArgs)
 			yyVAL.stmt = NewCallStmt(yyDollar[1].p, objectNameFromQn(yyDollar[2].qn), ca.exprs, ca.names())
 		}
 	case 2343:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8027
+//line ../../tmp/goopg_grammar.y:8029
 		{
 			yyVAL.node = &namedCallArgs{exprs: []Expr{}}
 		}
 	case 2344:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8028
+//line ../../tmp/goopg_grammar.y:8030
 		{
 			yyVAL.node = yyDollar[1].node
 		}
 	case 2345:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8031
+//line ../../tmp/goopg_grammar.y:8033
 		{
 			yyVAL.node = appendNamedCallArg(nil, yyDollar[1].node.(callArg))
 		}
 	case 2346:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8032
+//line ../../tmp/goopg_grammar.y:8034
 		{
 			yyVAL.node = appendNamedCallArg(yyDollar[1].node.(*namedCallArgs), yyDollar[3].node.(callArg))
 		}
 	case 2347:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8037
+//line ../../tmp/goopg_grammar.y:8039
 		{
 			yyVAL.node = callArg{expr: yyDollar[1].expr}
 		}
 	case 2348:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8038
+//line ../../tmp/goopg_grammar.y:8040
 		{
 			yyVAL.node = callArg{expr: yyDollar[3].expr, name: exprIdentName(yyDollar[1].expr), named: true}
 		}
 	case 2349:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8059
+//line ../../tmp/goopg_grammar.y:8061
 		{
 			yyVAL.stmt = NewSavepointStmt(yyDollar[1].p, yyDollar[2].str)
 		}
 	case 2350:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8062
+//line ../../tmp/goopg_grammar.y:8064
 		{
 			yyVAL.stmt = NewReleaseSavepointStmt(yyDollar[1].p, yyDollar[3].str)
 		}
 	case 2351:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8063
+//line ../../tmp/goopg_grammar.y:8065
 		{
 			yyVAL.stmt = NewReleaseSavepointStmt(yyDollar[1].p, yyDollar[2].str)
 		}
 	case 2352:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8066
+//line ../../tmp/goopg_grammar.y:8068
 		{
 			yyVAL.stmt = NewCheckpointStmt(yyDollar[1].p)
 		}
 	case 2353:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8073
+//line ../../tmp/goopg_grammar.y:8075
 		{
 			yyVAL.stmt = NewDiscardStmt(yyDollar[1].p, "ALL")
 		}
 	case 2354:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8074
+//line ../../tmp/goopg_grammar.y:8076
 		{
 			yyVAL.stmt = NewDiscardStmt(yyDollar[1].p, "PLANS")
 		}
 	case 2355:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8075
+//line ../../tmp/goopg_grammar.y:8077
 		{
 			yyVAL.stmt = NewDiscardStmt(yyDollar[1].p, "SEQUENCES")
 		}
 	case 2356:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8076
+//line ../../tmp/goopg_grammar.y:8078
 		{
 			yyVAL.stmt = NewDiscardStmt(yyDollar[1].p, "TEMP")
 		}
 	case 2357:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8077
+//line ../../tmp/goopg_grammar.y:8079
 		{
 			yyVAL.stmt = NewDiscardStmt(yyDollar[1].p, "TEMP")
 		}
 	case 2358:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8080
+//line ../../tmp/goopg_grammar.y:8082
 		{
 			yyVAL.stmt = NewDeallocateStmt(yyDollar[1].p, yyDollar[2].str)
 		}
 	case 2359:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8081
+//line ../../tmp/goopg_grammar.y:8083
 		{
 			yyVAL.stmt = NewDeallocateStmt(yyDollar[1].p, yyDollar[3].str)
 		}
 	case 2360:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8082
+//line ../../tmp/goopg_grammar.y:8084
 		{
 			yyVAL.stmt = NewDeallocateStmt(yyDollar[1].p, "")
 		}
 	case 2361:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8083
+//line ../../tmp/goopg_grammar.y:8085
 		{
 			yyVAL.stmt = NewDeallocateStmt(yyDollar[1].p, "")
 		}
 	case 2362:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8087
+//line ../../tmp/goopg_grammar.y:8089
 		{
 			yyVAL.stmt = NewPrepareStmt(yyDollar[1].p, yyDollar[2].str, yyDollar[3].strs, yyDollar[5].stmt)
 		}
 	case 2363:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8092
+//line ../../tmp/goopg_grammar.y:8094
 		{
 			yyVAL.stmt = NewPrepareTransactionStmt(yyDollar[1].p, yyDollar[3].str)
 		}
 	case 2364:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8097
+//line ../../tmp/goopg_grammar.y:8099
 		{
 			yyVAL.strs = []string(nil)
 		}
 	case 2365:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8098
+//line ../../tmp/goopg_grammar.y:8100
 		{
 			yyVAL.strs = yyDollar[2].strs
 		}
 	case 2366:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8101
+//line ../../tmp/goopg_grammar.y:8103
 		{
 			yyVAL.strs = []string{typeNameOf(yyDollar[1].node)}
 		}
 	case 2367:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8102
+//line ../../tmp/goopg_grammar.y:8104
 		{
 			yyVAL.strs = append(yyDollar[1].strs, typeNameOf(yyDollar[3].node))
 		}
 	case 2368:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8105
+//line ../../tmp/goopg_grammar.y:8107
 		{
 			yyVAL.stmt = NewExecuteStmt(yyDollar[1].p, yyDollar[2].str, nil)
 		}
 	case 2369:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8106
+//line ../../tmp/goopg_grammar.y:8108
 		{
 			yyVAL.stmt = NewExecuteStmt(yyDollar[1].p, yyDollar[2].str, yyDollar[4].exprs)
 		}
 	case 2370:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8109
+//line ../../tmp/goopg_grammar.y:8111
 		{
 			yyVAL.stmt = NewCloseStmt(yyDollar[1].p, yyDollar[2].str)
 		}
 	case 2371:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8110
+//line ../../tmp/goopg_grammar.y:8112
 		{
 			yyVAL.stmt = NewCloseStmt(yyDollar[1].p, "")
 		}
 	case 2372:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8121
+//line ../../tmp/goopg_grammar.y:8123
 		{
 			sel, _ := yyDollar[7].stmt.(*SelectStmt)
 			checkStrayInto(yylex, sel, "SELECT ... INTO is not allowed here", false)
@@ -20838,166 +20840,166 @@ yydefault:
 		}
 	case 2373:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8128
+//line ../../tmp/goopg_grammar.y:8130
 		{
 		}
 	case 2374:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8129
+//line ../../tmp/goopg_grammar.y:8131
 		{
 		}
 	case 2375:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8130
+//line ../../tmp/goopg_grammar.y:8132
 		{
 		}
 	case 2376:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8133
+//line ../../tmp/goopg_grammar.y:8135
 		{
 		}
 	case 2377:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8134
+//line ../../tmp/goopg_grammar.y:8136
 		{
 		}
 	case 2378:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8135
+//line ../../tmp/goopg_grammar.y:8137
 		{
 		}
 	case 2379:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8141
+//line ../../tmp/goopg_grammar.y:8143
 		{
 			yyVAL.stmt = fetchStmt(yyDollar[1].p, yyDollar[2].node, false)
 		}
 	case 2380:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8142
+//line ../../tmp/goopg_grammar.y:8144
 		{
 			yyVAL.stmt = fetchStmt(yyDollar[1].p, yyDollar[2].node, true)
 		}
 	case 2381:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8149
+//line ../../tmp/goopg_grammar.y:8151
 		{
 			yyVAL.node = &fetchSpec{count: 1, forward: true, name: yyDollar[1].str}
 		}
 	case 2382:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8150
+//line ../../tmp/goopg_grammar.y:8152
 		{
 			yyVAL.node = &fetchSpec{count: 1, forward: true, name: yyDollar[2].str}
 		}
 	case 2383:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8151
+//line ../../tmp/goopg_grammar.y:8153
 		{
 			yyVAL.node = &fetchSpec{count: 1, forward: true, name: yyDollar[2].str}
 		}
 	case 2384:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8152
+//line ../../tmp/goopg_grammar.y:8154
 		{
 			yyVAL.node = &fetchSpec{count: -1, forward: true, name: yyDollar[3].str}
 		}
 	case 2385:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8153
+//line ../../tmp/goopg_grammar.y:8155
 		{
 			yyVAL.node = &fetchSpec{count: yyDollar[1].i64, forward: true, name: yyDollar[3].str}
 		}
 	case 2386:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8154
+//line ../../tmp/goopg_grammar.y:8156
 		{
 			yyVAL.node = &fetchSpec{count: 1, forward: true, name: yyDollar[3].str}
 		}
 	case 2387:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8155
+//line ../../tmp/goopg_grammar.y:8157
 		{
 			yyVAL.node = &fetchSpec{count: 1, forward: false, name: yyDollar[3].str}
 		}
 	case 2388:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8156
+//line ../../tmp/goopg_grammar.y:8158
 		{
 			yyVAL.node = &fetchSpec{count: 1, forward: true, name: yyDollar[3].str}
 		}
 	case 2389:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8157
+//line ../../tmp/goopg_grammar.y:8159
 		{
 			yyVAL.node = &fetchSpec{count: 1, forward: false, name: yyDollar[3].str}
 		}
 	case 2390:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8158
+//line ../../tmp/goopg_grammar.y:8160
 		{
 			yyVAL.node = &fetchSpec{count: yyDollar[2].i64, forward: true, name: yyDollar[4].str}
 		}
 	case 2391:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8159
+//line ../../tmp/goopg_grammar.y:8161
 		{
 			yyVAL.node = &fetchSpec{count: yyDollar[2].i64, forward: true, name: yyDollar[4].str}
 		}
 	case 2392:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8160
+//line ../../tmp/goopg_grammar.y:8162
 		{
 			yyVAL.node = &fetchSpec{count: yyDollar[2].i64, forward: true, name: yyDollar[4].str}
 		}
 	case 2393:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8161
+//line ../../tmp/goopg_grammar.y:8163
 		{
 			yyVAL.node = &fetchSpec{count: yyDollar[2].i64, forward: false, name: yyDollar[4].str}
 		}
 	case 2394:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8164
+//line ../../tmp/goopg_grammar.y:8166
 		{
 			yyVAL.i64 = int64(1)
 		}
 	case 2395:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8165
+//line ../../tmp/goopg_grammar.y:8167
 		{
 			yyVAL.i64 = yyDollar[1].i64
 		}
 	case 2396:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8166
+//line ../../tmp/goopg_grammar.y:8168
 		{
 			yyVAL.i64 = int64(-1)
 		}
 	case 2397:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8169
+//line ../../tmp/goopg_grammar.y:8171
 		{
 		}
 	case 2398:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8170
+//line ../../tmp/goopg_grammar.y:8172
 		{
 		}
 	case 2399:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8171
+//line ../../tmp/goopg_grammar.y:8173
 		{
 		}
 	case 2400:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8174
+//line ../../tmp/goopg_grammar.y:8176
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2401:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8178
+//line ../../tmp/goopg_grammar.y:8180
 		{
 			v := yyDollar[2].node.(*VacuumStmt)
 			tg := yyDollar[3].node.(*vacTargets)
@@ -21005,17 +21007,17 @@ yydefault:
 		}
 	case 2402:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8185
+//line ../../tmp/goopg_grammar.y:8187
 		{
 		}
 	case 2403:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8186
+//line ../../tmp/goopg_grammar.y:8188
 		{
 		}
 	case 2404:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8190
+//line ../../tmp/goopg_grammar.y:8192
 		{
 			// The option list allocates the statement (it is the fold's
 			// accumulator), so the position is stamped by rebuilding the
@@ -21027,25 +21029,25 @@ yydefault:
 		}
 	case 2405:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8205
+//line ../../tmp/goopg_grammar.y:8207
 		{
 			yyVAL.node = yyDollar[1].node
 		}
 	case 2406:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8206
+//line ../../tmp/goopg_grammar.y:8208
 		{
 			yyVAL.node = yyDollar[2].node
 		}
 	case 2407:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8209
+//line ../../tmp/goopg_grammar.y:8211
 		{
 			yyVAL.node = NewVacuumStmt(0)
 		}
 	case 2408:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8210
+//line ../../tmp/goopg_grammar.y:8212
 		{
 			v := yyDollar[1].node.(*VacuumStmt)
 			yyDollar[2].node.(func(*VacuumStmt))(v)
@@ -21053,31 +21055,31 @@ yydefault:
 		}
 	case 2409:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8213
+//line ../../tmp/goopg_grammar.y:8215
 		{
 			yyVAL.node = func(v *VacuumStmt) { v.Verbose = true }
 		}
 	case 2410:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8214
+//line ../../tmp/goopg_grammar.y:8216
 		{
 			yyVAL.node = func(v *VacuumStmt) { v.Analyze = true }
 		}
 	case 2411:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8215
+//line ../../tmp/goopg_grammar.y:8217
 		{
 			yyVAL.node = func(v *VacuumStmt) { v.Full = true }
 		}
 	case 2412:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8216
+//line ../../tmp/goopg_grammar.y:8218
 		{
 			yyVAL.node = func(v *VacuumStmt) { v.Freeze = true }
 		}
 	case 2413:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8219
+//line ../../tmp/goopg_grammar.y:8221
 		{
 			v := NewVacuumStmt(0)
 			yyDollar[1].node.(func(*VacuumStmt))(v)
@@ -21085,7 +21087,7 @@ yydefault:
 		}
 	case 2414:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8220
+//line ../../tmp/goopg_grammar.y:8222
 		{
 			v := yyDollar[1].node.(*VacuumStmt)
 			yyDollar[3].node.(func(*VacuumStmt))(v)
@@ -21093,271 +21095,271 @@ yydefault:
 		}
 	case 2415:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8228
+//line ../../tmp/goopg_grammar.y:8230
 		{
 			yyVAL.node = vacuumNamedOpt(yyDollar[1].str, yyDollar[2].str)
 		}
 	case 2416:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8233
+//line ../../tmp/goopg_grammar.y:8235
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2417:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8234
+//line ../../tmp/goopg_grammar.y:8236
 		{
 			yyVAL.str = "verbose"
 		}
 	case 2418:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8235
+//line ../../tmp/goopg_grammar.y:8237
 		{
 			yyVAL.str = "analyze"
 		}
 	case 2419:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8236
+//line ../../tmp/goopg_grammar.y:8238
 		{
 			yyVAL.str = "full"
 		}
 	case 2420:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8237
+//line ../../tmp/goopg_grammar.y:8239
 		{
 			yyVAL.str = "freeze"
 		}
 	case 2421:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8240
+//line ../../tmp/goopg_grammar.y:8242
 		{
 			yyVAL.str = ""
 		}
 	case 2422:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8241
+//line ../../tmp/goopg_grammar.y:8243
 		{
 			yyVAL.str = "true"
 		}
 	case 2423:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8242
+//line ../../tmp/goopg_grammar.y:8244
 		{
 			yyVAL.str = "false"
 		}
 	case 2424:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8243
+//line ../../tmp/goopg_grammar.y:8245
 		{
 			yyVAL.str = "on"
 		}
 	case 2425:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8244
+//line ../../tmp/goopg_grammar.y:8246
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2426:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8245
+//line ../../tmp/goopg_grammar.y:8247
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2427:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8246
+//line ../../tmp/goopg_grammar.y:8248
 		{
 			yyVAL.str = strconv.FormatInt(yyDollar[1].i64, 10)
 		}
 	case 2428:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8249
+//line ../../tmp/goopg_grammar.y:8251
 		{
 			yyVAL.node = &vacTargets{}
 		}
 	case 2429:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8250
+//line ../../tmp/goopg_grammar.y:8252
 		{
 			yyVAL.node = yyDollar[1].node
 		}
 	case 2430:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8253
+//line ../../tmp/goopg_grammar.y:8255
 		{
 			yyVAL.node = appendVacTarget(nil, yyDollar[1].node.(*vacTarget))
 		}
 	case 2431:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8254
+//line ../../tmp/goopg_grammar.y:8256
 		{
 			yyVAL.node = appendVacTarget(yyDollar[1].node.(*vacTargets), yyDollar[3].node.(*vacTarget))
 		}
 	case 2432:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8257
+//line ../../tmp/goopg_grammar.y:8259
 		{
 			yyVAL.node = &vacTarget{name: objectNameFromQn(yyDollar[1].qn)}
 		}
 	case 2433:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8258
+//line ../../tmp/goopg_grammar.y:8260
 		{
 			yyVAL.node = &vacTarget{name: objectNameFromQn(yyDollar[1].qn), cols: yyDollar[3].strs}
 		}
 	case 2434:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8266
+//line ../../tmp/goopg_grammar.y:8268
 		{
 			yyVAL.stmt = NewReindexStmt(yyDollar[1].p, yyDollar[2].b, yyDollar[3].b || yyDollar[5].b, yyDollar[4].str, qnText(yyDollar[7].qn))
 		}
 	case 2435:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8269
+//line ../../tmp/goopg_grammar.y:8271
 		{
 			yyVAL.b = false
 		}
 	case 2436:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8270
+//line ../../tmp/goopg_grammar.y:8272
 		{
 			yyVAL.b = yyDollar[2].b
 		}
 	case 2437:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8273
+//line ../../tmp/goopg_grammar.y:8275
 		{
 			yyVAL.b = yyDollar[1].b
 		}
 	case 2438:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8274
+//line ../../tmp/goopg_grammar.y:8276
 		{
 			yyVAL.b = yyDollar[1].b || yyDollar[3].b
 		}
 	case 2439:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8277
+//line ../../tmp/goopg_grammar.y:8279
 		{
 			yyVAL.b = true
 		}
 	case 2440:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8278
+//line ../../tmp/goopg_grammar.y:8280
 		{
 			yyVAL.b = false
 		}
 	case 2441:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8281
+//line ../../tmp/goopg_grammar.y:8283
 		{
 			yyVAL.str = "INDEX"
 		}
 	case 2442:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8282
+//line ../../tmp/goopg_grammar.y:8284
 		{
 			yyVAL.str = "TABLE"
 		}
 	case 2443:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8283
+//line ../../tmp/goopg_grammar.y:8285
 		{
 			yyVAL.str = "DATABASE"
 		}
 	case 2444:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8284
+//line ../../tmp/goopg_grammar.y:8286
 		{
 			yyVAL.str = "SCHEMA"
 		}
 	case 2445:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8285
+//line ../../tmp/goopg_grammar.y:8287
 		{
 			yyVAL.str = "SYSTEM"
 		}
 	case 2446:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8290
+//line ../../tmp/goopg_grammar.y:8292
 		{
 			yyVAL.stmt = NewClusterStmt(yyDollar[1].p, yyDollar[2].b, nil, "")
 		}
 	case 2447:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8292
+//line ../../tmp/goopg_grammar.y:8294
 		{
 			n := objectNameFromQn(yyDollar[3].qn)
 			yyVAL.stmt = NewClusterStmt(yyDollar[1].p, yyDollar[2].b, &n, yyDollar[4].str)
 		}
 	case 2448:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8295
+//line ../../tmp/goopg_grammar.y:8297
 		{
 			yyVAL.b = false
 		}
 	case 2449:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8296
+//line ../../tmp/goopg_grammar.y:8298
 		{
 			yyVAL.b = true
 		}
 	case 2450:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8299
+//line ../../tmp/goopg_grammar.y:8301
 		{
 			yyVAL.str = ""
 		}
 	case 2451:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8300
+//line ../../tmp/goopg_grammar.y:8302
 		{
 			yyVAL.str = yyDollar[2].str
 		}
 	case 2452:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8306
+//line ../../tmp/goopg_grammar.y:8308
 		{
 			yyVAL.stmt = NewLockTableStmt(yyDollar[1].p, yyDollar[3].lrels, yyDollar[4].str, yyDollar[5].b)
 		}
 	case 2453:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8309
+//line ../../tmp/goopg_grammar.y:8311
 		{
 		}
 	case 2454:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8310
+//line ../../tmp/goopg_grammar.y:8312
 		{
 		}
 	case 2455:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8313
+//line ../../tmp/goopg_grammar.y:8315
 		{
 			yyVAL.lrels = []LockTableRelation{yyDollar[1].lrel}
 		}
 	case 2456:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8314
+//line ../../tmp/goopg_grammar.y:8316
 		{
 			yyVAL.lrels = append(yyDollar[1].lrels, yyDollar[3].lrel)
 		}
 	case 2457:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8317
+//line ../../tmp/goopg_grammar.y:8319
 		{
 			n := objectNameFromQn(yyDollar[2].qn)
 			yyVAL.lrel = NewLockTableRelation(n.Schema, n.Name)
 		}
 	case 2458:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8320
+//line ../../tmp/goopg_grammar.y:8322
 		{
 			yyVAL.str = "AccessExclusiveLock"
 		}
 	case 2459:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8322
+//line ../../tmp/goopg_grammar.y:8324
 		{
 			n, ok := LockModeName(yyDollar[2].strs)
 			if !ok {
@@ -21368,67 +21370,67 @@ yydefault:
 		}
 	case 2460:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8332
+//line ../../tmp/goopg_grammar.y:8334
 		{
 			yyVAL.strs = []string{yyDollar[1].str}
 		}
 	case 2461:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8333
+//line ../../tmp/goopg_grammar.y:8335
 		{
 			yyVAL.strs = append(yyDollar[1].strs, yyDollar[2].str)
 		}
 	case 2462:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8339
+//line ../../tmp/goopg_grammar.y:8341
 		{
 			yyVAL.str = "access"
 		}
 	case 2463:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8340
+//line ../../tmp/goopg_grammar.y:8342
 		{
 			yyVAL.str = "share"
 		}
 	case 2464:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8341
+//line ../../tmp/goopg_grammar.y:8343
 		{
 			yyVAL.str = "row"
 		}
 	case 2465:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8342
+//line ../../tmp/goopg_grammar.y:8344
 		{
 			yyVAL.str = "update"
 		}
 	case 2466:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8343
+//line ../../tmp/goopg_grammar.y:8345
 		{
 			yyVAL.str = "exclusive"
 		}
 	case 2467:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8346
+//line ../../tmp/goopg_grammar.y:8348
 		{
 			yyVAL.b = false
 		}
 	case 2468:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8347
+//line ../../tmp/goopg_grammar.y:8349
 		{
 			yyVAL.b = true
 		}
 	case 2469:
 		yyDollar = yyS[yypt-9 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8362
+//line ../../tmp/goopg_grammar.y:8364
 		{
 			yyVAL.stmt = NewMergeStmt(yyDollar[1].p, yyDollar[3].rvar, yyDollar[5].rvar, yyDollar[7].expr, yyDollar[8].mwcs, yyDollar[9].targets)
 		}
 	case 2470:
 		yyDollar = yyS[yypt-10 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8366
+//line ../../tmp/goopg_grammar.y:8368
 		{
 			m := NewMergeStmt(yyDollar[2].p, yyDollar[4].rvar, yyDollar[6].rvar, yyDollar[8].expr, yyDollar[9].mwcs, yyDollar[10].targets)
 			m.With = yyDollar[1].withc
@@ -21436,29 +21438,29 @@ yydefault:
 		}
 	case 2471:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8373
+//line ../../tmp/goopg_grammar.y:8375
 		{
 		}
 	case 2472:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8374
+//line ../../tmp/goopg_grammar.y:8376
 		{
 		}
 	case 2473:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8378
+//line ../../tmp/goopg_grammar.y:8380
 		{
 			yyVAL.mwcs = []*MergeWhenClause(nil)
 		}
 	case 2474:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8379
+//line ../../tmp/goopg_grammar.y:8381
 		{
 			yyVAL.mwcs = append(yyDollar[1].mwcs, yyDollar[2].mwc)
 		}
 	case 2475:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8383
+//line ../../tmp/goopg_grammar.y:8385
 		{
 			/* The WHEN keyword — merge_match reduces before it is on the
 			   stack, so the clause is re-anchored here. */
@@ -21469,85 +21471,85 @@ yydefault:
 		}
 	case 2476:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8393
+//line ../../tmp/goopg_grammar.y:8395
 		{
 			yyVAL.mwc = NewMergeWhenClause(0, true, false, false)
 		}
 	case 2477:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8394
+//line ../../tmp/goopg_grammar.y:8396
 		{
 			yyVAL.mwc = NewMergeWhenClause(0, false, false, false)
 		}
 	case 2478:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8395
+//line ../../tmp/goopg_grammar.y:8397
 		{
 			yyVAL.mwc = mergeNotMatchedBy(yyDollar[4].str)
 		}
 	case 2479:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8398
+//line ../../tmp/goopg_grammar.y:8400
 		{
 			yyVAL.expr = nil
 		}
 	case 2480:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8399
+//line ../../tmp/goopg_grammar.y:8401
 		{
 			yyVAL.expr = yyDollar[2].expr
 		}
 	case 2481:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8402
+//line ../../tmp/goopg_grammar.y:8404
 		{
 			yyVAL.node = &mergeAction{kind: MergeActionUpdate, assigns: yyDollar[3].ualist}
 		}
 	case 2482:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8403
+//line ../../tmp/goopg_grammar.y:8405
 		{
 			yyVAL.node = &mergeAction{kind: MergeActionDelete}
 		}
 	case 2483:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8404
+//line ../../tmp/goopg_grammar.y:8406
 		{
 			yyVAL.node = &mergeAction{kind: MergeActionDoNothing}
 		}
 	case 2484:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8413
+//line ../../tmp/goopg_grammar.y:8415
 		{
 			yyVAL.node = &mergeAction{kind: MergeActionInsert, cols: yyDollar[2].strs, vals: yyDollar[5].exprs}
 		}
 	case 2485:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8417
+//line ../../tmp/goopg_grammar.y:8419
 		{
 			yyVAL.node = &mergeAction{kind: MergeActionInsert, cols: yyDollar[2].strs}
 		}
 	case 2486:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8420
+//line ../../tmp/goopg_grammar.y:8422
 		{
 			yyVAL.strs = []string(nil)
 		}
 	case 2487:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8421
+//line ../../tmp/goopg_grammar.y:8423
 		{
 			yyVAL.strs = yyDollar[2].strs
 		}
 	case 2488:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8436
+//line ../../tmp/goopg_grammar.y:8438
 		{
 			yyVAL.stmt = NewCreateTypeStmt(yyDollar[1].p, objectNameFromQn(yyDollar[3].qn))
 		}
 	case 2489:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8439
+//line ../../tmp/goopg_grammar.y:8441
 		{
 			st := NewCreateTypeStmt(yyDollar[1].p, objectNameFromQn(yyDollar[3].qn))
 			st.HasOptions = true
@@ -21555,7 +21557,7 @@ yydefault:
 		}
 	case 2490:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8445
+//line ../../tmp/goopg_grammar.y:8447
 		{
 			st := NewCreateTypeStmt(yyDollar[1].p, objectNameFromQn(yyDollar[3].qn))
 			st.IsEnum, st.EnumValues = true, yyDollar[7].strs
@@ -21563,7 +21565,7 @@ yydefault:
 		}
 	case 2491:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8451
+//line ../../tmp/goopg_grammar.y:8453
 		{
 			st := NewCreateTypeStmt(yyDollar[1].p, objectNameFromQn(yyDollar[3].qn))
 			st.IsComposite, st.CompositeFields = true, yyDollar[6].tflds
@@ -21571,7 +21573,7 @@ yydefault:
 		}
 	case 2492:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8457
+//line ../../tmp/goopg_grammar.y:8459
 		{
 			st := NewCreateTypeStmt(yyDollar[1].p, objectNameFromQn(yyDollar[3].qn))
 			st.IsRange = true
@@ -21580,161 +21582,161 @@ yydefault:
 		}
 	case 2493:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8467
+//line ../../tmp/goopg_grammar.y:8469
 		{
 			yyVAL.strs = []string{yyDollar[1].str}
 		}
 	case 2494:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8468
+//line ../../tmp/goopg_grammar.y:8470
 		{
 			yyVAL.strs = append(yyDollar[1].strs, yyDollar[3].str)
 		}
 	case 2495:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8471
+//line ../../tmp/goopg_grammar.y:8473
 		{
 			yyVAL.tflds = []TypeField{yyDollar[1].tfld}
 		}
 	case 2496:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8472
+//line ../../tmp/goopg_grammar.y:8474
 		{
 			yyVAL.tflds = append(yyDollar[1].tflds, yyDollar[3].tfld)
 		}
 	case 2497:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8480
+//line ../../tmp/goopg_grammar.y:8482
 		{
 			yyVAL.tfld = NewTypeField(lowerIdent(yyDollar[1].str), rawTypeSpan(yylex, yyDollar[2].p), yyDollar[3].str)
 		}
 	case 2498:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8483
+//line ../../tmp/goopg_grammar.y:8485
 		{
 			yyVAL.str = ""
 		}
 	case 2499:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8484
+//line ../../tmp/goopg_grammar.y:8486
 		{
 			yyVAL.str = qnLastPart(yyDollar[2].qn)
 		}
 	case 2500:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8489
+//line ../../tmp/goopg_grammar.y:8491
 		{
 		}
 	case 2501:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8490
+//line ../../tmp/goopg_grammar.y:8492
 		{
 		}
 	case 2502:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8498
+//line ../../tmp/goopg_grammar.y:8500
 		{
 		}
 	case 2503:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8499
+//line ../../tmp/goopg_grammar.y:8501
 		{
 		}
 	case 2504:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8502
+//line ../../tmp/goopg_grammar.y:8504
 		{
 		}
 	case 2505:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8503
+//line ../../tmp/goopg_grammar.y:8505
 		{
 		}
 	case 2506:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8506
+//line ../../tmp/goopg_grammar.y:8508
 		{
 		}
 	case 2507:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8507
+//line ../../tmp/goopg_grammar.y:8509
 		{
 		}
 	case 2508:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8508
+//line ../../tmp/goopg_grammar.y:8510
 		{
 		}
 	case 2509:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8509
+//line ../../tmp/goopg_grammar.y:8511
 		{
 		}
 	case 2510:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8510
+//line ../../tmp/goopg_grammar.y:8512
 		{
 		}
 	case 2511:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8511
+//line ../../tmp/goopg_grammar.y:8513
 		{
 		}
 	case 2512:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8512
+//line ../../tmp/goopg_grammar.y:8514
 		{
 		}
 	case 2513:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8513
+//line ../../tmp/goopg_grammar.y:8515
 		{
 		}
 	case 2514:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8516
+//line ../../tmp/goopg_grammar.y:8518
 		{
 			yyVAL.nodes = appendRangeOpt(nil, yyDollar[1].node.(*kvPair))
 		}
 	case 2515:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8517
+//line ../../tmp/goopg_grammar.y:8519
 		{
 			yyVAL.nodes = appendRangeOpt(yyDollar[1].nodes, yyDollar[3].node.(*kvPair))
 		}
 	case 2516:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8523
+//line ../../tmp/goopg_grammar.y:8525
 		{
 			yyVAL.node = &kvPair{key: lowerIdent(yyDollar[1].str), val: rawTypeSpan(yylex, yyDollar[3].p), last: yyDollar[3].str}
 		}
 	case 2517:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8527
+//line ../../tmp/goopg_grammar.y:8529
 		{
 			yyVAL.node = &kvPair{key: "collation", val: rawTypeSpan(yylex, yyDollar[3].p), last: yyDollar[3].str}
 		}
 	case 2518:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8532
+//line ../../tmp/goopg_grammar.y:8534
 		{
 			yyVAL.str = qnLastPart(yyDollar[1].qn)
 		}
 	case 2519:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8536
+//line ../../tmp/goopg_grammar.y:8538
 		{
 			yyVAL.stmt = NewDropTypeStmt(yyDollar[1].p, yyDollar[4].onames, yyDollar[3].b, yyDollar[5].str == "cascade")
 		}
 	case 2520:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8540
+//line ../../tmp/goopg_grammar.y:8542
 		{
 			yyVAL.stmt = NewDropDomainStmt(yyDollar[1].p, yyDollar[4].onames, yyDollar[3].b, yyDollar[5].str == "cascade")
 		}
 	case 2521:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8546
+//line ../../tmp/goopg_grammar.y:8548
 		{
 			tw := yyDollar[5].node.(*typeWithArgs)
 			ct := colTypeOf(yylex, tw, yyDollar[5].p)
@@ -21751,65 +21753,65 @@ yydefault:
 		}
 	case 2522:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8562
+//line ../../tmp/goopg_grammar.y:8564
 		{
 		}
 	case 2523:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8563
+//line ../../tmp/goopg_grammar.y:8565
 		{
 		}
 	case 2524:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8566
+//line ../../tmp/goopg_grammar.y:8568
 		{
 			yyVAL.nodes = []any(nil)
 		}
 	case 2525:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8567
+//line ../../tmp/goopg_grammar.y:8569
 		{
 			yyVAL.nodes = append(yyDollar[1].nodes, yyDollar[2].node)
 		}
 	case 2526:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8570
+//line ../../tmp/goopg_grammar.y:8572
 		{
 			yyVAL.node = domainNotNull(true)
 		}
 	case 2527:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8571
+//line ../../tmp/goopg_grammar.y:8573
 		{
 			yyVAL.node = domainNotNull(false)
 		}
 	case 2528:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8572
+//line ../../tmp/goopg_grammar.y:8574
 		{
 			yyVAL.node = domainDefault(yyDollar[2].expr)
 		}
 	case 2529:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8573
+//line ../../tmp/goopg_grammar.y:8575
 		{
 			yyVAL.node = domainCheck(yylex, "", yyDollar[1].p)
 		}
 	case 2530:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8574
+//line ../../tmp/goopg_grammar.y:8576
 		{
 			yyVAL.node = domainCheck(yylex, yyDollar[2].str, yyDollar[3].p)
 		}
 	case 2531:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8576
+//line ../../tmp/goopg_grammar.y:8578
 		{
 			yyVAL.node = domainNoop()
 		}
 	case 2532:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8580
+//line ../../tmp/goopg_grammar.y:8582
 		{
 			pfx, _ := yyDollar[2].node.(*createPrefix)
 			temp, unlogged := false, false
@@ -21822,363 +21824,363 @@ yydefault:
 		}
 	case 2533:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8592
+//line ../../tmp/goopg_grammar.y:8594
 		{
 			yyVAL.nodes = []any(nil)
 		}
 	case 2534:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8593
+//line ../../tmp/goopg_grammar.y:8595
 		{
 			yyVAL.nodes = append(yyDollar[1].nodes, yyDollar[2].node)
 		}
 	case 2535:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8599
+//line ../../tmp/goopg_grammar.y:8601
 		{
 			yyVAL.node = seqDataType(yyDollar[2].str)
 		}
 	case 2536:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8600
+//line ../../tmp/goopg_grammar.y:8602
 		{
 			yyVAL.node = seqInt("increment", yyDollar[3].i64)
 		}
 	case 2537:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8601
+//line ../../tmp/goopg_grammar.y:8603
 		{
 			yyVAL.node = seqInt("minvalue", yyDollar[2].i64)
 		}
 	case 2538:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8602
+//line ../../tmp/goopg_grammar.y:8604
 		{
 			yyVAL.node = seqInt("maxvalue", yyDollar[2].i64)
 		}
 	case 2539:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8603
+//line ../../tmp/goopg_grammar.y:8605
 		{
 			yyVAL.node = seqInt("start", yyDollar[3].i64)
 		}
 	case 2540:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8604
+//line ../../tmp/goopg_grammar.y:8606
 		{
 			yyVAL.node = seqInt("cache", yyDollar[2].i64)
 		}
 	case 2541:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8605
+//line ../../tmp/goopg_grammar.y:8607
 		{
 			yyVAL.node = seqCycle()
 		}
 	case 2542:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8606
+//line ../../tmp/goopg_grammar.y:8608
 		{
 			yyVAL.node = seqNoop()
 		}
 	case 2543:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8607
+//line ../../tmp/goopg_grammar.y:8609
 		{
 			yyVAL.node = seqNoop()
 		}
 	case 2544:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8608
+//line ../../tmp/goopg_grammar.y:8610
 		{
 			yyVAL.node = seqNoop()
 		}
 	case 2545:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8609
+//line ../../tmp/goopg_grammar.y:8611
 		{
 			yyVAL.node = seqOwnedBy(yyDollar[3].str)
 		}
 	case 2546:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8612
+//line ../../tmp/goopg_grammar.y:8614
 		{
 		}
 	case 2547:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8613
+//line ../../tmp/goopg_grammar.y:8615
 		{
 		}
 	case 2548:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8616
+//line ../../tmp/goopg_grammar.y:8618
 		{
 		}
 	case 2549:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8617
+//line ../../tmp/goopg_grammar.y:8619
 		{
 		}
 	case 2550:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8621
+//line ../../tmp/goopg_grammar.y:8623
 		{
 			yyVAL.str = seqOwnerName(yyDollar[1].qn)
 		}
 	case 2551:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8626
+//line ../../tmp/goopg_grammar.y:8628
 		{
 			yyVAL.stmt = NewDoStmt(yyDollar[1].p, "plpgsql", yyDollar[2].str)
 		}
 	case 2552:
 		yyDollar = yyS[yypt-15 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8644
+//line ../../tmp/goopg_grammar.y:8646
 		{
 			yyVAL.stmt = buildTrigger(yyDollar[1].p, yyDollar[3].str, objectNameFromQn(yyDollar[7].qn), false, yyDollar[4].ival, yyDollar[5].nodes, nil, yyDollar[8].nodes, yyDollar[9].node, yyDollar[10].expr, objectNameFromQn(yyDollar[12].qn), yyDollar[14].strs)
 		}
 	case 2553:
 		yyDollar = yyS[yypt-17 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8650
+//line ../../tmp/goopg_grammar.y:8652
 		{
 			yyVAL.stmt = buildTrigger(yyDollar[1].p, yyDollar[4].str, objectNameFromQn(yyDollar[8].qn), true, yyDollar[5].ival, yyDollar[6].nodes, yyDollar[9].node, yyDollar[10].nodes, yyDollar[11].node, yyDollar[12].expr, objectNameFromQn(yyDollar[14].qn), yyDollar[16].strs)
 		}
 	case 2554:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8653
+//line ../../tmp/goopg_grammar.y:8655
 		{
 			yyVAL.ival = trigTiming(yyDollar[1].str)
 		}
 	case 2555:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8655
+//line ../../tmp/goopg_grammar.y:8657
 		{
 			yyVAL.ival = trigTiming(yyDollar[1].str)
 		}
 	case 2556:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8658
+//line ../../tmp/goopg_grammar.y:8660
 		{
 			yyVAL.nodes = appendTrigEvent(nil, yyDollar[1].node.(*trigEvent))
 		}
 	case 2557:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8659
+//line ../../tmp/goopg_grammar.y:8661
 		{
 			yyVAL.nodes = appendTrigEvent(yyDollar[1].nodes, yyDollar[3].node.(*trigEvent))
 		}
 	case 2558:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8662
+//line ../../tmp/goopg_grammar.y:8664
 		{
 			yyVAL.node = &trigEvent{name: "insert"}
 		}
 	case 2559:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8663
+//line ../../tmp/goopg_grammar.y:8665
 		{
 			yyVAL.node = &trigEvent{name: "delete"}
 		}
 	case 2560:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8664
+//line ../../tmp/goopg_grammar.y:8666
 		{
 			yyVAL.node = &trigEvent{name: "truncate"}
 		}
 	case 2561:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8665
+//line ../../tmp/goopg_grammar.y:8667
 		{
 			yyVAL.node = &trigEvent{name: "update"}
 		}
 	case 2562:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8666
+//line ../../tmp/goopg_grammar.y:8668
 		{
 			yyVAL.node = &trigEvent{name: "update", cols: yyDollar[3].strs}
 		}
 	case 2563:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8669
+//line ../../tmp/goopg_grammar.y:8671
 		{
 			yyVAL.node = (*constrDefer)(nil)
 		}
 	case 2564:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8670
+//line ../../tmp/goopg_grammar.y:8672
 		{
 			yyVAL.node = yyDollar[1].node
 		}
 	case 2565:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8673
+//line ../../tmp/goopg_grammar.y:8675
 		{
 			yyVAL.node = &constrDefer{deferrable: true, initDeferred: yyDollar[2].b}
 		}
 	case 2566:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8674
+//line ../../tmp/goopg_grammar.y:8676
 		{
 			yyVAL.node = &constrDefer{deferrable: false, initDeferred: yyDollar[3].b}
 		}
 	case 2567:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8675
+//line ../../tmp/goopg_grammar.y:8677
 		{
 			yyVAL.node = &constrDefer{initDeferred: initiallyDeferred(yyDollar[2].str)}
 		}
 	case 2568:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8678
+//line ../../tmp/goopg_grammar.y:8680
 		{
 			yyVAL.b = false
 		}
 	case 2569:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8679
+//line ../../tmp/goopg_grammar.y:8681
 		{
 			yyVAL.b = initiallyDeferred(yyDollar[2].str)
 		}
 	case 2570:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8684
+//line ../../tmp/goopg_grammar.y:8686
 		{
 			yyVAL.nodes = []any(nil)
 		}
 	case 2571:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8685
+//line ../../tmp/goopg_grammar.y:8687
 		{
 			yyVAL.nodes = yyDollar[2].nodes
 		}
 	case 2572:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8688
+//line ../../tmp/goopg_grammar.y:8690
 		{
 			yyVAL.nodes = []any{yyDollar[1].node}
 		}
 	case 2573:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8689
+//line ../../tmp/goopg_grammar.y:8691
 		{
 			yyVAL.nodes = append(asAnySlice(yyDollar[1].nodes), yyDollar[2].node)
 		}
 	case 2574:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8696
+//line ../../tmp/goopg_grammar.y:8698
 		{
 			yyVAL.node = trigTransition("old", yyDollar[4].str)
 		}
 	case 2575:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8697
+//line ../../tmp/goopg_grammar.y:8699
 		{
 			yyVAL.node = trigTransition("new", yyDollar[4].str)
 		}
 	case 2576:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8702
+//line ../../tmp/goopg_grammar.y:8704
 		{
 			yyVAL.node = (*trigForEach)(nil)
 		}
 	case 2577:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8703
+//line ../../tmp/goopg_grammar.y:8705
 		{
 			yyVAL.node = trigForEachOf(yyDollar[2].str)
 		}
 	case 2578:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8704
+//line ../../tmp/goopg_grammar.y:8706
 		{
 			yyVAL.node = trigForEachOf(yyDollar[3].str)
 		}
 	case 2579:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8707
+//line ../../tmp/goopg_grammar.y:8709
 		{
 			yyVAL.expr = (Expr)(nil)
 		}
 	case 2580:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8708
+//line ../../tmp/goopg_grammar.y:8710
 		{
 			yyVAL.expr = yyDollar[3].expr
 		}
 	case 2581:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8713
+//line ../../tmp/goopg_grammar.y:8715
 		{
 			yyVAL.qn = yyDollar[1].qn
 		}
 	case 2582:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8714
+//line ../../tmp/goopg_grammar.y:8716
 		{
 			yyVAL.qn = yyDollar[2].qn
 		}
 	case 2583:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8715
+//line ../../tmp/goopg_grammar.y:8717
 		{
 			yyVAL.qn = yyDollar[2].qn
 		}
 	case 2584:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8720
+//line ../../tmp/goopg_grammar.y:8722
 		{
 			yyVAL.strs = []string(nil)
 		}
 	case 2585:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8721
+//line ../../tmp/goopg_grammar.y:8723
 		{
 			yyVAL.strs = yyDollar[1].strs
 		}
 	case 2586:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8724
+//line ../../tmp/goopg_grammar.y:8726
 		{
 			yyVAL.strs = []string{yyDollar[1].str}
 		}
 	case 2587:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8725
+//line ../../tmp/goopg_grammar.y:8727
 		{
 			yyVAL.strs = append(yyDollar[1].strs, yyDollar[3].str)
 		}
 	case 2588:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8728
+//line ../../tmp/goopg_grammar.y:8730
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2589:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8729
+//line ../../tmp/goopg_grammar.y:8731
 		{
 			yyVAL.str = CanonicalTriggerIntArg(strconv.FormatInt(int64(yyDollar[1].ival), 10))
 		}
 	case 2590:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8730
+//line ../../tmp/goopg_grammar.y:8732
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2591:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8731
+//line ../../tmp/goopg_grammar.y:8733
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2592:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8735
+//line ../../tmp/goopg_grammar.y:8737
 		{
 			yyVAL.stmt = NewDropTriggerStmt(yyDollar[1].p, yyDollar[4].str, objectNameFromQn(yyDollar[6].qn), yyDollar[3].b)
 		}
 	case 2593:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8745
+//line ../../tmp/goopg_grammar.y:8747
 		{
 			cs := yyDollar[3].node.(*CommentOnStmt)
 			cs.Description = yyDollar[5].str
@@ -22186,157 +22188,157 @@ yydefault:
 		}
 	case 2594:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8752
+//line ../../tmp/goopg_grammar.y:8754
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2595:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8753
+//line ../../tmp/goopg_grammar.y:8755
 		{
 			yyVAL.str = ""
 		}
 	case 2596:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8756
+//line ../../tmp/goopg_grammar.y:8758
 		{
 			yyVAL.node = NewCommentOnStmt(0, "table", objectNameFromQn(yyDollar[2].qn), "")
 		}
 	case 2597:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8757
+//line ../../tmp/goopg_grammar.y:8759
 		{
 			yyVAL.node = NewCommentOnStmt(0, "index", objectNameFromQn(yyDollar[2].qn), "")
 		}
 	case 2598:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8758
+//line ../../tmp/goopg_grammar.y:8760
 		{
 			yyVAL.node = NewCommentOnStmt(0, "view", objectNameFromQn(yyDollar[2].qn), "")
 		}
 	case 2599:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8759
+//line ../../tmp/goopg_grammar.y:8761
 		{
 			yyVAL.node = NewCommentOnStmt(0, "sequence", objectNameFromQn(yyDollar[2].qn), "")
 		}
 	case 2600:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8760
+//line ../../tmp/goopg_grammar.y:8762
 		{
 			yyVAL.node = NewCommentOnStmt(0, "type", objectNameFromQn(yyDollar[2].qn), "")
 		}
 	case 2601:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8761
+//line ../../tmp/goopg_grammar.y:8763
 		{
 			yyVAL.node = NewCommentOnStmt(0, "domain", objectNameFromQn(yyDollar[2].qn), "")
 		}
 	case 2602:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8762
+//line ../../tmp/goopg_grammar.y:8764
 		{
 			yyVAL.node = NewCommentOnStmt(0, "schema", objectNameFromQn(yyDollar[2].qn), "")
 		}
 	case 2603:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8763
+//line ../../tmp/goopg_grammar.y:8765
 		{
 			yyVAL.node = NewCommentOnStmt(0, "extension", objectNameFromQn(yyDollar[2].qn), "")
 		}
 	case 2604:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8764
+//line ../../tmp/goopg_grammar.y:8766
 		{
 			yyVAL.node = NewCommentOnStmt(0, "collation", objectNameFromQn(yyDollar[2].qn), "")
 		}
 	case 2605:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8765
+//line ../../tmp/goopg_grammar.y:8767
 		{
 			yyVAL.node = NewCommentOnStmt(0, "server", objectNameFromQn(yyDollar[2].qn), "")
 		}
 	case 2606:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8766
+//line ../../tmp/goopg_grammar.y:8768
 		{
 			yyVAL.node = NewCommentOnStmt(0, "statistics", objectNameFromQn(yyDollar[2].qn), "")
 		}
 	case 2607:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8767
+//line ../../tmp/goopg_grammar.y:8769
 		{
 			yyVAL.node = NewCommentOnStmt(0, "materialized view", objectNameFromQn(yyDollar[3].qn), "")
 		}
 	case 2608:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8768
+//line ../../tmp/goopg_grammar.y:8770
 		{
 			yyVAL.node = NewCommentOnStmt(0, "access method", objectNameFromQn(yyDollar[3].qn), "")
 		}
 	case 2609:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8769
+//line ../../tmp/goopg_grammar.y:8771
 		{
 			yyVAL.node = NewCommentOnStmt(0, "foreign table", objectNameFromQn(yyDollar[3].qn), "")
 		}
 	case 2610:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8770
+//line ../../tmp/goopg_grammar.y:8772
 		{
 			yyVAL.node = NewCommentOnStmt(0, "foreign data wrapper", objectNameFromQn(yyDollar[4].qn), "")
 		}
 	case 2611:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8774
+//line ../../tmp/goopg_grammar.y:8776
 		{
 			yyVAL.node = NewCommentOnStmt(0, "large object", ObjectName{Name: strconv.FormatInt(int64(yyDollar[3].ival), 10)}, "")
 		}
 	case 2612:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8777
+//line ../../tmp/goopg_grammar.y:8779
 		{
 			yyVAL.node = commentColumn(yyDollar[2].qn)
 		}
 	case 2613:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8780
+//line ../../tmp/goopg_grammar.y:8782
 		{
 			yyVAL.node = commentConstraint(yyDollar[2].str, false, objectNameFromQn(yyDollar[4].qn))
 		}
 	case 2614:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8782
+//line ../../tmp/goopg_grammar.y:8784
 		{
 			yyVAL.node = commentConstraint(yyDollar[2].str, true, objectNameFromQn(yyDollar[5].qn))
 		}
 	case 2615:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8783
+//line ../../tmp/goopg_grammar.y:8785
 		{
 			yyVAL.node = NewCommentOnStmt(0, "trigger", objectNameFromQn(yyDollar[4].qn), yyDollar[2].str)
 		}
 	case 2616:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8784
+//line ../../tmp/goopg_grammar.y:8786
 		{
 			yyVAL.node = NewCommentOnStmt(0, "policy", objectNameFromQn(yyDollar[4].qn), yyDollar[2].str)
 		}
 	case 2617:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8785
+//line ../../tmp/goopg_grammar.y:8787
 		{
 			yyVAL.node = NewCommentOnStmt(0, "rule", objectNameFromQn(yyDollar[4].qn), yyDollar[2].str)
 		}
 	case 2618:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8789
+//line ../../tmp/goopg_grammar.y:8791
 		{
 			yyVAL.node = commentCast(rawTypeSpan(yylex, yyDollar[3].p), rawTypeSpan(yylex, yyDollar[5].p))
 		}
 	case 2619:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8791
+//line ../../tmp/goopg_grammar.y:8793
 		{
 			cs := NewCommentOnStmt(0, "function", objectNameFromQn(yyDollar[2].qn), "")
 			cs.Args = yyDollar[3].fargs
@@ -22344,19 +22346,19 @@ yydefault:
 		}
 	case 2620:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8800
+//line ../../tmp/goopg_grammar.y:8802
 		{
 			yyVAL.fargs = []FunctionArg(nil)
 		}
 	case 2621:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8801
+//line ../../tmp/goopg_grammar.y:8803
 		{
 			yyVAL.fargs = yyDollar[2].fargs
 		}
 	case 2622:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8811
+//line ../../tmp/goopg_grammar.y:8813
 		{
 			kind := yyDollar[2].str
 			st := NewAlterFunctionStmt(yyDollar[1].p, objectNameFromQn(yyDollar[3].qn), yyDollar[4].fargs, kind == "procedure", kind == "routine")
@@ -22365,151 +22367,151 @@ yydefault:
 		}
 	case 2623:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8819
+//line ../../tmp/goopg_grammar.y:8821
 		{
 			yyVAL.str = "function"
 		}
 	case 2624:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8820
+//line ../../tmp/goopg_grammar.y:8822
 		{
 			yyVAL.str = "procedure"
 		}
 	case 2625:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8821
+//line ../../tmp/goopg_grammar.y:8823
 		{
 			yyVAL.str = "routine"
 		}
 	case 2626:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8824
+//line ../../tmp/goopg_grammar.y:8826
 		{
 			yyVAL.nodes = []any(nil)
 		}
 	case 2627:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8825
+//line ../../tmp/goopg_grammar.y:8827
 		{
 			yyVAL.nodes = append(yyDollar[1].nodes, yyDollar[2].node)
 		}
 	case 2628:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8828
+//line ../../tmp/goopg_grammar.y:8830
 		{
 			yyVAL.node = alterFnVolatile("i")
 		}
 	case 2629:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8829
+//line ../../tmp/goopg_grammar.y:8831
 		{
 			yyVAL.node = alterFnVolatile("s")
 		}
 	case 2630:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8830
+//line ../../tmp/goopg_grammar.y:8832
 		{
 			yyVAL.node = alterFnVolatile("v")
 		}
 	case 2631:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8831
+//line ../../tmp/goopg_grammar.y:8833
 		{
 			yyVAL.node = alterFnStrict(true)
 		}
 	case 2632:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8832
+//line ../../tmp/goopg_grammar.y:8834
 		{
 			yyVAL.node = alterFnStrict(false)
 		}
 	case 2633:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8833
+//line ../../tmp/goopg_grammar.y:8835
 		{
 			yyVAL.node = alterFnStrict(true)
 		}
 	case 2634:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8834
+//line ../../tmp/goopg_grammar.y:8836
 		{
 			yyVAL.node = alterFnLeakproof(true)
 		}
 	case 2635:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8835
+//line ../../tmp/goopg_grammar.y:8837
 		{
 			yyVAL.node = alterFnLeakproof(false)
 		}
 	case 2636:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8836
+//line ../../tmp/goopg_grammar.y:8838
 		{
 			yyVAL.node = alterFnSecurity(true)
 		}
 	case 2637:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8837
+//line ../../tmp/goopg_grammar.y:8839
 		{
 			yyVAL.node = alterFnSecurity(false)
 		}
 	case 2638:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8842
+//line ../../tmp/goopg_grammar.y:8844
 		{
 			yyVAL.node = alterFnNoop()
 		}
 	case 2639:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8843
+//line ../../tmp/goopg_grammar.y:8845
 		{
 			yyVAL.node = alterFnNoop()
 		}
 	case 2640:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8846
+//line ../../tmp/goopg_grammar.y:8848
 		{
 			yyVAL.node = alterFnNoop()
 		}
 	case 2641:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8847
+//line ../../tmp/goopg_grammar.y:8849
 		{
 			yyVAL.node = alterFnNoop()
 		}
 	case 2642:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8848
+//line ../../tmp/goopg_grammar.y:8850
 		{
 			yyVAL.node = alterFnNoop()
 		}
 	case 2643:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8849
+//line ../../tmp/goopg_grammar.y:8851
 		{
 			yyVAL.node = alterFnNoop()
 		}
 	case 2644:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8850
+//line ../../tmp/goopg_grammar.y:8852
 		{
 			yyVAL.node = alterFnNoop()
 		}
 	case 2645:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8851
+//line ../../tmp/goopg_grammar.y:8853
 		{
 			yyVAL.node = alterFnOwner(yyDollar[3].str)
 		}
 	case 2646:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8852
+//line ../../tmp/goopg_grammar.y:8854
 		{
 			yyVAL.node = alterFnRename(yyDollar[3].str)
 		}
 	case 2647:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8859
+//line ../../tmp/goopg_grammar.y:8861
 		{
 			n, cv := yyDollar[2].str, fnConfigOf(yyDollar[3].node)
 			if eqFold(n, "schema") {
@@ -22520,61 +22522,61 @@ yydefault:
 		}
 	case 2648:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8867
+//line ../../tmp/goopg_grammar.y:8869
 		{
 			yyVAL.node = alterFnConfig(NewFunctionConfigOp(false, true, "", ""), true)
 		}
 	case 2649:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8868
+//line ../../tmp/goopg_grammar.y:8870
 		{
 			yyVAL.node = alterFnConfig(NewFunctionConfigOp(true, false, yyDollar[2].str, ""), true)
 		}
 	case 2650:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8873
+//line ../../tmp/goopg_grammar.y:8875
 		{
 			yyVAL.str = alterFnOwnerName(yyDollar[1].str)
 		}
 	case 2651:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8874
+//line ../../tmp/goopg_grammar.y:8876
 		{
 			yyVAL.str = "current_user"
 		}
 	case 2652:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8875
+//line ../../tmp/goopg_grammar.y:8877
 		{
 			yyVAL.str = "current_user"
 		}
 	case 2653:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8876
+//line ../../tmp/goopg_grammar.y:8878
 		{
 			yyVAL.str = "current_user"
 		}
 	case 2654:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8888
+//line ../../tmp/goopg_grammar.y:8890
 		{
 			yyVAL.stmt = NewDropCompatStmt(yyDollar[1].p, yyDollar[2].str, yyDollar[3].b, yyDollar[4].onames, dropBehavior(yyDollar[5].str))
 		}
 	case 2655:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8893
+//line ../../tmp/goopg_grammar.y:8895
 		{
 			yyVAL.stmt = dropWithArgs(yyDollar[1].p, "aggregate", yyDollar[3].b, yyDollar[4].qn, firstArg(yyDollar[6].strs), dropBehavior(yyDollar[8].str))
 		}
 	case 2656:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8895
+//line ../../tmp/goopg_grammar.y:8897
 		{
 			yyVAL.stmt = dropWithArgs(yyDollar[1].p, "operator", yyDollar[3].b, yyDollar[4].qn, yyDollar[5].strs, dropBehavior(yyDollar[6].str))
 		}
 	case 2657:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8897
+//line ../../tmp/goopg_grammar.y:8899
 		{
 			st := NewDropCompatStmt(yyDollar[1].p, yyDollar[3].str, yyDollar[4].b, []ObjectName{objectNameFromQn(yyDollar[5].qn)}, dropBehavior(yyDollar[8].str))
 			SetDropCompatExtras(st, nil, yyDollar[7].str, nil, "", "")
@@ -22582,7 +22584,7 @@ yydefault:
 		}
 	case 2658:
 		yyDollar = yyS[yypt-9 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8903
+//line ../../tmp/goopg_grammar.y:8905
 		{
 			st := NewDropCompatStmt(yyDollar[1].p, "cast", yyDollar[3].b, nil, dropBehavior(yyDollar[9].str))
 			SetDropCompatExtras(st, nil, "", []string{typeNameOf(yyDollar[5].node), typeNameOf(yyDollar[7].node)}, "", "")
@@ -22590,7 +22592,7 @@ yydefault:
 		}
 	case 2659:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8909
+//line ../../tmp/goopg_grammar.y:8911
 		{
 			st := NewDropCompatStmt(yyDollar[1].p, "transform", yyDollar[3].b, nil, dropBehavior(yyDollar[8].str))
 			SetDropCompatExtras(st, nil, "", nil, typeNameOf(yyDollar[5].node), lowerIdent(yyDollar[7].str))
@@ -22598,241 +22600,241 @@ yydefault:
 		}
 	case 2660:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8917
+//line ../../tmp/goopg_grammar.y:8919
 		{
 			yyVAL.stmt = NewDropRuleStmt(yyDollar[1].p, yyDollar[4].str, objectNameFromQn(yyDollar[6].qn), yyDollar[3].b)
 		}
 	case 2661:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8919
+//line ../../tmp/goopg_grammar.y:8921
 		{
 			yyVAL.stmt = NewDropPolicyStmt(yyDollar[1].p, yyDollar[4].str, objectNameFromQn(yyDollar[6].qn), yyDollar[3].b)
 		}
 	case 2662:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8921
+//line ../../tmp/goopg_grammar.y:8923
 		{
 			yyVAL.stmt = NewDropPublicationStmt(yyDollar[1].p, yyDollar[4].strs, yyDollar[3].b)
 		}
 	case 2663:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8923
+//line ../../tmp/goopg_grammar.y:8925
 		{
 			yyVAL.stmt = NewDropSubscriptionStmt(yyDollar[1].p, yyDollar[4].str, yyDollar[3].b)
 		}
 	case 2664:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8925
+//line ../../tmp/goopg_grammar.y:8927
 		{
 			yyVAL.stmt = NewDropTablespaceStmt(yyDollar[1].p, yyDollar[4].str, yyDollar[3].b)
 		}
 	case 2665:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8928
+//line ../../tmp/goopg_grammar.y:8930
 		{
 			yyVAL.str = "operator class"
 		}
 	case 2666:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8929
+//line ../../tmp/goopg_grammar.y:8931
 		{
 			yyVAL.str = "operator family"
 		}
 	case 2667:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8934
+//line ../../tmp/goopg_grammar.y:8936
 		{
 			yyVAL.str = "sequence"
 		}
 	case 2668:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8935
+//line ../../tmp/goopg_grammar.y:8937
 		{
 			yyVAL.str = "schema"
 		}
 	case 2669:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8936
+//line ../../tmp/goopg_grammar.y:8938
 		{
 			yyVAL.str = "extension"
 		}
 	case 2670:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8937
+//line ../../tmp/goopg_grammar.y:8939
 		{
 			yyVAL.str = "statistics"
 		}
 	case 2671:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8938
+//line ../../tmp/goopg_grammar.y:8940
 		{
 			yyVAL.str = "collation"
 		}
 	case 2672:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8939
+//line ../../tmp/goopg_grammar.y:8941
 		{
 			yyVAL.str = "server"
 		}
 	case 2673:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8940
+//line ../../tmp/goopg_grammar.y:8942
 		{
 			yyVAL.str = "conversion"
 		}
 	case 2674:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8941
+//line ../../tmp/goopg_grammar.y:8943
 		{
 			yyVAL.str = "language"
 		}
 	case 2675:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8942
+//line ../../tmp/goopg_grammar.y:8944
 		{
 			yyVAL.str = "event trigger"
 		}
 	case 2676:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8943
+//line ../../tmp/goopg_grammar.y:8945
 		{
 			yyVAL.str = "access method"
 		}
 	case 2677:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8944
+//line ../../tmp/goopg_grammar.y:8946
 		{
 			yyVAL.str = "foreign table"
 		}
 	case 2678:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8946
+//line ../../tmp/goopg_grammar.y:8948
 		{
 			yyVAL.str = "foreign-data wrapper"
 		}
 	case 2679:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8947
+//line ../../tmp/goopg_grammar.y:8949
 		{
 			yyVAL.str = "text search " + lowerIdent(yyDollar[3].str)
 		}
 	case 2680:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8958
+//line ../../tmp/goopg_grammar.y:8960
 		{
 			yyVAL.qn = qname{parts: []string{yyDollar[1].str}, pos: yyDollar[1].p}
 		}
 	case 2681:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8959
+//line ../../tmp/goopg_grammar.y:8961
 		{
 			yyVAL.qn = qname{parts: []string{yyDollar[1].str, yyDollar[3].str}, pos: yyDollar[3].p}
 		}
 	case 2682:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8962
+//line ../../tmp/goopg_grammar.y:8964
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2683:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8963
+//line ../../tmp/goopg_grammar.y:8965
 		{
 			yyVAL.str = yyDollar[1].str + yyDollar[2].str
 		}
 	case 2684:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8968
+//line ../../tmp/goopg_grammar.y:8970
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2685:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8969
+//line ../../tmp/goopg_grammar.y:8971
 		{
 			yyVAL.str = "+"
 		}
 	case 2686:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8970
+//line ../../tmp/goopg_grammar.y:8972
 		{
 			yyVAL.str = "-"
 		}
 	case 2687:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8971
+//line ../../tmp/goopg_grammar.y:8973
 		{
 			yyVAL.str = "*"
 		}
 	case 2688:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8972
+//line ../../tmp/goopg_grammar.y:8974
 		{
 			yyVAL.str = "/"
 		}
 	case 2689:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8973
+//line ../../tmp/goopg_grammar.y:8975
 		{
 			yyVAL.str = "%"
 		}
 	case 2690:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8974
+//line ../../tmp/goopg_grammar.y:8976
 		{
 			yyVAL.str = "^"
 		}
 	case 2691:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8975
+//line ../../tmp/goopg_grammar.y:8977
 		{
 			yyVAL.str = "<"
 		}
 	case 2692:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8976
+//line ../../tmp/goopg_grammar.y:8978
 		{
 			yyVAL.str = ">"
 		}
 	case 2693:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8977
+//line ../../tmp/goopg_grammar.y:8979
 		{
 			yyVAL.str = "="
 		}
 	case 2694:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8981
+//line ../../tmp/goopg_grammar.y:8983
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2695:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8982
+//line ../../tmp/goopg_grammar.y:8984
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2696:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8983
+//line ../../tmp/goopg_grammar.y:8985
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2697:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8987
+//line ../../tmp/goopg_grammar.y:8989
 		{
 			yyVAL.strs = []string{yyDollar[1].str}
 		}
 	case 2698:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8988
+//line ../../tmp/goopg_grammar.y:8990
 		{
 			yyVAL.strs = append(yyDollar[1].strs, yyDollar[3].str)
 		}
 	case 2699:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:8999
+//line ../../tmp/goopg_grammar.y:9001
 		{
 			raiseErr(yylex, &SyntaxError{
 				Pos:     yyDollar[2].p,
@@ -22844,37 +22846,37 @@ yydefault:
 		}
 	case 2700:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9009
+//line ../../tmp/goopg_grammar.y:9011
 		{
 			yyVAL.strs = append([]string{yyDollar[2].str}, yyDollar[4].strs...)
 		}
 	case 2701:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9012
+//line ../../tmp/goopg_grammar.y:9014
 		{
 			yyVAL.str = typeNameOf(yyDollar[1].node)
 		}
 	case 2702:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9015
+//line ../../tmp/goopg_grammar.y:9017
 		{
 			yyVAL.str = "none"
 		}
 	case 2703:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9017
+//line ../../tmp/goopg_grammar.y:9019
 		{
 			yyVAL.str = "*"
 		}
 	case 2704:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9032
+//line ../../tmp/goopg_grammar.y:9034
 		{
 			yyVAL.stmt = NewDropCompatStmt(yyDollar[1].p, "database", yyDollar[3].b, yyDollar[4].onames, dropBehavior(yyDollar[5].str))
 		}
 	case 2705:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9038
+//line ../../tmp/goopg_grammar.y:9040
 		{
 			st := NewCreateExtensionStmt(yyDollar[1].p, yyDollar[4].str, yyDollar[3].b)
 			applyExtOpts(st, yyDollar[6].nodes)
@@ -22882,175 +22884,175 @@ yydefault:
 		}
 	case 2706:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9045
+//line ../../tmp/goopg_grammar.y:9047
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2707:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9046
+//line ../../tmp/goopg_grammar.y:9048
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2708:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9049
+//line ../../tmp/goopg_grammar.y:9051
 		{
 			yyVAL.nodes = []any(nil)
 		}
 	case 2709:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9050
+//line ../../tmp/goopg_grammar.y:9052
 		{
 			yyVAL.nodes = append(yyDollar[1].nodes, yyDollar[2].node)
 		}
 	case 2710:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9053
+//line ../../tmp/goopg_grammar.y:9055
 		{
 			yyVAL.node = extSchema(yyDollar[2].str)
 		}
 	case 2711:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9054
+//line ../../tmp/goopg_grammar.y:9056
 		{
 			yyVAL.node = extVersion(yyDollar[2].str)
 		}
 	case 2712:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9055
+//line ../../tmp/goopg_grammar.y:9057
 		{
 			yyVAL.node = extCascade()
 		}
 	case 2713:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9061
+//line ../../tmp/goopg_grammar.y:9063
 		{
 			yyVAL.stmt = NewAlterSchemaStmt(yyDollar[1].p, yyDollar[3].str, "rename", yyDollar[6].str, "")
 		}
 	case 2714:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9063
+//line ../../tmp/goopg_grammar.y:9065
 		{
 			yyVAL.stmt = NewAlterSchemaStmt(yyDollar[1].p, yyDollar[3].str, "owner", "", yyDollar[6].str)
 		}
 	case 2715:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9069
+//line ../../tmp/goopg_grammar.y:9071
 		{
 			yyVAL.stmt = NewAlterLargeObjectOwnerStmt(yyDollar[1].p, int64(yyDollar[4].ival), yyDollar[7].str)
 		}
 	case 2716:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9082
+//line ../../tmp/goopg_grammar.y:9084
 		{
 			yyVAL.stmt = NewCreateAccessMethodStmt(yyDollar[1].p, yyDollar[4].str, yyDollar[6].str, objectNameFromQn(yyDollar[8].qn))
 		}
 	case 2717:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9085
+//line ../../tmp/goopg_grammar.y:9087
 		{
 			yyVAL.str = "i"
 		}
 	case 2718:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9086
+//line ../../tmp/goopg_grammar.y:9088
 		{
 			yyVAL.str = "t"
 		}
 	case 2719:
 		yyDollar = yyS[yypt-11 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9103
+//line ../../tmp/goopg_grammar.y:9105
 		{
 			yyVAL.stmt = NewCreateEventTriggerStmt(yyDollar[1].p, yyDollar[4].str, yyDollar[6].str, yyDollar[7].strs, objectNameFromQn(yyDollar[9].qn))
 		}
 	case 2720:
 		yyDollar = yyS[yypt-12 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9105
+//line ../../tmp/goopg_grammar.y:9107
 		{
 			yyVAL.stmt = NewCreateEventTriggerStmt(yyDollar[1].p, yyDollar[4].str, yyDollar[6].str, yyDollar[7].strs, objectNameFromQn(yyDollar[10].qn))
 		}
 	case 2721:
 		yyDollar = yyS[yypt-12 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9107
+//line ../../tmp/goopg_grammar.y:9109
 		{
 			yyVAL.stmt = NewCreateEventTriggerStmt(yyDollar[1].p, yyDollar[4].str, yyDollar[6].str, yyDollar[7].strs, objectNameFromQn(yyDollar[10].qn))
 		}
 	case 2722:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9114
+//line ../../tmp/goopg_grammar.y:9116
 		{
 			yyVAL.strs = []string(nil)
 		}
 	case 2723:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9115
+//line ../../tmp/goopg_grammar.y:9117
 		{
 			yyVAL.strs = yyDollar[2].strs
 		}
 	case 2724:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9119
+//line ../../tmp/goopg_grammar.y:9121
 		{
 			yyVAL.strs = []string{evtrigFilter(yyDollar[1].str, yyDollar[4].strs)}
 		}
 	case 2725:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9121
+//line ../../tmp/goopg_grammar.y:9123
 		{
 			yyVAL.strs = append(yyDollar[1].strs, evtrigFilter(yyDollar[3].str, yyDollar[6].strs))
 		}
 	case 2726:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9124
+//line ../../tmp/goopg_grammar.y:9126
 		{
 			yyVAL.strs = []string{yyDollar[1].str}
 		}
 	case 2727:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9125
+//line ../../tmp/goopg_grammar.y:9127
 		{
 			yyVAL.strs = append(yyDollar[1].strs, yyDollar[3].str)
 		}
 	case 2728:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9136
+//line ../../tmp/goopg_grammar.y:9138
 		{
 			yyVAL.stmt = NewAlterEventTriggerStmt(yyDollar[1].p, yyDollar[4].str, "disable", "", "")
 		}
 	case 2729:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9138
+//line ../../tmp/goopg_grammar.y:9140
 		{
 			yyVAL.stmt = NewAlterEventTriggerStmt(yyDollar[1].p, yyDollar[4].str, "enable", "", "")
 		}
 	case 2730:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9140
+//line ../../tmp/goopg_grammar.y:9142
 		{
 			yyVAL.stmt = NewAlterEventTriggerStmt(yyDollar[1].p, yyDollar[4].str, "enable_replica", "", "")
 		}
 	case 2731:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9142
+//line ../../tmp/goopg_grammar.y:9144
 		{
 			yyVAL.stmt = NewAlterEventTriggerStmt(yyDollar[1].p, yyDollar[4].str, "enable_always", "", "")
 		}
 	case 2732:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9144
+//line ../../tmp/goopg_grammar.y:9146
 		{
 			yyVAL.stmt = NewAlterEventTriggerStmt(yyDollar[1].p, yyDollar[4].str, "rename", yyDollar[7].str, "")
 		}
 	case 2733:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9146
+//line ../../tmp/goopg_grammar.y:9148
 		{
 			yyVAL.stmt = NewAlterEventTriggerStmt(yyDollar[1].p, yyDollar[4].str, "owner", "", yyDollar[7].str)
 		}
 	case 2734:
 		yyDollar = yyS[yypt-10 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9151
+//line ../../tmp/goopg_grammar.y:9153
 		{
 			st := NewCreatePolicyStmt(yyDollar[1].p, yyDollar[3].str, objectNameFromQn(yyDollar[5].qn))
 			if yyDollar[6].str != "" {
@@ -23065,229 +23067,229 @@ yydefault:
 		}
 	case 2735:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9165
+//line ../../tmp/goopg_grammar.y:9167
 		{
 			yyVAL.str = ""
 		}
 	case 2736:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9166
+//line ../../tmp/goopg_grammar.y:9168
 		{
 			yyVAL.str = lowerIdent(yyDollar[2].str)
 		}
 	case 2737:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9169
+//line ../../tmp/goopg_grammar.y:9171
 		{
 			yyVAL.str = ""
 		}
 	case 2738:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9170
+//line ../../tmp/goopg_grammar.y:9172
 		{
 			yyVAL.str = "all"
 		}
 	case 2739:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9171
+//line ../../tmp/goopg_grammar.y:9173
 		{
 			yyVAL.str = "select"
 		}
 	case 2740:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9172
+//line ../../tmp/goopg_grammar.y:9174
 		{
 			yyVAL.str = "insert"
 		}
 	case 2741:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9173
+//line ../../tmp/goopg_grammar.y:9175
 		{
 			yyVAL.str = "update"
 		}
 	case 2742:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9174
+//line ../../tmp/goopg_grammar.y:9176
 		{
 			yyVAL.str = "delete"
 		}
 	case 2743:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9177
+//line ../../tmp/goopg_grammar.y:9179
 		{
 			yyVAL.strs = []string(nil)
 		}
 	case 2744:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9178
+//line ../../tmp/goopg_grammar.y:9180
 		{
 			yyVAL.strs = yyDollar[2].strs
 		}
 	case 2745:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9181
+//line ../../tmp/goopg_grammar.y:9183
 		{
 			yyVAL.strs = []string{yyDollar[1].str}
 		}
 	case 2746:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9182
+//line ../../tmp/goopg_grammar.y:9184
 		{
 			yyVAL.strs = append(yyDollar[1].strs, yyDollar[3].str)
 		}
 	case 2747:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9185
+//line ../../tmp/goopg_grammar.y:9187
 		{
 			yyVAL.expr = (Expr)(nil)
 		}
 	case 2748:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9186
+//line ../../tmp/goopg_grammar.y:9188
 		{
 			yyVAL.expr = yyDollar[3].expr
 		}
 	case 2749:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9189
+//line ../../tmp/goopg_grammar.y:9191
 		{
 			yyVAL.expr = (Expr)(nil)
 		}
 	case 2750:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9190
+//line ../../tmp/goopg_grammar.y:9192
 		{
 			yyVAL.expr = yyDollar[4].expr
 		}
 	case 2751:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9203
+//line ../../tmp/goopg_grammar.y:9205
 		{
 			yyVAL.stmt = buildAlterSequence(yyDollar[1].p, objectNameFromQn(yyDollar[4].qn), yyDollar[3].b, yyDollar[5].nodes)
 		}
 	case 2752:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9208
+//line ../../tmp/goopg_grammar.y:9210
 		{
 			yyVAL.nodes = []any(nil)
 		}
 	case 2753:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9209
+//line ../../tmp/goopg_grammar.y:9211
 		{
 			yyVAL.nodes = append(yyDollar[1].nodes, yyDollar[2].node)
 		}
 	case 2754:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9215
+//line ../../tmp/goopg_grammar.y:9217
 		{
 			yyVAL.node = altSeqDataType(yyDollar[2].str)
 		}
 	case 2755:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9216
+//line ../../tmp/goopg_grammar.y:9218
 		{
 			yyVAL.node = altSeqInt("increment", yyDollar[3].i64)
 		}
 	case 2756:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9217
+//line ../../tmp/goopg_grammar.y:9219
 		{
 			yyVAL.node = altSeqInt("minvalue", yyDollar[2].i64)
 		}
 	case 2757:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9218
+//line ../../tmp/goopg_grammar.y:9220
 		{
 			yyVAL.node = altSeqInt("maxvalue", yyDollar[2].i64)
 		}
 	case 2758:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9219
+//line ../../tmp/goopg_grammar.y:9221
 		{
 			yyVAL.node = altSeqInt("start", yyDollar[3].i64)
 		}
 	case 2759:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9220
+//line ../../tmp/goopg_grammar.y:9222
 		{
 			yyVAL.node = altSeqRestart()
 		}
 	case 2760:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9221
+//line ../../tmp/goopg_grammar.y:9223
 		{
 			yyVAL.node = altSeqInt("restart", yyDollar[3].i64)
 		}
 	case 2761:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9222
+//line ../../tmp/goopg_grammar.y:9224
 		{
 			yyVAL.node = altSeqInt("cache", yyDollar[2].i64)
 		}
 	case 2762:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9223
+//line ../../tmp/goopg_grammar.y:9225
 		{
 			yyVAL.node = altSeqFlag("cycle")
 		}
 	case 2763:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9224
+//line ../../tmp/goopg_grammar.y:9226
 		{
 			yyVAL.node = altSeqFlag("nominvalue")
 		}
 	case 2764:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9225
+//line ../../tmp/goopg_grammar.y:9227
 		{
 			yyVAL.node = altSeqFlag("nomaxvalue")
 		}
 	case 2765:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9226
+//line ../../tmp/goopg_grammar.y:9228
 		{
 			yyVAL.node = altSeqFlag("nocycle")
 		}
 	case 2766:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9227
+//line ../../tmp/goopg_grammar.y:9229
 		{
 			yyVAL.node = altSeqLogged("logged")
 		}
 	case 2767:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9228
+//line ../../tmp/goopg_grammar.y:9230
 		{
 			yyVAL.node = altSeqLogged("unlogged")
 		}
 	case 2768:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9229
+//line ../../tmp/goopg_grammar.y:9231
 		{
 			yyVAL.node = altSeqOwnedBy(yyDollar[3].str)
 		}
 	case 2769:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9237
+//line ../../tmp/goopg_grammar.y:9239
 		{
 			yyVAL.node = altSeqRelOp("rename", yyDollar[3].str)
 		}
 	case 2770:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9238
+//line ../../tmp/goopg_grammar.y:9240
 		{
 			yyVAL.node = altSeqRelOp("owner", yyDollar[3].str)
 		}
 	case 2771:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9239
+//line ../../tmp/goopg_grammar.y:9241
 		{
 			yyVAL.node = altSeqRelOp("schema", yyDollar[3].str)
 		}
 	case 2772:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9243
+//line ../../tmp/goopg_grammar.y:9245
 		{
 			st := NewAlterTypeStmt(yyDollar[1].p, objectNameFromQn(yyDollar[3].qn))
 			yyDollar[4].node.(alterTypeOp)(st)
@@ -23295,181 +23297,181 @@ yydefault:
 		}
 	case 2773:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9252
+//line ../../tmp/goopg_grammar.y:9254
 		{
 			yyVAL.node = altTypeAddValue(yyDollar[3].b, yyDollar[4].str, yyDollar[5].node.(*enumPos))
 		}
 	case 2774:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9253
+//line ../../tmp/goopg_grammar.y:9255
 		{
 			yyVAL.node = altTypeRenameValue(yyDollar[3].str, yyDollar[5].str)
 		}
 	case 2775:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9255
+//line ../../tmp/goopg_grammar.y:9257
 		{
 			yyVAL.node = altTypeRenameAttr(yyDollar[3].str, yyDollar[5].str)
 		}
 	case 2776:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9256
+//line ../../tmp/goopg_grammar.y:9258
 		{
 			yyVAL.node = altTypeRenameTo(yyDollar[3].str)
 		}
 	case 2777:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9257
+//line ../../tmp/goopg_grammar.y:9259
 		{
 			yyVAL.node = altTypeOwner(yyDollar[3].str)
 		}
 	case 2778:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9263
+//line ../../tmp/goopg_grammar.y:9265
 		{
 			yyVAL.node = altTypeAttrCmds(yyDollar[1].nodes)
 		}
 	case 2779:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9266
+//line ../../tmp/goopg_grammar.y:9268
 		{
 			yyVAL.nodes = []any{yyDollar[1].node}
 		}
 	case 2780:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9267
+//line ../../tmp/goopg_grammar.y:9269
 		{
 			yyVAL.nodes = append(yyDollar[1].nodes, yyDollar[3].node)
 		}
 	case 2781:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9271
+//line ../../tmp/goopg_grammar.y:9273
 		{
 			yyVAL.node = NewAlterTypeAttrCmd("add", lowerIdent(yyDollar[3].str), rawTypeSpan(yylex, yyDollar[4].p), yyDollar[5].str, false)
 		}
 	case 2782:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9273
+//line ../../tmp/goopg_grammar.y:9275
 		{
 			yyVAL.node = NewAlterTypeAttrCmd("drop", lowerIdent(yyDollar[4].str), "", "", yyDollar[3].b)
 		}
 	case 2783:
 		yyDollar = yyS[yypt-8 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9275
+//line ../../tmp/goopg_grammar.y:9277
 		{
 			yyVAL.node = NewAlterTypeAttrCmd("alter", lowerIdent(yyDollar[3].str), rawTypeSpan(yylex, yyDollar[6].p), yyDollar[7].str, false)
 		}
 	case 2784:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9281
+//line ../../tmp/goopg_grammar.y:9283
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2785:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9282
+//line ../../tmp/goopg_grammar.y:9284
 		{
 			yyVAL.str = "only"
 		}
 	case 2786:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9285
+//line ../../tmp/goopg_grammar.y:9287
 		{
 		}
 	case 2787:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9286
+//line ../../tmp/goopg_grammar.y:9288
 		{
 		}
 	case 2788:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9289
+//line ../../tmp/goopg_grammar.y:9291
 		{
 			yyVAL.node = &enumPos{}
 		}
 	case 2789:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9290
+//line ../../tmp/goopg_grammar.y:9292
 		{
 			yyVAL.node = &enumPos{before: yyDollar[2].str}
 		}
 	case 2790:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9291
+//line ../../tmp/goopg_grammar.y:9293
 		{
 			yyVAL.node = &enumPos{after: yyDollar[2].str}
 		}
 	case 2791:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9295
+//line ../../tmp/goopg_grammar.y:9297
 		{
 			st := yyDollar[4].node.(alterDomainOp)(qnLastPart(yyDollar[3].qn))
 			yyVAL.stmt = alterDomainAt(yyDollar[1].p, st)
 		}
 	case 2792:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9301
+//line ../../tmp/goopg_grammar.y:9303
 		{
 			yyVAL.node = altDomAction("setnotnull")
 		}
 	case 2793:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9302
+//line ../../tmp/goopg_grammar.y:9304
 		{
 			yyVAL.node = altDomAction("dropnotnull")
 		}
 	case 2794:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9303
+//line ../../tmp/goopg_grammar.y:9305
 		{
 			e := yyDollar[3].expr
 			yyVAL.node = altDomDefault(e)
 		}
 	case 2795:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9304
+//line ../../tmp/goopg_grammar.y:9306
 		{
 			yyVAL.node = altDomAction("dropdefault")
 		}
 	case 2796:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9307
+//line ../../tmp/goopg_grammar.y:9309
 		{
 			yyVAL.node = altDomAddCheck(yylex, "", yyDollar[2].p)
 		}
 	case 2797:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9308
+//line ../../tmp/goopg_grammar.y:9310
 		{
 			yyVAL.node = altDomAddCheck(yylex, yyDollar[3].str, yyDollar[4].p)
 		}
 	case 2798:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9311
+//line ../../tmp/goopg_grammar.y:9313
 		{
 			yyVAL.node = altDomDropConstraint(yyDollar[3].b, yyDollar[4].str)
 		}
 	case 2799:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9312
+//line ../../tmp/goopg_grammar.y:9314
 		{
 			yyVAL.node = altDomRenameConstraint(yyDollar[3].str, yyDollar[5].str)
 		}
 	case 2800:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9313
+//line ../../tmp/goopg_grammar.y:9315
 		{
 			yyVAL.node = altDomRenameTo(yyDollar[3].str)
 		}
 	case 2801:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9314
+//line ../../tmp/goopg_grammar.y:9316
 		{
 			yyVAL.node = altDomOwner(yyDollar[3].str)
 		}
 	case 2802:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9329
+//line ../../tmp/goopg_grammar.y:9331
 		{
 			st := NewCopyStmt(yyDollar[1].p)
 			st.Table, st.Columns = objectNameFromQn(yyDollar[2].qn), yyDollar[3].strs
@@ -23486,7 +23488,7 @@ yydefault:
 		}
 	case 2803:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9346
+//line ../../tmp/goopg_grammar.y:9348
 		{
 			st := NewCopyStmt(yyDollar[1].p)
 			st.Direction = CopyTo
@@ -23502,265 +23504,265 @@ yydefault:
 		}
 	case 2804:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9361
+//line ../../tmp/goopg_grammar.y:9363
 		{
 			yyVAL.stmt = yyDollar[1].stmt
 		}
 	case 2805:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9362
+//line ../../tmp/goopg_grammar.y:9364
 		{
 			yyVAL.stmt = yyDollar[1].stmt
 		}
 	case 2806:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9363
+//line ../../tmp/goopg_grammar.y:9365
 		{
 			yyVAL.stmt = yyDollar[1].stmt
 		}
 	case 2807:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9364
+//line ../../tmp/goopg_grammar.y:9366
 		{
 			yyVAL.stmt = yyDollar[1].stmt
 		}
 	case 2808:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9367
+//line ../../tmp/goopg_grammar.y:9369
 		{
 			yyVAL.strs = []string(nil)
 		}
 	case 2809:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9368
+//line ../../tmp/goopg_grammar.y:9370
 		{
 			yyVAL.strs = yyDollar[2].strs
 		}
 	case 2810:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9371
+//line ../../tmp/goopg_grammar.y:9373
 		{
 			yyVAL.ival = int(CopyFrom)
 		}
 	case 2811:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9372
+//line ../../tmp/goopg_grammar.y:9374
 		{
 			yyVAL.ival = int(CopyTo)
 		}
 	case 2812:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9378
+//line ../../tmp/goopg_grammar.y:9380
 		{
 			yyVAL.node = copyEndpointWord(yylex, yyDollar[1].str, yyDollar[1].p)
 		}
 	case 2813:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9379
+//line ../../tmp/goopg_grammar.y:9381
 		{
 			yyVAL.node = copyEndpointProgram(yylex, yyDollar[1].str, yyDollar[2].str, yyDollar[1].p)
 		}
 	case 2814:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9380
+//line ../../tmp/goopg_grammar.y:9382
 		{
 			yyVAL.node = &copyEndpoint{kind: CopyEndpointFile, name: yyDollar[1].str}
 		}
 	case 2815:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9386
+//line ../../tmp/goopg_grammar.y:9388
 		{
 			yyVAL.copts = []CopyOption(nil)
 		}
 	case 2816:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9387
+//line ../../tmp/goopg_grammar.y:9389
 		{
 			yyVAL.copts = yyDollar[3].copts
 		}
 	case 2817:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9388
+//line ../../tmp/goopg_grammar.y:9390
 		{
 			yyVAL.copts = yyDollar[2].copts
 		}
 	case 2818:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9389
+//line ../../tmp/goopg_grammar.y:9391
 		{
 			yyVAL.copts = yyDollar[2].copts
 		}
 	case 2819:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9390
+//line ../../tmp/goopg_grammar.y:9392
 		{
 			yyVAL.copts = yyDollar[1].copts
 		}
 	case 2820:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9393
+//line ../../tmp/goopg_grammar.y:9395
 		{
 			yyVAL.copts = []CopyOption{yyDollar[1].copt}
 		}
 	case 2821:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9394
+//line ../../tmp/goopg_grammar.y:9396
 		{
 			yyVAL.copts = append(yyDollar[1].copts, yyDollar[3].copt)
 		}
 	case 2822:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9397
+//line ../../tmp/goopg_grammar.y:9399
 		{
 			yyVAL.copt = NewCopyOption(yyDollar[1].p, yyDollar[1].str)
 		}
 	case 2823:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9398
+//line ../../tmp/goopg_grammar.y:9400
 		{
 			yyVAL.copt = CopyOptionStar(NewCopyOption(yyDollar[1].p, yyDollar[1].str))
 		}
 	case 2824:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9399
+//line ../../tmp/goopg_grammar.y:9401
 		{
 			yyVAL.copt = CopyOptionCols(NewCopyOption(yyDollar[1].p, yyDollar[1].str), yyDollar[3].strs)
 		}
 	case 2825:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9400
+//line ../../tmp/goopg_grammar.y:9402
 		{
 			yyVAL.copt = CopyOptionValue(NewCopyOption(yyDollar[1].p, yyDollar[1].str), yyDollar[2].str)
 		}
 	case 2826:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9407
+//line ../../tmp/goopg_grammar.y:9409
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2827:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9410
+//line ../../tmp/goopg_grammar.y:9412
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2828:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9411
+//line ../../tmp/goopg_grammar.y:9413
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2829:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9412
+//line ../../tmp/goopg_grammar.y:9414
 		{
 			yyVAL.str = strconv.FormatInt(int64(yyDollar[1].ival), 10)
 		}
 	case 2830:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9417
+//line ../../tmp/goopg_grammar.y:9419
 		{
 			yyVAL.copts = yyDollar[1].copts
 		}
 	case 2831:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9418
+//line ../../tmp/goopg_grammar.y:9420
 		{
 			yyVAL.copts = append(yyDollar[1].copts, yyDollar[2].copts...)
 		}
 	case 2832:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9421
+//line ../../tmp/goopg_grammar.y:9423
 		{
 			yyVAL.copts = []CopyOption{NewCopyOption(yyDollar[1].p, "binary")}
 		}
 	case 2833:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9422
+//line ../../tmp/goopg_grammar.y:9424
 		{
 			yyVAL.copts = []CopyOption{NewCopyOption(yyDollar[1].p, yyDollar[1].str)}
 		}
 	case 2834:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9424
+//line ../../tmp/goopg_grammar.y:9426
 		{
 			yyVAL.copts = []CopyOption{CopyOptionValue(NewCopyOption(yyDollar[1].p, yyDollar[1].str), yyDollar[2].str)}
 		}
 	case 2835:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9426
+//line ../../tmp/goopg_grammar.y:9428
 		{
 			yyVAL.copts = []CopyOption{CopyOptionStar(NewCopyOption(yyDollar[1].p, "force_quote"))}
 		}
 	case 2836:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9428
+//line ../../tmp/goopg_grammar.y:9430
 		{
 			yyVAL.copts = []CopyOption{CopyOptionCols(NewCopyOption(yyDollar[1].p, "force_quote"), yyDollar[3].strs)}
 		}
 	case 2837:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9430
+//line ../../tmp/goopg_grammar.y:9432
 		{
 			yyVAL.copts = []CopyOption{CopyOptionCols(NewCopyOption(yyDollar[1].p, "force_not_null"), yyDollar[4].strs)}
 		}
 	case 2838:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9432
+//line ../../tmp/goopg_grammar.y:9434
 		{
 			yyVAL.copts = []CopyOption{CopyOptionCols(NewCopyOption(yyDollar[1].p, "force_null"), yyDollar[3].strs)}
 		}
 	case 2839:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9435
+//line ../../tmp/goopg_grammar.y:9437
 		{
 			yyVAL.str = "csv"
 		}
 	case 2840:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9436
+//line ../../tmp/goopg_grammar.y:9438
 		{
 			yyVAL.str = "header"
 		}
 	case 2841:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9437
+//line ../../tmp/goopg_grammar.y:9439
 		{
 			yyVAL.str = "freeze"
 		}
 	case 2842:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9440
+//line ../../tmp/goopg_grammar.y:9442
 		{
 			yyVAL.str = "delimiter"
 		}
 	case 2843:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9441
+//line ../../tmp/goopg_grammar.y:9443
 		{
 			yyVAL.str = "null"
 		}
 	case 2844:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9442
+//line ../../tmp/goopg_grammar.y:9444
 		{
 			yyVAL.str = "quote"
 		}
 	case 2845:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9443
+//line ../../tmp/goopg_grammar.y:9445
 		{
 			yyVAL.str = "escape"
 		}
 	case 2846:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9444
+//line ../../tmp/goopg_grammar.y:9446
 		{
 			yyVAL.str = "encoding"
 		}
 	case 2847:
 		yyDollar = yyS[yypt-9 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9457
+//line ../../tmp/goopg_grammar.y:9459
 		{
 			st := NewAlterIndexStmt(yyDollar[1].p, objectNameFromQn(yyDollar[3].qn), "")
 			a := NewATActionAt(AlterTableSetStatistics, yyDollar[1].p)
@@ -23770,7 +23772,7 @@ yydefault:
 		}
 	case 2848:
 		yyDollar = yyS[yypt-10 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9467
+//line ../../tmp/goopg_grammar.y:9469
 		{
 			st := NewAlterIndexStmt(yyDollar[1].p, objectNameFromQn(yyDollar[3].qn), "")
 			a := NewATActionAt(AlterTableAlterColumnSet, yyDollar[1].p)
@@ -23780,7 +23782,7 @@ yydefault:
 		}
 	case 2849:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9475
+//line ../../tmp/goopg_grammar.y:9477
 		{
 			st := NewAlterIndexStmt(yyDollar[1].p, objectNameFromQn(yyDollar[3].qn), "ALTER INDEX")
 			a := NewATActionAt(AlterTableSetTablespace, yyDollar[6].p)
@@ -23790,7 +23792,7 @@ yydefault:
 		}
 	case 2850:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9483
+//line ../../tmp/goopg_grammar.y:9485
 		{
 			st := NewAlterIndexStmt(yyDollar[1].p, objectNameFromQn(yyDollar[3].qn), "")
 			a := NewATActionAt(AlterIndexSetReloptions, yyDollar[1].p)
@@ -23800,7 +23802,7 @@ yydefault:
 		}
 	case 2851:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9493
+//line ../../tmp/goopg_grammar.y:9495
 		{
 			parent := objectNameFromQn(yyDollar[3].qn)
 			st := NewAlterIndexStmt(yyDollar[1].p, parent, "")
@@ -23811,7 +23813,7 @@ yydefault:
 		}
 	case 2852:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9502
+//line ../../tmp/goopg_grammar.y:9504
 		{
 			st := NewAlterIndexStmt(yyDollar[1].p, objectNameFromQn(yyDollar[3].qn), "ALTER INDEX")
 			a := NewATActionAt(AlterTableRenameTable, yyDollar[6].p)
@@ -23821,19 +23823,19 @@ yydefault:
 		}
 	case 2853:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9511
+//line ../../tmp/goopg_grammar.y:9513
 		{
 			yyVAL.str = yyDollar[1].str
 		}
 	case 2854:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9512
+//line ../../tmp/goopg_grammar.y:9514
 		{
 			yyVAL.str = strconv.FormatInt(int64(yyDollar[1].ival), 10)
 		}
 	case 2855:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9523
+//line ../../tmp/goopg_grammar.y:9525
 		{
 			st := NewAlterIndexStmt(yyDollar[1].p, objectNameFromQn(yyDollar[4].qn), "ALTER VIEW")
 			st.IfExists = yyDollar[3].b
@@ -23842,85 +23844,85 @@ yydefault:
 		}
 	case 2856:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9531
+//line ../../tmp/goopg_grammar.y:9533
 		{
 			yyVAL.node = altViewRenameTo(yyDollar[3].p, yyDollar[3].str)
 		}
 	case 2857:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9532
+//line ../../tmp/goopg_grammar.y:9534
 		{
 			yyVAL.node = altViewRenameCol(yyDollar[3].p, yyDollar[3].str, yyDollar[5].str)
 		}
 	case 2858:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9533
+//line ../../tmp/goopg_grammar.y:9535
 		{
 			yyVAL.node = altViewOwner(yyDollar[3].str)
 		}
 	case 2859:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9534
+//line ../../tmp/goopg_grammar.y:9536
 		{
 			yyVAL.node = altViewSetSchema(yyDollar[3].str)
 		}
 	case 2860:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9535
+//line ../../tmp/goopg_grammar.y:9537
 		{
 			yyVAL.node = altViewReloptions(yyDollar[3].strs, false)
 		}
 	case 2861:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9536
+//line ../../tmp/goopg_grammar.y:9538
 		{
 			yyVAL.node = altViewReloptions(yyDollar[3].strs, true)
 		}
 	case 2862:
 		yyDollar = yyS[yypt-6 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9537
+//line ../../tmp/goopg_grammar.y:9539
 		{
 			yyVAL.node = altViewSetDefault(yyDollar[3].p, yyDollar[3].str, yyDollar[6].expr)
 		}
 	case 2863:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9538
+//line ../../tmp/goopg_grammar.y:9540
 		{
 			yyVAL.node = altViewDropDefault(yyDollar[3].p, yyDollar[3].str)
 		}
 	case 2864:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9546
+//line ../../tmp/goopg_grammar.y:9548
 		{
 			yyVAL.stmt = NewListenStmt(yyDollar[1].p, yyDollar[2].str)
 		}
 	case 2865:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9549
+//line ../../tmp/goopg_grammar.y:9551
 		{
 			yyVAL.stmt = NewNotifyStmt(yyDollar[1].p, yyDollar[2].str, "", false)
 		}
 	case 2866:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9550
+//line ../../tmp/goopg_grammar.y:9552
 		{
 			yyVAL.stmt = NewNotifyStmt(yyDollar[1].p, yyDollar[2].str, yyDollar[4].str, true)
 		}
 	case 2867:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9553
+//line ../../tmp/goopg_grammar.y:9555
 		{
 			yyVAL.stmt = NewUnlistenStmt(yyDollar[1].p, yyDollar[2].str, false)
 		}
 	case 2868:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9554
+//line ../../tmp/goopg_grammar.y:9556
 		{
 			yyVAL.stmt = NewUnlistenStmt(yyDollar[1].p, "", true)
 		}
 	case 2869:
 		yyDollar = yyS[yypt-7 : yypt+1]
-//line ../../tmp/goopg_grammar.y:9560
+//line ../../tmp/goopg_grammar.y:9562
 		{
 			st := NewAlterIndexStmt(yyDollar[1].p, objectNameFromQn(yyDollar[4].qn), "ALTER MATERIALIZED VIEW")
 			st.SetSchema = yyDollar[7].str

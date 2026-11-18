@@ -34,6 +34,12 @@ With the parser in place the planner types every untyped literal opposite a time
 PG's input error. `dateTimeInputError` also gives PG's codes for a bad zone, an out\-of\-range displacement, and
 a month or day overflow, which carries the DateStyle hint.
 
+## Error position of typed literals \(M0149\-0001h1a55\)
+
+PG reports a bad `date 'x'` at the string \(`makeStringConstCast`\). The adapter's `TYPEDLIT` token keeps the
+type name's position, which raw source spans start from, and carries the string's position in `ival`. The
+grammar builds the literal from that, and the multi\-word forms use the `SCONST` position.
+
 ## Verification
 
 About 2,000 inputs were run as `date`, `timestamp` and `timestamptz` under the three field orders on goopg and
@@ -43,4 +49,5 @@ PG 18.3. Results and errors match, apart from dates after 294276 AD \(M0149\-000
 
 - `time` and `timetz` input still use their own parser, not `DecodeTimeOnly`, and `timezone_abbreviations` is
   always the `Default` set \(M0149\-0001h1a70\).
-- `date 'x'` puts the error caret on the type name \(M0149\-0001h1a55\).
+- Typed literals PG accepts but goopg's grammar does not, such as `uuid 'x'` and `timestamp(3) 'x'`, are
+  M0149\-0001h1a71.

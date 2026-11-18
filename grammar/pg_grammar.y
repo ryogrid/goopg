@@ -2948,8 +2948,10 @@ c_expr:
 			{ $$ = NewGroupingCall($<p>1, $3) }
 	| TYPEDLIT
 			{
+				/* $<ival>1 is the string's position: coerce_type reports a bad
+				   literal there (makeStringConstCast), not at the type name. */
 				typ, val := typedLitParts($1)
-				$$ = NewTypedStringLit($<p>1, typ, val)
+				$$ = NewTypedStringLit($<ival>1, typ, val)
 			}
 	/* Multi-word typed literals — gram.y ConstDatetime Sconst. The lexer's
 	   TYPEDLIT fold needs the SCONST to follow the type name IMMEDIATELY, so
@@ -2957,13 +2959,13 @@ c_expr:
 	   WITH/WITHOUT arrive as WITH_LA/WITHOUT_LA because base_yylex substitutes
 	   them when TIME follows. */
 	| TIMESTAMP WITH_LA TIME ZONE SCONST
-			{ $$ = NewTypedStringLit($<p>1, "timestamptz", $5) }
+			{ $$ = NewTypedStringLit($<p>5, "timestamptz", $5) }
 	| TIMESTAMP WITHOUT_LA TIME ZONE SCONST
-			{ $$ = NewTypedStringLit($<p>1, "timestamp", $5) }
+			{ $$ = NewTypedStringLit($<p>5, "timestamp", $5) }
 	| TIME WITH_LA TIME ZONE SCONST
-			{ $$ = NewTypedStringLit($<p>1, "timetz", $5) }
+			{ $$ = NewTypedStringLit($<p>5, "timetz", $5) }
 	| TIME WITHOUT_LA TIME ZONE SCONST
-			{ $$ = NewTypedStringLit($<p>1, "time", $5) }
+			{ $$ = NewTypedStringLit($<p>5, "time", $5) }
 	/* ARRAY[...] — gram.y array_expr: the inner brackets nest WITHOUT the
 	   keyword (`array[[1,2],[3,4]]`), and legacy builds nested
 	   ArrayConstructorExpr for them. */

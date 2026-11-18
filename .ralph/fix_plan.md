@@ -12355,12 +12355,15 @@ verify each at HEAD when the task starts.
     - Regress, all 165 failed cases on HEAD and this build: 79283→76077 mismatch lines. subscription +3 now raises PG's error
       for an empty `stats_reset` value, which an earlier gap in that case produces.
     Movement: yes — regress timestamp 1392→213, timestamptz 1949→343, date 294→56, horology 2480→2360, merge 759→431, interval 662→654, copy2 254→249
-- [ ] **M0149-0001h1a55 — date and timestamp literal errors: caret and DateStyle hint** (filed 2026-11-18 by M0149-0001h1a48e)
+- [x] **M0149-0001h1a55 — date and timestamp literal errors: caret and DateStyle hint** (filed 2026-11-18 by M0149-0001h1a48e)
   Kind: impl
   Parent: M0149-0001h1a
   - `date 'x'` and `timestamp 'x'` put the caret on the type name. PG puts it on the string \(makeStringConstCast\).
     The position comes from the grammar \(NewTypedStringLit\).
   - 2026\-11\-19: the DateStyle hint landed with h1a56; the caret remains.
+  - 2026\-11\-19 \(landed\): a typed literal's position is its string, for the one\-word, char\(n\) and multi\-word forms.
+    The TYPEDLIT token keeps the type name's position for source spans.
+    Movement: none — error positions only; regress over all 165 failed cases changed only in the known flakes
 - [ ] **M0149-0001h1a54 — dates from 294277 to 5874897 AD are rejected** (filed 2026-11-18 by M0149-0001h1a48e)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12426,6 +12429,15 @@ verify each at HEAD when the task starts.
   - `'10:00+05:30:15'::timetz` loses its offset, because parseTimeString and parseTimeTZString are separate from DecodeTimeOnly.
   - timezone\_abbreviations is not honoured: input always uses the Default set.
   - Resume: port DecodeTimeOnly onto internal/utils/adt/datetime/decode.go; load the abbreviation set the setting names.
+- [ ] **M0149-0001h1a71 — typed literals the grammar does not accept** (filed 2026-11-19 by M0149-0001h1a55)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `uuid 'x'`, `inet 'x'`, `cidr 'x'`, `macaddr 'x'`, `money 'x'`, `bytea 'x'`, `bit '1'`, `varbit '1'`, `regclass 'x'`, `xml 'x'`,
+    `double precision 'x'`, `timestamp(3) 'x'`, `time(3) 'x'`, `numeric(5,2) 'x'`, `pg_catalog.date 'x'` and `"date" 'x'` are syntax errors.
+    PG accepts them \(ConstTypename Sconst, func_name Sconst\).
+  - `interval 'x'` is a syntax error and `interval(3) 'x'` says `invalid interval count`, where PG reports
+    `invalid input syntax for type interval` at the string.
+  - Resume: replace knownTypeNames in internal/parser/adapter.go with gram.y's productions; playbook §12 first.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a
