@@ -12396,6 +12396,8 @@ verify each at HEAD when the task starts.
   Parent: M0149-0001h1a
   - A prepared statement or view with `t = '2020-01-01'` follows the zone in force when it runs. PG fixes the value when the
     statement is parsed, so it keeps the earlier zone, and pg\_get\_viewdef shows the resolved instant.
+  - EXPLAIN has the same cause: it prints `'2020-01-01'::timestamp with time zone`, where PG prints the resolved
+    `'2020-01-01 00:00:00-05'::timestamp with time zone`.
   - Resume: the planner needs the session TimeZone to fold these literals; views need their stored text rewritten.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
