@@ -1311,8 +1311,8 @@ func canonicalizeTimestampTimeToken(body string) (string, int, error) {
 // it cannot represent, so an out-of-range date is a loud 22008 instead of a
 // plausible-looking different date.
 var (
-	timeCarrierMin = time.Unix(0, math.MinInt64).UTC()
-	timeCarrierMax = time.Unix(0, math.MaxInt64).UTC()
+	timeCarrierMin = timeFromCarrier(math.MinInt64)
+	timeCarrierMax = timeFromCarrier(math.MaxInt64)
 
 	errTimeCarrierRange = errors.New("date/time value outside goopg's representable range")
 )

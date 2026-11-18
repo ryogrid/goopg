@@ -253,7 +253,25 @@ func (d Datum) BytesValue() []byte {
 // TimeValue returns the timestamp payload of a KindTime Datum,
 // reconstructed from the Unix nanoseconds stored in Int. Always UTC.
 func (d Datum) TimeValue() time.Time {
-	return time.Unix(0, d.Int).UTC()
+	return timeFromCarrier(d.Int)
+}
+
+// A KindTime Datum keeps its instant in Int. The functions below and this
+// constant are the only code that knows the unit, so the carrier can change
+// without touching its users (M0149-0001h1a48). Comparing or hashing Int needs
+// no conversion: order and equality hold in any unit.
+const timeCarrierUnitsPerSecond int64 = 1_000_000_000
+
+// timeToCarrier is the Int of a KindTime Datum holding t.
+func timeToCarrier(t time.Time) int64 { return t.UTC().UnixNano() }
+
+// timeFromCarrier is the instant a KindTime Datum's Int stands for.
+func timeFromCarrier(carrier int64) time.Time { return time.Unix(0, carrier).UTC() }
+
+// timeTZCompareKey is a timetz Datum's position in UTC, which timetz comparison
+// orders by. The offset lives in Scale, in minutes east of UTC.
+func timeTZCompareKey(d Datum) int64 {
+	return d.Int - int64(d.Scale)*60*timeCarrierUnitsPerSecond
 }
 
 // IntervalMonthsValue extracts the months component of KindInterval.
@@ -589,9 +607,9 @@ func cloneRowOwnedPrefix(src Row, bound int) Row {
 }
 
 // NewTimeDatum constructs a KindTime Datum from a time.Time.
-// The timestamp is normalized to UTC and stored as Unix nanoseconds.
+// The timestamp is normalized to UTC.
 func NewTimeDatum(t time.Time) Datum {
-	return Datum{Kind: KindTime, Int: t.UTC().UnixNano()}
+	return Datum{Kind: KindTime, Int: timeToCarrier(t)}
 }
 
 // NewDateDatum constructs a KindTime Datum tagged as a DATE
@@ -602,7 +620,7 @@ func NewTimeDatum(t time.Time) Datum {
 // timestamp shape otherwise. Use this at every date-producing site (literals,
 // casts, on-disk decode) so a date is indistinguishable regardless of origin.
 func NewDateDatum(t time.Time) Datum {
-	return Datum{Kind: KindTime, Int: t.UTC().UnixNano(), TimeSub: TimeSubDate}
+	return Datum{Kind: KindTime, Int: timeToCarrier(t), TimeSub: TimeSubDate}
 }
 
 // IsDate reports whether d is a KindTime Datum carrying a DATE. Prefer this to
@@ -625,7 +643,7 @@ func (d Datum) IsDate() bool { return d.Kind == KindTime && d.TimeSub == TimeSub
 // tagging them from a guess is the exact mislabelling this discriminator exists
 // to prevent.
 func NewTimestampTZDatum(t time.Time) Datum {
-	return Datum{Kind: KindTime, Int: t.UTC().UnixNano(), TimeSub: TimeSubTimestampTZ}
+	return Datum{Kind: KindTime, Int: timeToCarrier(t), TimeSub: TimeSubTimestampTZ}
 }
 
 // IsTimestampTZ reports whether d is a KindTime Datum carrying a
@@ -643,7 +661,7 @@ func (d Datum) IsTimestampTZ() bool {
 func NewTimeTZDatum(t time.Time, offsetSecs int) Datum {
 	return Datum{
 		Kind:    KindTime,
-		Int:     t.UTC().UnixNano(),
+		Int:     timeToCarrier(t),
 		Scale:   int16(offsetSecs / 60),
 		TimeSub: TimeSubTimeTZ,
 	}

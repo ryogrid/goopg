@@ -12169,6 +12169,49 @@ verify each at HEAD when the task starts.
     microseconds, so the limit is in the in\-memory value.
   - This also sets the column width of most tables in regress timestamp and timestamptz.
   - Resume: carry timestamps as PG\-epoch microseconds in the Datum, then the parser, formatter and arithmetic.
+  - 2026\-11\-18: sized and split into h1a48a to h1a48e; plan in docs/design/0100\-0149/0149\-0001h1a48\-timestamp\-range.md.
+- [x] **M0149-0001h1a48a — every use of the time carrier's unit goes through helpers in datum.go** (filed 2026-11-18 by M0149-0001h1a48)
+  Kind: impl
+  Parent: M0149-0001h1a48
+  - timeToCarrier, timeFromCarrier, timeCarrierUnitsPerSecond and timeTZCompareKey now hold the unit. Spill frames
+    and the subplan hash key use Int directly, and timezone\(\) works from microseconds of the day.
+  - Check: with the helpers switched to microseconds in a throwaway worktree, executor, postmaster, optimizer and
+    catalog tests passed, except TestExecCurrentTimestamp, which compares now\(\) at nanosecond precision.
+  - Also fixed: `'infinity'::date` and `'\-infinity'::date` printed 2262\-04\-11 and 1677\-09\-21.
+  - Tests: TestTimeCarrierRoundTrip, TestTimeTZCompareKey, TestInfinityCellText.
+  Movement: yes — regress date 407→405
+- [ ] **M0149-0001h1a48b — KindTime holds microseconds since 2000** (filed 2026-11-18 by M0149-0001h1a48)
+  Kind: impl
+  Parent: M0149-0001h1a48
+  - Change the helpers in datum.go. Keep the input range as it is. TimeValue must split seconds with floor division
+    and keep returning today's instants for the infinity sentinels, because index key encoders derive from them.
+  - time and timetz are anchored at 1970\-01\-01, with 24:00 on 1970\-01\-02; check they survive the new epoch.
+  - Update TestExecCurrentTimestamp for microsecond precision; check whether ctx.Now carries finer digits.
+- [ ] **M0149-0001h1a48c — date and time arithmetic that overflows past 292 years** (filed 2026-11-18 by M0149-0001h1a48)
+  Kind: impl
+  Parent: M0149-0001h1a48
+  - Replace time.Time.Sub and time.Duration products with integer microseconds: copy\_binary.go, expr.go
+    \(addTimeInterval, timestamp difference, generate\_series steps\), operators\_ddl.go and operators\_upsert.go index
+    keys, operators\_indexonly.go decoding. Keys must stay byte\-compatible for values in today's range.
+- [ ] **M0149-0001h1a48d — BC and long\-year output in every formatter** (filed 2026-11-18 by M0149-0001h1a48)
+  Kind: impl
+  Parent: M0149-0001h1a48
+  - Datum.Format, AppendValueText and to\_char have no era handling. Check misc.eraDisplay for BC leap days.
+- [ ] **M0149-0001h1a48e — accept PG's full timestamp and date range** (filed 2026-11-18 by M0149-0001h1a48)
+  Kind: impl
+  Parent: M0149-0001h1a48
+  - Parse years over four digits; enforce MIN\_TIMESTAMP and END\_TIMESTAMP with PG's errors; range\-check arithmetic
+    and decoded values; then replace checkTimeCarrierRange's bounds \(copy\_text.go\).
+  - Decide how to hold dates past 294276 AD, which PG allows up to 5874897 AD.
+  - Afterwards re\-measure regress timestamp and timestamptz, whose column widths depend on these dates.
+- [ ] **M0149-0001h1a49 — WRONG RESULTS: `AT TIME ZONE '+05'` on timetz uses the opposite sign** (filed 2026-11-18 by M0149-0001h1a48; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select '10:00+01'::timetz at time zone '+05'` returns `14:00:00+05`; PG 18.3 returns `04:00:00\-05`, because a
+    POSIX zone string counts hours west of Greenwich.
+  - Resume: parseTimezoneOffsetString's callers in the timezone\(\) arm of expr.go; compare the timestamptz path.
+  > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a49: `AT TIME ZONE` with a numeric zone string gives a different time
+  > The result differs from PG 18.3. Found while checking the timetz arithmetic in h1a48a.
 - [ ] **M0149-0001h1a46 — WRONG RESULTS: array elements and CREATE TABLE AS columns ignore their typmod** (filed 2026-11-18 by M0149-0001h1a39; S2)
   Kind: impl
   Parent: M0149-0001h1a

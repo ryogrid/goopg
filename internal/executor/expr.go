@@ -3667,7 +3667,7 @@ func addDateTimeInt(dt, days Datum, subtract bool, pos int) (Datum, error) {
 	if dt.IsTimestampNotFinite() {
 		return NullDatum, timestampOutOfRange(pos)
 	}
-	t := time.Unix(0, dt.Int).UTC()
+	t := dt.TimeValue()
 	n := int(days.Int)
 	if subtract {
 		n = -n
@@ -4675,8 +4675,8 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		// Plain time/timestamp datums (Scale == 0) compare by Int directly.
 		// M0097-0004.
 		if a.Scale != 0 || b.Scale != 0 {
-			aUTC := a.Int - int64(a.Scale)*60*1_000_000_000
-			bUTC := b.Int - int64(b.Scale)*60*1_000_000_000
+			aUTC := timeTZCompareKey(a)
+			bUTC := timeTZCompareKey(b)
 			switch {
 			case aUTC < bUTC:
 				return -1, nil
@@ -12491,15 +12491,12 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				Message: fmt.Sprintf("time zone %q not recognized", zoneStr)}
 		}
 		oldOffsetSecs := src.TimeTZOffsetSecs()
-		// Int stores LOCAL time nanoseconds (epoch-anchored). Compute UTC then
-		// apply new offset.
-		utcNanos := src.Int - int64(oldOffsetSecs)*1_000_000_000
-		newLocalNanos := utcNanos + int64(newOffsetSecs)*1_000_000_000
-		// Wrap within [0, 24h).
-		const dayNanos = int64(24 * 3600 * 1_000_000_000)
-		newLocalNanos = ((newLocalNanos % dayNanos) + dayNanos) % dayNanos
+		// The stored clock is LOCAL time: go through UTC to the new offset and
+		// wrap into [0, 24h).
+		micros := pgTimeMicros(src.TimeValue()) + int64(newOffsetSecs-oldOffsetSecs)*1_000_000
+		micros = ((micros % usecsPerDay) + usecsPerDay) % usecsPerDay
 		result := src
-		result.Int = newLocalNanos
+		result.Int = timeToCarrier(pgTimeFromMicros(micros))
 		result.Scale = int16(newOffsetSecs / 60)
 		return result, nil
 	case "pg_get_viewdef":

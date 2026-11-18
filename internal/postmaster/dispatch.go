@@ -4289,7 +4289,7 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 		// hardcoded ISO regardless of `SET datestyle`. M0097-0004,
 		// M-NIGHTLY (run 20260714-011651) DateStyle output-rendering
 		// follow-up.
-		if d.Kind == executor.KindTime {
+		if d.Kind == executor.KindTime && !d.IsTimestampNotFinite() {
 			style, order := "ISO", "MDY"
 			if getSetting != nil {
 				if v, ok := getSetting("datestyle"); ok {

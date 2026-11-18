@@ -6271,7 +6271,7 @@ func datumKey(d Datum) string {
 	case KindTime:
 		var buf [20]byte
 		b := append(buf[:0], 't', ':')
-		b = strconv.AppendInt(b, d.TimeValue().UnixNano(), 10)
+		b = strconv.AppendInt(b, d.Int, 10)
 		return string(b)
 	case KindInterval:
 		var buf [48]byte
