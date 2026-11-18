@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -12075,12 +12076,12 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 	case "string_agg":
 		// string_agg(expr, delimiter) returns the same type as its first arg
 		// (text for text input, bytea for bytea input). M0097-0115.
-		outType = exprType(argExpr)
+		outType = typeWithoutTypmod(exprType(argExpr))
 		if outType.Name == "" || outType.Name == "unknown" {
 			outType = catalog.Type{Name: "text"}
 		}
 	case "min", "max":
-		outType = exprType(argExpr)
+		outType = typeWithoutTypmod(exprType(argExpr))
 	case "regr_count":
 		outType = catalog.Type{Name: "int8"}
 	case "regr_avgx", "regr_avgy", "regr_sxx", "regr_syy", "regr_sxy",
@@ -17185,6 +17186,58 @@ func sumResultType(t catalog.Type) catalog.Type {
 			return catalog.Type{Name: "int8"}
 		}
 	}
+	return typeWithoutTypmod(t)
+}
+
+// castTypmodArgs turns a cast's encoded typmod (encodeTypmod) back into the
+// declared arguments, so a cast's result column keeps its typmod as PG's
+// exprTypmod reports it for a length-coercion. Types with no typmod get none.
+func castTypmodArgs(typeName string, typmod int64) []int64 {
+	if typmod <= 0 {
+		return nil
+	}
+	switch strings.ToLower(typeName) {
+	case "numeric", "decimal":
+		if typmod >= 1<<16 {
+			return []int64{typmod >> 16, typmod & 0xffff}
+		}
+		return []int64{typmod}
+	case "interval":
+		// A bare precision is packed as INTERVAL_TYPMOD(p, INTERVAL_FULL_RANGE),
+		// the form a declared column's Args carry.
+		if typmod <= 6 {
+			return []int64{0x7fff<<16 | typmod}
+		}
+		return []int64{typmod}
+	case "varchar", "character varying", "bpchar", "character", "bit", "varbit", "bit varying",
+		"time", "timetz", "timestamp", "timestamptz":
+		return []int64{typmod}
+	}
+	return nil
+}
+
+// typeWithoutTypmod is t as the result of an expression that has no typmod of
+// its own. Bare `char(n)` is spelled "char" with Args, so without them it must
+// be named bpchar or it would read as the one-byte "char" type.
+func typeWithoutTypmod(t catalog.Type) catalog.Type {
+	if len(t.Args) == 0 {
+		return t
+	}
+	if strings.EqualFold(t.Name, "char") {
+		t.Name = "bpchar"
+	}
+	t.Args = nil
+	return t
+}
+
+// typeWithCommonTypmod keeps t's typmod only when every expression has the same
+// one, as exprTypmod does for CASE, COALESCE and GREATEST / LEAST.
+func typeWithCommonTypmod(t catalog.Type, exprs []Expr) catalog.Type {
+	for _, e := range exprs {
+		if !slices.Equal(exprType(e).Args, t.Args) {
+			return typeWithoutTypmod(t)
+		}
+	}
 	return t
 }
 
@@ -17251,6 +17304,8 @@ func exprType(e Expr) catalog.Type {
 			// TypeOID in typeOIDFor, pg_typeof's pgTypeofDisplayName).
 			if strings.EqualFold(x.TargetType, "char") && x.Typmod > 0 {
 				t.Args = []int64{x.Typmod}
+			} else {
+				t.Args = castTypmodArgs(x.TargetType, x.Typmod)
 			}
 			return t
 		}
@@ -17384,14 +17439,22 @@ func exprType(e Expr) catalog.Type {
 		if x.Op == parser.OpNot {
 			return catalog.Type{Name: "bool"}
 		}
-		return exprType(x.Operand)
+		return typeWithoutTypmod(exprType(x.Operand))
 	case *CaseExpr:
 		// All Whens unify to a single result type during analysis;
 		// take the first branch's type as the representative.
 		if len(x.Whens) > 0 {
 			t := exprType(x.Whens[0].Then)
 			if t.Name != "unknown" && t.Name != "" {
-				return t
+				results := make([]Expr, 0, len(x.Whens)+1)
+				for _, w := range x.Whens {
+					results = append(results, w.Then)
+				}
+				if x.Else == nil {
+					// The implicit ELSE NULL has no typmod.
+					return typeWithoutTypmod(t)
+				}
+				return typeWithCommonTypmod(t, append(results, x.Else))
 			}
 		}
 		if x.Else != nil {
@@ -17694,13 +17757,14 @@ func exprType(e Expr) catalog.Type {
 			for _, a := range x.Args {
 				t := exprType(a)
 				if t.Name != "unknown" && t.Name != "" {
-					return t
+					return typeWithCommonTypmod(t, x.Args)
 				}
 			}
 		case "nullif":
-			// NULLIF returns the type of its first argument (nullable).
+			// NULLIF returns the type of its first argument (nullable),
+			// without its typmod (exprTypmod has no NullIfExpr arm).
 			if len(x.Args) > 0 {
-				return exprType(x.Args[0])
+				return typeWithoutTypmod(exprType(x.Args[0]))
 			}
 		case "pg_size_bytes",
 			"pg_database_size", "pg_relation_size", "pg_total_relation_size",
@@ -17737,7 +17801,7 @@ func exprType(e Expr) catalog.Type {
 			if len(x.Args) > 0 {
 				t := exprType(x.Args[0])
 				if t.Name != "unknown" && t.Name != "" {
-					return t
+					return typeWithoutTypmod(t)
 				}
 			}
 			return catalog.Type{Name: "numeric"}

@@ -3807,13 +3807,7 @@ func (s *Server) executeOneSimpleStmt(w *libpq.FrameWriter, ctx *executor.Contex
 	if schema != nil {
 		fields := make([]libpq.FieldDescription, len(schema))
 		for i, sc := range schema {
-			fields[i] = libpq.FieldDescription{
-				Name:         sc.Name,
-				TypeOID:      wireTypeOID(ctx.Catalog, ctx.CurrentDatabaseOid, sc.Type),
-				TypeSize:     -1,
-				TypeModifier: -1,
-				Format:       0,
-			}
+			fields[i] = wireFieldDescription(ctx.Catalog, ctx.CurrentDatabaseOid, sc.Name, sc.Type)
 		}
 		if err := w.WriteRowDescription(fields); err != nil {
 			_ = op.Close()
@@ -4672,13 +4666,7 @@ func (s *Server) executeFetch(_ context.Context, w *libpq.FrameWriter, ectx *exe
 	if schema != nil {
 		fields := make([]libpq.FieldDescription, len(schema))
 		for i, sc := range schema {
-			fields[i] = libpq.FieldDescription{
-				Name:         sc.Name,
-				TypeOID:      wireTypeOID(ectx.Catalog, ectx.CurrentDatabaseOid, sc.Type),
-				TypeSize:     -1,
-				TypeModifier: -1,
-				Format:       0,
-			}
+			fields[i] = wireFieldDescription(ectx.Catalog, ectx.CurrentDatabaseOid, sc.Name, sc.Type)
 		}
 		if err := w.WriteRowDescription(fields); err != nil {
 			return err

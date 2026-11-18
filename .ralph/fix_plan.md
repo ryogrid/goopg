@@ -12093,22 +12093,81 @@ verify each at HEAD when the task starts.
       alter\_generic \+1 from tied\-row order \(a known flaky case\). Inventory re\-measured for the moved cases.
     - Tests: TestWireTypeOID, TestExprTypeWireTypeOID.
     Movement: yes — regress groupingsets 468→454, domain 431→419, xid 212→211
-- [ ] **M0149-0001h1a38 — RowDescription residue: result types the planner and catalog stubs get wrong; typlen, typmod and source column are not sent** (filed 2026-11-18 by M0149-0001h1a3)
+- [x] **M0149-0001h1a38 — RowDescription sends typlen and typmod; result expressions carry PG's typmod** (filed 2026-11-18 by M0149-0001h1a3)
   Kind: impl
   Parent: M0149-0001h1a
-  - Compared with PG 18.3 through a protocol client, after h1a3:
-    - `select wt from wt` is record; PG sends the table's rowtype.
-    - A `wdom[]` column is `integer[]`; PG sends the domain's array type.
-    - `current_user` and `current_schema()` are text; PG sends name.
-    - `generate_series(1,1)` is bigint; PG sends integer.
-    - `now()` is timestamp, already filed as M0146\-0163.
-    - Catalog stubs differ from PG: pg\_proc.proname and provolatile are text, pg\_attribute.attoptions,
-      attfdwoptions and attmissingval are text, and other catalogs have similar gaps.
+  - 2026\-11\-18 \(landed\): wireFieldDescription sends the column's OID, typlen and typmod on every path.
+    - Compared through a protocol client with PG 18.3: typlen matches for all 303 built\-in scalar, range and
+      multirange types queried, and typlen and typmod match for table columns apart from domains \(h1a39\).
+    - exprType follows PG's exprTypmod: a length\-coercing cast keeps its typmod; min, max, sum, string\_agg,
+      NULLIF, unary operators and rounding functions have none; CASE, COALESCE, GREATEST and LEAST keep one
+      only when every input has the same typmod.
+    - char\(n\) without its typmod is named bpchar, so it cannot read as the one\-byte `"char"`.
+    - Side effect, toward PG: views and CREATE TABLE AS keep types such as `varchar(4)` and `numeric(16,4)`.
+    - Plan shapes are unchanged \(99/99, 99/99 MATCH\). EXPLAIN widths moved on 363 SF0.25 nodes and 374 SF1
+      nodes: 85 and 89 now equal PG, 3 on Q5 at each scale moved away, and costs did not change. The next
+      census is therefore not IDENTICAL and commits its full capture.
+    - Regress, all 165 failed cases on HEAD and this build, same list: 80421→80415 mismatch lines.
+      polymorphism and plpgsql move either way between runs: HEAD alone gave polymorphism 683 and 677 \(h1a44\).
+    - Residual filed: h1a39, h1a40, h1a41; found while probing: h1a42, h1a43, h1a44.
+    - Tests: TestWireFieldDescription, TestExprTypeTypmod.
+    Movement: yes — regress create\_view 1189→1148, expressions 48→44, psql 299→297
+- [ ] **M0149-0001h1a39 — WRONG RESULTS: a domain's typmod is dropped, so `varchar(5)` and `numeric(4,1)` domains are not enforced** (filed 2026-11-18 by M0149-0001h1a38; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Repro: `create domain d5 as varchar(5); create domain dn as numeric(4,1); create table td(a d5, b dn);`
+    - `insert into td values ('123456', 1)` succeeds; PG raises `value too long for type character varying(5)`.
+    - `insert into td values ('12345', 123.456)` stores 123.456; PG stores 123.5.
+    - `select 'abcdefg'::d5` returns abcdefg, PG abcde; `select 1.26::dn` returns 1.26, PG 1.3.
+    - RowDescription therefore reports typmod \-1 for such a column; PG reports 9 and 262149 style values.
+  - Cause: execCreateDomain keeps only the base type name \(CreateDomainStmt.BaseType\), and
+    catalog.ResolveColumnType returns a name, so Domain.Base and resolved table columns have no Args.
+  - PG: DefineDomain stores typtypmod; domain\_in and coerce\_to\_domain apply it \(domains.c, parse\_coerce.c\).
+  - Resume: carry the typmod through CreateDomainStmt into Domain.Base.Args, resolve table columns with it,
+    apply it in the domain cast path; pg\_type.typtypmod and pg\_dump's domain text must follow.
+  > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a39: domain length and precision are not enforced
+  > Over\-long values are stored and numeric values are not rounded. Found while comparing RowDescription typmods with PG 18.3.
+- [ ] **M0149-0001h1a40 — RowDescription sends table OID 0 and column 0 for every field** (filed 2026-11-18 by M0149-0001h1a38)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG sends resorigtbl and resorigcol for a column that is a plain reference to a table column
+    \(printtup.c; set by markTargetListOrigins, parse\_target.c\). libpq exposes them as PQftable and PQftablecol.
+  - Resume: record the origin on optimizer.SchemaColumn where the target list is built, carry it through
+    subqueries and views as markTargetListOrigin does, and fill FieldDescription in wireFieldDescription.
+- [ ] **M0149-0001h1a41 — result types and labels that still differ from PG 18.3** (filed 2026-11-18 by M0149-0001h1a38)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Types: `select wt from wt` is record \(PG: the rowtype\); a `wdom[]` column is `integer[]`; `current_user`
+    and `current_schema()` are text \(name\); `generate_series(1,1)` is bigint \(integer\); `abs(numeric)` is
+    bigint; `max(varchar)` and `nullif(varchar, ...)` are varchar \(text\); `now()` is M0146\-0163.
+  - Catalog stubs: pg\_proc.proname and provolatile are text, pg\_attribute.attoptions, attfdwoptions and
+    attmissingval are text; other catalogs have similar gaps.
+  - Typmod: UNION with differing branch typmods keeps the left one \(PG \-1\); `array[vc]` and `array[nu]` drop
+    the element typmod \(PG keeps it\).
+  - Labels: `case when true then vc end` is named vc \(PG case\); `vc collate "C"` is `?column?` \(PG vc\).
   - `order by` and `distinct` on a void column succeed; PG raises 42883.
-  - Every field sends TypeSize \-1, TypeModifier \-1, table OID 0 and column 0. PG sends typlen, atttypmod and
-    the source table and attribute \(printtup.c SendRowDescriptionMessage\), so psql `\gdesc` shows no
-    `varchar(3)` length.
-  - Resume: internal/postmaster/wire\_type\_oid.go for the field values; optimizer exprType for the expression types.
+  - Resume: optimizer exprType and targetMeta \(compare parser.figureColnameInternal\); the catalog stub schemas.
+- [ ] **M0149-0001h1a42 — `trim(x)` without a keyword is a syntax error** (filed 2026-11-18 by M0149-0001h1a38)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select trim('a')` and `select trim(ch) from t` fail with `syntax error at or near ")"`; `trim(both from 'a')`
+    works. PG accepts both \(gram.y func\_expr\_common\_subexpr, trim\_list\) and maps the first to btrim.
+  - Read docs/design/not\_ralph/06\-goyacc\-parser\-playbook.md before changing the grammar.
+- [ ] **M0149-0001h1a43 — WRONG RESULTS: timestamp plus or minus an interval: a cast operand is rejected and the result prints `.000000`** (filed 2026-11-18 by M0149-0001h1a38; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - On a timestamp column: `ts + '1 s'::interval` and `ts - '1 s'::interval` fail with `operator + requires numeric
+    operands`; PG returns the timestamp.
+  - `ts + interval '1 s'` returns `2020-01-01 00:00:01.000000`; PG prints `2020-01-01 00:00:01`.
+  - Resume: the analyzer's BinaryOp operand check for a CastExpr to interval, and the result's output formatter.
+  > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a43: timestamp arithmetic prints a different value text
+  > Valid queries fail, and a result row differs from PG's output.
+- [ ] **M0149-0001h1a44 — regress polymorphism and plpgsql vary between runs on one build: `column "x" does not exist`** (filed 2026-11-18 by M0149-0001h1a38)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select x, pg_typeof(x), y, pg_typeof(y) from polyf(11, array[1, 2], 42, 34.5)`, where polyf has polymorphic
+    OUT parameters, sometimes fails. Four isolated runs of polymorphism on HEAD gave 683, 683, 683 and 677.
+  - Resume: reproduce in a loop and look for map iteration in the resolution of a function's OUT columns.
 - [x] **M0149-0001h1a12 — `'name'::regrole` returned the text unresolved; to\_regrole and the other to\_reg\* functions did not exist; `col::a::b` was labelled with the type name** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
   Kind: impl
   Parent: M0149-0001h1a

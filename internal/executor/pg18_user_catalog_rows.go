@@ -1306,6 +1306,14 @@ func buildUserPGAttributeRowsForIndex(cat catalog.Catalog, idx *catalog.Index) (
 	return rows, attnames
 }
 
+// TypeLengthForOID is pg_type.typlen for a built-in type; an OID it does not
+// know is reported as variable-length (-1). RowDescription carries it.
+func TypeLengthForOID(oid uint32) int16 { return userTypeAttrsForOID(oid).TypLen }
+
+// AttTypmodForOID is the atttypmod of a column of the built-in type oid declared
+// with args, or -1 when the declaration has no modifier.
+func AttTypmodForOID(oid uint32, args []int64) int32 { return int32(pgAttTypmod(oid, args)) }
+
 // pgAttTypmod computes the PG-canonical pg_attribute.atttypmod from a column's
 // declared type arguments (e.g. the (10,2) in numeric(10,2)). It mirrors the
 // per-type typmodin functions in PostgreSQL so that catalog clients — notably

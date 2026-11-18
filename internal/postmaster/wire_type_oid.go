@@ -4,15 +4,40 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/libpq"
 	"github.com/goopg/goopg/internal/parser"
 )
 
-// wireTypeOID is the type OID a RowDescription field carries for a result
-// column of type t: PG's SendRowDescriptionMessage (printtup.c) sends the
-// column's own pg_type OID, with a domain replaced by its base type
-// (getBaseTypeAndTypmod). Every RowDescription goes through here, so the
-// simple, extended and FETCH paths and Describe report the same type.
+// wireType is what a RowDescription field says about a result column's type.
+type wireType struct {
+	oid    uint32
+	length int16 // pg_type.typlen
+	typmod int32
+}
+
+// wireFieldDescription builds the RowDescription field of one result column:
+// PG's SendRowDescriptionMessage (printtup.c) sends the column's pg_type OID,
+// typlen and typmod, with a domain replaced by its base type and base typmod
+// (getBaseTypeAndTypmod). Every RowDescription goes through here, so the simple,
+// extended and FETCH paths and Describe report the same type.
+func wireFieldDescription(cat catalog.Catalog, dbOid uint32, name string, t catalog.Type) libpq.FieldDescription {
+	w := resolveWireType(cat, dbOid, t)
+	return libpq.FieldDescription{
+		Name:         name,
+		TypeOID:      w.oid,
+		TypeSize:     w.length,
+		TypeModifier: w.typmod,
+		Format:       0,
+	}
+}
+
+// wireTypeOID is the type OID of wireFieldDescription.
 func wireTypeOID(cat catalog.Catalog, dbOid uint32, t catalog.Type) uint32 {
+	return resolveWireType(cat, dbOid, t).oid
+}
+
+func resolveWireType(cat catalog.Catalog, dbOid uint32, t catalog.Type) wireType {
 	name := strings.ToLower(strings.TrimSpace(t.Name))
 	isArray := t.IsArray
 	if elem, ok := strings.CutSuffix(name, "[]"); ok {
@@ -23,18 +48,24 @@ func wireTypeOID(cat catalog.Catalog, dbOid uint32, t catalog.Type) uint32 {
 	elem := t
 	elem.Name = name
 
-	oid := typeOIDFor(elem)
 	if !isBuiltinWireTypeName(name) && cat != nil {
-		if uoid, arrayOID, ok := userWireTypeOIDs(cat, dbOid, name); ok {
+		if u, ok := userWireType(cat, dbOid, name); ok {
 			if isArray {
-				return arrayOID
+				return wireType{oid: u.arrayOID, length: -1, typmod: u.scalar.typmod}
 			}
-			return uoid
+			return u.scalar
 		}
 	}
+	oid := typeOIDFor(elem)
+	typmod := executor.AttTypmodForOID(oid, t.Args)
 	if !isArray {
-		return oid
+		return wireType{oid: oid, length: executor.TypeLengthForOID(oid), typmod: typmod}
 	}
+	return wireType{oid: builtinArrayWireOID(oid), length: -1, typmod: typmod}
+}
+
+// builtinArrayWireOID is the array type of a built-in element type.
+func builtinArrayWireOID(oid uint32) uint32 {
 	if arr := catalog.ArrayOIDForBase(oid); arr != 0 {
 		return arr
 	}
@@ -46,48 +77,58 @@ func wireTypeOID(cat catalog.Catalog, dbOid uint32, t catalog.Type) uint32 {
 	return catalog.OIDText
 }
 
-// userWireTypeOIDs resolves a user-defined type name to the OID a result
-// column of that type reports, and to the OID of its array type. The array of
-// a domain is a type of its own, so only the scalar form flattens to the base.
-func userWireTypeOIDs(cat catalog.Catalog, dbOid uint32, name string) (scalar, array uint32, ok bool) {
+// userWireInfo is a user-defined type as a result column reports it, and the
+// OID of its array type. The array of a domain is a type of its own, so only
+// the scalar form flattens to the base type.
+type userWireInfo struct {
+	scalar   wireType
+	arrayOID uint32
+}
+
+func userWireType(cat catalog.Catalog, dbOid uint32, name string) (userWireInfo, bool) {
 	var db []uint32
 	if dbOid != 0 {
 		db = []uint32{dbOid}
 	}
+	varlena := func(oid, array uint32) (userWireInfo, bool) {
+		return userWireInfo{wireType{oid: oid, length: -1, typmod: -1}, array}, true
+	}
 	if et, ok := cat.LookupEnum(name, db...); ok {
-		return et.OID, et.ArrayOID, true
+		return userWireInfo{wireType{oid: et.OID, length: 4, typmod: -1}, et.ArrayOID}, true
 	}
 	if d, ok := cat.LookupDomain(name, db...); ok {
-		return domainBaseWireOID(cat, dbOid, d), d.ArrayOID, true
+		return userWireInfo{domainBaseWireType(cat, dbOid, d), d.ArrayOID}, true
 	}
 	if ct := cat.LookupCompositeType(name, db...); ct != nil {
-		return ct.OID, ct.ArrayOID, true
+		return varlena(ct.OID, ct.ArrayOID)
 	}
 	if rt, ok := cat.LookupRangeType(name, db...); ok {
-		return rt.OID, rt.ArrayOID, true
+		return varlena(rt.OID, rt.ArrayOID)
 	}
 	if rt, ok := cat.LookupRangeTypeByMultirangeName(name); ok {
-		return rt.MultirangeOID, rt.MultirangeArrayOID, true
+		return varlena(rt.MultirangeOID, rt.MultirangeArrayOID)
 	}
 	if tbl, ok := cat.LookupTable(parser.ObjectName{Name: name}, db...); ok && tbl.RowTypeOID != 0 {
-		return tbl.RowTypeOID, tbl.RowTypeOID - 1, true
+		return varlena(tbl.RowTypeOID, tbl.RowTypeOID-1)
 	}
-	return 0, 0, false
+	return userWireInfo{}, false
 }
 
-// domainBaseWireOID follows a domain to its non-domain base type.
-func domainBaseWireOID(cat catalog.Catalog, dbOid uint32, d *catalog.Domain) uint32 {
+// domainBaseWireType follows a domain to its non-domain base type
+// and that type's declared typmod (getBaseTypeAndTypmod).
+func domainBaseWireType(cat catalog.Catalog, dbOid uint32, d *catalog.Domain) wireType {
 	for depth := 0; depth < 64; depth++ {
-		if d.BaseOID == 0 {
-			return wireTypeOID(cat, dbOid, d.Base)
+		if next, ok := cat.LookupDomainByOID(d.BaseOID); d.BaseOID != 0 && ok {
+			d = next
+			continue
 		}
-		next, ok := cat.LookupDomainByOID(d.BaseOID)
-		if !ok {
-			return d.BaseOID
+		w := resolveWireType(cat, dbOid, d.Base)
+		if d.BaseOID != 0 {
+			w.oid = d.BaseOID
 		}
-		d = next
+		return w
 	}
-	return catalog.OIDText
+	return wireType{oid: catalog.OIDText, length: -1, typmod: -1}
 }
 
 // builtinWireTypeOID resolves a lower-case type name the typeOIDFor switch does

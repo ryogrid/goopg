@@ -30,6 +30,8 @@ func (c *wireTypeCatalog) LookupDomain(name string, db ...uint32) (*catalog.Doma
 		return &catalog.Domain{OID: 16410, ArrayOID: 16411, Base: catalog.Type{Name: "int4"}}, true
 	case "posint2":
 		return &catalog.Domain{OID: 16412, ArrayOID: 16413, BaseOID: 16410}, true
+	case "shorttext":
+		return &catalog.Domain{OID: 16414, ArrayOID: 16415, Base: catalog.Type{Name: "varchar", Args: []int64{5}}}, true
 	}
 	return nil, false
 }
@@ -130,5 +132,42 @@ func TestWireTypeOID(t *testing.T) {
 	}
 	if got := wireTypeOID(nil, 0, catalog.Type{Name: "bytea"}); got != 17 {
 		t.Errorf("without a catalog bytea = %d, want 17", got)
+	}
+}
+
+// TestWireFieldDescription pins typlen and typmod against what PG 18.3 sends
+// for the same declarations (printtup.c: attlen and atttypmod).
+func TestWireFieldDescription(t *testing.T) {
+	cat := &wireTypeCatalog{}
+	for _, tc := range []struct {
+		typ    catalog.Type
+		oid    uint32
+		length int16
+		typmod int32
+	}{
+		{catalog.Type{Name: "int4"}, 23, 4, -1},
+		{catalog.Type{Name: "int8"}, 20, 8, -1},
+		{catalog.Type{Name: "bool"}, 16, 1, -1},
+		{catalog.Type{Name: "name"}, 19, 64, -1},
+		{catalog.Type{Name: "uuid"}, 2950, 16, -1},
+		{catalog.Type{Name: "text"}, 25, -1, -1},
+		{catalog.Type{Name: "varchar", Args: []int64{3}}, 1043, -1, 7},
+		{catalog.Type{Name: "char", Args: []int64{2}}, 1042, -1, 6},
+		{catalog.Type{Name: "numeric", Args: []int64{4, 1}}, 1700, -1, 262149},
+		{catalog.Type{Name: "timestamp", Args: []int64{2}}, 1114, 8, 2},
+		{catalog.Type{Name: "bit", Args: []int64{3}}, 1560, -1, 3},
+		// An array keeps the element's typmod and is variable-length.
+		{catalog.Type{Name: "varchar", IsArray: true, Args: []int64{3}}, 1015, -1, 7},
+		{catalog.Type{Name: "int4", IsArray: true}, 1007, -1, -1},
+		// User types.
+		{catalog.Type{Name: "mood"}, 16400, 4, -1},
+		{catalog.Type{Name: "pair"}, 16420, -1, -1},
+		{catalog.Type{Name: "posint"}, 23, 4, -1},
+		{catalog.Type{Name: "shorttext"}, 1043, -1, 9},
+	} {
+		f := wireFieldDescription(cat, 5, "c", tc.typ)
+		if f.TypeOID != tc.oid || f.TypeSize != tc.length || f.TypeModifier != tc.typmod {
+			t.Errorf("%+v: oid %d len %d typmod %d, want %d %d %d", tc.typ, f.TypeOID, f.TypeSize, f.TypeModifier, tc.oid, tc.length, tc.typmod)
+		}
 	}
 }

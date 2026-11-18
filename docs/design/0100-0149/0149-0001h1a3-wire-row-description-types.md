@@ -42,7 +42,28 @@ A protocol probe compared each column's reported type with PG 18.3 for about 60 
 column types and a set of expressions. Differences left are the planner's or the
 catalog stubs' types, not this layer's; they are filed as M0149\-0001h1a38.
 
+## Type length and typmod \(M0149\-0001h1a38\)
+
+`wireFieldDescription` sends the OID, typlen and typmod together. An array reports
+length \-1 and keeps its element's typmod; a domain reports its base type's values.
+
+The typmod comes from `catalog.Type.Args`, so the planner's `exprType` has to follow
+PG's `exprTypmod` \(`nodeFuncs.c`\):
+
+- a length\-coercing cast has the cast's typmod \(`castTypmodArgs` decodes
+  `encodeTypmod`; a bare interval precision is packed as `INTERVAL_TYPMOD(p, full range)`\);
+- min, max, sum, string\_agg, NULLIF, unary operators and rounding functions have none;
+- CASE, COALESCE, GREATEST and LEAST keep a typmod only when every input has it.
+
+`typeWithoutTypmod` renames `char` with arguments to `bpchar`, because `char` with no
+arguments means the one\-byte type.
+
+This also reaches column creation from a query, so views and CREATE TABLE AS keep the
+declared length, and EXPLAIN widths use it. Plan shapes did not change.
+
 ## Not covered
 
-`TypeSize` and `TypeModifier` are still sent as \-1, and the table OID and column
-number as 0 \(M0149\-0001h1a38\).
+- The table OID and column number are still 0 \(M0149\-0001h1a40\).
+- A domain's typmod is not stored, so it is neither reported nor enforced
+  \(M0149\-0001h1a39\).
+- The remaining result type and label differences are M0149\-0001h1a41.
