@@ -19224,8 +19224,11 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		// comparisons like col > 'yellow' compare labels alphabetically instead
 		// of by declaration order. M0097-enum-cmp.
 		switch x.Op {
+		case parser.OpContains, parser.OpContainedBy, parser.OpOverlap:
+			l, r = coerceDatetimeArrayOperands(l, r)
 		case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
 			l, r = coerceTimestampOperands(l, r)
+			l, r = coerceDatetimeArrayOperands(l, r)
 			lt, rt := exprType(l), exprType(r)
 			if strings.EqualFold(lt.Name, "name") && !strings.EqualFold(rt.Name, "name") && isTextLikePlannerType(rt.Name) {
 				r = &CastExpr{pos: x.Pos(), Operand: r, TargetType: "name"}

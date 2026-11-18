@@ -168,6 +168,16 @@ func encodeArrayElem(elemName, e string, varlena bool, ctx *Context, pos int) ([
 		// parseTimeString, timetz through parseTimeTZString). The widths the
 		// element table declares (4/8/8/8/12) are exactly what those arms
 		// return, which is what keeps the array body self-describing.
+		// date and the timestamps need the session's zone and DateStyle, which the
+		// scalar encoder's text arm does not see, so array_in's element input runs
+		// here when a session is at hand.
+		if ctx != nil && (lower == "date" || lower == "timestamp" || lower == "timestamptz") {
+			v, err := evalCast(NewStringDatum(e), lower, pos, ctx)
+			if err != nil {
+				return nil, err
+			}
+			return encodeValuePG(catalog.Type{Name: lower}, v)
+		}
 		return encodeValuePG(catalog.Type{Name: lower}, NewStringDatum(e))
 	case "money":
 		// Element sibling of encodeValuePG's money arm (8-byte Cash; reached

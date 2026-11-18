@@ -5961,6 +5961,8 @@ func formatTimeDatumDateStyle(d Datum, style, order, zone string) string {
 		return misc.FormatDate(d.TimeValue(), style, order)
 	case TimeSubTimestampTZ:
 		return misc.FormatTimestampTZ(d.TimeValue(), style, order, zone)
+	case TimeSubTimeTZ:
+		return timeTZText(d)
 	}
 	return misc.FormatTimestamp(d.TimeValue(), style, order)
 }
@@ -6047,6 +6049,15 @@ func CoerceParamToDeclaredType(d Datum, targetType string, ctx *Context) (Datum,
 func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) {
 	if d.IsNull() {
 		return NullDatum, nil
+	}
+	if d.Kind == KindString && strings.HasSuffix(targetType, "]") {
+		if elem, ok := datetimeArrayElem(targetType); ok {
+			text, err := normalizeDatetimeArray(d.StringValue(), elem, pos, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			return NewStringDatum(text), nil
+		}
 	}
 	switch strings.ToLower(targetType) {
 	case "bool", "boolean":
@@ -12906,6 +12917,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		// Used to evaluate ARRAY[e1, e2, ...] constructors. M0097-0042.
 		var sb strings.Builder
 		sb.WriteByte('{')
+		hasDatetime := false
 		for i, arg := range x.Args {
 			if i > 0 {
 				sb.WriteByte(',')
@@ -12914,6 +12926,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil {
 				return NullDatum, err
 			}
+			hasDatetime = hasDatetime || v.Kind == KindTime || v.Kind == KindInterval
 			switch {
 			case v.IsNull():
 				sb.WriteString("NULL")
@@ -12930,6 +12943,13 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			}
 		}
 		sb.WriteByte('}')
+		if hasDatetime {
+			text, err := normalizeConstructedDatetimeArray(x, sb.String(), ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			return NewStringDatum(text), nil
+		}
 		return NewStringDatum(sb.String()), nil
 
 	case "row":

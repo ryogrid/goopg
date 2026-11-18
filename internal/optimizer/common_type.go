@@ -390,6 +390,24 @@ func timestampLiteralIsReadable(v string) bool {
 	return v != "" && v[0] >= '0' && v[0] <= '9'
 }
 
+// coerceDatetimeArrayOperands casts a bare literal opposite a date or time array to
+// that array type, so its elements are read as the element type.
+func coerceDatetimeArrayOperands(l, r Expr) (Expr, Expr) {
+	cast := func(lit, other Expr) Expr {
+		s, ok := lit.(*StringConst)
+		t := exprType(other)
+		if !ok || !t.IsArray {
+			return lit
+		}
+		switch n := commonTypeCanonical(strings.TrimSuffix(t.Name, "[]")); n {
+		case "date", "time", "timetz", "timestamp", "timestamptz", "interval":
+			return &CastExpr{pos: s.Pos(), Operand: s, TargetType: n + "[]", SourceType: "unknown"}
+		}
+		return lit
+	}
+	return cast(l, r), cast(r, l)
+}
+
 // coerceTimestampOperands types a bare literal opposite a timestamp or timestamptz.
 func coerceTimestampOperands(l, r Expr) (Expr, Expr) {
 	if lr, ok := l.(*RowExpr); ok {

@@ -834,7 +834,9 @@ func ParseIntervalBodyWithDefault(body, defaultUnit string) (months, days int32,
 	if mo, d, mu, isInf := IntervalInfinitySentinel(body); isInf {
 		return mo, d, mu, true
 	}
-	if mo, d, mu, fok := decodeIntervalFields(body, defaultUnit); fok {
+	// ParseDateTime skips stray punctuation such as the `@` of the verbose output
+	// style, which may precede every field.
+	if mo, d, mu, fok := decodeIntervalFields(strings.ReplaceAll(body, "@", " "), defaultUnit); fok {
 		return mo, d, mu, true
 	}
 	// PostgreSQL feeds the ORIGINAL (untrimmed) string to DecodeISO8601Interval,

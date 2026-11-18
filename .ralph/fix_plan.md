@@ -12321,12 +12321,19 @@ verify each at HEAD when the task starts.
     Movement: yes — regress horology 2482→2480
   > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a63: timestamptz filters return different rows
   > WHERE clauses return different rows from PG 18.3 outside UTC. Found while checking generate\_series.
-- [ ] **M0149-0001h1a67 — WRONG RESULTS: timestamp array literals keep their text** (filed 2026-11-19 by M0149-0001h1a63; S2)
+- [x] **M0149-0001h1a67 — WRONG RESULTS: timestamp array literals keep their text** (filed 2026-11-19 by M0149-0001h1a63; S2)
   Kind: impl
   Parent: M0149-0001h1a
   - With `set timezone='America/New_York'`, `'{2020-07-01}'::timestamptz[]` prints `{2020-07-01}`; PG prints
     `{"2020-07-01 00:00:00-04"}`. `t = ANY ('{2020-07-01}'::timestamptz[])` misses the matching row.
   - Resume: the array input path must run each element through the element type's input function \(array\_in\).
+  - 2026\-11\-19 \(landed\):
+    - Casts to date, time, timetz, timestamp, timestamptz and interval arrays read and reprint every element, with PG's errors.
+    - ARRAY\[...\] and bare literals opposite such arrays do the same, and stored elements use the session zone.
+    - Interval input skips `@`, which is most of the interval movement.
+    - Regress, all 165 failed cases on HEAD and this build: 79373→79293 mismatch lines. plpgsql and polymorphism moved within
+      their known flake range.
+    Movement: yes — regress interval 756→662
   > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a67: timestamp arrays print and compare differently
   > Output and matched rows differ from PG 18.3. Found while checking timestamp literal comparison.
 - [ ] **M0149-0001h1a56 — most PG date and timestamp input spellings are rejected** (filed 2026-11-18 by M0149-0001h1a48e)
@@ -12339,6 +12346,7 @@ verify each at HEAD when the task starts.
     of the layout list in copy\_text.go.
   - When this lands, remove timestampLiteralIsReadable \(internal/optimizer/common\_type.go\), so every untyped literal opposite
     a timestamp is typed and a bad one raises PG's input error.
+  - `'10:00+05:30:15'::timetz` loses its offset; PG reads an offset with seconds.
 - [ ] **M0149-0001h1a55 — date and timestamp literal errors: caret and DateStyle hint** (filed 2026-11-18 by M0149-0001h1a48e)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12399,6 +12407,12 @@ verify each at HEAD when the task starts.
   - EXPLAIN has the same cause: it prints `'2020-01-01'::timestamp with time zone`, where PG prints the resolved
     `'2020-01-01 00:00:00-05'::timestamp with time zone`.
   - Resume: the planner needs the session TimeZone to fold these literals; views need their stored text rewritten.
+- [ ] **M0149-0001h1a69 — interval input rejects `ago`** (filed 2026-11-19 by M0149-0001h1a67)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `'3 mons ago'::interval` fails with `invalid input syntax`, and `interval '3 mons ago'` with a syntax error. PG gives `-3 mons`
+    \(DecodeInterval negates every field\).
+  - Resume: decodeIntervalFields in internal/parser/interval.go.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a
