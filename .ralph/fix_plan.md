@@ -12193,12 +12193,21 @@ verify each at HEAD when the task starts.
     - Measure horology after timestamp's sibling cases: alone it needs their tables and reads 2606.
     - Tests: TestTimeCarrierIsPGMicroseconds, TestHashPartitionWordIsStableForTimeValues.
     Movement: yes — regress uuid 21→18, horology 2576→2574, timestamp 1595→1594
-- [ ] **M0149-0001h1a48c — date and time arithmetic that overflows past 292 years** (filed 2026-11-18 by M0149-0001h1a48)
+- [x] **M0149-0001h1a48c — date and time arithmetic that overflows past 292 years** (filed 2026-11-18 by M0149-0001h1a48)
   Kind: impl
   Parent: M0149-0001h1a48
-  - Replace time.Time.Sub and time.Duration products with integer microseconds: copy\_binary.go, expr.go
-    \(addTimeInterval, timestamp difference, generate\_series steps\), operators\_ddl.go and operators\_upsert.go index
-    keys, operators\_indexonly.go decoding. Keys must stay byte\-compatible for values in today's range.
+  - 2026\-11\-18 \(landed\): timestamp and date differences, interval addition, binary COPY, index keys and index\-only
+    decoding work on the carrier, not on time.Duration. The planner's date folding was fixed too: `'2200\-01\-01'::date
+    \- '1700\-01\-01'::date` gave 106751, the 292\-year limit, and now gives 182621.
+    - Wrong results fixed: `'2020\-01\-31'::timestamp \+ '1 month'` gave March 2; PG's month\-end clamp is ported.
+    - `date_bin` returned NULL for a literal stride or one under a day. It is now a port of timestamp\_bin.
+    - Infinity is stored in timestamp and date index keys as PG stores it. An existing index holding infinity needs
+      REINDEX, because its entry was written under the old finite key.
+    - A probe of arithmetic, indexes, index\-only order, binary COPY and ON CONFLICT matches PG 18.3 except h1a51.
+    - Regress, all 165 failed cases on HEAD and this build, same list: 80393→80384 mismatch lines; alter\_generic,
+      plpgsql and polymorphism moved within their known variation.
+    - Tests: TestAddMonthsClamped, TestTimeArithmeticBeyondDurationRange, TestPGDaysOfDatum, TestDateBinFollowsTimestampBin.
+    Movement: yes — regress timestamp 1594→1580, interval 764→760, timestamptz 2223→2222
 - [ ] **M0149-0001h1a48d — BC and long\-year output in every formatter** (filed 2026-11-18 by M0149-0001h1a48)
   Kind: impl
   Parent: M0149-0001h1a48
@@ -12210,6 +12219,22 @@ verify each at HEAD when the task starts.
     and decoded values; then replace checkTimeCarrierRange's bounds \(copy\_text.go\).
   - Decide how to hold dates past 294276 AD, which PG allows up to 5874897 AD.
   - Afterwards re\-measure regress timestamp and timestamptz, whose column widths depend on these dates.
+- [ ] **M0149-0001h1a51 — WRONG RESULTS: timestamptz plus an interval ignores the session time zone and loses its type** (filed 2026-11-18 by M0149-0001h1a48c; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - With `set timezone='America/New_York'`, `'2020\-03\-07 12:00\-05'::timestamptz \+ '1 day'` should cross the DST change
+    and give `2020\-03\-08 12:00:00\-04`; goopg gives `2020\-03\-08 17:00:00`, adding in UTC and printing no zone.
+    `date\_bin` on timestamptz also prints no zone.
+  - PG: timestamptz\_pl\_interval \(timestamp.c\) does month and day steps in the session zone.
+  - Resume: addTimeInterval in expr.go needs the session zone and must keep TimeSubTimestampTZ; exprType for the result.
+  > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a51: timestamptz arithmetic gives a different instant across DST
+  > The returned instant differs from PG 18.3. Found while porting month arithmetic.
+- [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `create table a(x timestamp[]); insert ...; create index on a(x)` raises `column "x" is not a timestamp at runtime`;
+    `date[]` raises the matching error. PG builds both with array\_ops.
+  - Resume: the scalar arms of the key encoder in operators\_ddl.go are reached for array columns; compare btree\_array\_key.go.
 - [ ] **M0149-0001h1a50 — hash partitioning on date, timestamp and other non\-int4, non\-text keys does not use PG's hash** (filed 2026-11-18 by M0149-0001h1a48b)
   Kind: impl
   Parent: M0149-0001h1a

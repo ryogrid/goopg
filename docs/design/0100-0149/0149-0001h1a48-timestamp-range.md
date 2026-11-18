@@ -19,7 +19,7 @@ extremes, which are also PG's values.
 |---|---|---|
 | h1a48a | every unit\-dependent read goes through helpers in `datum.go` | done |
 | h1a48b | switch the unit and epoch, keeping today's accepted range | done |
-| h1a48c | replace `time.Duration` arithmetic that overflows past 292 years | open |
+| h1a48c | replace `time.Duration` arithmetic that overflows past 292 years | done |
 | h1a48d | BC and long\-year output in every formatter | open |
 | h1a48e | parse long years, apply PG's bounds and errors, range\-check results, open the gate | open |
 
@@ -51,15 +51,28 @@ Hash partitioning was the one persisted use of the raw value: its fallback hashe
 of `Int`. `hashPartitionFallbackWord` keeps the former nanosecond word for time values, so rows
 already stored stay in the partition a lookup computes. This is not PG's hash \(M0149\-0001h1a50\).
 
+## Slice h1a48c
+
+Differences, interval addition, binary COPY and index keys work on the carrier directly, so none
+of them passes through `time.Duration`, which ends at 292 years. Overflow raises PG's `timestamp out
+of range` or `interval out of range`.
+
+- **Months.** `timestamp_pl_interval` clamps to the last day of a shorter month; `time.AddDate`
+  carried into the next month, so January 31 plus one month was March 2. `addMonthsClamped` ports
+  the PG rule.
+- **`date_bin`.** Now a port of `timestamp_bin`: any stride of days and time, rounding toward
+  \-infinity, PG's errors, and an infinite source returned unchanged. It used to return NULL for a
+  stride given as a literal or shorter than a day.
+- **Index keys.** Timestamp keys are the carrier and date keys are PG's day count, so infinity is
+  stored as PG stores it and sorts after every finite value.
+
+An index built before this change holds infinity under its old finite key. Such an index needs
+`REINDEX` if the table contains `infinity` or `\-infinity` in an indexed date or timestamp column.
+
 ## Risks for later slices
 
 These come from reading the code and have not been executed.
 
-- `time.Time.Sub` saturates at about 292 years, and `time.Duration` multiplication wraps. Index key
-  encoders, binary COPY, date subtraction and interval addition use them.
-- Index keys for infinity are derived from the sentinel's `TimeValue`, so `TimeValue` must keep
-  returning the old instants for sentinels until those encoders are changed.
-- Index\-only decoding must remain the exact inverse of the key encoders.
 - `eraDisplay` rebuilds a date with the display year, which looks wrong for a BC leap day.
 - Dates after 294276 AD, which PG allows up to 5874897 AD, do not fit in microseconds. Slice h1a48e
   has to decide how to treat them.

@@ -303,6 +303,61 @@ func timeFromCarrier(carrier int64) time.Time {
 	return time.Unix(sec+pgEpochUnixSeconds, micros*1000).UTC()
 }
 
+// newTimestampDatumFromPGMicros is the timestamp or timestamptz Datum for a value
+// in PG's stored form. The infinity sentinels are the same numbers in both forms.
+func newTimestampDatumFromPGMicros(micros int64, withTimeZone bool) Datum {
+	if withTimeZone {
+		return Datum{Kind: KindTime, Int: micros, TimeSub: TimeSubTimestampTZ}
+	}
+	return Datum{Kind: KindTime, Int: micros}
+}
+
+// pgDateDayLimit bounds the days from 2000-01-01 that the carrier can hold.
+const pgDateDayLimit = int32(math.MaxInt64 / (86400 * timeCarrierUnitsPerSecond))
+
+// newDateDatumFromPGDays is the DATE Datum for PG's stored day count, with
+// PG_INT32_MAX and PG_INT32_MIN as infinity. ok is false for a finite day the
+// carrier cannot hold.
+func newDateDatumFromPGDays(days int32) (d Datum, ok bool) {
+	switch {
+	case days == math.MaxInt32:
+		return NewDateInfinity(true), true
+	case days == math.MinInt32:
+		return NewDateInfinity(false), true
+	case days > pgDateDayLimit || days < -pgDateDayLimit:
+		return Datum{}, false
+	}
+	return Datum{Kind: KindTime, Int: int64(days) * 86400 * timeCarrierUnitsPerSecond, TimeSub: TimeSubDate}, true
+}
+
+// pgDaysOfDatum is PG's stored day count for a date Datum, rounding a value that
+// carries a time of day down to its day.
+func pgDaysOfDatum(d Datum) int32 {
+	switch {
+	case d.IsTimestampPosInf():
+		return math.MaxInt32
+	case d.IsTimestampNegInf():
+		return math.MinInt32
+	}
+	perDay := 86400 * timeCarrierUnitsPerSecond
+	days := d.Int / perDay
+	if d.Int%perDay < 0 {
+		days--
+	}
+	return int32(days)
+}
+
+// addTimeCarrierMicros adds microseconds to a finite carrier value. ok is false
+// when the result overflows or lands on an infinity sentinel.
+func addTimeCarrierMicros(carrier, micros int64) (sum int64, ok bool) {
+	sum = carrier + micros
+	if (micros > 0 && sum < carrier) || (micros < 0 && sum > carrier) ||
+		sum == math.MaxInt64 || sum == math.MinInt64 {
+		return 0, false
+	}
+	return sum, true
+}
+
 // timeTZCompareKey is a timetz Datum's position in UTC, which timetz comparison
 // orders by. The offset lives in Scale, in minutes east of UTC.
 func timeTZCompareKey(d Datum) int64 {

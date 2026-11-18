@@ -5,7 +5,6 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
@@ -908,23 +907,25 @@ func decodeIndexKeyColumnStyled(key []byte, col catalog.Column, st array.OutputS
 			return NullDatum, 0, fmt.Errorf("btree: timestamp key truncated, got %d bytes", len(key))
 		}
 		v, err := nbtree.DecodeTimestamp(key[:8])
-		ts := pgEpoch.Add(time.Duration(v) * time.Microsecond)
 		// The key form is shared but the TYPE is not: an index-only scan answers
 		// the column from the key, so this datum reaches the user in place of the
 		// heap's, and must carry the same subtype the heap decode assigns
 		// (decodeValuePG, codec.go). M0119-0006 (41st slice).
-		if isTimestamptzType(typeName) {
-			return NewTimestampTZDatum(ts), 8, err
-		}
-		return NewTimeDatum(ts), 8, err
+		return newTimestampDatumFromPGMicros(v, isTimestamptzType(typeName)), 8, err
 	case isDateType(typeName):
 		// date is encoded as int4 days since the PG epoch. M0118-0001.
 		if len(key) < 4 {
 			return NullDatum, 0, fmt.Errorf("btree: date key truncated, got %d bytes", len(key))
 		}
 		v, err := nbtree.DecodeInt4(key[:4])
-		ts := pgEpoch.Add(time.Duration(v) * 24 * time.Hour)
-		return NewDateDatum(ts), 4, err
+		if err != nil {
+			return NullDatum, 0, err
+		}
+		d, ok := newDateDatumFromPGDays(v)
+		if !ok {
+			return NullDatum, 0, fmt.Errorf("btree: date key %d out of range", v)
+		}
+		return d, 4, nil
 	case isNumericType(typeName):
 		// NUMERIC keys are variable-length but self-delimiting, so the
 		// composite walk can consume exactly this column. Value-preserving,
@@ -1162,14 +1163,10 @@ func decodeBTreeKeyToDatumStyled(key []byte, col catalog.Column, st array.Output
 		if err != nil {
 			return NullDatum, err
 		}
-		ts := pgEpoch.Add(time.Duration(v) * time.Microsecond)
 		// Sibling of decodeIndexKeyColumn's arm above — both must tag, or the
 		// same column decodes one way in a single-column index-only scan and
 		// another way in a composite one. M0119-0006 (41st slice).
-		if isTimestamptzType(typeName) {
-			return NewTimestampTZDatum(ts), nil
-		}
-		return NewTimeDatum(ts), nil
+		return newTimestampDatumFromPGMicros(v, isTimestamptzType(typeName)), nil
 
 	case isDateType(typeName):
 		// date is encoded as int4 days since the PG epoch. M0118-0001.
@@ -1177,8 +1174,11 @@ func decodeBTreeKeyToDatumStyled(key []byte, col catalog.Column, st array.Output
 		if err != nil {
 			return NullDatum, err
 		}
-		ts := pgEpoch.Add(time.Duration(v) * 24 * time.Hour)
-		return NewDateDatum(ts), nil
+		d, ok := newDateDatumFromPGDays(v)
+		if !ok {
+			return NullDatum, fmt.Errorf("btree: date key %d out of range", v)
+		}
+		return d, nil
 
 	default:
 		// Unknown type: attempt float8 decode for user-defined enums. M0097-0022.

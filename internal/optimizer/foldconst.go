@@ -402,7 +402,8 @@ func tryFoldDateIntegerOp(pos int, op parser.OpCode, l, r Expr) Expr {
 			return asDate(t.AddDate(0, 0, days))
 		}
 		if t2, ok2 := dateLit(r); ok2 && op == parser.OpSub {
-			return &IntegerConst{pos: pos, Value: int64(t.Sub(t2) / (24 * time.Hour))}
+			// Whole seconds: time.Time.Sub saturates at 292 years.
+			return &IntegerConst{pos: pos, Value: (t.Unix() - t2.Unix()) / 86400}
 		}
 		return nil
 	}

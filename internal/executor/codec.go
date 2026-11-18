@@ -745,9 +745,7 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 		case d.IsTimestampNegInf():
 			days = math.MinInt32
 		default:
-			t := d.TimeValue()
-			micros := t.UnixMicro() - pgEpochUnixMicros
-			days = int32(micros / (24 * 3600 * 1000000))
+			days = pgDaysOfDatum(d)
 		}
 		var buf [4]byte
 		binary.LittleEndian.PutUint32(buf[:], uint32(days))
@@ -1255,16 +1253,6 @@ func varlenaTextBytes(s string) []byte {
 // pgEpochUnixMicros is 2000-01-01 UTC in Unix microseconds (used by
 // the PG timestamp encoding).
 var pgEpochUnixMicros = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro()
-
-// maxDateDaysForMicros / minDateDaysForMicros bound the days-since-2000 range
-// whose conversion to Unix microseconds still fits in int64. PG's date type
-// reaches far past this (5874897 AD); the sentinels aside, a date beyond the
-// bound cannot be represented as micros at all (review/260831-2 EC-5).
-const (
-	microsPerDay         = int64(24 * 3600 * 1000000)
-	maxDateDaysForMicros = int32((math.MaxInt64 - 946684800000000) / microsPerDay)
-	minDateDaysForMicros = int32((math.MinInt64 + 946684800000000) / microsPerDay)
-)
 
 // pgTimeMicros extracts the microseconds-since-midnight that PG's TimeADT holds
 // from the time.Time carrier of a `time`/`timetz` Datum.
@@ -1900,32 +1888,16 @@ func decodePhysicalPGValueLowered(t *catalog.Type, tname string, data []byte, sc
 			return Datum{}, 0, fmt.Errorf("truncated date")
 		}
 		days := int32(binary.LittleEndian.Uint32(data[:4]))
-		// PG's DATEVAL_NOEND / DATEVAL_NOBEGIN sentinels (PG_INT32_MAX /
-		// PG_INT32_MIN days) decode to the ±infinity DATE carrier; the epoch
-		// arithmetic below would overflow, so intercept first. (#5(d-iv))
-		switch days {
-		case math.MaxInt32:
-			return NewDateInfinity(true), 4, nil
-		case math.MinInt32:
-			return NewDateInfinity(false), 4, nil
-		}
-		// Outside the sentinels PG still spans 4714 BC .. 5874897 AD, and the
-		// micros arithmetic below overflows int64 well before that upper end
-		// (~year 294247), wrapping a far-future date into a garbage near-past
-		// one. goopg's own date input already refuses anything outside Go's
-		// time range, so this only guards a heap written by real PG — but
-		// silently decoding it wrong is worse than saying so
-		// (review/260831-2 EC-5).
-		if days > maxDateDaysForMicros || days < minDateDaysForMicros {
+		// PG's dates run to 5874897 AD, past what the carrier holds. goopg's own
+		// input refuses those, so this only guards a heap written by real PG, and
+		// decoding it wrongly would be worse than saying so (review/260831-2 EC-5).
+		// A storage-decoded date is tagged DATE so it renders like a date literal
+		// in type-agnostic paths. M0003 / 0003-0013.
+		d, ok := newDateDatumFromPGDays(days)
+		if !ok {
 			return Datum{}, 0, fmt.Errorf("date out of range: %d days from 2000-01-01", days)
 		}
-		micros := int64(days)*24*3600*1000000 + pgEpochUnixMicros
-		// Tag as DATE (TimeSubDate) so a storage-decoded date renders identically
-		// to a date literal in type-agnostic paths (Datum.Format(): text casts,
-		// string concat, array/composite element rendering). The wire path
-		// (server dispatch) re-derives date formatting from the column type and
-		// is unaffected. M0003 / 0003-0013 KindDate carrier gap.
-		return NewDateDatum(time.UnixMicro(micros).UTC()), 4, nil
+		return d, 4, nil
 	case "time":
 		if len(data) < 8 {
 			return Datum{}, 0, fmt.Errorf("truncated time")

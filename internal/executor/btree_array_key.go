@@ -338,11 +338,7 @@ func arrayKeyElemRendererPGImage(name string, st array.OutputStyle) func(Datum) 
 	switch {
 	case isDateType(name):
 		return func(d Datum) (string, error) {
-			// Seconds, not micros: a date's key covers PG's full 4714 BC ..
-			// 5874897 AD range, whose microsecond count overflows int64. The
-			// decode built the time as pgEpoch + n*24h, so the division is exact.
-			days := (d.TimeValue().UTC().Unix() - pgEpochUnixMicros/1_000_000) / 86400
-			return quoteArrayTextElem(array.FormatDateElem(int32(days), st)), nil
+			return quoteArrayTextElem(array.FormatDateElem(pgDaysOfDatum(d), st)), nil
 		}
 	case isTimeOfDayType(name):
 		return func(d Datum) (string, error) {
@@ -365,10 +361,9 @@ func arrayKeyElemRendererPGImage(name string, st array.OutputStyle) func(Datum) 
 }
 
 // pgTimestampMicrosOfDatum is the timestamp/timestamptz heap image (int64
-// microseconds since the PG epoch) of a KindTime datum — the inverse of the
-// `pgEpoch.Add(micros)` the key decoder applies.
+// microseconds since the PG epoch) of a KindTime datum, which is its carrier.
 func pgTimestampMicrosOfDatum(d Datum) int64 {
-	return d.TimeValue().UTC().UnixMicro() - pgEpochUnixMicros
+	return d.Int
 }
 
 // arrayLiteralHasNestedBrace reports whether the INNER text of an array

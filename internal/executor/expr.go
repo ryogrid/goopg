@@ -3722,11 +3722,35 @@ func addTimeInterval(t, iv Datum, subtract bool, pos int) (Datum, error) {
 		days = -days
 		micros = -micros
 	}
-	res := t.TimeValue().AddDate(0, months, days)
-	if micros != 0 {
-		res = res.Add(time.Duration(micros) * time.Microsecond)
+	res := addMonthsClamped(t.TimeValue(), months).AddDate(0, 0, days)
+	carrier, ok := addTimeCarrierMicros(timeToCarrier(res), micros)
+	if !ok {
+		return NullDatum, timestampOutOfRange(pos)
 	}
-	return NewTimeDatum(res), nil
+	return Datum{Kind: KindTime, Int: carrier}, nil
+}
+
+// addMonthsClamped adds months as timestamp_pl_interval does: when the target
+// month is shorter, the day becomes that month's last day, so January 31 plus one
+// month is the end of February. time.AddDate would carry into March.
+func addMonthsClamped(t time.Time, months int) time.Time {
+	if months == 0 {
+		return t
+	}
+	year, month, day := t.Date()
+	total := year*12 + int(month) - 1 + months
+	newYear := total / 12
+	newMonth := total % 12
+	if newMonth < 0 {
+		newMonth += 12
+		newYear--
+	}
+	last := time.Date(newYear, time.Month(newMonth+2), 0, 0, 0, 0, 0, time.UTC).Day()
+	if day > last {
+		day = last
+	}
+	hour, minute, sec := t.Clock()
+	return time.Date(newYear, time.Month(newMonth+1), day, hour, minute, sec, t.Nanosecond(), time.UTC)
 }
 
 // timestampOutOfRange is PG's error for a non-representable timestamp result
@@ -3773,8 +3797,7 @@ func subDateDate(left, right Datum, pos int) (Datum, error) {
 	if left.IsTimestampNotFinite() || right.IsTimestampNotFinite() {
 		return Datum{}, &ExecError{Code: "22008", Pos: pos, Message: "cannot subtract infinite dates"}
 	}
-	diff := left.TimeValue().Sub(right.TimeValue())
-	return Datum{Kind: KindInt, Int: int64(diff / (24 * time.Hour))}, nil
+	return Datum{Kind: KindInt, Int: int64(pgDaysOfDatum(left)) - int64(pgDaysOfDatum(right))}, nil
 }
 
 func subTimeTime(left, right Datum, pos int) (Datum, error) {
@@ -3796,8 +3819,10 @@ func subTimeTime(left, right Datum, pos int) (Datum, error) {
 			return NewIntervalInfinity(false), nil
 		}
 	}
-	diff := left.TimeValue().Sub(right.TimeValue()) // time.Duration (ns)
-	micros := int64(diff / time.Microsecond)
+	micros := left.Int - right.Int
+	if (right.Int < 0 && micros < left.Int) || (right.Int > 0 && micros > left.Int) {
+		return Datum{}, intervalOutOfRange(pos)
+	}
 	days := micros / usecsPerDay
 	micros -= days * usecsPerDay
 	return NewIntervalDatumFull(0, int32(days), micros), nil
@@ -10225,32 +10250,63 @@ func evalDateBin(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, err
 	if len(x.Args) < 3 {
 		return NullDatum, nil
 	}
-	stepArg, err := evalExprSlot(x.Args[0], slot, ctx)
-	if err != nil || stepArg.IsNull() || stepArg.Kind != KindInterval {
+	args := [3]Datum{}
+	for i, target := range [3]string{"interval", "timestamp", "timestamp"} {
+		v, err := evalExprSlot(x.Args[i], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if v.IsNull() {
+			return NullDatum, nil
+		}
+		if v.Kind == KindString {
+			if v, err = evalCast(v, target, x.Pos(), ctx); err != nil {
+				return Datum{}, err
+			}
+		}
+		args[i] = v
+	}
+	stride, source, origin := args[0], args[1], args[2]
+	if stride.Kind != KindInterval || source.Kind != KindTime || origin.Kind != KindTime {
 		return NullDatum, nil
 	}
-	srcArg, err := evalExprSlot(x.Args[1], slot, ctx)
-	if err != nil || srcArg.IsNull() || srcArg.Kind != KindTime {
-		return NullDatum, nil
+	outOfRange := func(msg string) (Datum, error) {
+		return Datum{}, &ExecError{Code: "22008", Message: msg}
 	}
-	originArg, err := evalExprSlot(x.Args[2], slot, ctx)
-	if err != nil || originArg.IsNull() || originArg.Kind != KindTime {
-		return NullDatum, nil
+	// timestamp_bin (timestamp.c).
+	if source.IsTimestampNotFinite() {
+		return source, nil
 	}
-	// Convert interval step to duration (days only for v0).
-	stepDays := int64(stepArg.IntervalDaysValue())
-	if stepDays == 0 {
-		return NullDatum, nil
+	if origin.IsTimestampNotFinite() {
+		return outOfRange("origin out of range")
 	}
-	stepDur := time.Duration(stepDays) * 24 * time.Hour
-	src := srcArg.TimeValue().UTC()
-	origin := originArg.TimeValue().UTC()
-	diff := src.Sub(origin)
-	bucket := (diff / stepDur) * stepDur
-	if diff < 0 {
-		bucket = ((diff - stepDur + 1) / stepDur) * stepDur
+	if stride.IsIntervalNoBegin() || stride.IsIntervalNoEnd() {
+		return outOfRange("timestamps cannot be binned into infinite intervals")
 	}
-	return NewTimeDatum(origin.Add(bucket)), nil
+	if stride.IntervalMonthsValue() != 0 {
+		return Datum{}, &ExecError{Code: "0A000",
+			Message: "timestamps cannot be binned into intervals containing months or years"}
+	}
+	strideMicros := int64(stride.IntervalDaysValue())*usecsPerDay + stride.IntervalMicrosValue()
+	if strideMicros <= 0 {
+		return outOfRange("stride must be greater than zero")
+	}
+	diff := source.Int - origin.Int
+	if (origin.Int < 0 && diff < source.Int) || (origin.Int > 0 && diff > source.Int) {
+		return outOfRange("interval out of range")
+	}
+	modulo := diff % strideMicros
+	result := origin.Int + diff - modulo
+	if modulo < 0 {
+		// Round toward -infinity, which can leave the range.
+		var ok bool
+		if result, ok = addTimeCarrierMicros(result, -strideMicros); !ok {
+			return outOfRange("timestamp out of range")
+		}
+	}
+	binned := source
+	binned.Int = result
+	return binned, nil
 }
 
 // parseIntervalCastString parses a runtime interval-cast string (the

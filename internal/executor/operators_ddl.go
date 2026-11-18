@@ -16438,8 +16438,7 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 		if v.Kind != KindTime {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a timestamp at runtime", col.Name)}
 		}
-		micros := v.TimeValue().Sub(pgEpoch).Microseconds()
-		return nbtree.EncodeTimestamp(micros), nil
+		return nbtree.EncodeTimestamp(v.Int), nil
 	case isDateType(col.Type.Name):
 		// date stored as int32 days since the PG epoch (2000-01-01); encode via
 		// the order-preserving int4 path. Mirrors the codec date encoding so a
@@ -16447,9 +16446,7 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 		if v.Kind != KindTime {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a date at runtime", col.Name)}
 		}
-		micros := v.TimeValue().UnixMicro() - pgEpochUnixMicros
-		days := int32(micros / (24 * 3600 * 1000000))
-		return nbtree.EncodeInt4(days), nil
+		return nbtree.EncodeInt4(pgDaysOfDatum(v)), nil
 	case strings.ToLower(col.Type.Name) == "uuid":
 		// uuid stored as canonical lowercase-dashes text; sort order matches byte order.
 		if v.Kind != KindString {

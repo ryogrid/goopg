@@ -9,7 +9,6 @@ import (
 	"math"
 	"math/big"
 	"strings"
-	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/utils/adt/fixedgeo"
@@ -337,7 +336,7 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 			binary.BigEndian.PutUint64(b, uint64(sentinel))
 			return b, nil
 		}
-		return encodeTimestampBinary(d.TimeValue().UTC()), nil
+		return encodeTimestampBinary(d.Int), nil
 	case "time", "time without time zone":
 		// M0119-0006 (51st slice): before this arm `time` fell through to the
 		// default and shipped Datum.Format()'s TEXT under FORMAT binary — a
@@ -381,10 +380,8 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 			binary.BigEndian.PutUint32(b, uint32(sentinel))
 			return b, nil
 		}
-		epoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
-		days := int32(d.TimeValue().UTC().Truncate(24*time.Hour).Sub(epoch).Hours() / 24)
 		b := make([]byte, 4)
-		binary.BigEndian.PutUint32(b, uint32(days))
+		binary.BigEndian.PutUint32(b, uint32(pgDaysOfDatum(d)))
 		return b, nil
 	case "interval":
 		// M0119-0006 (55th slice): before this arm an `interval` column fell
@@ -598,26 +595,12 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 			return Datum{}, fmt.Errorf("timestamp: expected 8 bytes, got %d", len(payload))
 		}
 		usec := int64(binary.BigEndian.Uint64(payload))
-		// Decode twin of the encode intercept: timestamp_recv accepts
-		// DT_NOEND / DT_NOBEGIN unchanged, and the epoch arithmetic below
-		// would overflow on them. (review/260831-2 EC-7)
-		switch usec {
-		case math.MaxInt64:
-			return NewTimestampInfinity(true), nil
-		case math.MinInt64:
-			return NewTimestampInfinity(false), nil
-		}
-		ts := pgEpoch.Add(time.Duration(usec) * time.Microsecond)
-		// M0119-0006 (41st slice): the column type is in reach here, so this
-		// decoder owes the same subtype tag the heap decode already applies
-		// (decodePhysicalPGValueMctx, codec.go) — otherwise a value that entered through
-		// binary COPY renders differently from the identical value that entered
-		// through INSERT, in every type-agnostic path (Datum.Format(),
-		// CAST-to-text, string concat, FK-violation DETAIL). Hard-won Rule #2.
-		if isTimestampTZTypeName(t.Name) {
-			return NewTimestampTZDatum(ts), nil
-		}
-		return NewTimeDatum(ts), nil
+		// The wire value is the carrier, DT_NOEND / DT_NOBEGIN included
+		// (timestamp_recv accepts them unchanged; review/260831-2 EC-7). The
+		// column type picks the subtype tag, as the heap decode does, so a value
+		// from binary COPY renders like the same value from INSERT in every
+		// type-agnostic path. M0119-0006 (41st slice), Hard-won Rule #2.
+		return newTimestampDatumFromPGMicros(usec, isTimestampTZTypeName(t.Name)), nil
 	case "time", "time without time zone":
 		// Decode twin of the "time" arm in datumToCopyBinary. Upstream time_recv
 		// range-checks the received TimeADT against [0, USECS_PER_DAY] — the
@@ -657,16 +640,13 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 			return Datum{}, fmt.Errorf("date: expected 4 bytes, got %d", len(payload))
 		}
 		days := int32(binary.BigEndian.Uint32(payload))
-		// Decode twin of the encode intercept: date_recv accepts
-		// DATEVAL_NOEND / DATEVAL_NOBEGIN unchanged. (review/260831-2 EC-7)
-		switch days {
-		case math.MaxInt32:
-			return NewDateInfinity(true), nil
-		case math.MinInt32:
-			return NewDateInfinity(false), nil
+		// date_recv accepts DATEVAL_NOEND / DATEVAL_NOBEGIN unchanged.
+		// (review/260831-2 EC-7)
+		d, ok := newDateDatumFromPGDays(days)
+		if !ok {
+			return Datum{}, fmt.Errorf("date out of range: %d days from 2000-01-01", days)
 		}
-		d := pgEpoch.AddDate(0, 0, int(days))
-		return NewDateDatum(d), nil
+		return d, nil
 	case "interval":
 		// Decode twin of the "interval" encode arm. Upstream interval_recv
 		// (timestamp.c:997) is pq_getmsgint64(time) + pq_getmsgint(day) +
@@ -721,8 +701,7 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 	}
 }
 
-func encodeTimestampBinary(t time.Time) []byte {
-	usec := t.Sub(pgEpoch).Microseconds()
+func encodeTimestampBinary(usec int64) []byte {
 	b := make([]byte, 8)
 	binary.BigEndian.PutUint64(b, uint64(usec))
 	return b

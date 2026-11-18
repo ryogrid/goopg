@@ -1770,7 +1770,7 @@ func encodeArbiterExprKey(ctx *Context, v Datum, keyExpr optimizer.Expr, pos int
 	case KindNumeric:
 		return nbtree.EncodeNumericKey(numericMant(v), v.Scale)
 	case KindTime:
-		return nbtree.EncodeTimestamp(v.TimeValue().Sub(pgEpoch).Microseconds())
+		return nbtree.EncodeTimestamp(v.Int)
 	case KindBool:
 		if v.BoolValue() {
 			return nbtree.EncodeInt8(1)
