@@ -1778,10 +1778,10 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 		// timestamp - timestamp (returns interval upstream;
 		// scope-deferred until the type system).
 		if left.Kind == KindTime && right.Kind == KindInterval {
-			return addTimeInterval(left, right, op == parser.OpSub, pos)
+			return addTimeInterval(left, right, op == parser.OpSub, pos, ctx)
 		}
 		if op == parser.OpAdd && left.Kind == KindInterval && right.Kind == KindTime {
-			return addTimeInterval(right, left, false, pos)
+			return addTimeInterval(right, left, false, pos, ctx)
 		}
 		// timestamp − timestamp → interval; date − date → integer days.
 		// Mirrors upstream timestamp_mi / date_mi (timestamp.c / date.c):
@@ -3700,7 +3700,26 @@ func addDateTimeInt(dt, days Datum, subtract bool, pos int) (Datum, error) {
 // for the timestamp type and errors; a finite interval added to an already
 // infinite timestamp passes the timestamp through unchanged.
 // (unimplemented_feat #5(d-iv))
-func addTimeInterval(t, iv Datum, subtract bool, pos int) (Datum, error) {
+func addTimeInterval(t, iv Datum, subtract bool, pos int, ctx *Context) (Datum, error) {
+	zone := ""
+	if t.IsTimestampTZ() {
+		zone = timeZoneFromCtx(ctx)
+	}
+	return addTimeIntervalInZone(t, iv, subtract, pos, zone)
+}
+
+// addTimeIntervalInZone is timestamp_pl_interval, or for a timestamptz
+// timestamptz_pl_interval_internal with zone as attimezone.
+func addTimeIntervalInZone(t, iv Datum, subtract bool, pos int, zone string) (Datum, error) {
+	var sub TimeSubtype
+	if t.IsTimestampTZ() {
+		sub = TimeSubTimestampTZ
+	}
+	infinity := func(positive bool) (Datum, error) {
+		d := NewTimestampInfinity(positive)
+		d.TimeSub = sub
+		return d, nil
+	}
 	// timestamp_mi_interval negates the span first (interval_um_internal swaps
 	// the ±infinity sentinels), so fold subtract into the sentinel test.
 	spanNoBegin := iv.IsIntervalNoBegin() // interval == -infinity
@@ -3712,13 +3731,13 @@ func addTimeInterval(t, iv Datum, subtract bool, pos int) (Datum, error) {
 		if t.IsTimestampPosInf() {
 			return NullDatum, timestampOutOfRange(pos)
 		}
-		return NewTimestampInfinity(false), nil
+		return infinity(false)
 	}
 	if spanNoEnd { // span is +infinity
 		if t.IsTimestampNegInf() {
 			return NullDatum, timestampOutOfRange(pos)
 		}
-		return NewTimestampInfinity(true), nil
+		return infinity(true)
 	}
 	// Span is finite: an already-infinite timestamp passes through unchanged
 	// (TIMESTAMP_NOT_FINITE(timestamp) branch).
@@ -3733,7 +3752,12 @@ func addTimeInterval(t, iv Datum, subtract bool, pos int) (Datum, error) {
 		days = -days
 		micros = -micros
 	}
-	res := addMonthsClamped(t.TimeValue(), months).AddDate(0, 0, days)
+	var res time.Time
+	if t.IsTimestampTZ() {
+		res = addMonthsDaysInZone(t.TimeValue(), months, days, zone)
+	} else {
+		res = addMonthsClamped(t.TimeValue(), months).AddDate(0, 0, days)
+	}
 	if checkTimeCarrierRange(res) != nil {
 		return NullDatum, timestampOutOfRange(pos)
 	}
@@ -3741,7 +3765,81 @@ func addTimeInterval(t, iv Datum, subtract bool, pos int) (Datum, error) {
 	if !ok {
 		return NullDatum, timestampOutOfRange(pos)
 	}
-	return Datum{Kind: KindTime, Int: carrier}, nil
+	return Datum{Kind: KindTime, Int: carrier, TimeSub: sub}, nil
+}
+
+// evalDateAdd is date_add and date_subtract (timestamptz_pl_interval and
+// timestamptz_pl_interval_at_zone): timestamptz arithmetic in the session zone or
+// in the named one.
+func evalDateAdd(x *optimizer.FuncCall, subtract bool, slot SlotView, ctx *Context) (Datum, error) {
+	if len(x.Args) < 2 {
+		return NullDatum, nil
+	}
+	targets := [...]string{"timestamptz", "interval", "text"}
+	var args [3]Datum
+	for i := range x.Args {
+		if i == len(args) {
+			break
+		}
+		v, err := evalExprSlot(x.Args[i], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if v.IsNull() {
+			return NullDatum, nil
+		}
+		if i < 2 && (v.Kind == KindString || (i == 0 && !v.IsTimestampTZ())) {
+			if v, err = evalCast(v, targets[i], x.Pos(), ctx); err != nil {
+				return Datum{}, err
+			}
+		}
+		args[i] = v
+	}
+	zone := timeZoneFromCtx(ctx)
+	if len(x.Args) > 2 {
+		var err error
+		if zone, err = lookupTimeZoneName(args[2].StringValue()); err != nil {
+			return Datum{}, err
+		}
+	}
+	return addTimeIntervalInZone(args[0], args[1], subtract, x.Pos(), zone)
+}
+
+// lookupTimeZoneName is lookup_timezone: an abbreviation, which becomes a POSIX
+// fixed-offset zone, or a time zone name or POSIX specification.
+func lookupTimeZoneName(name string) (string, error) {
+	if offset, ok := tzAbbrevOffsets[strings.ToUpper(name)]; ok {
+		west := -offset
+		sign := "+"
+		if west < 0 {
+			sign, west = "-", -west
+		}
+		return fmt.Sprintf("<%s>%s%d:%02d:%02d", "tz", sign, west/3600, west%3600/60, west%60), nil
+	}
+	if !misc.ZoneKnown(name) {
+		return "", &ExecError{Code: "22023", Message: fmt.Sprintf("time zone %q not recognized", name)}
+	}
+	return name, nil
+}
+
+// addMonthsDaysInZone does the month and day steps of
+// timestamptz_pl_interval_internal: each works on the wall clock in zone and is
+// converted back on its own, which is how PG settles a time in a DST change.
+func addMonthsDaysInZone(t time.Time, months, days int, zone string) time.Time {
+	loc := misc.SessionLocation(zone)
+	wallClock := func(t time.Time) time.Time {
+		l := t.In(loc)
+		y, mo, d := l.Date()
+		hh, mi, ss := l.Clock()
+		return time.Date(y, mo, d, hh, mi, ss, l.Nanosecond(), time.UTC)
+	}
+	if months != 0 {
+		t = misc.TimestampToTimestampTZ(addMonthsClamped(wallClock(t), months), zone)
+	}
+	if days != 0 {
+		t = misc.TimestampToTimestampTZ(wallClock(t).AddDate(0, 0, days), zone)
+	}
+	return t
 }
 
 // addMonthsClamped adds months as timestamp_pl_interval does: when the target
@@ -6585,6 +6683,21 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		// a real instant), so leave them untouched — as are DATE and the two
 		// time-of-day subtypes, whose carriers mean something else (see
 		// NewTimeTZDatum's offset in Datum.Scale).
+		if d.IsDate() {
+			// date2timestamp is the same day at midnight; date2timestamptz is
+			// midnight in the session zone.
+			switch {
+			case d.IsTimestampNotFinite() && tz:
+				d.TimeSub = TimeSubTimestampTZ
+				return d, nil
+			case d.IsTimestampNotFinite():
+				d.TimeSub = TimeSubTimestamp
+				return d, nil
+			case tz:
+				return NewTimestampTZDatum(misc.TimestampToTimestampTZ(d.TimeValue(), timeZoneFromCtx(ctx))), nil
+			}
+			return NewTimeDatum(d.TimeValue()), nil
+		}
 		if d.Kind == KindTime &&
 			(d.TimeSub == TimeSubTimestamp || d.TimeSub == TimeSubTimestampTZ) &&
 			d.Int != math.MaxInt64 && d.Int != math.MinInt64 {
@@ -9588,7 +9701,7 @@ func evalDateBin(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, err
 		return NullDatum, nil
 	}
 	args := [3]Datum{}
-	for i, target := range [3]string{"interval", "timestamp", "timestamp"} {
+	for i := range args {
 		v, err := evalExprSlot(x.Args[i], slot, ctx)
 		if err != nil {
 			return Datum{}, err
@@ -9596,12 +9709,30 @@ func evalDateBin(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, err
 		if v.IsNull() {
 			return NullDatum, nil
 		}
-		if v.Kind == KindString {
-			if v, err = evalCast(v, target, x.Pos(), ctx); err != nil {
+		args[i] = v
+	}
+	if args[0].Kind == KindString {
+		var err error
+		if args[0], err = evalCast(args[0], "interval", x.Pos(), ctx); err != nil {
+			return Datum{}, err
+		}
+	}
+	// Function resolution: a timestamp argument selects the timestamp form unless
+	// the other is a timestamptz; otherwise the preferred type timestamptz wins,
+	// also for dates and unknown literals.
+	plain := func(d Datum) bool { return d.Kind == KindTime && !d.IsTimestampTZ() && !d.IsDate() }
+	target := "timestamptz"
+	if (plain(args[1]) || plain(args[2])) && !args[1].IsTimestampTZ() && !args[2].IsTimestampTZ() {
+		target = "timestamp"
+	}
+	for i := 1; i < 3; i++ {
+		if args[i].Kind == KindString || args[i].IsDate() || (target == "timestamptz" && !args[i].IsTimestampTZ()) {
+			v, err := evalCast(args[i], target, x.Pos(), ctx)
+			if err != nil {
 				return Datum{}, err
 			}
+			args[i] = v
 		}
-		args[i] = v
 	}
 	stride, source, origin := args[0], args[1], args[2]
 	if stride.Kind != KindInterval || source.Kind != KindTime || origin.Kind != KindTime {
@@ -12008,6 +12139,8 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		return evalJustify(name, x, slot, ctx)
 	case "date_bin":
 		return evalDateBin(x, slot, ctx)
+	case "date_add", "date_subtract":
+		return evalDateAdd(x, name == "date_subtract", slot, ctx)
 	case "set_config":
 		// set_config(setting_name, new_value, is_local) → text
 		// vacuumdb calls SELECT pg_catalog.set_config('search_path', '', false)
@@ -13068,7 +13201,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				return NullDatum, ivErr
 			}
 			if iv.Kind == KindInterval {
-				shifted, aerr := addTimeInterval(NewTimeDatum(ctx.Now), iv, false, x.Pos())
+				shifted, aerr := addTimeInterval(NewTimeDatum(ctx.Now), iv, false, x.Pos(), ctx)
 				if aerr != nil {
 					return NullDatum, aerr
 				}

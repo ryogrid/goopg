@@ -83,7 +83,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale,mismatch_l
 ,regress-sql,regress,postgres/src/test/regress/sql/hash_func.sql,failed,no,-,Attempted via pg-regress-runner; M0134-0128 — 447/317 diff lines before/after wiring the hashint2/4/8/oid/char/float4/float8/name/text/bpchar scalar hash-function pair + integer::bit(n) cast; ~18 composite/typed hash functions (hash_numeric/array/record/range/multirange/aclitem/macaddr[8]/inet/uuid/pg_lsn/time*/interval/timestamp/enum/jsonb/oidvector) still unimplemented,66,341
 ,regress-sql,regress,postgres/src/test/regress/sql/hash_index.sql,pass,yes,,Passes under TestPort_RegressSuite as of M0134-0017 (partial-index predicate proof); must stay passing,,
 ,regress-sql,regress,postgres/src/test/regress/sql/hash_part.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,,
-,regress-sql,regress,postgres/src/test/regress/sql/horology.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,2517,3593
+,regress-sql,regress,postgres/src/test/regress/sql/horology.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,2482,3593
 ,regress-sql,regress,postgres/src/test/regress/sql/identity.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,318,871
 ,regress-sql,regress,postgres/src/test/regress/sql/incremental_sort.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,184,1662
 ,regress-sql,regress,postgres/src/test/regress/sql/index_including.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,,
@@ -99,7 +99,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale,mismatch_l
 ,regress-sql,regress,postgres/src/test/regress/sql/int2.sql,pass,yes,-,Recovered 2026-05-24 by M0111-0005: encodeValuePG int2 arm emitted the bare 'smallint out of range' (int2pl arithmetic wording) on storage-encode of an out-of-range string literal; now mirrors int4 sibling and PostgreSQL int2in with the value-N-is-out-of-range-for-type-smallint wording,,
 ,regress-sql,regress,postgres/src/test/regress/sql/int4.sql,pass,yes,-,Recovered 2026-05-24 by M0097-0037 fast-path int2/int4 overflow fix (evalFastExpr omitted the overflow check); real cause was the M0107-0003 fast expression evaluator not the M0106-0010 codec,,
 ,regress-sql,regress,postgres/src/test/regress/sql/int8.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,,
-,regress-sql,regress,postgres/src/test/regress/sql/interval.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,760,2159
+,regress-sql,regress,postgres/src/test/regress/sql/interval.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,756,2159
 ,regress-sql,regress,postgres/src/test/regress/sql/join.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,2686,9403
 ,regress-sql,regress,postgres/src/test/regress/sql/join_hash.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,172,1092
 ,regress-sql,regress,postgres/src/test/regress/sql/json.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,1185,2356
@@ -202,8 +202,8 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale,mismatch_l
 ,regress-sql,regress,postgres/src/test/regress/sql/tidrangescan.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,71,265
 ,regress-sql,regress,postgres/src/test/regress/sql/tidscan.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,63,263
 ,regress-sql,regress,postgres/src/test/regress/sql/time.sql,pass,yes,-,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13),,
-,regress-sql,regress,postgres/src/test/regress/sql/timestamp.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,1438,2133
-,regress-sql,regress,postgres/src/test/regress/sql/timestamptz.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,2027,3131
+,regress-sql,regress,postgres/src/test/regress/sql/timestamp.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,1426,2133
+,regress-sql,regress,postgres/src/test/regress/sql/timestamptz.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,1999,3131
 ,regress-sql,regress,postgres/src/test/regress/sql/timetz.sql,pass,yes,-,TestPort_RegressSuite/timetz passes — M0097-0004: AT LOCAL/AT TIME ZONE/timezone()/timetz comparison/TABLE shorthand,,
 ,regress-sql,regress,postgres/src/test/regress/sql/transactions.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,257,1101
 ,regress-sql,regress,postgres/src/test/regress/sql/triggers.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,784,3488

@@ -124,7 +124,7 @@ func TestTimestampRangeBounds(t *testing.T) {
 		}
 	}
 	end := Datum{Kind: KindTime, Int: pgTimestampEnd - 1}
-	if _, err := addTimeInterval(end, NewIntervalDatumFull(0, 0, 1), false, 0); err == nil {
+	if _, err := addTimeInterval(end, NewIntervalDatumFull(0, 0, 1), false, 0, nil); err == nil {
 		t.Error("adding past the end of the range must fail")
 	}
 	last, _ := newDateDatumFromPGDays(pgDateEndDay - 1)
@@ -150,6 +150,45 @@ func TestTimestampInputErrorNamesTheType(t *testing.T) {
 		got := dateTimeInputError(err, timestampInputTypeName(tc.withZone), "x", 0)
 		if got.Code != "22007" || got.Message != tc.want {
 			t.Errorf("withZone=%v: %s %q, want 22007 %q", tc.withZone, got.Code, got.Message, tc.want)
+		}
+	}
+}
+
+// TestTimestamptzIntervalUsesTheZone pins results captured from PostgreSQL 18.3:
+// month and day steps work on the wall clock of the zone, so they cross DST
+// changes, and a time inside a change is settled as DetermineTimeZoneOffset does.
+func TestTimestamptzIntervalUsesTheZone(t *testing.T) {
+	const newYork = "America/New_York"
+	parse := func(s string) time.Time {
+		v, err := time.Parse("2006-01-02 15:04:05-07", s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	for _, tc := range []struct {
+		start        string
+		months, days int32
+		micros       int64
+		zone, want   string
+	}{
+		{"2020-03-07 12:00:00-05", 0, 1, 0, newYork, "2020-03-08 12:00:00-04"},
+		{"2020-03-07 12:00:00-05", 0, 0, 24 * 3600 * 1000000, newYork, "2020-03-08 13:00:00-04"},
+		{"2020-03-07 12:00:00-05", 1, 1, 3600 * 1000000, newYork, "2020-04-08 13:00:00-04"},
+		{"2020-03-07 02:30:00-05", 0, 1, 0, newYork, "2020-03-08 03:30:00-04"},
+		{"2020-10-31 01:30:00-04", 0, 1, 0, newYork, "2020-11-01 01:30:00-05"},
+		{"2020-02-08 02:30:00-05", 1, 0, 0, newYork, "2020-03-08 03:30:00-04"},
+		{"2020-01-31 12:00:00-05", 1, 0, 0, newYork, "2020-02-29 12:00:00-05"},
+		{"2022-10-30 00:00:00+01", 0, 1, 0, "Europe/Warsaw", "2022-10-30 20:00:00-04"},
+	} {
+		iv := NewIntervalDatumFull(tc.months, tc.days, tc.micros)
+		got, err := addTimeIntervalInZone(NewTimestampTZDatum(parse(tc.start)), iv, false, 0, tc.zone)
+		if err != nil {
+			t.Errorf("%s: %v", tc.start, err)
+			continue
+		}
+		if !got.IsTimestampTZ() || !got.TimeValue().Equal(parse(tc.want)) {
+			t.Errorf("%s + (%d,%d,%d) = %v, want %s", tc.start, tc.months, tc.days, tc.micros, got.TimeValue(), tc.want)
 		}
 	}
 }

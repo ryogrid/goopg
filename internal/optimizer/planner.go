@@ -17287,6 +17287,10 @@ func typeWithCommonTypmod(t catalog.Type, exprs []Expr) catalog.Type {
 	return t
 }
 
+func isTimestampResultName(name string) bool {
+	return strings.EqualFold(name, "timestamp") || strings.EqualFold(name, "timestamptz")
+}
+
 // ExprType is the SQL type of a planned expression, for executor functions whose
 // behaviour depends on the argument type PG resolved.
 func ExprType(e Expr) catalog.Type { return exprType(e) }
@@ -17335,6 +17339,8 @@ func exprType(e Expr) catalog.Type {
 		return catalog.Type{Name: "text"}
 	case *MergeWholeRowRef:
 		return catalog.Type{Name: "text"} // composite displayed as text
+	case *IntervalLit:
+		return catalog.Type{Name: "interval"}
 	case *TypedStringLit:
 		// Typed string literals carry their explicit type (e.g. int2 '2').
 		// Return it so downstream type inference (BinaryOp etc.) can use it.
@@ -17415,6 +17421,14 @@ func exprType(e Expr) catalog.Type {
 			}
 			if isDateTypeName(lt.Name) && isDateTypeName(rt.Name) && x.Op == parser.OpSub {
 				return catalog.Type{Name: "int4"}
+			}
+			// timestamp[tz] ± interval / interval + timestamp[tz] keep the
+			// timestamp type (timestamp_pl_interval, timestamptz_pl_interval).
+			if isTimestampResultName(lt.Name) && strings.EqualFold(rt.Name, "interval") && (x.Op == parser.OpAdd || x.Op == parser.OpSub) {
+				return catalog.Type{Name: strings.ToLower(lt.Name)}
+			}
+			if strings.EqualFold(lt.Name, "interval") && isTimestampResultName(rt.Name) && x.Op == parser.OpAdd {
+				return catalog.Type{Name: strings.ToLower(rt.Name)}
 			}
 			// date ± interval / interval + date → timestamp
 			// (date_pl_interval / date_mi_interval / interval_pl_date),
@@ -17871,7 +17885,23 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "point"}
 		case "uuid_extract_version":
 			return catalog.Type{Name: "int2"}
-		case "uuid_extract_timestamp":
+		case "uuid_extract_timestamp", "date_add", "date_subtract":
+			return catalog.Type{Name: "timestamptz"}
+		case "date_bin":
+			// A timestamp argument selects the timestamp form unless the other
+			// is a timestamptz; otherwise the preferred type timestamptz wins.
+			plain, zoned := false, false
+			for _, a := range x.Args[min(1, len(x.Args)):] {
+				switch strings.ToLower(exprType(a).Name) {
+				case "timestamp", "timestamp without time zone":
+					plain = true
+				case "timestamptz", "timestamp with time zone":
+					zoned = true
+				}
+			}
+			if plain && !zoned {
+				return catalog.Type{Name: "timestamp"}
+			}
 			return catalog.Type{Name: "timestamptz"}
 		case "gen_random_uuid", "uuidv4", "uuidv7":
 			return catalog.Type{Name: "uuid"}

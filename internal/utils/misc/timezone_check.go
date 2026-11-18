@@ -278,6 +278,16 @@ func ZoneLocation(zone string) *time.Location {
 	return sessionLocation(zone)
 }
 
+// ZoneKnown reports whether zone names a tz database zone or is a POSIX TZ
+// specification, which are the two forms ZoneLocation resolves.
+func ZoneKnown(zone string) bool {
+	if _, err := time.LoadLocation(zone); err == nil && zone != "" {
+		return true
+	}
+	_, ok := posixLocation(zone)
+	return ok
+}
+
 // posixLocation builds the zone a POSIX TZ string describes. Go's time
 // package already implements POSIX TZ rules for the footer of a TZif file,
 // so the location is a TZif v2 image with a single standard-time type, no

@@ -12254,7 +12254,7 @@ verify each at HEAD when the task starts.
     Movement: yes — regress numeric 1139→995, timestamp 1441→1438, timestamptz 2030→2027
   > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a53: to\_char prints a different number
   > The formatted value differs from PG 18.3. Found while checking the to\_char port.
-- [ ] **M0149-0001h1a51 — WRONG RESULTS: timestamptz plus an interval ignores the session time zone and loses its type** (filed 2026-11-18 by M0149-0001h1a48c; S2)
+- [x] **M0149-0001h1a51 — WRONG RESULTS: timestamptz plus an interval ignores the session time zone and loses its type** (filed 2026-11-18 by M0149-0001h1a48c; S2)
   Kind: impl
   Parent: M0149-0001h1a
   - With `set timezone='America/New_York'`, `'2020\-03\-07 12:00\-05'::timestamptz \+ '1 day'` should cross the DST change
@@ -12262,6 +12262,15 @@ verify each at HEAD when the task starts.
     `date\_bin` on timestamptz also prints no zone.
   - PG: timestamptz\_pl\_interval \(timestamp.c\) does month and day steps in the session zone.
   - Resume: addTimeInterval in expr.go needs the session zone and must keep TimeSubTimestampTZ; exprType for the result.
+  - 2026\-11\-19 \(landed\):
+    - Month and day steps work on the session zone's wall clock, each settled by the DST rule, and the result stays a
+      timestamptz.
+    - date\_add and date\_subtract exist, with the optional zone argument.
+    - date\_bin resolves between its timestamp and timestamptz forms as PG does; date::timestamptz is local midnight.
+    - exprType reports the result types, and interval for an interval literal.
+    - Regress, all 165 failed cases on HEAD and this build: 79726→79650 mismatch lines. plpgsql +3 is the known flake
+      \(`column "x" does not exist`\).
+    Movement: yes — regress timestamptz 2027→1999, horology 2517→2482, timestamp 1438→1426, interval 760→756
   > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a51: timestamptz arithmetic gives a different instant across DST
   > The returned instant differs from PG 18.3. Found while porting month arithmetic.
 - [ ] **M0149-0001h1a57 — WRONG RESULTS: later rows of a VALUES list keep their literal text instead of the column type** (filed 2026-11-18 by M0149-0001h1a53; S2)
@@ -12273,6 +12282,15 @@ verify each at HEAD when the task starts.
   - Resume: coerce each VALUES cell to the column type that transformValuesClause resolves \(select\_common\_type\).
   > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a57: VALUES rows are not converted to the column type
   > Values print and compare as text. Found while checking to\_char in regress numeric and timestamp.
+- [ ] **M0149-0001h1a60 — WRONG RESULTS: generate\_series over timestamps returns zeros or fails** (filed 2026-11-19 by M0149-0001h1a51; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select * from generate_series('2020-03-07 12:00'::timestamp, '2020-03-09 12:00', '1 day')` returns one row holding 0;
+    PG 18.3 returns three timestamps. The four\-argument timestamptz form fails with `generate_series requires 2 or 3 arguments`.
+  - PG: generate\_series\_timestamp and generate\_series\_timestamptz\_internal \(timestamp.c\).
+  - Resume: internal/executor/operators\_generate\_series.go, stepping with addTimeIntervalInZone.
+  > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a60: generate\_series over timestamps returns wrong rows
+  > The rows differ from PG 18.3. Found while checking timestamptz arithmetic.
 - [ ] **M0149-0001h1a56 — most PG date and timestamp input spellings are rejected** (filed 2026-11-18 by M0149-0001h1a48e)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12299,6 +12317,18 @@ verify each at HEAD when the task starts.
   Parent: M0149-0001h1a
   - `L`, `G`, `D` and `S` print the C locale's values. PG takes them from localeconv \(NUM\_prepare\_locale, PGLC\_localeconv\).
   - Resume: numProcess in internal/executor/to\_char\_number.go.
+- [ ] **M0149-0001h1a59 — time plus or minus an interval prints a date and has no result type** (filed 2026-11-19 by M0149-0001h1a51)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `'10:00'::time + '1 hour'::interval` prints `1970-01-01 11:00:00`, and pg\_typeof says unknown. PG prints `11:00:00` and wraps
+    at midnight \(time\_pl\_interval\).
+  - Cause: a time value is an ordinary KindTime Datum, because TimeSubTime is declared but not set.
+  - Resume: set TimeSubTime where time values are made, then handle it in addTimeIntervalInZone and exprType.
+- [ ] **M0149-0001h1a61 — date\_add matches time zone names case\-sensitively** (filed 2026-11-19 by M0149-0001h1a51)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG finds zone names without regard to case \(pg\_tzset\). lookupTimeZoneName uses time.LoadLocation, which follows the file
+    system. This comes from reading the code and has not been run.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a
