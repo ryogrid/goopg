@@ -266,14 +266,28 @@ const timeCarrierUnitsPerSecond int64 = 1_000_000
 // pgEpochUnixSeconds is 2000-01-01 00:00:00 UTC as a Unix time.
 const pgEpochUnixSeconds int64 = 946684800
 
-// The infinity sentinels convert to these instants, the ends of the former
-// nanosecond carrier. Code that has not been taught about infinity, index key
-// encoders among them, derives values from them, and a value converted to
-// time.Time and back must stay infinite.
-var (
-	timeCarrierPosInfInstant = time.Unix(0, math.MaxInt64).UTC()
-	timeCarrierNegInfInstant = time.Unix(0, math.MinInt64).UTC()
+// PG's timestamp range (datatype/timestamp.h): MIN_TIMESTAMP is 4714-11-24 BC and
+// END_TIMESTAMP, which is exclusive, is 294277-01-01. Dates use the same range
+// here; PG's dates run further, to 5874897 AD, but the carrier cannot hold them.
+const (
+	pgTimestampMin int64 = -211813488000000000
+	pgTimestampEnd int64 = 9223371331200000000
+	pgDateMinDay   int32 = -2451545
+	pgDateEndDay   int32 = 106751983
 )
+
+// The infinity sentinels convert to these instants, outside every finite value,
+// so time.Time comparisons order them correctly and a value converted to
+// time.Time and back stays infinite.
+var (
+	timeCarrierPosInfInstant = time.Date(300000, 1, 1, 0, 0, 0, 0, time.UTC)
+	timeCarrierNegInfInstant = time.Date(-5000, 1, 1, 0, 0, 0, 0, time.UTC)
+)
+
+// validTimestampCarrier is IS_VALID_TIMESTAMP for a finite carrier value.
+func validTimestampCarrier(carrier int64) bool {
+	return carrier >= pgTimestampMin && carrier < pgTimestampEnd
+}
 
 // timeToCarrier is the Int of a KindTime Datum holding t, truncated to the
 // microsecond.
@@ -313,9 +327,6 @@ func newTimestampDatumFromPGMicros(micros int64, withTimeZone bool) Datum {
 	return Datum{Kind: KindTime, Int: micros}
 }
 
-// pgDateDayLimit bounds the days from 2000-01-01 that the carrier can hold.
-const pgDateDayLimit = int32(math.MaxInt64 / (86400 * timeCarrierUnitsPerSecond))
-
 // newDateDatumFromPGDays is the DATE Datum for PG's stored day count, with
 // PG_INT32_MAX and PG_INT32_MIN as infinity. ok is false for a finite day the
 // carrier cannot hold.
@@ -325,7 +336,7 @@ func newDateDatumFromPGDays(days int32) (d Datum, ok bool) {
 		return NewDateInfinity(true), true
 	case days == math.MinInt32:
 		return NewDateInfinity(false), true
-	case days > pgDateDayLimit || days < -pgDateDayLimit:
+	case days < pgDateMinDay || days >= pgDateEndDay:
 		return Datum{}, false
 	}
 	return Datum{Kind: KindTime, Int: int64(days) * 86400 * timeCarrierUnitsPerSecond, TimeSub: TimeSubDate}, true
@@ -349,11 +360,10 @@ func pgDaysOfDatum(d Datum) int32 {
 }
 
 // addTimeCarrierMicros adds microseconds to a finite carrier value. ok is false
-// when the result overflows or lands on an infinity sentinel.
+// when the result is outside the timestamp range.
 func addTimeCarrierMicros(carrier, micros int64) (sum int64, ok bool) {
 	sum = carrier + micros
-	if (micros > 0 && sum < carrier) || (micros < 0 && sum > carrier) ||
-		sum == math.MaxInt64 || sum == math.MinInt64 {
+	if (micros > 0 && sum < carrier) || (micros < 0 && sum > carrier) || !validTimestampCarrier(sum) {
 		return 0, false
 	}
 	return sum, true

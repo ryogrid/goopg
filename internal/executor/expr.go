@@ -1063,7 +1063,13 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 				return evalCastTyped(NewStringDatum(MoneyText(v)), castTargetType, "text", x.Pos(), ctx)
 			}
 		}
-		result, err := evalCastTyped(v, castTargetType, x.SourceType, x.Pos(), ctx)
+		// A failing literal is reported at the literal, as PG does when it
+		// coerces the constant at parse time.
+		castPos := x.Pos()
+		if lit, isLit := x.Operand.(*optimizer.StringConst); isLit {
+			castPos = lit.Pos()
+		}
+		result, err := evalCastTyped(v, castTargetType, x.SourceType, castPos, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -3667,12 +3673,17 @@ func addDateTimeInt(dt, days Datum, subtract bool, pos int) (Datum, error) {
 	if dt.IsTimestampNotFinite() {
 		return NullDatum, timestampOutOfRange(pos)
 	}
-	t := dt.TimeValue()
-	n := int(days.Int)
+	n := days.Int
 	if subtract {
 		n = -n
 	}
-	return NewDateDatum(t.AddDate(0, 0, n)), nil
+	// date_pli / date_mii: the result must be a valid date.
+	sum := int64(pgDaysOfDatum(dt)) + n
+	if sum < int64(pgDateMinDay) || sum >= int64(pgDateEndDay) {
+		return NullDatum, &ExecError{Code: "22008", Message: "date out of range"}
+	}
+	result, _ := newDateDatumFromPGDays(int32(sum))
+	return result, nil
 }
 
 // addTimeInterval applies an interval to a time value. When
@@ -3723,6 +3734,9 @@ func addTimeInterval(t, iv Datum, subtract bool, pos int) (Datum, error) {
 		micros = -micros
 	}
 	res := addMonthsClamped(t.TimeValue(), months).AddDate(0, 0, days)
+	if checkTimeCarrierRange(res) != nil {
+		return NullDatum, timestampOutOfRange(pos)
+	}
 	carrier, ok := addTimeCarrierMicros(timeToCarrier(res), micros)
 	if !ok {
 		return NullDatum, timestampOutOfRange(pos)
@@ -5058,10 +5072,7 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		// would get the wrong instant.
 		t, usedSession, err := parsePGTimestampTextZoneSession(x.Value, tsZoneModeForType(x.Type), timeZoneFromCtx(ctx))
 		if err != nil {
-			if ee := dateTimeInputError(err, x.Type, x.Value, x.Pos()); ee.Code == "22008" {
-				return Datum{}, ee
-			}
-			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid timestamp %q", x.Value)}
+			return Datum{}, dateTimeInputError(err, timestampInputTypeName(isTimestampTZTypeName(x.Type)), x.Value, x.Pos())
 		}
 		if !usedSession {
 			x.CachedTime = t
@@ -6552,7 +6563,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			// not cache its result on a plan node.
 			ts, err := parseCopyTimestampZoneSession(d.StringValue(), tsZoneModeForType(targetType), timeZoneFromCtx(ctx))
 			if err != nil {
-				return Datum{}, dateTimeInputError(err, "timestamp", d.StringValue(), pos)
+				return Datum{}, dateTimeInputError(err, timestampInputTypeName(tz), d.StringValue(), pos)
 			}
 			if tz {
 				return NewTimestampTZDatum(ts), nil
@@ -8011,6 +8022,10 @@ func extractTimestampField(field string, t time.Time, pos int) (int64, error) {
 	// zone with .UTC(). A plain timestamp/date/time/timetz keeps its wall clock.
 	switch field {
 	case "year":
+		// There is no year 0: astronomical 0 is 1 BC, reported as -1.
+		if y := int64(t.Year()); y <= 0 {
+			return y - 1, nil
+		}
 		return int64(t.Year()), nil
 	case "month":
 		return int64(t.Month()), nil
@@ -8036,6 +8051,9 @@ func extractTimestampField(field string, t time.Time, pos int) (int64, error) {
 		return int64(week), nil
 	case "isoyear":
 		year, _ := t.ISOWeek()
+		if year <= 0 {
+			year-- // BC years, as for "year"
+		}
 		return int64(year), nil
 	case "isodow":
 		wd := t.Weekday()
@@ -8048,19 +8066,19 @@ func extractTimestampField(field string, t time.Time, pos int) (int64, error) {
 		if y >= 0 {
 			return y / 10, nil
 		}
-		return (y - 9) / 10, nil
+		return -((8 - (y - 1)) / 10), nil
 	case "century":
 		y := int64(t.Year())
 		if y > 0 {
 			return (y + 99) / 100, nil
 		}
-		return -((-y + 99) / 100), nil
+		return -((99 - (y - 1)) / 100), nil
 	case "millennium":
 		y := int64(t.Year())
 		if y > 0 {
 			return (y + 999) / 1000, nil
 		}
-		return -((-y + 999) / 1000), nil
+		return -((999 - (y - 1)) / 1000), nil
 	case "microseconds", "microsecond", "usec":
 		return int64(t.Second())*1_000_000 + int64(t.Nanosecond()/1000), nil
 	case "milliseconds", "millisecond", "msec":
@@ -8972,22 +8990,29 @@ func evalDateTrunc(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, e
 	case "year":
 		t = time.Date(t.Year(), 1, 1, 0, 0, 0, 0, t.Location())
 	case "decade":
-		y := (t.Year() / 10) * 10
+		// timestamp_trunc: BC years are astronomical here, so these count from
+		// the other side of year 0.
+		y := t.Year()
+		if y > 0 {
+			y = (y / 10) * 10
+		} else {
+			y = -((8 - (y - 1)) / 10) * 10
+		}
 		t = time.Date(y, 1, 1, 0, 0, 0, 0, t.Location())
 	case "century":
-		y := ((t.Year() - 1) / 100) * 100
-		if y < 0 {
-			y = ((t.Year()) / 100) * 100
+		y := t.Year()
+		if y > 0 {
+			y = ((y+99)/100)*100 - 99
 		} else {
-			y++
+			y = -((99-(y-1))/100)*100 + 1
 		}
 		t = time.Date(y, 1, 1, 0, 0, 0, 0, t.Location())
 	case "millennium":
-		y := ((t.Year() - 1) / 1000) * 1000
-		if y < 0 {
-			y = (t.Year() / 1000) * 1000
+		y := t.Year()
+		if y > 0 {
+			y = ((y+999)/1000)*1000 - 999
 		} else {
-			y++
+			y = -((999-(y-1))/1000)*1000 + 1
 		}
 		t = time.Date(y, 1, 1, 0, 0, 0, 0, t.Location())
 	}
@@ -10245,6 +10270,9 @@ func evalDateBin(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, err
 		if result, ok = addTimeCarrierMicros(result, -strideMicros); !ok {
 			return outOfRange("timestamp out of range")
 		}
+	}
+	if !validTimestampCarrier(result) {
+		return outOfRange("timestamp out of range")
 	}
 	binned := source
 	binned.Int = result

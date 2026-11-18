@@ -170,7 +170,7 @@ func pgHashUint32(k uint32) uint32 {
 // Unix nanoseconds, so rows already stored in hash partitions are still found.
 // PG hashes these types differently (M0149-0001h1a50).
 func hashPartitionFallbackWord(d Datum) uint32 {
-	if d.Kind == KindTime {
+	if d.Kind == KindTime && !d.IsTimestampNotFinite() {
 		return uint32(d.TimeValue().UnixNano())
 	}
 	return uint32(d.Int)

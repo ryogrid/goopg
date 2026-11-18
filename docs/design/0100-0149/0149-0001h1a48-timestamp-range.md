@@ -21,7 +21,7 @@ extremes, which are also PG's values.
 | h1a48b | switch the unit and epoch, keeping today's accepted range | done |
 | h1a48c | replace `time.Duration` arithmetic that overflows past 292 years | done |
 | h1a48d | BC and long\-year output in every formatter | done |
-| h1a48e | parse long years, apply PG's bounds and errors, range\-check results, open the gate | open |
+| h1a48e | parse long years, apply PG's bounds and errors, range\-check results, open the gate | done |
 
 The gate opens last, so a value that cannot be handled correctly is never accepted.
 
@@ -81,9 +81,28 @@ timestamptz is broken down in the session zone, and a date is midnight in that z
 resolves `to_char(date, text)` to the timestamptz form. Its tests compare with output captured from
 PG 18.3 for every pattern, on BC dates, BC leap days, five\-digit years and ordinary dates.
 
-## Risks for later slices
+## Slice h1a48e
 
-These come from reading the code and have not been executed.
+Input, binary COPY, interval and day arithmetic, and `date_bin` now share PG's bounds:
+`MIN_TIMESTAMP` is 4714\-11\-24 BC and `END_TIMESTAMP`, the first value past the range, is
+294277\-01\-01. A value outside them raises `timestamp out of range` or `date out of range` with
+SQLSTATE 22008.
 
-- Dates after 294276 AD, which PG allows up to 5874897 AD, do not fit in microseconds. Slice h1a48e
-  has to decide how to treat them.
+Go's layouts read only four\-digit, positive years, so input with a BC marker or a longer year is
+parsed with a proxy year and the real year is put back afterwards. The proxy is a leap year, so
+February 29 of a leap BC year stays valid.
+
+EXTRACT of year, decade, century and millennium and `date_trunc` of the last three use the
+`timestamp_part` and `timestamp_trunc` formulas for BC years. Selectivity reads far literals in whole
+seconds, because `UnixNano` overflows outside 1678 to 2261.
+
+A bad literal in `'x'::date` is reported at the string, as `coerce_type` does.
+
+## Not covered
+
+- Dates from 294277 to 5874897 AD are refused, because a date shares the microsecond carrier
+  \(M0149\-0001h1a54\).
+- `date 'x'` puts the caret on the type name, and the DateStyle hint is missing
+  \(M0149\-0001h1a55\).
+- Many valid input spellings are still rejected, because `DecodeDateTime` is not ported
+  \(M0149\-0001h1a56\).

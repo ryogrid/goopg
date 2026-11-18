@@ -42,10 +42,7 @@ func TestParsePGDateTextTextualMonth(t *testing.T) {
 	// The era suffix suppresses the 2-digit-year window, exactly as it does for
 	// the run-together numeric form ('1-May-02 BC' is 0002-05-01 BC to PG, not
 	// 2002-05-01 BC). That is asserted one layer down, in pgdatetime's
-	// TestNormalizeDateTimeInputTextualMonth: goopg's KindTime carrier is a
-	// nanosecond count, so no BC date survives checkTimeCarrierRange here
-	// regardless of how it was spelled (ledger: the ns->microsecond carrier
-	// move).
+	// TestNormalizeDateTimeInputTextualMonth.
 	for _, c := range cases {
 		got, err := parsePGDateText(c.lit)
 		if err != nil {

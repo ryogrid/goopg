@@ -12160,7 +12160,7 @@ verify each at HEAD when the task starts.
       fractional digits \(h1a47\).
     - Tests: TestTimestampPrecisionIsApplied, TestExprTypeTypmod.
     Movement: yes — regress window 1112→1082, interval 771→764
-- [ ] **M0149-0001h1a48 — timestamps outside 1677 to 2262 are rejected** (filed 2026-11-18 by M0149-0001h1a45)
+- [x] **M0149-0001h1a48 — timestamps outside 1677 to 2262 are rejected** (filed 2026-11-18 by M0149-0001h1a45)
   Kind: impl
   Parent: M0149-0001h1a
   - `'4714-11-23 23:59:59 BC'::timestamp` and `'0055-06-10 15:44:17.71393 BC'::timestamp` fail with `date/time value out
@@ -12170,6 +12170,8 @@ verify each at HEAD when the task starts.
   - This also sets the column width of most tables in regress timestamp and timestamptz.
   - Resume: carry timestamps as PG\-epoch microseconds in the Datum, then the parser, formatter and arithmetic.
   - 2026\-11\-18: sized and split into h1a48a to h1a48e; plan in docs/design/0100\-0149/0149\-0001h1a48\-timestamp\-range.md.
+  - 2026\-11\-18 \(closed\): all five slices landed. Timestamps run from 4714\-11\-24 BC to 294276 AD as in PG. Dates past
+    294276 AD moved to h1a54.
 - [x] **M0149-0001h1a48a — every use of the time carrier's unit goes through helpers in datum.go** (filed 2026-11-18 by M0149-0001h1a48)
   Kind: impl
   Parent: M0149-0001h1a48
@@ -12219,13 +12221,22 @@ verify each at HEAD when the task starts.
     - Tests compare with output captured from PG 18.3 for BC dates, BC leap days, five\-digit years and ordinary dates.
     - Regress, all 165 failed cases on HEAD and this build, same list: 80383→80111 mismatch lines, none worse.
     Movement: yes — regress timestamptz 2222→2060, timestamp 1580→1482, horology 2574→2566
-- [ ] **M0149-0001h1a48e — accept PG's full timestamp and date range** (filed 2026-11-18 by M0149-0001h1a48)
+- [x] **M0149-0001h1a48e — accept PG's full timestamp and date range** (filed 2026-11-18 by M0149-0001h1a48)
   Kind: impl
   Parent: M0149-0001h1a48
   - Parse years over four digits; enforce MIN\_TIMESTAMP and END\_TIMESTAMP with PG's errors; range\-check arithmetic
     and decoded values; then replace checkTimeCarrierRange's bounds \(copy\_text.go\).
   - Decide how to hold dates past 294276 AD, which PG allows up to 5874897 AD.
   - Afterwards re\-measure regress timestamp and timestamptz, whose column widths depend on these dates.
+  - 2026\-11\-18 \(landed\):
+    - Text, binary COPY, arithmetic and date\_bin use PG's bounds and errors: `timestamp out of range: "x"` and
+      `date out of range: "x"`, 22008. Years over four digits and BC years parse.
+    - EXTRACT and date\_trunc follow PG for BC years. A bad cast literal is reported at the literal, and
+      `'x'::timestamp` has PG's wording.
+    - Dates past 294276 AD stay refused, because they do not fit the carrier \(h1a54\).
+    - Regress, all 165 failed cases on HEAD and this build: 80106→79870 mismatch lines. polymorphism +2 is the known
+      flake \(`column "x" does not exist`, seen in plpgsql on the other build\).
+    Movement: yes — regress date 405→294, horology 2566→2517, timestamp 1482→1441, timestamptz 2060→2030
 - [ ] **M0149-0001h1a53 — WRONG RESULTS: to\_char on numbers truncates instead of rounding; to\_char\(interval\) is not ported** (filed 2026-11-18 by M0149-0001h1a48d; S2)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12245,6 +12256,27 @@ verify each at HEAD when the task starts.
   - Resume: addTimeInterval in expr.go needs the session zone and must keep TimeSubTimestampTZ; exprType for the result.
   > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a51: timestamptz arithmetic gives a different instant across DST
   > The returned instant differs from PG 18.3. Found while porting month arithmetic.
+- [ ] **M0149-0001h1a56 — most PG date and timestamp input spellings are rejected** (filed 2026-11-18 by M0149-0001h1a48e)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `'Feb 10 17:32:01 1997'`, `'Mon Feb 10 17:32:01 1997 PST'`, `'19970210 173201 PST'`, `'1997/02/10 17:32:01-0800'`,
+    `'1997-06-10 18:32:01 PDT'` and `'01-08-1999'` fail with `invalid input syntax`. PG accepts them.
+  - This is the largest remaining cause in regress timestamp \(58 errors\), timestamptz \(153\) and date \(54\).
+  - Resume: port ParseDateTime, DecodeDateTime and DecodeDate \(datetime.c\) with the zone abbreviation table, in place
+    of the layout list in copy\_text.go.
+- [ ] **M0149-0001h1a55 — date and timestamp literal errors: caret and DateStyle hint** (filed 2026-11-18 by M0149-0001h1a48e)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `date 'x'` and `timestamp 'x'` put the caret on the type name. PG puts it on the string \(makeStringConstCast\).
+    The position comes from the grammar \(NewTypedStringLit\).
+  - `'2020-13-01'::date` lacks PG's `HINT:  Perhaps you need a different "DateStyle" setting.`
+    \(DTERR\_MD\_FIELD\_OVERFLOW, DateTimeParseError\).
+- [ ] **M0149-0001h1a54 — dates from 294277 to 5874897 AD are rejected** (filed 2026-11-18 by M0149-0001h1a48e)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `'294276-12-31'::date + 1` and `date '294277-01-01'` fail with `date out of range`. PG accepts dates up to 5874897 AD.
+  - Cause: KindDate shares the KindTime carrier, microseconds since 2000, which ends at 294277 AD.
+  - Resume: hold a date as PG's day count, then the formatter, comparison, arithmetic and codec paths.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a

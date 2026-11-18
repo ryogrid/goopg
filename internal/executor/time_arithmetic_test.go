@@ -70,7 +70,7 @@ func TestPGDaysOfDatum(t *testing.T) {
 			t.Errorf("day %d came back as %d", days, got)
 		}
 	}
-	if _, ok := newDateDatumFromPGDays(pgDateDayLimit + 1); ok {
+	if _, ok := newDateDatumFromPGDays(pgDateEndDay); ok {
 		t.Error("a day the carrier cannot hold must be refused")
 	}
 	beforeMidnight := NewTimeDatum(time.Date(1999, 12, 31, 23, 0, 0, 0, time.UTC))
@@ -106,6 +106,50 @@ func TestDateBinFollowsTimestampBin(t *testing.T) {
 		ee, ok := err.(*ExecError)
 		if !ok || ee.Code != want {
 			t.Errorf("%s: error %v, want SQLSTATE %s", sql, err, want)
+		}
+	}
+}
+
+// TestTimestampRangeBounds pins PG's limits: 4714-11-24 BC is the first valid
+// timestamp and 294277-01-01 is the first one past the end.
+func TestTimestampRangeBounds(t *testing.T) {
+	for _, in := range []string{"4714-11-24 00:00:00 BC", "294276-12-31 23:59:59.999999", "12345-06-07 08:09:10"} {
+		if _, err := parseCopyTimestamp(in); err != nil {
+			t.Errorf("%q: %v", in, err)
+		}
+	}
+	for _, in := range []string{"4714-11-23 23:59:59 BC", "294277-01-01 00:00:00"} {
+		if _, err := parseCopyTimestamp(in); err == nil {
+			t.Errorf("%q must be out of range", in)
+		}
+	}
+	end := Datum{Kind: KindTime, Int: pgTimestampEnd - 1}
+	if _, err := addTimeInterval(end, NewIntervalDatumFull(0, 0, 1), false, 0); err == nil {
+		t.Error("adding past the end of the range must fail")
+	}
+	last, _ := newDateDatumFromPGDays(pgDateEndDay - 1)
+	if _, err := addDateTimeInt(last, NewIntDatum(1), false, 0); err == nil {
+		t.Error("adding a day past the last date must fail")
+	}
+	if !NewTimestampInfinity(true).TimeValue().After(timeFromCarrier(pgTimestampEnd - 1)) {
+		t.Error("infinity must sort after every finite instant")
+	}
+}
+
+// TestTimestampInputErrorNamesTheType pins the wording PG's timestamp_in and
+// timestamptz_in use for text they cannot read.
+func TestTimestampInputErrorNamesTheType(t *testing.T) {
+	for _, tc := range []struct {
+		withZone bool
+		want     string
+	}{
+		{false, `invalid input syntax for type timestamp: "x"`},
+		{true, `invalid input syntax for type timestamp with time zone: "x"`},
+	} {
+		_, err := parseCopyTimestamp("x")
+		got := dateTimeInputError(err, timestampInputTypeName(tc.withZone), "x", 0)
+		if got.Code != "22007" || got.Message != tc.want {
+			t.Errorf("withZone=%v: %s %q, want 22007 %q", tc.withZone, got.Code, got.Message, tc.want)
 		}
 	}
 }

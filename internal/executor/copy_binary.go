@@ -600,6 +600,9 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		// column type picks the subtype tag, as the heap decode does, so a value
 		// from binary COPY renders like the same value from INSERT in every
 		// type-agnostic path. M0119-0006 (41st slice), Hard-won Rule #2.
+		if usec != math.MaxInt64 && usec != math.MinInt64 && !validTimestampCarrier(usec) {
+			return Datum{}, &ExecError{Code: "22008", Message: "timestamp out of range"}
+		}
 		return newTimestampDatumFromPGMicros(usec, isTimestampTZTypeName(t.Name)), nil
 	case "time", "time without time zone":
 		// Decode twin of the "time" arm in datumToCopyBinary. Upstream time_recv
@@ -644,7 +647,7 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		// (review/260831-2 EC-7)
 		d, ok := newDateDatumFromPGDays(days)
 		if !ok {
-			return Datum{}, fmt.Errorf("date out of range: %d days from 2000-01-01", days)
+			return Datum{}, &ExecError{Code: "22008", Message: "date out of range"}
 		}
 		return d, nil
 	case "interval":

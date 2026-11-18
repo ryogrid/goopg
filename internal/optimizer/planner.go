@@ -19406,7 +19406,9 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		// runtime cast.
 		if lit, isStr := operand.(*StringConst); isStr && typmod == 0 {
 			if castTargetTakesStringLiteral(typeName) {
-				return &TypedStringLit{pos: x.Pos(), Type: typeName, Value: lit.Value}, nil
+				// coerce_type reports a bad literal at the literal, not at the
+				// "::" that follows it.
+				return &TypedStringLit{pos: lit.Pos(), Type: typeName, Value: lit.Value}, nil
 			}
 		}
 		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: srcType, Typmod: typmod, Explicit: true}, nil

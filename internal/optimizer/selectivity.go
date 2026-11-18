@@ -971,6 +971,10 @@ func numericValue(s, typeName string) (float64, bool) {
 			"2006-01-02",
 		} {
 			if t, err := time.Parse(layout, padISODateLiteral(s)); err == nil {
+				// UnixNano wraps outside 1678..2261, so a far date uses seconds.
+				if y := t.Year(); y < 1678 || y > 2261 {
+					return float64(t.Unix()), true
+				}
 				return float64(t.UnixNano()) / 1e9, true
 			}
 		}

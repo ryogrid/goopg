@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -1188,38 +1187,39 @@ func parsePGTimestampTextPartsSession(s string, zone tsZoneMode, sessionZone str
 				return adjusted, cand.carry, usedSession, nil
 			}
 		}
-		// M0119-0006 §15.2: the TIMESTAMP half of the BC leap-day race the
-		// preceding slice fixed for DATE. validateDateTokenFull above already
-		// accepted the date token against the ASTRONOMICAL year, but every
-		// layout here still runs time.Parse's own day-in-month check against
-		// the token's LITERAL year — so '0001-02-29 10:00:00 BC' (astronomical
-		// year 0, leap) matches nothing and reads as a syntax miss (22007)
-		// where PG answers a field-range error. Try the proxy-year rebuild
-		// before giving up on this candidate, so the hour-24 / leap-second
-		// canonical candidate still gets its own turn afterwards.
-		if ts, usedSession, ok := bcLeapTimestampFallback(cand.text, bc, zone, sessionZone); ok {
+		// M0119-0006 §15.2: validateDateTokenFull above already accepted the
+		// date token against the ASTRONOMICAL year, but every layout here runs
+		// time.Parse's own checks against the token's LITERAL year and takes
+		// exactly four digits, so '0001-02-29 10:00:00 BC' and
+		// '12345-01-01 10:00:00' match nothing. Try the proxy-year rebuild before
+		// giving up on this candidate, so the hour-24 / leap-second canonical
+		// candidate still gets its own turn afterwards.
+		if ts, usedSession, ok := proxyYearTimestampFallback(cand.text, bc, zone, sessionZone); ok {
 			return ts, cand.carry, usedSession, nil
 		}
 	}
 	return time.Time{}, 0, false, errNoTimestampLayout
 }
 
-// bcLeapProxyYear is the year bcLeapTimestampFallback substitutes into the date
+// proxyYear is the year proxyYearTimestampFallback substitutes into the date
 // token so the layout table can decode the TIME and ZONE fields around it. It
 // only has to be a year every validated month/day fits in — i.e. a leap one,
 // since Feb 29 is the whole point — and to be spelled with four digits, which
 // is what the layouts' "2006" element expects.
-const bcLeapProxyYear = 2000
+const proxyYear = 2000
 
-// bcLeapTimestampFallback is bcLeapDateFallback for a token that also carries a
-// time of day. The date half cannot be handed to time.Parse at its own year (see
-// the call site), but the time and zone halves must still be decoded by the
-// SAME layout table as every other input — hand-rolling a second time-of-day
-// parser here is exactly the divergence pgTimestampLayouts exists to prevent.
-// So the year is swapped for a leap proxy, the candidate is re-parsed through
-// the ordinary table, and the decoded wall clock is then rebuilt at the real
-// astronomical year (which also performs ApplyEra's era shift by hand, as the
-// DATE fallback does).
+// dateTokenNeedsProxyYear reports a date token time.Parse cannot read at its own
+// year: a BC date, whose literal year is not the astronomical one that decides
+// leap days, or a year longer than the four digits the layouts' "2006" takes.
+func dateTokenNeedsProxyYear(dateTok string, bc bool) bool {
+	return bc || len(dateTok) > len("2006-01-02")
+}
+
+// proxyYearTimestampFallback decodes a date token time.Parse cannot read at its
+// own year (dateTokenNeedsProxyYear). The time and zone halves must still be
+// decoded by the SAME layout table as every other input, so the year is swapped
+// for a leap proxy, the candidate is re-parsed through the ordinary table, and the
+// decoded wall clock is then rebuilt at the real astronomical year.
 //
 // The zone rule is applied to the PROXY value, not afterwards, because
 // tsApplyZone shifts the wall clock onto the UTC line and that shift can cross
@@ -1228,16 +1228,14 @@ const bcLeapProxyYear = 2000
 // rebuilt one, so the fallback and the ordinary path agree about which day the
 // value lands on.
 //
-// ok is false for everything this does not apply to: a non-BC input (whose
-// literal and astronomical years agree, so time.Parse never disagreed), a token
-// whose fields do not read back, the no-year-zero refusal, and any candidate
-// the proxy rebuild still fails to parse — all of which keep the caller's
-// existing errNoTimestampLayout.
-func bcLeapTimestampFallback(text string, bc bool, zone tsZoneMode, sessionZone string) (time.Time, bool, bool) {
-	if !bc {
+// ok is false for everything this does not apply to: a token whose fields do not
+// read back, the no-year-zero refusal, and any candidate the proxy rebuild still
+// fails to parse, all of which keep the caller's existing errNoTimestampLayout.
+func proxyYearTimestampFallback(text string, bc bool, zone tsZoneMode, sessionZone string) (time.Time, bool, bool) {
+	dateTok := dateTokenPrefix(text)
+	if !dateTokenNeedsProxyYear(dateTok, bc) {
 		return time.Time{}, false, false
 	}
-	dateTok := dateTokenPrefix(text)
 	month, day, mdok := datetime.DateTokenMonthDay(dateTok)
 	year, yok := datetime.DateTokenYear(dateTok)
 	if !mdok || !yok {
@@ -1247,7 +1245,7 @@ func bcLeapTimestampFallback(text string, bc bool, zone tsZoneMode, sessionZone 
 	if !ok {
 		return time.Time{}, false, false
 	}
-	probe := fmt.Sprintf("%04d-%02d-%02d", bcLeapProxyYear, month, day) + text[len(dateTok):]
+	probe := fmt.Sprintf("%04d-%02d-%02d", proxyYear, month, day) + text[len(dateTok):]
 	for _, layout := range pgTimestampLayouts {
 		ts, err := time.Parse(layout, probe)
 		if err != nil {
@@ -1255,7 +1253,7 @@ func bcLeapTimestampFallback(text string, bc bool, zone tsZoneMode, sessionZone 
 		}
 		ts, usedSession := applyTSZoneMode(ts, zone, sessionZone, layoutHasZoneField(layout))
 		dayShift := int(time.Date(ts.Year(), ts.Month(), ts.Day(), 0, 0, 0, 0, time.UTC).
-			Sub(time.Date(bcLeapProxyYear, time.Month(month), day, 0, 0, 0, 0, time.UTC)).Hours() / 24)
+			Sub(time.Date(proxyYear, time.Month(month), day, 0, 0, 0, 0, time.UTC)).Hours() / 24)
 		return time.Date(astroYear, time.Month(month), day,
 			ts.Hour(), ts.Minute(), ts.Second(), ts.Nanosecond(), time.UTC).
 			AddDate(0, 0, dayShift), usedSession, true
@@ -1283,44 +1281,33 @@ func dateTokenPrefix(s string) string {
 // token decoded but is out of range — which the caller must NOT paper over as a
 // syntax miss, since upstream answers 22008 for it.
 func canonicalizeTimestampTimeToken(body string) (string, int, error) {
-	if len(body) < 12 || body[4] != '-' || body[7] != '-' {
+	dateLen := len(dateTokenPrefix(body))
+	if dateLen < len("2006-01-02") || dateLen+2 > len(body) ||
+		body[dateLen-3] != '-' || body[dateLen-6] != '-' {
 		return "", 0, nil
 	}
-	if sep := body[10]; sep != ' ' && sep != 'T' {
+	if sep := body[dateLen]; sep != ' ' && sep != 'T' {
 		return "", 0, nil
 	}
-	canon, dayCarry, err := datetime.CanonicalizeTimeToken(body[11:])
+	canon, dayCarry, err := datetime.CanonicalizeTimeToken(body[dateLen+1:])
 	if err != nil {
 		return "", 0, err
 	}
-	return body[:11] + canon, dayCarry, nil
+	return body[:dateLen+1] + canon, dayCarry, nil
 }
 
-// goopg's KindTime Datum carries an int64 count of NANOSECONDS since 1970
-// (datum.go: NewTimeDatum / TimeValue), which is Go's UnixNano domain and spans
-// only 1677-09-21 .. 2262-04-11. PostgreSQL's timestamp is an int64 count of
-// MICROSECONDS since 2000-01-01, spanning 4713 BC .. 294276 AD, and its date is
-// an int32 day count over the same span.
-//
-// The mismatch was silent and produced WRONG ANSWERS, not errors: '1000-01-01'
-// wrapped to 2169-02-08 and '2300-01-01' to 1715-06-13, because UnixNano
-// overflows int64 outside its domain and Go leaves the wrapped value in place.
-// Until the carrier moves to microseconds (deferral ledger, M0119-0006 — it is
-// the same blocker that keeps a BC date from being STORED after this slice
-// taught the input path to READ one), every text-input entry point refuses what
-// it cannot represent, so an out-of-range date is a loud 22008 instead of a
-// plausible-looking different date.
+// timestampRangeMin and timestampRangeEnd bound the instants a timestamp or date
+// can hold (MIN_TIMESTAMP inclusive, END_TIMESTAMP exclusive; see datum.go).
 var (
-	timeCarrierMin = timeFromCarrier(math.MinInt64)
-	timeCarrierMax = timeFromCarrier(math.MaxInt64)
+	timestampRangeMin = timeFromCarrier(pgTimestampMin)
+	timestampRangeEnd = timeFromCarrier(pgTimestampEnd)
 
-	errTimeCarrierRange = errors.New("date/time value outside goopg's representable range")
+	errTimeCarrierRange = errors.New("date/time value out of range")
 )
 
-// checkTimeCarrierRange reports whether t survives a round trip through the
-// KindTime carrier. See the comment on timeCarrierMin above.
+// checkTimeCarrierRange reports whether t is inside the timestamp range.
 func checkTimeCarrierRange(t time.Time) error {
-	if t.Before(timeCarrierMin) || t.After(timeCarrierMax) {
+	if t.Before(timestampRangeMin) || !t.Before(timestampRangeEnd) {
 		return errTimeCarrierRange
 	}
 	return nil
@@ -1334,11 +1321,12 @@ func checkTimeCarrierRange(t time.Time) error {
 // goopg reported 22007 for both, which mislabels a range error as a typo.
 func dateTimeInputError(err error, typeName, input string, pos int) *ExecError {
 	if errors.Is(err, errTimeCarrierRange) {
+		kind := "timestamp"
+		if strings.EqualFold(typeName, "date") {
+			kind = "date"
+		}
 		return &ExecError{Code: "22008", Pos: pos,
-			Message: fmt.Sprintf("date/time value out of range for %s: %q "+
-				"(goopg stores %s between %s and %s)",
-				typeName, input, typeName,
-				timeCarrierMin.Format("2006-01-02"), timeCarrierMax.Format("2006-01-02"))}
+			Message: fmt.Sprintf("%s out of range: %q", kind, input)}
 	}
 	if errors.Is(err, datetime.ErrFieldOutOfRange) {
 		return &ExecError{Code: "22008", Pos: pos,
@@ -1346,6 +1334,14 @@ func dateTimeInputError(err error, typeName, input string, pos int) *ExecError {
 	}
 	return &ExecError{Code: "22007", Pos: pos,
 		Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, input)}
+}
+
+// timestampInputTypeName is the type name PG's input errors use.
+func timestampInputTypeName(withZone bool) string {
+	if withZone {
+		return "timestamp with time zone"
+	}
+	return "timestamp"
 }
 
 // parsePGDateText is the DATE-domain sibling of parsePGTimestampText: the same
@@ -1374,7 +1370,7 @@ func parsePGDateText(s string) (time.Time, error) {
 		// build the time.Time directly from the validated fields at the
 		// astronomical year, which sidesteps ApplyEra's own literal->
 		// astronomical shift (already done here) as well as its rejection.
-		if t2, ok := bcLeapDateFallback(norm, bc); ok {
+		if t2, ok := proxyYearDateFallback(norm, bc); ok {
 			return t2, checkTimeCarrierRange(t2)
 		}
 		return time.Time{}, err
@@ -1386,15 +1382,12 @@ func parsePGDateText(s string) (time.Time, error) {
 	return t, checkTimeCarrierRange(t)
 }
 
-// bcLeapDateFallback reconstructs a validated "...-MM-DD" BC date token
-// directly via time.Date at the ASTRONOMICAL year, bypassing time.Parse's
-// day-out-of-range check — see the M0119-0006 §14.3 comment in
-// parsePGDateText above for why that check disagrees with PG for a BC
-// February 29. ok is false for anything this fallback does not apply to
-// (not BC, or the token/year don't parse — including the no-year-zero
-// refusal, left to the caller's original time.Parse error as before).
-func bcLeapDateFallback(dateToken string, bc bool) (time.Time, bool) {
-	if !bc {
+// proxyYearDateFallback builds a validated "...-MM-DD" date token that time.Parse
+// cannot read at its own year (dateTokenNeedsProxyYear) directly at the
+// ASTRONOMICAL year. ok is false for anything else, including the no-year-zero
+// refusal, which is left to the caller's original time.Parse error.
+func proxyYearDateFallback(dateToken string, bc bool) (time.Time, bool) {
+	if !dateTokenNeedsProxyYear(dateToken, bc) {
 		return time.Time{}, false
 	}
 	month, day, mdok := datetime.DateTokenMonthDay(dateToken)
