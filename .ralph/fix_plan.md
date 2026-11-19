@@ -12377,11 +12377,16 @@ verify each at HEAD when the task starts.
     - COPY writes `infinity` and `\-infinity` for dates and timestamps; it wrote a far\-future date before.
     - Regress, all 165 failed cases on HEAD and this build: 76082→76067 mismatch lines, none worse apart from the known flakes.
     Movement: yes — regress horology 2360→2342, date 56→52
-- [ ] **M0149-0001h1a58 — to\_char ignores lc\_numeric and lc\_monetary** (filed 2026-11-18 by M0149-0001h1a53)
+- [x] **M0149-0001h1a58 — to\_char ignores lc\_numeric and lc\_monetary** (filed 2026-11-18 by M0149-0001h1a53)
   Kind: impl
   Parent: M0149-0001h1a
   - `L`, `G`, `D` and `S` print the C locale's values. PG takes them from localeconv \(NUM\_prepare\_locale, PGLC\_localeconv\).
   - Resume: numProcess in internal/executor/to\_char\_number.go.
+  - 2026\-11\-19 \(landed\):
+    - to\_char reads the decimal point, thousands separator, signs and currency symbol from the glibc locale data of
+      lc\_numeric and lc\_monetary, from a locale directory, LOCPATH or locale\-archive.
+    - About 3,800 statements under C, C.UTF\-8, en\_US, de\_DE, fr\_FR and ja\_JP match PG 18.3 started with the same LOCPATH.
+    Movement: none — the regress suite runs in the C locale; all 165 failed cases changed only in the known flakes
 - [ ] **M0149-0001h1a59 — time plus or minus an interval prints a date and has no result type** (filed 2026-11-19 by M0149-0001h1a51)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12451,6 +12456,13 @@ verify each at HEAD when the task starts.
   - `daterange('2020-01-01','2020-01-05') @> '2020-01-02'::date` and `int4range(1,5) @> 2` fail with `operator @> requires box
     operands`. PG returns true \(range\_contains\_elem\).
   - Resume: the operator's dispatch in evalBinary, by operand type.
+- [ ] **M0149-0001h1a73 — monetary and numeric locale data beyond to\_char** (filed 2026-11-19 by M0149-0001h1a58)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Locale strings are not converted to the database encoding when the locale's codeset differs \(db\_encoding\_convert in
+    PGLC\_localeconv\), and PG's warning for an undeterminable codeset is not raised.
+  - money input and output ignore lc\_monetary \(cash\_in, cash\_out\); internal/utils/adt/cash is fixed to the C locale's form.
+  - Resume: misc.LocaleConvFor needs the remaining monetary fields; pass them to cash.In and cash.Out.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a

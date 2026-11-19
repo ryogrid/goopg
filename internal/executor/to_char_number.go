@@ -6,13 +6,15 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
+	"unicode/utf8"
+
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // This file ports the numeric half of PostgreSQL's to_char from
 // postgres/src/backend/utils/adt/formatting.c: NUM_keywords, parse_format in its
-// NUM mode, NUMDesc_prepare, NUM_processor, NUM_numpart_to_char, and the
-// int4, int8, float4, float8 and numeric entry points. The locale values are the
-// C locale's, which is what NUM_prepare_locale produces there.
+// NUM mode, NUMDesc_prepare, NUM_prepare_locale, NUM_processor,
+// NUM_numpart_to_char, and the int4, int8, float4, float8 and numeric entry points.
 
 const (
 	numFDecimal = 1 << (iota + 1)
@@ -86,6 +88,7 @@ type numNode struct {
 // numDesc is NUMDesc.
 type numDesc struct {
 	pre, post, lsign, preLSignNum, multi, zeroStart, zeroEnd, flag int
+	needLocale                                                     bool
 }
 
 func (n *numDesc) has(flag int) bool { return n.flag&flag != 0 }
@@ -133,6 +136,7 @@ func (n *numDesc) prepare(id numID) error {
 	case numD, numDec:
 		if id == numD {
 			n.flag |= numFLDecimal
+			n.needLocale = true
 		}
 		if n.has(numFDecimal) {
 			return numSyntaxError("multiple decimal points", "")
@@ -153,9 +157,11 @@ func (n *numDesc) prepare(id numID) error {
 		if !n.has(numFDecimal) {
 			n.lsign = numLSignPre
 			n.preLSignNum = n.pre
+			n.needLocale = true
 			n.flag |= numFLSign
 		} else if n.lsign == 0 {
 			n.lsign = numLSignPost
+			n.needLocale = true
 			n.flag |= numFLSign
 		}
 	case numMI:
@@ -189,6 +195,8 @@ func (n *numDesc) prepare(id numID) error {
 			return numSyntaxError(`cannot use "RN" twice`, "")
 		}
 		n.flag |= numFRoman
+	case numL, numG:
+		n.needLocale = true
 	case numV:
 		if n.has(numFDecimal) {
 			return numSyntaxError(`cannot use "V" and decimal point together`, "")
@@ -267,6 +275,40 @@ type numProc struct {
 	numberP      int
 	lastRelevant int
 	out          []byte
+	locale       numLocale
+}
+
+// numLocale is the strings NUM_prepare_locale chooses.
+type numLocale struct {
+	negative, positive, decimal, thousands, currency string
+}
+
+// prepareNumLocale is NUM_prepare_locale.
+func prepareNumLocale(n *numDesc, conv misc.LocaleConv) numLocale {
+	l := numLocale{negative: "-", positive: "+", decimal: ".", thousands: ",", currency: " "}
+	if !n.needLocale {
+		return l
+	}
+	if conv.NegativeSign != "" {
+		l.negative = conv.NegativeSign
+	}
+	if conv.PositiveSign != "" {
+		l.positive = conv.PositiveSign
+	}
+	if conv.DecimalPoint != "" && n.has(numFLDecimal) {
+		l.decimal = conv.DecimalPoint
+	}
+	switch {
+	case conv.ThousandsSep != "":
+		l.thousands = conv.ThousandsSep
+	case l.decimal == ",":
+		// A thousands separator must differ from the decimal point.
+		l.thousands = "."
+	}
+	if conv.CurrencySymbol != "" {
+		l.currency = conv.CurrencySymbol
+	}
+	return l
 }
 
 func (np *numProc) isPredecSpace() bool {
@@ -279,9 +321,9 @@ func (np *numProc) lastRelevantIsPoint() bool {
 
 func (np *numProc) writeLocaleSign() {
 	if np.sign == '-' {
-		np.out = append(np.out, '-')
+		np.out = append(np.out, np.locale.negative...)
 	} else {
-		np.out = append(np.out, '+')
+		np.out = append(np.out, np.locale.positive...)
 	}
 }
 
@@ -331,7 +373,7 @@ func (np *numProc) digitPart(id numID) {
 		default:
 			if np.number[np.numberP] == '.' {
 				if !np.lastRelevantIsPoint() || n.has(numFFillMode) {
-					np.out = append(np.out, '.')
+					np.out = append(np.out, np.locale.decimal...)
 				}
 			} else {
 				switch {
@@ -402,14 +444,15 @@ func numOrdinal(number []byte, upper bool) (string, error) {
 
 // numProcess is NUM_processor for to_char. A digit pattern past the end of the
 // number writes the terminating NUL, and the C result ends at the first NUL.
-func numProcess(nodes []numNode, n *numDesc, number string, outPreSpaces int, sign byte) (string, error) {
+func numProcess(nodes []numNode, n *numDesc, number string, outPreSpaces int, sign byte, conv misc.LocaleConv) (string, error) {
 	if n.zeroStart != 0 {
 		n.zeroStart--
 	}
 	if n.has(numFEEEE) {
 		return number, nil
 	}
-	np := &numProc{num: n, sign: sign, number: append([]byte(number), 0), lastRelevant: -1}
+	np := &numProc{num: n, sign: sign, number: append([]byte(number), 0), lastRelevant: -1,
+		locale: prepareNumLocale(n, conv)}
 	if n.has(numFPlus) || n.has(numFMinus) {
 		np.signWrote = !(n.has(numFPlus) && !n.has(numFMinus))
 	} else {
@@ -437,14 +480,6 @@ func numProcess(nodes []numNode, n *numDesc, number string, outPreSpaces int, si
 	}
 
 	fill := n.has(numFFillMode)
-	// separator writes a group separator, or a blank before the first digit.
-	separator := func() {
-		if np.numIn {
-			np.out = append(np.out, ',')
-		} else if !fill {
-			np.out = append(np.out, ' ')
-		}
-	}
 	for _, node := range nodes {
 		if !node.action {
 			np.out = append(np.out, node.ch)
@@ -453,10 +488,20 @@ func numProcess(nodes []numNode, n *numDesc, number string, outPreSpaces int, si
 		switch node.id {
 		case num9, num0, numDec, numD:
 			np.digitPart(node.id)
-		case numComma, numG:
-			separator()
+		case numComma:
+			if np.numIn {
+				np.out = append(np.out, ',')
+			} else if !fill {
+				np.out = append(np.out, ' ')
+			}
+		case numG:
+			if np.numIn {
+				np.out = append(np.out, np.locale.thousands...)
+			} else if !fill {
+				np.out = append(np.out, strings.Repeat(" ", utf8.RuneCountInString(np.locale.thousands))...)
+			}
 		case numL:
-			np.out = append(np.out, ' ')
+			np.out = append(np.out, np.locale.currency...)
 		case numRN, numRNLower:
 			roman := string(np.number[np.numberP : len(np.number)-1])
 			if node.id == numRNLower {
@@ -805,6 +850,11 @@ func floatToCharText(n *numDesc, value float64, single bool) (string, int, byte)
 // value's Datum kind does not separate int4 from int8 or float8 from numeric, and
 // those format differently.
 func toCharNumber(d Datum, typeName, format string) (string, error) {
+	return toCharNumberLocale(d, typeName, format, misc.LocaleConv{})
+}
+
+// toCharNumberLocale is toCharNumber under the session's lc_numeric and lc_monetary.
+func toCharNumberLocale(d Datum, typeName, format string, conv misc.LocaleConv) (string, error) {
 	if format == "" {
 		return "", nil
 	}
@@ -853,5 +903,5 @@ func toCharNumber(d Datum, typeName, format string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return numProcess(nodes, n, number, spaces, sign)
+	return numProcess(nodes, n, number, spaces, sign, conv)
 }

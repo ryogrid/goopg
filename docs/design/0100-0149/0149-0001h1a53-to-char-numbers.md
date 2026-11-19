@@ -36,6 +36,12 @@ are computed from the raw values. Patterns under `INVALID_FOR_INTERVAL` raise 22
 
 `evalToChar` used to turn an argument error into NULL. It now returns the error.
 
+## Locale \(M0149\-0001h1a58\)
+
+`L`, `G`, `D` and `S` read `localeconv` under `lc_monetary` and `lc_numeric`, as `NUM_prepare_locale` does.
+`misc.LocaleConvFor` reads the same glibc data `setlocale` would: a compiled locale directory, searched through
+`LOCPATH` when it is set, or `locale-archive`. A template with none of these patterns uses the fixed defaults.
+
 ## Verification
 
 About 7,800 statements over every number type, intervals and `time` were run on goopg and
@@ -44,6 +50,6 @@ that output for `TestToCharMatchesPG18`.
 
 ## Not covered
 
-- `L`, `G`, `D` and `S` use C locale values, because `lc_numeric` and `lc_monetary` are not
-  consulted \(M0149\-0001h1a58\).
+- Locale strings are used as stored, so a locale whose codeset is not UTF\-8 is not converted to the database
+  encoding \(M0149\-0001h1a73\).
 - `to_number` is a separate function and is not changed here.

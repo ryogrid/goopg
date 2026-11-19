@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // TestToCharMatchesPG18 replays output captured from PostgreSQL 18.3:
@@ -80,5 +82,22 @@ func TestToCharNotFiniteInterval(t *testing.T) {
 	}
 	if got, err := toCharInterval(NewIntervalDatumFull(0, 0, 0), ""); err != nil || !got.IsNull() {
 		t.Errorf("empty template: %v, %v", got, err)
+	}
+}
+
+// TestToCharUsesTheLocale pins output captured from PostgreSQL 18.3 under a
+// de_DE.UTF-8 locale for lc_numeric and lc_monetary.
+func TestToCharUsesTheLocale(t *testing.T) {
+	de := misc.LocaleConv{DecimalPoint: ",", ThousandsSep: ".", NegativeSign: "-", CurrencySymbol: "€"}
+	for _, tc := range []struct{ format, want string }{
+		{"L9G999D99", "€ 1.234,50"},
+		{"FM9G999D99", "1.234,5"},
+		{"S9G999D99", "+1.234,50"},
+		{"9,999.99", " 1,234.50"}, // the non-locale patterns do not change
+	} {
+		got, err := toCharNumberLocale(NewStringDatum("1234.5"), "numeric", tc.format, de)
+		if err != nil || got != tc.want {
+			t.Errorf("%s: %q, %v; want %q", tc.format, got, err, tc.want)
+		}
 	}
 }

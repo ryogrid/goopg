@@ -5911,6 +5911,20 @@ func dateStyleFromCtx(ctx *Context) (style, order string) {
 	return style, order
 }
 
+// localeConvFromCtx is localeconv under the session's lc_numeric and lc_monetary.
+func localeConvFromCtx(ctx *Context) misc.LocaleConv {
+	numeric, monetary := "C", "C"
+	if ctx != nil && ctx.GetSetting != nil {
+		if v, ok := ctx.GetSetting("lc_numeric"); ok {
+			numeric = v
+		}
+		if v, ok := ctx.GetSetting("lc_monetary"); ok {
+			monetary = v
+		}
+	}
+	return misc.LocaleConvFor(numeric, monetary)
+}
+
 // timeZoneFromCtx resolves the session's TimeZone GUC via ctx.GetSetting,
 // returning "" (which config.FormatTimestampTZ reads as UTC) when ctx is nil,
 // has no GetSetting wired, or the GUC is unset. Mirrors the same lookup
@@ -8416,7 +8430,7 @@ func evalToChar(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, erro
 	case srcArg.Kind == KindTime:
 		return toCharDatetime(srcArg, format, ctx)
 	}
-	text, err := toCharNumber(srcArg, typeName, format)
+	text, err := toCharNumberLocale(srcArg, typeName, format, localeConvFromCtx(ctx))
 	if err != nil {
 		return Datum{}, err
 	}
