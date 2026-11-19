@@ -799,8 +799,8 @@ func parseTimeTZString(s string, zone string) (time.Time, int, error) {
 		if tzStr != "" {
 			// Named timezone like "America/New_York"
 			if strings.Contains(tzStr, "/") {
-				loc, err := time.LoadLocation(tzStr)
-				if err == nil {
+				loc, ok := misc.ZoneByName(tzStr)
+				if ok {
 					// Parse the full datetime in the named timezone
 					full := dateStr + " " + timeStr
 					for _, layout := range []string{"2006-01-02 15:04:05.999999", "2006-01-02 15:04:05", "2006-01-02 15:04"} {

@@ -31,7 +31,12 @@ named zone.
 - `exprType` reports timestamp and timestamptz for these operators, `date_add`, `date_subtract` and
   `date_bin`, and interval for an interval literal.
 
+## Zone names
+
+`lookupTimeZoneName` resolves a name as `pg_tzset` does, through `misc.CanonicalZoneName`: a tz database
+name in any case, or an upper\-cased POSIX specification. The zone tokens of date/time input, `AT TIME ZONE`
+on timetz and `timetz` input use the same lookup \(M0149\-0001h1a61\).
+
 ## Not covered
 
 - `generate_series` over timestamps returns wrong rows \(M0149\-0001h1a60\).
-- Zone names are matched case\-sensitively in `date_add` \(M0149\-0001h1a61\).

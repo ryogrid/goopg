@@ -12400,11 +12400,16 @@ verify each at HEAD when the task starts.
     - timetz keeps its offset in text output. timestamptz casts to time and timetz, current\_time and localtime use the session zone.
     - Design: docs/design/0100\-0149/0149\-0001h1a59\-time\-operators.md. Remaining gaps are filed as M0149\-0001h1a74.
     Movement: yes — regress runner over all 165 failed cases 76077 → 76007 lines; horology 2348 → 2294, interval 654 → 646
-- [ ] **M0149-0001h1a61 — date\_add matches time zone names case\-sensitively** (filed 2026-11-19 by M0149-0001h1a51)
+- [x] **M0149-0001h1a61 — date\_add matches time zone names case\-sensitively** (filed 2026-11-19 by M0149-0001h1a51)
   Kind: impl
   Parent: M0149-0001h1a
   - PG finds zone names without regard to case \(pg\_tzset\). lookupTimeZoneName uses time.LoadLocation, which follows the file
     system. This comes from reading the code and has not been run.
+  - 2026\-11\-19 \(landed\):
+    - date\_add, date\_subtract and generate\_series find zones in any case through misc.CanonicalZoneName, the pg\_tzset lookup.
+    - Zone tokens in date/time input, timetz input and `AT TIME ZONE` on timetz use the same lookup.
+    - The comparison with PG found wrong results under other zone functions, filed as M0149\-0001h1a75 \(S2\), and smaller gaps, M0149\-0001h1a76.
+    Movement: yes — `date_add(..., 'america/new_york')` errored and now equals PG; regress over all 165 failed cases changed only in the known flakes, 76007 → 76008
 - [ ] **M0149-0001h1a62 — numeric variance and stddev use a fixed result scale** (filed 2026-11-19 by M0149-0001h1a57)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12479,6 +12484,25 @@ verify each at HEAD when the task starts.
   - EXPLAIN prints a time literal as written \(`'09:00'`, or `'11:00'` in a comparison\); PG prints `'09:00:00'::time without
     time zone`.
   - Resume: set TimeSubTime in NewTimeDatum's time\-of\-day callers, parser.ResolveTimeOperator for the error, castLiteralConstText for EXPLAIN.
+- [ ] **M0149-0001h1a75 — WRONG RESULTS: time zone arguments on timestamps are mishandled** (filed 2026-11-19 by M0149-0001h1a61; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `'2020-07-01 00:00+00'::timestamptz at time zone 'Asia/Tokyo'` returns `1970-01-01 09:00:00`; PG returns
+    `2020-07-01 09:00:00`. `timestamp at time zone` also loses the date, and so does timezone\(\).
+  - `date_trunc('day', '2020-07-01 12:00+00'::timestamptz, 'asia/tokyo')` ignores the zone: `2020-07-01 00:00:00`, PG
+    `2020-06-30 15:00:00+00`.
+  - `make_timestamptz(2020,7,1,0,0,0,'asia/tokyo')` ignores the zone: `2020-07-01 00:00:00`, PG `2020-06-30 15:00:00+00`.
+  - `AT LOCAL` assumes the session zone is UTC.
+  - Resume: the timezone arm of expr.go treats every value as timetz; add timestamp\_zone and timestamptz\_zone, then the
+    zone arguments of date\_trunc and evalMakeTimestamp.
+  > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a75: `AT TIME ZONE` on a timestamp returns a 1970 date
+  > The result differs from PG 18.3 for every timestamp input. Found while comparing zone names in h1a61.
+- [ ] **M0149-0001h1a76 — smaller differences in time zone input and listing** (filed 2026-11-19 by M0149-0001h1a61)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `'12:00 asia/tokyo'::timetz` is accepted as `12:00:00+09`; PG raises invalid input syntax because the zone needs a date.
+  - `pg_timezone_names` returns no row for `Asia/Tokyo`.
+  - Resume: parseTimeTZString for the first; the pg\_timezone\_names source for the second.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a

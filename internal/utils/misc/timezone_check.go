@@ -294,14 +294,10 @@ func WallClockWestOffset(wall time.Time, loc *time.Location) int {
 	return int(resolveLocalWallClock(wall, loc).Unix() - wall.Unix())
 }
 
-// ZoneKnown reports whether zone names a tz database zone or is a POSIX TZ
-// specification, which are the two forms ZoneLocation resolves.
-func ZoneKnown(zone string) bool {
-	if _, err := time.LoadLocation(zone); err == nil && zone != "" {
-		return true
-	}
-	_, ok := posixLocation(zone)
-	return ok
+// CanonicalZoneName is pg_tzset's name resolution: the tz database spelling of a
+// zone name in any case, or the upper-cased form of a POSIX specification.
+func CanonicalZoneName(name string) (string, bool) {
+	return zoneName(name)
 }
 
 // posixLocation builds the zone a POSIX TZ string describes. Go's time

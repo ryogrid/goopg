@@ -88,3 +88,18 @@ func TestDateWithTime(t *testing.T) {
 		t.Errorf("zoned = %+v", zoned)
 	}
 }
+
+func TestLookupTimeZoneNameIgnoresCase(t *testing.T) {
+	for _, name := range []string{"america/new_york", "AMERICA/NEW_YORK", "America/New_York"} {
+		got, err := lookupTimeZoneName(name)
+		if err != nil || got != "America/New_York" {
+			t.Errorf("%s = %q, %v", name, got, err)
+		}
+	}
+	if got, err := lookupTimeZoneName("jst-9"); err != nil || got != "JST-9" {
+		t.Errorf("POSIX spec = %q, %v", got, err)
+	}
+	if _, err := lookupTimeZoneName("no/such"); err == nil {
+		t.Error("unknown zone accepted")
+	}
+}

@@ -3819,10 +3819,11 @@ func lookupTimeZoneName(name string) (string, error) {
 		}
 		return fmt.Sprintf("<%s>%s%d:%02d:%02d", "tz", sign, west/3600, west%3600/60, west%60), nil
 	}
-	if !misc.ZoneKnown(name) {
+	canonical, ok := misc.CanonicalZoneName(name)
+	if !ok {
 		return "", &ExecError{Code: "22023", Message: fmt.Sprintf("time zone %q not recognized", name)}
 	}
-	return name, nil
+	return canonical, nil
 }
 
 // dateOutOfRangeForTimestamp is date2timestamp's error for a date no timestamp
@@ -21222,7 +21223,7 @@ func parseTimezoneOffsetString(s string) (int, error) {
 	}
 
 	// Named timezone (America/New_York, Europe/London, etc.).
-	if loc, err := time.LoadLocation(s); err == nil {
+	if loc, ok := misc.ZoneByName(s); ok {
 		_, off := time.Now().In(loc).Zone()
 		return off, nil
 	}
