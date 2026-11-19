@@ -39,6 +39,19 @@ therefore chosen from static types, the way `moneyArithCall` does it.
 About 80 statements covering every operand pairing, NULL, infinity, range errors, columns, aggregates,
 CTAS and EXPLAIN match PG 18.3, apart from the items below.
 
+## Interval, timestamp and date with a literal or a number \(M0149\-0001h1a65\)
+
+`parser.ResolveDateTimeLiteralOperator` is the second table, for operands the time table does not cover:
+
+- An untyped literal next to timestamp or timestamptz takes the same type under `-` and interval under `+`. Next to
+  interval it is an interval. `date - unknown` reads a date, and `date + unknown` is ambiguous, as in PG.
+- A number times an interval becomes `mul_d_interval`, the number taken as float8. `interval / number` keeps the
+  ordinary operator; `number / interval`, `interval * interval` and `interval / interval` do not exist.
+
+Only a string literal or NULL counts as unknown in the analyzer. Any other expression it cannot type is left to
+the existing checks, so `'2016-06-02'::date + length(foo(10))` still works. `exprType` now types
+`timestamp - timestamp` as interval.
+
 ## Not covered \(M0149\-0001h1a74\)
 
 - A plain `time` prints with a date in `format`, `concat` and row output.

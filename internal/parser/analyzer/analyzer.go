@@ -1537,6 +1537,9 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			if t, handled, err := timeArithResultType(x, leftTyp, rightTyp); handled {
 				return t, err
 			}
+			if t, handled, err := dateTimeLiteralResultType(x, leftTyp, rightTyp); handled {
+				return t, err
+			}
 			// timestamp/date ± interval → timestamp. TPC-H Q1
 			// (`l_shipdate <= date '...' - interval '90' day`)
 			// hits this; v0 returns the result as `timestamp`
@@ -4012,12 +4015,15 @@ func moneyArithResultType(op parser.OpCode, l, r catalog.Type) (catalog.Type, bo
 // timeArithResultType types + and - when an operand is time or timetz. The
 // planner applies the same rules in timeArithCall.
 func timeArithResultType(x *parser.BinaryOp, l, r catalog.Type) (catalog.Type, bool, error) {
-	kind := func(t catalog.Type) string {
+	kind := func(e parser.Expr, t catalog.Type) string {
 		if t.IsArray {
 			return ""
 		}
 		if isUnknownType(t) {
-			return "unknown"
+			if isUntypedLiteral(e) {
+				return "unknown"
+			}
+			return ""
 		}
 		return strings.ToLower(t.Name)
 	}
@@ -4030,7 +4036,7 @@ func timeArithResultType(x *parser.BinaryOp, l, r catalog.Type) (catalog.Type, b
 				return n
 			}
 		}
-		return kind(t)
+		return kind(e, t)
 	}
 	lk, rk := operand(x.Left, l), operand(x.Right, r)
 	result, status := parser.ResolveTimeOperator(x.Op, lk, rk)
@@ -4041,6 +4047,64 @@ func timeArithResultType(x *parser.BinaryOp, l, r catalog.Type) (catalog.Type, b
 		return catalog.Type{Name: result}, true, nil
 	}
 	code, message, hint := parser.TimeOperatorError(status, x.Op, lk, rk)
+	ae := analyzeError(x.Pos(), code, message)
+	ae.Hint = hint
+	return catalog.Type{}, true, ae
+}
+
+// isUntypedLiteral reports whether e is a string literal or NULL, the operands
+// PG types as unknown.
+func isUntypedLiteral(e parser.Expr) bool {
+	switch e.(type) {
+	case *parser.StringConst, *parser.NullConst:
+		return true
+	}
+	return false
+}
+
+// dateTimeLiteralResultType types the operators on timestamp, timestamptz, date
+// and interval with an untyped literal, and interval times or divided by a
+// number. The planner applies the same rules in dateTimeLiteralCall.
+func dateTimeLiteralResultType(x *parser.BinaryOp, l, r catalog.Type) (catalog.Type, bool, error) {
+	name := func(e parser.Expr, t catalog.Type) string {
+		if c, ok := e.(*parser.CastExpr); ok {
+			switch n := strings.ToLower(c.Type.Name); n {
+			case "timestamp", "timestamptz", "interval", "date":
+				return n
+			}
+		}
+		if _, ok := e.(*parser.IntegerConst); ok {
+			return "int4"
+		}
+		if t.IsArray {
+			return ""
+		}
+		if isUnknownType(t) {
+			// Only a literal is PG's unknown; any other untyped
+			// expression is a type the analyzer does not track.
+			if isUntypedLiteral(e) {
+				return "unknown"
+			}
+			return ""
+		}
+		return strings.ToLower(t.Name)
+	}
+	kind := func(n string) string {
+		switch n {
+		case "int2", "int4", "int8", "numeric", "float4", "float8":
+			return "number"
+		}
+		return n
+	}
+	ln, rn := name(x.Left, l), name(x.Right, r)
+	result, _, status := parser.ResolveDateTimeLiteralOperator(x.Op, kind(ln), kind(rn))
+	switch status {
+	case parser.TimeOperatorNone:
+		return catalog.Type{}, false, nil
+	case parser.TimeOperatorFound:
+		return catalog.Type{Name: result}, true, nil
+	}
+	code, message, hint := parser.TimeOperatorError(status, x.Op, ln, rn)
 	ae := analyzeError(x.Pos(), code, message)
 	ae.Hint = hint
 	return catalog.Type{}, true, ae

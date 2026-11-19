@@ -8823,6 +8823,7 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
   - Rank: below item 10 — correctness\-only, no owner placement \(S7 carve\-out\)\.
   - First step: the BinaryOp `\+` / `\*` typing arms for timestamp/interval and int/interval \(PG timestamp\_pl\_interval,
     interval\_mul, mul\_d\_interval\) and the timestamp output path for a folded constant\.
+  - 2026\-11\-19: `g \* interval '1 minute'` now works \(M0149\-0001h1a65, mul\_d\_interval\). make\_interval is still missing.
 - [ ] **M0146-0175 — the ordered index producer builds a clauseless twin of an index that has restriction clauses**
   \(filed 2026\-10\-13 by M0146\-0172\)\. PG\'s build\_index\_paths builds ONE path per index and adds the clauseless
   ordered one only when no clause matches \(indxpath\.c\)\. goopg\'s `addOneOrderedIndexPath` \(pathindexordered\.go\) always
@@ -12431,13 +12432,19 @@ verify each at HEAD when the task starts.
       count. Correlated, grouped and filtered forms match PG 18.3.
     - Remaining nested set\-returning differences are filed as M0149\-0001h1a78.
     Movement: none — regress runner over all 165 failed cases changed only in known flakes \(75996 → 76001: plpgsql, alter\_generic, copy2's FREEZE block\)
-- [ ] **M0149-0001h1a65 — a number times an interval is rejected** (filed 2026-11-19 by M0149-0001h1a60)
+- [x] **M0149-0001h1a65 — a number times an interval is rejected** (filed 2026-11-19 by M0149-0001h1a60)
   Kind: impl
   Parent: M0149-0001h1a
   - `select 2 * interval '1 day'` fails with `operator * requires numeric operands`; PG gives `2 days` \(mul\_d\_interval\).
     Swapping the operands in evalBinary was not enough, so another path rejects it first.
   - `interval * interval` should raise `operator does not exist: interval * interval` with PG's hint.
   - `t - '2020-01-01'` and `t + '1 day'` on a timestamptz fail the same way, with `operator - requires numeric operands`.
+  - 2026\-11\-19 \(landed\):
+    - parser.ResolveDateTimeLiteralOperator, shared by the analyzer and the planner, types interval, timestamp and date
+      next to an untyped literal, and an interval times or divided by a number. A number times an interval is mul\_d\_interval.
+    - PG's errors for `interval * interval`, `interval / interval`, `number / interval` and `date + unknown` are raised.
+    - sum and avg over interval are missing \(M0149\-0001h1a79\). EXPLAIN keeps the spelling of these literals \(h1a74\).
+    Movement: yes — regress runner timestamp 213 → 185
 - [ ] **M0149-0001h1a66 — compare generate\_series row estimates for numeric and timestamps with PG** (filed 2026-11-19 by M0149-0001h1a60)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12494,6 +12501,8 @@ verify each at HEAD when the task starts.
     time zone + integer` with its hint. Bare integer literals are typed int8 here, so the message needs the literal's PG type.
   - EXPLAIN prints a time literal as written \(`'09:00'`, or `'11:00'` in a comparison\); PG prints `'09:00:00'::time without
     time zone`.
+  - The same holds for timestamptz literals \(`'2020-01-01'` for PG's `'2020-01-01 00:00:00+00'`\), and PG prints a number
+    multiplying an interval as `'2'::double precision`.
   - Resume: set TimeSubTime in NewTimeDatum's time\-of\-day callers, parser.ResolveTimeOperator for the error, castLiteralConstText for EXPLAIN.
 - [ ] **M0149-0001h1a75 — WRONG RESULTS: time zone arguments on timestamps are mishandled** (filed 2026-11-19 by M0149-0001h1a61; S2)
   Kind: impl
@@ -12529,6 +12538,12 @@ verify each at HEAD when the task starts.
   - EXPLAIN VERBOSE of `select generate_series(1,2) + 1` prints a ProjectSet with `Output: ?column?`; PG prints a Result
     over a ProjectSet with the expressions.
   - Resume: isNestedSRFName and buildSelectSrfProjectSet in internal/optimizer/planner.go; the analyzer for the errors.
+- [ ] **M0149-0001h1a79 — sum and avg over interval are rejected** (filed 2026-11-19 by M0149-0001h1a65)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select sum(i), avg(i) from (values ('1 hour'::interval),('2 hours')) v(i)` raises `aggregate sum requires numeric argument
+    in v0`; PG returns `03:00:00` and `01:30:00` \(interval\_sum, interval\_avg\).
+  - Resume: the sum/avg transition in internal/executor/operators\_join\_agg.go.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a

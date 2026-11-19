@@ -76,3 +76,30 @@ func TestTimeArithCallRejects(t *testing.T) {
 		t.Errorf("timestamp + interval must stay an ordinary operator: ok=%v err=%v", ok, err)
 	}
 }
+
+func TestDateTimeLiteralCall(t *testing.T) {
+	iv := timeArithCast("interval")
+	e, ok, err := dateTimeLiteralCall(1, parser.OpMul, &IntegerConst{Value: 2}, iv)
+	if err != nil || !ok {
+		t.Fatalf("2 * interval: ok=%v err=%v", ok, err)
+	}
+	if fc, isCall := e.(*FuncCall); !isCall || fc.Name != "mul_d_interval" || fc.ReturnType != "interval" {
+		t.Errorf("2 * interval = %#v", e)
+	}
+	e, ok, err = dateTimeLiteralCall(1, parser.OpSub, timeArithCast("timestamptz"), &StringConst{Value: "2020-01-01"})
+	if err != nil || !ok {
+		t.Fatalf("timestamptz - unknown: ok=%v err=%v", ok, err)
+	}
+	b, isBinary := e.(*BinaryOp)
+	if !isBinary || b.ResultType != "interval" {
+		t.Fatalf("timestamptz - unknown = %#v", e)
+	}
+	if lit, isLit := b.Right.(*TypedStringLit); !isLit || lit.Type != "timestamptz" {
+		t.Errorf("literal = %#v", b.Right)
+	}
+	var pe *PlanError
+	_, _, err = dateTimeLiteralCall(1, parser.OpDiv, &IntegerConst{Value: 2}, iv)
+	if !errors.As(err, &pe) || pe.Message != "operator does not exist: integer / interval" {
+		t.Errorf("2 / interval: %v", err)
+	}
+}

@@ -499,3 +499,63 @@ func timeArithCall(pos int, op parser.OpCode, l, r Expr) (Expr, bool, error) {
 	}
 	return &FuncCall{pos: pos, Name: fn, Args: []Expr{l, r}, ReturnType: result, Operator: op.String()}, true, nil
 }
+
+// dateTimeLiteralCall resolves operators on timestamp, timestamptz, date and
+// interval with an untyped literal operand, and an interval multiplied or
+// divided by a number, through parser.ResolveDateTimeLiteralOperator. The
+// analyzer counterpart is dateTimeLiteralResultType.
+func dateTimeLiteralCall(pos int, op parser.OpCode, l, r Expr) (Expr, bool, error) {
+	untyped := func(e Expr) bool {
+		if _, ok := e.(*StringConst); ok {
+			return true
+		}
+		_, ok := e.(*NullConst)
+		return ok
+	}
+	name := func(e Expr) string {
+		if untyped(e) {
+			return "unknown"
+		}
+		if c, ok := e.(*IntegerConst); ok && c.Value >= math.MinInt32 && c.Value <= math.MaxInt32 {
+			return "int4"
+		}
+		t := exprType(e)
+		if t.IsArray {
+			return ""
+		}
+		return commonTypeCanonical(t.Name)
+	}
+	kind := func(n string) string {
+		switch n {
+		case "int2", "int4", "int8", "numeric", "float4", "float8":
+			return "number"
+		}
+		return n
+	}
+	ln, rn := name(l), name(r)
+	result, lit, status := parser.ResolveDateTimeLiteralOperator(op, kind(ln), kind(rn))
+	switch status {
+	case parser.TimeOperatorNone:
+		return nil, false, nil
+	case parser.TimeOperatorMissing, parser.TimeOperatorAmbiguous:
+		code, message, hint := parser.TimeOperatorError(status, op, ln, rn)
+		return nil, false, &PlanError{Pos: pos, Code: code, Message: message, Hint: hint}
+	}
+	literal := func(e Expr) Expr {
+		sc, ok := e.(*StringConst)
+		if !ok || lit == "" {
+			return e
+		}
+		if castTargetTakesStringLiteral(lit) {
+			return &TypedStringLit{pos: sc.Pos(), Type: lit, Value: sc.Value}
+		}
+		return &CastExpr{pos: sc.Pos(), Operand: sc, TargetType: lit, SourceType: "unknown"}
+	}
+	l, r = literal(l), literal(r)
+	if op == parser.OpMul && rn == "interval" {
+		// mul_d_interval: the number, as float8, times the interval.
+		return &FuncCall{pos: pos, Name: "mul_d_interval", Args: []Expr{l, r}, ReturnType: "interval", Operator: "*"}, true, nil
+	}
+	return &BinaryOp{pos: pos, Op: op, Left: l, Right: r, ResultType: result}, true, nil
+}
+

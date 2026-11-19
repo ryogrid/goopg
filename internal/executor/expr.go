@@ -12197,6 +12197,8 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		return evalDateBin(x, slot, ctx)
 	case "date_add", "date_subtract":
 		return evalDateAdd(x, name == "date_subtract", slot, ctx)
+	case "mul_d_interval":
+		return evalMulDInterval(x, slot, ctx)
 	case "time_pl_interval", "time_mi_interval", "timetz_pl_interval", "timetz_mi_interval",
 		"time_mi_time", "datetime_pl", "datetimetz_pl":
 		return evalTimeOperator(name, x, slot, ctx)

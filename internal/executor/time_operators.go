@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -146,3 +147,28 @@ func evalTimeOperator(name string, x *optimizer.FuncCall, slot SlotView, ctx *Co
 	}
 	return dateWithTime(l, r, withZone)
 }
+
+// evalMulDInterval is mul_d_interval: a number, as float8, times an interval.
+func evalMulDInterval(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
+	if len(x.Args) != 2 {
+		return NullDatum, nil
+	}
+	n, err := evalExprSlot(x.Args[0], slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	iv, err := evalExprSlot(x.Args[1], slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if n.IsNull() || iv.IsNull() {
+		return NullDatum, nil
+	}
+	factor, ok := datumToFloat64(n)
+	if !ok {
+		return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+			Message: fmt.Sprintf("invalid input syntax for type double precision: %q", n.Format())}
+	}
+	return intervalMul(iv, factor, x.Pos())
+}
+

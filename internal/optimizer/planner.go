@@ -10774,6 +10774,11 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		} else if ok {
 			return e, nil
 		}
+		if e, ok, err := dateTimeLiteralCall(x.Pos(), x.Op, l, r); err != nil {
+			return nil, err
+		} else if ok {
+			return e, nil
+		}
 		if x.Op == parser.OpConcat {
 			l, r = moneyConcatOperand(l), moneyConcatOperand(r)
 		}
@@ -10994,6 +10999,11 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 			return fc, nil
 		}
 		if e, ok, err := timeArithCall(x.Pos(), x.Op, l, r); err != nil {
+			return nil, err
+		} else if ok {
+			return e, nil
+		}
+		if e, ok, err := dateTimeLiteralCall(x.Pos(), x.Op, l, r); err != nil {
 			return nil, err
 		} else if ok {
 			return e, nil
@@ -17425,6 +17435,12 @@ func exprType(e Expr) catalog.Type {
 				(x.Op == parser.OpAdd || x.Op == parser.OpSub) {
 				return catalog.Type{Name: "interval"}
 			}
+			// timestamp - timestamp and timestamptz - timestamptz (timestamp_mi).
+			if x.Op == parser.OpSub && lt.Name != "" && !lt.IsArray && !rt.IsArray &&
+				commonTypeCanonical(lt.Name) == commonTypeCanonical(rt.Name) &&
+				(commonTypeCanonical(lt.Name) == "timestamp" || commonTypeCanonical(lt.Name) == "timestamptz") {
+				return catalog.Type{Name: "interval"}
+			}
 			if strings.EqualFold(lt.Name, "interval") && (x.Op == parser.OpMul || x.Op == parser.OpDiv) {
 				return catalog.Type{Name: "interval"}
 			}
@@ -19282,6 +19298,11 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 			return fc, nil
 		}
 		if e, ok, err := timeArithCall(x.Pos(), x.Op, l, r); err != nil {
+			return nil, err
+		} else if ok {
+			return e, nil
+		}
+		if e, ok, err := dateTimeLiteralCall(x.Pos(), x.Op, l, r); err != nil {
 			return nil, err
 		} else if ok {
 			return e, nil

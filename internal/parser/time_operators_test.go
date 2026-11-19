@@ -50,3 +50,34 @@ func TestTimeOperatorError(t *testing.T) {
 		t.Errorf("missing: %s %q", code, message)
 	}
 }
+
+func TestResolveDateTimeLiteralOperator(t *testing.T) {
+	cases := []struct {
+		op              OpCode
+		left, right     string
+		result, literal string
+		status          TimeOperatorStatus
+	}{
+		{OpSub, "timestamptz", "unknown", "interval", "timestamptz", TimeOperatorFound},
+		{OpAdd, "timestamptz", "unknown", "timestamptz", "interval", TimeOperatorFound},
+		{OpAdd, "unknown", "timestamp", "timestamp", "interval", TimeOperatorFound},
+		{OpSub, "unknown", "timestamp", "interval", "timestamp", TimeOperatorFound},
+		{OpSub, "date", "unknown", "int4", "date", TimeOperatorFound},
+		{OpAdd, "date", "unknown", "", "", TimeOperatorAmbiguous},
+		{OpSub, "interval", "unknown", "interval", "interval", TimeOperatorFound},
+		{OpMul, "number", "interval", "interval", "", TimeOperatorFound},
+		{OpMul, "unknown", "interval", "interval", "float8", TimeOperatorFound},
+		{OpDiv, "interval", "number", "interval", "", TimeOperatorFound},
+		{OpDiv, "number", "interval", "", "", TimeOperatorMissing},
+		{OpMul, "interval", "interval", "", "", TimeOperatorMissing},
+		{OpAdd, "timestamp", "interval", "", "", TimeOperatorNone},
+		{OpAdd, "unknown", "unknown", "", "", TimeOperatorNone},
+		{OpMul, "number", "number", "", "", TimeOperatorNone},
+	}
+	for _, c := range cases {
+		result, literal, status := ResolveDateTimeLiteralOperator(c.op, c.left, c.right)
+		if result != c.result || literal != c.literal || status != c.status {
+			t.Errorf("%s %s %s = %q %q %d", c.left, c.op, c.right, result, literal, status)
+		}
+	}
+}
