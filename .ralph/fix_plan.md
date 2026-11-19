@@ -12364,12 +12364,19 @@ verify each at HEAD when the task starts.
   - 2026\-11\-19 \(landed\): a typed literal's position is its string, for the one\-word, char\(n\) and multi\-word forms.
     The TYPEDLIT token keeps the type name's position for source spans.
     Movement: none — error positions only; regress over all 165 failed cases changed only in the known flakes
-- [ ] **M0149-0001h1a54 — dates from 294277 to 5874897 AD are rejected** (filed 2026-11-18 by M0149-0001h1a48e)
+- [x] **M0149-0001h1a54 — dates from 294277 to 5874897 AD are rejected** (filed 2026-11-18 by M0149-0001h1a48e)
   Kind: impl
   Parent: M0149-0001h1a
   - `'294276-12-31'::date + 1` and `date '294277-01-01'` fail with `date out of range`. PG accepts dates up to 5874897 AD.
   - Cause: KindDate shares the KindTime carrier, microseconds since 2000, which ends at 294277 AD.
   - Resume: hold a date as PG's day count, then the formatter, comparison, arithmetic and codec paths.
+  - 2026\-11\-19 \(landed\):
+    - A date past 294276 AD is held as a day count above the timestamp range and below \+infinity, so ordering and hashing are unchanged.
+    - Input, arithmetic, output, indexes and COPY cover dates up to 5874897\-12\-31.
+    - Converting such a date to a timestamp raises `date out of range for timestamp`.
+    - COPY writes `infinity` and `\-infinity` for dates and timestamps; it wrote a far\-future date before.
+    - Regress, all 165 failed cases on HEAD and this build: 76082→76067 mismatch lines, none worse apart from the known flakes.
+    Movement: yes — regress horology 2360→2342, date 56→52
 - [ ] **M0149-0001h1a58 — to\_char ignores lc\_numeric and lc\_monetary** (filed 2026-11-18 by M0149-0001h1a53)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12438,6 +12445,12 @@ verify each at HEAD when the task starts.
   - `interval 'x'` is a syntax error and `interval(3) 'x'` says `invalid interval count`, where PG reports
     `invalid input syntax for type interval` at the string.
   - Resume: replace knownTypeNames in internal/parser/adapter.go with gram.y's productions; playbook §12 first.
+- [ ] **M0149-0001h1a72 — range operators such as `@>` reject range operands** (filed 2026-11-19 by M0149-0001h1a54)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `daterange('2020-01-01','2020-01-05') @> '2020-01-02'::date` and `int4range(1,5) @> 2` fail with `operator @> requires box
+    operands`. PG returns true \(range\_contains\_elem\).
+  - Resume: the operator's dispatch in evalBinary, by operand type.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a

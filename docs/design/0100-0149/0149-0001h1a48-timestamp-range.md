@@ -98,10 +98,22 @@ seconds, because `UnixNano` overflows outside 1678 to 2261.
 
 A bad literal in `'x'::date` is reported at the string, as `coerce_type` does.
 
+## Dates past 294276 AD \(M0149\-0001h1a54\)
+
+PG's dates run to 5874897\-12\-31, far past what microseconds since 2000 can hold. Such a date keeps
+`KindTime`, and its `Int` is `pgTimestampEnd` plus the days since that point. Those values lie between
+every finite timestamp and the \+infinity sentinel, so comparison, sorting and hashing of `Int` need no
+change, and a far date compares later than any timestamp, as `date_cmp_timestamp` has it.
+
+`timeToCarrier`, `timeFromCarrier`, `pgDaysOfDatum` and `newDateDatumFromPGDays` know the encoding. The
+\+infinity instant moved to year 6000000 so it stays outside every date. Date input checks the date range, and
+converting a far date to a timestamp, directly or through interval arithmetic, `date_trunc` or `to_char`, raises
+`date out of range for timestamp`.
+
+COPY now writes `infinity` and `\-infinity` for dates and timestamps.
+
 ## Not covered
 
-- Dates from 294277 to 5874897 AD are refused, because a date shares the microsecond carrier
-  \(M0149\-0001h1a54\).
 - `date 'x'` puts the caret on the type name, and the DateStyle hint is missing
   \(M0149\-0001h1a55\).
 - Many valid input spellings are still rejected, because `DecodeDateTime` is not ported
