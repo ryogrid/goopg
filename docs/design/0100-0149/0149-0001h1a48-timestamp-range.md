@@ -111,10 +111,3 @@ converting a far date to a timestamp, directly or through interval arithmetic, `
 `date out of range for timestamp`.
 
 COPY now writes `infinity` and `\-infinity` for dates and timestamps.
-
-## Not covered
-
-- `date 'x'` puts the caret on the type name, and the DateStyle hint is missing
-  \(M0149\-0001h1a55\).
-- Many valid input spellings are still rejected, because `DecodeDateTime` is not ported
-  \(M0149\-0001h1a56\).
