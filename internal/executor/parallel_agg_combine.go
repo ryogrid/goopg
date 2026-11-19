@@ -298,6 +298,7 @@ func combineVariance(dst, src *aggRuntime) {
 			dst.numericExact = true
 		}
 		dst.numericSx.Add(dst.numericSx, src.numericSx)
+		dst.numericScale = max(dst.numericScale, src.numericScale)
 		if src.numericSxx != nil {
 			if dst.numericSxx == nil {
 				dst.numericSxx = new(big.Rat)

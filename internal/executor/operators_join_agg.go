@@ -2560,6 +2560,7 @@ type aggRuntime struct {
 	numericExact bool
 	numericSx    *big.Rat // Σx (exact)
 	numericSxx   *big.Rat // Σx² (exact)
+	numericScale int      // largest input display scale
 	// Regression accumulators for regr_*/covar_*/corr. M0097-0020.
 	// Follows PostgreSQL's float8_regr_accum signature: first arg is y, second is x.
 	regrN     int64   // count of non-NULL (x,y) pairs
@@ -4910,6 +4911,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call *optimizer.AggregateCall, sl
 						st.numericSx.Add(st.numericSx, x)
 						x2 := new(big.Rat).Mul(x, x)
 						st.numericSxx.Add(st.numericSxx, x2)
+						st.numericScale = max(st.numericScale, numericTextScale(numStr))
 					}
 					st.count++
 					break
@@ -5143,51 +5145,49 @@ func isFloat4TypeName(name string) bool {
 // Matching PostgreSQL's int4_accum / numeric_var_samp / numeric_var_pop path.
 // isSample: true=var_samp/stddev_samp, false=var_pop/stddev_pop.
 // isSqrt: true=stddev output, false=variance output.
-// exactNumericVariance computes var_pop/var_samp/stddev for exact rational accumulators.
-// Matches PG's numeric_accum + numeric_var_pop/var_samp path for numeric inputs. M0097-0125.
-func exactNumericVariance(sx, sxx *big.Rat, n int64, isSample, isSqrt bool) Datum {
-	bigN := new(big.Rat).SetInt64(n)
-	// numerator = N * Σxx - (Σx)²
-	numer := new(big.Rat).Mul(bigN, sxx)
-	sxSq := new(big.Rat).Mul(sx, sx)
-	numer.Sub(numer, sxSq)
-	// denominator = N² (pop) or N*(N-1) (samp)
-	var denom *big.Rat
-	if isSample {
-		denom = new(big.Rat).Mul(bigN, new(big.Rat).SetInt64(n-1))
-	} else {
-		denom = new(big.Rat).Mul(bigN, bigN)
-	}
-	if denom.Sign() == 0 {
+// exactNumericVariance is numeric_stddev_internal (numeric.c) for numeric input.
+// scale is the largest display scale among the inputs: sumX has that scale and
+// sumX2 twice it, so N*sumX2 - sumX^2 is exact at 2*scale. The variance is that
+// over N*(N-1) or N^2, divided at select_div_scale's rscale and rounded half away
+// from zero; the stddev is sqrt_var of the rounded variance at the same rscale.
+func exactNumericVariance(sx, sxx *big.Rat, n int64, scale int, isSample, isSqrt bool) Datum {
+	if n == 0 || (isSample && n <= 1) {
 		return NullDatum
 	}
-	result := new(big.Rat).Quo(numer, denom)
-	if isSqrt {
-		f64, _ := result.Float64()
-		if f64 <= 0 {
-			// Variance is 0 (or negative due to floating-point artifacts): stddev = 0.
-			return NewStringDatum("0")
-		}
-		prec := uint(128)
-		ratFloat := new(big.Float).SetPrec(prec).SetRat(result)
-		seed := new(big.Float).SetPrec(prec).SetFloat64(math.Sqrt(f64))
-		half := new(big.Float).SetPrec(prec).SetFloat64(0.5)
-		for i := 0; i < 15; i++ {
-			if seed.Sign() == 0 {
-				break
-			}
-			div := new(big.Float).SetPrec(prec).Quo(ratFloat, seed)
-			seed.Mul(half, new(big.Float).SetPrec(prec).Add(seed, div))
-		}
-		// PG uses 15 significant digits for numeric stddev output (extra_float_digits=0).
-		s := seed.Text('g', 15)
-		if strings.Contains(s, ".") && !strings.Contains(s, "e") {
-			s = strings.TrimRight(s, "0")
-			s = strings.TrimRight(s, ".")
-		}
-		return NewStringDatum(s)
+	bigN := new(big.Rat).SetInt64(n)
+	numer := new(big.Rat).Mul(bigN, sxx)
+	numer.Sub(numer, new(big.Rat).Mul(sx, sx))
+	numScale := scale * 2
+	numer.Mul(numer, new(big.Rat).SetInt(pow10Big(numScale)))
+	num := new(big.Int).Quo(numer.Num(), numer.Denom())
+	if num.Sign() <= 0 {
+		// make_result(&const_zero), display scale 0.
+		return Datum{Kind: KindNumeric}
 	}
-	return NewStringDatum(formatBigRatDecimal(result, 12))
+	den := big.NewInt(n)
+	if isSample {
+		den.Mul(den, big.NewInt(n-1))
+	} else {
+		den.Mul(den, big.NewInt(n))
+	}
+	rscale := pgSelectDivScale(num, numScale, den)
+	// div_var(num / 10^numScale, den, rscale, round): half away from zero.
+	divisor := new(big.Int).Mul(den, pow10Big(numScale))
+	q := new(big.Int).Mul(num, pow10Big(rscale))
+	q.Lsh(q, 1).Add(q, divisor)
+	q.Quo(q, new(big.Int).Lsh(divisor, 1))
+	if !isSqrt {
+		return newNumeric(q, rscale)
+	}
+	return pgSqrtScaled(q, rscale)
+}
+
+// numericTextScale is the display scale of a numeric's text form.
+func numericTextScale(s string) int {
+	if i := strings.IndexByte(s, '.'); i >= 0 {
+		return len(s) - i - 1
+	}
+	return 0
 }
 
 // int128 is a two's-complement 128-bit integer, value hi*2^64 + lo — the
@@ -5331,16 +5331,18 @@ func pgSqrtScaled(q *big.Int, rscale int) Datum {
 // significant digits of the quotient, estimated from the operands' NBASE
 // weights and leading NBASE digits, clamped to [0, NUMERIC_MAX_DISPLAY_SCALE].
 func pgSelectDivScaleInt(num, den *big.Int) int {
-	w1, f1 := pgNBaseWeightFirst(num, 0)
+	return pgSelectDivScale(num, 0, den)
+}
+
+// pgSelectDivScale is select_div_scale for num / 10^numScale over the integer den.
+func pgSelectDivScale(num *big.Int, numScale int, den *big.Int) int {
+	w1, f1 := pgNBaseWeightFirst(num, numScale)
 	w2, f2 := pgNBaseWeightFirst(den, 0)
 	qweight := w1 - w2
 	if f1 <= f2 {
 		qweight--
 	}
-	rscale := 16 - qweight*4
-	if rscale < 0 {
-		rscale = 0
-	}
+	rscale := max(16-qweight*4, numScale, 0)
 	return min(rscale, 1000)
 }
 
@@ -5907,7 +5909,7 @@ func (o *aggregateOp) finishBuiltinAgg(st *aggRuntime, call *optimizer.Aggregate
 			return st.intVariance(false, false)
 		}
 		if st.numericExact && !math.IsNaN(st.floatM2) { // NaN: an infinity or NaN was seen
-			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, false, false)
+			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, st.numericScale, false, false)
 		}
 		varPop := st.floatM2 / float64(st.count)
 		return NewStringDatum(strconv.FormatFloat(varPop, 'g', 15, 64))
@@ -5920,7 +5922,7 @@ func (o *aggregateOp) finishBuiltinAgg(st *aggRuntime, call *optimizer.Aggregate
 			return st.intVariance(true, false)
 		}
 		if st.numericExact && !math.IsNaN(st.floatM2) { // NaN: an infinity or NaN was seen
-			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, true, false)
+			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, st.numericScale, true, false)
 		}
 		varSamp := st.floatM2 / float64(st.count-1)
 		return NewStringDatum(strconv.FormatFloat(varSamp, 'g', 15, 64))
@@ -5932,7 +5934,7 @@ func (o *aggregateOp) finishBuiltinAgg(st *aggRuntime, call *optimizer.Aggregate
 			return st.intVariance(false, true)
 		}
 		if st.numericExact && !math.IsNaN(st.floatM2) { // NaN: an infinity or NaN was seen
-			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, false, true)
+			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, st.numericScale, false, true)
 		}
 		varPop := st.floatM2 / float64(st.count)
 		if varPop < 0 {
@@ -5947,7 +5949,7 @@ func (o *aggregateOp) finishBuiltinAgg(st *aggRuntime, call *optimizer.Aggregate
 			return st.intVariance(true, true)
 		}
 		if st.numericExact && !math.IsNaN(st.floatM2) { // NaN: an infinity or NaN was seen
-			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, true, true)
+			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, st.numericScale, true, true)
 		}
 		varSamp := st.floatM2 / float64(st.count-1)
 		if varSamp < 0 {

@@ -122,6 +122,7 @@ func serializeAggRuntime(name string, st *aggRuntime) (Datum, error) {
 		buf = appendBigInt(buf, sxx)
 		buf = appendBigRat(buf, st.numericSx)
 		buf = appendBigRat(buf, st.numericSxx)
+		buf = binary.LittleEndian.AppendUint64(buf, uint64(st.numericScale))
 
 	case "regr_count", "regr_avgx", "regr_avgy", "regr_sxx", "regr_syy", "regr_sxy",
 		"covar_pop", "covar_samp", "regr_r2", "regr_slope", "regr_intercept", "corr":
@@ -207,6 +208,7 @@ func deserializeAggRuntime(name string, data []byte) (aggRuntime, error) {
 		st.intSxx = rd.bigInt()
 		st.numericSx = rd.bigRat()
 		st.numericSxx = rd.bigRat()
+		st.numericScale = int(rd.u64())
 
 	case "regr_count", "regr_avgx", "regr_avgy", "regr_sxx", "regr_syy", "regr_sxy",
 		"covar_pop", "covar_samp", "regr_r2", "regr_slope", "regr_intercept", "corr":

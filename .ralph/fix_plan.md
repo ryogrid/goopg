@@ -12410,12 +12410,18 @@ verify each at HEAD when the task starts.
     - Zone tokens in date/time input, timetz input and `AT TIME ZONE` on timetz use the same lookup.
     - The comparison with PG found wrong results under other zone functions, filed as M0149\-0001h1a75 \(S2\), and smaller gaps, M0149\-0001h1a76.
     Movement: yes — `date_add(..., 'america/new_york')` errored and now equals PG; regress over all 165 failed cases changed only in the known flakes, 76007 → 76008
-- [ ] **M0149-0001h1a62 — numeric variance and stddev use a fixed result scale** (filed 2026-11-19 by M0149-0001h1a57)
+- [x] **M0149-0001h1a62 — numeric variance and stddev use a fixed result scale** (filed 2026-11-19 by M0149-0001h1a57)
   Kind: impl
   Parent: M0149-0001h1a
   - `var_pop(x::numeric)` over `1e30`, `2e30` and `3` prints 12 fractional digits; PG 18.3 prints none, because
     numeric\_stddev\_internal uses select\_div\_scale. stddev goes through 15 significant digits instead of sqrt\_var.
   - Resume: exactNumericVariance in internal/executor/operators\_join\_agg.go; the state must keep the input display scale.
+  - 2026\-11\-19 \(landed\):
+    - exactNumericVariance follows numeric\_stddev\_internal with exact integers: select\_div\_scale, rounded division and sqrt\_var.
+    - The largest input scale is kept in aggRuntime.numericScale, merged across parallel workers and serialized.
+    - 150 randomized input sets plus NaN, infinity, window and grouped queries match PG 18.3. The numeric scale\(\) function is missing \(M0149\-0001h1a77\).
+    - Design: docs/design/0100\-0149/0149\-0001h1a62\-numeric\-variance.md.
+    Movement: yes — regress runner numeric 929 → 925, window 1081 → 1069
 - [ ] **M0149-0001h1a64 — a set\-returning call inside pg\_typeof returns one row** (filed 2026-11-19 by M0149-0001h1a60)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12503,6 +12509,11 @@ verify each at HEAD when the task starts.
   - `'12:00 asia/tokyo'::timetz` is accepted as `12:00:00+09`; PG raises invalid input syntax because the zone needs a date.
   - `pg_timezone_names` returns no row for `Asia/Tokyo`.
   - Resume: parseTimeTZString for the first; the pg\_timezone\_names source for the second.
+- [ ] **M0149-0001h1a77 — the numeric scale function is missing** (filed 2026-11-19 by M0149-0001h1a62)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select scale(1.50)` raises `function scale does not exist`; PG returns 2 \(numeric\_scale\). min\_scale and trim\_scale exist.
+  - Resume: the trim\_scale and min\_scale arm in internal/executor/expr.go, plus the function's result type.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a
