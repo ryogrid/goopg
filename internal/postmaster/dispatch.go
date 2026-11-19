@@ -4276,7 +4276,13 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 	case "money":
 		// cash_out ("$1,234.56"): goopg's money Datum is a scale-2 numeric of
 		// the Cash value. M0149-0001k1.
-		return append(dst, executor.MoneyText(d)...)
+		monetary := "C"
+		if getSetting != nil {
+			if v, ok := getSetting("lc_monetary"); ok {
+				monetary = v
+			}
+		}
+		return append(dst, executor.MoneyTextLocale(d, monetary)...)
 	case "float4", "real":
 		// float4/real uses float32 precision (~7 significant digits).
 		// Use strconv bit=32 so the shortest float32 round-trip representation

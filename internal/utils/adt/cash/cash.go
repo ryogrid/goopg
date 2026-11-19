@@ -1,8 +1,8 @@
 // Package cash ports PostgreSQL's money input and output functions
-// (postgres/src/backend/utils/adt/cash.c cash_in / cash_out) for the C / POSIX
-// monetary locale: frac_digits 2, currency symbol "$", decimal point ".",
-// thousands separator "," grouped by 3, sign before the currency symbol
-// (p/n_sign_posn CHAR_MAX → case 1, cs_precedes, no separating space).
+// (postgres/src/backend/utils/adt/cash.c cash_in / cash_out) over the monetary
+// locale data in Conv. In and Out use the C / POSIX locale: frac_digits 2,
+// currency symbol "$", decimal point ".", thousands separator "," grouped by 3,
+// sign before the currency symbol.
 //
 // A money value is an int64 count of cents (Cash). goopg's executor keeps it
 // as a scale-2 numeric Datum whose mantissa is that count, so comparison,
@@ -15,14 +15,66 @@ import (
 	"strings"
 )
 
-const (
-	fpoint  = 2
+// Conv is the monetary locale data cash_in and cash_out read
+// (PGLC_localeconv). Char fields are as localeconv returns them, CHAR_MAX
+// (127) or -1 when the locale leaves them unset.
+type Conv struct {
+	CurrencySymbol  string
+	MonDecimalPoint string
+	MonThousandsSep string
+	MonGrouping     int
+	PositiveSign    string
+	NegativeSign    string
+	FracDigits      int
+	PCsPrecedes     int
+	PSepBySpace     int
+	NCsPrecedes     int
+	NSepBySpace     int
+	PSignPosn       int
+	NSignPosn       int
+}
+
+// CLocale is the C and POSIX locale's monetary data.
+var CLocale = Conv{MonGrouping: 127, FracDigits: 127, PCsPrecedes: 127, PSepBySpace: 127,
+	NCsPrecedes: 127, NSepBySpace: 127, PSignPosn: 127, NSignPosn: 127}
+
+// symbols applies cash_in's and cash_out's defaults to the locale data.
+func (c Conv) symbols() (fpoint int, dsymbol byte, ssymbol, csymbol, psymbol, nsymbol string) {
+	fpoint = c.FracDigits
+	if fpoint < 0 || fpoint > 10 {
+		fpoint = 2 // best guess, as cash.c says
+	}
 	dsymbol = '.'
-	ssymbol = ","
-	csymbol = "$"
-	psymbol = "+"
-	nsymbol = "-"
-)
+	if len(c.MonDecimalPoint) == 1 {
+		dsymbol = c.MonDecimalPoint[0]
+	}
+	ssymbol = c.MonThousandsSep
+	if ssymbol == "" {
+		ssymbol = ","
+		if dsymbol == ',' {
+			ssymbol = "."
+		}
+	}
+	csymbol = c.CurrencySymbol
+	if csymbol == "" {
+		csymbol = "$"
+	}
+	psymbol = c.PositiveSign
+	if psymbol == "" {
+		psymbol = "+"
+	}
+	nsymbol = c.NegativeSign
+	if nsymbol == "" {
+		nsymbol = "-"
+	}
+	return
+}
+
+// FracDigits is the number of fraction digits a money value has under c.
+func (c Conv) FractionDigits() int {
+	f, _, _, _, _, _ := c.symbols()
+	return f
+}
 
 // RangeError is cash_in's 22003 "value … is out of range for type money".
 type RangeError struct{ Input string }
@@ -42,9 +94,14 @@ func isSpace(c byte) bool { return c == ' ' || (c >= '\t' && c <= '\r') }
 
 func isDigit(c byte) bool { return c >= '0' && c <= '9' }
 
-// In is cash_in: it parses str to a count of cents. Like PG it accumulates
-// the amount in the negative so the most negative value is reachable.
-func In(str string) (int64, error) {
+// In is cash_in under the C locale.
+func In(str string) (int64, error) { return InLocale(str, CLocale) }
+
+// InLocale is cash_in: it parses str to a Cash value, in units of
+// 10^-frac_digits. Like PG it accumulates the amount in the negative so the
+// most negative value is reachable.
+func InLocale(str string, conv Conv) (int64, error) {
+	fpoint, dsymbol, ssymbol, csymbol, psymbol, nsymbol := conv.symbols()
 	s := str
 	skipSpace := func() {
 		for len(s) > 0 && isSpace(s[0]) {
@@ -131,24 +188,37 @@ func In(str string) (int64, error) {
 	return value, nil
 }
 
-// Out is cash_out: "$1,234.56", "-$1,234.56".
-func Out(value int64) string {
+// Out is cash_out under the C locale: "$1,234.56", "-$1,234.56".
+func Out(value int64) string { return OutLocale(value, CLocale) }
+
+// OutLocale is cash_out: the digits with the locale's separators, then the
+// currency symbol and sign placed by p/n_sign_posn, p/n_cs_precedes and
+// p/n_sep_by_space.
+func OutLocale(value int64, conv Conv) string {
+	points, dsymbol, ssymbol, csymbol, _, nsymbol := conv.symbols()
+	monGroup := conv.MonGrouping
+	if monGroup <= 0 || monGroup > 6 {
+		monGroup = 3
+	}
 	var u uint64
-	sign := ""
+	signsymbol := conv.PositiveSign
+	signPosn, csPrecedes, sepBySpace := conv.PSignPosn, conv.PCsPrecedes, conv.PSepBySpace
 	if value < 0 {
-		sign = nsymbol
+		signsymbol = nsymbol
+		signPosn, csPrecedes, sepBySpace = conv.NSignPosn, conv.NCsPrecedes, conv.NSepBySpace
 		u = uint64(-(value + 1)) + 1
 	} else {
 		u = uint64(value)
 	}
-	const monGroup = 3
 	buf := make([]byte, 0, 32) // built right to left, reversed below
-	digitPos := fpoint
+	digitPos := points
 	for {
-		if digitPos == 0 {
+		if points != 0 && digitPos == 0 {
 			buf = append(buf, dsymbol)
 		} else if digitPos < 0 && digitPos%monGroup == 0 {
-			buf = append(buf, ssymbol...)
+			for i := len(ssymbol) - 1; i >= 0; i-- {
+				buf = append(buf, ssymbol[i])
+			}
 		}
 		buf = append(buf, byte('0'+u%10))
 		u /= 10
@@ -160,7 +230,40 @@ func Out(value int64) string {
 	for i, j := 0, len(buf)-1; i < j; i, j = i+1, j-1 {
 		buf[i], buf[j] = buf[j], buf[i]
 	}
-	return sign + csymbol + string(buf)
+	num := string(buf)
+	sp := func(n int) string {
+		if sepBySpace == n {
+			return " "
+		}
+		return ""
+	}
+	cs := csPrecedes != 0
+	switch signPosn {
+	case 0:
+		if cs {
+			return "(" + csymbol + sp(1) + num + ")"
+		}
+		return "(" + num + sp(1) + csymbol + ")"
+	case 2:
+		if cs {
+			return csymbol + sp(1) + num + sp(2) + signsymbol
+		}
+		return num + sp(1) + csymbol + sp(2) + signsymbol
+	case 3:
+		if cs {
+			return signsymbol + sp(2) + csymbol + sp(1) + num
+		}
+		return num + sp(1) + signsymbol + sp(2) + csymbol
+	case 4:
+		if cs {
+			return csymbol + sp(2) + signsymbol + sp(1) + num
+		}
+		return num + sp(1) + csymbol + sp(2) + signsymbol
+	}
+	if cs {
+		return signsymbol + sp(2) + csymbol + sp(1) + num
+	}
+	return signsymbol + sp(2) + num + sp(1) + csymbol
 }
 
 var smallWords = [...]string{

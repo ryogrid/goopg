@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/utils/adt/cash"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // money (M0149-0001k1). PG's Cash is an int64 count of cents
@@ -31,19 +32,57 @@ func moneyDatum(c int64) Datum {
 //   - text / unknown: cash_in;
 //   - numeric: numeric_cash, value × 100 rounded half away from zero;
 //   - int2 / int4 / int8: int4_cash / int8_cash, value × 100.
-func moneyCents(d Datum) (int64, error) {
+func moneyCents(d Datum) (int64, error) { return moneyCentsConv(d, cash.CLocale) }
+
+// moneyCentsCtx is moneyCents under the session's lc_monetary.
+func moneyCentsCtx(d Datum, ctx *Context) (int64, error) {
+	return moneyCentsConv(d, moneyConvFromCtx(ctx))
+}
+
+// moneyConvFromCtx reads the monetary locale data lc_monetary names.
+func moneyConvFromCtx(ctx *Context) cash.Conv {
+	monetary := "C"
+	if ctx != nil && ctx.GetSetting != nil {
+		if v, ok := ctx.GetSetting("lc_monetary"); ok {
+			monetary = v
+		}
+	}
+	return MoneyConvFor(monetary)
+}
+
+// MoneyConvFor is cash's view of a locale's monetary localeconv fields.
+func MoneyConvFor(monetary string) cash.Conv {
+	m := misc.MonetaryConvFor(monetary)
+	return cash.Conv{
+		CurrencySymbol: m.CurrencySymbol, MonDecimalPoint: m.MonDecimalPoint,
+		MonThousandsSep: m.MonThousandsSep, MonGrouping: m.MonGrouping,
+		PositiveSign: m.PositiveSign, NegativeSign: m.NegativeSign, FracDigits: m.FracDigits,
+		PCsPrecedes: m.PCsPrecedes, PSepBySpace: m.PSepBySpace, NCsPrecedes: m.NCsPrecedes,
+		NSepBySpace: m.NSepBySpace, PSignPosn: m.PSignPosn, NSignPosn: m.NSignPosn,
+	}
+}
+
+// moneyCentsConv is moneyCents under the given monetary locale: cash_in
+// parses with its symbols, and int8_cash / numeric_cash scale by its
+// frac_digits.
+func moneyCentsConv(d Datum, conv cash.Conv) (int64, error) {
+	frac := conv.FractionDigits()
+	scale := int64(1)
+	for i := 0; i < frac; i++ {
+		scale *= 10
+	}
 	switch d.Kind {
 	case KindString:
-		c, err := cash.In(d.StringValue())
+		c, err := cash.InLocale(d.StringValue(), conv)
 		if err != nil {
 			return 0, moneyInputError(err)
 		}
 		return c, nil
 	case KindInt:
-		if d.Int > math.MaxInt64/100 || d.Int < math.MinInt64/100 {
+		if d.Int > math.MaxInt64/scale || d.Int < math.MinInt64/scale {
 			return 0, &ExecError{Code: "22003", Message: "money out of range"}
 		}
-		return d.Int * 100, nil
+		return d.Int * scale, nil
 	case KindNumeric:
 		mant := d.NumericBigValue()
 		if mant == nil {
@@ -51,10 +90,10 @@ func moneyCents(d Datum) (int64, error) {
 		}
 		scale := int(d.NumericScaleValue())
 		v := new(big.Int).Set(mant)
-		if scale <= 2 {
-			v.Mul(v, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(2-scale)), nil))
+		if scale <= frac {
+			v.Mul(v, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(frac-scale)), nil))
 		} else {
-			div := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale-2)), nil)
+			div := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale-frac)), nil)
 			q, r := new(big.Int).QuoRem(v, div, new(big.Int))
 			// round half away from zero, as numeric_int8 (round_var) does
 			if new(big.Int).Mul(new(big.Int).Abs(r), big.NewInt(2)).Cmp(div) >= 0 {
@@ -86,15 +125,23 @@ func moneyInputError(err error) error {
 // MoneyText renders a money Datum as cash_out does ("$1,234.56"); a value
 // that is not a money Datum (legacy text) is rendered from its cash_in parse,
 // or verbatim when even that fails.
-func MoneyText(d Datum) string {
+func MoneyText(d Datum) string { return MoneyTextConv(d, cash.CLocale) }
+
+// MoneyTextLocale is MoneyText under an lc_monetary setting.
+func MoneyTextLocale(d Datum, monetary string) string {
+	return MoneyTextConv(d, MoneyConvFor(monetary))
+}
+
+// MoneyTextConv renders a money Datum with cash_out under conv.
+func MoneyTextConv(d Datum, conv cash.Conv) string {
 	if d.Kind == KindNumeric && d.NumericBigValue() == nil && d.NumericScaleValue() == 2 {
-		return cash.Out(d.NumericMantissaValue())
+		return cash.OutLocale(d.NumericMantissaValue(), conv)
 	}
-	c, err := moneyCents(d)
+	c, err := moneyCentsConv(d, conv)
 	if err != nil {
 		return d.Format()
 	}
-	return cash.Out(c)
+	return cash.OutLocale(c, conv)
 }
 
 // isMoneyTypeName reports whether a lowered type name is money.

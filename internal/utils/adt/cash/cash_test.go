@@ -61,3 +61,36 @@ func TestWords(t *testing.T) {
 		}
 	}
 }
+
+// TestLocaleMoney pins cash_out and cash_in under de_DE.UTF-8's and
+// ja_JP.UTF-8's monetary data, as PG 18.3 prints and reads them.
+func TestLocaleMoney(t *testing.T) {
+	de := Conv{CurrencySymbol: "€", MonDecimalPoint: ",", MonThousandsSep: ".", MonGrouping: 3,
+		NegativeSign: "-", FracDigits: 2, PCsPrecedes: 0, PSepBySpace: 1, NCsPrecedes: 0,
+		NSepBySpace: 1, PSignPosn: 1, NSignPosn: 1}
+	ja := Conv{CurrencySymbol: "￥", MonDecimalPoint: ".", MonThousandsSep: ",", MonGrouping: 3,
+		NegativeSign: "-", FracDigits: 0, PCsPrecedes: 1, PSepBySpace: 0, NCsPrecedes: 1,
+		NSepBySpace: 0, PSignPosn: 1, NSignPosn: 4}
+	cases := []struct {
+		conv  Conv
+		value int64
+		want  string
+	}{
+		{de, 123456, "1.234,56 €"},
+		{de, -123456, "-1.234,56 €"},
+		{ja, 1235, "￥1,235"},
+		{ja, -1235, "￥-1,235"},
+		{CLocale, -123456, "-$1,234.56"},
+	}
+	for _, c := range cases {
+		if got := OutLocale(c.value, c.conv); got != c.want {
+			t.Errorf("OutLocale(%d) = %q, want %q", c.value, got, c.want)
+		}
+	}
+	if v, err := InLocale("1.234,56 €", de); err != nil || v != 123456 {
+		t.Errorf("InLocale de = %d, %v", v, err)
+	}
+	if v, err := InLocale("￥1,235", ja); err != nil || v != 1235 {
+		t.Errorf("InLocale ja = %d, %v", v, err)
+	}
+}

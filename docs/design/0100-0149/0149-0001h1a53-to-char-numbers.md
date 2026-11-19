@@ -53,3 +53,17 @@ that output for `TestToCharMatchesPG18`.
 - Locale strings are used as stored, so a locale whose codeset is not UTF\-8 is not converted to the database
   encoding \(M0149\-0001h1a73\).
 - `to_number` is a separate function and is not changed here.
+
+## money under lc\_monetary \(M0149\-0001h1a73\)
+
+`misc.MonetaryConvFor` reads the rest of LC\_MONETARY from the same locale data: mon\_decimal\_point,
+mon\_thousands\_sep, mon\_grouping, frac\_digits and the p/n\_cs\_precedes, p/n\_sep\_by\_space and p/n\_sign\_posn fields,
+with CHAR\_MAX in the C locale. `cash.InLocale` and `cash.OutLocale` are cash\_in and cash\_out over those fields, with
+cash.c's defaults and range checks; `In` and `Out` keep the C locale for storage and other session\-free paths.
+Casts into and out of money, int8\_cash and numeric\_cash scaling by frac\_digits, and the wire output follow the
+session's lc\_monetary. Money output and input under C, en\_US, de\_DE, fr\_FR and ja\_JP match PG 18.3 started with
+the same LOCPATH.
+
+Not covered \(M0149\-0001h1a87\): COPY and array input/output of money still use the C locale; `money::numeric` assumes
+two fraction digits; locale strings in another codeset are not converted to the database encoding.
+

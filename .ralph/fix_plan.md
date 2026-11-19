@@ -12526,13 +12526,20 @@ verify each at HEAD when the task starts.
     - Equality on non\-canonical numrange text, range ordering in sorts, the range functions and user range types are M0149\-0001h1a86.
     - Design: docs/design/0100\-0149/0149\-0001h1a72\-range\-operators.md.
     Movement: yes — regress runner rangetypes 832 → 463, multirangetypes 1843 → 1830, without\_overlaps 563 → 558, box 312 → 310, polygon 155 → 151
-- [ ] **M0149-0001h1a73 — monetary and numeric locale data beyond to\_char** (filed 2026-11-19 by M0149-0001h1a58)
+- [x] **M0149-0001h1a73 — monetary and numeric locale data beyond to\_char** (filed 2026-11-19 by M0149-0001h1a58)
   Kind: impl
   Parent: M0149-0001h1a
   - Locale strings are not converted to the database encoding when the locale's codeset differs \(db\_encoding\_convert in
     PGLC\_localeconv\), and PG's warning for an undeterminable codeset is not raised.
   - money input and output ignore lc\_monetary \(cash\_in, cash\_out\); internal/utils/adt/cash is fixed to the C locale's form.
   - Resume: misc.LocaleConvFor needs the remaining monetary fields; pass them to cash.In and cash.Out.
+  - 2026\-11\-19 \(landed\):
+    - misc.MonetaryConvFor reads all monetary localeconv fields; cash.InLocale and cash.OutLocale port cash\_in and cash\_out
+      over them. Money casts, int and numeric to money scaling, and the wire output follow lc\_monetary.
+    - 90 statements under C, en\_US, de\_DE, fr\_FR and ja\_JP match PG 18.3 with the same LOCPATH.
+    - COPY and array money, money::numeric under other frac\_digits, codeset conversion and `-1234.56::money` precedence are M0149\-0001h1a87.
+    - Design: docs/design/0100\-0149/0149\-0001h1a53\-to\-char\-numbers.md \(new section\).
+    Movement: none — the regress suite runs in the C locale; regress runner over all 165 failed cases changed only in known flakes \(75464 → 75465\)
 - [ ] **M0149-0001h1a74 — remaining time output and operator error gaps** (filed 2026-11-19 by M0149-0001h1a59)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12642,6 +12649,15 @@ verify each at HEAD when the task starts.
   - isempty, lower\_inc, upper\_inf, range\_merge and the rest of the range functions do not exist.
   - Operators over user\-defined range types and multiranges are not resolved.
   - Resume: range\_ops.go in internal/executor; the sort comparator for range types; rangeOpCall for catalog range types.
+- [ ] **M0149-0001h1a87 — money locale gaps outside casts and output** (filed 2026-11-19 by M0149-0001h1a73)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - COPY text input and output and array input of money use the C locale; PG uses cash\_in and cash\_out under lc\_monetary.
+  - `money::numeric` divides by 100 whatever frac\_digits is \(cash\_numeric uses the locale's scale\).
+  - Locale strings in a codeset other than the database encoding are not converted \(PGLC\_localeconv's db\_encoding\_convert\),
+    and PG's warning for an undeterminable codeset is not raised.
+  - `select -1234.56::money` returns a value; PG applies the cast first and raises `operator does not exist: - money`.
+  - Resume: datumToCopyText and copyTextToDatum need the session's lc\_monetary; the money to numeric cast; doNegate in the parser.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a

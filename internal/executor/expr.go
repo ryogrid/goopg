@@ -1060,7 +1060,7 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		if isMoneyTypeName(x.SourceType) && !v.IsNull() {
 			switch strings.ToLower(castTargetType) {
 			case "text", "varchar", "character varying", "bpchar", "char", "character", "name":
-				return evalCastTyped(NewStringDatum(MoneyText(v)), castTargetType, "text", x.Pos(), ctx)
+				return evalCastTyped(NewStringDatum(MoneyTextConv(v, moneyConvFromCtx(ctx))), castTargetType, "text", x.Pos(), ctx)
 			}
 		}
 		// A failing literal is reported at the literal, as PG does when it
@@ -6539,7 +6539,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		// goopg's money Datum, a scale-2 numeric of the Cash value. Before
 		// this arm `::money` fell to the catch-all pass-through and kept the
 		// input text, so money compared and sorted as text.
-		c, err := moneyCents(d)
+		c, err := moneyCentsCtx(d, ctx)
 		if err != nil {
 			if ee, ok := err.(*ExecError); ok {
 				ee.Pos = pos

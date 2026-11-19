@@ -179,3 +179,62 @@ func LocaleConvFor(numeric, monetary string) LocaleConv {
 		nlCurrencySymbol, nlPositiveSign, nlNegativeSign)
 	return LocaleConv{DecimalPoint: n[0], ThousandsSep: n[1], CurrencySymbol: m[0], PositiveSign: m[1], NegativeSign: m[2]}
 }
+
+// MonetaryConv is the LC_MONETARY half of localeconv that cash_in and
+// cash_out read. The char fields hold CHAR_MAX (127) when the locale leaves
+// them unset, as the C locale does.
+type MonetaryConv struct {
+	CurrencySymbol  string
+	MonDecimalPoint string
+	MonThousandsSep string
+	MonGrouping     int
+	PositiveSign    string
+	NegativeSign    string
+	FracDigits      int
+	PCsPrecedes     int
+	PSepBySpace     int
+	NCsPrecedes     int
+	NSepBySpace     int
+	PSignPosn       int
+	NSignPosn       int
+}
+
+// LC_MONETARY item positions (glibc's _NL_ITEM order).
+const (
+	nlMonDecimalPoint = 2
+	nlMonThousandsSep = 3
+	nlMonGrouping     = 4
+	nlFracDigits      = 8
+	nlPCsPrecedes     = 9
+	nlPSepBySpace     = 10
+	nlNCsPrecedes     = 11
+	nlNSepBySpace     = 12
+	nlPSignPosn       = 13
+	nlNSignPosn       = 14
+)
+
+// MonetaryConvFor is localeconv's monetary fields under the lc_monetary setting.
+func MonetaryConvFor(monetary string) MonetaryConv {
+	name := resolveLocaleSetting(monetary, "LC_MONETARY")
+	m := localeStrings(name, lcMonetary, nlCurrencySymbol, nlMonDecimalPoint, nlMonThousandsSep,
+		nlMonGrouping, nlPositiveSign, nlNegativeSign, nlFracDigits, nlPCsPrecedes, nlPSepBySpace,
+		nlNCsPrecedes, nlNSepBySpace, nlPSignPosn, nlNSignPosn)
+	if name == "C" || name == "POSIX" || m[7] == "" && m[1] == "" && m[0] == "" {
+		// No data: the C locale, whose char fields are CHAR_MAX.
+		return MonetaryConv{MonGrouping: 127, FracDigits: 127, PCsPrecedes: 127, PSepBySpace: 127,
+			NCsPrecedes: 127, NSepBySpace: 127, PSignPosn: 127, NSignPosn: 127}
+	}
+	char := func(s string) int {
+		if s == "" {
+			return 0
+		}
+		return int(int8(s[0]))
+	}
+	return MonetaryConv{
+		CurrencySymbol: m[0], MonDecimalPoint: m[1], MonThousandsSep: m[2], MonGrouping: char(m[3]),
+		PositiveSign: m[4], NegativeSign: m[5], FracDigits: char(m[6]),
+		PCsPrecedes: char(m[7]), PSepBySpace: char(m[8]), NCsPrecedes: char(m[9]), NSepBySpace: char(m[10]),
+		PSignPosn: char(m[11]), NSignPosn: char(m[12]),
+	}
+}
+
