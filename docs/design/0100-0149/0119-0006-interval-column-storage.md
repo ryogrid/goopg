@@ -179,3 +179,11 @@ slice removes `interval` from the class; `numeric` and `uuid` remain.
    returns `t` — the same lexicographic defect this slice fixed for the scalar,
    one container down. Resume point: `encodeArrayValuePG` /
    `decodePGTextArrayElements` in `internal/executor/codec.go`.
+
+## "ago" \(M0149\-0001h1a69\)
+
+`decodeIntervalFields` handles DecodeInterval's AGO keyword: when the last field is `ago` the remaining
+fields are decoded and every component is negated, so `'3 mons ago'` is `-3 mons` and `'-1 day ago'` is
+`1 day`. As in PG it is a bad format anywhere else, twice, or right after a bare number, because AGO leaves no
+unit for that number.
+

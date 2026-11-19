@@ -12473,12 +12473,17 @@ verify each at HEAD when the task starts.
     - Views, current\-time literals and the `epoch` index condition remain \(M0149\-0001h1a81\).
     - Design: docs/design/0100\-0149/0149\-0001h1a68\-datetime\-literals\-at\-plan\-time.md.
     Movement: yes — regress runner alter\_table 685 → 672, partition\_prune 1675 → 1674
-- [ ] **M0149-0001h1a69 — interval input rejects `ago`** (filed 2026-11-19 by M0149-0001h1a67)
+- [x] **M0149-0001h1a69 — interval input rejects `ago`** (filed 2026-11-19 by M0149-0001h1a67)
   Kind: impl
   Parent: M0149-0001h1a
   - `'3 mons ago'::interval` fails with `invalid input syntax`, and `interval '3 mons ago'` with a syntax error. PG gives `-3 mons`
     \(DecodeInterval negates every field\).
   - Resume: decodeIntervalFields in internal/parser/interval.go.
+  - 2026\-11\-19 \(landed\):
+    - decodeIntervalFields negates every field when the last one is `ago`, and rejects it elsewhere, twice, or after a bare
+      number, as DecodeInterval does. The cast and the typed literal both match PG 18.3.
+    - Design: docs/design/0100\-0149/0119\-0006\-interval\-column\-storage.md \(new section\).
+    Movement: yes — regress runner interval 646 → 605
 - [ ] **M0149-0001h1a70 — time and timetz input do not use PG's parser** (filed 2026-11-19 by M0149-0001h1a56)
   Kind: impl
   Parent: M0149-0001h1a
