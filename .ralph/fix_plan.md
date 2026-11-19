@@ -12457,7 +12457,7 @@ verify each at HEAD when the task starts.
       arguments. Remaining cost differences are M0149\-0001h1a80.
     - Design: docs/design/0100\-0149/0149\-0001h1a66\-generate\-series\-estimates.md.
     Movement: yes — regress runner misc\_functions 231 → 208
-- [ ] **M0149-0001h1a68 — timestamp literals are read at execution instead of parse time** (filed 2026-11-19 by M0149-0001h1a63)
+- [x] **M0149-0001h1a68 — timestamp literals are read at execution instead of parse time** (filed 2026-11-19 by M0149-0001h1a63)
   Kind: impl
   Parent: M0149-0001h1a
   - A prepared statement or view with `t = '2020-01-01'` follows the zone in force when it runs. PG fixes the value when the
@@ -12465,6 +12465,14 @@ verify each at HEAD when the task starts.
   - EXPLAIN has the same cause: it prints `'2020-01-01'::timestamp with time zone`, where PG prints the resolved
     `'2020-01-01 00:00:00-05'::timestamp with time zone`.
   - Resume: the planner needs the session TimeZone to fold these literals; views need their stored text rewritten.
+  - 2026\-11\-19 \(landed\):
+    - TimeZone and DateStyle are planner settings and part of the plan cache key. After planning, every date/time literal,
+      cast string and compared string gets its output text, checked to read back as the same value.
+    - PREPARE keeps its TimeZone and DateStyle for EXECUTE, so a prepared statement keeps the zone it was prepared under.
+    - The regress A/B found an endless loop when reading a zone abbreviation under a POSIX session zone \(horology\); fixed in zonePeriods.
+    - Views, current\-time literals and the `epoch` index condition remain \(M0149\-0001h1a81\).
+    - Design: docs/design/0100\-0149/0149\-0001h1a68\-datetime\-literals\-at\-plan\-time.md.
+    Movement: yes — regress runner alter\_table 685 → 672, partition\_prune 1675 → 1674
 - [ ] **M0149-0001h1a69 — interval input rejects `ago`** (filed 2026-11-19 by M0149-0001h1a67)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12559,6 +12567,15 @@ verify each at HEAD when the task starts.
   - A one\-row table analyzed just after insert shows `Seq Scan ... cost=0.00..0.01`; PG `0.00..1.01` \(one page\).
   - A Hash Join over two function scans costs `0.33..2.80`, PG `0.23..1.71`.
   - Resume: DeriveLegacyDisplayCost's GenerateSeries arm in internal/optimizer/plancost.go; then compare the join costs.
+- [ ] **M0149-0001h1a81 — date/time literals in views, current\-time literals and epoch** (filed 2026-11-19 by M0149-0001h1a68)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - A view keeps its source text and is planned again at each use, so `create view v as select t = '2020-01-01' ...`
+    compares with the zone of the query; PG fixes the instant at CREATE VIEW and pg\_get\_viewdef prints it.
+  - `'now'`, `'today'`, `'tomorrow'` and `'yesterday'` are read at run time and EXPLAIN prints them as written; PG converts them
+    at parse time. goopg's plan cache reuses plans across statements, so converting needs a cache rule first.
+  - `t > 'epoch'` on an indexed timestamptz column stays a filter; PG uses it as an index condition.
+  - Resume: the view definition store \(CREATE VIEW\) for the first; the plan cache key for the second.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a

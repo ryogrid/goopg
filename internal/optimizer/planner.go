@@ -183,6 +183,7 @@ func planWithRtableSize(stmt parser.Stmt, cat catalog.Catalog, plannerSet Planne
 	// could see refs==1 while a later sibling subquery adds a second
 	// reference to the same shared body.
 	pushQualsThroughSingleRefCTEs(node)
+	canonicalizeDateTimeLiterals(node, plannerSet)
 	// M0148-0001k: a restriction on an inheritance / partition appendrel
 	// filters at every member scan, as set_append_rel_size gives each
 	// child rel its own translated copy (appendrel_pushdown.go).

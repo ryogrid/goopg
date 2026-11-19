@@ -50,6 +50,7 @@ var costGUCValues = map[string]string{
 	"geqo_effort": "10", "geqo_pool_size": "100",
 	"geqo_generations": "50", "geqo_selection_bias": "1.8",
 	"geqo_seed": "0.5",
+	"timezone": "Asia/Tokyo", "datestyle": "SQL, DMY",
 }
 
 func TestSessionPlannerFingerprintDetectsEveryCostGUC(t *testing.T) {

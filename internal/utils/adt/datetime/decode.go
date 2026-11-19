@@ -734,7 +734,10 @@ func zonePeriods(loc *time.Location) []zonePeriod {
 		name, off := t.Zone()
 		out = append(out, zonePeriod{t.Unix(), strings.ToUpper(name), off, t.IsDST()})
 		_, end := t.ZoneBounds()
-		if end.IsZero() || end.After(limit) {
+		// A zone built from a POSIX TZ string (misc.posixLocation) can
+		// report a bound that does not move forward; stop there rather
+		// than loop and grow out without end.
+		if end.IsZero() || !end.After(t) || end.After(limit) {
 			break
 		}
 		t = end

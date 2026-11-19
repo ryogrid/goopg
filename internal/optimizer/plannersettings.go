@@ -120,6 +120,13 @@ type PlannerSettings struct {
 	// C-19h.
 	EnableGatherMerge bool
 
+	// TimeZone and DateStyle are the session's GUCs. A date/time literal is
+	// read when the statement is planned, as PG reads it at parse time, so
+	// they are planner inputs (canonicalizeDateTimeLiterals). "" means the
+	// built-in default.
+	TimeZone  string
+	DateStyle string
+
 	// EnableHashAgg / EnablePresortedAggregate / Geqo / GeqoThreshold are the
 	// remaining P2-02c bridges. Same defect as EnableMemoize below: each
 	// reached the planner through a registry.OnChange bridge writing a
@@ -266,6 +273,8 @@ type PlannerSettings struct {
 func DefaultPlannerSettings() PlannerSettings {
 	cp := defaultCostParams()
 	return PlannerSettings{
+		TimeZone:  "UTC",      // TimeZone BootVal (internal/utils/misc/defaults.go)
+		DateStyle: "ISO, MDY", // DateStyle BootVal
 		EnableHashJoin:  true,
 		EnableMergeJoin: true,
 		EnableNestLoop:  true,

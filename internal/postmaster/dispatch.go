@@ -781,6 +781,9 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 					return s.writeQueryError(w, "42P05",
 						fmt.Sprintf("prepared statement %q already exists", ps.Name))
 				}
+				if lit := ctxPlannerSettings(ectx); lit.TimeZone != "" || lit.DateStyle != "" {
+					prepStmts.SetLiteralSettings(ps.Name, &executor.PreparedLiteralSettings{TimeZone: lit.TimeZone, DateStyle: lit.DateStyle})
+				}
 				// Infer result column types and undeclared parameter types by planning/walking.
 				if ectx.Catalog != nil {
 					if plan, planErr := optimizer.PlanWithSettings(ps.Query, sessionPlanCatalog(sess, ectx.Catalog, ectx.CurrentDatabaseOid), sessionPlannerSettings(sess)); planErr == nil {
@@ -808,6 +811,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 			continue
 		}
 		restoreParams := ectx.Params
+		restoreLiterals := ectx.PreparedLiterals
 		if es, ok := stmt.(*parser.ExecuteStmt); ok {
 			if prepStmts != nil {
 				if prepDef, found := prepStmts.Lookup(es.Name); found {
@@ -894,6 +898,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 					}
 					stmt = prepDef.stmt
 					ectx.Params = params
+					ectx.PreparedLiterals = prepDef.literals
 					disablePlanCache = true
 				} else {
 					return s.writeQueryError(w, "26000", fmt.Sprintf("prepared statement %q does not exist", es.Name))
@@ -1166,6 +1171,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		}
 		ectx.Ctx = savedCtx
 		ectx.Params = restoreParams
+		ectx.PreparedLiterals = restoreLiterals
 		if err != nil {
 			if errors.Is(err, errQueryErrorSent) {
 				// Error + ReadyForQuery already sent to the client (M0097-0003).
@@ -1834,7 +1840,11 @@ func ctxPlannerSettings(ctx *executor.Context) optimizer.PlannerSettings {
 	if ctx == nil || ctx.GetSetting == nil {
 		return optimizer.DefaultPlannerSettings()
 	}
-	return plannerSettingsFrom(ctx.GetSetting)
+	ps := plannerSettingsFrom(ctx.GetSetting)
+	if lit := ctx.PreparedLiterals; lit != nil {
+		ps.TimeZone, ps.DateStyle = lit.TimeZone, lit.DateStyle
+	}
+	return ps
 }
 
 func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSettings {
@@ -1854,6 +1864,12 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readFloat("parallel_setup_cost", &ps.ParallelSetupCost)
 	readFloat("parallel_tuple_cost", &ps.ParallelTupleCost)
 	readFloat("hash_mem_multiplier", &ps.HashMemMultiplier)
+	if v, ok := get("timezone"); ok {
+		ps.TimeZone = v
+	}
+	if v, ok := get("datestyle"); ok {
+		ps.DateStyle = v
+	}
 
 	// take2 P2-05: the planner-method toggles. These were registered GUCs with
 	// no consumer anywhere outside the pg_settings view — `SET
@@ -2071,6 +2087,8 @@ func plannerCacheFingerprint(ps optimizer.PlannerSettings, disableSeqScan, disab
 		strconv.FormatInt(ps.MinParallelIndexScanSize, 10),
 		bit(ps.ParallelLeaderParticipation),
 		bit(ps.EnableGatherMerge),
+		ps.TimeZone,
+		ps.DateStyle,
 		bit(disableSeqScan),
 		bit(disableIndexScan),
 		bit(disableBitmapScan),

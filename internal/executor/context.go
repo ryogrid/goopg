@@ -32,6 +32,10 @@ type Context struct {
 
 	// Params holds bind values for $1, $2, ... — Params[i-1] is $i.
 	Params []Datum
+	// PreparedLiterals, when set, is the TimeZone and DateStyle of the
+	// PREPARE whose statement is being executed: PG reads its literals at
+	// PREPARE, so planning at EXECUTE must read them the same way.
+	PreparedLiterals *PreparedLiteralSettings
 	// Now is the wall-clock value `current_timestamp` and friends
 	// resolve to. Captured once at statement start so retries see
 	// consistent values, matching upstream.
@@ -2189,3 +2193,11 @@ func sessionTempOwner(ctx *Context) string {
 	}
 	return ""
 }
+
+// PreparedLiteralSettings is the TimeZone and DateStyle a prepared statement
+// was parsed under.
+type PreparedLiteralSettings struct {
+	TimeZone  string
+	DateStyle string
+}
+

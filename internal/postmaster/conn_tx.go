@@ -731,6 +731,20 @@ type preparedStatementDef struct {
 	// equalRowTypes (postgres/src/backend/utils/cache/plancache.c:858).
 	// M0134-0054 bucket 5.
 	resultNames []string
+	// literals is the TimeZone and DateStyle in force at PREPARE, under which
+	// EXECUTE plans the statement's date/time literals.
+	literals *executor.PreparedLiteralSettings
+}
+
+// SetLiteralSettings records the settings the statement's literals are read
+// under.
+func (ps *preparedStatements) SetLiteralSettings(name string, s *executor.PreparedLiteralSettings) {
+	ps.mu.Lock()
+	if def, ok := ps.stmts[name]; ok {
+		def.literals = s
+		ps.stmts[name] = def
+	}
+	ps.mu.Unlock()
 }
 
 // preparedStatements stores named prepared SQL statements for this connection.
