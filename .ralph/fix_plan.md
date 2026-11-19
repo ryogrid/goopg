@@ -12445,11 +12445,18 @@ verify each at HEAD when the task starts.
     - PG's errors for `interval * interval`, `interval / interval`, `number / interval` and `date + unknown` are raised.
     - sum and avg over interval are missing \(M0149\-0001h1a79\). EXPLAIN keeps the spelling of these literals \(h1a74\).
     Movement: yes — regress runner timestamp 213 → 185
-- [ ] **M0149-0001h1a66 — compare generate\_series row estimates for numeric and timestamps with PG** (filed 2026-11-19 by M0149-0001h1a60)
+- [x] **M0149-0001h1a66 — compare generate\_series row estimates for numeric and timestamps with PG** (filed 2026-11-19 by M0149-0001h1a60)
   Kind: impl
   Parent: M0149-0001h1a
   - PG has planner support functions for these forms \(generate\_series\_numeric\_support, generate\_series\_timestamp\_support\).
     goopg's estimates for them have not been compared.
+  - 2026\-11\-19 \(landed\):
+    - Every FROM generate\_series was estimated at 1 row, the integer form included. generateSeriesRows now applies the
+      formulas of the support functions to arguments evaluated at plan time, and prorows 1000 otherwise.
+    - Rows match PG 18.3 for integer, numeric and timestamp forms, NULL, zero step, now\(\), volatile and correlated
+      arguments. Remaining cost differences are M0149\-0001h1a80.
+    - Design: docs/design/0100\-0149/0149\-0001h1a66\-generate\-series\-estimates.md.
+    Movement: yes — regress runner misc\_functions 231 → 208
 - [ ] **M0149-0001h1a68 — timestamp literals are read at execution instead of parse time** (filed 2026-11-19 by M0149-0001h1a63)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12544,6 +12551,14 @@ verify each at HEAD when the task starts.
   - `select sum(i), avg(i) from (values ('1 hour'::interval),('2 hours')) v(i)` raises `aggregate sum requires numeric argument
     in v0`; PG returns `03:00:00` and `01:30:00` \(interval\_sum, interval\_avg\).
   - Resume: the sum/avg transition in internal/executor/operators\_join\_agg.go.
+- [ ] **M0149-0001h1a80 — function scan and small\-table costs differ from PG** (filed 2026-11-19 by M0149-0001h1a66)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `generate_series(now(), now() + '1 day', '1 hour')` costs `0.00..0.25`; PG `0.01..0.26`, because cost\_functionscan
+    charges the argument evaluation as startup cost.
+  - A one\-row table analyzed just after insert shows `Seq Scan ... cost=0.00..0.01`; PG `0.00..1.01` \(one page\).
+  - A Hash Join over two function scans costs `0.33..2.80`, PG `0.23..1.71`.
+  - Resume: DeriveLegacyDisplayCost's GenerateSeries arm in internal/optimizer/plancost.go; then compare the join costs.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a

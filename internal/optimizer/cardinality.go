@@ -294,8 +294,88 @@ func EstimateRows(n Node) int64 {
 			return r
 		}
 		return estimateNLIndexJoin(x)
+	case *GenerateSeries:
+		return generateSeriesRows(x)
 	}
 	return 0
+}
+
+// EstimateSeriesRows evaluates generate_series arguments at plan time and
+// returns the row count its planner support function computes
+// (generate_series_int4_support, _numeric_support, _timestamp_support), or
+// false when there is no estimate. The executor registers it, as it does
+// EvalConstFunc.
+var EstimateSeriesRows func(args []Expr) (float64, bool)
+
+// generateSeriesRows is set_function_size_estimates for generate_series: the
+// support function's count when every argument can be estimated, else
+// prorows, which is 1000 for every generate_series variant.
+func generateSeriesRows(x *GenerateSeries) int64 {
+	args := []Expr{x.Start, x.Stop}
+	if x.Step != nil {
+		args = append(args, x.Step)
+	}
+	if EstimateSeriesRows != nil && seriesArgsEstimable(args) {
+		if rows, ok := EstimateSeriesRows(args); ok {
+			return int64(clampRowEst(rows))
+		}
+	}
+	return 1000
+}
+
+// seriesArgsEstimable reports whether estimate_expression_value could reduce
+// every argument to a constant: literals, casts, operators and plain function
+// calls, with no column, parameter or subquery inside.
+func seriesArgsEstimable(args []Expr) bool {
+	for _, a := range args {
+		if !seriesArgEstimable(a) {
+			return false
+		}
+	}
+	return true
+}
+
+func seriesArgEstimable(e Expr) bool {
+	if e == nil {
+		return true
+	}
+	if _, ok := e.(*IntegerConst); ok {
+		return true
+	}
+	if _, ok := e.(*NumericConst); ok {
+		return true
+	}
+	if _, ok := e.(*StringConst); ok {
+		return true
+	}
+	if _, ok := e.(*TypedStringLit); ok {
+		return true
+	}
+	if _, ok := e.(*IntervalLit); ok {
+		return true
+	}
+	if _, ok := e.(*NullConst); ok {
+		return true
+	}
+	if c, ok := e.(*CastExpr); ok {
+		return seriesArgEstimable(c.Operand)
+	}
+	if u, ok := e.(*UnaryOp); ok {
+		return seriesArgEstimable(u.Operand)
+	}
+	if b, ok := e.(*BinaryOp); ok {
+		return seriesArgEstimable(b.Left) && seriesArgEstimable(b.Right)
+	}
+	if f, ok := e.(*FuncCall); ok {
+		// estimate_expression_value folds immutable and stable calls only;
+		// a volatile or user-defined one keeps prorows.
+		if f.Star || f.Distinct || !catalog.IsBuiltinProcName(f.Name) ||
+			catalog.BuiltinProcIsVolatile(f.Name) || catalog.BuiltinProcReturnsSet(f.Name) {
+			return false
+		}
+		return seriesArgsEstimable(f.Args)
+	}
+	return false
 }
 
 // probeIndexKeys returns the index and the bound equality keys of an index
