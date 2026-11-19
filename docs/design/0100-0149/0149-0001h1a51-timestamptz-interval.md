@@ -37,6 +37,21 @@ named zone.
 name in any case, or an upper\-cased POSIX specification. The zone tokens of date/time input, `AT TIME ZONE`
 on timetz and `timetz` input use the same lookup \(M0149\-0001h1a61\).
 
+## pg\_timezone\_names and pg\_timezone\_abbrevs \(M0149\-0001h1a76\)
+
+`pg_timezone_names` was a fixed list of about thirty synthetic rows. `misc.TimezoneNames` now walks the tz database
+as `pg_tzenumerate_next` does: hidden entries are skipped, a file must carry a TZif header, and a leap\-second zone
+\(a non\-zero leap count, `pg_tz_acceptable`\) is left out; each zone gives its abbreviation, offset and DST flag at
+the current time.
+
+`pg_timezone_abbrevs` follows its view definition: the session zone's all\-letter abbreviations
+\(`pg_timezone_abbrevs_zone`, `datetime.ZoneAbbrevRows`\) and then the Default set without those names
+\(`datetime.DefaultAbbrevRows`\). A dynamic abbreviation that the zone data no longer uses takes the zone's offset,
+as `DetermineTimeZoneAbbrevOffsetInternal` does. The scan reads the session TimeZone.
+
+utc\_offset is still rendered in postgres\_verbose, the style pg\_regress uses, because goopg has no IntervalStyle
+output \(M0149\-0001h1a89\).
+
 ## Not covered
 
 - `generate_series` over timestamps returns wrong rows \(M0149\-0001h1a60\).

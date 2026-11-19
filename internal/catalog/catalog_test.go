@@ -762,36 +762,20 @@ func TestVerboseIntervalOffset(t *testing.T) {
 // `select * from pg_timezone_abbrevs where abbrev = 'LMT'` must return the
 // verbose-interval offset and a "f" is_dst (not "false"/"-07:52:58").
 func TestPgTimezoneAbbrevsLMTRow(t *testing.T) {
-	c := NewInMemory()
-	for _, name := range []string{"pg_timezone_abbrevs", "pg_timezone_names"} {
-		tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: name})
-		if !ok || tbl.VirtualRows == nil {
-			t.Fatalf("%s virtual table not registered", name)
+	// sysviews.sql runs under America/Los_Angeles, whose local mean time
+	// reaches pg_timezone_abbrevs through pg_timezone_abbrevs_zone.
+	var found bool
+	for _, row := range TimezoneAbbrevRows("America/Los_Angeles") {
+		if row[0] != "LMT" {
+			continue
 		}
-		var found bool
-		for _, row := range tbl.VirtualRows() {
-			// abbrev is col 0 for abbrevs, col 1 for names.
-			abbrevIdx := 0
-			isDstIdx := len(row) - 1
-			offIdx := isDstIdx - 1
-			if row[abbrevIdx] != "LMT" && row[len(row)-3] != "LMT" {
-				continue
-			}
-			// Locate the LMT row regardless of table shape.
-			if !(row[0] == "LMT" || (len(row) >= 3 && row[len(row)-3] == "LMT")) {
-				continue
-			}
-			found = true
-			if row[offIdx] != "@ 7 hours 52 mins 58 secs ago" {
-				t.Errorf("%s LMT utc_offset = %q, want verbose interval", name, row[offIdx])
-			}
-			if row[isDstIdx] != "f" {
-				t.Errorf("%s LMT is_dst = %q, want \"f\"", name, row[isDstIdx])
-			}
+		found = true
+		if row[1] != "@ 7 hours 52 mins 58 secs ago" || row[2] != "f" {
+			t.Errorf("LMT row = %q", row)
 		}
-		if !found {
-			t.Errorf("%s: no LMT row found", name)
-		}
+	}
+	if !found {
+		t.Error("pg_timezone_abbrevs: no LMT row for America/Los_Angeles")
 	}
 }
 

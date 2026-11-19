@@ -12574,12 +12574,19 @@ verify each at HEAD when the task starts.
     zone arguments of date\_trunc and evalMakeTimestamp.
   > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a75: `AT TIME ZONE` on a timestamp returns a 1970 date
   > The result differs from PG 18.3 for every timestamp input. Found while comparing zone names in h1a61.
-- [ ] **M0149-0001h1a76 — smaller differences in time zone input and listing** (filed 2026-11-19 by M0149-0001h1a61)
+- [x] **M0149-0001h1a76 — smaller differences in time zone input and listing** (filed 2026-11-19 by M0149-0001h1a61)
   Kind: impl
   Parent: M0149-0001h1a
   - `'12:00 asia/tokyo'::timetz` is accepted as `12:00:00+09`; PG raises invalid input syntax because the zone needs a date.
   - `pg_timezone_names` returns no row for `Asia/Tokyo`.
   - Resume: parseTimeTZString for the first; the pg\_timezone\_names source for the second.
+  - 2026\-11\-20 \(landed\):
+    - The timetz case was already fixed by M0149\-0001h1a70's DecodeTimeOnly port.
+    - pg\_timezone\_names enumerates the tz database \(pg\_tzenumerate\_next\); pg\_timezone\_abbrevs lists the session zone's
+      abbreviations and then the Default set, as its view does. Names, abbreviations, offsets and DST flags match PG 18.3.
+    - utc\_offset stays in postgres\_verbose: goopg has no IntervalStyle output \(M0149\-0001h1a89\).
+    - Design: docs/design/0100\-0149/0149\-0001h1a51\-timestamptz\-interval.md \(new section\).
+    Movement: none — regress runner over all 165 failed cases changed only in known flakes \(75461 → 75455\); sysviews stays passing
 - [ ] **M0149-0001h1a77 — the numeric scale function is missing** (filed 2026-11-19 by M0149-0001h1a62)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12675,6 +12682,16 @@ verify each at HEAD when the task starts.
   - `select '1 day' * 2` raises `operator * requires integer operands`; PG reads the literal as an integer and raises
     `invalid input syntax for type integer`.
   - Resume: the json function table in internal/executor; VALUES pull\-up in the planner; the SQLValueFunction deparse.
+- [ ] **M0149-0001h1a89 — IntervalStyle is ignored** (filed 2026-11-20 by M0149-0001h1a76)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `set intervalstyle = postgres_verbose; select '05:30:00'::interval` prints `05:30:00`; PG prints `@ 5 hours 30 mins`.
+    sql\_standard and iso\_8601 are ignored too. pg\_regress and goopg's regress runner set postgres\_verbose, so every
+    interval in the regress output follows the wrong style.
+  - The timezone views pre\-render utc\_offset in postgres\_verbose to keep sysviews passing; once this lands they should
+    emit interval values.
+  - Resume: EncodeInterval's four styles in internal/utils/adt/datetime/interval\_format.go, read from the session in the
+    wire output and the text casts.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a
