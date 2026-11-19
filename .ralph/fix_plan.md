@@ -12387,13 +12387,19 @@ verify each at HEAD when the task starts.
       lc\_numeric and lc\_monetary, from a locale directory, LOCPATH or locale\-archive.
     - About 3,800 statements under C, C.UTF\-8, en\_US, de\_DE, fr\_FR and ja\_JP match PG 18.3 started with the same LOCPATH.
     Movement: none — the regress suite runs in the C locale; all 165 failed cases changed only in the known flakes
-- [ ] **M0149-0001h1a59 — time plus or minus an interval prints a date and has no result type** (filed 2026-11-19 by M0149-0001h1a51)
+- [x] **M0149-0001h1a59 — time plus or minus an interval prints a date and has no result type** (filed 2026-11-19 by M0149-0001h1a51)
   Kind: impl
   Parent: M0149-0001h1a
   - `'10:00'::time + '1 hour'::interval` prints `1970-01-01 11:00:00`, and pg\_typeof says unknown. PG prints `11:00:00` and wraps
     at midnight \(time\_pl\_interval\).
   - Cause: a time value is an ordinary KindTime Datum, because TimeSubTime is declared but not set.
   - Resume: set TimeSubTime where time values are made, then handle it in addTimeIntervalInZone and exprType.
+  - 2026\-11\-19 \(landed\):
+    - `+` and `-` on time and timetz resolve from static types through one table, parser.ResolveTimeOperator, used by the
+      analyzer and the planner. This includes untyped operands and the implicit time to interval cast.
+    - timetz keeps its offset in text output. timestamptz casts to time and timetz, current\_time and localtime use the session zone.
+    - Design: docs/design/0100\-0149/0149\-0001h1a59\-time\-operators.md. Remaining gaps are filed as M0149\-0001h1a74.
+    Movement: yes — regress runner over all 165 failed cases 76077 → 76007 lines; horology 2348 → 2294, interval 654 → 646
 - [ ] **M0149-0001h1a61 — date\_add matches time zone names case\-sensitively** (filed 2026-11-19 by M0149-0001h1a51)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12463,6 +12469,16 @@ verify each at HEAD when the task starts.
     PGLC\_localeconv\), and PG's warning for an undeterminable codeset is not raised.
   - money input and output ignore lc\_monetary \(cash\_in, cash\_out\); internal/utils/adt/cash is fixed to the C locale's form.
   - Resume: misc.LocaleConvFor needs the remaining monetary fields; pass them to cash.In and cash.Out.
+- [ ] **M0149-0001h1a74 — remaining time output and operator error gaps** (filed 2026-11-19 by M0149-0001h1a59)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - A plain time value prints with a date in format, concat and row output: `format('%s', '10:00'::time)` gives
+    `1970-01-01 10:00:00`, PG gives `10:00:00`. TimeSubTime is declared but never set.
+  - `'10:00'::time + 1` raises `operator + requires integer operands`; PG raises `operator does not exist: time without
+    time zone + integer` with its hint. Bare integer literals are typed int8 here, so the message needs the literal's PG type.
+  - EXPLAIN prints a time literal as written \(`'09:00'`, or `'11:00'` in a comparison\); PG prints `'09:00:00'::time without
+    time zone`.
+  - Resume: set TimeSubTime in NewTimeDatum's time\-of\-day callers, parser.ResolveTimeOperator for the error, castLiteralConstText for EXPLAIN.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a

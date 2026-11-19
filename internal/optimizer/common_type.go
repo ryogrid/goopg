@@ -5,6 +5,8 @@ import (
 	"math"
 	"strconv"
 	"strings"
+
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // commonTypeCanonical maps the spellings exprType returns (SQL-standard
@@ -410,4 +412,90 @@ func coerceTimestampOperands(l, r Expr) (Expr, Expr) {
 		return l, typedTimestampLiteral(r, t)
 	}
 	return typedTimestampLiteral(l, timestampLiteralType(r)), r
+}
+
+// timeArithCall resolves the time and timetz operators of pg_operator to their
+// functions, as moneyArithCall does for money. An untyped literal takes the type
+// PG's operator resolution picks: interval, except that time - 'x' is time.
+func timeArithCall(pos int, op parser.OpCode, l, r Expr) (Expr, bool, error) {
+	kind := func(e Expr) string {
+		if _, ok := e.(*StringConst); ok {
+			return "unknown"
+		}
+		if _, ok := e.(*NullConst); ok {
+			return "unknown"
+		}
+		t := exprType(e)
+		if t.IsArray {
+			return ""
+		}
+		return commonTypeCanonical(t.Name)
+	}
+	lk, rk := kind(l), kind(r)
+	result, status := parser.ResolveTimeOperator(op, lk, rk)
+	switch status {
+	case parser.TimeOperatorNone:
+		return nil, false, nil
+	case parser.TimeOperatorMissing, parser.TimeOperatorAmbiguous:
+		code, message, hint := parser.TimeOperatorError(status, op, lk, rk)
+		return nil, false, &PlanError{Pos: pos, Code: code, Message: message, Hint: hint}
+	}
+	sub := op == parser.OpSub
+	// An untyped operand is time in time - unknown and unknown - time, and
+	// interval everywhere else.
+	literalType := "interval"
+	if sub && (lk == "time" || rk == "time") {
+		literalType = "time"
+	}
+	literal := func(e Expr) Expr {
+		lit, ok := e.(*StringConst)
+		if !ok {
+			return e // NULL needs no conversion: every function here is strict.
+		}
+		if castTargetTakesStringLiteral(literalType) {
+			return &TypedStringLit{pos: lit.Pos(), Type: literalType, Value: lit.Value}
+		}
+		return &CastExpr{pos: lit.Pos(), Operand: lit, TargetType: literalType, SourceType: "unknown"}
+	}
+	if lk == "unknown" {
+		l, lk = literal(l), literalType
+	}
+	if rk == "unknown" {
+		r, rk = literal(r), literalType
+	}
+	asInterval := func(e Expr) Expr {
+		return &CastExpr{pos: e.Pos(), Operand: e, TargetType: "interval", SourceType: "time"}
+	}
+	isTime := func(n string) bool { return n == "time" || n == "timetz" }
+	// timedate_pl, timetzdate_pl and the interval + x operators are SQL functions
+	// that PG inlines with their arguments reversed, so EXPLAIN shows them that way.
+	if !sub && isTime(lk) && rk == "date" {
+		l, r, lk, rk = r, l, rk, lk
+	}
+	if !sub && lk == "time" && rk != "interval" {
+		l, lk = asInterval(l), "interval"
+	}
+	if rk == "time" && lk != "time" && (sub || (lk != "date" && lk != "interval")) {
+		r, rk = asInterval(r), "interval"
+	}
+	if !sub && lk == "interval" && rk != "interval" {
+		l, r, lk, rk = r, l, rk, lk
+	}
+	fn := ""
+	switch {
+	case isTime(lk) && rk == "interval" && sub:
+		fn = lk + "_mi_interval"
+	case isTime(lk) && rk == "interval":
+		fn = lk + "_pl_interval"
+	case lk == "time" && rk == "time":
+		fn = "time_mi_time"
+	case lk == "date" && rk == "time" && !sub:
+		fn = "datetime_pl"
+	case lk == "date" && rk == "timetz" && !sub:
+		fn = "datetimetz_pl"
+	default:
+		// Only the implicit cast was needed: an ordinary date/time operator remains.
+		return &BinaryOp{pos: pos, Op: op, Left: l, Right: r, ResultType: result}, true, nil
+	}
+	return &FuncCall{pos: pos, Name: fn, Args: []Expr{l, r}, ReturnType: result, Operator: op.String()}, true, nil
 }

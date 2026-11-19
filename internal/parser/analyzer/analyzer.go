@@ -1534,6 +1534,9 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			}
 			return catalog.Type{Name: "bool"}, nil
 		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
+			if t, handled, err := timeArithResultType(x, leftTyp, rightTyp); handled {
+				return t, err
+			}
 			// timestamp/date ± interval → timestamp. TPC-H Q1
 			// (`l_shipdate <= date '...' - interval '90' day`)
 			// hits this; v0 returns the result as `timestamp`
@@ -4004,6 +4007,43 @@ func moneyArithResultType(op parser.OpCode, l, r catalog.Type) (catalog.Type, bo
 		}
 	}
 	return catalog.Type{}, false
+}
+
+// timeArithResultType types + and - when an operand is time or timetz. The
+// planner applies the same rules in timeArithCall.
+func timeArithResultType(x *parser.BinaryOp, l, r catalog.Type) (catalog.Type, bool, error) {
+	kind := func(t catalog.Type) string {
+		if t.IsArray {
+			return ""
+		}
+		if isUnknownType(t) {
+			return "unknown"
+		}
+		return strings.ToLower(t.Name)
+	}
+	// analyzeExpr reports most casts as unknown, but an operand cast to a
+	// date/time type is typed for operator resolution.
+	operand := func(e parser.Expr, t catalog.Type) string {
+		if c, ok := e.(*parser.CastExpr); ok {
+			switch n := strings.ToLower(c.Type.Name); n {
+			case "time", "timetz", "timestamp", "timestamptz", "interval":
+				return n
+			}
+		}
+		return kind(t)
+	}
+	lk, rk := operand(x.Left, l), operand(x.Right, r)
+	result, status := parser.ResolveTimeOperator(x.Op, lk, rk)
+	switch status {
+	case parser.TimeOperatorNone:
+		return catalog.Type{}, false, nil
+	case parser.TimeOperatorFound:
+		return catalog.Type{Name: result}, true, nil
+	}
+	code, message, hint := parser.TimeOperatorError(status, x.Op, lk, rk)
+	ae := analyzeError(x.Pos(), code, message)
+	ae.Hint = hint
+	return catalog.Type{}, true, ae
 }
 
 // castFamily classifies a built-in type for castAssignmentError. "" means

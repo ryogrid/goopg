@@ -949,6 +949,9 @@ func (d Datum) AppendValueText(dst []byte) []byte {
 		if d.Int == math.MinInt64 {
 			return append(dst, "-infinity"...)
 		}
+		if d.TimeSub == TimeSubTimeTZ {
+			return append(dst, timeTZText(d)...)
+		}
 		t := d.TimeValue()
 		if t.Year() <= 0 {
 			return append(dst, formatBCTimeDatum(d, t)...)
@@ -1043,6 +1046,9 @@ func (d Datum) Format() string {
 		}
 		if d.Int == math.MinInt64 {
 			return "-infinity"
+		}
+		if d.TimeSub == TimeSubTimeTZ {
+			return timeTZText(d)
 		}
 		t := d.TimeValue()
 		if t.Year() <= 0 {

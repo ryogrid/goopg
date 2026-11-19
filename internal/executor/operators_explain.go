@@ -5612,6 +5612,11 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		}
 		return "(" + x.Op.String() + " " + formatExprQual(x.Operand, reg, qualify) + ")"
 	case *optimizer.CastExpr:
+		// time to interval is a real conversion (time_interval), so it is shown
+		// even when the operator resolution added it implicitly.
+		if isTimeOfDaySource(x.SourceType) && strings.EqualFold(x.TargetType, "interval") {
+			return "(" + formatExprQual(x.Operand, reg, qualify) + ")::interval"
+		}
 		if x.Explicit {
 			if txt, ok := explicitCastText(x, reg, qualify); ok {
 				return txt

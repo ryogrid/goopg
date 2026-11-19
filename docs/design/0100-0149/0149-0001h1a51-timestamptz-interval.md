@@ -33,7 +33,5 @@ named zone.
 
 ## Not covered
 
-- `time` plus or minus an interval prints a date, because a time value has no subtype of its own
-  \(M0149\-0001h1a59\).
 - `generate_series` over timestamps returns wrong rows \(M0149\-0001h1a60\).
 - Zone names are matched case\-sensitively in `date_add` \(M0149\-0001h1a61\).

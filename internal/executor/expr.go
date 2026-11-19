@@ -5734,6 +5734,15 @@ func byteaToIntN(b []byte, width int, typeName string) (int64, error) {
 }
 
 func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context) (Datum, error) {
+	if d.Kind == KindTime && d.TimeSub == TimeSubTimeTZ {
+		switch strings.ToLower(targetType) {
+		case "text", "varchar", "character varying", "bpchar", "char", "character", "name":
+			return evalCast(NewStringDatum(timeTZText(d)), targetType, pos, ctx)
+		}
+	}
+	if isTimeOfDaySource(sourceType) && strings.EqualFold(targetType, "interval") && !d.IsNull() {
+		return timeToInterval(d)
+	}
 	if sourceType == "" {
 		return evalCast(d, targetType, pos, ctx)
 	}
@@ -6651,6 +6660,13 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			}
 			return NewTimeDatum(ts), nil
 		}
+		if d.Kind == KindTime && d.IsTimestampNotFinite() {
+			return NullDatum, nil
+		}
+		if d.Kind == KindTime && d.TimeSub == TimeSubTimestampTZ {
+			clock, _ := sessionClock(d.TimeValue(), ctx)
+			return NewTimeDatum(clock), nil
+		}
 		if d.Kind == KindTime {
 			t := d.TimeValue().UTC()
 			// Re-anchor to epoch to strip any date component.
@@ -6668,6 +6684,13 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 				return Datum{}, err
 			}
 			return NewTimeTZDatum(ts, offsetSecs), nil
+		}
+		if d.Kind == KindTime && d.IsTimestampNotFinite() {
+			return NullDatum, nil
+		}
+		if d.Kind == KindTime && d.TimeSub == TimeSubTimestampTZ {
+			clock, offset := sessionClock(d.TimeValue(), ctx)
+			return NewTimeTZDatum(clock, offset), nil
 		}
 		if d.Kind == KindTime {
 			t := d.TimeValue().UTC()
@@ -11940,8 +11963,8 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		// making `now()::time(3) = current_time(3)`-shaped comparisons flaky
 		// (they only matched when the discarded digits happened to floor and
 		// round to the same value).
-		t := ctx.Now.UTC()
-		d := NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC))
+		clock, offset := sessionClock(ctx.Now, ctx)
+		d := NewTimeTZDatum(clock, offset)
 		if len(x.Args) > 0 {
 			prec, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err == nil && prec.Kind == KindInt {
@@ -12173,6 +12196,9 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		return evalDateBin(x, slot, ctx)
 	case "date_add", "date_subtract":
 		return evalDateAdd(x, name == "date_subtract", slot, ctx)
+	case "time_pl_interval", "time_mi_interval", "timetz_pl_interval", "timetz_mi_interval",
+		"time_mi_time", "datetime_pl", "datetimetz_pl":
+		return evalTimeOperator(name, x, slot, ctx)
 	case "set_config":
 		// set_config(setting_name, new_value, is_local) → text
 		// vacuumdb calls SELECT pg_catalog.set_config('search_path', '', false)
@@ -17987,8 +18013,8 @@ case "pg_char_to_encoding":
 		// see the current_time case above, M0134-0084: the previous
 		// floor-via-integer-division here is what made
 		// `now()::time(N)::text = localtime(N)::text` (expressions.sql) flaky).
-		t := ctx.Now.UTC()
-		d := NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC))
+		clock, _ := sessionClock(ctx.Now, ctx)
+		d := NewTimeDatum(clock)
 		if len(x.Args) > 0 {
 			prec, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err == nil && prec.Kind == KindInt {

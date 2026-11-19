@@ -10757,6 +10757,11 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		if fc, ok := moneyArithCall(x.Pos(), x.Op, l, r); ok {
 			return fc, nil
 		}
+		if e, ok, err := timeArithCall(x.Pos(), x.Op, l, r); err != nil {
+			return nil, err
+		} else if ok {
+			return e, nil
+		}
 		if x.Op == parser.OpConcat {
 			l, r = moneyConcatOperand(l), moneyConcatOperand(r)
 		}
@@ -10976,6 +10981,11 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		}
 		if fc, ok := moneyArithCall(x.Pos(), x.Op, l, r); ok {
 			return fc, nil
+		}
+		if e, ok, err := timeArithCall(x.Pos(), x.Op, l, r); err != nil {
+			return nil, err
+		} else if ok {
+			return e, nil
 		}
 		if x.Op == parser.OpConcat {
 			l, r = moneyConcatOperand(l), moneyConcatOperand(r)
@@ -17400,6 +17410,10 @@ func exprType(e Expr) catalog.Type {
 			// before the numeric-dominance check below, which would otherwise
 			// misreport the wire TypeOID as numeric (right-aligning the
 			// interval text in psql instead of left-aligning it). M0134-0035.
+			if strings.EqualFold(lt.Name, "interval") && strings.EqualFold(rt.Name, "interval") &&
+				(x.Op == parser.OpAdd || x.Op == parser.OpSub) {
+				return catalog.Type{Name: "interval"}
+			}
 			if strings.EqualFold(lt.Name, "interval") && (x.Op == parser.OpMul || x.Op == parser.OpDiv) {
 				return catalog.Type{Name: "interval"}
 			}
@@ -17613,6 +17627,10 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "int8"}
 		case "current_timestamp", "now", "transaction_timestamp", "statement_timestamp":
 			return catalog.Type{Name: "timestamp"}
+		case "current_time":
+			return catalog.Type{Name: "timetz"}
+		case "localtime":
+			return catalog.Type{Name: "time"}
 		case "current_date", "to_date":
 			return catalog.Type{Name: "date"}
 		case "to_timestamp":
@@ -19251,6 +19269,11 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		}
 		if fc, ok := moneyArithCall(x.Pos(), x.Op, l, r); ok {
 			return fc, nil
+		}
+		if e, ok, err := timeArithCall(x.Pos(), x.Op, l, r); err != nil {
+			return nil, err
+		} else if ok {
+			return e, nil
 		}
 		if x.Op == parser.OpConcat {
 			l, r = moneyConcatOperand(l), moneyConcatOperand(r)
