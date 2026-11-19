@@ -267,20 +267,28 @@ const timeCarrierUnitsPerSecond int64 = 1_000_000
 const pgEpochUnixSeconds int64 = 946684800
 
 // PG's timestamp range (datatype/timestamp.h): MIN_TIMESTAMP is 4714-11-24 BC and
-// END_TIMESTAMP, which is exclusive, is 294277-01-01. Dates use the same range
-// here; PG's dates run further, to 5874897 AD, but the carrier cannot hold them.
+// END_TIMESTAMP, which is exclusive, is 294277-01-01. Dates share the lower bound
+// and run on to 5874897-12-31 (DATE_END_JULIAN is exclusive).
+//
+// A date at or past END_TIMESTAMP does not fit in microseconds, so its Int is
+// pgTimestampEnd plus the days since that point. The values lie between every
+// finite timestamp and +infinity, so comparing, sorting and hashing Int stay
+// correct, including a date against a timestamp, where PG also treats such a date
+// as later than any timestamp.
 const (
 	pgTimestampMin int64 = -211813488000000000
 	pgTimestampEnd int64 = 9223371331200000000
 	pgDateMinDay   int32 = -2451545
-	pgDateEndDay   int32 = 106751983
+	// pgDateFarDay is the day of pgTimestampEnd, the first date stored by day count.
+	pgDateFarDay int32 = 106751983
+	pgDateEndDay int32 = 2145031949
 )
 
 // The infinity sentinels convert to these instants, outside every finite value,
 // so time.Time comparisons order them correctly and a value converted to
 // time.Time and back stays infinite.
 var (
-	timeCarrierPosInfInstant = time.Date(300000, 1, 1, 0, 0, 0, 0, time.UTC)
+	timeCarrierPosInfInstant = time.Date(6000000, 1, 1, 0, 0, 0, 0, time.UTC)
 	timeCarrierNegInfInstant = time.Date(-5000, 1, 1, 0, 0, 0, 0, time.UTC)
 )
 
@@ -299,7 +307,25 @@ func timeToCarrier(t time.Time) int64 {
 	case sec == timeCarrierNegInfInstant.Unix() && t.Equal(timeCarrierNegInfInstant):
 		return math.MinInt64
 	}
+	if sec >= pgEpochUnixSeconds+int64(pgDateFarDay)*86400 {
+		return farDateCarrier((sec - pgEpochUnixSeconds) / 86400)
+	}
 	return (sec-pgEpochUnixSeconds)*timeCarrierUnitsPerSecond + int64(t.Nanosecond())/1000
+}
+
+// farDateCarrier is the Int of a date at or past pgDateFarDay. It stays below the
+// +infinity sentinel for any day.
+func farDateCarrier(day int64) int64 {
+	span := day - int64(pgDateFarDay)
+	if span >= math.MaxInt64-pgTimestampEnd {
+		span = math.MaxInt64 - pgTimestampEnd - 1
+	}
+	return pgTimestampEnd + span
+}
+
+// isFarDateCarrier reports an Int holding a day count, past every timestamp.
+func isFarDateCarrier(carrier int64) bool {
+	return carrier >= pgTimestampEnd && carrier != math.MaxInt64
 }
 
 // timeFromCarrier is the instant a KindTime Datum's Int stands for.
@@ -309,6 +335,10 @@ func timeFromCarrier(carrier int64) time.Time {
 		return timeCarrierPosInfInstant
 	case math.MinInt64:
 		return timeCarrierNegInfInstant
+	}
+	if isFarDateCarrier(carrier) {
+		day := int64(pgDateFarDay) + carrier - pgTimestampEnd
+		return time.Unix(day*86400+pgEpochUnixSeconds, 0).UTC()
 	}
 	sec, micros := carrier/timeCarrierUnitsPerSecond, carrier%timeCarrierUnitsPerSecond
 	if micros < 0 {
@@ -339,6 +369,9 @@ func newDateDatumFromPGDays(days int32) (d Datum, ok bool) {
 	case days < pgDateMinDay || days >= pgDateEndDay:
 		return Datum{}, false
 	}
+	if days >= pgDateFarDay {
+		return Datum{Kind: KindTime, Int: farDateCarrier(int64(days)), TimeSub: TimeSubDate}, true
+	}
 	return Datum{Kind: KindTime, Int: int64(days) * 86400 * timeCarrierUnitsPerSecond, TimeSub: TimeSubDate}, true
 }
 
@@ -350,6 +383,8 @@ func pgDaysOfDatum(d Datum) int32 {
 		return math.MaxInt32
 	case d.IsTimestampNegInf():
 		return math.MinInt32
+	case isFarDateCarrier(d.Int):
+		return int32(int64(pgDateFarDay) + d.Int - pgTimestampEnd)
 	}
 	perDay := 86400 * timeCarrierUnitsPerSecond
 	days := d.Int / perDay

@@ -24,9 +24,9 @@ func TestDecodeDateOutOfMicrosRange(t *testing.T) {
 		return b
 	}
 
-	// Well past the micros range (PG's own max date, 5874897 AD, is ~1.43e9
-	// days from 2000-01-01) — must error, not wrap.
-	for _, days := range []int32{1_430_000_000, -1_430_000_000} {
+	// Past PG's own limits (5874897-12-31 is day 2145031948, and 4714-11-24 BC is
+	// day -2451545): must error, not wrap.
+	for _, days := range []int32{2_145_031_949, -2_451_546} {
 		if _, _, err := decodePhysicalPGValueLowered(&dateType, "date", enc(days), nil, array.OutputStyle{}); err == nil {
 			t.Errorf("decode of %d days succeeded, want an out-of-range error", days)
 		}

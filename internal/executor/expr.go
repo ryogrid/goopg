@@ -3711,6 +3711,9 @@ func addTimeInterval(t, iv Datum, subtract bool, pos int, ctx *Context) (Datum, 
 // addTimeIntervalInZone is timestamp_pl_interval, or for a timestamptz
 // timestamptz_pl_interval_internal with zone as attimezone.
 func addTimeIntervalInZone(t, iv Datum, subtract bool, pos int, zone string) (Datum, error) {
+	if t.IsDate() && isFarDateCarrier(t.Int) {
+		return NullDatum, dateOutOfRangeForTimestamp()
+	}
 	var sub TimeSubtype
 	if t.IsTimestampTZ() {
 		sub = TimeSubTimestampTZ
@@ -3820,6 +3823,12 @@ func lookupTimeZoneName(name string) (string, error) {
 		return "", &ExecError{Code: "22023", Message: fmt.Sprintf("time zone %q not recognized", name)}
 	}
 	return name, nil
+}
+
+// dateOutOfRangeForTimestamp is date2timestamp's error for a date no timestamp
+// can hold.
+func dateOutOfRangeForTimestamp() error {
+	return &ExecError{Code: "22008", Message: "date out of range for timestamp"}
 }
 
 // addMonthsDaysInZone does the month and day steps of
@@ -6696,6 +6705,9 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		if d.IsDate() {
 			// date2timestamp is the same day at midnight; date2timestamptz is
 			// midnight in the session zone.
+			if isFarDateCarrier(d.Int) {
+				return Datum{}, dateOutOfRangeForTimestamp()
+			}
 			switch {
 			case d.IsTimestampNotFinite() && tz:
 				d.TimeSub = TimeSubTimestampTZ
@@ -8446,6 +8458,9 @@ func evalDateTrunc(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, e
 		if src.Kind != KindTime {
 			return NullDatum, nil
 		}
+	}
+	if src.IsDate() && isFarDateCarrier(src.Int) {
+		return Datum{}, dateOutOfRangeForTimestamp()
 	}
 	t := src.TimeValue().UTC()
 	switch strings.ToLower(strings.TrimSpace(fieldArg.StringValue())) {

@@ -524,6 +524,10 @@ func toCharDatetime(d Datum, format string, ctx *Context) (Datum, error) {
 	if format == "" || d.IsTimestampNotFinite() {
 		return NullDatum, nil
 	}
+	if d.IsDate() && isFarDateCarrier(d.Int) {
+		// to_char(date) is to_char(timestamptz) after date2timestamptz.
+		return Datum{}, dateOutOfRangeForTimestamp()
+	}
 	t := d.TimeValue()
 	zoneName, zoneOffset := "", 0
 	switch {

@@ -67,7 +67,8 @@ func TestDateTimeInputErrorSeparatesRangeFromSyntax(t *testing.T) {
 		{"0000-01-01", "22008"},
 		{"1000-01-01", ""},
 		{"2020-01-01 BC", ""},
-		{"294277-01-01", "22008"},
+		{"294277-01-01", ""},
+		{"5874898-01-01", "22008"},
 		{"4714-11-23 BC", "22008"},
 		{"not-a-date", "22007"},
 		// M0119-0006: ValidateDate()'s month/day range check—a month/day

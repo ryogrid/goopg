@@ -340,6 +340,9 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone, by
 		if d.Kind != KindTime {
 			return "", fmt.Errorf("expected time datum for date, got kind %d", d.Kind)
 		}
+		if text, ok := infiniteTimeText(d); ok {
+			return text, nil
+		}
 		return misc.FormatDate(d.TimeValue(), dateStyle, dateOrder), nil
 	case "timestamp":
 		// DateStyle-aware, mirroring the "date" case above and dispatch.go's
@@ -347,6 +350,9 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone, by
 		// output-rendering follow-up.
 		if d.Kind != KindTime {
 			return "", fmt.Errorf("expected time datum, got kind %d", d.Kind)
+		}
+		if text, ok := infiniteTimeText(d); ok {
+			return text, nil
 		}
 		return misc.FormatTimestamp(d.TimeValue().UTC(), dateStyle, dateOrder), nil
 	case "timestamptz":
@@ -357,6 +363,9 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone, by
 		// Split off from the shared "timestamp" case in M0119-0006.
 		if d.Kind != KindTime {
 			return "", fmt.Errorf("expected time datum, got kind %d", d.Kind)
+		}
+		if text, ok := infiniteTimeText(d); ok {
+			return text, nil
 		}
 		return misc.FormatTimestampTZ(d.TimeValue(), dateStyle, dateOrder, timeZone), nil
 	case "time":
@@ -1012,6 +1021,7 @@ func parsePGTimestampTextZone(s string, zone tsZoneMode) (time.Time, error) {
 var (
 	timestampRangeMin = timeFromCarrier(pgTimestampMin)
 	timestampRangeEnd = timeFromCarrier(pgTimestampEnd)
+	dateRangeEnd      = time.Date(5874898, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	errTimeCarrierRange = errors.New("date/time value out of range")
 )
@@ -1220,6 +1230,17 @@ func normalizeTimestampTZ(s string) string {
 	return s
 }
 
+// infiniteTimeText is the output of a date or timestamp infinity.
+func infiniteTimeText(d Datum) (string, bool) {
+	switch {
+	case d.IsTimestampPosInf():
+		return "infinity", true
+	case d.IsTimestampNegInf():
+		return "-infinity", true
+	}
+	return "", false
+}
+
 // dateInput is the session state date and timestamp input depends on. The zero
 // value means UTC, the MDY field order and the current time.
 type dateInput struct {
@@ -1299,7 +1320,10 @@ func decodeDateTextSession(s string, in dateInput) (time.Time, bool, error) {
 		return timeCarrierNegInfInstant, false, nil
 	}
 	t := time.Date(d.Year, time.Month(d.Mon), d.Mday, 0, 0, 0, 0, time.UTC)
-	return t, d.UsedSession, checkTimeCarrierRange(t)
+	if t.Before(timestampRangeMin) || !t.Before(dateRangeEnd) {
+		return time.Time{}, false, errTimeCarrierRange
+	}
+	return t, d.UsedSession, nil
 }
 
 // parsePGDateText reads a date with default session settings.

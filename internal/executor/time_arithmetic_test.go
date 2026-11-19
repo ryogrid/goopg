@@ -192,3 +192,31 @@ func TestTimestamptzIntervalUsesTheZone(t *testing.T) {
 		}
 	}
 }
+
+// TestFarDatesKeepTheirOrder pins the day-count range of the date carrier: it sits
+// between every timestamp and +infinity, and round-trips through time.Time.
+func TestFarDatesKeepTheirOrder(t *testing.T) {
+	first, ok := newDateDatumFromPGDays(pgDateFarDay)
+	last, ok2 := newDateDatumFromPGDays(pgDateEndDay - 1)
+	if !ok || !ok2 {
+		t.Fatal("far dates must be representable")
+	}
+	if _, ok := newDateDatumFromPGDays(pgDateEndDay); ok {
+		t.Error("the day after 5874897-12-31 must be refused")
+	}
+	if !(pgTimestampEnd-1 < first.Int && first.Int < last.Int && last.Int < NewDateInfinity(true).Int) {
+		t.Errorf("carriers out of order: %d %d", first.Int, last.Int)
+	}
+	if got := last.TimeValue(); got.Year() != 5874897 || got.Month() != 12 || got.Day() != 31 {
+		t.Errorf("last date = %v", got)
+	}
+	if again := NewDateDatum(last.TimeValue()); again.Int != last.Int || pgDaysOfDatum(again) != pgDateEndDay-1 {
+		t.Errorf("round trip: %d, day %d", again.Int, pgDaysOfDatum(again))
+	}
+	if _, err := addTimeInterval(first, NewIntervalDatumFull(0, 1, 0), false, 0, nil); err == nil {
+		t.Error("a far date has no timestamp to add an interval to")
+	}
+	if _, err := evalCast(first, "timestamp", 0, nil); err == nil {
+		t.Error("a far date cannot become a timestamp")
+	}
+}
