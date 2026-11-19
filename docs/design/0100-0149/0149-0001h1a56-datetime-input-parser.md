@@ -51,3 +51,19 @@ PG 18.3. Results and errors match, apart from dates after 294276 AD \(M0149\-000
   always the `Default` set \(M0149\-0001h1a70\).
 - Typed literals PG accepts but goopg's grammar does not, such as `uuid 'x'` and `timestamp(3) 'x'`, are
   M0149\-0001h1a71.
+
+## Time and timetz input \(M0149\-0001h1a70\)
+
+`DecodeTimeOnlyInput` \(`internal/utils/adt/datetime/timeonly.go`\) ports `DecodeTimeOnly` onto the same
+decoder, and `parseTimeString`, `parseTimeTZString` and the time and timetz casts and typed literals all go
+through it \(`decodeTimeOnlyText`\). As in `time_in`, zone fields parse for `time` too and are dropped.
+
+- `now` reads the clock in the session zone; `allballs` and `z` are midnight UTC.
+- Without a zone field, timetz takes the session offset at the input's date or today's.
+- A named zone needs a full date unless the zone has only ever had one offset \(`pg_get_timezone_offset`\).
+
+A timetz offset can have seconds \(`+05:30:15`, LMT zones\). The minutes still live in `Datum.Scale`; the
+exact seconds now ride in `Datum.Hi`, which `TimeTZOffsetSecs` reads, and the wire output prints them.
+
+Not covered: the `timezone_abbreviations` setting; input always uses the Default set \(M0149\-0001h1a82\).
+

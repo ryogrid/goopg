@@ -590,87 +590,8 @@ func copyTextToDatum(t catalog.Type, raw []byte, timeZone string, dateOrder ...s
 // date component to return just the time portion. Timezone-name-only strings like
 // "15:36:39 America/New_York" are rejected with an error.
 func parseTimeString(s string) (time.Time, error) {
-	orig := s
-	// M0125-0007: pad unpadded hour/minute/second (and any leading date) up
-	// front. Everything below indexes fixed offsets — the date-prefix probe
-	// `s[4] == '-' && s[7] == '-'`, the hour-24 rewrite on s[:2], the
-	// leap-second probe on s[5] — so it only ever worked on padded input.
-	s = datetime.NormalizeInput(s)
-
-	// Full timestamp with date prefix: strip date, keep time part.
-	// e.g. "2003-03-07 15:36:39 America/New_York" → "15:36:39"
-	// PostgreSQL accepts timezone names in full timestamp→time casts (strips them).
-	hadDatePrefix := false
-	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
-		// Extract time portion after the date (YYYY-MM-DD ); any zone suffix
-		// it carries is dropped by stripValidatedZoneSuffix below.
-		hadDatePrefix = true
-		s = strings.TrimSpace(s[10:])
-	}
-
-	// Strip the trailing zone/era fields (" PST", " Etc/GMT", "+05", "+05:30",
-	// " BC"); a time-only value has no zone to apply it to, so the offset is
-	// discarded here — parseTimeTZString is the caller that keeps it. The AM/PM
-	// marker is NOT a zone and must survive: dropping it here is what made
-	// '2020-01-01 12:00 AM'::timestamp lose its meridiem.
-	//
-	// M0119-0006: the fields are now VALIDATED rather than assumed to be a
-	// zone, so '10:00 GARBAGE' is 22007 and '10:00 A.M.' is 22023 as on PG —
-	// see classifyZoneToken for how the tokenizer picks between the two.
-	s, _, _, err := stripValidatedZoneSuffix(s, hadDatePrefix, "time", orig)
-	if err != nil {
-		return time.Time{}, err
-	}
-
-	// M0119-0006: field decoding proper is PostgreSQL's, not a layout table's —
-	// see pgdatetime.ParseTimeOfDay for the forms this unlocks ('10:00.5' as
-	// MINUTE TO SECOND, '040506', '10::00', 'allballs', hour-12 AM).
-	tod, err := datetime.ParseTimeOfDay(s)
-	if err != nil {
-		if errors.Is(err, datetime.ErrTimeFieldOverflow) {
-			return time.Time{}, &ExecError{Code: "22008",
-				Message: fmt.Sprintf("date/time field value out of range: %q", orig)}
-		}
-		return time.Time{}, &ExecError{Code: "22007",
-			Message: fmt.Sprintf("invalid input syntax for type time: %q", orig)}
-	}
-
-	h, m, sec, ns := tod.Hour, tod.Min, tod.Sec, tod.Nsec
-
-	// Handle extra fractional precision beyond microseconds (6 digits):
-	// Round nanoseconds to nearest microsecond. If rounding causes carry, propagate.
-	if ns%1000 >= 500 {
-		ns = ((ns / 1000) + 1) * 1000
-	} else {
-		ns = (ns / 1000) * 1000
-	}
-	// Carry nanosecond overflow.
-	if ns >= 1_000_000_000 {
-		ns -= 1_000_000_000
-		sec++
-		if sec >= 60 {
-			sec -= 60
-			m++
-			if m >= 60 {
-				m -= 60
-				h++
-			}
-		}
-	}
-
-	// The range check and the hour-24 / leap-second fold are upstream's
-	// time_overflows() plus tm2time()'s composition, shared with the timestamp
-	// path through pgdatetime — the two used to carry their own copies, and only
-	// this one had them (a timestamp rejected '24:00:00' outright).
-	norm, dayCarry, err := datetime.TimeOfDay{Hour: h, Min: m, Sec: sec, Nsec: ns}.Normalize()
-	if err != nil {
-		return time.Time{}, &ExecError{Code: "22008",
-			Message: fmt.Sprintf("date/time field value out of range: %q", orig)}
-	}
-
-	// Anchor to epoch date 1970-01-01 UTC. A whole-day time (24:00:00, 23:59:60)
-	// is stored as next-day midnight, which is how it round-trips as 24:00:00.
-	return time.Date(1970, 1, 1+dayCarry, norm.Hour, norm.Min, norm.Sec, norm.Nsec, time.UTC), nil
+	t, _, err := decodeTimeOnlyText(s, dateInput{}, false)
+	return t, err
 }
 
 // tzAbbrevOffsets maps common timezone abbreviations to their UTC offsets
@@ -773,131 +694,7 @@ func parseTZOffset(s string) (int, bool) {
 // datetime.c). Callers that are deciding a TYPE rather than reading a declared
 // timetz pass "" deliberately; see parseTimeTZString's call sites.
 func parseTimeTZString(s string, zone string) (time.Time, int, error) {
-	orig := s
-	// M0125-0007: as in parseTimeString — the date-prefix probe below is a
-	// fixed-offset test (s[4], s[7], s[:10]) that assumes zero-padded fields.
-	s = datetime.NormalizeInput(s)
-
-	offsetSecs := 0
-	// haveOff distinguishes "the input carried a zone field that resolved to +00"
-	// from "the input carried no zone field at all" — only the latter falls back
-	// to the session zone. Before this slice both were spelled `offsetSecs == 0`.
-	haveOff := false
-
-	// Full timestamp with date prefix: "YYYY-MM-DD HH:MM:SS[±HH[:MM]] [TZ]"
-	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
-		dateStr := s[:10]
-		rest := strings.TrimSpace(s[10:])
-		// Split time portion from space-separated timezone suffix
-		var timeStr, tzStr string
-		if idx := strings.Index(rest, " "); idx >= 0 {
-			timeStr = rest[:idx]
-			tzStr = strings.TrimSpace(rest[idx+1:])
-		} else {
-			timeStr = rest
-		}
-		if tzStr != "" {
-			// Named timezone like "America/New_York"
-			if strings.Contains(tzStr, "/") {
-				loc, ok := misc.ZoneByName(tzStr)
-				if ok {
-					// Parse the full datetime in the named timezone
-					full := dateStr + " " + timeStr
-					for _, layout := range []string{"2006-01-02 15:04:05.999999", "2006-01-02 15:04:05", "2006-01-02 15:04"} {
-						if ts, e := time.ParseInLocation(layout, full, loc); e == nil {
-							_, off := ts.Zone()
-							offsetSecs = off // seconds east of UTC
-							// Extract H/M/S from local time
-							lt := ts.In(loc)
-							t, err := parseTimeString(lt.Format("15:04:05.999999"))
-							if err != nil {
-								break
-							}
-							return t, offsetSecs, nil
-						}
-					}
-				}
-				// Named zone but couldn't load → strip to just time, offset = 0
-			} else if off, ok := parseTZOffset(tzStr); ok {
-				offsetSecs, haveOff = off, true
-			} else if off, ok := tzAbbrevOffsets[strings.ToUpper(tzStr)]; ok {
-				offsetSecs, haveOff = off, true
-			}
-		}
-		// timeStr may have an inline numeric offset like "13:30:25.575401-04" or "13:30:25+05:30"
-		// Extract it before passing to parseTimeString.
-		if !haveOff {
-			if plus := strings.LastIndex(timeStr, "+"); plus > 2 {
-				if off, ok := parseTZOffset(timeStr[plus:]); ok {
-					offsetSecs, haveOff = off, true
-					timeStr = timeStr[:plus]
-				}
-			} else if minus := strings.LastIndex(timeStr, "-"); minus > 2 {
-				if off, ok := parseTZOffset(timeStr[minus:]); ok {
-					offsetSecs, haveOff = off, true
-					timeStr = timeStr[:minus]
-				}
-			}
-		}
-		// Fall through: just parse the time portion
-		t, err := parseTimeString(timeStr)
-		if err != nil {
-			return time.Time{}, 0, wrapTimeTZError(err, orig)
-		}
-		// No zone field: DecodeTimeOnly resolves the session zone AT THE DATE THE
-		// INPUT CARRIES, not at today's — `'2020-01-05 10:00'::timetz` is
-		// 10:00:00-05 on America/New_York while `'2020-07-05 10:00'::timetz` is
-		// 10:00:00-04. M0119-0006.
-		if !haveOff && zone != "" {
-			if d, e := time.Parse("2006-01-02", dateStr); e == nil {
-				offsetSecs = misc.ZoneOffsetForLocalTime(zone,
-					time.Date(d.Year(), d.Month(), d.Day(),
-						t.Hour(), t.Minute(), t.Second(), 0, time.UTC))
-			}
-		}
-		return t, offsetSecs, nil
-	}
-
-	// Bare time string — the trailing fields go through the same validating
-	// classifier as `time` (M0119-0006). It replaces this arm's own zone scan,
-	// which knew only the abbreviation table and the numeric displacement: an
-	// era field was rejected outright ('10:00 BC'::timetz is `10:00:00` on PG),
-	// a zone *name* was rejected even when fixed-offset ('10:00 Etc/GMT'), and
-	// a name-shaped token that names nothing got 22007 where PG raises 22023
-	// ('10:00 A.M.' → `time zone "a.m." not recognized`).
-	//
-	// The AM/PM marker is detached first so it reaches parseTimeString, which
-	// owns the meridiem rules (hour 12 AM is hour 0) — stripValidatedZoneSuffix
-	// stops at it, but it must not block the era/zone fields that may FOLLOW it
-	// ('10:00 AM BC' parses on PG).
-	meridiem := ""
-	if u := strings.ToUpper(s); strings.HasSuffix(u, " PM") || strings.HasSuffix(u, " AM") {
-		meridiem = s[len(s)-3:]
-		s = strings.TrimSpace(s[:len(s)-3])
-	}
-
-	rest, off, zoneSeen, err := stripValidatedZoneSuffix(s, false, "time with time zone", orig)
-	if err != nil {
-		return time.Time{}, 0, err
-	}
-	s = rest
-	if zoneSeen {
-		offsetSecs, haveOff = off, true
-	}
-
-	// Now parse the bare time portion with its meridiem re-attached.
-	s += meridiem
-
-	t, err := parseTimeString(s)
-	if err != nil {
-		return time.Time{}, 0, wrapTimeTZError(err, orig)
-	}
-	// No zone field and no date: GetCurrentDateTime supplies today's date and the
-	// session zone supplies the offset for it. M0119-0006.
-	if !haveOff && zone != "" {
-		offsetSecs = misc.TimeTZSessionOffset(zone, t.Hour(), t.Minute(), t.Second())
-	}
-	return t, offsetSecs, nil
+	return decodeTimeOnlyText(s, dateInput{zone: zone}, true)
 }
 
 // wrapTimeTZError converts a time-parsing error into a timetz error.
@@ -1255,8 +1052,34 @@ func dateInputFromCtx(ctx *Context) dateInput {
 	return dateInput{zone: timeZoneFromCtx(ctx), order: order, now: nowFromCtx(ctx)}
 }
 
+// decodeTimeOnlyText is time_in, or timetz_in for withZone: PostgreSQL's
+// ParseDateTime and DecodeTimeOnly over the shared decoder. The time of day is
+// returned on 1970-01-01 UTC, 24:00:00 as the next midnight, with the zone's
+// offset east of UTC for timetz.
+func decodeTimeOnlyText(s string, in dateInput, withZone bool) (time.Time, int, error) {
+	typeName := "time"
+	if withZone {
+		typeName = "time with time zone"
+	}
+	env := decodeEnvFor(in)
+	// time_in also passes tzp, so zone fields parse for time too and are
+	// dropped; only timetz keeps the offset.
+	d, err := datetime.DecodeTimeOnlyInput(s, &env, true)
+	if err != nil {
+		return time.Time{}, 0, dateTimeInputError(err, typeName, s, 0)
+	}
+	micros := ((int64(d.Hour)*60+int64(d.Min))*60+int64(d.Sec))*1_000_000 + int64(d.Usec)
+	return pgTimeFromMicros(micros), -d.TZWest, nil
+}
+
 // decodeDateTimeText runs PostgreSQL's date and time input parser.
 func decodeDateTimeText(s string, in dateInput) (datetime.Decoded, error) {
+	env := decodeEnvFor(in)
+	return datetime.DecodeDateTimeInput(s, &env)
+}
+
+// decodeEnvFor is the decoder's view of the session settings.
+func decodeEnvFor(in dateInput) datetime.DecodeEnv {
 	env := datetime.DecodeEnv{
 		Order:      datetime.DateOrderMDY,
 		Now:        in.now,
@@ -1273,7 +1096,7 @@ func decodeDateTimeText(s string, in dateInput) (datetime.Decoded, error) {
 	if env.Now.IsZero() {
 		env.Now = time.Now()
 	}
-	return datetime.DecodeDateTimeInput(s, &env)
+	return env
 }
 
 // decodeTimestampText is timestamp_in, or timestamptz_in for tsApplyZone.

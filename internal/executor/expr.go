@@ -5106,11 +5106,7 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		// M0146-0040.
 		return NewDateDatum(t.UTC()), nil
 	case "time":
-		// 'now' is the only RESERV token DecodeTimeOnly accepts (#5(d-iv), M0134-0182).
-		if inf, ok := parseTimeSpecialLiteral(x.Value, nowFromCtx(ctx)); ok {
-			return inf, nil
-		}
-		ts, err := parseTimeString(x.Value)
+		ts, _, err := decodeTimeOnlyText(x.Value, dateInputFromCtx(ctx), false)
 		if err != nil {
 			// parseTimeString already distinguishes 22007 (syntax) from 22008
 			// (range, e.g. "25:00:00") — see btree_scalar_keys.go's identical
@@ -5124,10 +5120,7 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		}
 		return NewTimeDatum(ts), nil
 	case "timetz":
-		if inf, ok := parseTimeTZSpecialLiteral(x.Value, nowFromCtx(ctx), timeZoneFromCtx(ctx)); ok {
-			return inf, nil
-		}
-		ts, offsetSecs, err := parseTimeTZString(x.Value, timeZoneFromCtx(ctx))
+		ts, offsetSecs, err := decodeTimeOnlyText(x.Value, dateInputFromCtx(ctx), true)
 		if err != nil {
 			if ee, ok := err.(*ExecError); ok {
 				ee.Pos = x.Pos()
@@ -6651,12 +6644,11 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 	case "time":
 		// Cast to time: extract time-of-day from KindTime, parse strings. M0097-0004.
 		if d.Kind == KindString {
-			// 'now' is the only RESERV token DecodeTimeOnly accepts (#5(d-iv), M0134-0182).
-			if inf, ok := parseTimeSpecialLiteral(d.StringValue(), nowFromCtx(ctx)); ok {
-				return inf, nil
-			}
-			ts, err := parseTimeString(d.StringValue())
+			ts, _, err := decodeTimeOnlyText(d.StringValue(), dateInputFromCtx(ctx), false)
 			if err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = pos
+				}
 				return Datum{}, err
 			}
 			return NewTimeDatum(ts), nil
@@ -6677,11 +6669,11 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 	case "timetz":
 		// Cast to timetz: parse strings with timezone offset. M0097-0004.
 		if d.Kind == KindString {
-			if inf, ok := parseTimeTZSpecialLiteral(d.StringValue(), nowFromCtx(ctx), timeZoneFromCtx(ctx)); ok {
-				return inf, nil
-			}
-			ts, offsetSecs, err := parseTimeTZString(d.StringValue(), timeZoneFromCtx(ctx))
+			ts, offsetSecs, err := decodeTimeOnlyText(d.StringValue(), dateInputFromCtx(ctx), true)
 			if err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = pos
+				}
 				return Datum{}, err
 			}
 			return NewTimeTZDatum(ts, offsetSecs), nil
@@ -12081,6 +12073,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		result := src
 		result.Int = timeToCarrier(pgTimeFromMicros(micros))
 		result.Scale = int16(newOffsetSecs / 60)
+		result.Hi = uint64(int64(newOffsetSecs))
 		return result, nil
 	case "pg_get_viewdef":
 		// pg_get_viewdef(view [, …]) → text: the view's defining SELECT.

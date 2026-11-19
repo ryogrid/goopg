@@ -407,7 +407,7 @@ func addTimeCarrierMicros(carrier, micros int64) (sum int64, ok bool) {
 // timeTZCompareKey is a timetz Datum's position in UTC, which timetz comparison
 // orders by. The offset lives in Scale, in minutes east of UTC.
 func timeTZCompareKey(d Datum) int64 {
-	return d.Int - int64(d.Scale)*60*timeCarrierUnitsPerSecond
+	return d.Int - int64(d.TimeTZOffsetSecs())*timeCarrierUnitsPerSecond
 }
 
 // IntervalMonthsValue extracts the months component of KindInterval.
@@ -799,12 +799,18 @@ func NewTimeTZDatum(t time.Time, offsetSecs int) Datum {
 		Int:     timeToCarrier(t),
 		Scale:   int16(offsetSecs / 60),
 		TimeSub: TimeSubTimeTZ,
+		// Hi keeps the offset to the second (timetz zones such as LMT ones
+		// have seconds); Scale stays the whole minutes for older readers.
+		Hi: uint64(int64(offsetSecs)),
 	}
 }
 
 // TimeTZOffsetSecs returns the timezone offset in seconds east of UTC for a
 // timetz Datum (stored in Scale as minutes). Returns 0 for plain time datums.
 func (d Datum) TimeTZOffsetSecs() int {
+	if d.TimeSub == TimeSubTimeTZ && d.Hi != 0 {
+		return int(int64(d.Hi))
+	}
 	return int(d.Scale) * 60
 }
 

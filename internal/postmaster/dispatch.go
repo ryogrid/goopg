@@ -4583,7 +4583,7 @@ func appendTimeText(dst []byte, d executor.Datum, _ catalog.Type) []byte {
 }
 
 // appendTimeTZOffset appends the timezone offset to dst in PostgreSQL's format:
-// "+HH", "-HH", "+HH:MM", or "-HH:MM". offsetSecs is seconds east of UTC.
+// "+HH", "+HH:MM" or "+HH:MM:SS", and the same with "-". offsetSecs is seconds east of UTC.
 // UTC (0) is rendered as "+00".
 func appendTimeTZOffset(dst []byte, offsetSecs int) []byte {
 	if offsetSecs < 0 {
@@ -4594,9 +4594,14 @@ func appendTimeTZOffset(dst []byte, offsetSecs int) []byte {
 	}
 	h := offsetSecs / 3600
 	m := (offsetSecs % 3600) / 60
+	sec := offsetSecs % 60
 	dst = append(dst, byte('0'+h/10), byte('0'+h%10))
-	if m != 0 {
+	// EncodeTimezone: minutes when either part is nonzero, seconds when set.
+	if m != 0 || sec != 0 {
 		dst = append(dst, ':', byte('0'+m/10), byte('0'+m%10))
+	}
+	if sec != 0 {
+		dst = append(dst, ':', byte('0'+sec/10), byte('0'+sec%10))
 	}
 	return dst
 }

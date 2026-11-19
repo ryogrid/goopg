@@ -12484,12 +12484,18 @@ verify each at HEAD when the task starts.
       number, as DecodeInterval does. The cast and the typed literal both match PG 18.3.
     - Design: docs/design/0100\-0149/0119\-0006\-interval\-column\-storage.md \(new section\).
     Movement: yes — regress runner interval 646 → 605
-- [ ] **M0149-0001h1a70 — time and timetz input do not use PG's parser** (filed 2026-11-19 by M0149-0001h1a56)
+- [x] **M0149-0001h1a70 — time and timetz input do not use PG's parser** (filed 2026-11-19 by M0149-0001h1a56)
   Kind: impl
   Parent: M0149-0001h1a
   - `'10:00+05:30:15'::timetz` loses its offset, because parseTimeString and parseTimeTZString are separate from DecodeTimeOnly.
   - timezone\_abbreviations is not honoured: input always uses the Default set.
   - Resume: port DecodeTimeOnly onto internal/utils/adt/datetime/decode.go; load the abbreviation set the setting names.
+  - 2026\-11\-19 \(landed\):
+    - DecodeTimeOnlyInput ports DecodeTimeOnly onto the shared decoder; every time and timetz input path uses it.
+    - timetz offsets keep their seconds \(Datum.Hi\) and print them. `now` reads the session zone, not UTC.
+    - About 120 inputs match PG 18.3 apart from the clock value of `now`. timezone\_abbreviations is filed as M0149\-0001h1a82.
+    - Design: docs/design/0100\-0149/0149\-0001h1a56\-datetime\-input\-parser.md \(new section\).
+    Movement: yes — regress runner horology 2328 → 2318
 - [ ] **M0149-0001h1a71 — typed literals the grammar does not accept** (filed 2026-11-19 by M0149-0001h1a55)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12581,6 +12587,13 @@ verify each at HEAD when the task starts.
     at parse time. goopg's plan cache reuses plans across statements, so converting needs a cache rule first.
   - `t > 'epoch'` on an indexed timestamptz column stays a filter; PG uses it as an index condition.
   - Resume: the view definition store \(CREATE VIEW\) for the first; the plan cache key for the second.
+- [ ] **M0149-0001h1a82 — the timezone\_abbreviations setting is ignored** (filed 2026-11-19 by M0149-0001h1a70)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Date/time input always reads abbreviations from the Default set; PG loads the file the setting names
+    \(load\_tzoffsets, share/timezonesets\), and `SET timezone_abbreviations = 'India'` changes what `IST` means.
+  - pg\_timezone\_abbrevs should list the active set.
+  - Resume: defaultZoneAbbrevs in internal/utils/adt/datetime; a loader for share/timezonesets and the GUC hook.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a
