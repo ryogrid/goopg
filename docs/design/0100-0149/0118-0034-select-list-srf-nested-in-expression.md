@@ -106,3 +106,12 @@ slot assignment and eval-row construction.
 `... NOT VALID` parsing, `ALTER TABLE ... VALIDATE CONSTRAINT`, and the
 ShareUpdateExclusive/ShareRowExclusive lock semantics. This change removes their
 data-setup blocker.
+
+## pg\_typeof over a set\-returning call \(M0149\-0001h1a64\)
+
+`pg_typeof` is folded at plan time to its argument's type name, which used to drop a nested
+`generate_series` and return one row. `foldPgTypeof` now keeps such an argument as a second argument that
+the executor never reads, so `findFirstNestedSRF` still finds the call and the row count is PG's.
+Only generate\_series is expanded when nested; other set\-returning calls, EXPLAIN's shape for these plans and
+PG's errors for set\-returning calls inside CASE and COALESCE are M0149\-0001h1a78.
+

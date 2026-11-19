@@ -17736,6 +17736,17 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		}
 		return Datum{Kind: KindInt, Int: int64(cnt)}, nil
 	case "pg_typeof":
+		if len(x.Args) == 2 {
+			// Folded with a set-returning argument kept for its row count
+			// (foldPgTypeof); only the type name is read.
+			if sc, ok := x.Args[0].(*optimizer.StringConst); ok {
+				var cat catalog.Catalog
+				if ctx != nil {
+					cat = ctx.Catalog
+				}
+				return NewIntDatum(int64(pgTypeofOIDForName(cat, sc.Value))), nil
+			}
+		}
 		if len(x.Args) == 1 {
 			var cat catalog.Catalog
 			if ctx != nil {

@@ -6671,6 +6671,18 @@ func isNestedSRFName(fname string) bool {
 	return strings.EqualFold(fname, "generate_series")
 }
 
+// foldPgTypeof replaces pg_typeof's argument with its type name. A
+// set-returning call inside the argument still has to run, because it sets the
+// number of rows, so the argument is kept as a second argument that the
+// executor does not read; buildSelectSrfProjectSet finds the call there.
+func foldPgTypeof(pos int, arg Expr) *FuncCall {
+	args := []Expr{&StringConst{Value: pgTypeofDisplayName(exprType(arg))}}
+	if findFirstNestedSRF(arg) != nil {
+		args = append(args, arg)
+	}
+	return &FuncCall{pos: pos, Name: "pg_typeof", Args: args}
+}
+
 // findFirstNestedSRF returns the first set-returning FuncCall (DFS) inside a
 // resolved SELECT-list target expression, or nil when none is present. It walks
 // the same node kinds as replaceExprNode so the two stay in lockstep. M0118-0008.
@@ -10824,8 +10836,7 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 			if err != nil {
 				return nil, err
 			}
-			typName := pgTypeofDisplayName(exprType(arg))
-			return &FuncCall{pos: x.Pos(), Name: "pg_typeof", Args: []Expr{&StringConst{Value: typName}}}, nil
+			return foldPgTypeof(x.Pos(), arg), nil
 		}
 		// pg_collation_for(ordered-set-agg(...) WITHIN GROUP (...)): the same
 		// structural problem pg_typeof solves just above -- a compile-time
@@ -19352,8 +19363,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 			if err != nil {
 				return nil, err
 			}
-			typName := pgTypeofDisplayName(exprType(arg))
-			return &FuncCall{pos: x.Pos(), Name: "pg_typeof", Args: []Expr{&StringConst{Value: typName}}}, nil
+			return foldPgTypeof(x.Pos(), arg), nil
 		}
 		// pg_collation_for(expr): PostgreSQL resolves the collation OID during
 		// parse analysis (exprCollation), so the result is a static property of

@@ -12422,10 +12422,15 @@ verify each at HEAD when the task starts.
     - 150 randomized input sets plus NaN, infinity, window and grouped queries match PG 18.3. The numeric scale\(\) function is missing \(M0149\-0001h1a77\).
     - Design: docs/design/0100\-0149/0149\-0001h1a62\-numeric\-variance.md.
     Movement: yes — regress runner numeric 929 → 925, window 1081 → 1069
-- [ ] **M0149-0001h1a64 — a set\-returning call inside pg\_typeof returns one row** (filed 2026-11-19 by M0149-0001h1a60)
+- [x] **M0149-0001h1a64 — a set\-returning call inside pg\_typeof returns one row** (filed 2026-11-19 by M0149-0001h1a60)
   Kind: impl
   Parent: M0149-0001h1a
   - `select pg_typeof(generate_series(1,2))` returns one row; PG 18.3 returns two.
+  - 2026\-11\-19 \(landed\):
+    - foldPgTypeof keeps a nested set\-returning argument beside the folded type name, so the call still sets the row
+      count. Correlated, grouped and filtered forms match PG 18.3.
+    - Remaining nested set\-returning differences are filed as M0149\-0001h1a78.
+    Movement: none — regress runner over all 165 failed cases changed only in known flakes \(75996 → 76001: plpgsql, alter\_generic, copy2's FREEZE block\)
 - [ ] **M0149-0001h1a65 — a number times an interval is rejected** (filed 2026-11-19 by M0149-0001h1a60)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12514,6 +12519,16 @@ verify each at HEAD when the task starts.
   Parent: M0149-0001h1a
   - `select scale(1.50)` raises `function scale does not exist`; PG returns 2 \(numeric\_scale\). min\_scale and trim\_scale exist.
   - Resume: the trim\_scale and min\_scale arm in internal/executor/expr.go, plus the function's result type.
+- [ ] **M0149-0001h1a78 — other set\-returning calls nested in an expression** (filed 2026-11-19 by M0149-0001h1a64)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select unnest(array[1,2]) + 1` raises `function unnest does not exist`; PG returns 2 and 3. Only
+    generate\_series is expanded when nested \(isNestedSRFName\).
+  - `select case when generate_series(1,2) > 1 then 'a' else 'b' end` returns rows; PG raises `argument of CASE/WHEN must
+    not return a set`. `coalesce(generate_series(1,2), 0)` likewise returns rows where PG raises an error.
+  - EXPLAIN VERBOSE of `select generate_series(1,2) + 1` prints a ProjectSet with `Output: ?column?`; PG prints a Result
+    over a ProjectSet with the expressions.
+  - Resume: isNestedSRFName and buildSelectSrfProjectSet in internal/optimizer/planner.go; the analyzer for the errors.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a
