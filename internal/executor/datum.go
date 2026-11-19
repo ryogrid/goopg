@@ -132,7 +132,7 @@ const (
 	TimeSubDate
 	// TimeSubTimestampTZ marks `timestamp with time zone`. Not yet populated.
 	TimeSubTimestampTZ
-	// TimeSubTime marks `time without time zone`. Not yet populated.
+	// TimeSubTime marks `time without time zone` (NewTimeOfDayDatum).
 	TimeSubTime
 	// TimeSubTimeTZ marks `time with time zone`; the offset east of UTC rides
 	// in Datum.Scale as minutes (see NewTimeTZDatum).
@@ -743,6 +743,14 @@ func cloneRowOwnedPrefix(src Row, bound int) Row {
 
 // NewTimeDatum constructs a KindTime Datum from a time.Time.
 // The timestamp is normalized to UTC.
+// NewTimeOfDayDatum is a `time without time zone` value: a time of day on
+// 1970-01-01, tagged so the type-agnostic renderers print it as time_out does.
+func NewTimeOfDayDatum(t time.Time) Datum {
+	d := NewTimeDatum(t)
+	d.TimeSub = TimeSubTime
+	return d
+}
+
 func NewTimeDatum(t time.Time) Datum {
 	return Datum{Kind: KindTime, Int: timeToCarrier(t)}
 }
@@ -958,6 +966,9 @@ func (d Datum) AppendValueText(dst []byte) []byte {
 		if d.TimeSub == TimeSubTimeTZ {
 			return append(dst, timeTZText(d)...)
 		}
+		if d.TimeSub == TimeSubTime {
+			return append(dst, timeOfDayText(d)...)
+		}
 		t := d.TimeValue()
 		if t.Year() <= 0 {
 			return append(dst, formatBCTimeDatum(d, t)...)
@@ -1055,6 +1066,9 @@ func (d Datum) Format() string {
 		}
 		if d.TimeSub == TimeSubTimeTZ {
 			return timeTZText(d)
+		}
+		if d.TimeSub == TimeSubTime {
+			return timeOfDayText(d)
 		}
 		t := d.TimeValue()
 		if t.Year() <= 0 {

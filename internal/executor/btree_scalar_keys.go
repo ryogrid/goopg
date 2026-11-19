@@ -221,7 +221,7 @@ func coerceScalarKeyStringDatum(v Datum, col *catalog.Column, pos int) (Datum, *
 			return v, &ExecError{Code: "22007", Pos: pos,
 				Message: fmt.Sprintf("invalid input syntax for type time: %q", s)}
 		}
-		return NewTimeDatum(t), nil
+		return NewTimeOfDayDatum(t), nil
 	}
 	return v, nil
 }
@@ -370,7 +370,7 @@ func decodeScalarBTreeKey(key []byte, typeName string) (d Datum, n int, handled 
 		if derr != nil {
 			return NullDatum, 0, true, derr
 		}
-		return NewTimeDatum(pgTimeFromMicros(v)), 8, true, nil
+		return NewTimeOfDayDatum(pgTimeFromMicros(v)), 8, true, nil
 	case isInetType(typeName), isCidrType(typeName):
 		// M0134-0002 C5: inverts encodeInetBTreeKey. The key is fixed-width
 		// and self-describing (the family byte selects the address width), so

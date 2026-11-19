@@ -425,6 +425,9 @@ func timeArithCall(pos int, op parser.OpCode, l, r Expr) (Expr, bool, error) {
 		if _, ok := e.(*NullConst); ok {
 			return "unknown"
 		}
+		if c, ok := e.(*IntegerConst); ok && c.Value >= math.MinInt32 && c.Value <= math.MaxInt32 {
+			return "int4" // an integer literal is int4 when it fits (make_const)
+		}
 		t := exprType(e)
 		if t.IsArray {
 			return ""
@@ -553,7 +556,14 @@ func dateTimeLiteralCall(pos int, op parser.OpCode, l, r Expr) (Expr, bool, erro
 	}
 	l, r = literal(l), literal(r)
 	if op == parser.OpMul && rn == "interval" {
-		// mul_d_interval: the number, as float8, times the interval.
+		// mul_d_interval: the number, as float8, times the interval. A
+		// constant number is a float8 Const after parse analysis, and EXPLAIN
+		// prints it so; a column's implicit cast stays hidden.
+		_, isInt := l.(*IntegerConst)
+		_, isNum := l.(*NumericConst)
+		if isInt || isNum {
+			l = &CastExpr{pos: l.Pos(), Operand: l, TargetType: "float8", SourceType: ln, Explicit: true}
+		}
 		return &FuncCall{pos: pos, Name: "mul_d_interval", Args: []Expr{l, r}, ReturnType: "interval", Operator: "*"}, true, nil
 	}
 	return &BinaryOp{pos: pos, Op: op, Left: l, Right: r, ResultType: result}, true, nil

@@ -81,7 +81,7 @@ func timePlusInterval(t, iv Datum, subtract, withZone bool) (Datum, error) {
 	if withZone {
 		return NewTimeTZDatum(result, t.TimeTZOffsetSecs()), nil
 	}
-	return NewTimeDatum(result), nil
+	return NewTimeOfDayDatum(result), nil
 }
 
 // dateWithTime is datetime_timestamp and datetimetz_timestamptz.

@@ -6846,6 +6846,8 @@ func castTypeName(name string, typmod int64) (string, bool) {
 		return "text", true
 	case "date":
 		return "date", true
+	case "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange":
+		return strings.ToLower(name), true
 	case "bool", "boolean":
 		return "boolean", true
 	case "timestamp":

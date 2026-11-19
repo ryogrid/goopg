@@ -52,8 +52,21 @@ Only a string literal or NULL counts as unknown in the analyzer. Any other expre
 the existing checks, so `'2016-06-02'::date + length(foo(10))` still works. `exprType` now types
 `timestamp - timestamp` as interval.
 
-## Not covered \(M0149\-0001h1a74\)
+## Follow\-up \(M0149\-0001h1a74\)
 
-- A plain `time` prints with a date in `format`, `concat` and row output.
-- `time + 1` reports goopg's own error text rather than `operator does not exist`.
-- EXPLAIN keeps the spelling of a time literal \(`'09:00'`\) instead of its output form.
+- Every producer of a `time` value now uses `NewTimeOfDayDatum`, which sets `TimeSubTime`. `Datum.Format`,
+  `AppendValueText` and the DateStyle formatter print that subtype as time\_out does, so `format('%s', t)`, `concat`,
+  row and array output print `10:00:00`; `24:00:00`, stored as the next midnight, prints as such. Group and hash keys
+  use the stored instant, so the subtype does not change grouping.
+- `time` or `timetz` with a number, text or boolean operand raises `operator does not exist`, with an integer literal
+  shown as integer.
+- In EXPLAIN a constant multiplying an interval prints as `'2'::double precision`, and a literal range operand carries
+  its type label.
+- The analyzer reads the target of a cast to a number type, so `2::float8 * interval '1 hour'` is accepted again.
+
+## Not covered \(M0149\-0001h1a88\)
+
+- `to_json` does not exist.
+- EXPLAIN of a constant SELECT over VALUES prints `Output: i` where PG folds the expression; `CURRENT_DATE` deparses as
+  `current_date()`.
+- `'1 day' * 2` reports goopg's own error where PG reads the literal as an integer.

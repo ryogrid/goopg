@@ -619,7 +619,7 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		if micros < 0 || micros > usecsPerDay {
 			return Datum{}, &ExecError{Code: "22008", Message: "time out of range"}
 		}
-		return roundTimeDatumToPrecision(NewTimeDatum(pgTimeFromMicros(micros)), timeColumnPrecision(t)), nil
+		return roundTimeDatumToPrecision(NewTimeOfDayDatum(pgTimeFromMicros(micros)), timeColumnPrecision(t)), nil
 	case "timetz", "time with time zone":
 		// Decode twin of the "timetz" encode arm; upstream timetz_recv reads the
 		// TimeADT then the int32 zone and applies the same TZDISP_LIMIT sanity

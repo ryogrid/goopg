@@ -34,6 +34,9 @@ func ResolveTimeOperator(op OpCode, left, right string) (string, TimeOperatorSta
 	}
 	switch other {
 	case "time", "timetz", "date", "timestamp", "timestamptz", "interval", "unknown":
+	case "int2", "int4", "int8", "numeric", "float4", "float8", "text", "varchar", "bool":
+		// No operator pairs a time of day with these.
+		return "", TimeOperatorMissing
 	default:
 		return "", TimeOperatorNone
 	}
@@ -82,6 +85,10 @@ func TimeOperatorError(status TimeOperatorStatus, op OpCode, left, right string)
 			return "real"
 		case "float8":
 			return "double precision"
+		case "varchar":
+			return "character varying"
+		case "bool":
+			return "boolean"
 		case "time":
 			return "time without time zone"
 		case "timetz":

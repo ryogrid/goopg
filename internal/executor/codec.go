@@ -756,7 +756,7 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 			if err != nil {
 				return nil, err
 			}
-			d = NewTimeDatum(ts)
+			d = NewTimeOfDayDatum(ts)
 		}
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
@@ -1310,7 +1310,7 @@ func roundTimeDatumToPrecision(d Datum, prec int64) Datum {
 	if d.TimeSub == TimeSubTimeTZ {
 		return NewTimeTZDatum(tv, d.TimeTZOffsetSecs())
 	}
-	return NewTimeDatum(tv)
+	return NewTimeOfDayDatum(tv)
 }
 
 // roundTimestampDatumToPrecision rounds a timestamp or timestamptz Datum to the
@@ -1907,7 +1907,7 @@ func decodePhysicalPGValueLowered(t *catalog.Type, tname string, data []byte, sc
 		if micros < 0 || micros > maxTimeMicros {
 			return Datum{}, 0, fmt.Errorf("invalid time micros")
 		}
-		return NewTimeDatum(pgTimeFromMicros(micros)), 8, nil
+		return NewTimeOfDayDatum(pgTimeFromMicros(micros)), 8, nil
 	case "timetz":
 		if len(data) < 12 {
 			return Datum{}, 0, fmt.Errorf("truncated timetz")

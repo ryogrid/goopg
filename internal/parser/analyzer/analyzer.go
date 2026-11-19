@@ -4036,6 +4036,9 @@ func timeArithResultType(x *parser.BinaryOp, l, r catalog.Type) (catalog.Type, b
 				return n
 			}
 		}
+		if _, ok := e.(*parser.IntegerConst); ok {
+			return "int4"
+		}
 		return kind(e, t)
 	}
 	lk, rk := operand(x.Left, l), operand(x.Right, r)
@@ -4068,8 +4071,10 @@ func isUntypedLiteral(e parser.Expr) bool {
 func dateTimeLiteralResultType(x *parser.BinaryOp, l, r catalog.Type) (catalog.Type, bool, error) {
 	name := func(e parser.Expr, t catalog.Type) string {
 		if c, ok := e.(*parser.CastExpr); ok {
+			// analyzeExpr types most casts as unknown; the target is known.
 			switch n := strings.ToLower(c.Type.Name); n {
-			case "timestamp", "timestamptz", "interval", "date":
+			case "timestamp", "timestamptz", "interval", "date",
+				"int2", "int4", "int8", "numeric", "float4", "float8":
 				return n
 			}
 		}

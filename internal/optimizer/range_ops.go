@@ -31,7 +31,9 @@ func rangeOpCall(pos int, op parser.OpCode, l, r Expr) (Expr, bool) {
 	}
 	literal := func(e Expr, typ string) Expr {
 		if sc, ok := e.(*StringConst); ok {
-			return &CastExpr{pos: sc.Pos(), Operand: sc, TargetType: typ, SourceType: "unknown"}
+			// Explicit: parse analysis turns it into a Const of the range type,
+			// which EXPLAIN prints with its type label.
+			return &CastExpr{pos: sc.Pos(), Operand: sc, TargetType: typ, SourceType: "unknown", Explicit: true}
 		}
 		return e
 	}

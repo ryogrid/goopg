@@ -12540,7 +12540,7 @@ verify each at HEAD when the task starts.
     - COPY and array money, money::numeric under other frac\_digits, codeset conversion and `-1234.56::money` precedence are M0149\-0001h1a87.
     - Design: docs/design/0100\-0149/0149\-0001h1a53\-to\-char\-numbers.md \(new section\).
     Movement: none — the regress suite runs in the C locale; regress runner over all 165 failed cases changed only in known flakes \(75464 → 75465\)
-- [ ] **M0149-0001h1a74 — remaining time output and operator error gaps** (filed 2026-11-19 by M0149-0001h1a59)
+- [x] **M0149-0001h1a74 — remaining time output and operator error gaps** (filed 2026-11-19 by M0149-0001h1a59)
   Kind: impl
   Parent: M0149-0001h1a
   - A plain time value prints with a date in format, concat and row output: `format('%s', '10:00'::time)` gives
@@ -12553,6 +12553,14 @@ verify each at HEAD when the task starts.
   - The same holds for timestamptz literals \(`'2020-01-01'` for PG's `'2020-01-01 00:00:00+00'`\), and PG prints a number
     multiplying an interval as `'2'::double precision`.
   - Resume: set TimeSubTime in NewTimeDatum's time\-of\-day callers, parser.ResolveTimeOperator for the error, castLiteralConstText for EXPLAIN.
+  - 2026\-11\-19 \(landed\):
+    - NewTimeOfDayDatum tags every time\-of\-day value with TimeSubTime; the generic renderers print it as time\_out, 24:00:00
+      included. The packed\-tuple round trip now keeps the subtype.
+    - time and timetz with a number, text or boolean operand raise PG's `operator does not exist`.
+    - EXPLAIN prints `'2'::double precision` for a constant interval factor and labels literal range operands.
+    - Fixed on the way: `2::float8 * interval` had been rejected since h1a65; the analyzer now reads numeric cast targets.
+    - to\_json, EXPLAIN over VALUES, CURRENT\_DATE deparse and `'1 day' * 2` are M0149\-0001h1a88.
+    Movement: none — regress runner over all 165 failed cases changed only in known flakes \(75468 → 75467\)
 - [ ] **M0149-0001h1a75 — WRONG RESULTS: time zone arguments on timestamps are mishandled** (filed 2026-11-19 by M0149-0001h1a61; S2)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12658,6 +12666,15 @@ verify each at HEAD when the task starts.
     and PG's warning for an undeterminable codeset is not raised.
   - `select -1234.56::money` returns a value; PG applies the cast first and raises `operator does not exist: - money`.
   - Resume: datumToCopyText and copyTextToDatum need the session's lc\_monetary; the money to numeric cast; doNegate in the parser.
+- [ ] **M0149-0001h1a88 — to\_json and remaining EXPLAIN spellings** (filed 2026-11-19 by M0149-0001h1a74)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select to_json('10:00'::time)` raises `function to_json does not exist`; PG returns `"10:00:00"` \(to\_json, json.c\).
+  - `explain (verbose) select '10:00'::time + i from (values ('1 hour'::interval)) v(i)` prints `Output: i`; PG pulls the
+    VALUES up and prints the folded constant. `CURRENT_DATE` deparses as `current_date()`.
+  - `select '1 day' * 2` raises `operator * requires integer operands`; PG reads the literal as an integer and raises
+    `invalid input syntax for type integer`.
+  - Resume: the json function table in internal/executor; VALUES pull\-up in the planner; the SQLValueFunction deparse.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a

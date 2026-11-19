@@ -37,7 +37,7 @@ func TestTimestampPrecisionIsApplied(t *testing.T) {
 		{`SELECT '2020-12-31 23:59:59.9'::timestamp(0)`, "2021-01-01 00:00:00.000000"},
 		{`SELECT '2020-01-01 00:00:01.26'::timestamp(1)`, "2020-01-01 00:00:01.300000"},
 		{`SELECT 'infinity'::timestamp(0)`, "infinity"},
-		{`SELECT '00:00:01.6'::time(0)`, "1970-01-01 00:00:02.000000"},
+		{`SELECT '00:00:01.6'::time(0)`, "00:00:02"},
 	} {
 		if got := one(tc.sql); got != tc.want {
 			t.Errorf("%s = %s, want %s", tc.sql, got, tc.want)

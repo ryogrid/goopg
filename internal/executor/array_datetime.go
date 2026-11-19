@@ -48,6 +48,9 @@ func datetimeElemText(d Datum, elem string, ctx *Context) string {
 
 // timeOfDayText is time_out: the clock, with fractional digits only when present.
 func timeOfDayText(d Datum) string {
+	if d.Int-timeOfDayBase == usecsPerDay {
+		return "24:00:00" // stored as the next midnight
+	}
 	t := d.TimeValue().UTC()
 	text := t.Format("15:04:05")
 	if micros := t.Nanosecond() / 1000; micros != 0 {

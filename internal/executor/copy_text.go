@@ -534,7 +534,7 @@ func copyTextToDatum(t catalog.Type, raw []byte, timeZone string, dateOrder ...s
 		if err != nil {
 			return Datum{}, err
 		}
-		return roundTimeDatumToPrecision(NewTimeDatum(ts), timeColumnPrecision(t)), nil
+		return roundTimeDatumToPrecision(NewTimeOfDayDatum(ts), timeColumnPrecision(t)), nil
 	case "timetz":
 		// M0119-0006 (48th slice): a COPY field with no zone of its own takes the
 		// SESSION zone, exactly as the literal path does since the 47th slice —
@@ -977,7 +977,7 @@ func parseTimeSpecialLiteral(s string, now time.Time) (Datum, bool) {
 		return Datum{}, false
 	}
 	t := now.UTC()
-	return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)), true
+	return NewTimeOfDayDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)), true
 }
 
 // parseTimeTZSpecialLiteral is the timetz-domain sibling of

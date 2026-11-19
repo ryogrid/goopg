@@ -4482,7 +4482,7 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 		}
 		// Try time-of-day first ("HH:MM:SS") then full timestamp.
 		if t, err := parseTimeString(s); err == nil {
-			return NewTimeDatum(t)
+			return NewTimeOfDayDatum(t)
 		}
 		if t, err := parseCopyTimestamp(s); err == nil {
 			return NewTimeDatum(t)
@@ -4973,6 +4973,8 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 			return NewDateDatum(x.CachedTime), nil
 		case isTimestampTZTypeName(x.Type):
 			return NewTimestampTZDatum(x.CachedTime), nil
+		case x.Type == "time":
+			return NewTimeOfDayDatum(x.CachedTime), nil
 		}
 		return NewTimeDatum(x.CachedTime), nil
 	}
@@ -5118,7 +5120,7 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 			}
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid input syntax for type time: %q", x.Value)}
 		}
-		return NewTimeDatum(ts), nil
+		return NewTimeOfDayDatum(ts), nil
 	case "timetz":
 		ts, offsetSecs, err := decodeTimeOnlyText(x.Value, dateInputFromCtx(ctx), true)
 		if err != nil {
@@ -5989,6 +5991,8 @@ func formatTimeDatumDateStyle(d Datum, style, order, zone string) string {
 		return misc.FormatTimestampTZ(d.TimeValue(), style, order, zone)
 	case TimeSubTimeTZ:
 		return timeTZText(d)
+	case TimeSubTime:
+		return timeOfDayText(d)
 	}
 	return misc.FormatTimestamp(d.TimeValue(), style, order)
 }
@@ -6651,19 +6655,19 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 				}
 				return Datum{}, err
 			}
-			return NewTimeDatum(ts), nil
+			return NewTimeOfDayDatum(ts), nil
 		}
 		if d.Kind == KindTime && d.IsTimestampNotFinite() {
 			return NullDatum, nil
 		}
 		if d.Kind == KindTime && d.TimeSub == TimeSubTimestampTZ {
 			clock, _ := sessionClock(d.TimeValue(), ctx)
-			return NewTimeDatum(clock), nil
+			return NewTimeOfDayDatum(clock), nil
 		}
 		if d.Kind == KindTime {
 			t := d.TimeValue().UTC()
 			// Re-anchor to epoch to strip any date component.
-			return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)), nil
+			return NewTimeOfDayDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)), nil
 		}
 		return d, nil
 	case "timetz":
@@ -18024,7 +18028,7 @@ case "pg_char_to_encoding":
 		// floor-via-integer-division here is what made
 		// `now()::time(N)::text = localtime(N)::text` (expressions.sql) flaky).
 		clock, _ := sessionClock(ctx.Now, ctx)
-		d := NewTimeDatum(clock)
+		d := NewTimeOfDayDatum(clock)
 		if len(x.Args) > 0 {
 			prec, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err == nil && prec.Kind == KindInt {

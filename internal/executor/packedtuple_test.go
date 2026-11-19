@@ -412,7 +412,7 @@ func TestPackedTupleRoundTripCoversEveryTimeSubtype(t *testing.T) {
 		// query can observe it), but any later slice that starts populating
 		// TimeSubTime must close this at the same time or a retained `time`
 		// column silently widens to `timestamp` — the TPC-DS Q72 shape.
-		TimeSubTime:   {"time", "M0127-P5.9-u (TimeSubTime has no producer)"},
+		TimeSubTime:   {"time", ""},
 		TimeSubTimeTZ: {"timetz", ""},
 	}
 	for sub := TimeSubtype(0); sub < timeSubtypeCount; sub++ {

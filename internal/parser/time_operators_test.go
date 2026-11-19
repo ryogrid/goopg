@@ -29,7 +29,7 @@ func TestResolveTimeOperator(t *testing.T) {
 		{OpSub, "time", "timestamp", "", TimeOperatorMissing},
 		{OpAdd, "timestamp", "timetz", "", TimeOperatorMissing},
 		{OpAdd, "timestamp", "interval", "", TimeOperatorNone},
-		{OpAdd, "time", "int4", "", TimeOperatorNone},
+		{OpAdd, "time", "int4", "", TimeOperatorMissing},
 		{OpMul, "time", "interval", "", TimeOperatorNone},
 	}
 	for _, c := range cases {
