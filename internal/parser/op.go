@@ -76,6 +76,12 @@ const (
 	// JSON path-extraction operators (M0134-0039)
 	OpJSONPathGet     // a #> b   (json value at path, returns json)
 	OpJSONPathGetText // a #>> b  (json value at path, returns text)
+
+	// Range position operators (rangetypes.c): range_overleft, range_overright
+	// and range_adjacent.
+	OpOverLeft  // a &< b
+	OpOverRight // a &> b
+	OpAdjacent  // a -|- b
 )
 
 // ParseUnaryOp converts the token text the parser emits
@@ -162,6 +168,12 @@ func ParseBinaryOp(s string) OpCode {
 		return OpContains
 	case "&&":
 		return OpOverlap
+	case "&<":
+		return OpOverLeft
+	case "&>":
+		return OpOverRight
+	case "-|-":
+		return OpAdjacent
 	case "->":
 		return OpJSONGet
 	case "->>":
@@ -251,6 +263,12 @@ func (o OpCode) String() string {
 		return "@>"
 	case OpOverlap:
 		return "&&"
+	case OpOverLeft:
+		return "&<"
+	case OpOverRight:
+		return "&>"
+	case OpAdjacent:
+		return "-|-"
 	case OpJSONGet:
 		return "->"
 	case OpJSONGetText:

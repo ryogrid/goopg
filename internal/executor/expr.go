@@ -11828,6 +11828,9 @@ func declaredBpcharTypmod(e optimizer.Expr) int64 {
 // no-arg time functions pgbench needs; HammerDB TPC-H also uses
 // to_timestamp(text, fmt) to load TIMESTAMP columns.
 func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
+	if fn, typ, ok := strings.Cut(x.Name, optimizer.RangeOpTypeSep); ok {
+		return evalRangeOperator(fn, typ, x, slot, ctx)
+	}
 	name := strings.ToLower(x.Name)
 	// Strip pg_catalog. prefix for matching — these are schema-qualified
 	// versions of the same built-in functions.

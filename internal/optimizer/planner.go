@@ -10780,6 +10780,9 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		} else if ok {
 			return e, nil
 		}
+		if e, ok := rangeOpCall(x.Pos(), x.Op, l, r); ok {
+			return e, nil
+		}
 		if x.Op == parser.OpConcat {
 			l, r = moneyConcatOperand(l), moneyConcatOperand(r)
 		}
@@ -11007,6 +11010,9 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		if e, ok, err := dateTimeLiteralCall(x.Pos(), x.Op, l, r); err != nil {
 			return nil, err
 		} else if ok {
+			return e, nil
+		}
+		if e, ok := rangeOpCall(x.Pos(), x.Op, l, r); ok {
 			return e, nil
 		}
 		if x.Op == parser.OpConcat {
@@ -19306,6 +19312,9 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		if e, ok, err := dateTimeLiteralCall(x.Pos(), x.Op, l, r); err != nil {
 			return nil, err
 		} else if ok {
+			return e, nil
+		}
+		if e, ok := rangeOpCall(x.Pos(), x.Op, l, r); ok {
 			return e, nil
 		}
 		if x.Op == parser.OpConcat {

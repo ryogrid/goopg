@@ -12513,12 +12513,19 @@ verify each at HEAD when the task starts.
     - Remaining forms are M0149\-0001h1a85; string casts to bit\(n\) are M0149\-0001h1a83.
     - Design: docs/design/0100\-0149/0149\-0001h1a71\-typed\-literals.md.
     Movement: yes — regress runner interval 605 → 586
-- [ ] **M0149-0001h1a72 — range operators such as `@>` reject range operands** (filed 2026-11-19 by M0149-0001h1a54)
+- [x] **M0149-0001h1a72 — range operators such as `@>` reject range operands** (filed 2026-11-19 by M0149-0001h1a54)
   Kind: impl
   Parent: M0149-0001h1a
   - `daterange('2020-01-01','2020-01-05') @> '2020-01-02'::date` and `int4range(1,5) @> 2` fail with `operator @> requires box
     operands`. PG returns true \(range\_contains\_elem\).
   - Resume: the operator's dispatch in evalBinary, by operand type.
+  - 2026\-11\-19 \(landed\):
+    - The planner resolves range operators by type to the rangetypes.c functions \(rangeOpCall\); the executor ports their
+      bodies over the canonical text. New operator codes for `&<`, `&>` and `-|-`.
+    - Containment, overlap, position, adjacency, union, intersection, difference and ordering match PG 18.3.
+    - Equality on non\-canonical numrange text, range ordering in sorts, the range functions and user range types are M0149\-0001h1a86.
+    - Design: docs/design/0100\-0149/0149\-0001h1a72\-range\-operators.md.
+    Movement: yes — regress runner rangetypes 832 → 463, multirangetypes 1843 → 1830, without\_overlaps 563 → 558, box 312 → 310, polygon 155 → 151
 - [ ] **M0149-0001h1a73 — monetary and numeric locale data beyond to\_char** (filed 2026-11-19 by M0149-0001h1a58)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12535,6 +12542,7 @@ verify each at HEAD when the task starts.
     time zone + integer` with its hint. Bare integer literals are typed int8 here, so the message needs the literal's PG type.
   - EXPLAIN prints a time literal as written \(`'09:00'`, or `'11:00'` in a comparison\); PG prints `'09:00:00'::time without
     time zone`.
+  - A literal range operand prints without its type label \(`'[1,3)'` for PG's `'[1,3)'::int4range`\).
   - The same holds for timestamptz literals \(`'2020-01-01'` for PG's `'2020-01-01 00:00:00+00'`\), and PG prints a number
     multiplying an interval as `'2'::double precision`.
   - Resume: set TimeSubTime in NewTimeDatum's time\-of\-day callers, parser.ResolveTimeOperator for the error, castLiteralConstText for EXPLAIN.
@@ -12626,6 +12634,14 @@ verify each at HEAD when the task starts.
     `national character` and `tid` are not folded; `schema.type 'x'` only for pg\_catalog.
   - A general `IDENT Sconst` fold must not capture FDW option lists \(`OPTIONS (host 'x')`\); gram.y separates them by context.
   - Resume: peekTypedLitForm in internal/parser/adapter.go; tid after M0149\-0001h1a84.
+- [ ] **M0149-0001h1a86 — remaining range type behaviour** (filed 2026-11-19 by M0149-0001h1a72)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `numrange(1.50, 2) = numrange(1.5, 2)` is false; PG compares bounds with the subtype \(range\_eq\).
+  - `order by` over a range column sorts the text: `[1,20)` after `[1,3)`; PG sorts by range\_cmp.
+  - isempty, lower\_inc, upper\_inf, range\_merge and the rest of the range functions do not exist.
+  - Operators over user\-defined range types and multiranges are not resolved.
+  - Resume: range\_ops.go in internal/executor; the sort comparator for range types; rangeOpCall for catalog range types.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a
