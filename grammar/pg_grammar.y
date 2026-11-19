@@ -2923,7 +2923,11 @@ c_expr:
 	   records it as the Qualified form with unit "second" and the precision. */
 	| INTERVAL '(' ICONST ')' SCONST
 			{
-				$$ = NewIntervalLitQualified($<p>1, $5, "second", true, $3)
+				if buildIntervalLit($<p>1, $5) == nil {
+					$$ = NewCastExpr($<p>5, NewStringConst($<p>5, $5), ObjectName{Name: "interval"}, nil)
+				} else {
+					$$ = NewIntervalLitQualified($<p>1, $5, "second", true, $3)
+				}
 			}
 	| INTERVAL SCONST
 			{
@@ -2934,8 +2938,9 @@ c_expr:
 				   fall-through blames. */
 				e := buildIntervalLit($<p>1, $2)
 				if e == nil {
-					raiseErr(yylex, &SyntaxError{Pos: $<p>2, Message: "'" + strings.ReplaceAll($2, "'", "''") + "'"})
-					e = NewNullConst($<p>1)
+					/* A body that is not an interval is reported by interval_in
+					   at the string, as makeStringConstCast leaves it to do. */
+					e = NewCastExpr($<p>2, NewStringConst($<p>2, $2), ObjectName{Name: "interval"}, nil)
 				}
 				// Remember the raw body for AT TIME ZONE — see lastIntervalNode.
 				l.lastIntervalNode, l.lastIntervalRaw, l.lastIntervalLitPos = e, $2, $<p>2
@@ -2950,8 +2955,7 @@ c_expr:
 			{
 				/* $<ival>1 is the string's position: coerce_type reports a bad
 				   literal there (makeStringConstCast), not at the type name. */
-				typ, val := typedLitParts($1)
-				$$ = NewTypedStringLit($<ival>1, typ, val)
+				$$ = typedLitExpr(yylex, $1, $<p>1, $<ival>1)
 			}
 	/* Multi-word typed literals — gram.y ConstDatetime Sconst. The lexer's
 	   TYPEDLIT fold needs the SCONST to follow the type name IMMEDIATELY, so

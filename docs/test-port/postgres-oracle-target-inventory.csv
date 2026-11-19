@@ -99,7 +99,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale,mismatch_l
 ,regress-sql,regress,postgres/src/test/regress/sql/int2.sql,pass,yes,-,Recovered 2026-05-24 by M0111-0005: encodeValuePG int2 arm emitted the bare 'smallint out of range' (int2pl arithmetic wording) on storage-encode of an out-of-range string literal; now mirrors int4 sibling and PostgreSQL int2in with the value-N-is-out-of-range-for-type-smallint wording,,
 ,regress-sql,regress,postgres/src/test/regress/sql/int4.sql,pass,yes,-,Recovered 2026-05-24 by M0097-0037 fast-path int2/int4 overflow fix (evalFastExpr omitted the overflow check); real cause was the M0107-0003 fast expression evaluator not the M0106-0010 codec,,
 ,regress-sql,regress,postgres/src/test/regress/sql/int8.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,,
-,regress-sql,regress,postgres/src/test/regress/sql/interval.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,605,2159
+,regress-sql,regress,postgres/src/test/regress/sql/interval.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,586,2159
 ,regress-sql,regress,postgres/src/test/regress/sql/join.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,2686,9403
 ,regress-sql,regress,postgres/src/test/regress/sql/join_hash.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,172,1092
 ,regress-sql,regress,postgres/src/test/regress/sql/json.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,1185,2356

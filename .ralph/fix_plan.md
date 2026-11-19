@@ -12496,7 +12496,7 @@ verify each at HEAD when the task starts.
     - About 120 inputs match PG 18.3 apart from the clock value of `now`. timezone\_abbreviations is filed as M0149\-0001h1a82.
     - Design: docs/design/0100\-0149/0149\-0001h1a56\-datetime\-input\-parser.md \(new section\).
     Movement: yes — regress runner horology 2328 → 2318
-- [ ] **M0149-0001h1a71 — typed literals the grammar does not accept** (filed 2026-11-19 by M0149-0001h1a55)
+- [x] **M0149-0001h1a71 — typed literals the grammar does not accept** (filed 2026-11-19 by M0149-0001h1a55)
   Kind: impl
   Parent: M0149-0001h1a
   - `uuid 'x'`, `inet 'x'`, `cidr 'x'`, `macaddr 'x'`, `money 'x'`, `bytea 'x'`, `bit '1'`, `varbit '1'`, `regclass 'x'`, `xml 'x'`,
@@ -12505,6 +12505,14 @@ verify each at HEAD when the task starts.
   - `interval 'x'` is a syntax error and `interval(3) 'x'` says `invalid interval count`, where PG reports
     `invalid input syntax for type interval` at the string.
   - Resume: replace knownTypeNames in internal/parser/adapter.go with gram.y's productions; playbook §12 first.
+  - 2026\-11\-19 \(landed\):
+    - The adapter folds type modifiers, pg\_catalog qualification, double precision and more type names into TYPEDLIT, and
+      typedLitExpr builds a cast of the string for them. An invalid interval body is interval\_in's error at the string.
+    - Parity goldens 1716 → 1721 statements; only the new forms changed.
+    - Accepting `tid '(2, 0)'` sent brin.sql into an endless DO loop because RETURNING ctid is NULL; tid stays out \(M0149\-0001h1a84\).
+    - Remaining forms are M0149\-0001h1a85; string casts to bit\(n\) are M0149\-0001h1a83.
+    - Design: docs/design/0100\-0149/0149\-0001h1a71\-typed\-literals.md.
+    Movement: yes — regress runner interval 605 → 586
 - [ ] **M0149-0001h1a72 — range operators such as `@>` reject range operands** (filed 2026-11-19 by M0149-0001h1a54)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12594,6 +12602,30 @@ verify each at HEAD when the task starts.
     \(load\_tzoffsets, share/timezonesets\), and `SET timezone_abbreviations = 'India'` changes what `IST` means.
   - pg\_timezone\_abbrevs should list the active set.
   - Resume: defaultZoneAbbrevs in internal/utils/adt/datetime; a loader for share/timezonesets and the GUC hook.
+- [ ] **M0149-0001h1a83 — a string cast to bit\(n\) or varbit\(n\) raises instead of padding** (filed 2026-11-19 by M0149-0001h1a71)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select '10'::bit(4)` and `bit(4) '10'` raise `bit string length 2 does not match type bit(4)`; PG returns `1000`.
+    `'111'::varbit(2)` raises where PG returns `11`. coerce\_type reads an unknown literal with typmod \-1 and then applies
+    the explicit length coercion \(bit\(\), varbit\(\) with isExplicit\).
+  - Resume: bitStringCast in internal/executor/expr.go, for a StringConst operand.
+- [ ] **M0149-0001h1a84 — WRONG RESULTS: RETURNING ctid is NULL and RETURNING xmin is rejected** (filed 2026-11-19 by M0149-0001h1a71; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `insert into t values (1) returning ctid` returns NULL; PG returns `(0,1)`. The same in PL/pgSQL `RETURNING ctid INTO`.
+    `returning xmin` raises `column "xmin" does not exist`.
+  - brin.sql's `LOOP INSERT ... RETURNING ctid INTO curtid; EXIT WHEN curtid > tid '(2, 0)'` never ends once the tid literal
+    parses, so the `tid` typed literal waits for this \(M0149\-0001h1a85\).
+  - Resume: the RETURNING projection of Insert/Update/Delete in internal/executor; system columns of the new tuple.
+  > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a84: RETURNING ctid returns NULL
+  > The result differs from PG 18.3 for every INSERT. Found while testing typed literals in h1a71.
+- [ ] **M0149-0001h1a85 — remaining typed literal forms** (filed 2026-11-19 by M0149-0001h1a71)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - User\-defined and unknown types \(`mood 'happy'`, `nosuchtype 'x'` → PG `type "nosuchtype" does not exist`\), `nchar`,
+    `national character` and `tid` are not folded; `schema.type 'x'` only for pg\_catalog.
+  - A general `IDENT Sconst` fold must not capture FDW option lists \(`OPTIONS (host 'x')`\); gram.y separates them by context.
+  - Resume: peekTypedLitForm in internal/parser/adapter.go; tid after M0149\-0001h1a84.
 - [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
   Kind: impl
   Parent: M0149-0001h1a

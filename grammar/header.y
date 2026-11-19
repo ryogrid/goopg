@@ -8,7 +8,6 @@ package parser
 
 import (
 	"strconv"
-	"strings"
 )
 
 %}
