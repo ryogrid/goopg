@@ -12587,11 +12587,16 @@ verify each at HEAD when the task starts.
     - utc\_offset stays in postgres\_verbose: goopg has no IntervalStyle output \(M0149\-0001h1a89\).
     - Design: docs/design/0100\-0149/0149\-0001h1a51\-timestamptz\-interval.md \(new section\).
     Movement: none — regress runner over all 165 failed cases changed only in known flakes \(75461 → 75455\); sysviews stays passing
-- [ ] **M0149-0001h1a77 — the numeric scale function is missing** (filed 2026-11-19 by M0149-0001h1a62)
+- [x] **M0149-0001h1a77 — the numeric scale function is missing** (filed 2026-11-19 by M0149-0001h1a62)
   Kind: impl
   Parent: M0149-0001h1a
   - `select scale(1.50)` raises `function scale does not exist`; PG returns 2 \(numeric\_scale\). min\_scale and trim\_scale exist.
   - Resume: the trim\_scale and min\_scale arm in internal/executor/expr.go, plus the function's result type.
+  - 2026\-11\-20 \(landed\):
+    - scale\(\) is numeric\_scale, with NULL for NaN and infinity and PG's error for other argument types; scale, min\_scale
+      and trim\_scale have result types in exprType.
+    - Design: docs/design/0100\-0149/0149\-0001h1a62\-numeric\-variance.md \(new section\).
+    Movement: yes — regress runner numeric 925 → 871, numeric\_big 688 → 685
 - [ ] **M0149-0001h1a78 — other set\-returning calls nested in an expression** (filed 2026-11-19 by M0149-0001h1a64)
   Kind: impl
   Parent: M0149-0001h1a

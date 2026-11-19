@@ -16116,6 +16116,35 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			}
 			return Datum{Kind: KindInt, Int: 0}, nil
 		}
+	case "scale":
+		// numeric_scale: the display scale of a numeric, NULL for NaN and the
+		// infinities. Integers reach it through the implicit cast to numeric;
+		// any other argument type has no scale function.
+		if len(x.Args) == 1 {
+			if t, ok := optimizer.ExprResultType(x.Args[0]); ok && !t.IsArray {
+				switch strings.ToLower(t.Name) {
+				case "numeric", "decimal", "int2", "int4", "int8", "smallint", "integer", "bigint", "unknown", "":
+				default:
+					return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(),
+						Message: fmt.Sprintf("function scale(%s) does not exist", pgFormatTypeName(t.Name)),
+						Hint:    "No function matches the given name and argument types. You might need to add explicit type casts."}
+				}
+			}
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			if v.IsNull() {
+				return NullDatum, nil
+			}
+			switch v.Kind {
+			case KindInt:
+				return Datum{Kind: KindInt, Int: 0}, nil
+			case KindNumeric:
+				return Datum{Kind: KindInt, Int: int64(v.Scale)}, nil
+			}
+			return NullDatum, nil // NaN and the infinities
+		}
 	case "trim_scale", "min_scale":
 		// trim_scale(numeric) reduces the value's display scale to the
 		// minimum needed to represent it exactly (drop trailing zero

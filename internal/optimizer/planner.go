@@ -17661,6 +17661,10 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "int8"}
 		case "current_timestamp", "now", "transaction_timestamp", "statement_timestamp":
 			return catalog.Type{Name: "timestamp"}
+		case "scale", "min_scale":
+			return catalog.Type{Name: "int4"}
+		case "trim_scale":
+			return catalog.Type{Name: "numeric"}
 		case "current_time":
 			return catalog.Type{Name: "timetz"}
 		case "localtime":

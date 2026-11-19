@@ -26,3 +26,10 @@ the serialized partial state, because a parallel worker may see only some of the
 
 150 randomized input sets of up to six values, plus NaN, infinities, one\-row and NULL input, window frames
 and grouped queries, match PG 18.3 for all six aggregates.
+
+## scale\(\) \(M0149\-0001h1a77\)
+
+`scale(numeric)` is numeric\_scale: the display scale of the argument, 0 for an integer argument through the implicit
+cast, and NULL for NaN and the infinities. Another argument type raises `function scale(double precision) does not
+exist` with PG's hint. `scale`, `min_scale` and `trim_scale` now also report their result types to the planner.
+
