@@ -1814,6 +1814,17 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		if _, err := analyzeExpr(x.Index, ctx); err != nil {
 			return catalog.Type{}, err
 		}
+		// `a[2][1]` is ONE SubscriptingRef with two subscripts to PG
+		// (transformContainerSubscripts): every subscript of a plain
+		// element fetch indexes one dimension of the same array, and the
+		// result is its element type. goopg nests the subscripts, so the
+		// inner one already typed the element; the outer one keeps it
+		// (M0149-0001h1a78b).
+		if inner, ok := x.Base.(*parser.ArraySubscriptExpr); ok && !inner.IsSlice && !baseTyp.IsArray && !strings.HasSuffix(baseTyp.Name, "[]") && !isUnknownType(baseTyp) {
+			if bt, err := analyzeExpr(inner.Base, ctx); err == nil && (bt.IsArray || strings.HasSuffix(bt.Name, "[]")) {
+				return baseTyp, nil
+			}
+		}
 		// Infer element type from array type (strip trailing []).
 		if strings.HasSuffix(baseTyp.Name, "[]") {
 			return catalog.Type{Name: baseTyp.Name[:len(baseTyp.Name)-2]}, nil
@@ -1880,12 +1891,15 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		// errors and return a generic text[] type. The planner's resolveExpr
 		// converts this to FuncCall{Name:"array_construct"} which the executor
 		// evaluates as a {v1,v2,...} text representation. M0097-0065.
+		elemTypes := make([]catalog.Type, 0, len(x.Elements))
 		for _, el := range x.Elements {
-			if _, err := analyzeExpr(el, ctx); err != nil {
+			t, err := analyzeExpr(el, ctx)
+			if err != nil {
 				return catalog.Type{}, err
 			}
+			elemTypes = append(elemTypes, t)
 		}
-		return catalog.Type{Name: "text[]"}, nil
+		return arrayConstructorType(elemTypes), nil
 	default:
 		return catalog.Type{}, analyzeError(e.Pos(), "0A000", fmt.Sprintf("unsupported expression %T", e))
 	}
@@ -4334,3 +4348,42 @@ func isSRFCallName(x *parser.FuncCall, cat catalog.Catalog) bool {
 	return false
 }
 
+
+// arrayConstructorType is the type transformArrayExpr (parse_expr.c) gives
+// ARRAY[e1, e2, ...]: the array of the elements' common type
+// (select_common_type), with unknown literals resolving to text. Numeric
+// elements promote along the numeric lattice and an element that is itself
+// an array makes a multidimensional array of the same type. Anything this
+// does not settle keeps the analyzer's earlier text[], so that a subscript
+// over ARRAY[1, 2] types as int4 and `(ARRAY[1, 2])[1] + 1` passes the
+// arithmetic check (M0149-0001h1a78b).
+func arrayConstructorType(elems []catalog.Type) catalog.Type {
+	fallback := catalog.Type{Name: "text[]"}
+	var common catalog.Type
+	for _, t := range elems {
+		if isUnknownType(t) || t.Name == "" {
+			continue
+		}
+		if common.Name == "" {
+			common = t
+			continue
+		}
+		if strings.EqualFold(common.Name, t.Name) && common.IsArray == t.IsArray {
+			continue
+		}
+		if isNumericLike(common) && isNumericLike(t) && !common.IsArray && !t.IsArray {
+			if p := PromoteNumericType(common, t); p.Name != "" {
+				common = p
+				continue
+			}
+		}
+		return fallback
+	}
+	if common.Name == "" {
+		return fallback
+	}
+	if common.IsArray || strings.HasSuffix(common.Name, "[]") {
+		return common
+	}
+	return catalog.Type{Name: strings.ToLower(common.Name) + "[]"}
+}

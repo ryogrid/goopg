@@ -1,5 +1,7 @@
 package parser
 
+import "strings"
+
 // FigureIndexColname is parse_target.c FigureIndexColname: the name
 // transformIndexStmt gives an expression index column (indexcolname), which
 // ChooseIndexColumnNames then uses for the index's attribute names and its
@@ -88,6 +90,12 @@ func figureColnameInternal(e Expr) (string, int) {
 // and the like (gram.y Numeric / Character / Bit rules), so `1::integer`
 // names its column int4.
 func systemTypeColname(t ObjectName) string {
+	// FigureColnameInternal takes the type name's last component, which
+	// never carries array bounds: `x::int[]` is named int4, `x::date[]`
+	// date (M0149-0001h1a78b).
+	for strings.HasSuffix(t.Name, "[]") {
+		t.Name = strings.TrimSpace(t.Name[:len(t.Name)-2])
+	}
 	if t.Schema != "" {
 		return t.Name
 	}

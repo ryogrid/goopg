@@ -162,3 +162,27 @@ func TestExplainSelectListProjectSetEstimates(t *testing.T) {
 		}
 	}
 }
+
+// TestArraySubscriptArithmetic pins M0149-0001h1a78b: a subscript over an
+// ARRAY constructor or a date[] yields its element type's datum, so
+// arithmetic on it is PG's (int4pl, date_pli), not "requires integer
+// operands".
+func TestArraySubscriptArithmetic(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	for sql, want := range map[string]string{
+		"SELECT (ARRAY[1,2])[1] + 1":                  "2",
+		"SELECT (ARRAY[1,2])[2] * 3":                  "6",
+		"SELECT ('{2020-01-31}'::date[])[1] + 1":      "2020-02-01",
+		"SELECT (ARRAY['2020-03-01'::date])[1] - 1":   "2020-02-29",
+		"SELECT ('{2020-01-01,infinity}'::date[])[2]": "infinity",
+	} {
+		rows := runQuery(t, ctx, sql)
+		if len(rows) != 1 {
+			t.Fatalf("%s: %d rows", sql, len(rows))
+		}
+		if got := formatDatumDateStyle(rows[0][0], ctx); got != want {
+			t.Errorf("%s = %s, want %s", sql, got, want)
+		}
+	}
+}

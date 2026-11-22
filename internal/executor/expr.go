@@ -4406,6 +4406,24 @@ func hasISODatePrefix(s string) bool {
 // ledger rather than guessed at. Falling through leaves the pre-existing text
 // behaviour, which is already correct for ISO date/timestamp comparisons because
 // their spelling sorts the same way their values do.
+// arraySubscriptElemDatumCtx is arraySubscriptElemDatum plus the date element:
+// a DATE element is a date datum (date_in), so `d[1] + 1` reaches date_pli
+// instead of failing as text. It needs the session's date input settings: array_out spells a date element in the session
+// DateStyle (`31.01.2020` under German), which date_in reads back the same
+// way (M0149-0001h1a78b).
+func arraySubscriptElemDatumCtx(elemType, elem string, ctx *Context) (Datum, bool) {
+	if strings.EqualFold(elemType, "date") {
+		if d, ok := parseDateSpecialLiteral(elem, time.Time{}); ok {
+			return d, true
+		}
+		if t, _, err := decodeDateTextSession(elem, dateInputFromCtx(ctx)); err == nil {
+			return NewDateDatum(t.UTC()), true
+		}
+		return NullDatum, false
+	}
+	return arraySubscriptElemDatum(elemType, elem)
+}
+
 func arraySubscriptElemDatum(elemType, elem string) (Datum, bool) {
 	switch strings.ToLower(elemType) {
 	case "interval":
@@ -12744,7 +12762,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			// kind instead of text — otherwise compareDatum never reaches the
 			// interval_cmp_value / numeric ladders and `c[1] = c[2]` compares the
 			// two element SPELLINGS. M0119-0006.
-			if d, ok := arraySubscriptElemDatum(x.ReturnType, elem); ok {
+			if d, ok := arraySubscriptElemDatumCtx(x.ReturnType, elem, ctx); ok {
 				return d, nil
 			}
 			// Try to infer element type: if the element looks like a plain integer

@@ -81,10 +81,12 @@ func TestArraySubscriptYieldsElementTypeDatum(t *testing.T) {
 		{"SELECT f[1] + f[2] FROM ai", "19.7"},
 		{"SELECT g[1] > g[2] FROM ai", "f"},
 		{"SELECT g[2] FROM ai", "10.2"},
-		// date and bool elements are NOT re-typed (their spellings already sort
-		// like their values); pinned so the scope note stays honest.
+		// date elements are re-typed to date datums since M0149-0001h1a78b, so
+		// date arithmetic works on them (date_pli); bool elements are still
+		// not re-typed (their spellings already sort like their values).
 		{"SELECT d[1] < d[2] FROM ai", "t"},
-		{"SELECT d[1] FROM ai", "2026-01-05"},
+		{"SELECT d[1]::text FROM ai", "2026-01-05"},
+		{"SELECT (d[1] + 1)::text FROM ai", "2026-01-06"},
 		{"SELECT b[1] > b[2] FROM ai", "t"},
 	}
 	for _, c := range cases {

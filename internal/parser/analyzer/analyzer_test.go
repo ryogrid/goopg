@@ -673,3 +673,38 @@ func TestAnalyzeSRFInCaseAndCoalesceRejected(t *testing.T) {
 		}
 	}
 }
+
+// TestAnalyzeArrayConstructorElementType pins M0149-0001h1a78b: ARRAY[...]
+// is the array of its elements' common type (transformArrayExpr), so a
+// subscript over it is an int4 and arithmetic on it passes. goopg typed every
+// constructor text[], and `(ARRAY[1,2])[1] + 1` failed with 42804.
+func TestAnalyzeArrayConstructorElementType(t *testing.T) {
+	cat := analyzerCatalog(t)
+	for _, sql := range []string{
+		"SELECT (ARRAY[1,2])[1] + 1",
+		"SELECT 1 + (ARRAY[1,2])[2] * 3",
+		"SELECT (ARRAY[1, 2.5])[2] - 1",
+		"SELECT (ARRAY[ARRAY[1,2],ARRAY[3,4]])[2][1] + 1",
+		"SELECT (ARRAY['a','b'])[1] || 'x'",
+		"SELECT ARRAY[1,2] || 3, 1 = ANY(ARRAY[1,2])",
+	} {
+		if err := Analyze(parseOne(t, sql), cat); err != nil {
+			t.Errorf("Analyze(%q): %v", sql, err)
+		}
+	}
+	for _, c := range []struct {
+		elems []catalog.Type
+		want  string
+	}{
+		{[]catalog.Type{{Name: "int4"}, {Name: "int4"}}, "int4[]"},
+		{[]catalog.Type{{Name: "int4"}, {Name: "numeric"}}, "numeric[]"},
+		{[]catalog.Type{{Name: "unknown"}, {Name: "int8"}}, "int8[]"},
+		{[]catalog.Type{{Name: "int4[]"}, {Name: "int4[]"}}, "int4[]"},
+		{[]catalog.Type{{Name: "unknown"}}, "text[]"},
+		{[]catalog.Type{{Name: "int4"}, {Name: "text"}}, "text[]"},
+	} {
+		if got := arrayConstructorType(c.elems).Name; got != c.want {
+			t.Errorf("arrayConstructorType(%v) = %s, want %s", c.elems, got, c.want)
+		}
+	}
+}

@@ -17,6 +17,9 @@ func TestFigureIndexColname(t *testing.T) {
 		{"('a'::\"char\"), ('a'::char), (cast('a' as \"char\")), ('a'::character)", "char bpchar char bpchar"},
 		{"coalesce(a,b), nullif(a,b), greatest(a,b), (current_date), (case when a then 1 end), (case when a then 1 else b end)", "coalesce nullif greatest current_date case b"},
 		{"(a + b), (row(a,b)), (array[a]), (a collate \"C\")", " row array a"},
+		// A subscript names the column by its base; a cast's array bounds
+		// are not part of the type's name (M0149-0001h1a78b).
+		{"((array[a])[1]), ((a::int[])[1]), ('{1}'::date[]), (a[1])", "array a date a"},
 	} {
 		st, err := Parse("create index on t (" + c.cols + ")")
 		if err != nil {

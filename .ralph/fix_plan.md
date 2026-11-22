@@ -12645,12 +12645,31 @@ verify each at HEAD when the task starts.
   - An input Result with no columns prints `width=1`; PG prints `width=0`. This is also true under `select count(*)`.
   - Resume: explainOutputNames for *optimizer.ProjectSet and the synthesised Result in
     internal/executor/operators\_explain.go. srfFunctionCallArgs already deparses the FROM\-clause SRF calls.
-- [ ] **M0149-0001h1a78b — arithmetic on an array subscript is rejected** (filed 2026-11-22 by M0149-0001h1a78)
+- [x] **M0149-0001h1a78b — arithmetic on an array subscript is rejected** (filed 2026-11-22 by M0149-0001h1a78)
   Kind: impl
   Parent: M0149-0001h1a
   - `select (array[1,2])[1] + 1` fails with `operator + requires numeric operands`; PG returns 2. The same happens
     on HEAD before M0149\-0001h1a78.
   - Resume: the element type that exprType gives an ArraySubscript over an ARRAY constructor.
+  - 2026\-11\-22 \(landed\):
+    - The analyzer types ARRAY\[...\] as the array of its elements' common type \(transformArrayExpr\), not text\[\].
+      A chained subscript over a multidimensional array keeps the element type.
+    - A subscript over a date\[\] yields a date datum read with the session DateStyle, so `d[1] + 1` is date\_pli.
+    - FigureColname drops a cast's array bounds, so the column of `('{1}'::date[])` is named `date`.
+    - Multidimensional subscripts return wrong values; this is filed as M0149\-0001h1a78e \(S2\).
+    - Design: docs/design/0100\-0149/0149\-0001h1a78b\-array\-constructor\-type.md \(new\).
+    Movement: yes — regress runner arrays 1277 → 1271 \(same\-list A/B against HEAD over 23 cases; plpgsql and polymorphism moved only in their known nondeterministic OUT\-parameter block\)
+- [ ] **M0149-0001h1a78e — WRONG RESULTS: subscripts of a multidimensional array** (filed 2026-11-22 by M0149-0001h1a78b; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select ('{{1,2},{3,4}}'::int[])[2][1]` returns `}`; PG returns 3. `(array[array[1,2],array[3,4]])[2]` returns `2}`;
+    PG returns NULL, because a single subscript of a 2\-D array is out of range for the element fetch.
+  - Resume: the array\_subscript arm in internal/executor/expr.go. parseTextArray splits only the top level, and goopg
+    nests `[2][1]` as two subscripts where PG's SubscriptingRef carries both. Fold the chain into one multi\-index fetch
+    in the planner, and return NULL for fewer subscripts than dimensions.
+  > \#\# ESCALATION 2026\-11\-22 \(S2\) — M0149\-0001h1a78e: multidimensional array subscripts return wrong values
+  > Any `a[i][j]` over a 2\-D array returns a fragment of the array text instead of the element. Found while fixing
+  > h1a78b; this is not new, because array literals fail the same way on HEAD.
 - [ ] **M0149-0001h1a78c — string\_to\_array is missing** (filed 2026-11-22 by M0149-0001h1a78)
   Kind: impl
   Parent: M0149-0001h1a
