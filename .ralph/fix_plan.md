@@ -12670,12 +12670,26 @@ verify each at HEAD when the task starts.
   > \#\# ESCALATION 2026\-11\-22 \(S2\) — M0149\-0001h1a78e: multidimensional array subscripts return wrong values
   > Any `a[i][j]` over a 2\-D array returns a fragment of the array text instead of the element. Found while fixing
   > h1a78b; this is not new, because array literals fail the same way on HEAD.
-- [ ] **M0149-0001h1a78c — string\_to\_array is missing** (filed 2026-11-22 by M0149-0001h1a78)
+- [x] **M0149-0001h1a78c — string\_to\_array is missing** (filed 2026-11-22 by M0149-0001h1a78)
   Kind: impl
   Parent: M0149-0001h1a
   - `select string_to_array('a,b', ',')` raises `function string_to_array does not exist`; PG returns `{a,b}`
     \(text\_to\_array, text\_to\_array\_null in varlena.c\). Only the pg\_proc rows exist.
   - Resume: add the function to the executor's builtin dispatch next to array\_to\_string.
+  - 2026\-11\-23 \(landed\):
+    - string\_to\_array ports split\_text, including NULL\-delimiter character splitting, null\_string and the empty cases.
+    - string\_to\_array and regexp\_split\_to\_array have the result type text\[\].
+    - array output quotes an element spelling NULL.
+    - string\_to\_table is missing; this is filed as M0149\-0001h1a78f.
+    - Design: docs/design/0100\-0149/0149\-0001h1a78b\-array\-constructor\-type.md \(new section\).
+    Movement: yes — regress runner arrays 1271 → 1214 \(same\-list A/B against HEAD over 19 cases, none worse\)
+- [ ] **M0149-0001h1a78f — string\_to\_table is missing** (filed 2026-11-23 by M0149-0001h1a78c)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select * from string_to_table('a,b', ',')` raises `table-valued function "string_to_table" not supported`;
+    PG returns two rows \(text\_to\_table, text\_to\_table\_null in varlena.c\). The target\-list form is missing too.
+  - Resume: planTableFuncRangeVar in internal/optimizer/planner.go, next to regexp\_split\_to\_table. Reuse
+    splitTextToArray from internal/executor/expr.go.
 - [ ] **M0149-0001h1a79 — sum and avg over interval are rejected** (filed 2026-11-19 by M0149-0001h1a65)
   Kind: impl
   Parent: M0149-0001h1a

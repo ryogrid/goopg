@@ -186,3 +186,33 @@ func TestArraySubscriptArithmetic(t *testing.T) {
 		}
 	}
 }
+
+// TestStringToArray pins M0149-0001h1a78c against PG 18.3's text_to_array
+// (varlena.c split_text): the function is not strict, a NULL delimiter splits
+// into characters, an empty delimiter keeps the input whole, an empty input
+// is {}, and elements equal to null_string become NULL. An element spelling
+// NULL is quoted, as array_out does.
+func TestStringToArray(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	for sql, want := range map[string]string{
+		"SELECT string_to_array('a,b,,c', ',')":     "{a,b,\"\",c}",
+		"SELECT string_to_array('abc', null)":       "{a,b,c}",
+		"SELECT string_to_array('abc', '')":         "{abc}",
+		"SELECT string_to_array('', ',')":           "{}",
+		"SELECT string_to_array('a,*,b', ',', '*')": "{a,NULL,b}",
+		"SELECT string_to_array('aXbXXc', 'XX')":    "{aXb,c}",
+		"SELECT string_to_array('NULL,x', ',')":     "{\"NULL\",x}",
+		"SELECT string_to_array('x y,{z}', ',')":    "{\"x y\",\"{z}\"}",
+		"SELECT (string_to_array('a,b', ','))[2]":   "b",
+		"SELECT string_to_array(null, ',') IS NULL": "t",
+	} {
+		rows := runQuery(t, ctx, sql)
+		if len(rows) != 1 {
+			t.Fatalf("%s: %d rows", sql, len(rows))
+		}
+		if got := rows[0][0].Format(); got != want {
+			t.Errorf("%s = %s, want %s", sql, got, want)
+		}
+	}
+}

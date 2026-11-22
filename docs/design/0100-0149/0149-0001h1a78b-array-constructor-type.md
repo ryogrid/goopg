@@ -28,3 +28,18 @@
   The values agree in every probe, because the executor re\-types per element.
 - Multidimensional subscripts return fragments of the array text. This is M0149\-0001h1a78e \(S2\).
 - Other datetime element types \(timestamp, time\) still come back as text from a subscript.
+
+## string\_to\_array \(M0149\-0001h1a78c\)
+
+- `string_to_array(string, delimiter [, null_string])` is a port of varlena.c's split\_text and
+  split\_text\_accum\_result \(`splitTextToArray` in internal/executor/expr.go\).
+  - The function is not strict: a NULL string gives a NULL result, and a NULL null\_string matches nothing.
+  - A NULL delimiter makes one element per character.
+  - An empty delimiter makes the whole input one element, and an empty input gives `{}`.
+- The planner gives string\_to\_array and regexp\_split\_to\_array the result type text\[\]; before this change
+  pg\_typeof said `unknown`.
+- array\_out quotes an element that spells NULL in any case, so it reads back as text and not as a null. Both text
+  array formatters \(formatTextArray, formatTextArrayWithNulls\) now do this.
+- Not done:
+  - string\_to\_table, the set\-returning sibling \(text\_to\_table\), is M0149\-0001h1a78f.
+  - The separator search is byte\-wise. PG's text\_position honours nondeterministic collations.

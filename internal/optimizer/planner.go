@@ -17897,6 +17897,10 @@ func exprType(e Expr) catalog.Type {
 				}
 			}
 			return catalog.Type{Name: "text[]"}
+		case "string_to_array", "regexp_split_to_array":
+			// text_to_array / text_to_array_null (pg_proc 394, 376) and
+			// regexp_split_to_array return text[].
+			return catalog.Type{Name: "text[]"}
 		case "array_construct":
 			// ARRAY[e1,...] constructor: return element type with [] suffix.
 			if len(x.Args) > 0 {

@@ -16827,6 +16827,33 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			return NewIntDatum(1), nil
 		}
 
+	case "string_to_array":
+		// string_to_array(string, delimiter [, null_string]) → text[]:
+		// text_to_array / text_to_array_null (varlena.c split_text). Not
+		// strict: a NULL string is a NULL result, a NULL delimiter splits
+		// into characters, and a NULL null_string matches nothing.
+		// M0149-0001h1a78c.
+		if len(x.Args) == 2 || len(x.Args) == 3 {
+			args := make([]Datum, len(x.Args))
+			for i, a := range x.Args {
+				d, err := evalExprSlot(a, slot, ctx)
+				if err != nil {
+					return NullDatum, err
+				}
+				args[i] = d
+			}
+			if args[0].IsNull() {
+				return NullDatum, nil
+			}
+			var nullStr *string
+			if len(args) == 3 && !args[2].IsNull() {
+				v := args[2].StringValue()
+				nullStr = &v
+			}
+			elems, nulls := splitTextToArray(args[0].StringValue(), args[1], nullStr)
+			return NewStringDatum(formatTextArrayWithNulls(elems, nulls)), nil
+		}
+
 	case "regexp_split_to_array":
 		// regexp_split_to_array(string, pattern [, flags]) → text[]
 		// Splits string by regexp and returns the parts as an array. M0097-0035.
@@ -19508,8 +19535,9 @@ func formatTextArray(elems []string) string {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
-		// Quote the element if it contains special chars, spaces, commas, braces, or backslashes.
-		needsQuote := len(e) == 0
+		// Quote the element if it contains special chars, spaces, commas, braces, or backslashes,
+		// or spells NULL (array_out quotes it so it reads back as text, not a null).
+		needsQuote := len(e) == 0 || strings.EqualFold(e, "NULL")
 		if !needsQuote {
 			for _, c := range e {
 				if c == '"' || c == ',' || c == '{' || c == '}' || c == '\\' || c == ' ' || c == '\t' {
@@ -19552,8 +19580,9 @@ func formatTextArrayWithNulls(elems []string, nulls []bool) string {
 			sb.WriteString("NULL")
 			continue
 		}
-		// Quote the element if it contains special chars, spaces, commas, braces, or backslashes.
-		needsQuote := len(e) == 0
+		// Quote the element if it contains special chars, spaces, commas, braces, or backslashes,
+		// or spells NULL (array_out quotes it so it reads back as text, not a null).
+		needsQuote := len(e) == 0 || strings.EqualFold(e, "NULL")
 		if !needsQuote {
 			for _, c := range e {
 				if c == '"' || c == ',' || c == '{' || c == '}' || c == '\\' || c == ' ' || c == '\t' {
@@ -22322,4 +22351,31 @@ func toRegTypmod(s string, ctx *Context) Datum {
 		}
 	}
 	return NewIntDatum(pgAttTypmod(oid, args))
+}
+
+// splitTextToArray is varlena.c's split_text for string_to_array: the fields
+// of input between occurrences of sep, or one field per character when sep is
+// NULL, with any field equal to nullStr reported as NULL
+// (split_text_accum_result). An empty input has no fields; an empty separator
+// makes the whole input one field. M0149-0001h1a78c.
+func splitTextToArray(input string, sep Datum, nullStr *string) ([]string, []bool) {
+	var fields []string
+	switch {
+	case sep.IsNull():
+		for _, r := range input {
+			fields = append(fields, string(r))
+		}
+	case input == "":
+	case sep.StringValue() == "":
+		fields = []string{input}
+	default:
+		fields = strings.Split(input, sep.StringValue())
+	}
+	nulls := make([]bool, len(fields))
+	if nullStr != nil {
+		for i, f := range fields {
+			nulls[i] = f == *nullStr
+		}
+	}
+	return fields, nulls
 }
