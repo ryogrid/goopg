@@ -42,6 +42,12 @@ loop.
    order and the Selection rules; reading only the baton's "Next step" does not
    satisfy this check.
 5. Implement the highest priority item per that banner using best practices
+   - **Detour guard (owner, 2026-11-23):** for M0149 work, before implementing a
+     blocker write `Path-to-TAP: <TAP test> ← <blocker> ← … ← <task>` in the
+     working_set and confirm each link is a proven requirement of the TAP test
+     passing (see the ANTI-DETOUR RULE in fix_plan.md item 10). Defects found
+     "nearby" are filed, not worked. If the chain exceeds 3 links, skip the
+     task as `detour` and take the next M0149 canonical-queue task.
 6. Use parallel subagents for complex tasks (max 8 concurrent; default to 2-4)
 7. Run tests after each implementation
    - **Record progress and learnings as nested bullet points.** When a task or

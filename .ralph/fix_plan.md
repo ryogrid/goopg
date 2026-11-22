@@ -300,6 +300,27 @@ it to hold the lineage.)
     close-out run once all descendants are `[x]`. One task per loop. A
     deferral-ledger row never completes or parks an M0149 task. Movement
     uses the `tap` instrument (`tap <test> assertions a/n→b/n`).
+    **ANTI-DETOUR RULE (owner decision 2026-11-23).** The goal of every
+    M0149 task is ONE thing: the upstream TAP test it names passes against
+    PG 18.3 (`tap` Movement). Fixing a blocker is allowed ONLY when the
+    selected TAP test (or its mixed PG-node run) cannot pass without it.
+    A defect that is merely *found nearby* (client-tool conformance such as
+    `psql \l+`, regress-suite diffs, other types' output/labels, WRONG
+    RESULTS in features the TAP test never touches) is filed (S2 where it
+    applies) and is NOT selected under M0149. Before selecting any
+    `Kind: impl` child, the loop writes in working_set `Path-to-TAP:` one
+    line `<TAP test> ← <blocker> ← … ← <task>` and checks each arrow is a
+    *proven requirement* (a failing TAP assertion or PG-node crash that names
+    it), not "same family" or "found while fixing". If the chain is longer
+    than 3 links, or any arrow is only "found by", the task is a DETOUR:
+    do not select it, record it in `Skip-rationale:` as `detour`, and take the
+    next M0149 canonical-queue task. Every loop's status block states which
+    TAP assertion count (`a/n`) the work moved; `Movement: none` twice in a
+    row on one lineage = stop that lineage (park `[!]`, like M0149-0001g).
+    The parked roots M0149-0001h / -0001i / -0001l (and with them h1, h1a and
+    all their descendants, S7) are exactly such detours: M0149-0001 closed
+    `[x]` when 034 passed; they stay `[!]` until a selected TAP task cites
+    one as a proven prerequisite.
     **PG 18.3 COMPATIBILITY IS THE PASS CONDITION:** goopg must match PG
     18.3 on the wire (walsender commands, CopyBoth streaming, pgoutput
     v1–4, `test_decoding`, matched log/error texts) and in EVERY file it
@@ -11802,9 +11823,10 @@ verify each at HEAD when the task starts.
     - Gates: units, postmaster, testport \(pg\_dump, Recovery, interop, template1,
       CREATE DATABASE\), spotcheck, sf025 99.
     Movement: yes — regress misc\_sanity 18→15, privileges 1252→1242
-- [ ] **M0149-0001h — has\_database\_privilege is not implemented: psql \\l+ fails** \(filed 2026-11-16; correctness / client-tool conformance, below the item-10 rank\)
+- [!] **M0149-0001h — has\_database\_privilege is not implemented: psql \\l+ fails** \(filed 2026-11-16; correctness / client-tool conformance, below the item-10 rank\)
   Kind: impl
   Parent: none
+  - **PARKED `[!]` 2026-11-23 (owner, anti-detour):** not a proven prerequisite of any M0149 TAP test (M0149-0001 closed `[x]` with 034 passing). Reopen only when a selected TAP task cites this as a proven blocker; its descendants stay unselectable (S7).
   - Repro: goopg `psql -c '\\l+'` → "function pg\_catalog.has\_database\_privilege does not exist". pg\_proc
     seeds OIDs 2250/2251 \(and the other overloads\), but the executor has no handler.
   - PG: `has_database_privilege` family in utils/adt/acl.c \(name/oid user × text/oid database × privilege
@@ -13893,9 +13915,10 @@ verify each at HEAD when the task starts.
     - Gates: units \(TestParserExprKeyUsesEveryField caught the key; fixed\),
       fire\-set \(fires=none\), spotcheck, sf025 99, acceptance.
     Movement: regress bit 254→27, largeobject 220→46, privileges 693→673
-- [ ] **M0149-0001l — WRONG RESULTS: an explicit cast to numeric\(p\) without a scale applies p as the scale and skips the overflow check** \(filed 2026-11-17 by M0149-0001h1a1; S2\)
+- [!] **M0149-0001l — WRONG RESULTS: an explicit cast to numeric\(p\) without a scale applies p as the scale and skips the overflow check** \(filed 2026-11-17 by M0149-0001h1a1; S2\)
   Kind: impl
   Parent: none
+  - **PARKED `[!]` 2026-11-23 (owner, anti-detour):** not a proven prerequisite of any M0149 TAP test (M0149-0001 closed `[x]` with 034 passing). Reopen only when a selected TAP task cites this as a proven blocker; its descendants stay unselectable (S7).
   - Repro on goopg:
     - `select 1.5::numeric(3), 12345::numeric(3), 1::numeric(3)` →
       `1.500 | 12345.000 | 1.000`;
@@ -14501,9 +14524,10 @@ verify each at HEAD when the task starts.
     - Gates: units, spotcheck, sf025 99 \(PLAN\-SHAPE same\), acceptance.
       Regress A/B over 11 cases unchanged \(join −1, a known flake\).
     Movement: none — C3 interop fix plus a goopg time/timetz estimate fix \(TPC plans unchanged\)
-- [ ] **M0149-0001i — regnamespace has no name-resolution seam: `'public'::regnamespace::oid` errors, `99::regnamespace` prints 99** \(filed 2026-11-16 by M0149-0001g slice 24; correctness, below the item-10 rank\)
+- [!] **M0149-0001i — regnamespace has no name-resolution seam: `'public'::regnamespace::oid` errors, `99::regnamespace` prints 99** \(filed 2026-11-16 by M0149-0001g slice 24; correctness, below the item-10 rank\)
   Kind: impl
   Parent: none
+  - **PARKED `[!]` 2026-11-23 (owner, anti-detour):** not a proven prerequisite of any M0149 TAP test (M0149-0001 closed `[x]` with 034 passing). Reopen only when a selected TAP task cites this as a proven blocker; its descendants stay unselectable (S7).
   - Repro on goopg: `select 'public'::regnamespace::oid` → "invalid input syntax for type oid"; `select 99::regnamespace` → `99`. PG 18.3: 2200 and `pg_toast`.
   - PG: regnamespacein / regnamespaceout \(postgres/src/backend/utils/adt/regproc.c\): a single identifier \(42602 "invalid name syntax" otherwise\), resolved by get\_namespace\_oid \(3F000 when missing\); output is quote\_identifier of the name, or the numeric OID when dangling.
   - goopg: "regnamespace" is missing from every reg\* sibling list, so it stays unresolved text:
