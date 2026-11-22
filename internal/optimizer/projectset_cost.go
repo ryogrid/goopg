@@ -78,6 +78,10 @@ func projectSetTlistRows(n *ProjectSet) float64 {
 		take(r)
 	}
 	for _, u := range n.UnnestCols {
+		if u.FuncName == "string_to_table" {
+			take(1000) // text_to_table's prorows; it has no support function
+			continue
+		}
 		// array_unnest_support: estimate_array_length of the argument.
 		take(float64(estimateArrayLength(u.ArrExpr)))
 	}

@@ -2658,6 +2658,13 @@ type FromUnnest struct {
 	// specified. Consumed by the EXPLAIN Function Scan label.
 	Alias    string
 	schema   Schema
+	// FuncName and FuncArgs name the SQL function when the scan stands in for
+	// one: FROM string_to_table(s, d) is unnest(string_to_array(s, d)) — the
+	// same rows from text_to_table — and EXPLAIN prints `Function Scan on
+	// string_to_table` with its own arguments. Empty for a plain unnest.
+	// M0149-0001h1a78f.
+	FuncName string
+	FuncArgs []Expr
 }
 
 func (n *FromUnnest) Pos() int       { return n.pos }
@@ -2743,6 +2750,10 @@ type UnnestCol struct {
 	CastType string // cast each element to this type (e.g. "int4"), empty=no cast. M0097-0035.
 	// Wrapped: see SrfCol.Wrapped. M0118-0008.
 	Wrapped bool
+	// FuncName is the SQL function the unnest stands in for: string_to_table
+	// is unnest(string_to_array(...)), and EXPLAIN prints it under its own
+	// name with ArrExpr's arguments. "" for a plain unnest. M0149-0001h1a78f.
+	FuncName string
 	// ExplicitCast marks a CastType the SQL wrote over the unnest that
 	// changes the element type (`unnest(a)::integer` over text[]) — PG
 	// evaluates it in a Result above the ProjectSet. A CastType inferred

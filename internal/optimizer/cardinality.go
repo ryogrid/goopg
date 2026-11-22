@@ -296,6 +296,13 @@ func EstimateRows(n Node) int64 {
 		return estimateNLIndexJoin(x)
 	case *GenerateSeries:
 		return generateSeriesRows(x)
+	case *FromUnnest:
+		// string_to_table has no support function: set_function_size_estimates
+		// takes its prorows, 1000 (M0149-0001h1a78f). A plain unnest keeps
+		// its existing estimate.
+		if x.FuncName == "string_to_table" {
+			return 1000
+		}
 	case *ProjectSet:
 		// M0149-0001h1a78a: create_set_projection_path's rows.
 		if isSelectListProjectSet(x) {

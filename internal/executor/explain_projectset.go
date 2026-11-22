@@ -48,6 +48,10 @@ func projectSetSRFCalls(ps *optimizer.ProjectSet, reg *subPlanReg, qualify bool)
 		put(sc.ColIdx, sc.Wrapped, &optimizer.FuncCall{Name: "generate_series", Args: args})
 	}
 	for _, u := range ps.UnnestCols {
+		if fc, ok := u.ArrExpr.(*optimizer.FuncCall); ok && u.FuncName != "" {
+			put(u.ColIdx, u.Wrapped, &optimizer.FuncCall{Name: u.FuncName, Args: fc.Args})
+			continue
+		}
 		put(u.ColIdx, u.Wrapped, &optimizer.FuncCall{Name: "unnest", Args: []optimizer.Expr{u.ArrExpr}})
 	}
 	for _, rc := range ps.RegexpMatchesCols {

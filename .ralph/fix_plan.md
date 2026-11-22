@@ -12705,13 +12705,19 @@ verify each at HEAD when the task starts.
   > blocks reverting the file. The change is still in the working tree and STAGED. Please commit or revert it.
   > Without it, the next census that adds routing\-20261123b restores discovery: an added ROUTING.md is the newest
   > again. Until then the check reports a spurious DUE.
-- [ ] **M0149-0001h1a78f — string\_to\_table is missing** (filed 2026-11-23 by M0149-0001h1a78c)
+- [x] **M0149-0001h1a78f — string\_to\_table is missing** (filed 2026-11-23 by M0149-0001h1a78c)
   Kind: impl
   Parent: M0149-0001h1a
   - `select * from string_to_table('a,b', ',')` raises `table-valued function "string_to_table" not supported`;
     PG returns two rows \(text\_to\_table, text\_to\_table\_null in varlena.c\). The target\-list form is missing too.
   - Resume: planTableFuncRangeVar in internal/optimizer/planner.go, next to regexp\_split\_to\_table. Reuse
     splitTextToArray from internal/executor/expr.go.
+  - 2026\-11\-23 \(landed\):
+    - FROM, bare target\-list and nested string\_to\_table are planned as unnest\(string\_to\_array\(...\)\). EXPLAIN keeps
+      the function name and its prorows of 1000.
+    - `ROWS FROM (string_to_table(...))` is not covered and is recorded in the ledger.
+    - Design: docs/design/0100\-0149/0149\-0001h1a78b\-array\-constructor\-type.md \(new section\).
+    Movement: yes — regress runner arrays 1214 → 1134 \(same\-list A/B against HEAD over 14 cases, none worse\)
 - [ ] **M0149-0001h1a79 — sum and avg over interval are rejected** (filed 2026-11-19 by M0149-0001h1a65)
   Kind: impl
   Parent: M0149-0001h1a

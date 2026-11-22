@@ -40,6 +40,17 @@
   pg\_typeof said `unknown`.
 - array\_out quotes an element that spells NULL in any case, so it reads back as text and not as a null. Both text
   array formatters \(formatTextArray, formatTextArrayWithNulls\) now do this.
-- Not done:
-  - string\_to\_table, the set\-returning sibling \(text\_to\_table\), is M0149\-0001h1a78f.
-  - The separator search is byte\-wise. PG's text\_position honours nondeterministic collations.
+- Not done: the separator search is byte\-wise. PG's text\_position honours nondeterministic collations.
+
+## string\_to\_table \(M0149\-0001h1a78f\)
+
+- text\_to\_table's rows are exactly `unnest(string_to_array(...))`: the same split\_text, with no rows for a NULL
+  or empty string. goopg plans the function as that unnest rather than adding a plan node.
+  - **FROM:** `planFromStringToTable` builds a FromUnnest over `string_to_array(...)`. `FromUnnest.FuncName` and
+    `FuncArgs` keep the function's name and arguments, so EXPLAIN prints `Function Scan on string_to_table` and
+    the VERBOSE `Function Call` line shows its own arguments.
+  - **SELECT list:** the bare target and the nested form are UnnestCols with `FuncName: "string_to_table"`. The
+    VERBOSE ProjectSet Output deparses them under that name.
+- **Estimates:** string\_to\_table has no support function, so the estimate is its prorows of 1000, both in the
+  Function Scan \(EstimateRows\) and in the ProjectSet's largest\-SRF row count.
+- **Not done:** `ROWS FROM (string_to_table(...))` does not go through this path.

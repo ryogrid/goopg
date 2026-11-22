@@ -8358,6 +8358,9 @@ func srfFunctionCallArgs(n optimizer.Node) (string, []optimizer.Expr) {
 		}
 		return "generate_subscripts", args
 	case *optimizer.FromUnnest:
+		if p.FuncName != "" {
+			return p.FuncName, p.FuncArgs
+		}
 		if p.ArrExpr != nil {
 			return "unnest", []optimizer.Expr{p.ArrExpr}
 		}
@@ -8460,6 +8463,9 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 	case *optimizer.GenerateSubscripts:
 		return srfFunctionScanLabelQualified("pg_catalog.generate_subscripts", "generate_subscripts", p.Alias)
 	case *optimizer.FromUnnest:
+		if p.FuncName != "" {
+			return srfFunctionScanLabelQualified("pg_catalog."+p.FuncName, p.FuncName, p.Alias)
+		}
 		return srfFunctionScanLabelQualified("pg_catalog.unnest", "unnest", p.Alias)
 	case *optimizer.UserSrfScan:
 		return srfFunctionScanLabelQualified(p.Routine.QualifiedName(), p.Routine.Name, p.Alias)
@@ -8896,6 +8902,9 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 	case *optimizer.GenerateSubscripts:
 		return srfFunctionScanLabel("generate_subscripts", p.Alias)
 	case *optimizer.FromUnnest:
+		if p.FuncName != "" {
+			return srfFunctionScanLabel(p.FuncName, p.Alias)
+		}
 		return srfFunctionScanLabel("unnest", p.Alias)
 	case *optimizer.UserSrfScan:
 		// PG's get_func_name returns the BARE function name in both plain

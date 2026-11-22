@@ -6669,7 +6669,7 @@ func projectSetCompositeSchema(name string) Schema {
 // `unnest(a) + 1`); bare and FROM-clause SRFs keep their existing paths.
 // M0118-0008, M0149-0001h1a78.
 func isNestedSRFName(fname string) bool {
-	return strings.EqualFold(fname, "generate_series") || strings.EqualFold(fname, "unnest")
+	return strings.EqualFold(fname, "generate_series") || strings.EqualFold(fname, "unnest") || strings.EqualFold(fname, "string_to_table")
 }
 
 // nestedSRFArityOK reports whether a nested SRF call has an arity the
@@ -6679,6 +6679,8 @@ func nestedSRFArityOK(fc *FuncCall) bool {
 	switch {
 	case strings.EqualFold(fc.Name, "unnest"):
 		return len(fc.Args) == 1
+	case strings.EqualFold(fc.Name, "string_to_table"):
+		return len(fc.Args) == 2 || len(fc.Args) == 3
 	case strings.EqualFold(fc.Name, "regexp_matches"):
 		return len(fc.Args) == 2 || len(fc.Args) == 3
 	case strings.EqualFold(fc.Name, "generate_series"):
@@ -6805,6 +6807,7 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		colIdx   int
 		arrExpr  parser.Expr
 		castType string // element-level cast type (e.g. "int4"); empty = no cast. M0097-0035.
+		funcName string // the SQL function the unnest stands in for (string_to_table); "" = unnest
 	}
 	type regexpMatchesEntry struct {
 		colIdx      int
@@ -6841,6 +6844,13 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			}
 			e := srfEntry{colIdx: i, pos: fc.Pos(), args: fc.Args}
 			srfs = append(srfs, e)
+			continue
+		}
+		// string_to_table(s, d[, n]) in the target list is the unnest of
+		// string_to_array(s, d[, n]): the same split_text rows
+		// (text_to_table). M0149-0001h1a78f.
+		if strings.EqualFold(fc.Name.Name, "string_to_table") && (len(fc.Args) == 2 || len(fc.Args) == 3) {
+			unnests = append(unnests, unnestEntry{colIdx: i, arrExpr: &parser.FuncCall{Name: parser.ObjectName{Name: "string_to_array"}, Args: fc.Args}, castType: srfCastType, funcName: "string_to_table"})
 			continue
 		}
 		// unnest(array) → one row per element. M0097-0106.
@@ -7155,7 +7165,7 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			}
 			explicitCast = canonicalScalarTypeName(u.castType) != canonicalScalarTypeName(elem)
 		}
-		unnestCols[k] = UnnestCol{ColIdx: u.colIdx, ArrExpr: arrResolved, CastType: castType, ExplicitCast: explicitCast}
+		unnestCols[k] = UnnestCol{ColIdx: u.colIdx, ArrExpr: arrResolved, CastType: castType, ExplicitCast: explicitCast, FuncName: u.funcName}
 	}
 
 	// Resolve regexp_matches args against ctx. M0122-0002.
@@ -7209,6 +7219,11 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 					rc.FlagsExpr = sl.srfNode.Args[2]
 				}
 				regexpMatchesCols = append(regexpMatchesCols, rc)
+				continue
+			}
+			if strings.EqualFold(sl.srfNode.Name, "string_to_table") {
+				arr := &FuncCall{Name: "string_to_array", Args: sl.srfNode.Args}
+				unnestCols = append(unnestCols, UnnestCol{ColIdx: sl.slotIdx, ArrExpr: arr, Wrapped: true, FuncName: "string_to_table"})
 				continue
 			}
 			if strings.EqualFold(sl.srfNode.Name, "unnest") {
@@ -7441,6 +7456,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	}
 	if strings.EqualFold(tf.Name, "pg_options_to_table") {
 		return planPgOptionsToTable(rv, cat, sourceIdx, lateralCtx)
+	}
+	if strings.EqualFold(tf.Name, "string_to_table") {
+		return planFromStringToTable(rv, cat, sourceIdx, lateralCtx)
 	}
 	if strings.EqualFold(tf.Name, "unnest") {
 		return planFromUnnest(rv, cat, sourceIdx, lateralCtx)
@@ -8002,6 +8020,45 @@ func planFromRegexpMatches(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if tf.WithOrdinality {
 		node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
 		return node2, b2, nil
+	}
+	return node, b, nil
+}
+
+// planFromStringToTable plans FROM string_to_table(string, delimiter[,
+// null_string]) (text_to_table, text_to_table_null in varlena.c). Its rows
+// are exactly unnest(string_to_array(...)): the same split_text, one row per
+// field, none for a NULL or empty string. The scan is planned as that unnest
+// and keeps the function's name and arguments for EXPLAIN; the default
+// column name is string_to_table. M0149-0001h1a78f.
+func planFromStringToTable(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if len(tf.Args) < 2 || len(tf.Args) > 3 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "function string_to_table requires 2 or 3 arguments"}
+	}
+	tf2 := *tf
+	tf2.Name = "unnest"
+	tf2.Args = []parser.Expr{&parser.FuncCall{Name: parser.ObjectName{Name: "string_to_array"}, Args: tf.Args}}
+	rv2 := rv
+	rv2.TableFunc = &tf2
+	if rv2.Alias == "" {
+		rv2.Alias = "string_to_table"
+	}
+	node, b, err := planFromUnnest(rv2, cat, sourceIdx, lateralCtx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	fu, ok := node.(*FromUnnest)
+	if !ok {
+		if ow, isOW := node.(*OrdinalityWrap); isOW {
+			fu, ok = ow.Child.(*FromUnnest)
+		}
+	}
+	if ok {
+		fu.FuncName = "string_to_table"
+		if fc, isFC := fu.ArrExpr.(*FuncCall); isFC {
+			fu.FuncArgs = fc.Args
+		}
 	}
 	return node, b, nil
 }
@@ -17897,6 +17954,9 @@ func exprType(e Expr) catalog.Type {
 				}
 			}
 			return catalog.Type{Name: "text[]"}
+		case "string_to_table":
+			// text_to_table returns setof text.
+			return catalog.Type{Name: "text"}
 		case "string_to_array", "regexp_split_to_array":
 			// text_to_array / text_to_array_null (pg_proc 394, 376) and
 			// regexp_split_to_array return text[].

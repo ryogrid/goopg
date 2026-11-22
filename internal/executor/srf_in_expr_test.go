@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/optimizer"
@@ -234,6 +235,41 @@ func TestStringToArray(t *testing.T) {
 		}
 		if got := rows[0][0].Format(); got != want {
 			t.Errorf("%s = %s, want %s", sql, got, want)
+		}
+	}
+}
+
+// TestStringToTable pins M0149-0001h1a78f against PG 18.3's text_to_table:
+// the FROM form and the target-list form split like string_to_array (NULL
+// delimiter per character, null_string → NULL, no rows for NULL or ”), and
+// EXPLAIN names the function with its prorows of 1000.
+func TestStringToTable(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	col := func(sql string) []string {
+		t.Helper()
+		var out []string
+		for _, r := range runQuery(t, ctx, sql) {
+			if r[0].IsNull() {
+				out = append(out, "NULL")
+				continue
+			}
+			out = append(out, r[0].Format())
+		}
+		return out
+	}
+	for sql, want := range map[string]string{
+		"SELECT * FROM string_to_table('a,b,,c', ',')":       "a||b||||c",
+		"SELECT * FROM string_to_table('1,NA,3', ',', 'NA')": "1||NULL||3",
+		"SELECT * FROM string_to_table('abc', null)":         "a||b||c",
+		"SELECT count(*) FROM string_to_table('', ',')":      "0",
+		"SELECT count(*) FROM string_to_table(null, ',')":    "0",
+		"SELECT string_to_table('p,q', ',')":                 "p||q",
+		"SELECT upper(string_to_table('p,q', ','))":          "P||Q",
+		"EXPLAIN SELECT * FROM string_to_table('a,b', ',')":  "Function Scan on string_to_table  (cost=0.00..10.00 rows=1000 width=32)",
+	} {
+		if got := strings.Join(col(sql), "||"); got != want {
+			t.Errorf("%s = %q, want %q", sql, got, want)
 		}
 	}
 }
