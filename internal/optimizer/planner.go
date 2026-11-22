@@ -17102,9 +17102,11 @@ func encodeTypmod(typeName string, typmods []int64) int64 {
 
 func castTargetLabel(t string) string {
 	// Strip array brackets: PostgreSQL FigureColname uses the element type name
-	// as the column label (e.g. ::rainbow[] → "rainbow"). M0097-enum-fix.
-	if strings.HasSuffix(t, "[]") {
-		t = t[:len(t)-2]
+	// as the column label (e.g. ::rainbow[] → "rainbow"), however many
+	// dimensions the cast spells (::int[][] → "int4"). M0097-enum-fix,
+	// M0149-0001h1a85b.
+	for strings.HasSuffix(t, "[]") {
+		t = strings.TrimSpace(t[:len(t)-2])
 	}
 	switch t {
 	case "boolean":

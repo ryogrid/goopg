@@ -62,4 +62,9 @@ The parse stays limited to listed names. A general `IDENT Sconst` fold would als
     search\_path. They print qualified off the path \(`internal/catalog/information_schema_types.go`, OIDs as
     initdb seeds them\). Casts to them still evaluate as their base type's text: `'1'::cardinal_number` prints
     left-aligned.
-- Not done: `tid 'x'` waits for M0149\-0001h1a84.
+- A cast's column name strips every array suffix of its type \(`'{{1}}'::int[][]` is int4\), in the planner's
+  castTargetLabel \(M0149\-0001h1a85b\).
+- Not done:
+  - `tid 'x'` waits for M0149\-0001h1a84.
+  - Casts to the information\_schema domains run no domain input or CHECK, and their type is text
+    \(M0149\-0001h1a85b\).

@@ -12923,6 +12923,17 @@ verify each at HEAD when the task starts.
     component\). A single `[]` is already right.
   - Resume: the CastExpr evaluator's domain lookup \(information\_schema OIDs are in
     internal/catalog/information\_schema\_types.go\); systemTypeColname in internal/parser/figurecolname.go.
+  - 2026\-11\-23 \(partial, still open\):
+    - The `int[][]` column name is fixed. The label came from the planner's castTargetLabel, which stripped one `[]`;
+      the parser's systemTypeColname was already right.
+    - Still open: casts to the information\_schema domains.
+      - PG evaluates them as domains: the base type's input plus the CHECK. `'-1'::cardinal_number` and
+        `'maybe'::yes_or_no` fail the check; time\_stamp is timestamptz.
+      - goopg has no built\-in domain objects. User domains live in catalog.Domain, and the cast evaluator looks
+        them up by name \(expr.go LookupDomain, domainCastWithTypmod\).
+      - Resume: register the five domains \(base types and CHECKs from information\_schema.sql\) where both the
+        cast evaluator and exprType see them. Keep them out of the user\-domain pg\_type/pg\_dump output: they
+        already have bootstrap pg\_type rows.
 - [ ] **M0149-0001h1a86 — remaining range type behaviour** (filed 2026-11-19 by M0149-0001h1a72)
   Kind: impl
   Parent: M0149-0001h1a
