@@ -389,6 +389,13 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 				return NewIntDatum(int64(oid)), nil
 			}
 		}
+		// The information_schema domains (sql_identifier, cardinal_number…)
+		// answer to their schema, or bare when it is on search_path.
+		// M0149-0001h1a85a.
+		if oid, ok := catalog.InformationSchemaTypeOID(typeName); ok &&
+			(strings.EqualFold(schema, "information_schema") || schema == "" && informationSchemaOnPath(ctx)) {
+			return NewIntDatum(int64(oid)), nil
+		}
 		if !strings.EqualFold(schema, "pg_catalog") {
 			if oid, ok := userTypeOIDForName(ctx.Catalog, typeName); ok &&
 				userTypeOnPath(ctx, oid, schema) {
@@ -1055,4 +1062,18 @@ func quoteRegIdentPart(s string) string {
 		}
 	}
 	return s
+}
+
+// informationSchemaOnPath reports whether the session's search_path names
+// information_schema.
+func informationSchemaOnPath(ctx *Context) bool {
+	if ctx == nil {
+		return false
+	}
+	for _, sch := range searchPathSchemas(ctx) {
+		if strings.EqualFold(sch, "information_schema") {
+			return true
+		}
+	}
+	return false
 }

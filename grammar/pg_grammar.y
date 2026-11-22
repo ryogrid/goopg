@@ -3869,6 +3869,7 @@ cast_typename:
 opt_array_tail:
 		/* empty */          { $$ = 0 }
 	| '[' ']' opt_array_tail { $$ = $3 + 1 }
+	| '[' ICONST ']' opt_array_tail { $$ = $4 + 1 } /* bounds are not enforced (gram.y opt_array_bounds) */
 
 character_word:
 		CHARACTER  { $$ = "character" }

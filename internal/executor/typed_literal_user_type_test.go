@@ -74,3 +74,58 @@ func TestTypedLiteralOfUserType(t *testing.T) {
 		t.Errorf("OPTIONS list: %v", err)
 	}
 }
+
+// TestCastToUnknownType pins M0149-0001h1a85a against PG 18.3:
+// transformTypeCast looks every cast target up first, so `'x'::nosuchtype`,
+// CAST('x' AS nosuchtype) and `null::nosuch[]` are 42704 at the type name
+// (TypeNameToString keeps the "[]"). Casts to a domain over an array
+// (declared `int[2]`, the bound ignored) and to the information_schema
+// domains resolve.
+func TestCastToUnknownType(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE DOMAIN op2 AS int[2] CHECK (VALUE[1] < VALUE[2])"); err != nil {
+		t.Fatal(err)
+	}
+	for sql, want := range map[string]string{
+		"SELECT 'x'::nosuchtype":         `type "nosuchtype" does not exist`,
+		"SELECT CAST('x' AS nosuchtype)": `type "nosuchtype" does not exist`,
+		"SELECT null::nosuch[]":          `type "nosuch[]" does not exist`,
+		"SELECT 'x'::public.nosuchtype":  `type "public.nosuchtype" does not exist`,
+	} {
+		stmts, err := parser.Parse(sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", sql, err)
+		}
+		err = analyzer.Analyze(stmts[0], ctx.Catalog)
+		ae, ok := err.(*analyzer.AnalyzeError)
+		if !ok || ae.Code != "42704" || ae.Message != want {
+			t.Errorf("Analyze(%q) = %v, want 42704 %s", sql, err, want)
+		}
+	}
+	for _, sql := range []string{
+		"SELECT '{1,2}'::op2",
+		"SELECT '{1,2}'::int[5]",
+		"SELECT '{{1}}'::int[3][4]",
+		"SELECT 'x'::information_schema.sql_identifier",
+		"SELECT '1'::information_schema.cardinal_number",
+	} {
+		stmts, err := parser.Parse(sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", sql, err)
+		}
+		if err := analyzer.Analyze(stmts[0], ctx.Catalog); err != nil {
+			t.Errorf("Analyze(%q): %v", sql, err)
+		}
+	}
+	for sql, want := range map[string]string{
+		"SELECT 'information_schema.sql_identifier'::regtype::oid":   "13292",
+		"SELECT 'information_schema.sql_identifier[]'::regtype::oid": "13291",
+		"SELECT 'op2'::regtype::text":                                "op2",
+	} {
+		rows := runQuery(t, ctx, sql)
+		if got := rows[0][0].Format(); got != want {
+			t.Errorf("%s = %s, want %s", sql, got, want)
+		}
+	}
+}

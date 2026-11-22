@@ -12880,7 +12880,7 @@ verify each at HEAD when the task starts.
     - The remaining `tid 'x'` and `'x'::nosuchtype` are split out as M0149\-0001h1a85a.
     - Design: docs/design/0100\-0149/0149\-0001h1a71\-typed\-literals.md \(new section\).
     Movement: none — regress runner same\-list A/B over 15 cases unchanged; probes match PG
-- [ ] **M0149-0001h1a85a — `tid 'x'` and a cast to an unknown type** (filed 2026-11-23 by M0149-0001h1a85)
+- [x] **M0149-0001h1a85a — `tid 'x'` and a cast to an unknown type** (filed 2026-11-23 by M0149-0001h1a85)
   Kind: impl
   Parent: M0149-0001h1a
   - `select 'x'::nosuchtype` returns `x`; PG raises 42704 `type "nosuchtype" does not exist` at the type name.
@@ -12904,6 +12904,25 @@ verify each at HEAD when the task starts.
     - Resume: make `'orderedpair'::regtype` and `'information_schema.sql_identifier'::regtype` resolve, and diagnose
       copy2's delta in tmp/h1a78/rd15\-new/copy2.diff. Then widen the check in the analyzer's CastExpr arm \(drop
       `x.IsTypedLiteral() &&`\) and repeat the 60\-case A/B.
+  - 2026\-11\-23 \(done\): every cast target is checked, and `'x'::nosuchtype` is 42704 at the type name.
+    - Array bounds parse in type names \(`int[2]`\); the Makefile conflict count is 61.
+    - The information\_schema domains resolve through regtype.
+    - The copy2 delta was the COPY FREEZE vistest block, not a cast.
+    - The 56\-case same\-list A/B \(tmp/h1a78/ab60.txt\) moved two cases. plpgsql went 1221 → 1213 \(flaky\).
+      multirangetypes went 1830 → 1834: `varbitmultirange` comes from rangetypes.sql, which is not in the list,
+      so the new error is PG's. With the type created, the query matches PG.
+    - The `tid` literal moves to M0149\-0001h1a84; follow\-ups are in M0149\-0001h1a85b.
+- [ ] **M0149-0001h1a85b — casts to information_schema domains and the `int[][]` column name** (filed 2026-11-23 by M0149-0001h1a85a)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Casts to the information\_schema domains evaluate as text.
+    - PG: `pg_typeof('1'::information_schema.cardinal_number)` is cardinal\_number, and the value is right\-aligned
+      as an integer.
+    - goopg: text.
+  - `select '{{1}}'::int[][]` names its column `int[]`; PG names it `int4` \(FigureColname takes the last name
+    component\). A single `[]` is already right.
+  - Resume: the CastExpr evaluator's domain lookup \(information\_schema OIDs are in
+    internal/catalog/information\_schema\_types.go\); systemTypeColname in internal/parser/figurecolname.go.
 - [ ] **M0149-0001h1a86 — remaining range type behaviour** (filed 2026-11-19 by M0149-0001h1a72)
   Kind: impl
   Parent: M0149-0001h1a

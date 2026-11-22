@@ -50,7 +50,16 @@ The parse stays limited to listed names. A general `IDENT Sconst` fold would als
 - The check is lenient where it has no session \(M0149\-0001h1a85a\). An unqualified name passes when a user type
   of that name exists in any schema, because search\_path is not available. `x[]` checks `x`, and the `float` and
   `dec` aliases pass.
-- Not done:
-  - `'x'::nosuchtype` is still accepted. Checking every cast target refused valid casts: the resolver does not see
-    a domain over an array or the information\_schema domains. See M0149\-0001h1a85a.
-  - `tid 'x'` waits for M0149\-0001h1a84.
+- Every cast target is checked \(M0149\-0001h1a85a\): `'x'::nosuchtype`, `CAST('x' AS nosuchtype)` and
+  `null::nosuch[]` raise 42704 at the type name. As in transformTypeCast, this happens before the operand is
+  analysed. The message keeps the `[]`, as TypeNameToString does. Two resolver gaps had to be closed first:
+  - Cast and column types accept array bounds: `int[2]` and `int[3][4]`. As in gram.y opt\_array\_bounds, the bound
+    is not enforced. A domain over `int[2]` used to be a syntax error, so casts to it went unchecked. The grammar
+    has one more known `'['` shift/reduce, since a cast type's array tail competes with a subscript; shift wins, as
+    in PG. The Makefile count is now 61.
+  - The information\_schema domains and their arrays \(sql\_identifier, cardinal\_number, character\_data,
+    time\_stamp, yes\_or\_no\) resolve through regtype input, by qualified name or when information\_schema is on
+    search\_path. They print qualified off the path \(`internal/catalog/information_schema_types.go`, OIDs as
+    initdb seeds them\). Casts to them still evaluate as their base type's text: `'1'::cardinal_number` prints
+    left-aligned.
+- Not done: `tid 'x'` waits for M0149\-0001h1a84.

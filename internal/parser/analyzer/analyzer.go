@@ -1467,16 +1467,14 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		// is deferred to the planner's expandQualifiedStarToRowExpr.
 		return catalog.Type{Name: "record"}, nil
 	case *parser.CastExpr:
-		// gram.y's `func_name Sconst` typed literal names its type
-		// directly; typenameType rejects one that does not exist.
-		// M0149-0001h1a85.
-		// Only typed literals are checked: goopg's type resolver does not yet
-		// see every type a cast can name (a domain over an array, the
-		// information_schema domains), so checking every cast target refused
-		// valid queries (domain.sql, subselect.sql). M0149-0001h1a85a.
-		if x.IsTypedLiteral() && TypeNameExists != nil {
+		// transformTypeCast looks the target type up before it transforms
+		// the operand; typenameType rejects one that does not exist, for a
+		// `::` cast, CAST(... AS ...) and a typed literal alike.
+		// M0149-0001h1a85, widened from typed literals once domains over
+		// arrays and the information_schema domains resolved (h1a85a).
+		if TypeNameExists != nil {
 			if cat := scopeCatalog(ctx); cat != nil && !TypeNameExists(cat, x.Type.Schema, x.Type.Name) {
-				name := strings.TrimSuffix(x.Type.Name, "[]")
+				name := x.Type.Name // TypeNameToString keeps the "[]"
 				if x.Type.Schema != "" {
 					name = x.Type.Schema + "." + name
 				}

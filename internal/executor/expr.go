@@ -20664,6 +20664,14 @@ func userTypeNameForOID(cat catalog.Catalog, oid uint32, qualify func(schema str
 			return name, true
 		}
 	}
+	// The information_schema domains and their arrays: format_type_be
+	// qualifies them off the search path. M0149-0001h1a85a.
+	if name, ok := catalog.InformationSchemaTypeName(oid); ok {
+		if qualify == nil || qualify("information_schema") {
+			return "information_schema." + name, true
+		}
+		return name, true
+	}
 	return "", false
 }
 
