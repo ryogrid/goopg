@@ -47,6 +47,10 @@ The parse stays limited to listed names. A general `IDENT Sconst` fold would als
 - These casts carry `typedLiteral` and `typePos` \(dumped omitempty, so the other goldens are unchanged\). The
   analyzer checks that the type exists through the hook `analyzer.TypeNameExists`, which the executor fills with
   its regtype resolver, and raises 42704 `type "..." does not exist` at the type name, as typenameType does.
+- The check is lenient where it has no session \(M0149\-0001h1a85a\). An unqualified name passes when a user type
+  of that name exists in any schema, because search\_path is not available. `x[]` checks `x`, and the `float` and
+  `dec` aliases pass.
 - Not done:
-  - `'x'::nosuchtype` is still accepted: the check covers only typed literals.
+  - `'x'::nosuchtype` is still accepted. Checking every cast target refused valid casts: the resolver does not see
+    a domain over an array or the information\_schema domains. See M0149\-0001h1a85a.
   - `tid 'x'` waits for M0149\-0001h1a84.

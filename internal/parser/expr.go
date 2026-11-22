@@ -634,15 +634,18 @@ type CastExpr struct {
 	Operand Expr
 	Type    ObjectName
 	Typmods []int64 // optional `(N)` or `(N,M)` typmod arguments
-	// typedLiteral marks gram.y's `func_name Sconst` form (`mood 'happy'`),
-	// whose type name the analyzer checks exists as typenameType does;
-	// typePos is that name's position. Tagged omitempty so the AST goldens
-	// of every other cast are unchanged. M0149-0001h1a85.
+	// typedLiteral marks gram.y's `func_name Sconst` form (`mood 'happy'`);
+	// typePos is the position of the type name, where typenameType reports a
+	// type that does not exist (the goldens strip it like pos). typedLiteral
+	// is dumped omitempty so the other casts' goldens are unchanged.
+	// M0149-0001h1a85, M0149-0001h1a85a.
 	typedLiteral bool `dump:"omitempty"`
-	typePos      int  `dump:"omitempty"`
+	typePos      int
 }
 
 // IsTypedLiteral reports gram.y's `func_name Sconst` form.
+//
+// TypeNamePos (below) is 0 when the cast's builder did not record it.
 func (e *CastExpr) IsTypedLiteral() bool { return e.typedLiteral }
 
 // TypeNamePos is the position of a typed literal's type name.

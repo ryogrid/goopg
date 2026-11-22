@@ -12887,6 +12887,23 @@ verify each at HEAD when the task starts.
     analyzer.TypeNameExists already checks typed literals; extend it to every CastExpr target. First confirm that
     the regtype resolver knows every name goopg accepts as a cast target, including the SQL aliases.
   - `tid '(0,1)'` is not folded; this waits for M0149\-0001h1a84.
+  - 2026\-11\-23 \(partial, still open\):
+    - The typed\-literal check \(h1a85\) refused types that the resolver cannot see; it is fixed for three cases.
+      - A type in a schema reached only through search\_path is accepted: the analyzer has no session, so an
+        unqualified user type of that name in any schema passes.
+      - Array spellings check their element type.
+      - `float` and `dec` are accepted as SQL aliases.
+    - `::` casts now record the type name's position \(`typePos`, stripped from the goldens like `pos`\).
+    - Checking every cast target was tried and reverted: the same\-list A/B regressed domain 400 → 404, copy2
+      249 → 253 and subselect 839 → 844, with false 42704 errors on valid casts.
+    - The resolver \(regtype input plus userTypeOIDForName\) misses:
+      - a domain over an array \(`create domain orderedpair as int[2] ...`; `array[1,2]::orderedpair` then
+        fails\);
+      - the information\_schema domains \(`'1'::information_schema.sql_identifier`\);
+      - whatever copy2 casts to, which is not yet diagnosed.
+    - Resume: make `'orderedpair'::regtype` and `'information_schema.sql_identifier'::regtype` resolve, and diagnose
+      copy2's delta in tmp/h1a78/rd15\-new/copy2.diff. Then widen the check in the analyzer's CastExpr arm \(drop
+      `x.IsTypedLiteral() &&`\) and repeat the 60\-case A/B.
 - [ ] **M0149-0001h1a86 — remaining range type behaviour** (filed 2026-11-19 by M0149-0001h1a72)
   Kind: impl
   Parent: M0149-0001h1a

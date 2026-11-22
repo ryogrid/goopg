@@ -1470,13 +1470,21 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		// gram.y's `func_name Sconst` typed literal names its type
 		// directly; typenameType rejects one that does not exist.
 		// M0149-0001h1a85.
+		// Only typed literals are checked: goopg's type resolver does not yet
+		// see every type a cast can name (a domain over an array, the
+		// information_schema domains), so checking every cast target refused
+		// valid queries (domain.sql, subselect.sql). M0149-0001h1a85a.
 		if x.IsTypedLiteral() && TypeNameExists != nil {
 			if cat := scopeCatalog(ctx); cat != nil && !TypeNameExists(cat, x.Type.Schema, x.Type.Name) {
-				name := x.Type.Name
+				name := strings.TrimSuffix(x.Type.Name, "[]")
 				if x.Type.Schema != "" {
 					name = x.Type.Schema + "." + name
 				}
-				return catalog.Type{}, analyzeError(x.TypeNamePos(), "42704", fmt.Sprintf("type \"%s\" does not exist", name))
+				pos := x.TypeNamePos()
+				if pos == 0 {
+					pos = x.Pos()
+				}
+				return catalog.Type{}, analyzeError(pos, "42704", fmt.Sprintf("type \"%s\" does not exist", name))
 			}
 		}
 		// v0 treats `expr::type` as a no-op for type-checking. We

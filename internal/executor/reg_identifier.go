@@ -1008,13 +1008,41 @@ func init() {
 	// typenameType for the analyzer's typed-literal check: the regtype input
 	// resolver, which knows built-in, user, array and qualified names.
 	// M0149-0001h1a85.
+	//
+	// The check only refuses a name that is no type at all: it has no
+	// session, so it cannot apply search_path, and an unqualified user type
+	// of that name in any schema is accepted (the cast itself resolves it).
+	// Array spellings check their element type; float and dec are the SQL
+	// aliases gram.y rewrites. M0149-0001h1a85a.
 	analyzer.TypeNameExists = func(cat catalog.Catalog, schema, name string) bool {
+		for strings.HasSuffix(name, "[]") {
+			name = strings.TrimSuffix(name, "[]")
+		}
+		if name == "" {
+			return true
+		}
+		if schema == "" {
+			switch strings.ToLower(name) {
+			case "float", "dec":
+				return true
+			}
+		}
 		full := quoteRegIdentPart(name)
 		if schema != "" {
 			full = quoteRegIdentPart(schema) + "." + full
 		}
-		d, err := regIdentifierInput(NewStringDatum(full), "regtype", &Context{Catalog: cat}, 0)
-		return err == nil && d.Kind == KindInt
+		if d, err := regIdentifierInput(NewStringDatum(full), "regtype", &Context{Catalog: cat}, 0); err == nil && d.Kind == KindInt {
+			return true
+		}
+		if schema == "" {
+			if _, ok := userTypeOIDForName(cat, name); ok {
+				return true
+			}
+			if _, ok := cat.LookupTable(parser.ObjectName{Name: name}); ok {
+				return true // a table's row type
+			}
+		}
+		return false
 	}
 }
 

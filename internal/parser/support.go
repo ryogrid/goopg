@@ -4201,7 +4201,9 @@ func castTo(l yyLexer, operand Expr, ct castType, extra []int64, pos, castPos in
 	if !quoted {
 		args = typmodsFor(name, args, len(args))
 	}
-	return NewCastExpr(castPos, operand, ObjectName{Schema: ct.schema, Name: name}, args)
+	ce := NewCastExpr(castPos, operand, ObjectName{Schema: ct.schema, Name: name}, args)
+	ce.typePos = pos
+	return ce
 }
 
 // partBoundValues turns the bare words MINVALUE and MAXVALUE in a range

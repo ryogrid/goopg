@@ -35,7 +35,7 @@ func canonDump(v reflect.Value) string {
 		first := true
 		for i := 0; i < t.NumField(); i++ {
 			name := t.Field(i).Name
-			if name == "pos" || name == "Pos" {
+			if name == "pos" || name == "Pos" || name == "typePos" {
 				continue // position-stripped canonical form
 			}
 			// A field tagged dump:"omitempty" prints only when set, so adding
