@@ -4426,6 +4426,35 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call *optimizer.AggregateCall, sl
 		st.hasValue = true
 	case "sum", "avg":
 		switch arg.Kind {
+		case KindInterval:
+			// interval_accum (timestamp.c do_interval_accum): infinities are
+			// counted apart from the finite sum — floatSpecial carries the
+			// sign, and both signs together are interval_sum/interval_avg's
+			// "interval out of range" — and the finite inputs add with
+			// finite_interval_pl's overflow check. M0149-0001h1a79.
+			if arg.IsIntervalNotFinite() {
+				kind := floatSpecialNegInf
+				if arg.IsIntervalNoEnd() {
+					kind = floatSpecialPosInf
+				}
+				st.floatSpecial = combineFloatSpecial(st.floatSpecial, kind)
+				if st.floatSpecial == floatSpecialNaN {
+					return intervalOutOfRange(call.Pos())
+				}
+				if st.numericSum.Kind != KindInterval {
+					// Mark the state as an interval one; the finite sum
+					// starts at zero.
+					st.numericSum = NewIntervalDatumFull(0, 0, 0)
+				}
+			} else if st.numericSum.Kind != KindInterval {
+				st.numericSum = arg
+			} else {
+				s, err := addIntervalInterval(st.numericSum, arg, false, call.Pos())
+				if err != nil {
+					return err
+				}
+				st.numericSum = s
+			}
 		case KindInt:
 			st.sum += arg.Int
 		case KindNumeric:
@@ -5705,6 +5734,9 @@ func (o *aggregateOp) finishBuiltinAgg(st *aggRuntime, call *optimizer.Aggregate
 		if !st.hasValue {
 			return NullDatum
 		}
+		if d, ok := finishIntervalSumAvg(st, false); ok {
+			return d
+		}
 		// IEEE 754 special values from float4/float8 columns take precedence.
 		// M0097-0053.
 		switch st.floatSpecial {
@@ -5738,6 +5770,9 @@ func (o *aggregateOp) finishBuiltinAgg(st *aggRuntime, call *optimizer.Aggregate
 	case "avg":
 		if st.count == 0 {
 			return NullDatum
+		}
+		if d, ok := finishIntervalSumAvg(st, true); ok {
+			return d
 		}
 		// IEEE 754 special values from float4/float8 columns. M0097-0053.
 		switch st.floatSpecial {
@@ -7220,4 +7255,30 @@ func (o *joinOp) probeIntKeyDatum(node int32, probeSlot TupleSlot, keySlot SlotV
 		}
 	}
 	return o.evalHashKeyDatumSlot(node, o.probeKeyTrim[0], keySlot)
+}
+
+// finishIntervalSumAvg is interval_sum / interval_avg (timestamp.c) over the
+// state the interval arm of the transition built: an infinity of one sign
+// wins (both signs already raised "interval out of range"), else the finite
+// sum, or for avg the finite sum divided by the finite count
+// (interval_div). ok is false when the state is not an interval one.
+// M0149-0001h1a79.
+func finishIntervalSumAvg(st *aggRuntime, avg bool) (Datum, bool) {
+	if st.numericSum.Kind != KindInterval {
+		return Datum{}, false
+	}
+	switch st.floatSpecial {
+	case floatSpecialPosInf:
+		return NewIntervalInfinity(true), true
+	case floatSpecialNegInf:
+		return NewIntervalInfinity(false), true
+	}
+	if !avg {
+		return st.numericSum, true
+	}
+	d, err := intervalDiv(st.numericSum, float64(st.count), 0)
+	if err != nil {
+		return NullDatum, true
+	}
+	return d, true
 }

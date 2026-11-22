@@ -9515,7 +9515,9 @@ func buildWindowFunc(fc *parser.FuncCall, inputCtx *resolveContext, agg *aggrega
 		case "sum":
 			outTyp = sumResultType(inputTyp)
 		case "avg":
-			if isFloatTypeName(inputTyp.Name) {
+			if strings.EqualFold(inputTyp.Name, "interval") && !inputTyp.IsArray {
+				outTyp = catalog.Type{Name: "interval"} // interval_avg. M0149-0001h1a79.
+			} else if isFloatTypeName(inputTyp.Name) {
 				outTyp = catalog.Type{Name: "float8"}
 			} else {
 				outTyp = catalog.Type{Name: "numeric"}
@@ -12257,7 +12259,9 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 	case "avg":
 		// avg(float4/float8) returns float8; avg(integer types) returns numeric. M0097-0020.
 		argType := exprType(argExpr)
-		if isFloatTypeName(argType.Name) {
+		if strings.EqualFold(argType.Name, "interval") && !argType.IsArray {
+			outType = catalog.Type{Name: "interval"} // interval_avg. M0149-0001h1a79.
+		} else if isFloatTypeName(argType.Name) {
 			outType = catalog.Type{Name: "float8"}
 		} else {
 			outType = catalog.Type{Name: "numeric"}

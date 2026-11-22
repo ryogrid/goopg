@@ -1769,7 +1769,7 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			if err != nil {
 				return catalog.Type{}, err
 			}
-			if !isNumericLike(argTyp) {
+			if !isNumericLike(argTyp) && !isIntervalType(argTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", "sum() argument must be numeric")
 			}
 			if argTyp.Name == "unknown" {
@@ -1970,7 +1970,7 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 		case "count":
 			retType = catalog.Type{Name: "int8"}
 		case "sum":
-			if !isNumericLike(argTyp) {
+			if !isNumericLike(argTyp) && !isIntervalType(argTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", "sum() argument must be numeric")
 			}
 			if argTyp.Name == "unknown" {
@@ -1979,10 +1979,13 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 				retType = argTyp
 			}
 		case "avg":
-			if !isNumericLike(argTyp) {
+			if !isNumericLike(argTyp) && !isIntervalType(argTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", "avg() argument must be numeric")
 			}
 			switch strings.ToLower(argTyp.Name) {
+			case "interval":
+				// interval_avg returns interval (pg_aggregate.dat). M0149-0001h1a79.
+				retType = argTyp
 			case "float4", "float8", "real", "double precision", "double", "float":
 				retType = catalog.Type{Name: "float8"}
 			default:
@@ -4386,4 +4389,10 @@ func arrayConstructorType(elems []catalog.Type) catalog.Type {
 		return common
 	}
 	return catalog.Type{Name: strings.ToLower(common.Name) + "[]"}
+}
+
+// isIntervalType reports an interval (not interval[]) type: sum and avg take
+// one (interval_accum / interval_sum / interval_avg). M0149-0001h1a79.
+func isIntervalType(t catalog.Type) bool {
+	return strings.EqualFold(t.Name, "interval") && !t.IsArray
 }

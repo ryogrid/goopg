@@ -70,6 +70,9 @@ func combineAggRuntime(call optimizer.AggregateCall, dst, src *aggRuntime, ctx *
 		}
 		dst.count += src.count
 		dst.floatSpecial = combineFloatSpecial(dst.floatSpecial, src.floatSpecial)
+		if dst.floatSpecial == floatSpecialNaN && dst.numericSum.Kind == KindInterval {
+			return intervalOutOfRange(0)
+		}
 		if src.hasValue {
 			dst.hasValue = true
 		}
@@ -197,6 +200,21 @@ func combineAggRuntime(call optimizer.AggregateCall, dst, src *aggRuntime, ctx *
 // combineNumericSum adds src's running sum into dst, honouring the int and
 // numeric lanes the transition function picks between.
 func combineNumericSum(dst, src *aggRuntime) error {
+	// interval_combine (timestamp.c): the finite sums add; the infinity
+	// counts travel in floatSpecial, which the caller combines.
+	// M0149-0001h1a79.
+	if src.numericSum.Kind == KindInterval {
+		if dst.numericSum.Kind != KindInterval {
+			dst.numericSum = src.numericSum
+			return nil
+		}
+		s, err := addIntervalInterval(dst.numericSum, src.numericSum, false, 0)
+		if err != nil {
+			return err
+		}
+		dst.numericSum = s
+		return nil
+	}
 	dst.sum += src.sum
 	if src.numericSum.Kind == KindNumeric {
 		if dst.numericSum.Kind != KindNumeric {

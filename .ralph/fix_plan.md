@@ -12718,12 +12718,34 @@ verify each at HEAD when the task starts.
     - `ROWS FROM (string_to_table(...))` is not covered and is recorded in the ledger.
     - Design: docs/design/0100\-0149/0149\-0001h1a78b\-array\-constructor\-type.md \(new section\).
     Movement: yes — regress runner arrays 1214 → 1134 \(same\-list A/B against HEAD over 14 cases, none worse\)
-- [ ] **M0149-0001h1a79 — sum and avg over interval are rejected** (filed 2026-11-19 by M0149-0001h1a65)
+- [x] **M0149-0001h1a79 — sum and avg over interval are rejected** (filed 2026-11-19 by M0149-0001h1a65)
   Kind: impl
   Parent: M0149-0001h1a
   - `select sum(i), avg(i) from (values ('1 hour'::interval),('2 hours')) v(i)` raises `aggregate sum requires numeric argument
     in v0`; PG returns `03:00:00` and `01:30:00` \(interval\_sum, interval\_avg\).
   - Resume: the sum/avg transition in internal/executor/operators\_join\_agg.go.
+  - 2026\-11\-23 \(landed\):
+    - sum and avg take an interval argument, ported from interval\_accum, interval\_sum and interval\_avg.
+      - The finite sum adds with overflow checking. Infinities are counted by sign, and mixed signs raise 22008.
+      - avg divides the finite sum by the finite count with interval\_div.
+      - avg\(interval\) is typed interval in the analyzer, the planner and window functions.
+    - The parallel combine \(interval\_combine\) and the state serialization share the numericSum/floatSpecial fields.
+      Results matched PG under a parallel plan and with a spilling hash aggregate.
+    - interval input overflow returns wrong values; this is filed as M0149\-0001h1a79a \(S2\).
+    - Design: docs/design/0100\-0149/0149\-0001h1a79\-interval\-sum\-avg.md \(new\).
+    Movement: yes — regress runner window 1069 → 1050, interval 586 → 584 \(same\-list A/B against HEAD over 13 cases, none worse\)
+- [ ] **M0149-0001h1a79a — WRONG RESULTS: interval input overflow wraps instead of raising** (filed 2026-11-23 by M0149-0001h1a79; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select interval '2147483647 years 1 decade'` returns `9 years`; PG raises 22008 `interval field value out of range`.
+    The same happens for every `2147483647 years` plus a decade, century or millennium, and for the fractional forms
+    \(`'0.1 millennium 2147483647 months'` returns `-178956870 years -9 mons`\). This is interval.sql's overflow block.
+  - Resume: the interval input parser \(parser.ParseIntervalBody and DecodeInterval's unit scaling\). Port PG's
+    overflow\-checked accumulation \(int64 multiply and add with the 22008 error\) from datetime.c DecodeInterval and
+    AdjustYears/AdjustFractYears.
+  > \#\# ESCALATION 2026\-11\-23 \(S2\) — M0149\-0001h1a79a: interval input overflow returns wrong values
+  > An out\-of\-range interval literal silently wraps to a different interval instead of raising 22008. Found in the
+  > interval.sql regress diff while working on h1a79. It is not caused by that change: HEAD has the same lines.
 - [ ] **M0149-0001h1a80 — function scan and small\-table costs differ from PG** (filed 2026-11-19 by M0149-0001h1a66)
   Kind: impl
   Parent: M0149-0001h1a
