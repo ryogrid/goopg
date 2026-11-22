@@ -12791,7 +12791,7 @@ verify each at HEAD when the task starts.
       the S2 M0149\-0001h1a75.
     - Design: docs/design/0100\-0149/0149\-0001h1a68\-datetime\-literals\-at\-plan\-time.md \(new section\).
     Movement: yes — regress runner timestamptz 343 → 341 \(same\-list A/B against HEAD over 14 cases, none worse\)
-- [ ] **M0149-0001h1a81a — date/time literals in a view follow the querying session's zone** (filed 2026-11-23 by M0149-0001h1a81)
+- [x] **M0149-0001h1a81a — date/time literals in a view follow the querying session's zone** (filed 2026-11-23 by M0149-0001h1a81)
   Kind: impl
   Parent: M0149-0001h1a
   - `create view v as select t = '2020-01-01 00:00' as m from tz1` is created under UTC. Selected under
@@ -12802,6 +12802,27 @@ verify each at HEAD when the task starts.
   - Resume: CREATE VIEW in internal/executor. Store the canonicalized literals \(canonicalizeDateTimeLiterals under the
     creating session's settings\) in the view definition, or record the creation\-time TimeZone and DateStyle and plan
     view bodies with them, the way PREPARE does \(PreparedLiterals\).
+  - 2026\-11\-23 \(landed\):
+    - CREATE VIEW rewrites the stored view text. Each date/time literal is replaced by its value read under the
+      creating session's TimeZone and DateStyle, printed in ISO style \(`bindViewDateTimeLiterals`\). The view then
+      answers the same in any zone or DateStyle, and the binding survives a restart.
+    - pg\_get\_viewdef prints the bound literal but not PG's deparsed query or cast.
+    - After a restart, pg\_get\_viewdef returns the raw pg\_rewrite node tree, on HEAD as well; this is filed as
+      M0149\-0001h1a81b \(S2\).
+    - Design: docs/design/0100\-0149/0149\-0001h1a68\-datetime\-literals\-at\-plan\-time.md \(new section\).
+    Movement: none — regress runner same\-list A/B over 12 view and date cases unchanged; probes match PG under UTC,
+    Asia/Tokyo, America/New\_York and German DMY
+- [ ] **M0149-0001h1a81b — WRONG RESULTS: pg\_get\_viewdef returns the rule's node tree after a restart** (filed 2026-11-23 by M0149-0001h1a81a; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Steps: `create view v as select t + 1 as m from tz3`, restart the server, then `select pg_get_viewdef('v')`. It returns
+    `({QUERY :commandType 1 ...})`, the pg\_rewrite ev\_action, and not the view's SQL. pg\_dump of any view breaks after
+    a restart.
+  - Resume: internal/initdb/catalog\_heap\_reload.go sets `tbl.ViewDef = r.evAction`. Keep the SQL text somewhere
+    durable, or deparse the node tree as ruleutils does, and have pg\_get\_viewdef use it.
+  > \#\# ESCALATION 2026\-11\-23 \(S2\) — M0149\-0001h1a81b: pg\_get\_viewdef returns a node tree after restart
+  > Every view's definition is unreadable through pg\_get\_viewdef \(and pg\_dump\) after a server restart. Found while
+  > checking that h1a81a's literal binding persists. HEAD behaves the same.
 - [ ] **M0149-0001h1a82 — the timezone\_abbreviations setting is ignored** (filed 2026-11-19 by M0149-0001h1a70)
   Kind: impl
   Parent: M0149-0001h1a

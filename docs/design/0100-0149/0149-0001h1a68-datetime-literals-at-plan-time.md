@@ -49,8 +49,27 @@ string reports a bound that does not move forward. The loop now stops there.
 - `allballs` is a constant \(00:00:00\) and is canonicalized like any other literal.
 - `t > 'epoch'` is already an index condition.
 - **Not done:**
-  - Views still keep their source text, so their literals follow the zone of the query \(M0149\-0001h1a81a\).
   - A prepared statement re\-reads `now`, where PG fixes it at PREPARE.
   - Within a transaction, `now` is the statement time and not the transaction start.
   - JSON, XML and YAML EXPLAIN still print the literal as written.
   - `timestamptz::date` and `date_trunc` ignore the session zone; this is appended to the S2 M0149\-0001h1a75.
+
+## Literals in views \(M0149\-0001h1a81a\)
+
+PG converts a view's literals during parse analysis of CREATE VIEW, so the rule keeps the instant read under the
+creating session's settings. goopg stores the view's source text and re\-plans it at each use, so
+`bindViewDateTimeLiterals` \(internal/executor/view\_datetime\_literals.go\) fixes the literals in the text at
+creation:
+
+- The body is re\-parsed on its own, so positions are relative to the text, and planned with the session's
+  TimeZone and a DateStyle of `ISO, <session order>`.
+- For each datetime TypedStringLit, and each string cast to a datetime type, whose planned text differs from the
+  quoted literal at its position, the quoted span is replaced. A type keyword before the quote is kept.
+- Escape, Unicode, bit and dollar\-quoted strings are left alone.
+- The new text is parsed again and stored, both as the query and as the view text, so the binding is durable.
+- A timestamptz literal carries its offset and an ISO date is unambiguous, so the stored text reads back as the
+  same value under any session settings.
+- Not done:
+  - Current\-time literals \(`'now'`\) in a view are still read at each use, where PG freezes them at CREATE VIEW.
+  - Materialized views are not rewritten.
+  - pg\_get\_viewdef shows the bound text, not PG's deparse.

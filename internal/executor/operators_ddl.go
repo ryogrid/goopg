@@ -7148,6 +7148,11 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 			}
 		}
 	}
+	// M0149-0001h1a81a: the view's date/time literals are read now, under
+	// this session's TimeZone and DateStyle, as PG's parse analysis does.
+	if text, q, ok := bindViewDateTimeLiterals(o.ctx, s.RawDef, o.planCatalog()); ok {
+		s.RawDef, s.Query = text, q
+	}
 	vt, err := o.ctx.Catalog.CreateView(s.Name, cols, s.Columns, s.Query, s.OrReplace, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
