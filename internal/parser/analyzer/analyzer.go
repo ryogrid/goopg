@@ -1467,6 +1467,18 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		// is deferred to the planner's expandQualifiedStarToRowExpr.
 		return catalog.Type{Name: "record"}, nil
 	case *parser.CastExpr:
+		// gram.y's `func_name Sconst` typed literal names its type
+		// directly; typenameType rejects one that does not exist.
+		// M0149-0001h1a85.
+		if x.IsTypedLiteral() && TypeNameExists != nil {
+			if cat := scopeCatalog(ctx); cat != nil && !TypeNameExists(cat, x.Type.Schema, x.Type.Name) {
+				name := x.Type.Name
+				if x.Type.Schema != "" {
+					name = x.Type.Schema + "." + name
+				}
+				return catalog.Type{}, analyzeError(x.TypeNamePos(), "42704", fmt.Sprintf("type \"%s\" does not exist", name))
+			}
+		}
 		// v0 treats `expr::type` as a no-op for type-checking. We
 		// recurse into the operand so analysis errors inside it
 		// surface, but report `unknown` for the cast result so
@@ -4396,3 +4408,8 @@ func arrayConstructorType(elems []catalog.Type) catalog.Type {
 func isIntervalType(t catalog.Type) bool {
 	return strings.EqualFold(t.Name, "interval") && !t.IsArray
 }
+
+// TypeNameExists reports whether a type name resolves in the catalog
+// (typenameType); the executor registers its regtype resolver. nil skips the
+// check. M0149-0001h1a85.
+var TypeNameExists func(cat catalog.Catalog, schema, name string) bool

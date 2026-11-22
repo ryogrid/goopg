@@ -79,10 +79,16 @@ func TestKeywordTypedLiterals(t *testing.T) {
 	} {
 		assertParity(t, q)
 	}
+	// NCHAR Sconst is gram.y ConstCharacter Sconst — PG 18.3 accepts it as a
+	// bpchar literal (M0149-0001h1a85), as it does user types and qualified
+	// names.
 	for _, q := range []string{
 		"SELECT nchar 'c'",
+		"SELECT national character 'c'",
+		"SELECT mood 'happy'",
+		"SELECT s1.color 'red'",
 	} {
-		assertBothReject(t, q)
+		assertParity(t, q)
 	}
 }
 

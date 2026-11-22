@@ -793,6 +793,10 @@ func typedLitExpr(l yyLexer, raw string, typePos, strPos int) Expr {
 	if name == "character" {
 		name = "bpchar"
 	}
+	if schema != "" && schema != "pg_catalog" && args == nil {
+		// A user schema's type: typenameType checks it exists (M0149-0001h1a85).
+		return newTypedLitCast(strPos, val, ObjectName{Schema: schema, Name: name}, typePos)
+	}
 	return NewCastExpr(strPos, NewStringConst(strPos, val), ObjectName{Schema: schema, Name: name}, args)
 }
 

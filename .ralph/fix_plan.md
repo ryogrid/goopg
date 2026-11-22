@@ -12864,13 +12864,29 @@ verify each at HEAD when the task starts.
   - Resume: the RETURNING projection of Insert/Update/Delete in internal/executor; system columns of the new tuple.
   > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a84: RETURNING ctid returns NULL
   > The result differs from PG 18.3 for every INSERT. Found while testing typed literals in h1a71.
-- [ ] **M0149-0001h1a85 — remaining typed literal forms** (filed 2026-11-19 by M0149-0001h1a71)
+- [x] **M0149-0001h1a85 — remaining typed literal forms** (filed 2026-11-19 by M0149-0001h1a71)
   Kind: impl
   Parent: M0149-0001h1a
   - User\-defined and unknown types \(`mood 'happy'`, `nosuchtype 'x'` → PG `type "nosuchtype" does not exist`\), `nchar`,
     `national character` and `tid` are not folded; `schema.type 'x'` only for pg\_catalog.
   - A general `IDENT Sconst` fold must not capture FDW option lists \(`OPTIONS (host 'x')`\); gram.y separates them by context.
   - Resume: peekTypedLitForm in internal/parser/adapter.go; tid after M0149\-0001h1a84.
+  - 2026\-11\-23 \(landed\):
+    - `mood 'happy'` is a grammar rule \(IDENT SCONST, gram.y func\_name Sconst\); option lists are untouched and there
+      are still 60 conflicts.
+    - `schema.type 'x'` is folded by the lexer for any schema; `nchar 'x'` and `national character 'x'` are bpchar.
+    - An unknown type name raises 42704 at the type name, through analyzer.TypeNameExists \(the regtype resolver\).
+    - Goldens: 3 new statements; `nchar 'c'` flipped from rejected to accepted, which PG 18.3 accepts.
+    - The remaining `tid 'x'` and `'x'::nosuchtype` are split out as M0149\-0001h1a85a.
+    - Design: docs/design/0100\-0149/0149\-0001h1a71\-typed\-literals.md \(new section\).
+    Movement: none — regress runner same\-list A/B over 15 cases unchanged; probes match PG
+- [ ] **M0149-0001h1a85a — `tid 'x'` and a cast to an unknown type** (filed 2026-11-23 by M0149-0001h1a85)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select 'x'::nosuchtype` returns `x`; PG raises 42704 `type "nosuchtype" does not exist` at the type name.
+    analyzer.TypeNameExists already checks typed literals; extend it to every CastExpr target. First confirm that
+    the regtype resolver knows every name goopg accepts as a cast target, including the SQL aliases.
+  - `tid '(0,1)'` is not folded; this waits for M0149\-0001h1a84.
 - [ ] **M0149-0001h1a86 — remaining range type behaviour** (filed 2026-11-19 by M0149-0001h1a72)
   Kind: impl
   Parent: M0149-0001h1a

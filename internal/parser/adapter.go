@@ -559,6 +559,24 @@ func (l *lexerState) peekTypedLitForm(lower string) (spec, val string, pos int, 
 		}
 		return "", "", 0, false
 	}
+	// schema.name 'x' — gram.y func_name Sconst with a qualified name. A
+	// qualified name directly followed by a string is a typed literal
+	// wherever it appears (option names are never qualified), so any schema
+	// folds; pg_catalog keeps its known-type list. M0149-0001h1a85.
+	if lower != "pg_catalog" {
+		dot, ok1 := tok(0)
+		name, ok2 := tok(1)
+		s, ok3 := tok(2)
+		if ok1 && ok2 && ok3 && isSym(dot, ".") && s.Kind == TokenStringLit &&
+			(name.Kind == TokenIdent || name.Kind == TokenQuotedIdent) {
+			n := name.Value
+			if name.Kind != TokenQuotedIdent {
+				n = strings.ToLower(n)
+			}
+			l.i = i + 3
+			return lower + "." + n, s.Value, s.Pos, true
+		}
+	}
 	// pg_catalog.name 'x'
 	if lower == "pg_catalog" {
 		dot, ok1 := tok(0)

@@ -174,6 +174,12 @@ func NewCastExpr(pos int, operand Expr, typ ObjectName, typmods []int64) *CastEx
 	return &CastExpr{pos: pos, Operand: operand, Type: typ, Typmods: typmods}
 }
 
+// newTypedLitCast is gram.y's `func_name Sconst`: the string cast to the
+// named type, with the type name's position kept for typenameType's error.
+func newTypedLitCast(strPos int, val string, typ ObjectName, typePos int) *CastExpr {
+	return &CastExpr{pos: strPos, Operand: NewStringConst(strPos, val), Type: typ, typedLiteral: true, typePos: typePos}
+}
+
 func NewCollateExpr(pos int, operand Expr, collation string) *CollateExpr {
 	return &CollateExpr{pos: pos, Operand: operand, CollationName: collation}
 }

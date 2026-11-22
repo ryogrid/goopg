@@ -34,3 +34,19 @@ The parse stays limited to listed names. A general `IDENT Sconst` fold would als
   `tid` \(M0149\-0001h1a85\). `tid` waits for M0149\-0001h1a84: brin.sql loops until `curtid > tid '(2, 0)'`, and
   `INSERT ... RETURNING ctid` returns NULL.
 - A string cast to `bit(n)` or `varbit(n)` raises where PG pads or truncates \(M0149\-0001h1a83\).
+
+## User and unknown types, qualified names, nchar \(M0149\-0001h1a85\)
+
+- gram.y's `AexprConst: func_name Sconst` is now the grammar rule `IDENT SCONST` in c\_expr, so `mood 'happy'`
+  reads a literal of a user type. Because it is a grammar rule, it applies only where an expression is expected:
+  `OPTIONS (host 'x')` and the other option lists keep parsing as before, and goyacc reports no new conflicts.
+- A qualified name, `schema.type 'x'`, is folded by the lexer for any schema, not only pg\\_catalog. A qualified
+  name directly followed by a string appears nowhere else in the grammar. A qualified `IDENT '.' IDENT SCONST`
+  grammar rule was tried and dropped: it shifted `.` over ColId and broke `x.i = y.j`.
+- `NCHAR Sconst` and `NATIONAL TYPEDLIT` are bpchar literals.
+- These casts carry `typedLiteral` and `typePos` \(dumped omitempty, so the other goldens are unchanged\). The
+  analyzer checks that the type exists through the hook `analyzer.TypeNameExists`, which the executor fills with
+  its regtype resolver, and raises 42704 `type "..." does not exist` at the type name, as typenameType does.
+- Not done:
+  - `'x'::nosuchtype` is still accepted: the check covers only typed literals.
+  - `tid 'x'` waits for M0149\-0001h1a84.

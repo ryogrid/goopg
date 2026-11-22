@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser/analyzer"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -1001,4 +1002,29 @@ func lookupTableOnSearchPath(ctx *Context, name parser.ObjectName, dbOid uint32)
 	}
 	wrapped := catalog.WithSearchPath(ctx.Catalog, func() []string { return searchPathSchemas(ctx) })
 	return wrapped.LookupTable(name, dbOid)
+}
+
+func init() {
+	// typenameType for the analyzer's typed-literal check: the regtype input
+	// resolver, which knows built-in, user, array and qualified names.
+	// M0149-0001h1a85.
+	analyzer.TypeNameExists = func(cat catalog.Catalog, schema, name string) bool {
+		full := quoteRegIdentPart(name)
+		if schema != "" {
+			full = quoteRegIdentPart(schema) + "." + full
+		}
+		d, err := regIdentifierInput(NewStringDatum(full), "regtype", &Context{Catalog: cat}, 0)
+		return err == nil && d.Kind == KindInt
+	}
+}
+
+// quoteRegIdentPart double-quotes a name part that is not a plain lower-case
+// identifier, so regtype input reads it as written.
+func quoteRegIdentPart(s string) string {
+	for _, c := range s {
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_') {
+			return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+		}
+	}
+	return s
 }

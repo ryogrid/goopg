@@ -2957,6 +2957,24 @@ c_expr:
 				   literal there (makeStringConstCast), not at the type name. */
 				$$ = typedLitExpr(yylex, $1, $<p>1, $<ival>1)
 			}
+	/* gram.y AexprConst: func_name Sconst — a typed literal of a type the
+	   lexer's TYPEDLIT fold does not know (a user type: `mood 'happy'`,
+	   or an unknown name, which the analyzer rejects
+	   as typenameType does; `schema.type 'x'` is the lexer's TYPEDLIT
+	   fold). As a grammar rule it applies only where an
+	   expression is expected, so option lists (`OPTIONS (host 'x')`) are
+	   untouched. M0149-0001h1a85. */
+	| IDENT SCONST
+			{ $$ = newTypedLitCast($<p>2, $2, ObjectName{Name: $1}, $<p>1) }
+	/* NCHAR Sconst and NATIONAL CHARACTER Sconst — gram.y ConstCharacter
+	   Sconst; both are bpchar. */
+	| NCHAR SCONST
+			{ $$ = NewCastExpr($<p>2, NewStringConst($<p>2, $2), ObjectName{Name: "bpchar"}, nil) }
+	| NATIONAL TYPEDLIT
+			{
+				/* The lexer has already folded `character 'x'`. */
+				$$ = typedLitExpr(yylex, $2, $<p>2, $<ival>2)
+			}
 	/* Multi-word typed literals — gram.y ConstDatetime Sconst. The lexer's
 	   TYPEDLIT fold needs the SCONST to follow the type name IMMEDIATELY, so
 	   `TIMESTAMP WITH TIME ZONE '...'` cannot fold and needs real productions.
