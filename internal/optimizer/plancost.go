@@ -199,6 +199,13 @@ func DeriveLegacyDisplayCost(n Node, rows int64) PlanCost {
 	}
 
 	perRow := cp.cpuTupleCost * float64(rows)
+	if st, ok := functionScanStartup(cp, n); ok {
+		// M0149-0001h1a80: cost_functionscan — the call is evaluated once,
+		// as startup, before the per-row charge.
+		out.StartupCost = st
+		out.TotalCost = st + perRow
+		return out
+	}
 	switch x := n.(type) {
 	case *Project:
 		// M0149-0001h1a78a: a Project returning a SELECT-list ProjectSet's
@@ -273,6 +280,16 @@ func DeriveLegacyDisplayCost(n Node, rows int64) PlanCost {
 		out.StartupCost = childStartup
 		out.TotalCost = childTotal + perRow
 	case *Filter:
+		if st, ok := functionScanStartup(cp, x.Child); ok {
+			// M0149-0001h1a80: the qual of a function scan is its
+			// baserestrictinfo — cost_functionscan charges it with
+			// cpu_tuple_cost on every tuple the function returns.
+			qs, qp := qualEvalOps(x.Predicate)
+			in := float64(EstimateRows(x.Child))
+			out.StartupCost = st + qs*cp.cpuOperatorCost
+			out.TotalCost = out.StartupCost + (cp.cpuTupleCost+qp*cp.cpuOperatorCost)*in
+			break
+		}
 		if agg, ok := x.Child.(*Aggregate); ok {
 			// M0146-0214: a Filter over an Aggregate is its HAVING. cost_agg
 			// prices the quals inside the aggregate (costsize.c, "If there

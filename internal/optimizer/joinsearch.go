@@ -526,6 +526,10 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 			// its child-rel paths are not (inherit's pm `order by a + 1`);
 			// ledgered.
 			p.Cost = c
+		} else if c, ok := costFunctionScanLeaf(cp, ri, leaf); ok {
+			// M0149-0001h1a80: a function scan is cost_functionscan, not a
+			// sub-plan.
+			p.Cost = c
 		} else if isSubplanLeaf(leaf) {
 			// M0144-0011b-1: a leaf that wraps a finished SUB-PLAN is not a
 			// relation and must not be priced as a scan of one — see

@@ -296,12 +296,33 @@ func EstimateRows(n Node) int64 {
 		return estimateNLIndexJoin(x)
 	case *GenerateSeries:
 		return generateSeriesRows(x)
+	case *UserSrfScan:
+		// set_function_size_estimates: a routine without a support function
+		// returns its prorows (ROWS clause, else 1000). M0149-0001h1a80.
+		if x.Routine != nil && x.Routine.ReturnsSet {
+			return int64(routineProRows(x.Routine))
+		}
 	case *FromUnnest:
 		// string_to_table has no support function: set_function_size_estimates
 		// takes its prorows, 1000 (M0149-0001h1a78f). A plain unnest keeps
 		// its existing estimate.
 		if x.FuncName == "string_to_table" {
 			return 1000
+		}
+		// array_unnest_support: estimate_array_length of the argument; the
+		// multi-array form returns as many rows as its longest array.
+		// M0149-0001h1a80.
+		if x.ArrExpr != nil {
+			return int64(estimateArrayLength(x.ArrExpr))
+		}
+		longest := 0
+		for _, a := range x.ArrExprs {
+			if l := estimateArrayLength(a); l > longest {
+				longest = l
+			}
+		}
+		if longest > 0 {
+			return int64(longest)
 		}
 	case *ProjectSet:
 		// M0149-0001h1a78a: create_set_projection_path's rows.

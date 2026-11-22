@@ -12746,7 +12746,7 @@ verify each at HEAD when the task starts.
   > \#\# ESCALATION 2026\-11\-23 \(S2\) — M0149\-0001h1a79a: interval input overflow returns wrong values
   > An out\-of\-range interval literal silently wraps to a different interval instead of raising 22008. Found in the
   > interval.sql regress diff while working on h1a79. It is not caused by that change: HEAD has the same lines.
-- [ ] **M0149-0001h1a80 — function scan and small\-table costs differ from PG** (filed 2026-11-19 by M0149-0001h1a66)
+- [x] **M0149-0001h1a80 — function scan and small\-table costs differ from PG** (filed 2026-11-19 by M0149-0001h1a66)
   Kind: impl
   Parent: M0149-0001h1a
   - `generate_series(now(), now() + '1 day', '1 hour')` costs `0.00..0.25`; PG `0.01..0.26`, because cost\_functionscan
@@ -12754,6 +12754,15 @@ verify each at HEAD when the task starts.
   - A one\-row table analyzed just after insert shows `Seq Scan ... cost=0.00..0.01`; PG `0.00..1.01` \(one page\).
   - A Hash Join over two function scans costs `0.33..2.80`, PG `0.23..1.71`.
   - Resume: DeriveLegacyDisplayCost's GenerateSeries arm in internal/optimizer/plancost.go; then compare the join costs.
+  - 2026\-11\-23 \(landed\):
+    - Function scans follow cost\_functionscan: the call's evaluation is startup cost, and each returned tuple costs
+      cpu\_tuple\_cost plus the quals. This covers the display cost, a Filter over the scan, and the join\-search leaf.
+    - unnest estimates the array length, and a SETOF routine its prorows.
+    - The one\-row table case already matched PG \(`0.00..1.01`\) when re\-measured.
+    - Three divergences that are not specific to function scans are in the ledger: lateral Seq Scan filter cost,
+      `a = b + 1` join selectivity, and the scan width under count\(\*\).
+    - Design: docs/design/0100\-0149/0149\-0001h1a80\-function\-scan\-cost.md \(new\).
+    Movement: yes — regress runner misc\_functions 210 → 207 \(same\-list A/B against HEAD over 18 cases, none worse\)
 - [ ] **M0149-0001h1a81 — date/time literals in views, current\-time literals and epoch** (filed 2026-11-19 by M0149-0001h1a68)
   Kind: impl
   Parent: M0149-0001h1a
