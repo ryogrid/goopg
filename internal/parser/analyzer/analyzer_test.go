@@ -632,3 +632,44 @@ func TestAnalyzeWithOrdinalityNamedColumn(t *testing.T) {
 		"SELECT bogus FROM unnest(ARRAY[1,2,3]) WITH ORDINALITY AS t(m, n)",
 		"42703")
 }
+
+// TestAnalyzeSRFInCaseAndCoalesceRejected pins M0149-0001h1a78: PG's
+// transformCaseExpr and transformCoalesceExpr (parse_expr.c) reject a
+// set-returning function anywhere inside CASE or COALESCE with 0A000 at the
+// last SRF transformed, and a WHEN condition that returns a set fails
+// coerce_to_boolean with 42804 first. goopg used to return rows for both.
+func TestAnalyzeSRFInCaseAndCoalesceRejected(t *testing.T) {
+	cat := analyzerCatalog(t)
+	cases := []struct {
+		sql, code, msg string
+		pos            int
+	}{
+		{"SELECT CASE WHEN generate_series(1,2) > 1 THEN 'a' ELSE 'b' END", "42804", "argument of CASE/WHEN must not return a set", 17},
+		{"SELECT CASE WHEN true THEN generate_series(1,2) ELSE 0 END", "0A000", "set-returning functions are not allowed in CASE", 27},
+		{"SELECT CASE generate_series(1,2) WHEN 1 THEN 'a' END", "0A000", "set-returning functions are not allowed in CASE", 12},
+		{"SELECT CASE WHEN true THEN 1 ELSE unnest(array[1,2]) END", "0A000", "set-returning functions are not allowed in CASE", 34},
+		{"SELECT coalesce(generate_series(1,2), 0)", "0A000", "set-returning functions are not allowed in COALESCE", 16},
+		{"SELECT coalesce(1, generate_series(1,2))", "0A000", "set-returning functions are not allowed in COALESCE", 19},
+		{"SELECT coalesce(abs(generate_series(1,2)), 0)", "0A000", "set-returning functions are not allowed in COALESCE", 20},
+	}
+	for _, c := range cases {
+		err := Analyze(parseOne(t, c.sql), cat)
+		ae, ok := err.(*AnalyzeError)
+		if !ok {
+			t.Fatalf("Analyze(%q) = %v (%T), want AnalyzeError %s", c.sql, err, err, c.code)
+		}
+		if ae.Code != c.code || ae.Message != c.msg || ae.Pos != c.pos {
+			t.Errorf("Analyze(%q) = %s %q at %d, want %s %q at %d", c.sql, ae.Code, ae.Message, ae.Pos, c.code, c.msg, c.pos)
+		}
+	}
+	// SRFs outside CASE/COALESCE, and CASE/COALESCE without SRFs, stay legal.
+	for _, sql := range []string{
+		"SELECT generate_series(1,2) + 1",
+		"SELECT CASE WHEN true THEN 1 ELSE 2 END, coalesce(null, 1)",
+		"SELECT abs(unnest(array[-1,2]))",
+	} {
+		if err := Analyze(parseOne(t, sql), cat); err != nil {
+			t.Errorf("Analyze(%q): %v", sql, err)
+		}
+	}
+}

@@ -6665,11 +6665,26 @@ func projectSetCompositeSchema(name string) Schema {
 
 // isNestedSRFName reports whether fname is a built-in set-returning function
 // that buildSelectSrfProjectSet expands when it appears nested inside a larger
-// SELECT-list target expression (e.g. `generate_series(1,n) % 4`). Limited to
-// generate_series for now; bare and FROM-clause SRFs keep their existing paths.
-// M0118-0008.
+// SELECT-list target expression (e.g. `generate_series(1,n) % 4`,
+// `unnest(a) + 1`); bare and FROM-clause SRFs keep their existing paths.
+// M0118-0008, M0149-0001h1a78.
 func isNestedSRFName(fname string) bool {
-	return strings.EqualFold(fname, "generate_series")
+	return strings.EqualFold(fname, "generate_series") || strings.EqualFold(fname, "unnest")
+}
+
+// nestedSRFArityOK reports whether a nested SRF call has an arity the
+// ProjectSet wrapper can expand: generate_series takes 2 to 4 arguments and a
+// target-list unnest exactly one (the multi-array form is FROM-only).
+func nestedSRFArityOK(fc *FuncCall) bool {
+	switch {
+	case strings.EqualFold(fc.Name, "unnest"):
+		return len(fc.Args) == 1
+	case strings.EqualFold(fc.Name, "regexp_matches"):
+		return len(fc.Args) == 2 || len(fc.Args) == 3
+	case strings.EqualFold(fc.Name, "generate_series"):
+		return len(fc.Args) >= 2 && len(fc.Args) <= 4
+	}
+	return true // a user SETOF routine, matched on its argument count
 }
 
 // foldPgTypeof replaces pg_typeof's argument with its type name. A
@@ -6688,9 +6703,17 @@ func foldPgTypeof(pos int, arg Expr) *FuncCall {
 // resolved SELECT-list target expression, or nil when none is present. It walks
 // the same node kinds as replaceExprNode so the two stay in lockstep. M0118-0008.
 func findFirstNestedSRF(e Expr) *FuncCall {
+	return findFirstNestedSRFWith(e, func(fc *FuncCall) bool { return isNestedSRFName(fc.Name) })
+}
+
+// findFirstNestedSRFWith is findFirstNestedSRF with the set-returning test
+// supplied by the caller, so buildSelectSrfProjectSet can also recognise
+// regexp_matches and the catalog's SETOF routines. M0149-0001h1a78.
+func findFirstNestedSRFWith(e Expr, isSRF func(*FuncCall) bool) *FuncCall {
+	findFirstNestedSRF := func(e Expr) *FuncCall { return findFirstNestedSRFWith(e, isSRF) }
 	switch x := e.(type) {
 	case *FuncCall:
-		if isNestedSRFName(x.Name) {
+		if isSRF(x) {
 			return x
 		}
 		for _, a := range x.Args {
@@ -6880,10 +6903,31 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 	// (M0118-0008). We resolve the target, locate the nested SRF, and rewrite it
 	// into a wrapper expression that reads the SRF's expanded per-step value from
 	// a temp eval-row slot.
+	type nestedSRFSlot struct {
+		srfNode *FuncCall        // the nested SRF call (resolved args reused verbatim)
+		slotIdx int              // temp eval-row slot holding the raw per-step SRF value
+		routine *catalog.Routine // the SETOF routine for a user function; nil for builtins
+	}
 	type wrappedSRF struct {
-		expr    Expr      // wrapper expr (SRF replaced by a ColumnRef temp slot)
-		srfNode *FuncCall // the nested SRF call (resolved args reused verbatim)
-		slotIdx int       // temp eval-row slot holding the raw per-step SRF value
+		expr  Expr            // wrapper expr (each SRF replaced by a ColumnRef temp slot)
+		slots []nestedSRFSlot // every SRF the expression holds, zipped like bare ones
+	}
+	// nestedUserSRF is the SETOF sql/plpgsql routine a resolved call names, or
+	// nil — the routines the bare-target scan above expands as UserSrfCols.
+	nestedUserSRF := func(fc *FuncCall) *catalog.Routine {
+		if rs == nil || isNestedSRFName(fc.Name) || strings.EqualFold(fc.Name, "regexp_matches") {
+			return nil
+		}
+		name := parser.ObjectName{Name: fc.Name}
+		if dot := strings.LastIndexByte(fc.Name, '.'); dot >= 0 {
+			name = parser.ObjectName{Schema: fc.Name[:dot], Name: fc.Name[dot+1:]}
+		}
+		for _, r := range rs.LookupByName(name) {
+			if r.ReturnsSet && (strings.EqualFold(r.Language, "sql") || strings.EqualFold(r.Language, "plpgsql")) && r.NumInputArgs() == len(fc.Args) {
+				return r
+			}
+		}
+		return nil
 	}
 	childWidth := 0
 	if child != nil {
@@ -6905,17 +6949,32 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		if rerr != nil {
 			continue // let the normal target-resolution path report the error
 		}
-		srfNode := findFirstNestedSRF(resolved)
-		if srfNode == nil {
+		// Replace every nested SRF, not only the first: PG's ProjectSet runs
+		// all the SRFs of `unnest(a) * generate_series(1, 3)` in lockstep and
+		// the Result above applies the operator (split_pathtarget_at_srfs).
+		expr := resolved
+		var slots []nestedSRFSlot
+		for {
+			srfNode := findFirstNestedSRFWith(expr, func(fc *FuncCall) bool {
+				return isNestedSRFName(fc.Name) || strings.EqualFold(fc.Name, "regexp_matches") || nestedUserSRF(fc) != nil
+			})
+			if srfNode == nil {
+				break
+			}
+			if !nestedSRFArityOK(srfNode) {
+				slots = nil
+				break
+			}
+			slotIdx := childWidth + wrapSlot + len(slots)
+			repl := &ColumnRef{pos: srfNode.Pos(), Index: slotIdx, Name: strings.ToLower(srfNode.Name), Type: exprType(srfNode)}
+			expr = replaceExprNode(expr, srfNode, repl)
+			slots = append(slots, nestedSRFSlot{srfNode: srfNode, slotIdx: slotIdx, routine: nestedUserSRF(srfNode)})
+		}
+		if len(slots) == 0 {
 			continue
 		}
-		if len(srfNode.Args) < 2 || len(srfNode.Args) > 4 { // generate_series arity
-			continue
-		}
-		slotIdx := childWidth + wrapSlot
-		repl := &ColumnRef{pos: srfNode.Pos(), Index: slotIdx, Name: strings.ToLower(srfNode.Name), Type: catalog.Type{Name: "int8"}}
-		wrapped[i] = wrappedSRF{expr: replaceExprNode(resolved, srfNode, repl), srfNode: srfNode, slotIdx: slotIdx}
-		wrapSlot++
+		wrapped[i] = wrappedSRF{expr: expr, slots: slots}
+		wrapSlot += len(slots)
 	}
 
 	if len(srfs) == 0 && len(unnests) == 0 && len(regexpMatchesEntries) == 0 && len(userSrfs) == 0 && len(wrapped) == 0 {
@@ -6929,9 +6988,14 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		if w, isWrapped := wrapped[i]; isWrapped {
 			// Nested-SRF column: the output is the enclosing wrapper expression
 			// (the raw SRF value lives in a temp eval-row slot). M0118-0008.
-			name := alias
+			// FigureColname over the SQL the user wrote: the resolved
+			// target has lost the subscript's base call name.
+			name := t.Alias
 			if name == "" {
-				name = exprOutputName(t.Expr)
+				name = parser.FigureIndexColname(t.Expr)
+			}
+			if name == "" {
+				name = "?column?"
 			}
 			schema[i] = SchemaColumn{Name: name, Type: exprType(w.expr)}
 			otherExprs[i] = nil // filled by the wrapper, not as a passthrough
@@ -7076,33 +7140,7 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		}
 		castType := u.castType
 		if castType == "" {
-			// Infer element type from array type suffix.
-			// Strip ALL [] suffixes to get the scalar base type (handles 2D arrays
-			// like int4[][] from array_agg(ARRAY[x]) where unnest flattens all dims).
-			at := exprType(arrResolved).Name
-			base := strings.ToLower(at)
-			for strings.HasSuffix(base, "[]") {
-				base = base[:len(base)-2]
-			}
-			if base != strings.ToLower(at) {
-				// Normalize type aliases → canonical form so int[]/integer[]/bigint[] etc. work.
-				switch base {
-				case "int4", "int", "integer":
-					castType = "int4"
-				case "int8", "bigint":
-					castType = "int8"
-				case "int2", "smallint":
-					castType = "int2"
-				case "float4", "real":
-					castType = "float4"
-				case "float8", "double precision", "float":
-					castType = "float8"
-				case "bool", "boolean":
-					castType = "bool"
-				case "numeric", "decimal":
-					castType = "numeric"
-				}
-			}
+			castType = unnestElementCastType(exprType(arrResolved).Name)
 		}
 		// M0148-0001i3: a cast the SQL wrote over the unnest that changes the
 		// element type is an expression over the SRF, which PG evaluates in a
@@ -7160,9 +7198,28 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 	// output row) and applies the enclosing scalar expression. M0118-0008.
 	wrappers := make([]SrfWrapper, 0, len(wrapped))
 	for i, w := range wrapped {
-		sc := newGenerateSeriesCol(w.slotIdx, w.srfNode.Args)
-		sc.Wrapped = true
-		srfCols = append(srfCols, sc)
+		for _, sl := range w.slots {
+			if sl.routine != nil {
+				userSrfCols = append(userSrfCols, UserSrfCol{ColIdx: sl.slotIdx, FuncPos: sl.srfNode.Pos(), Args: sl.srfNode.Args, Routine: sl.routine, Wrapped: true})
+				continue
+			}
+			if strings.EqualFold(sl.srfNode.Name, "regexp_matches") {
+				rc := RegexpMatchesCol{ColIdx: sl.slotIdx, StringExpr: sl.srfNode.Args[0], PatternExpr: sl.srfNode.Args[1], Wrapped: true}
+				if len(sl.srfNode.Args) == 3 {
+					rc.FlagsExpr = sl.srfNode.Args[2]
+				}
+				regexpMatchesCols = append(regexpMatchesCols, rc)
+				continue
+			}
+			if strings.EqualFold(sl.srfNode.Name, "unnest") {
+				arr := sl.srfNode.Args[0]
+				unnestCols = append(unnestCols, UnnestCol{ColIdx: sl.slotIdx, ArrExpr: arr, CastType: unnestElementCastType(exprType(arr).Name), Wrapped: true})
+				continue
+			}
+			sc := newGenerateSeriesCol(sl.slotIdx, sl.srfNode.Args)
+			sc.Wrapped = true
+			srfCols = append(srfCols, sc)
+		}
 		wrappers = append(wrappers, SrfWrapper{OutCol: i, Expr: w.expr})
 	}
 
@@ -7181,6 +7238,39 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 	}, nil
 }
 
+// unnestElementCastType is the element-level cast a target-list unnest applies
+// so the executor produces typed elements (int4, not text): the canonical
+// scalar name of the array type's element, or "" when the type is not an
+// array of one of those scalars. Strips every [] suffix, since unnest
+// flattens all dimensions. M0097-0035, M0097-0125.
+func unnestElementCastType(arrayType string) string {
+	at := strings.ToLower(arrayType)
+	base := at
+	for strings.HasSuffix(base, "[]") {
+		base = base[:len(base)-2]
+	}
+	if base == at {
+		return ""
+	}
+	switch base {
+	case "int4", "int", "integer":
+		return "int4"
+	case "int8", "bigint":
+		return "int8"
+	case "int2", "smallint":
+		return "int2"
+	case "float4", "real":
+		return "float4"
+	case "float8", "double precision", "float":
+		return "float8"
+	case "bool", "boolean":
+		return "bool"
+	case "numeric", "decimal":
+		return "numeric"
+	}
+	return ""
+}
+
 // exprOutputName returns a human-readable column name for an expression that
 // has no explicit alias. Matches PostgreSQL's heuristic used in SELECT lists.
 func exprOutputName(e parser.Expr) string {
@@ -7192,6 +7282,10 @@ func exprOutputName(e parser.Expr) string {
 	case *parser.ArraySubqueryExpr:
 		_ = x
 		return "array"
+	case *parser.ArraySubscriptExpr:
+		if name := parser.FigureIndexColname(x); name != "" {
+			return name
+		}
 	}
 	return "?column?"
 }
@@ -16640,6 +16734,15 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	// whatever the selection resolved to (M0146-0047b).
 	if fs, ok := t.Expr.(*parser.FieldSelect); ok {
 		return strings.ToLower(fs.Field), exprType(e)
+	}
+	// A subscript has no field name, so FigureColname names it by the
+	// subscripted expression: `(array[1,2])[1]` is array, `(regexp_match(s,
+	// p))[1]` is regexp_match (M0149-0001h1a78).
+	if _, ok := t.Expr.(*parser.ArraySubscriptExpr); ok {
+		if name := parser.FigureIndexColname(t.Expr); name != "" {
+			return name, exprType(e)
+		}
+		return "?column?", exprType(e)
 	}
 	// FigureColname (parse_target.c) names a bare column reference by the
 	// name as WRITTEN. The resolved ref carries the column it reads, which is

@@ -1,6 +1,11 @@
 package executor
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // TestSelectListSRFInsideExpression pins M0118-0008: a set-returning function
 // nested inside a larger SELECT-list scalar expression (e.g.
@@ -54,4 +59,62 @@ func TestSelectListSRFInsideExpression(t *testing.T) {
 	eq("bare gs",
 		collect("SELECT generate_series(1,4)"),
 		[]int64{1, 2, 3, 4})
+}
+
+// TestSelectListNestedUnnestAndZippedSRFs pins M0149-0001h1a78: unnest nested
+// in an expression expands like generate_series (it used to fail with
+// "function unnest does not exist", or return one NULL row under abs()), and
+// every SRF in one expression runs in lockstep with the shorter NULL-padded,
+// as PG's ProjectSet does (`unnest(array[1,2]) * generate_series(1,3)` is
+// 1, 4, NULL).
+func TestSelectListNestedUnnestAndZippedSRFs(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	check := func(sql string, want []string) {
+		t.Helper()
+		rows := runQuery(t, ctx, sql)
+		if len(rows) != len(want) {
+			t.Fatalf("%s: got %d rows, want %d", sql, len(rows), len(want))
+		}
+		for i, w := range want {
+			got := "NULL"
+			if !rows[i][0].IsNull() {
+				got = datumToString(rows[i][0])
+			}
+			if got != w {
+				t.Fatalf("%s: row %d = %s, want %s", sql, i, got, w)
+			}
+		}
+	}
+	check("SELECT unnest(array[1,2]) + 1", []string{"2", "3"})
+	check("SELECT abs(unnest(array[-1,2]))", []string{"1", "2"})
+	check("SELECT upper(unnest(array['a','b']))", []string{"A", "B"})
+	check("SELECT unnest(array[1,2]) * generate_series(1,3)", []string{"1", "4", "NULL"})
+	check("SELECT (generate_series(1,2) + generate_series(1,3)) * 10", []string{"20", "40", "NULL"})
+	check("SELECT (regexp_matches('abab', '(b)', 'g'))[1] || '!'", []string{"b!", "b!"})
+	if err := runDDL(t, ctx, "CREATE FUNCTION h78f() RETURNS SETOF int LANGUAGE sql AS 'SELECT 1 UNION ALL SELECT 2'"); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	check("SELECT h78f() + 10", []string{"11", "12"})
+
+	// FigureColname names a subscript by the subscripted expression.
+	for sql, want := range map[string]string{
+		"SELECT (regexp_matches('ab', 'a'))[1]":        "regexp_matches",
+		"SELECT (array[1,2])[1], generate_series(1,2)": "array",
+		"SELECT (array[1,2])[1]":                       "array",
+		"SELECT (regexp_match('ab', 'a'))[1]":          "regexp_match",
+	} {
+		stmts, err := parser.Parse(sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", sql, err)
+		}
+		plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
+		if err != nil {
+			t.Fatalf("Plan(%q): %v", sql, err)
+		}
+		if got := plan.Output()[0].Name; got != want {
+			t.Errorf("%s: column 1 is %q, want %q", sql, got, want)
+		}
+	}
 }

@@ -2762,6 +2762,8 @@ type RegexpMatchesCol struct {
 	StringExpr  Expr // the subject string argument
 	PatternExpr Expr // the regex pattern argument
 	FlagsExpr   Expr // optional flags argument; nil when not given
+	// Wrapped: see SrfCol.Wrapped. M0149-0001h1a78.
+	Wrapped bool
 }
 
 // SrfWrapper applies an enclosing scalar expression to a set-returning function
@@ -2784,6 +2786,8 @@ type UserSrfCol struct {
 	FuncPos int    // source position for error reporting
 	Args    []Expr // resolved argument expressions
 	Routine *catalog.Routine
+	// Wrapped: see SrfCol.Wrapped. M0149-0001h1a78.
+	Wrapped bool
 }
 
 type ProjectSet struct {

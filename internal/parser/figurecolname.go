@@ -31,6 +31,11 @@ func figureColnameInternal(e Expr) (string, int) {
 			return x.Field, 2
 		}
 		return figureColnameInternal(x.Arg)
+	case *ArraySubscriptExpr:
+		// A_Indirection with only subscripts: no field name, so the
+		// subscripted expression names the column — `(regexp_matches(s,
+		// p))[1]` is regexp_matches, `(array[1,2])[1]` is array.
+		return figureColnameInternal(x.Base)
 	case *FuncCall:
 		return x.Name.Name, 2
 	case *CastExpr:

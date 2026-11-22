@@ -190,8 +190,9 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 
 		// Evaluate unnest(array) SRF columns. M0097-0106.
 		type unnestResult struct {
-			colIdx int
-			vals   []Datum
+			colIdx  int
+			vals    []Datum
+			wrapped bool // raw element goes into the eval row (M0149-0001h1a78)
 		}
 		unnestResults := make([]unnestResult, len(o.plan.UnnestCols))
 		for k, uc := range o.plan.UnnestCols {
@@ -213,7 +214,7 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 					vals = append(vals, d)
 				}
 			}
-			unnestResults[k] = unnestResult{colIdx: uc.ColIdx, vals: vals}
+			unnestResults[k] = unnestResult{colIdx: uc.ColIdx, vals: vals, wrapped: uc.Wrapped}
 			if len(vals) > maxLen {
 				maxLen = len(vals)
 			}
@@ -224,8 +225,9 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 		// flattened element like unnest), one row per match with the 'g'
 		// flag. M0122-0002.
 		type regexpMatchesResult struct {
-			colIdx int
-			vals   []Datum
+			colIdx  int
+			vals    []Datum
+			wrapped bool // raw value goes into the eval row (M0149-0001h1a78)
 		}
 		regexpMatchesResults := make([]regexpMatchesResult, len(o.plan.RegexpMatchesCols))
 		for k, rc := range o.plan.RegexpMatchesCols {
@@ -248,7 +250,7 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 			if rmErr != nil {
 				return rmErr
 			}
-			regexpMatchesResults[k] = regexpMatchesResult{colIdx: rc.ColIdx, vals: vals}
+			regexpMatchesResults[k] = regexpMatchesResult{colIdx: rc.ColIdx, vals: vals, wrapped: rc.Wrapped}
 			if len(vals) > maxLen {
 				maxLen = len(vals)
 			}
@@ -256,8 +258,9 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 
 		// Evaluate user-defined SETOF SQL functions. M0097-0020.
 		type userSrfResult struct {
-			colIdx int
-			vals   []Datum
+			colIdx  int
+			vals    []Datum
+			wrapped bool // raw value goes into the eval row (M0149-0001h1a78)
 		}
 		userResults := make([]userSrfResult, len(o.plan.UserSrfCols))
 		for k, usc := range o.plan.UserSrfCols {
@@ -281,7 +284,7 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 			if srfErr != nil {
 				return srfErr
 			}
-			userResults[k] = userSrfResult{colIdx: usc.ColIdx, vals: vals}
+			userResults[k] = userSrfResult{colIdx: usc.ColIdx, vals: vals, wrapped: usc.Wrapped}
 			if len(vals) > maxLen {
 				maxLen = len(vals)
 			}
@@ -315,24 +318,36 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 				}
 			}
 			for _, unnr := range unnestResults {
+				val := Datum{} // NULL
 				if step < len(unnr.vals) {
-					outRow[unnr.colIdx] = unnr.vals[step]
+					val = unnr.vals[step]
+				}
+				if unnr.wrapped {
+					evalRow[unnr.colIdx] = val
 				} else {
-					outRow[unnr.colIdx] = Datum{} // NULL
+					outRow[unnr.colIdx] = val
 				}
 			}
 			for _, ur := range userResults {
+				val := Datum{} // NULL
 				if step < len(ur.vals) {
-					outRow[ur.colIdx] = ur.vals[step]
+					val = ur.vals[step]
+				}
+				if ur.wrapped {
+					evalRow[ur.colIdx] = val
 				} else {
-					outRow[ur.colIdx] = Datum{} // NULL
+					outRow[ur.colIdx] = val
 				}
 			}
 			for _, rmr := range regexpMatchesResults {
+				val := Datum{} // NULL
 				if step < len(rmr.vals) {
-					outRow[rmr.colIdx] = rmr.vals[step]
+					val = rmr.vals[step]
+				}
+				if rmr.wrapped {
+					evalRow[rmr.colIdx] = val
 				} else {
-					outRow[rmr.colIdx] = Datum{} // NULL
+					outRow[rmr.colIdx] = val
 				}
 			}
 			// Apply nested-SRF wrappers: each reads its SRF's per-step value

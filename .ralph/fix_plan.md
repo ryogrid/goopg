@@ -12597,7 +12597,7 @@ verify each at HEAD when the task starts.
       and trim\_scale have result types in exprType.
     - Design: docs/design/0100\-0149/0149\-0001h1a62\-numeric\-variance.md \(new section\).
     Movement: yes — regress runner numeric 925 → 871, numeric\_big 688 → 685
-- [ ] **M0149-0001h1a78 — other set\-returning calls nested in an expression** (filed 2026-11-19 by M0149-0001h1a64)
+- [x] **M0149-0001h1a78 — other set\-returning calls nested in an expression** (filed 2026-11-19 by M0149-0001h1a64)
   Kind: impl
   Parent: M0149-0001h1a
   - `select unnest(array[1,2]) + 1` raises `function unnest does not exist`; PG returns 2 and 3. Only
@@ -12607,6 +12607,37 @@ verify each at HEAD when the task starts.
   - EXPLAIN VERBOSE of `select generate_series(1,2) + 1` prints a ProjectSet with `Output: ?column?`; PG prints a Result
     over a ProjectSet with the expressions.
   - Resume: isNestedSRFName and buildSelectSrfProjectSet in internal/optimizer/planner.go; the analyzer for the errors.
+  - 2026\-11\-22 \(landed\):
+    - unnest, regexp\_matches and user SETOF routines nested in an expression expand like generate\_series. Every
+      SRF in one expression gets its own slot, and they run in lockstep: `unnest(array[1,2]) * generate_series(1,3)`
+      is 1, 4, NULL. `abs(unnest(...))` used to return one NULL row, and `(regexp_matches(s, p, 'g'))[1]` one row.
+    - The analyzer raises PG's CASE and COALESCE errors: 42804 for a WHEN that returns a set, and 0A000 at the last
+      SRF otherwise \(transformCaseExpr, transformCoalesceExpr\).
+    - Subscripted targets are named by FigureColname's A\_Indirection arm, so `(array[1,2])[1]` is `array`.
+    - The EXPLAIN shape is split out as M0149\-0001h1a78a. Two gaps found along the way are M0149\-0001h1a78b and
+      M0149\-0001h1a78c.
+    - Design: docs/design/0100\-0149/0118\-0034\-select\-list\-srf\-nested\-in\-expression.md \(new section\).
+    Movement: yes — regress runner tsrf 205 → 197, arrays 1281 → 1277, subselect 852 → 844, jsonb 2484 → 2473 \(same\-list A/B against HEAD; plpgsql moved only in its known nondeterministic block\)
+- [ ] **M0149-0001h1a78a — EXPLAIN of a set\-returning call nested in an expression** (filed 2026-11-22 by M0149-0001h1a78)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `explain verbose select generate_series(1,2) + 1`: PG prints `Result (rows=2)` with
+    `Output: ((generate_series(1, 2)) + 1)` over `ProjectSet (rows=2)` with `Output: generate_series(1, 2)`.
+    goopg prints only the ProjectSet, with `rows=1` and `Output: ?column?`. The same applies to unnest.
+  - Resume: srfNeedsResultAbove in internal/executor/operators\_explain.go synthesises the Result only below a
+    Sort; the row estimate for a wrapped SRF is missing in the ProjectSet costing.
+- [ ] **M0149-0001h1a78b — arithmetic on an array subscript is rejected** (filed 2026-11-22 by M0149-0001h1a78)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select (array[1,2])[1] + 1` fails with `operator + requires numeric operands`; PG returns 2. The same happens
+    on HEAD before M0149\-0001h1a78.
+  - Resume: the element type that exprType gives an ArraySubscript over an ARRAY constructor.
+- [ ] **M0149-0001h1a78c — string\_to\_array is missing** (filed 2026-11-22 by M0149-0001h1a78)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select string_to_array('a,b', ',')` raises `function string_to_array does not exist`; PG returns `{a,b}`
+    \(text\_to\_array, text\_to\_array\_null in varlena.c\). Only the pg\_proc rows exist.
+  - Resume: add the function to the executor's builtin dispatch next to array\_to\_string.
 - [ ] **M0149-0001h1a79 — sum and avg over interval are rejected** (filed 2026-11-19 by M0149-0001h1a65)
   Kind: impl
   Parent: M0149-0001h1a

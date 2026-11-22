@@ -325,7 +325,7 @@ var exprSwitchInventory = map[string]walkerRole{
 
 	"planner.go:exprSideUnder":                   nonRecursiveClassifier,
 	"planner.go:exprType":                        walkerPending, // 22 of 32 arms
-	"planner.go:findFirstNestedSRF":              walkerPending, // 6 of 32 arms
+	"planner.go:findFirstNestedSRFWith":          walkerPending, // 6 of 32 arms
 	"planner.go:inferExprType":                   nonRecursiveClassifier,
 	"planner.go:isConstantExpr":                  walkerPending, // 25 of 32 arms
 	"planner.go:isConstantPlanExpr":              walkerPending, // 12 of 32 arms

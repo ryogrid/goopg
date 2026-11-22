@@ -88,7 +88,9 @@ slot assignment and eval-row construction.
 - Only `generate_series` is expanded when nested; nested `unnest` / user-SETOF
   functions and multiple SRFs in one target expression keep current behavior
   (the pre-scan takes the first SRF and only when arity is valid). The `Wrapped`
-  flag on `UnnestCol` is reserved for a future extension.
+  flag on `UnnestCol` is reserved for a future extension. *(Superseded by
+  M0149-0001h1a78, below: unnest, regexp_matches, user SETOF routines and
+  several SRFs in one expression are now expanded.)*
 - WAL / storage / visibility untouched.
 
 ## Tests / gates
@@ -115,3 +117,34 @@ the executor never reads, so `findFirstNestedSRF` still finds the call and the r
 Only generate\_series is expanded when nested; other set\-returning calls, EXPLAIN's shape for these plans and
 PG's errors for set\-returning calls inside CASE and COALESCE are M0149\-0001h1a78.
 
+
+## unnest, several SRFs in one expression, and CASE/COALESCE errors \(M0149\-0001h1a78\)
+
+- `isNestedSRFName` now covers `unnest` as well as `generate_series`. The ProjectSet pre\-scan uses
+  `findFirstNestedSRFWith` with a wider test that also matches `regexp_matches` and the catalog's SETOF sql and
+  plpgsql routines, the same set the bare\-target scan expands. `nestedSRFArityOK` checks the arity per function:
+  2 to 4 arguments for generate\_series, exactly one for unnest \(the multi\-array form is FROM\-only in PG too\),
+  and 2 or 3 for regexp\_matches. A user routine is matched on its argument count.
+- A wrapped SRF of each kind is its usual column with `Wrapped: true`: `UnnestCol`, `RegexpMatchesCol` or
+  `UserSrfCol`. The executor writes the per\-step value into the eval row instead of the output row.
+- The pre\-scan replaces every nested SRF in a target, not only the first. Each SRF gets its own eval\-row slot,
+  so `unnest(array[1,2]) * generate_series(1,3)` runs both in lockstep like PG's ProjectSet: the result is 1, 4 and
+  NULL, with the shorter SRF padded with NULL.
+- A wrapped unnest takes its element cast from `unnestElementCastType`, the helper the bare unnest uses as well.
+- Column names follow FigureColname. `figureColnameInternal` \(internal/parser/figurecolname.go\) gained PG's
+  A\_Indirection arm: a subscript has no field name, so the subscripted expression names the column, as in
+  `(regexp_matches(s, p))[1]` → regexp\_matches. targetMeta and exprOutputName use it for subscripted targets, so
+  `(array[1,2])[1]` is `array`, where goopg used to print `int4` or `?column?`.
+- A slot ColumnRef takes `exprType` of its SRF, so `generate_series(1,2) + 1` is `integer`, as in PG. The slot
+  used to be fixed at `int8`.
+- The analyzer applies PG's rules from parse\_expr.c:
+  - transformCaseExpr: a WHEN condition that returns a set fails coerce\_to\_boolean with 42804. Any other
+    set\-returning call in a CASE raises 0A000 `set-returning functions are not allowed in CASE`.
+  - transformCoalesceExpr raises the same 0A000 error for COALESCE.
+  - The error is reported at the last SRF transformed \(p\_last\_srf\), with PG's LATERAL hint.
+- Still open: EXPLAIN for these plans. PG prints a Result over the ProjectSet with the SRF row estimate
+  \(`rows=2`\) and real Output lists. goopg prints the ProjectSet alone, with `rows=1` and `Output: ?column?`.
+  This is M0149\-0001h1a78a.
+- Found along the way and filed separately:
+  - `(array[1,2])[1] + 1` fails with `operator + requires numeric operands` \(M0149\-0001h1a78b\).
+  - string\_to\_array has no executor implementation \(M0149\-0001h1a78c\).

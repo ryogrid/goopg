@@ -1733,6 +1733,11 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		if x.Over != nil {
 			return analyzeWindowFuncCall(x, ctx)
 		}
+		if strings.EqualFold(x.Name.Name, "coalesce") && x.Name.Schema == "" {
+			if pos, ok := lastSRFPos(x.Args, scopeCatalog(ctx)); ok {
+				return catalog.Type{}, srfNotAllowed(pos, "COALESCE")
+			}
+		}
 		for _, a := range x.Args {
 			if _, err := analyzeExpr(a, ctx); err != nil {
 				return catalog.Type{}, err
@@ -3661,6 +3666,9 @@ func isComparable(left, right catalog.Type) bool {
 // it assignable to any column). Real type unification (numeric
 // promotion, text/varchar coalescing) waits on the type system.
 func analyzeCaseExpr(x *parser.CaseExpr, ctx *scope) (catalog.Type, error) {
+	if err := caseSRFPlacement(x, ctx); err != nil {
+		return catalog.Type{}, err
+	}
 	// Operand of the simple form just needs to be a valid
 	// expression; type-checking the comparison is deferred until
 	// the type system can do real coercions.
@@ -4211,3 +4219,118 @@ func castAssignmentError(e parser.Expr, colName string, colType catalog.Type) er
 		Message: fmt.Sprintf("column \"%s\" is of type %s but expression is of type %s", colName, pgTypeDisplayName(dst), pgTypeDisplayName(src)),
 		Hint:    "You will need to rewrite or cast the expression."}
 }
+
+func scopeCatalog(ctx *scope) catalog.Catalog {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.cat
+}
+
+// srfNotAllowed is the error transformCaseExpr and transformCoalesceExpr
+// (parse_expr.c) raise when a set-returning function appears inside them.
+// M0149-0001h1a78.
+func srfNotAllowed(pos int, construct string) error {
+	return analyzeErrorWithHint(pos, "0A000", "set-returning functions are not allowed in "+construct,
+		"You might be able to move the set-returning function into a LATERAL FROM item.")
+}
+
+// caseSRFPlacement applies transformCaseExpr's two rules: a WHEN condition
+// that returns a set fails coerce_to_boolean, and any other set-returning call
+// in the CASE is rejected at the last one transformed (p_last_srf).
+func caseSRFPlacement(x *parser.CaseExpr, ctx *scope) error {
+	cat := scopeCatalog(ctx)
+	for _, w := range x.Whens {
+		if exprHasSRF(w.When, cat) {
+			return analyzeError(leftmostPos(w.When), "42804", "argument of CASE/WHEN must not return a set")
+		}
+	}
+	var parts []parser.Expr
+	if x.Operand != nil {
+		parts = append(parts, x.Operand)
+	}
+	for _, w := range x.Whens {
+		parts = append(parts, w.When, w.Then)
+	}
+	if x.Else != nil {
+		parts = append(parts, x.Else)
+	}
+	if pos, ok := lastSRFPos(parts, cat); ok {
+		return srfNotAllowed(pos, "CASE")
+	}
+	return nil
+}
+
+// leftmostPos is exprLocation for an operator expression: the leftmost of its
+// operands' positions.
+func leftmostPos(e parser.Expr) int {
+	for {
+		b, ok := e.(*parser.BinaryOp)
+		if !ok {
+			return e.Pos()
+		}
+		e = b.Left
+	}
+}
+
+// lastSRFPos is the position of the last set-returning call in transform
+// order (arguments before the call itself) among exprs.
+func lastSRFPos(exprs []parser.Expr, cat catalog.Catalog) (int, bool) {
+	pos, found := 0, false
+	var walk func(e parser.Expr)
+	walk = func(e parser.Expr) {
+		if e == nil || !exprHasSRF(e, cat) {
+			return
+		}
+		switch x := e.(type) {
+		case *parser.BinaryOp:
+			walk(x.Left)
+			walk(x.Right)
+		case *parser.UnaryOp:
+			walk(x.Operand)
+		case *parser.CastExpr:
+			walk(x.Operand)
+		case *parser.CaseExpr:
+			walk(x.Operand)
+			for _, w := range x.Whens {
+				walk(w.When)
+				walk(w.Then)
+			}
+			walk(x.Else)
+		case *parser.FuncCall:
+			for _, a := range x.Args {
+				walk(a)
+			}
+			nested := false
+			for _, a := range x.Args {
+				nested = nested || exprHasSRF(a, cat)
+			}
+			if !nested || isSRFCallName(x, cat) {
+				pos, found = x.Pos(), true
+			}
+		default:
+			pos, found = e.Pos(), true
+		}
+	}
+	for _, e := range exprs {
+		walk(e)
+	}
+	return pos, found
+}
+
+func isSRFCallName(x *parser.FuncCall, cat catalog.Catalog) bool {
+	if builtinSRFNames[strings.ToLower(x.Name.Name)] {
+		return true
+	}
+	if cat != nil {
+		if rs := cat.Routines(); rs != nil {
+			for _, r := range rs.LookupByName(x.Name) {
+				if r.ReturnsSet {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
