@@ -10,7 +10,7 @@ import (
 // timestamptz literal under the given TimeZone and DateStyle and returns the
 // text its output function prints, which reads back as the same value in any
 // session. The executor registers it; false leaves the literal unchanged.
-var CanonicalDateTimeLiteral func(typ, value, zone, dateStyle string) (string, bool)
+var CanonicalDateTimeLiteral func(typ, value, zone, dateStyle, abbrevs string) (string, bool)
 
 // canonicalizeDateTimeLiterals fixes every date/time literal of a plan when
 // the statement is planned. PG converts such a literal into a Const during
@@ -26,7 +26,7 @@ func canonicalizeDateTimeLiterals(n Node, settings PlannerSettings) {
 		if !castTargetTakesStringLiteral(typ) || namesCurrentTime(*value) {
 			return
 		}
-		if text, ok := CanonicalDateTimeLiteral(typ, *value, settings.TimeZone, settings.DateStyle); ok {
+		if text, ok := CanonicalDateTimeLiteral(typ, *value, settings.TimeZone, settings.DateStyle, settings.TimezoneAbbreviations); ok {
 			*value = text
 		}
 	}
@@ -76,7 +76,7 @@ func typeLiteral(side *Expr, other Expr, settings PlannerSettings, done map[*Typ
 		*side = lit
 		return
 	}
-	if text, ok := CanonicalDateTimeLiteral(typ, sc.Value, settings.TimeZone, settings.DateStyle); ok {
+	if text, ok := CanonicalDateTimeLiteral(typ, sc.Value, settings.TimeZone, settings.DateStyle, settings.TimezoneAbbreviations); ok {
 		lit := &TypedStringLit{pos: sc.Pos(), Type: typ, Value: text}
 		done[lit] = true
 		*side = lit

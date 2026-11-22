@@ -18,14 +18,24 @@ type AbbrevRow struct {
 // abbreviation set: a fixed abbreviation as written, and a dynamic one with the
 // meaning it has in its zone at now (DetermineTimeZoneAbbrevOffsetTS).
 func DefaultAbbrevRows(now time.Time, lookup func(name string) (*time.Location, bool)) []AbbrevRow {
-	keys := make([]string, 0, len(defaultZoneAbbrevs))
-	for k := range defaultZoneAbbrevs {
+	return AbbrevRows("", now, lookup)
+}
+
+// AbbrevRows is DefaultAbbrevRows over the named timezone_abbreviations set
+// ("" = Default; an unloadable name falls back to Default). M0149-0001h1a82.
+func AbbrevRows(setName string, now time.Time, lookup func(name string) (*time.Location, bool)) []AbbrevRow {
+	set, err := abbrevSet(setName)
+	if err != nil {
+		set = defaultZoneAbbrevs
+	}
+	keys := make([]string, 0, len(set))
+	for k := range set {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	rows := make([]AbbrevRow, 0, len(keys))
 	for _, k := range keys {
-		ab := defaultZoneAbbrevs[k]
+		ab := set[k]
 		up := strings.ToUpper(k)
 		switch ab.kind {
 		case tokTZ:

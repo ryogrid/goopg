@@ -114,7 +114,7 @@ func (o *valuesOp) Open(ctx *Context) error {
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.ExtensionRows())
 		} else if tbl.Name == "pg_timezone_abbrevs" && tbl.Schema == "pg_catalog" && ctx != nil {
 			// pg_timezone_abbrevs_zone reads the session's TimeZone.
-			o.rows = rematerialiseVirtualRowsFromStrings(tbl, catalog.TimezoneAbbrevRows(timeZoneFromCtx(ctx)))
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, catalog.TimezoneAbbrevRows(timeZoneFromCtx(ctx), abbrevSetFromCtx(ctx)))
 		} else if tbl.Name == "pg_stat_slru" && ctx != nil {
 			// pg_stat_slru reports live cumulative SLRU statistics (notify
 			// blks_zeroed) honouring the session's stats_fetch_consistency, which

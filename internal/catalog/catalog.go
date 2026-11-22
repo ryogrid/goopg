@@ -7538,7 +7538,11 @@ func (c *InMemory) Routines() *Routines { return c.routines }
 // set without those names (pg_timezone_abbrevs_abbrevs ... WHERE NOT EXISTS).
 // utc_offset is rendered as postgres_verbose, the style pg_regress runs with,
 // because goopg has no IntervalStyle output yet (M0149-0001h1a89).
-func TimezoneAbbrevRows(zone string) [][]string {
+func TimezoneAbbrevRows(zone string, abbrevSet ...string) [][]string {
+	set := ""
+	if len(abbrevSet) > 0 {
+		set = abbrevSet[0]
+	}
 	now := time.Now()
 	var rows [][]string
 	inZone := map[string]bool{}
@@ -7548,7 +7552,7 @@ func TimezoneAbbrevRows(zone string) [][]string {
 			rows = append(rows, []string{r.Abbrev, verboseIntervalOffset(r.Offset), boolText(r.IsDST)})
 		}
 	}
-	for _, r := range datetime.DefaultAbbrevRows(now, misc.ZoneByName) {
+	for _, r := range datetime.AbbrevRows(set, now, misc.ZoneByName) {
 		if !inZone[r.Abbrev] {
 			rows = append(rows, []string{r.Abbrev, verboseIntervalOffset(r.Offset), boolText(r.IsDST)})
 		}

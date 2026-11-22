@@ -47,6 +47,9 @@ func bindViewDateTimeLiterals(ctx *Context, rawDef string, cat catalog.Catalog) 
 	settings := optimizer.DefaultPlannerSettings()
 	settings.TimeZone = timeZoneFromCtx(ctx)
 	settings.DateStyle = "ISO, " + dateStyleOrder(ctx)
+	if set := abbrevSetFromCtx(ctx); set != "" {
+		settings.TimezoneAbbreviations = set
+	}
 	plan, err := optimizer.PlanWithSettings(sel, cat, settings)
 	if err != nil || plan == nil {
 		return "", nil, false

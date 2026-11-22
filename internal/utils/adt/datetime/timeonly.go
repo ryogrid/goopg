@@ -162,7 +162,7 @@ func (x *decoder) runTimeOnly(fields []dateField, withZone bool) (Decoded, error
 				default:
 					kind, val = tokTZ, off
 				}
-			} else if ab, ok := defaultZoneAbbrevs[text]; ok {
+			} else if ab, ok := x.env.abbrev(text); ok {
 				kind, val = ab.kind, ab.offset
 				if ab.kind == tokDynTZ {
 					if dynZone, ok = x.env.LookupZone(ab.zone); !ok {

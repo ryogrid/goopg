@@ -126,6 +126,10 @@ type PlannerSettings struct {
 	// built-in default.
 	TimeZone  string
 	DateStyle string
+	// TimezoneAbbreviations is the timezone_abbreviations GUC: which
+	// abbreviation set a literal's zone abbreviation is read from
+	// (M0149-0001h1a82). "" means Default.
+	TimezoneAbbreviations string
 
 	// EnableHashAgg / EnablePresortedAggregate / Geqo / GeqoThreshold are the
 	// remaining P2-02c bridges. Same defect as EnableMemoize below: each
@@ -275,6 +279,7 @@ func DefaultPlannerSettings() PlannerSettings {
 	return PlannerSettings{
 		TimeZone:  "UTC",      // TimeZone BootVal (internal/utils/misc/defaults.go)
 		DateStyle: "ISO, MDY", // DateStyle BootVal
+		TimezoneAbbreviations: "Default", // timezone_abbreviations BootVal
 		EnableHashJoin:  true,
 		EnableMergeJoin: true,
 		EnableNestLoop:  true,

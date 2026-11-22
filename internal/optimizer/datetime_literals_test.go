@@ -12,7 +12,7 @@ import (
 func TestCanonicalizeDateTimeLiterals(t *testing.T) {
 	saved := CanonicalDateTimeLiteral
 	defer func() { CanonicalDateTimeLiteral = saved }()
-	CanonicalDateTimeLiteral = func(typ, value, zone, style string) (string, bool) {
+	CanonicalDateTimeLiteral = func(typ, value, zone, style, _ string) (string, bool) {
 		return typ + ":" + value + "@" + zone, true
 	}
 	typed := &TypedStringLit{Type: "timestamptz", Value: "2020-01-01"}

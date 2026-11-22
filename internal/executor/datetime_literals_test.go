@@ -20,12 +20,12 @@ func TestCanonicalDateTimeLiteral(t *testing.T) {
 		{"date", "0044-03-15 BC", "UTC", "ISO, MDY", "0044-03-15 BC"},
 	}
 	for _, c := range cases {
-		got, ok := canonicalDateTimeLiteral(c.typ, c.value, c.zone, c.style)
+		got, ok := canonicalDateTimeLiteral(c.typ, c.value, c.zone, c.style, "")
 		if !ok || got != c.want {
 			t.Errorf("%s %q under %s/%s = %q, %v; want %q", c.typ, c.value, c.zone, c.style, got, ok, c.want)
 		}
 	}
-	if _, ok := canonicalDateTimeLiteral("date", "not a date", "UTC", "ISO, MDY"); ok {
+	if _, ok := canonicalDateTimeLiteral("date", "not a date", "UTC", "ISO, MDY", ""); ok {
 		t.Error("an invalid literal is left for run time to report")
 	}
 }

@@ -2199,5 +2199,6 @@ func sessionTempOwner(ctx *Context) string {
 type PreparedLiteralSettings struct {
 	TimeZone  string
 	DateStyle string
+	// TimezoneAbbreviations is timezone_abbreviations at PREPARE (M0149-0001h1a82).
+	TimezoneAbbreviations string
 }
-

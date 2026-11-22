@@ -782,7 +782,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 						fmt.Sprintf("prepared statement %q already exists", ps.Name))
 				}
 				if lit := ctxPlannerSettings(ectx); lit.TimeZone != "" || lit.DateStyle != "" {
-					prepStmts.SetLiteralSettings(ps.Name, &executor.PreparedLiteralSettings{TimeZone: lit.TimeZone, DateStyle: lit.DateStyle})
+					prepStmts.SetLiteralSettings(ps.Name, &executor.PreparedLiteralSettings{TimeZone: lit.TimeZone, DateStyle: lit.DateStyle, TimezoneAbbreviations: lit.TimezoneAbbreviations})
 				}
 				// Infer result column types and undeclared parameter types by planning/walking.
 				if ectx.Catalog != nil {
@@ -1842,7 +1842,7 @@ func ctxPlannerSettings(ctx *executor.Context) optimizer.PlannerSettings {
 	}
 	ps := plannerSettingsFrom(ctx.GetSetting)
 	if lit := ctx.PreparedLiterals; lit != nil {
-		ps.TimeZone, ps.DateStyle = lit.TimeZone, lit.DateStyle
+		ps.TimeZone, ps.DateStyle, ps.TimezoneAbbreviations = lit.TimeZone, lit.DateStyle, lit.TimezoneAbbreviations
 	}
 	return ps
 }
@@ -1869,6 +1869,9 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	}
 	if v, ok := get("datestyle"); ok {
 		ps.DateStyle = v
+	}
+	if v, ok := get("timezone_abbreviations"); ok {
+		ps.TimezoneAbbreviations = v
 	}
 
 	// take2 P2-05: the planner-method toggles. These were registered GUCs with
@@ -2089,6 +2092,7 @@ func plannerCacheFingerprint(ps optimizer.PlannerSettings, disableSeqScan, disab
 		bit(ps.EnableGatherMerge),
 		ps.TimeZone,
 		ps.DateStyle,
+		ps.TimezoneAbbreviations,
 		bit(disableSeqScan),
 		bit(disableIndexScan),
 		bit(disableBitmapScan),

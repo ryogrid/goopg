@@ -16,7 +16,7 @@ func init() {
 // function's text under the same settings. That text must read back as the
 // same value; when it does not, the ISO form is tried, and failing that the
 // literal is left as written.
-func canonicalDateTimeLiteral(typ, value, zone, dateStyle string) (text string, ok bool) {
+func canonicalDateTimeLiteral(typ, value, zone, dateStyle, abbrevs string) (text string, ok bool) {
 	defer func() {
 		if recover() != nil {
 			text, ok = "", false
@@ -29,6 +29,8 @@ func canonicalDateTimeLiteral(typ, value, zone, dateStyle string) (text string, 
 				return zone, zone != ""
 			case "datestyle":
 				return style, style != ""
+			case "timezone_abbreviations":
+				return abbrevs, abbrevs != ""
 			}
 			return "", false
 		}}

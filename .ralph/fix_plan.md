@@ -12823,13 +12823,22 @@ verify each at HEAD when the task starts.
   > \#\# ESCALATION 2026\-11\-23 \(S2\) — M0149\-0001h1a81b: pg\_get\_viewdef returns a node tree after restart
   > Every view's definition is unreadable through pg\_get\_viewdef \(and pg\_dump\) after a server restart. Found while
   > checking that h1a81a's literal binding persists. HEAD behaves the same.
-- [ ] **M0149-0001h1a82 — the timezone\_abbreviations setting is ignored** (filed 2026-11-19 by M0149-0001h1a70)
+- [x] **M0149-0001h1a82 — the timezone\_abbreviations setting is ignored** (filed 2026-11-19 by M0149-0001h1a70)
   Kind: impl
   Parent: M0149-0001h1a
   - Date/time input always reads abbreviations from the Default set; PG loads the file the setting names
     \(load\_tzoffsets, share/timezonesets\), and `SET timezone_abbreviations = 'India'` changes what `IST` means.
   - pg\_timezone\_abbrevs should list the active set.
   - Resume: defaultZoneAbbrevs in internal/utils/adt/datetime; a loader for share/timezonesets and the GUC hook.
+  - 2026\-11\-23 \(landed\):
+    - The Default, Australia and India sets are embedded and parsed by a ParseTzFile port.
+      - Date/time input, the plan\-time literal canonicalizer \(part of the plan cache key\), PREPARE and
+        pg\_timezone\_abbrevs all use the set the setting names.
+      - An unknown or dotted name is rejected with 22023.
+    - Probes match PG: IST under India, EST and CST under Australia, timetz input.
+    - pg\_timezone\_abbrevs' utc\_offset formatting remains M0149\-0001h1a89.
+    - Design: docs/design/0100\-0149/0149\-0001h1a82\-timezone\-abbreviations.md \(new\).
+    Movement: none — regress runner same\-list A/B over 9 date/time and GUC cases unchanged \(sysviews stays PASS\)
 - [ ] **M0149-0001h1a83 — a string cast to bit\(n\) or varbit\(n\) raises instead of padding** (filed 2026-11-19 by M0149-0001h1a71)
   Kind: impl
   Parent: M0149-0001h1a

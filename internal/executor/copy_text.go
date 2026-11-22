@@ -1065,12 +1065,25 @@ type dateInput struct {
 	zone  string
 	order string
 	now   time.Time
+	// abbrevs is the timezone_abbreviations setting ("" = Default).
+	abbrevs string
 }
 
 // dateInputFromCtx reads the TimeZone and DateStyle settings and statement time.
 func dateInputFromCtx(ctx *Context) dateInput {
 	_, order := dateStyleFromCtx(ctx)
-	return dateInput{zone: timeZoneFromCtx(ctx), order: order, now: nowFromCtx(ctx)}
+	return dateInput{zone: timeZoneFromCtx(ctx), order: order, now: nowFromCtx(ctx), abbrevs: abbrevSetFromCtx(ctx)}
+}
+
+// abbrevSetFromCtx is the session's timezone_abbreviations setting.
+// M0149-0001h1a82.
+func abbrevSetFromCtx(ctx *Context) string {
+	if ctx != nil && ctx.GetSetting != nil {
+		if v, ok := ctx.GetSetting("timezone_abbreviations"); ok {
+			return v
+		}
+	}
+	return ""
 }
 
 // decodeTimeOnlyText is time_in, or timetz_in for withZone: PostgreSQL's
@@ -1107,6 +1120,7 @@ func decodeEnvFor(in dateInput) datetime.DecodeEnv {
 		Session:    misc.SessionLocation(in.zone),
 		LookupZone: misc.ZoneByName,
 		WestOffset: misc.WallClockWestOffset,
+		AbbrevSet:  in.abbrevs,
 	}
 	switch in.order {
 	case "DMY":

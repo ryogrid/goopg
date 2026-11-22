@@ -5,6 +5,8 @@ import (
 	"math"
 	"strconv"
 	"strings"
+
+	"github.com/goopg/goopg/internal/utils/adt/datetime"
 )
 
 // BuildDefaultRegistry returns a Registry seeded with every GUC the
@@ -119,6 +121,14 @@ func BuildDefaultRegistry() *Registry {
 		Name: "timezone_abbreviations", Type: TypeString, BootVal: "Default",
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
+		// check_timezone_abbreviations: the set must load (load_tzoffsets).
+		// M0149-0001h1a82.
+		CheckFn: func(v string) error {
+			if err := datetime.ValidAbbrevSet(v); err != nil {
+				return fmt.Errorf("invalid value for parameter %q: %q", "timezone_abbreviations", v)
+			}
+			return nil
+		},
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "integer_datetimes", Type: TypeBool, BootVal: "on",

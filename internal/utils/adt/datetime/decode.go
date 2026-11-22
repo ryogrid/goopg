@@ -55,6 +55,23 @@ type DecodeEnv struct {
 	// WestOffset is DetermineTimeZoneOffset: seconds west of UTC of a wall clock,
 	// given as UTC-tagged fields, in loc.
 	WestOffset func(wall time.Time, loc *time.Location) int
+	// AbbrevSet is the timezone_abbreviations setting: the set an
+	// abbreviation outside the session zone is read from ("" = Default).
+	AbbrevSet string
+}
+
+// abbrev looks text up in the active abbreviation set (M0149-0001h1a82). A
+// set that cannot be loaded — the GUC hook rejects those — falls back to
+// Default.
+func (e *DecodeEnv) abbrev(text string) (zoneAbbrev, bool) {
+	set := defaultZoneAbbrevs
+	if e != nil && e.AbbrevSet != "" {
+		if m, err := abbrevSet(e.AbbrevSet); err == nil {
+			set = m
+		}
+	}
+	ab, ok := set[text]
+	return ab, ok
 }
 
 // DecodeType is DecodeDateTime's dtype result.
@@ -1010,7 +1027,7 @@ func (x *decoder) run(fields []dateField) (Decoded, error) {
 				default:
 					kind, val = tokTZ, off
 				}
-			} else if ab, ok := defaultZoneAbbrevs[text]; ok {
+			} else if ab, ok := x.env.abbrev(text); ok {
 				kind, val = ab.kind, ab.offset
 				if ab.kind == tokDynTZ {
 					if dynZone, ok = x.env.LookupZone(ab.zone); !ok {
