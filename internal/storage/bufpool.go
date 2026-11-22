@@ -822,7 +822,9 @@ type BtreeMarkPageHalfDeadRequest struct {
 type LogBtreeMarkPageHalfDeadFunc func(rel RelFileNode, req BtreeMarkPageHalfDeadRequest) (LSN, error)
 
 // LogHeapFreezeFunc emits the M0080-0001 heap-freeze redo record.
-type LogHeapFreezeFunc func(rel RelFileNode, blk BlockNumber, frozenSlots []uint16) (LSN, error)
+// page is the page after the freeze: the PG record's freeze plans carry the
+// frozen tuples' header fields (M0149-0002).
+type LogHeapFreezeFunc func(rel RelFileNode, blk BlockNumber, page Page, frozenSlots []uint16) (LSN, error)
 
 // LogHeapHotUpdateFunc emits one atomic HOT-update redo record. newSlot is the
 // line-pointer slot the new tuple version landed at (PG's xl_heap_update

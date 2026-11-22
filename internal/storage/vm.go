@@ -255,6 +255,19 @@ func (v *VisibilityMap) TruncateRel(rel RelFileNode, nblocks BlockNumber) {
 // to prevent stale visibility bits from being returned for future relations
 // with the same OID.
 func (v *VisibilityMap) DropRelation(rel RelFileNode) {
+	v.dropRelation(rel, true)
+}
+
+// DropRelationNoWAL forgets rel's map without a change record, for a caller
+// whose own WAL already removes the fork: a DROP's commit record lists the
+// relation, and replay unlinks every fork (DropRelationFiles); a TRUNCATE's
+// XLOG_SMGR_TRUNCATE carries SMGR_TRUNCATE_VM. PG logs no separate
+// visibility-map record in either case. M0149-0002.
+func (v *VisibilityMap) DropRelationNoWAL(rel RelFileNode) {
+	v.dropRelation(rel, false)
+}
+
+func (v *VisibilityMap) dropRelation(rel RelFileNode, logIt bool) {
 	if v == nil {
 		return
 	}
@@ -269,7 +282,9 @@ func (v *VisibilityMap) DropRelation(rel RelFileNode) {
 		v.dropped = make(map[vmKey]bool)
 	}
 	v.dropped[key] = true
-	v.logChange(rel, 0, VMWALDropRelation)
+	if logIt {
+		v.logChange(rel, 0, VMWALDropRelation)
+	}
 }
 
 // PageAllVisible checks whether every LP_NORMAL tuple on the page p has a

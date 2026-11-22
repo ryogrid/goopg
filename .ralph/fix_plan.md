@@ -15490,11 +15490,37 @@ verify each at HEAD when the task starts.
   - First step: register pg\_shdepend and pg\_shdescription as catalog tables backed by global/1214 and
     global/2396. Then decide whether goopg records shared dependencies \(owner and ACL of databases, roles,
     tablespaces: `shdepend.c`\).
-- [ ] **M0149-0002 — port recovery/t/036_truncated_dropped.pl**
+- [x] **M0149-0002 — port recovery/t/036_truncated_dropped.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/036_truncated_dropped.pl` — replay against relation files shorter than the WAL expects \(truncated/dropped\).
   Likely prerequisites \(verify at start\): `XLOG_SMGR_TRUNCATE` replay, missing-page tolerance in `XLogReadBufferExtended`/`xlogutils.c`, VACUUM truncation WAL in PG format. Overlap: VACUUM tail truncation emitting no `XLOG_SMGR_TRUNCATE` is the M0122-0009c finding \(deferral ledger 2026-10-13; no fix\_plan entry exists at filing — reference it if filed, else file it here\).
+  - 2026\-11\-23 \(done\): TestPort\_Recovery036TruncatedDropped passes 8/8 assertions all\-goopg and on a PG 18\.3 cold
+    start of each crashed directory. Movement: tap 036 0/8 → 8/8. Design: docs/design/0100\-0149/0149\-0002\-truncated\-dropped\-recovery.md.
+    - Path\-to\-TAP \(each link a failing assertion or a PG\-node crash\):
+      - 036 ← tapnode ran scripts as one transaction \(`psql -c`\);
+      - 036 PG cold start ← `FATAL: resource manager with ID 128` \(the DROP\-time VM record\);
+      - 036 scenarios 3 and 4 ← TRUNCATE not WAL\-logged \(897 rows\);
+      - 036 scenario 5 on PG ← zero freeze plans \(NULL columns\).
+    - Fixes:
+      - tapnode runs scripts with `psql -f`;
+      - DROP and TRUNCATE drop the VM without a record;
+      - TRUNCATE and VACUUM's tail truncation log XLOG\_SMGR\_TRUNCATE. This closes the VACUUM half of the
+        M0122\-0009c finding;
+      - a rolled\-back TRUNCATE logs its restored pages as FPIs;
+      - freeze plans carry the frozen tuples' headers.
+    - Follow\-ups are filed as M0149\-0002a.
+- [ ] **M0149-0002a — TRUNCATE's new relfilenode and PG's freeze bits** (filed 2026-11-23 by M0149-0002)
+  Kind: impl
+  Parent: none
+  - Not a TAP prerequisite: 036 passes without them. Do not select under M0149 \(ANTI\-DETOUR RULE\) unless a TAP test
+    names one.
+  - goopg's TRUNCATE keeps the relfilenode and logs XLOG\_SMGR\_TRUNCATE. PG assigns a new relfilenode
+    \(RelationSetNewRelfilenumber\), so the files and pg\_class.relfilenode differ from PG after a TRUNCATE.
+  - goopg freezes by rewriting xmin to FrozenTransactionId. PG sets HEAP\_XMIN\_FROZEN \(heap\_prepare\_freeze\_tuple\)
+    and keeps xmin, so after replay the pages differ in xmin only.
+  - The executor's truncate record is not flushed before the file shrinks; RelationTruncate flushes when a VM or FSM
+    exists.
 - [ ] **M0149-0003 — port recovery/t/014_unlogged_reinit.pl**
   Kind: impl
   Parent: none

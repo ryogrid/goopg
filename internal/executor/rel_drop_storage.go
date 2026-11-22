@@ -4,6 +4,8 @@ import (
 	"log/slog"
 
 	"github.com/goopg/goopg/internal/access/transam"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -81,8 +83,33 @@ func removeRelationStorage(pool *storage.Pool, fsm *storage.FSM, vm *storage.Vis
 			fsm.DropRelation(rel)
 		}
 		if vm != nil {
-			vm.DropRelation(rel)
+			// The commit record's dropped-relation list removes the fork at
+			// replay; PG writes nothing else (M0149-0002).
+			vm.DropRelationNoWAL(rel)
 		}
 	}
 	return nil
+}
+
+// logRelationTruncate WAL-logs a truncation of rel to zero blocks as
+// RelationTruncate does (catalog/storage.c): XLOG_SMGR_TRUNCATE with
+// SMGR_TRUNCATE_ALL, under the transaction's xid. goopg truncates a relation
+// in place where PG gives TRUNCATE a new relfilenode, so this is the record PG
+// writes for its own in-place case (a relation created in the same
+// transaction). Without it, replay rebuilds the pre-TRUNCATE pages from the
+// earlier inserts and the post-TRUNCATE rows land among them. Temporary and
+// unlogged relations are not logged (RelationNeedsWAL). M0149-0002.
+func logRelationTruncate(ctx *Context, tbl *catalog.Table, rel storage.RelFileNode) error {
+	if ctx.Pool == nil || tbl.Temp || tbl.Unlogged {
+		return nil
+	}
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return err
+	}
+	payload, err := xlog.EncodeSmgrTruncatePG(rel, 0, xlog.SmgrTruncateAll, ctx.Tx.XID)
+	if err != nil {
+		return err
+	}
+	_, err = ctx.Pool.LogChangeRecord(payload)
+	return err
 }

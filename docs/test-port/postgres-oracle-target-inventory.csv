@@ -419,7 +419,7 @@ R-019,recovery-tap,tap,postgres/src/test/recovery/t/019_replslot_limit.pl,port,y
 ,recovery-tap,tap,postgres/src/test/recovery/t/033_replay_tsp_drops.pl,not-tried,no,-,,,
 R-034,recovery-tap,tap,postgres/src/test/recovery/t/034_create_database.pl,port,yes,-,"Ported as TestPort_Recovery034CreateDatabase in internal/testport/recovery_034_create_database_test.go: all-goopg (stop immediate + restart) and a PG 18.3 cold start on a copy of the crashed goopg directory (M0149 C3), 2/2 assertions in both",,
 ,recovery-tap,tap,postgres/src/test/recovery/t/035_standby_logical_decoding.pl,not-tried,no,-,,,
-,recovery-tap,tap,postgres/src/test/recovery/t/036_truncated_dropped.pl,not-tried,no,-,,,
+R-036,recovery-tap,tap,postgres/src/test/recovery/t/036_truncated_dropped.pl,port,yes,-,"Ported as TestPort_Recovery036TruncatedDropped in internal/testport/recovery_036_truncated_dropped_test.go: all-goopg (stop immediate + restart) and a PG 18.3 cold start on a copy of each crashed goopg directory (M0149 C3), 8/8 assertions in both",,
 ,recovery-tap,tap,postgres/src/test/recovery/t/037_invalid_database.pl,not-tried,no,-,,,
 R-038,recovery-tap,tap,postgres/src/test/recovery/t/038_save_logical_slots_shutdown.pl,port,yes,-,Ported as TestPort_Recovery038SaveLogicalSlots in internal/testport/recovery_port_test.go,,
 R-039,recovery-tap,tap,postgres/src/test/recovery/t/039_end_of_wal.pl,port,yes,-,Ported as TestPort_Recovery039EndOfWal in internal/testport/recovery_port_test.go,,

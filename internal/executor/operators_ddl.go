@@ -17899,10 +17899,19 @@ func restoreTruncateUndo(ctx *Context, entry TruncateUndoEntry) {
 		ctx.Pool.InvalidateRel(snap.Rel)
 		// Re-truncate to zero so we start fresh (handles case where new pages were added).
 		_ = mgr.TruncateRelation(snap.Rel)
-		// Re-extend with the saved pages.
-		for _, pg := range snap.Pages {
+		// Re-extend with the saved pages. TRUNCATE logged an
+		// XLOG_SMGR_TRUNCATE, so each restored page is logged as a full-page
+		// image (log_newpage) too: replay would otherwise truncate the
+		// relation and never bring the rolled-back rows back. M0149-0002.
+		logImage := ctx.Pool.LogPageImage()
+		for blk, pg := range snap.Pages {
 			if pg == nil {
 				continue
+			}
+			if logImage != nil {
+				if lsn, err := logImage(snap.Rel, storage.BlockNumber(blk), storage.Page(pg)); err == nil && lsn != 0 {
+					storage.PageHeader{Page: storage.Page(pg)}.SetLSN(lsn)
+				}
 			}
 			_, _ = mgr.Extend(snap.Rel, pg)
 		}
@@ -17991,6 +18000,9 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 	// wait it out and discard the page (DropRelationBuffers), or its later
 	// eviction flush writes past the re-extended relation's end.
 	o.ctx.Pool.InvalidateRelForTruncate(rel)
+	if err := logRelationTruncate(o.ctx, tbl, rel); err != nil {
+		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+	}
 	if err := o.ctx.Pool.Manager().TruncateRelation(rel); err != nil {
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
@@ -18003,11 +18015,15 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 		o.ctx.FSM.DropRelation(rel)
 	}
 	if o.ctx.VM != nil {
-		o.ctx.VM.DropRelation(rel)
+		// The truncate record carries SMGR_TRUNCATE_VM (M0149-0002).
+		o.ctx.VM.DropRelationNoWAL(rel)
 	}
 	for _, idx := range idxs {
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 		o.ctx.Pool.InvalidateRelForTruncate(idxRel)
+		if err := logRelationTruncate(o.ctx, tbl, idxRel); err != nil {
+			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+		}
 		if err := o.ctx.Pool.Manager().TruncateRelation(idxRel); err != nil {
 			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 		}

@@ -3,6 +3,7 @@ package xlog
 import (
 	"encoding/binary"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/goopg/goopg/internal/access/nbtree"
@@ -693,30 +694,85 @@ func EncodeHeapVacuumCleanupPG(rel storage.RelFileNode, blk storage.BlockNumber,
 const pruneReasonVacuumCleanup = 2
 
 // EncodeHeapFreezePG builds a PostgreSQL xl_heap_prune record for one page's
-// tuple freeze. goopg freezes uniformly (rewrites each frozen tuple's xmin to
-// FrozenTransactionId — no per-tuple xmax/infomask variation), so a single
-// xlhp_freeze_plan covers all frozen slots: {xmax=0, t_infomask2=0, t_infomask=0,
-// frzflags=0, ntuples=len(frozenSlots)} followed by the trailing offset array =
-// frozenSlots. XLHP_HAS_FREEZE_PLANS; opcode XLOG_HEAP2_PRUNE_VACUUM_CLEANUP.
-// Replay applies it via PageFreezeBySlots (goopg's xmin-rewrite freeze; a real-PG
-// standby's infomask-bit freeze is a separate representation — a documented gap).
-func EncodeHeapFreezePG(rel storage.RelFileNode, blk storage.BlockNumber, frozenSlots []uint16) ([]byte, error) {
+// tuple freeze, with XLHP_HAS_FREEZE_PLANS and opcode
+// XLOG_HEAP2_PRUNE_VACUUM_CLEANUP. page is the page AFTER goopg's freeze.
+//
+// A freeze plan is not a "freeze these" marker. heap_xlog_prune's redo
+// (heap_execute_freeze_tuple) stores the plan's xmax, t_infomask2 and
+// t_infomask into every listed tuple header. A plan with zeros therefore
+// wipes the natts bits, and a PG server replaying it reads every column as
+// NULL. heap_log_freeze_plan groups tuples whose new header fields are
+// equal and sorts the plans (heap_log_freeze_cmp: xmax, infomask2,
+// infomask, frzflags), with offsets ascending inside each plan. That is
+// rebuilt here from the frozen tuples' own headers.
+//
+// goopg freezes by rewriting xmin to FrozenTransactionId and leaves the
+// other fields unchanged, so PG's redo leaves those headers as goopg wrote
+// them, except xmin, which plans do not carry. goopg's own replay rewrites
+// xmin through PageFreezeBySlots. M0149-0002.
+func EncodeHeapFreezePG(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page, frozenSlots []uint16) ([]byte, error) {
 	if len(frozenSlots) == 0 {
 		return nil, fmt.Errorf("wal: heap-freeze with no frozen slots")
 	}
+	type freezeKey struct {
+		xmax                uint32
+		infomask2, infomask uint16
+	}
+	type freezeTuple struct {
+		key  freezeKey
+		slot uint16
+	}
+	tuples := make([]freezeTuple, 0, len(frozenSlots))
+	for _, slot := range frozenSlots {
+		h, err := storage.PageGetItemRawNoCopy(page, slot)
+		if err != nil || len(h) < storage.SizeOfHeapTupleHeaderData {
+			return nil, fmt.Errorf("wal: heap-freeze slot %d has no tuple: %v", slot, err)
+		}
+		tuples = append(tuples, freezeTuple{
+			key: freezeKey{
+				xmax:      binary.LittleEndian.Uint32(h[4:8]),
+				infomask2: binary.LittleEndian.Uint16(h[18:20]),
+				infomask:  binary.LittleEndian.Uint16(h[20:22]),
+			},
+			slot: slot,
+		})
+	}
+	sort.Slice(tuples, func(i, j int) bool {
+		a, b := tuples[i].key, tuples[j].key
+		switch {
+		case a.xmax != b.xmax:
+			return a.xmax < b.xmax
+		case a.infomask2 != b.infomask2:
+			return a.infomask2 < b.infomask2
+		case a.infomask != b.infomask:
+			return a.infomask < b.infomask
+		}
+		return tuples[i].slot < tuples[j].slot
+	})
+	var plans []freezeKey
+	var counts []uint16
+	for i, tp := range tuples {
+		if i == 0 || tp.key != tuples[i-1].key {
+			plans = append(plans, tp.key)
+			counts = append(counts, 0)
+		}
+		counts[len(counts)-1]++
+	}
 	var blockData []byte
-	blockData = binary.LittleEndian.AppendUint16(blockData, 1) // nplans
-	blockData = binary.LittleEndian.AppendUint16(blockData, 0) // pad2
-	// one xlhp_freeze_plan (sizeOfXLHPFreezePlan = 12): xmax, infomask2,
+	blockData = binary.LittleEndian.AppendUint16(blockData, uint16(len(plans))) // nplans
+	blockData = binary.LittleEndian.AppendUint16(blockData, 0)                  // pad2
+	// Each xlhp_freeze_plan (sizeOfXLHPFreezePlan = 12): xmax, infomask2,
 	// infomask, frzflags, the C struct's alignment pad byte, ntuples.
-	blockData = binary.LittleEndian.AppendUint32(blockData, 0)                        // xmax
-	blockData = binary.LittleEndian.AppendUint16(blockData, 0)                        // t_infomask2
-	blockData = binary.LittleEndian.AppendUint16(blockData, 0)                        // t_infomask
-	blockData = append(blockData, 0, 0)                                               // frzflags, pad
-	blockData = binary.LittleEndian.AppendUint16(blockData, uint16(len(frozenSlots))) // ntuples
-	// trailing offset array = the frozen slots.
-	for _, s := range frozenSlots {
-		blockData = binary.LittleEndian.AppendUint16(blockData, s)
+	for i, pl := range plans {
+		blockData = binary.LittleEndian.AppendUint32(blockData, pl.xmax)
+		blockData = binary.LittleEndian.AppendUint16(blockData, pl.infomask2)
+		blockData = binary.LittleEndian.AppendUint16(blockData, pl.infomask)
+		blockData = append(blockData, 0, 0) // frzflags, pad
+		blockData = binary.LittleEndian.AppendUint16(blockData, counts[i])
+	}
+	// The trailing offset array, in plan order.
+	for _, tp := range tuples {
+		blockData = binary.LittleEndian.AppendUint16(blockData, tp.slot)
 	}
 
 	// XLHP_CLEANUP_LOCK for the same reason as the prune encoder above: this
@@ -1313,6 +1369,38 @@ func EncodeSmgrCreatePG(rel storage.RelFileNode, xid storage.TransactionID) ([]b
 	mainData = binary.LittleEndian.AppendUint32(mainData, rel.RelOid)
 	mainData = binary.LittleEndian.AppendUint32(mainData, uint32(rel.Fork))
 	return framedAssemble(RmgrStorage, xlogSmgrCreate, uint32(xid), mainData, nil)
+}
+
+// SMGR_TRUNCATE_* flags (catalog/storage_xlog.h): which forks an
+// xl_smgr_truncate record truncates.
+const (
+	SmgrTruncateHeap uint32 = 0x0001
+	SmgrTruncateVM   uint32 = 0x0002
+	SmgrTruncateFSM  uint32 = 0x0004
+	SmgrTruncateAll  uint32 = SmgrTruncateHeap | SmgrTruncateVM | SmgrTruncateFSM
+)
+
+// EncodeSmgrTruncatePG builds PostgreSQL's RM_SMGR XLOG_SMGR_TRUNCATE record,
+// as RelationTruncate (catalog/storage.c) logs it: an xl_smgr_truncate main
+// data body (BlockNumber blkno, RelFileLocator, int flags), no block ref, and
+// XLR_SPECIAL_REL_UPDATE in xl_info. blkno is the number of main-fork blocks
+// that survive; RelationTruncate always passes SMGR_TRUNCATE_ALL.
+// M0149-0002.
+func EncodeSmgrTruncatePG(rel storage.RelFileNode, blkno storage.BlockNumber, flags uint32, xid storage.TransactionID) ([]byte, error) {
+	spc := rel.TblOid
+	switch {
+	case rel.DBOid == 0:
+		spc = pgGlobalTableSpaceOID
+	case spc == 0:
+		spc = pgDefaultTableSpaceOID
+	}
+	mainData := make([]byte, 0, 20)
+	mainData = binary.LittleEndian.AppendUint32(mainData, uint32(blkno))
+	mainData = binary.LittleEndian.AppendUint32(mainData, spc)
+	mainData = binary.LittleEndian.AppendUint32(mainData, storage.StorageDBOid(rel.DBOid))
+	mainData = binary.LittleEndian.AppendUint32(mainData, rel.RelOid)
+	mainData = binary.LittleEndian.AppendUint32(mainData, flags)
+	return framedAssemble(RmgrStorage, xlogSmgrTruncate|XLRSpecialRelUpdate, uint32(xid), mainData, nil)
 }
 
 // EncodeTblspcCreatePG builds a PostgreSQL RM_TBLSPC tablespace-create record

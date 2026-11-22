@@ -69,3 +69,16 @@ port\-facing surface.
 - Both pass, 2/2 assertions each.
 - The mixed variant depends on the M0149\-0001a1 layout \(template1 at
   `base/1`\) and on M0149\-0001a \(template1's full image at initdb\).
+
+## Statement-at-a-time scripts and append\_conf \(M0149\-0002\)
+
+- `PSQL` / `SafePSQL` write the SQL to a file and run `psql -f <file>`.
+  - Cluster.pm feeds the SQL on stdin \(`psql -f -`\), so psql sends each
+    statement as its own query, in its own transaction.
+  - `-c` sent a multi-statement script as one query. PG runs that as one
+    implicit transaction block, which refuses VACUUM and changes what
+    TRUNCATE logs.
+  - 036's scripts ran wrongly under `-c`; 034's single statements were not
+    affected.
+- `AppendConf(line)` is Cluster.pm's append\_conf\('postgresql.conf', line\)
+  for a goopg node.

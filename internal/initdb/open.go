@@ -800,11 +800,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	// M0080-0001: heap-freeze logical record.
-	logHeapFreeze := func(rel storage.RelFileNode, blk storage.BlockNumber, frozenSlots []uint16) (storage.LSN, error) {
-		// A7: emit a PostgreSQL xl_heap_prune (RM_HEAP2) record with a single
-		// freeze plan covering all frozen slots. Recovery routes it to
+	logHeapFreeze := func(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page, frozenSlots []uint16) (storage.LSN, error) {
+		// A7: emit a PostgreSQL xl_heap_prune (RM_HEAP2) record whose freeze
+		// plans carry the frozen tuples' headers. Recovery routes it to
 		// replayDecodedXLogHeapPrune (PageFreezeBySlots).
-		payload, err := xlog.EncodeHeapFreezePG(rel, blk, frozenSlots)
+		payload, err := xlog.EncodeHeapFreezePG(rel, blk, page, frozenSlots)
 		if err != nil {
 			return 0, err
 		}
@@ -908,6 +908,21 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return err
 	}
 
+	// M0149-0002: a relation tail truncation (VACUUM's lazy_truncate_heap) is
+	// RelationTruncate's XLOG_SMGR_TRUNCATE, flushed before the file shrinks
+	// so replay never meets pages the file no longer has.
+	logSmgrTruncateTo := func(rel storage.RelFileNode, keep storage.BlockNumber) error {
+		payload, err := xlog.EncodeSmgrTruncatePG(rel, keep, xlog.SmgrTruncateAll, storage.InvalidTransactionID)
+		if err != nil {
+			return err
+		}
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return err
+		}
+		return walWriter.FlushUpTo(end)
+	}
+
 	// Generic catalog-DDL WAL append (M0079-0001). The executor's
 	// CREATE / DROP INDEX paths use this to emit pre-encoded
 	// `RecordKindCreateIndex` / `RecordKindDropIndex` records
@@ -947,6 +962,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogHeapPruneOpt:          logHeapPruneOpt,
 		LogHeapVacuumCleanup:     logHeapVacuumCleanup,
 		LogSmgrCreate:            logSmgrCreate,
+		LogSmgrTruncateTo:        logSmgrTruncateTo,
 		LogChangeRecord:          logChangeRecord,
 		FullPageWrites:           true,
 	})

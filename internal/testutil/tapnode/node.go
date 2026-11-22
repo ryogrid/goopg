@@ -177,7 +177,23 @@ func (n *Node) SafePSQL(db, sqlText string) string {
 // psql's stdout (unaligned, tuples only, trailing newline trimmed) and an
 // error carrying stderr when psql exits non-zero.
 func (n *Node) PSQL(db, sqlText string) (string, error) {
-	args := []string{"-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1", "-d", db, "-c", sqlText}
+	// Cluster.pm feeds the SQL on stdin (`psql -f -`), so psql sends each
+	// statement as its own query, each in its own transaction. `-c` would
+	// send the whole script as one multi-statement query, one implicit
+	// transaction block, which refuses VACUUM and changes what TRUNCATE
+	// logs. A file gives psql the same statement-by-statement reading.
+	f, err := os.CreateTemp(n.t.TempDir(), "psql-*.sql")
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.WriteString(sqlText); err != nil {
+		f.Close()
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	args := []string{"-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1", "-d", db, "-f", f.Name()}
 	if n.g != nil {
 		res, err := n.g.PSQL(args...)
 		if err != nil {
@@ -257,4 +273,16 @@ func (n *Node) logTail(lines int) string {
 		all = all[len(all)-lines:]
 	}
 	return strings.Join(all, "\n")
+}
+
+// AppendConf is Cluster.pm's append_conf('postgresql.conf', line) for a goopg
+// node; it fails the test when the file cannot be written.
+func (n *Node) AppendConf(line string) {
+	n.t.Helper()
+	if n.g == nil {
+		n.t.Fatalf("tapnode %s: AppendConf on a %s node", n.name, n.flavor)
+	}
+	if err := n.g.AppendPostgresqlConf(line); err != nil {
+		n.t.Fatalf("tapnode %s: append_conf %q: %v", n.name, line, err)
+	}
 }
