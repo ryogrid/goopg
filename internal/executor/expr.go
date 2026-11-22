@@ -1033,8 +1033,22 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		if v.Kind == KindString && (strings.EqualFold(castTargetType, "bit") || strings.EqualFold(castTargetType, "varbit") || strings.EqualFold(castTargetType, "bit varying")) {
 			digits, berr := scanBitInput(v.StringValue())
 			if berr != nil {
+				// bit_in's errposition is the literal's location when the
+				// input is a literal, else the cast's.
 				berr.Pos = x.Pos()
+				if sc, lit := x.Operand.(*optimizer.StringConst); lit {
+					berr.Pos = sc.Pos()
+				}
 				return Datum{}, berr
+			}
+			// An explicit cast from a string ('10'::bit(4), bit(4) '10',
+			// textcol::bit(4)) reads the value with typmod -1 (bit_in, or
+			// CoerceViaIO) and then applies the length coercion with
+			// isExplicit, as coerce_type does: pad or truncate bit(n),
+			// truncate bit varying(n). Assignment keeps the length errors
+			// below. M0149-0001h1a83.
+			if n := int(x.Typmod); n > 0 && x.Explicit {
+				return NewStringDatum(bitExplicitLength(digits, n, strings.EqualFold(castTargetType, "bit"))), nil
 			}
 			if n := int(x.Typmod); n > 0 {
 				if strings.EqualFold(castTargetType, "bit") {

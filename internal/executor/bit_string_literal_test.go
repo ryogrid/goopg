@@ -108,8 +108,10 @@ func TestBitTextPrefixInsert(t *testing.T) {
 	}
 
 	// A prefix'd string whose scanned bit count violates typmod reports the
-	// BIT count, not the raw text length (varbit.c:207-213).
-	err := runDDL(t, ctx, "INSERT INTO bit_prefix(b) VALUES ('B01'::bit(4))")
+	// BIT count, not the raw text length (varbit.c:207-213) — on
+	// assignment. An explicit cast pads instead (bit() with isExplicit,
+	// M0149-0001h1a83): PG 18.3 stores 'B01'::bit(4) as 0100.
+	err := runDDL(t, ctx, "INSERT INTO bit_prefix(b) VALUES ('B01')")
 	assertBitError(t, err, "22026", "bit string length 2 does not match type bit(4)")
 
 	// The quoted B'…' spelling as TEXT is invalid in PG too (the quote is

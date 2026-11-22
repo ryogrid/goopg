@@ -12839,13 +12839,21 @@ verify each at HEAD when the task starts.
     - pg\_timezone\_abbrevs' utc\_offset formatting remains M0149\-0001h1a89.
     - Design: docs/design/0100\-0149/0149\-0001h1a82\-timezone\-abbreviations.md \(new\).
     Movement: none — regress runner same\-list A/B over 9 date/time and GUC cases unchanged \(sysviews stays PASS\)
-- [ ] **M0149-0001h1a83 — a string cast to bit\(n\) or varbit\(n\) raises instead of padding** (filed 2026-11-19 by M0149-0001h1a71)
+- [x] **M0149-0001h1a83 — a string cast to bit\(n\) or varbit\(n\) raises instead of padding** (filed 2026-11-19 by M0149-0001h1a71)
   Kind: impl
   Parent: M0149-0001h1a
   - `select '10'::bit(4)` and `bit(4) '10'` raise `bit string length 2 does not match type bit(4)`; PG returns `1000`.
     `'111'::varbit(2)` raises where PG returns `11`. coerce\_type reads an unknown literal with typmod \-1 and then applies
     the explicit length coercion \(bit\(\), varbit\(\) with isExplicit\).
   - Resume: bitStringCast in internal/executor/expr.go, for a StringConst operand.
+  - 2026\-11\-23 \(landed\):
+    - An explicit cast with a typmod from a string \(literal, typed literal or text column\) is read with typmod \-1 and
+      then padded or truncated \(bit\(\)/varbit\(\) with isExplicit\). Assignment keeps the length errors.
+    - An invalid\-digit error points at the literal, as in PG.
+    - The pin in TestBitTextPrefixInsert expected `'B01'::bit(4)` to raise. PG stores `0100`, so it now checks the
+      assignment form.
+    - Design: docs/design/0100\-0149/0149\-0001h1a1\-bit\-string\-operators.md \(new section\).
+    Movement: none — regress runner same\-list A/B over 6 cases unchanged \(bit 27 → 27\); probes match PG
 - [ ] **M0149-0001h1a84 — WRONG RESULTS: RETURNING ctid is NULL and RETURNING xmin is rejected** (filed 2026-11-19 by M0149-0001h1a71; S2)
   Kind: impl
   Parent: M0149-0001h1a

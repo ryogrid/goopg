@@ -95,3 +95,16 @@ Regress:
 - bitStringFuncOverload runs only in the main resolver. A bit\-typed
   overloaded call after aggregation \(HAVING / post\-aggregate target\) still
   takes the text version.
+
+## Explicit casts from strings \(M0149\-0001h1a83\)
+
+coerce\_type reads a string with typmod \-1 \(bit\_in for an unknown literal, CoerceViaIO for text\) and then applies
+the length coercion bit\(\) or varbit\(\) with isExplicit:
+
+- bit\(n\) zero\-pads on the right or truncates: `'10'::bit(4)` and `bit(4) '10'` give `1000`.
+- bit varying\(n\) truncates: `'111'::varbit(2)` gives `11`.
+
+The cast arm in expr.go now does this for every explicit cast with a typmod, alongside the existing arm for
+bit\-typed sources. Implicit assignment keeps the 22026/22001 length errors: `INSERT ... VALUES ('10')` into a
+bit\(4\) column still fails, as in PG. An invalid digit is now reported at the literal's position rather than the
+cast's.
