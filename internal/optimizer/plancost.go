@@ -180,6 +180,12 @@ func DeriveLegacyDisplayCost(n Node, rows int64) PlanCost {
 		return out
 	}
 	out.PlanWidth = TupleWidth(n.Output())
+	if len(n.Output()) == 0 {
+		// An empty targetlist is width 0 to PG (the input Result of a
+		// FROM-less SELECT, `select count(*)`); tupleWidth's floor of 1 is a
+		// planner-side guard, not a displayed width (M0149-0001h1a78d).
+		out.PlanWidth = 0
+	}
 
 	childStartup, childTotal := 0.0, 0.0
 	for _, c := range legacyDisplayChildren(n) {

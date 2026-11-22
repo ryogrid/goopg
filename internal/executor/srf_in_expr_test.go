@@ -130,7 +130,28 @@ func TestExplainSelectListProjectSetEstimates(t *testing.T) {
 	defer cleanup()
 	cases := map[string][]string{
 		"EXPLAIN SELECT generate_series(1,2)": {
-			"ProjectSet  (cost=0.00..0.03 rows=2 width=4)"},
+			"ProjectSet  (cost=0.00..0.03 rows=2 width=4)",
+			"  ->  Result  (cost=0.00..0.01 rows=1 width=0)"},
+		// M0149-0001h1a78d: VERBOSE Output lists of the split targetlist.
+		"EXPLAIN VERBOSE SELECT generate_series(1,2) + 1": {
+			"Result  (cost=0.00..0.06 rows=2 width=4)",
+			"  Output: ((generate_series(1, 2)) + 1)",
+			"  ->  ProjectSet  (cost=0.00..0.03 rows=2 width=4)",
+			"        Output: generate_series(1, 2)"},
+		"EXPLAIN VERBOSE SELECT 5, generate_series(1,3) % 2, generate_series(1,2)": {
+			"Result  (cost=0.00..0.09 rows=3 width=12)",
+			"  Output: 5, ((generate_series(1, 3)) % 2), (generate_series(1, 2))",
+			"  ->  ProjectSet  (cost=0.00..0.04 rows=3 width=8)",
+			"        Output: generate_series(1, 3), generate_series(1, 2)"},
+		"EXPLAIN VERBOSE SELECT (regexp_matches('abab', 'b', 'g'))[1]": {
+			"Result  (cost=0.00..0.19 rows=10 width=32)",
+			"  Output: (regexp_matches('abab'::text, 'b'::text, 'g'::text))[1]"},
+		"EXPLAIN VERBOSE SELECT generate_series(1,3), unnest(array['a','b'])": {
+			"ProjectSet  (cost=0.00..0.04 rows=3 width=36)",
+			"  Output: generate_series(1, 3), unnest('{a,b}'::text[])"},
+		"EXPLAIN VERBOSE SELECT generate_series(1,3) g, 7 ORDER BY 1 LIMIT 2": {
+			"Limit  (cost=0.06..0.06 rows=2 width=8)",
+			"  Output: (generate_series(1, 3)), 7"},
 		"EXPLAIN SELECT generate_series(1,2) + 1": {
 			"Result  (cost=0.00..0.06 rows=2 width=4)",
 			"  ->  ProjectSet  (cost=0.00..0.03 rows=2 width=4)"},
@@ -139,7 +160,7 @@ func TestExplainSelectListProjectSetEstimates(t *testing.T) {
 			"  ->  ProjectSet  (cost=0.00..0.04 rows=3 width=8)"},
 		"EXPLAIN SELECT generate_series(1,2) % 2 ORDER BY 1": {
 			"Sort  (cost=0.07..0.07 rows=2 width=4)",
-			"  Sort Key: ?column?", // PG: (((generate_series(1, 2)) % 2)) — M0149-0001h1a78d
+			"  Sort Key: (((generate_series(1, 2)) % 2))",
 			"  ->  Result  (cost=0.00..0.06 rows=2 width=4)",
 			"        ->  ProjectSet  (cost=0.00..0.03 rows=2 width=4)"},
 		"EXPLAIN SELECT (regexp_matches('abab', 'b', 'g'))[1]": {

@@ -484,7 +484,7 @@ func (o *explainOp) Close() error { return nil }
 func walkPlan(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, hashMem int64, rtableSize int) {
 	reg := &subPlanReg{rel: newExplainNamesSized(n, rtableSize, opts.Verbose), cte: collectCTEHoist(n), hashMemLimit: hashMem}
 	reg.reservePGPlanIDs(n)
-	depth = emitRootSRFResult(n, depth, rows, opts)
+	depth = emitRootSRFResult(n, depth, rows, opts, reg)
 	walkPlanFiltered(n, depth, rows, opts, nil, nil, reg)
 }
 
@@ -692,6 +692,7 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 		}
 		if srfNeedsResultAbove(c) {
 			ci = emitHashNodeLine(rows, "Result", ci, c, showCosts, nil)
+			emitSRFResultOutput(rows, c, ci, opts, reg)
 		}
 		restore := reg.enterParamInner(n, c)
 		walkPlanFiltered(c, ci, rows, opts, nil, nil, reg)
@@ -728,7 +729,7 @@ func srfNeedsResultAbove(c optimizer.Node) bool {
 // whose SRFs feed enclosing expressions (`SELECT generate_series(1, 2) + 1`),
 // and returns the indent the ProjectSet then renders at. Below a parent the
 // Result is synthesised by the child loop instead (M0149-0001h1a78a).
-func emitRootSRFResult(n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions) int {
+func emitRootSRFResult(n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, reg *subPlanReg) int {
 	if depth != 0 || !srfNeedsResultAbove(n) {
 		return depth
 	}
@@ -743,6 +744,7 @@ func emitRootSRFResult(n optimizer.Node, depth int, rows *[]Row, opts parser.Exp
 		line += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, total, est, width)
 	}
 	*rows = append(*rows, Row{NewStringDatum(line)})
+	emitSRFResultOutput(rows, n, 1, opts, reg)
 	return 1
 }
 
@@ -1725,6 +1727,20 @@ func resolveKeySourceDepth(expr optimizer.Expr, node optimizer.Node, reg *subPla
 				return nil, false
 			}
 			j := col.Index
+			// M0149-0001h1a78d: a column computed over an SRF is the Result
+			// PG plans above the ProjectSet — its targetlist entry, as a
+			// non-Var referent, parenthesised (`(((generate_series(1, 2)) % 2))`).
+			if reg != nil && projectSetSelectList(n) && optimizer.ProjectSetNeedsResult(n) {
+				for _, w := range n.Wrappers {
+					if w.OutCol != j {
+						continue
+					}
+					_, res := projectSetVerboseLists(n, reg, reg.names().qualify())
+					if j < len(res) {
+						return displayColumn(col, "("+res[j]+")", reg), true
+					}
+				}
+			}
 			for _, sc := range n.SrfCols {
 				if sc.ColIdx != j {
 					continue
@@ -5673,6 +5689,30 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 			// A prefix operator (~ on a bit string, M0149-0001h1a1).
 			return "(" + x.Operator + " " + formatExprQual(x.Args[0], reg, qualify) + ")"
 		}
+		if x.Name == "array_construct" {
+			// An ARRAY[...] constructor is an ArrayExpr to PG, folded to an
+			// array Const when every element is a constant
+			// (eval_const_expressions): `'{1,2}'::integer[]`, else
+			// `ARRAY[a, b]` (ruleutils T_ArrayExpr). M0149-0001h1a78d.
+			if lit, ok := constArrayLiteral(x.Args); ok {
+				return lit
+			}
+			parts := make([]string, len(x.Args))
+			for i, a := range x.Args {
+				parts[i] = formatExprQual(a, reg, qualify)
+			}
+			return "ARRAY[" + strings.Join(parts, ", ") + "]"
+		}
+		if x.Name == "array_subscript" && len(x.Args) == 2 {
+			// A SubscriptingRef: the container is parenthesised unless it is
+			// a plain column reference (ruleutils printSubscripts).
+			// M0149-0001h1a78d.
+			base := formatExprQual(x.Args[0], reg, qualify)
+			if _, isVar := x.Args[0].(*optimizer.ColumnRef); !isVar {
+				base = "(" + base + ")"
+			}
+			return base + "[" + formatExprQual(x.Args[1], reg, qualify) + "]"
+		}
 		if x.SQLName != "" {
 			// An overload resolved to its variant (bit_length(bit) →
 			// bitlength) prints under its SQL name. M0149-0001h1a1.
@@ -7126,6 +7166,26 @@ func explainOutputNames(n optimizer.Node, reg *subPlanReg) []string {
 	if so, ok := n.(*optimizer.SetOp); ok && setOpRendersAsAppend(so) {
 		return nil
 	}
+	// M0149-0001h1a78d: a SELECT-list ProjectSet's targetlist is its SRF
+	// calls (plus, under a Result, the input columns the Result reads).
+	if ps, ok := n.(*optimizer.ProjectSet); ok && projectSetSelectList(ps) {
+		psOut, _ := projectSetVerboseLists(ps, reg, qualify)
+		return psOut
+	}
+	// A Sort / Limit over that ProjectSet (or the Result above it) passes its
+	// entries through as OUTER_VARs: each non-Var referent parenthesised.
+	if child := explainPassThroughChild(n); child != nil {
+		// Through further pass-through nodes (Limit over Sort): each
+		// re-references the same entries.
+		for c := explainPassThroughChild(skipProjectsAndFilters(child)); c != nil; c = explainPassThroughChild(skipProjectsAndFilters(child)) {
+			child = c
+		}
+		if ps, ok := skipProjectsAndFilters(child).(*optimizer.ProjectSet); ok && projectSetSelectList(ps) && len(ps.Output()) == len(names) {
+			if txt := projectSetPassThroughNames(ps, reg, qualify); len(txt) == len(names) {
+				return txt
+			}
+		}
+	}
 	if txt, ok := explainScanProjectionOutput(n, reg, qualify); ok {
 		return txt
 	}
@@ -7305,7 +7365,7 @@ func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Ro
 	reg.reservePGPlanIDs(n)
 	reg.sortStats, reg.sortWorkers = sortStats, sortWorkers
 	reg.memoWorkers = memoWorkers
-	depth = emitRootSRFResult(n, depth, rows, opts)
+	depth = emitRootSRFResult(n, depth, rows, opts, reg)
 	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 }
 
@@ -7837,6 +7897,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		}
 		if srfNeedsResultAbove(c) {
 			ci = emitHashNodeLine(rows, "Result", ci, c, showCostsA, hashInputStats(c, stats))
+			emitSRFResultOutput(rows, c, ci, opts, reg)
 		}
 		restore := reg.enterParamInner(n, c)
 		walkPlanAnalyzeFiltered(c, ci, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
@@ -10073,4 +10134,41 @@ func rowCompareCondText(tbl *catalog.Table, idx *catalog.Index, rc *optimizer.Bi
 		vals[i] = formatIndexCondKeyTyped(rr.Elems[i], reg, t)
 	}
 	return "ROW(" + strings.Join(cols, ", ") + ") " + saopOpText(op) + " ROW(" + strings.Join(vals, ", ") + ")"
+}
+
+// constArrayLiteral renders an ARRAY[...] of constants the way PG prints the
+// array Const eval_const_expressions folds it to: the array_out text, quoted,
+// with the array type (`'{1,2}'::integer[]`, `'{a,b}'::text[]`). It reports
+// false unless every element is a non-NULL constant of one kind.
+func constArrayLiteral(args []optimizer.Expr) (string, bool) {
+	if len(args) == 0 {
+		return "", false
+	}
+	elems := make([]string, len(args))
+	typ := ""
+	for i, a := range args {
+		var t, v string
+		switch c := a.(type) {
+		case *optimizer.IntegerConst:
+			t, v = "integer", strconv.FormatInt(c.Value, 10)
+			if c.Value > math.MaxInt32 || c.Value < math.MinInt32 {
+				t = "bigint"
+			}
+		case *optimizer.NumericConst:
+			t, v = "numeric", c.Value
+		case *optimizer.StringConst:
+			if c.BitString {
+				return "", false
+			}
+			t, v = "text", c.Value
+		default:
+			return "", false
+		}
+		if typ != "" && typ != t {
+			return "", false
+		}
+		typ, elems[i] = t, v
+	}
+	lit := formatTextArray(elems)
+	return "'" + strings.ReplaceAll(lit, "'", "''") + "'::" + typ + "[]", true
 }

@@ -174,8 +174,29 @@ Result above it for the expressions. internal/optimizer/projectset\_cost.go comp
 - A Project that returns a ProjectSet's columns unchanged is no projection to PG, so it is priced as the
   ProjectSet in DeriveLegacyDisplayCost and in subplanLeafSubpathCost. Before this change, a derived table
   `select generate_series(1,10) x` charged cpu\_tuple\_cost per row twice.
-- Still different from PG \(M0149\-0001h1a78d\):
-  - VERBOSE Output lists and Sort Keys over SRF columns print `?column?` or the bare function name, not the
-    deparsed calls.
-  - The input Result with no columns prints `width=1`, where PG prints `width=0`.
-  - Casts are priced at zero, so `unnest(...)::text` comes out 0.01 low.
+- Casts are still priced at zero, so `unnest(...)::text` comes out 0.01 low.
+
+## VERBOSE output for a SELECT\-list ProjectSet \(M0149\-0001h1a78d\)
+
+internal/executor/explain\_projectset.go rebuilds the two targetlists of split\_pathtarget\_at\_srfs from goopg's
+single ProjectSet node:
+
+- **ProjectSet.** Its Output is the deparsed SRF calls in SELECT\-list order, a wrapper's slots at its column's
+  position, followed by the input columns the Result still reads. Without a Result, it is the whole SELECT list.
+- **Result.** Its Output is the SELECT list. Every reference to a ProjectSet column is a non\-Var OUTER\_VAR
+  referent, so ruleutils wraps it in parentheses: a slot becomes `displayColumn(slot, "(call)")`, which gives
+  `((generate_series(1, 2)) + 1)`. The root Result line \(`emitRootSRFResult`\) and the Result printed under a parent
+  both print this list.
+- **Pass\-through nodes and Sort Keys.**
+  - A Sort or Limit above the pair, including a chain such as a Limit over a Sort, references the pair's top.
+    Non\-Var entries are parenthesised, and Consts stay bare, because setrefs leaves them in the parent's tlist.
+  - The Sort Key chase returns the parenthesised Result entry for a wrapped column.
+- **New deparse arms in formatExprQual:**
+  - `array_construct` prints as PG's folded array Const when every element is a constant of one kind
+    \(`'{1,2}'::integer[]`), and as `ARRAY[a, b]` otherwise.
+  - `array_subscript` prints as a SubscriptingRef, `(container)[i]`, with no parentheses around a plain column.
+- **Width.** The legacy display cost prints width 0 for a node with an empty targetlist, such as the input Result
+  of a FROM\-less SELECT. The planner's `tupleWidth` floor of 1 is unchanged.
+- **Not done:**
+  - A Values Scan's columns print under their SQL alias \(`x`\), where PG prints `"*VALUES*".column1`.
+  - A stamped Seq Scan feeding `count(*)` still prints `width=4`, where PG prints `width=0`.

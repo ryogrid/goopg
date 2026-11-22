@@ -12634,7 +12634,7 @@ verify each at HEAD when the task starts.
       M0149\-0001h1a78d.
     - Design: docs/design/0100\-0149/0118\-0034\-select\-list\-srf\-nested\-in\-expression.md \(new section\).
     Movement: yes — regress runner tsrf 197 → 193 \(same\-list A/B against HEAD over 20 cases; plpgsql moved only in its known nondeterministic block\)
-- [ ] **M0149-0001h1a78d — VERBOSE output for a SELECT\-list ProjectSet** (filed 2026-11-22 by M0149-0001h1a78a)
+- [x] **M0149-0001h1a78d — VERBOSE output for a SELECT\-list ProjectSet** (filed 2026-11-22 by M0149-0001h1a78a)
   Kind: impl
   Parent: M0149-0001h1a
   - `explain verbose select generate_series(1,2) + 1`:
@@ -12645,6 +12645,15 @@ verify each at HEAD when the task starts.
   - An input Result with no columns prints `width=1`; PG prints `width=0`. This is also true under `select count(*)`.
   - Resume: explainOutputNames for *optimizer.ProjectSet and the synthesised Result in
     internal/executor/operators\_explain.go. srfFunctionCallArgs already deparses the FROM\-clause SRF calls.
+  - 2026\-11\-23 \(landed\):
+    - VERBOSE Output of the ProjectSet and of the Result above it follows split\_pathtarget\_at\_srfs, with ruleutils'
+      parentheses. So do pass\-through Sort and Limit Output and the Sort Key over a wrapped column.
+    - formatExprQual deparses array\_construct as `'{..}'::T[]` or `ARRAY[..]`, and array\_subscript as `(x)[i]`.
+    - A display width of 0 is printed for an empty targetlist.
+    - The Values Scan column naming \(`x` vs `"*VALUES*".column1`\) and the stamped Seq Scan width under count\(\*\)
+      are not specific to ProjectSet and stay open; they are recorded in the ledger.
+    - Design: docs/design/0100\-0149/0118\-0034\-select\-list\-srf\-nested\-in\-expression.md \(new section\).
+    Movement: yes — regress runner tsrf 193 → 181, rangefuncs 802 → 796, subselect 844 → 839 \(same\-list A/B against HEAD over 22 cases; plpgsql flaps 1213/1221 on one build\)
 - [x] **M0149-0001h1a78b — arithmetic on an array subscript is rejected** (filed 2026-11-22 by M0149-0001h1a78)
   Kind: impl
   Parent: M0149-0001h1a
@@ -12683,6 +12692,19 @@ verify each at HEAD when the task starts.
     - string\_to\_table is missing; this is filed as M0149\-0001h1a78f.
     - Design: docs/design/0100\-0149/0149\-0001h1a78b\-array\-constructor\-type.md \(new section\).
     Movement: yes — regress runner arrays 1271 → 1214 \(same\-list A/B against HEAD over 19 cases, none worse\)
+- [!] **M0146-0014-s9rename — s9\-census\-due.sh misses a census directory that was renamed** (filed 2026-11-23 by the census routing-20261123a pass; owner-only file)
+  Kind: harness
+  Parent: M0146-0014
+  - The local census helper tmp/census.sh had a bug: one shell variable held both the series name and the binary's
+    sha256. It committed 5bf05c07e under `routing-<sha>a`. 2246e213c renamed the directory to `routing-20261123a`.
+  - scripts/s9-census-due.sh finds the newest census with `--diff-filter=A`, so it does not see a renamed ROUTING.md.
+    It then reports DUE with `unparsable-capture-sha`, read from the old path.
+  > \#\# ESCALATION 2026\-11\-23 \(owner\-only\) — M0146\-0014\-s9rename
+  > The loop changed both `--diff-filter=A` in scripts/s9\-census\-due.sh to `AR`, and with that the check reports
+  > REUSE on routing\-20261123a. The pre\-commit protected\-region guard rejected the commit, and the shell guard
+  > blocks reverting the file. The change is still in the working tree and STAGED. Please commit or revert it.
+  > Without it, the next census that adds routing\-20261123b restores discovery: an added ROUTING.md is the newest
+  > again. Until then the check reports a spurious DUE.
 - [ ] **M0149-0001h1a78f — string\_to\_table is missing** (filed 2026-11-23 by M0149-0001h1a78c)
   Kind: impl
   Parent: M0149-0001h1a
