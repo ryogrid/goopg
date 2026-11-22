@@ -484,6 +484,7 @@ func (o *explainOp) Close() error { return nil }
 func walkPlan(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, hashMem int64, rtableSize int) {
 	reg := &subPlanReg{rel: newExplainNamesSized(n, rtableSize, opts.Verbose), cte: collectCTEHoist(n), hashMemLimit: hashMem}
 	reg.reservePGPlanIDs(n)
+	depth = emitRootSRFResult(n, depth, rows, opts)
 	walkPlanFiltered(n, depth, rows, opts, nil, nil, reg)
 }
 
@@ -608,7 +609,7 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 		// PG's cost annotation, from the path the planner chose (take2 P0-02).
 		// `rows=` comes from the SAME carrier since C-20a's successor, so the
 		// line no longer states one estimator's costs beside another's rows.
-		est, startup, total, width := explainCostFields(rowSrc, est)
+		est, startup, total, width := explainNodeCostFields(rowSrc, est)
 		label += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, total, est, width)
 	}
 	*rows = append(*rows, Row{NewStringDatum(label)})
@@ -716,24 +717,44 @@ func srfNeedsResultAbove(c optimizer.Node) bool {
 			c = w.Child
 			continue
 		case *optimizer.ProjectSet:
-			if len(w.Wrappers) > 0 {
-				return true
-			}
-			for _, u := range w.UnnestCols {
-				if u.ExplicitCast || u.Wrapped {
-					return true
-				}
-			}
-			for _, sc := range w.SrfCols {
-				if sc.Wrapped {
-					return true
-				}
-			}
-			return false
+			return optimizer.ProjectSetNeedsResult(w)
 		}
 		return false
 	}
 	return false
+}
+
+// emitRootSRFResult prints the Result PG plans above a top-level ProjectSet
+// whose SRFs feed enclosing expressions (`SELECT generate_series(1, 2) + 1`),
+// and returns the indent the ProjectSet then renders at. Below a parent the
+// Result is synthesised by the child loop instead (M0149-0001h1a78a).
+func emitRootSRFResult(n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions) int {
+	if depth != 0 || !srfNeedsResultAbove(n) {
+		return depth
+	}
+	line := "Result"
+	if !opts.Set.Costs || opts.Costs {
+		ps := skipProjects(n)
+		est := optimizer.EstimateRows(ps)
+		if est <= 0 {
+			est = 1
+		}
+		est, startup, total, width := explainCostFields(ps, est)
+		line += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, total, est, width)
+	}
+	*rows = append(*rows, Row{NewStringDatum(line)})
+	return 1
+}
+
+// skipProjects steps down through Project wrappers, which EXPLAIN folds.
+func skipProjects(n optimizer.Node) optimizer.Node {
+	for {
+		p, ok := n.(*optimizer.Project)
+		if !ok || p.Child == nil {
+			return n
+		}
+		n = p.Child
+	}
 }
 
 // hashBuildChild reports whether c is the input a hash join n builds its
@@ -808,7 +829,13 @@ func emitHashNodeLine(rows *[]Row, label string, indent int, c optimizer.Node, s
 	line := strings.Repeat(" ", indent*2) + "->  " + label
 	if showCosts {
 		est, cost, width := hashNodeCost(c)
-		line += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", cost, cost, est, width)
+		startup := cost
+		if label == "Result" {
+			// The Result PG plans above a ProjectSet streams: its startup
+			// is the ProjectSet's, not its total (create_projection_path).
+			_, startup, _, _ = explainCostFields(skipProjects(c), est)
+		}
+		line += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, cost, est, width)
 	}
 	if s != nil && s.loops == 0 {
 		// explain.c ExplainNode: an instrumented node with nloops == 0.
@@ -7278,6 +7305,7 @@ func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Ro
 	reg.reservePGPlanIDs(n)
 	reg.sortStats, reg.sortWorkers = sortStats, sortWorkers
 	reg.memoWorkers = memoWorkers
+	depth = emitRootSRFResult(n, depth, rows, opts)
 	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 }
 
@@ -7366,7 +7394,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		if est <= 0 {
 			est = 1
 		}
-		est, startup, total, width := explainCostFields(rowSrc, est)
+		est, startup, total, width := explainNodeCostFields(rowSrc, est)
 		label += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, total, est, width)
 	}
 	// A collapsed Filter is rendered as part of THIS line, so the line's
@@ -8163,6 +8191,20 @@ func explainCostFields(n optimizer.Node, rows int64) (est int64, startup, total 
 	}
 	d := optimizer.DeriveLegacyDisplayCost(n, rows)
 	return planCostRows(d.PlanRows, rows), d.StartupCost + ch, d.TotalCost + ch, d.PlanWidth
+}
+
+// explainNodeCostFields is explainCostFields for a node's own line. A
+// SELECT-list ProjectSet that PG splits into a ProjectSet under a Result
+// prints the ProjectSet's own estimate here; explainCostFields (what a parent
+// and the synthesised Result line read) reports the pair's top
+// (M0149-0001h1a78a).
+func explainNodeCostFields(n optimizer.Node, rows int64) (est int64, startup, total float64, width int) {
+	if ps, ok := n.(*optimizer.ProjectSet); ok && optimizer.ProjectSetNeedsResult(ps) {
+		pc := optimizer.ProjectSetOwnCost(ps)
+		ch := optimizer.InitPlanChargeOf(n)
+		return planCostRows(pc.PlanRows, rows), pc.StartupCost + ch, pc.TotalCost + ch, pc.PlanWidth
+	}
+	return explainCostFields(n, rows)
 }
 
 // planCostRows converts a carrier's `PlanRows` to the integer EXPLAIN prints,

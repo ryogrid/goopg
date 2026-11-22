@@ -12618,7 +12618,7 @@ verify each at HEAD when the task starts.
       M0149\-0001h1a78c.
     - Design: docs/design/0100\-0149/0118\-0034\-select\-list\-srf\-nested\-in\-expression.md \(new section\).
     Movement: yes — regress runner tsrf 205 → 197, arrays 1281 → 1277, subselect 852 → 844, jsonb 2484 → 2473 \(same\-list A/B against HEAD; plpgsql moved only in its known nondeterministic block\)
-- [ ] **M0149-0001h1a78a — EXPLAIN of a set\-returning call nested in an expression** (filed 2026-11-22 by M0149-0001h1a78)
+- [x] **M0149-0001h1a78a — EXPLAIN of a set\-returning call nested in an expression** (filed 2026-11-22 by M0149-0001h1a78)
   Kind: impl
   Parent: M0149-0001h1a
   - `explain verbose select generate_series(1,2) + 1`: PG prints `Result (rows=2)` with
@@ -12626,6 +12626,25 @@ verify each at HEAD when the task starts.
     goopg prints only the ProjectSet, with `rows=1` and `Output: ?column?`. The same applies to unnest.
   - Resume: srfNeedsResultAbove in internal/executor/operators\_explain.go synthesises the Result only below a
     Sort; the row estimate for a wrapped SRF is missing in the ProjectSet costing.
+  - 2026\-11\-22 \(landed\):
+    - A SELECT\-list ProjectSet now carries PG's rows and costs \(create\_set\_projection\_path\), and the Result above
+      it carries create\_projection\_path's. That Result is now printed at the top level too.
+    - A Project that returns the ProjectSet's columns unchanged costs nothing, as in PG.
+    - The verbose Output lists, the Sort Key deparse and the `width=0` input Result are split out as
+      M0149\-0001h1a78d.
+    - Design: docs/design/0100\-0149/0118\-0034\-select\-list\-srf\-nested\-in\-expression.md \(new section\).
+    Movement: yes — regress runner tsrf 197 → 193 \(same\-list A/B against HEAD over 20 cases; plpgsql moved only in its known nondeterministic block\)
+- [ ] **M0149-0001h1a78d — VERBOSE output for a SELECT\-list ProjectSet** (filed 2026-11-22 by M0149-0001h1a78a)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `explain verbose select generate_series(1,2) + 1`:
+    - PG prints `Output: ((generate_series(1, 2)) + 1)` on the Result and `Output: generate_series(1, 2)` on the ProjectSet.
+    - goopg prints no Output on the Result and `Output: ?column?` on the ProjectSet.
+    - A bare `generate_series(1,2)` prints `Output: generate_series` without its arguments.
+  - The Sort Key over a wrapped column is `?column?`; PG deparses `(((generate_series(1, 2)) % 2))`.
+  - An input Result with no columns prints `width=1`; PG prints `width=0`. This is also true under `select count(*)`.
+  - Resume: explainOutputNames for *optimizer.ProjectSet and the synthesised Result in
+    internal/executor/operators\_explain.go. srfFunctionCallArgs already deparses the FROM\-clause SRF calls.
 - [ ] **M0149-0001h1a78b — arithmetic on an array subscript is rejected** (filed 2026-11-22 by M0149-0001h1a78)
   Kind: impl
   Parent: M0149-0001h1a

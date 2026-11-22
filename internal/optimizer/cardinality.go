@@ -296,6 +296,11 @@ func EstimateRows(n Node) int64 {
 		return estimateNLIndexJoin(x)
 	case *GenerateSeries:
 		return generateSeriesRows(x)
+	case *ProjectSet:
+		// M0149-0001h1a78a: create_set_projection_path's rows.
+		if isSelectListProjectSet(x) {
+			return int64(clampRowEst(ProjectSetOwnCost(x).PlanRows))
+		}
 	}
 	return 0
 }

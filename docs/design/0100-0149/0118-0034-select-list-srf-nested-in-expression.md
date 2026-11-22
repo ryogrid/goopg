@@ -142,9 +142,40 @@ PG's errors for set\-returning calls inside CASE and COALESCE are M0149\-0001h1a
     set\-returning call in a CASE raises 0A000 `set-returning functions are not allowed in CASE`.
   - transformCoalesceExpr raises the same 0A000 error for COALESCE.
   - The error is reported at the last SRF transformed \(p\_last\_srf\), with PG's LATERAL hint.
-- Still open: EXPLAIN for these plans. PG prints a Result over the ProjectSet with the SRF row estimate
-  \(`rows=2`\) and real Output lists. goopg prints the ProjectSet alone, with `rows=1` and `Output: ?column?`.
-  This is M0149\-0001h1a78a.
+- EXPLAIN for these plans is M0149\-0001h1a78a, described in the next section.
 - Found along the way and filed separately:
   - `(array[1,2])[1] + 1` fails with `operator + requires numeric operands` \(M0149\-0001h1a78b\).
   - string\_to\_array has no executor implementation \(M0149\-0001h1a78c\).
+
+## EXPLAIN estimates for a SELECT\-list ProjectSet \(M0149\-0001h1a78a\)
+
+goopg evaluates the SRFs and the expressions over them in one ProjectSet node. When an SRF sits inside an
+expression, PG splits the target list instead \(split\_pathtarget\_at\_srfs\): a ProjectSet for the SRFs and a
+Result above it for the expressions. internal/optimizer/projectset\_cost.go computes PG's numbers for that pair:
+
+- `ProjectSetOwnCost` is create\_set\_projection\_path:
+  - rows are the input's rows times the largest SRF estimate \(expression\_returns\_set\_rows\). generate\_series
+    takes its support function's count, else its prorows of 1000. unnest takes estimate\_array\_length of its
+    argument: the argument count of an ARRAY constructor, the element count of an array literal, else 10.
+    regexp\_matches takes 10, and a user routine its ROWS clause, else 1000.
+  - total cost is the input's total, plus cpu\_tuple\_cost and the target's per\-tuple cost for each input row,
+    plus half of cpu\_tuple\_cost for each added row.
+  - the target is the SRF calls, plus the other expressions when no Result is planned above.
+- The Result above is create\_projection\_path: cpu\_tuple\_cost plus the whole target's cost for each row.
+  The target still holds the SRF calls inside its expressions, so they are charged a second time, as in PG.
+  `ProjectSetNeedsResult` decides whether there is a Result: there is one when some SRF is wrapped, or when an
+  unnest has an explicit cast.
+- An ARRAY constructor and a subscript are free in cost\_qual\_eval \(ArrayExpr, SubscriptingRef\). goopg resolves
+  them to `array_construct` and `array_subscript` calls, so `targetExprOps` takes those calls back out.
+- DeriveLegacyDisplayCost and EstimateRows report the pair's top, which is what a parent is priced over.
+  EXPLAIN prints the ProjectSet's own estimate on its own line \(`explainNodeCostFields`\). The synthesised Result
+  prints the pair's top: at the top level through `emitRootSRFResult`, and under a parent through the existing
+  child loop, whose Result line now has a real startup cost.
+- A Project that returns a ProjectSet's columns unchanged is no projection to PG, so it is priced as the
+  ProjectSet in DeriveLegacyDisplayCost and in subplanLeafSubpathCost. Before this change, a derived table
+  `select generate_series(1,10) x` charged cpu\_tuple\_cost per row twice.
+- Still different from PG \(M0149\-0001h1a78d\):
+  - VERBOSE Output lists and Sort Keys over SRF columns print `?column?` or the bare function name, not the
+    deparsed calls.
+  - The input Result with no columns prints `width=1`, where PG prints `width=0`.
+  - Casts are priced at zero, so `unnest(...)::text` comes out 0.01 low.

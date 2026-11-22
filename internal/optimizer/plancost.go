@@ -194,6 +194,27 @@ func DeriveLegacyDisplayCost(n Node, rows int64) PlanCost {
 
 	perRow := cp.cpuTupleCost * float64(rows)
 	switch x := n.(type) {
+	case *Project:
+		// M0149-0001h1a78a: a Project returning a SELECT-list ProjectSet's
+		// columns unchanged is the ProjectSet's own target list to PG — no
+		// projection node and no cpu_tuple_cost.
+		if ps, ok := x.Child.(*ProjectSet); ok && isSelectListProjectSet(ps) && projectIsPositionalIdentity(x) {
+			pc := projectSetDisplayCost(cp, ps)
+			pc.CostSet = false
+			return pc
+		}
+		out.StartupCost = childStartup
+		out.TotalCost = childTotal + perRow
+	case *ProjectSet:
+		if isSelectListProjectSet(x) {
+			// M0149-0001h1a78a: create_set_projection_path, plus the Result
+			// above when PG plans one (projectset_cost.go).
+			pc := projectSetDisplayCost(cp, x)
+			pc.CostSet = false
+			return pc
+		}
+		out.StartupCost = childStartup
+		out.TotalCost = childTotal + perRow
 	case *CTEScan:
 		if !x.Inlined() {
 			// cost_ctescan (M0146-0005az): cpu_tuple_cost per tuple for the
@@ -352,6 +373,11 @@ func legacyDisplayChildren(n Node) []Node {
 	case *Memoize:
 		return []Node{p.Child}
 	case *Materialize:
+		return []Node{p.Child}
+	case *ProjectSet:
+		if p.Child == nil {
+			return nil
+		}
 		return []Node{p.Child}
 	case *Result:
 		if p.Child == nil {

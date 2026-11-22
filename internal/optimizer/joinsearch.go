@@ -908,6 +908,14 @@ func subplanLeafSubpathCost(leaf Node) PlanCost {
 	}
 	if p, ok := n.(*Project); ok && projectionCapableNode(p.Child) {
 		peel(p, p.Child)
+	} else if ok && projectIsPositionalIdentity(p) {
+		// M0149-0001h1a78a: a ProjectSet is not projection-capable, but a
+		// Project that returns its columns unchanged is no projection at
+		// all to PG — the subquery's target list is the ProjectSet's own
+		// (`select generate_series(1, 10) x` under `where x > 3`).
+		if ps, isPS := p.Child.(*ProjectSet); isPS && isSelectListProjectSet(ps) {
+			peel(p, p.Child)
+		}
 	}
 	sub := legacyDisplayCostOf(n)
 	sub.StartupCost += initPlans

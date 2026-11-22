@@ -118,3 +118,47 @@ func TestSelectListNestedUnnestAndZippedSRFs(t *testing.T) {
 		}
 	}
 }
+
+// TestExplainSelectListProjectSetEstimates pins M0149-0001h1a78a against PG
+// 18.3's EXPLAIN: a SELECT-list ProjectSet's rows are its input's times the
+// largest SRF estimate (create_set_projection_path), and an SRF inside an
+// expression gets the Result PG plans above the ProjectSet
+// (split_pathtarget_at_srfs, create_projection_path) — at the top level as
+// well as under a parent. goopg used to print rows=1 and no Result.
+func TestExplainSelectListProjectSetEstimates(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	cases := map[string][]string{
+		"EXPLAIN SELECT generate_series(1,2)": {
+			"ProjectSet  (cost=0.00..0.03 rows=2 width=4)"},
+		"EXPLAIN SELECT generate_series(1,2) + 1": {
+			"Result  (cost=0.00..0.06 rows=2 width=4)",
+			"  ->  ProjectSet  (cost=0.00..0.03 rows=2 width=4)"},
+		"EXPLAIN SELECT 5, generate_series(1,3) % 2, generate_series(1,2)": {
+			"Result  (cost=0.00..0.09 rows=3 width=12)",
+			"  ->  ProjectSet  (cost=0.00..0.04 rows=3 width=8)"},
+		"EXPLAIN SELECT generate_series(1,2) % 2 ORDER BY 1": {
+			"Sort  (cost=0.07..0.07 rows=2 width=4)",
+			"  Sort Key: ?column?", // PG: (((generate_series(1, 2)) % 2)) — M0149-0001h1a78d
+			"  ->  Result  (cost=0.00..0.06 rows=2 width=4)",
+			"        ->  ProjectSet  (cost=0.00..0.03 rows=2 width=4)"},
+		"EXPLAIN SELECT (regexp_matches('abab', 'b', 'g'))[1]": {
+			"Result  (cost=0.00..0.19 rows=10 width=32)",
+			"  ->  ProjectSet  (cost=0.00..0.07 rows=10 width=32)"},
+		"EXPLAIN SELECT count(*) FROM (SELECT unnest('{1,2,3}'::int[]) + 1) s": {
+			"Aggregate  (cost=0.11..0.12 rows=1 width=8)",
+			"  ->  Result  (cost=0.00..0.08 rows=3 width=4)",
+			"        ->  ProjectSet  (cost=0.00..0.03 rows=3 width=4)"},
+	}
+	for sql, want := range cases {
+		rows := runQuery(t, ctx, sql)
+		if len(rows) < len(want) {
+			t.Fatalf("%s: %d lines, want at least %d", sql, len(rows), len(want))
+		}
+		for i, w := range want {
+			if got := datumToString(rows[i][0]); got != w {
+				t.Errorf("%s: line %d = %q, want %q", sql, i, got, w)
+			}
+		}
+	}
+}
