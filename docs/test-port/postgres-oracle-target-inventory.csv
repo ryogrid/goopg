@@ -203,7 +203,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale,mismatch_l
 ,regress-sql,regress,postgres/src/test/regress/sql/tidscan.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,63,263
 ,regress-sql,regress,postgres/src/test/regress/sql/time.sql,pass,yes,-,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13),,
 ,regress-sql,regress,postgres/src/test/regress/sql/timestamp.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,185,2133
-,regress-sql,regress,postgres/src/test/regress/sql/timestamptz.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,343,3131
+,regress-sql,regress,postgres/src/test/regress/sql/timestamptz.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,341,3131
 ,regress-sql,regress,postgres/src/test/regress/sql/timetz.sql,pass,yes,-,TestPort_RegressSuite/timetz passes — M0097-0004: AT LOCAL/AT TIME ZONE/timezone()/timetz comparison/TABLE shorthand,,
 ,regress-sql,regress,postgres/src/test/regress/sql/transactions.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,257,1101
 ,regress-sql,regress,postgres/src/test/regress/sql/triggers.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,784,3488

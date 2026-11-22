@@ -659,7 +659,7 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 	case "timestamp", "timestamptz":
 		if d.Kind == KindString {
 			// 'infinity' / '-infinity' / 'today' / ... (#5(d-iv), M0134-0182).
-			if inf, ok := parseTimestampSpecialLiteral(d.StringValue(), nowFromCtx(ctx), isTimestampTZTypeName(t.Name)); ok {
+			if inf, ok := parseTimestampSpecialLiteral(d.StringValue(), nowFromCtx(ctx), isTimestampTZTypeName(t.Name), timeZoneFromCtx(ctx)); ok {
 				d = inf
 			} else {
 				// A zone in the text belongs to the value only for timestamptz;
@@ -719,7 +719,7 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 	case "date":
 		if d.Kind == KindString {
 			// 'infinity' / '-infinity' / 'today' / ... (#5(d-iv), M0134-0182).
-			if inf, ok := parseDateSpecialLiteral(d.StringValue(), nowFromCtx(ctx)); ok {
+			if inf, ok := parseDateSpecialLiteral(d.StringValue(), nowFromCtx(ctx), timeZoneFromCtx(ctx)); ok {
 				d = inf
 			} else {
 				// date_in never looks at the decoded zone, nor at an hour-24 /

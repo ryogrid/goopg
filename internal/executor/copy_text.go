@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/utils/adt/datetime"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // COPY TEXT format (the default for `COPY ... TO/FROM STDOUT/STDIN`):
@@ -906,14 +906,23 @@ func parseCopyTimestampZone(s string, zone tsZoneMode) (time.Time, error) {
 // (isTimestampTZTypeName). Returns the resolved Datum and true, or (zero,
 // false) when s matches none of the RESERV spellings. (unimplemented_feat
 // #5(d-iv), M0134-0182)
-func parseTimestampSpecialLiteral(s string, now time.Time, tz bool) (Datum, bool) {
-	mk := NewTimeDatum
-	if tz {
-		mk = NewTimestampTZDatum
+func parseTimestampSpecialLiteral(s string, now time.Time, tz bool, zone ...string) (Datum, bool) {
+	// DecodeDateTime (datetime.c) reads 'now', 'today', 'tomorrow' and
+	// 'yesterday' in the session TimeZone: 'today' is midnight of the
+	// current LOCAL date, and a timestamp without time zone takes the local
+	// wall clock. zone is that TimeZone; without it the instant is read as
+	// UTC. M0149-0001h1a81.
+	z := ""
+	if len(zone) > 0 {
+		z = zone[0]
 	}
-	midnight := func(t time.Time) Datum {
-		t = t.UTC()
-		return mk(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC))
+	local := misc.TimestampTZToTimestamp(now, z) // the session's wall clock
+	midnight := func(days int) Datum {
+		day := time.Date(local.Year(), local.Month(), local.Day()+days, 0, 0, 0, 0, time.UTC)
+		if tz {
+			return NewTimestampTZDatum(misc.TimestampToTimestampTZ(day, z))
+		}
+		return NewTimeDatum(day)
 	}
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "infinity", "+infinity":
@@ -921,15 +930,21 @@ func parseTimestampSpecialLiteral(s string, now time.Time, tz bool) (Datum, bool
 	case "-infinity":
 		return NewTimestampInfinity(false), true
 	case "now":
-		return mk(now), true
+		if tz {
+			return NewTimestampTZDatum(now), true
+		}
+		return NewTimeDatum(local), true
 	case "epoch":
-		return mk(time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)), true
+		if tz {
+			return NewTimestampTZDatum(time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)), true
+		}
+		return NewTimeDatum(time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)), true
 	case "today":
-		return midnight(now), true
+		return midnight(0), true
 	case "tomorrow":
-		return midnight(now.AddDate(0, 0, 1)), true
+		return midnight(1), true
 	case "yesterday":
-		return midnight(now.AddDate(0, 0, -1)), true
+		return midnight(-1), true
 	}
 	return Datum{}, false
 }
@@ -942,10 +957,16 @@ func parseTimestampSpecialLiteral(s string, now time.Time, tz bool) (Datum, bool
 // keeps the time-of-day). See parseTimestampSpecialLiteral for the shared
 // now/UTC-midnight semantics and the current_date TimeZone caveat.
 // (unimplemented_feat #5(d-iv), M0134-0182)
-func parseDateSpecialLiteral(s string, now time.Time) (Datum, bool) {
-	midnight := func(t time.Time) Datum {
-		t = t.UTC()
-		return NewDateDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC))
+func parseDateSpecialLiteral(s string, now time.Time, zone ...string) (Datum, bool) {
+	// The current date is the session TimeZone's (DecodeDateTime);
+	// M0149-0001h1a81.
+	z := ""
+	if len(zone) > 0 {
+		z = zone[0]
+	}
+	local := misc.TimestampTZToTimestamp(now, z)
+	day := func(days int) Datum {
+		return NewDateDatum(time.Date(local.Year(), local.Month(), local.Day()+days, 0, 0, 0, 0, time.UTC))
 	}
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "infinity", "+infinity":
@@ -953,11 +974,11 @@ func parseDateSpecialLiteral(s string, now time.Time) (Datum, bool) {
 	case "-infinity":
 		return NewDateInfinity(false), true
 	case "now", "today":
-		return midnight(now), true
+		return day(0), true
 	case "tomorrow":
-		return midnight(now.AddDate(0, 0, 1)), true
+		return day(1), true
 	case "yesterday":
-		return midnight(now.AddDate(0, 0, -1)), true
+		return day(-1), true
 	case "epoch":
 		return NewDateDatum(time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)), true
 	}

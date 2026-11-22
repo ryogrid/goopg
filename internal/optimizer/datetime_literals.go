@@ -56,7 +56,7 @@ func canonicalizeDateTimeLiterals(n Node, settings PlannerSettings) {
 // date/time type holding the canonical text.
 func typeLiteral(side *Expr, other Expr, settings PlannerSettings, done map[*TypedStringLit]bool) {
 	sc, ok := (*side).(*StringConst)
-	if !ok || namesCurrentTime(sc.Value) {
+	if !ok {
 		return
 	}
 	t := exprType(other)
@@ -65,6 +65,15 @@ func typeLiteral(side *Expr, other Expr, settings PlannerSettings, done map[*Typ
 	}
 	typ := commonTypeCanonical(t.Name)
 	if !castTargetTakesStringLiteral(typ) {
+		return
+	}
+	if namesCurrentTime(sc.Value) {
+		// Typed as the operand, as coerce_type types it, but the value is
+		// still read at run time (see canonicalizeDateTimeLiterals).
+		// M0149-0001h1a81.
+		lit := &TypedStringLit{pos: sc.Pos(), Type: typ, Value: sc.Value}
+		done[lit] = true
+		*side = lit
 		return
 	}
 	if text, ok := CanonicalDateTimeLiteral(typ, sc.Value, settings.TimeZone, settings.DateStyle); ok {
@@ -76,7 +85,8 @@ func typeLiteral(side *Expr, other Expr, settings PlannerSettings, done map[*Typ
 
 func namesCurrentTime(value string) bool {
 	v := strings.ToLower(value)
-	for _, w := range []string{"now", "today", "tomorrow", "yesterday", "allballs"} {
+	// allballs is a constant (00:00:00), read like any other literal.
+	for _, w := range []string{"now", "today", "tomorrow", "yesterday"} {
 		if strings.Contains(v, w) {
 			return true
 		}
@@ -90,4 +100,57 @@ func isDateTimeComparison(op parser.OpCode) bool {
 		return true
 	}
 	return false
+}
+
+// CurrentTimeLiteral is one literal naming the current time (now, today,
+// tomorrow, yesterday) that canonicalizeDateTimeLiterals leaves to run time,
+// with the date/time type it is read as. Lit is the *TypedStringLit or the
+// *StringConst holding the text.
+type CurrentTimeLiteral struct {
+	Lit  Expr
+	Type string
+}
+
+// CurrentTimeLiterals lists the current-time literals of a plan, found the
+// way canonicalizeDateTimeLiterals finds the literals it converts: typed
+// literals, string casts, and strings compared with a date/time operand.
+// EXPLAIN prints them as the instant they denote, as PG's parse-time Const
+// does (M0149-0001h1a81).
+func CurrentTimeLiterals(n Node) []CurrentTimeLiteral {
+	if n == nil {
+		return nil
+	}
+	var out []CurrentTimeLiteral
+	seen := map[Expr]bool{}
+	add := func(lit Expr, typ, value string) {
+		typ = strings.ToLower(typ)
+		if seen[lit] || !castTargetTakesStringLiteral(typ) || !namesCurrentTime(value) {
+			return
+		}
+		seen[lit] = true
+		out = append(out, CurrentTimeLiteral{Lit: lit, Type: typ})
+	}
+	WalkPlanExprsDeep(n, func(e Expr) {
+		switch x := e.(type) {
+		case *BinaryOp:
+			if !isDateTimeComparison(x.Op) {
+				return
+			}
+			for _, pair := range [][2]Expr{{x.Left, x.Right}, {x.Right, x.Left}} {
+				if sc, ok := pair[0].(*StringConst); ok {
+					t := exprType(pair[1])
+					if !t.IsArray {
+						add(sc, commonTypeCanonical(t.Name), sc.Value)
+					}
+				}
+			}
+		case *TypedStringLit:
+			add(x, x.Type, x.Value)
+		case *CastExpr:
+			if sc, ok := x.Operand.(*StringConst); ok && (x.SourceType == "" || x.SourceType == "unknown") {
+				add(sc, x.TargetType, sc.Value)
+			}
+		}
+	})
+	return out
 }

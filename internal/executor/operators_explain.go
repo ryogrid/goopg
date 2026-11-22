@@ -144,7 +144,7 @@ func (o *explainOp) Open(ctx *Context) error {
 			return nil
 		}
 		var b strings.Builder
-		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats, ctx.GatherLaunched, ctx.GatherWorkerStats, ctx.SortStats, ctx.SortWorkerStats, ctx.MemoizeWorkerStats, explainHashMem(ctx), o.plan.RtableSize)
+		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats, ctx.GatherLaunched, ctx.GatherWorkerStats, ctx.SortStats, ctx.SortWorkerStats, ctx.MemoizeWorkerStats, explainHashMem(ctx), o.plan.RtableSize, currentTimeLiteralTexts(o.plan.Child, ctx))
 		appendExplainSettingsRow(ctx, opts, &o.rows)
 		if summary {
 			o.rows = append(o.rows,
@@ -181,7 +181,7 @@ func (o *explainOp) Open(ctx *Context) error {
 		return nil
 	}
 	var b strings.Builder
-	walkPlan(&b, o.plan.Child, 0, &o.rows, opts, explainHashMem(ctx), o.plan.RtableSize)
+	walkPlan(&b, o.plan.Child, 0, &o.rows, opts, explainHashMem(ctx), o.plan.RtableSize, currentTimeLiteralTexts(o.plan.Child, ctx))
 	appendExplainSettingsRow(ctx, opts, &o.rows)
 	if plainSummary {
 		o.rows = append(o.rows,
@@ -481,8 +481,11 @@ func (o *explainOp) Close() error { return nil }
 // `(rows=N)` is only appended when opts.Costs is true (the PG
 // default). `EXPLAIN (COSTS OFF) ...` therefore renders bare
 // node labels, matching upstream `COSTS OFF` output.
-func walkPlan(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, hashMem int64, rtableSize int) {
+func walkPlan(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, hashMem int64, rtableSize int, lits ...map[optimizer.Expr]string) {
 	reg := &subPlanReg{rel: newExplainNamesSized(n, rtableSize, opts.Verbose), cte: collectCTEHoist(n), hashMemLimit: hashMem}
+	if len(lits) > 0 {
+		reg.currentTimeText = lits[0]
+	}
 	reg.reservePGPlanIDs(n)
 	depth = emitRootSRFResult(n, depth, rows, opts, reg)
 	walkPlanFiltered(n, depth, rows, opts, nil, nil, reg)
@@ -4654,6 +4657,11 @@ func forceParen(s string) string {
 // nothing, so callers without a registry (JSON rendering, direct
 // formatExprPG users) keep working unchanged.
 type subPlanReg struct {
+	// currentTimeText is the EXPLAIN text of each current-time literal
+	// ('today', 'now', ...) as the instant it denotes under the statement's
+	// clock (currentTimeLiteralTexts, M0149-0001h1a81). nil = print as written.
+	currentTimeText map[optimizer.Expr]string
+
 	num     map[optimizer.Expr]int
 	pending []subPlanEntry
 
@@ -5599,6 +5607,11 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 	case *optimizer.StringConst:
 		// PG renders string literals as single-quoted; escape
 		// embedded single quotes per SQL convention.
+		if reg != nil {
+			if v, ok := reg.currentTimeText[x]; ok {
+				return "'" + strings.ReplaceAll(v, "'", "''") + "'"
+			}
+		}
 		return "'" + strings.ReplaceAll(x.Value, "'", "''") + "'"
 	case *optimizer.BooleanConst:
 		if x.Value {
@@ -5782,6 +5795,11 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 	case *optimizer.TypedStringLit:
 		// Upstream renders a typed literal as `'value'::type`
 		// (ruleutils.c get_const_expr with showtype).
+		if reg != nil {
+			if v, ok := reg.currentTimeText[x]; ok {
+				return "'" + strings.ReplaceAll(v, "'", "''") + "'::" + typedLiteralTypeName(x.Type)
+			}
+		}
 		return "'" + strings.ReplaceAll(typedLiteralValueText(x.Type, x.Value), "'", "''") + "'::" + typedLiteralTypeName(x.Type)
 	case *optimizer.IntervalLit:
 		// `interval 'N' <unit>` (Qualified) folds the unit into the
@@ -7360,8 +7378,11 @@ func schemaColumnNames(n optimizer.Node) []string {
 // `(actual time=startup..total rows=R loops=L)` suffix pulled
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
-func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, sortStats map[*optimizer.Sort]SortStat, sortWorkers map[*optimizer.Sort][]SortStat, memoWorkers map[*optimizer.Memoize][]MemoizeStats, hashMem int64, rtableSize int) {
+func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, sortStats map[*optimizer.Sort]SortStat, sortWorkers map[*optimizer.Sort][]SortStat, memoWorkers map[*optimizer.Memoize][]MemoizeStats, hashMem int64, rtableSize int, lits ...map[optimizer.Expr]string) {
 	reg := &subPlanReg{rel: newExplainNamesSized(n, rtableSize, opts.Verbose), cte: collectCTEHoist(n), hashMemLimit: hashMem}
+	if len(lits) > 0 {
+		reg.currentTimeText = lits[0]
+	}
 	reg.reservePGPlanIDs(n)
 	reg.sortStats, reg.sortWorkers = sortStats, sortWorkers
 	reg.memoWorkers = memoWorkers

@@ -4413,7 +4413,7 @@ func hasISODatePrefix(s string) bool {
 // way (M0149-0001h1a78b).
 func arraySubscriptElemDatumCtx(elemType, elem string, ctx *Context) (Datum, bool) {
 	if strings.EqualFold(elemType, "date") {
-		if d, ok := parseDateSpecialLiteral(elem, time.Time{}); ok {
+		if d, ok := parseDateSpecialLiteral(elem, nowFromCtx(ctx), timeZoneFromCtx(ctx)); ok {
 			return d, true
 		}
 		if t, _, err := decodeDateTextSession(elem, dateInputFromCtx(ctx)); err == nil {
@@ -5108,7 +5108,7 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		// PG's 'infinity' / '-infinity' spellings have no finite time.Time and
 		// map to the DATEVAL_NOEND / DATEVAL_NOBEGIN sentinel; intercept before
 		// the layout parse (not time-cached). (unimplemented_feat #5(d-iv))
-		if inf, ok := parseDateSpecialLiteral(x.Value, nowFromCtx(ctx)); ok {
+		if inf, ok := parseDateSpecialLiteral(x.Value, nowFromCtx(ctx), timeZoneFromCtx(ctx)); ok {
 			return inf, nil
 		}
 		// A spelling whose meaning depends on DateStyle must not stay cached on
@@ -5168,7 +5168,7 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		// time.Time and so are intercepted before the layout loop; the
 		// ±infinity sentinel is not time-cached (detection is a trivial
 		// string compare). (unimplemented_feat #5(d-iv))
-		if inf, ok := parseTimestampSpecialLiteral(x.Value, nowFromCtx(ctx), isTimestampTZTypeName(x.Type)); ok {
+		if inf, ok := parseTimestampSpecialLiteral(x.Value, nowFromCtx(ctx), isTimestampTZTypeName(x.Type), timeZoneFromCtx(ctx)); ok {
 			return inf, nil
 		}
 		// M0125-0007: same field-at-a-time acceptance as the date case above —
@@ -6634,7 +6634,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		if d.Kind == KindString {
 			s := d.StringValue()
 			// 'infinity' / '-infinity' → DATEVAL_NOEND / NOBEGIN (#5(d-iv)).
-			if inf, ok := parseDateSpecialLiteral(s, nowFromCtx(ctx)); ok {
+			if inf, ok := parseDateSpecialLiteral(s, nowFromCtx(ctx), timeZoneFromCtx(ctx)); ok {
 				return inf, nil
 			}
 			// date_in decodes a zone field and then ignores it, so the day comes
@@ -6718,7 +6718,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		tz := isTimestampTZTypeName(targetType)
 		if d.Kind == KindString {
 			// 'infinity' / '-infinity' have no finite time.Time (#5(d-iv)).
-			if inf, ok := parseTimestampSpecialLiteral(d.StringValue(), nowFromCtx(ctx), tz); ok {
+			if inf, ok := parseTimestampSpecialLiteral(d.StringValue(), nowFromCtx(ctx), tz, timeZoneFromCtx(ctx)); ok {
 				return inf, nil
 			}
 			// `::timestamp` discards a zone the text carries, `::timestamptz`
@@ -11969,7 +11969,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		// `date(now())::text = current_date::text` (expressions.sql) always
 		// compared unequal regardless of the actual day. NewDateDatum is the
 		// same site every other date-producing path already uses.
-		t := ctx.Now.UTC()
+		// The current date is the session TimeZone's: date_in of 'today'
+		// and timestamptz_date(now()) both read the local date
+		// (M0149-0001h1a81); the UTC date was a day off near midnight.
+		t := misc.TimestampTZToTimestamp(ctx.Now, timeZoneFromCtx(ctx))
 		return NewDateDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)), nil
 	case "current_time":
 		// Returns time-of-day anchored at epoch, matching parseTimeString convention.

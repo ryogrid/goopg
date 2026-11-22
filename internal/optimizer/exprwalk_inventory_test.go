@@ -144,6 +144,7 @@ var exprSwitchInventory = map[string]walkerRole{
 	"pseudoconstant_gate.go:isPseudoconstantConjunct": nonRecursiveClassifier, // M0145-0008o: a walkExprRefs Visit callback; the recursion is the driver's
 	"rangequery.go:isRangePseudoConstant":             nonRecursiveClassifier, // M0146-0184: a walkExprRefs Visit callback; the recursion is the driver's
 	"projectset_cost.go:estimateArrayLength": nonRecursiveClassifier, // M0149-0001h1a78a: estimate_array_length's top-level shape test, no recursion
+	"datetime_literals.go:CurrentTimeLiterals": nonRecursiveClassifier, // M0149-0001h1a81: a WalkPlanExprsDeep visit callback; the recursion is the driver's
 	"qualevalcost.go:isPlanTimeConst":                 nonRecursiveClassifier, // M0146-0228: a walkExprRefs Visit callback (Var/Param/FuncCall -> not constant); the recursion is the driver's
 	"considerparallel.go:InitPlanEvaluatedByLeader":   nonRecursiveClassifier, // M0146-0192: a walkPlanExprsDeep callback flagging param/outer reads; the recursion is the driver's
 

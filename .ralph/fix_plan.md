@@ -12570,6 +12570,13 @@ verify each at HEAD when the task starts.
     `2020-06-30 15:00:00+00`.
   - `make_timestamptz(2020,7,1,0,0,0,'asia/tokyo')` ignores the zone: `2020-07-01 00:00:00`, PG `2020-06-30 15:00:00+00`.
   - `AT LOCAL` assumes the session zone is UTC.
+  - 2026\-11\-23 \(found by M0149\-0001h1a81\): the session zone is ignored in three more places.
+    - Under `set timezone='Asia/Tokyo'`, `'2020-01-01 20:00+00'::timestamptz::date` and `date(...)` return
+      `2020-01-01`; PG returns `2020-01-02` \(timestamptz\_date\).
+    - Two\-argument `date_trunc('day', timestamptz)` truncates in UTC and returns a timestamp; PG truncates in the
+      session zone and returns `2020-01-02 00:00:00+09`.
+    - `current_date` and the `'today'`/`'now'` literals already read the local date since h1a81, so
+      `current_date = now()::date` is `f` near midnight.
   - Resume: the timezone arm of expr.go treats every value as timetz; add timestamp\_zone and timestamptz\_zone, then the
     zone arguments of date\_trunc and evalMakeTimestamp.
   > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a75: `AT TIME ZONE` on a timestamp returns a 1970 date
@@ -12763,7 +12770,7 @@ verify each at HEAD when the task starts.
       `a = b + 1` join selectivity, and the scan width under count\(\*\).
     - Design: docs/design/0100\-0149/0149\-0001h1a80\-function\-scan\-cost.md \(new\).
     Movement: yes — regress runner misc\_functions 210 → 207 \(same\-list A/B against HEAD over 18 cases, none worse\)
-- [ ] **M0149-0001h1a81 — date/time literals in views, current\-time literals and epoch** (filed 2026-11-19 by M0149-0001h1a68)
+- [x] **M0149-0001h1a81 — date/time literals in views, current\-time literals and epoch** (filed 2026-11-19 by M0149-0001h1a68)
   Kind: impl
   Parent: M0149-0001h1a
   - A view keeps its source text and is planned again at each use, so `create view v as select t = '2020-01-01' ...`
@@ -12772,6 +12779,29 @@ verify each at HEAD when the task starts.
     at parse time. goopg's plan cache reuses plans across statements, so converting needs a cache rule first.
   - `t > 'epoch'` on an indexed timestamptz column stays a filter; PG uses it as an index condition.
   - Resume: the view definition store \(CREATE VIEW\) for the first; the plan cache key for the second.
+  - 2026\-11\-23 \(landed\):
+    - `today`, `tomorrow`, `yesterday`, `now` \(as a timestamp\) and `current_date` read the session zone's date and
+      wall clock. They used UTC: `'today'::timestamptz` in New York was 19:00 the day before, and in Tokyo a whole
+      day off.
+    - EXPLAIN \(text\) prints current\-time literals as the instant they denote; a literal compared with a date column is
+      typed `::date`.
+    - Evaluation stays at run time, so the plan cache is unaffected.
+    - `t > 'epoch'` was already an index condition when re\-measured.
+    - Views are split out as M0149\-0001h1a81a. Zone gaps in `timestamptz::date` and `date_trunc` were appended to
+      the S2 M0149\-0001h1a75.
+    - Design: docs/design/0100\-0149/0149\-0001h1a68\-datetime\-literals\-at\-plan\-time.md \(new section\).
+    Movement: yes — regress runner timestamptz 343 → 341 \(same\-list A/B against HEAD over 14 cases, none worse\)
+- [ ] **M0149-0001h1a81a — date/time literals in a view follow the querying session's zone** (filed 2026-11-23 by M0149-0001h1a81)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `create view v as select t = '2020-01-01 00:00' as m from tz1` is created under UTC. Selected under
+    `set timezone='Asia/Tokyo'` it returns `f` for the 00:00 UTC row; PG returns `t`, because the literal became a Const
+    at CREATE VIEW.
+  - pg\_get\_viewdef prints the stored source text. PG prints the deparsed query with
+    `'2020-01-01 00:00:00+00'::timestamp with time zone`.
+  - Resume: CREATE VIEW in internal/executor. Store the canonicalized literals \(canonicalizeDateTimeLiterals under the
+    creating session's settings\) in the view definition, or record the creation\-time TimeZone and DateStyle and plan
+    view bodies with them, the way PREPARE does \(PreparedLiterals\).
 - [ ] **M0149-0001h1a82 — the timezone\_abbreviations setting is ignored** (filed 2026-11-19 by M0149-0001h1a70)
   Kind: impl
   Parent: M0149-0001h1a

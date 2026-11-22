@@ -61,3 +61,34 @@ func dateTimeLiteralText(typ string, d Datum, ctx *Context) string {
 	}
 	return formatDatumDateStyle(d, ctx)
 }
+
+// currentTimeLiteralTexts reads every current-time literal of the plan
+// (optimizer.CurrentTimeLiterals) under the statement's own clock and
+// settings, and returns the text the type's output function prints for it.
+// PG converts 'today' and friends into a Const at parse time, and EXPLAIN
+// prints that value: `(t < '2026-11-22 00:00:00+00'::timestamp with time
+// zone)`. goopg keeps evaluating them at run time — its plan cache reuses a
+// plan across statements — so only the EXPLAIN text uses the values.
+// M0149-0001h1a81.
+func currentTimeLiteralTexts(n optimizer.Node, ctx *Context) map[optimizer.Expr]string {
+	lits := optimizer.CurrentTimeLiterals(n)
+	if len(lits) == 0 {
+		return nil
+	}
+	out := make(map[optimizer.Expr]string, len(lits))
+	for _, l := range lits {
+		value := ""
+		switch x := l.Lit.(type) {
+		case *optimizer.StringConst:
+			value = x.Value
+		case *optimizer.TypedStringLit:
+			value = x.Value
+		}
+		d, err := evalTypedStringLit(&optimizer.TypedStringLit{Type: l.Type, Value: value}, ctx)
+		if err != nil || d.Kind != KindTime {
+			continue
+		}
+		out[l.Lit] = dateTimeLiteralText(l.Type, d, ctx)
+	}
+	return out
+}

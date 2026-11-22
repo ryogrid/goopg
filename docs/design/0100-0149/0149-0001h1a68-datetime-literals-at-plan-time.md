@@ -31,8 +31,26 @@ Reading back `'Sat Apr 02 12:00:00 2005 CST'` under horology's POSIX zone `CST7C
 without end in `zonePeriods` \(`internal/utils/adt/datetime/decode.go`\), because the zone built from a POSIX
 string reports a bound that does not move forward. The loop now stops there.
 
-## Not covered \(M0149\-0001h1a81\)
+## Current\-time literals \(M0149\-0001h1a81\)
 
-- Views keep their source text and are planned again at each use, so their literals follow the zone of the query.
-- `now` and the other current\-time literals stay unconverted, and EXPLAIN prints them as written.
-- `t > 'epoch'` is not used as an index condition, as PG does.
+- **Session zone.** `today`, `tomorrow` and `yesterday` are midnight of the current date in the session TimeZone,
+  and `now` read as a timestamp without time zone is the local wall clock \(DecodeDateTime, datetime.c\).
+  - parseTimestampSpecialLiteral and parseDateSpecialLiteral take the zone, and convert with
+    misc.TimestampTZToTimestamp and TimestampToTimestampTZ. They used the UTC date, which is a day off near
+    midnight.
+  - `current_date` reads the local date as well.
+- **Run time, not plan time.** The literals are still evaluated when the statement runs, because goopg's plan cache
+  reuses a plan across statements where PG parses again.
+  - The canonicalizer types a current\-time string compared with a date/time operand as that operand's type, as a
+    TypedStringLit holding the original text, so EXPLAIN shows `'...'::date`.
+  - EXPLAIN \(text format\) prints each such literal as the instant it denotes under the statement's clock.
+    `optimizer.CurrentTimeLiterals` finds the literals, `currentTimeLiteralTexts` reads them, and
+    `subPlanReg.currentTimeText` substitutes the text at render time, so a cached plan is never changed.
+- `allballs` is a constant \(00:00:00\) and is canonicalized like any other literal.
+- `t > 'epoch'` is already an index condition.
+- **Not done:**
+  - Views still keep their source text, so their literals follow the zone of the query \(M0149\-0001h1a81a\).
+  - A prepared statement re\-reads `now`, where PG fixes it at PREPARE.
+  - Within a transaction, `now` is the statement time and not the transaction start.
+  - JSON, XML and YAML EXPLAIN still print the literal as written.
+  - `timestamptz::date` and `date_trunc` ignore the session zone; this is appended to the S2 M0149\-0001h1a75.
