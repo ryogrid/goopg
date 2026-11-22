@@ -231,6 +231,13 @@ func ColdStartPG(t testing.TB, src *Node, name string) *Node {
 	if out, err := exec.Command("cp", "-a", src.DataDir(), dst).CombinedOutput(); err != nil {
 		t.Fatalf("tapnode: copy %s → %s: %v\n%s", src.DataDir(), dst, err, out)
 	}
+	// cp -a copies pg_tblspc's symlinks as symlinks, which would point the
+	// copy at src's own tablespace directories. Copy each external
+	// tablespace too and re-point the copy's link at it, as a base backup's
+	// tablespace mapping would (M0149-0003).
+	if err := copyTablespaces(dst, filepath.Join(t.TempDir(), name+"-tblspc")); err != nil {
+		t.Fatalf("tapnode: copy tablespaces of %s: %v", dst, err)
+	}
 	// A goopg immediate stop or SIGKILL leaves its lock file, as PG's
 	// postmaster does after a crash; the copy is a different directory, so
 	// the stale file only blocks PG's start. PG removes it itself when the
@@ -285,4 +292,42 @@ func (n *Node) AppendConf(line string) {
 	if err := n.g.AppendPostgresqlConf(line); err != nil {
 		n.t.Fatalf("tapnode %s: append_conf %q: %v", n.name, line, err)
 	}
+}
+
+// copyTablespaces copies every external tablespace of dataDir (a symlink
+// pg_tblspc/<oid> -> location) into root/<oid> and re-points the link there.
+func copyTablespaces(dataDir, root string) error {
+	dir := filepath.Join(dataDir, "pg_tblspc")
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, e := range ents {
+		link := filepath.Join(dir, e.Name())
+		st, err := os.Lstat(link)
+		if err != nil || st.Mode()&os.ModeSymlink == 0 {
+			continue
+		}
+		target, err := os.Readlink(link)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			return err
+		}
+		copyDst := filepath.Join(root, e.Name())
+		if out, err := exec.Command("cp", "-a", target, copyDst).CombinedOutput(); err != nil {
+			return fmt.Errorf("copy %s: %v: %s", target, err, out)
+		}
+		if err := os.Remove(link); err != nil {
+			return err
+		}
+		if err := os.Symlink(copyDst, link); err != nil {
+			return err
+		}
+	}
+	return nil
 }

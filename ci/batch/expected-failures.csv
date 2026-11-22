@@ -1,2 +1,3 @@
 case_id,scope,reason,since,tracking
 deadlock-parallel.spec,isolation,known-fail per upstream-isolation-coverage (120/121 pass),2026-07-06,docs/test-port/upstream-isolation-coverage.md
+TestPort_Recovery014UnloggedReinit,testport,port in progress (M0149-0003): 5/27 assertions all-goopg; unlogged init forks and ResetUnloggedRelations not implemented yet,2026-11-23,.ralph/fix_plan.md M0149-0003

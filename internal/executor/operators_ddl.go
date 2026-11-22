@@ -20,7 +20,6 @@ import (
 	"github.com/goopg/goopg/internal/parser/analyzer"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/utils/activity"
-	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/access/transam"
@@ -409,15 +408,12 @@ func (o *ddlOp) inPlaceTablespacesEnabled() bool {
 	}
 }
 
-// execCreateTablespace handles CREATE TABLESPACE. goopg supports only the
-// developer/regression in-place form (empty LOCATION with
-// allow_in_place_tablespaces on), which creates pg_tblspc/<oid> as a real
-// directory and records the tablespace in the runtime registry. It mirrors PG's
-// CreateTableSpace (commands/tablespace.c) error semantics: a location with a
-// single quote, a non-absolute non-in-place location, and a reserved "pg_"
-// name all raise the upstream-verbatim errors. External (absolute-path)
-// tablespaces are rejected as unsupported because goopg cannot relocate relation
-// files. M0095-0003.
+// execCreateTablespace handles CREATE TABLESPACE, as PG's CreateTableSpace
+// (commands/tablespace.c): an external LOCATION becomes the symlink
+// pg_tblspc/<oid> -> location (M0149-0003), and the in-place form (empty
+// LOCATION with allow_in_place_tablespaces on) a real directory. The
+// errors for a single quote in the location, a non-absolute location and a
+// reserved "pg_" name are PG's, word for word. M0095-0003.
 func (o *ddlOp) execCreateTablespace(s *parser.CreateTablespaceStmt) error {
 	location := s.Location
 	// PG: disallow quotes, else CREATE DATABASE would be at risk.
@@ -431,14 +427,6 @@ func (o *ddlOp) execCreateTablespace(s *parser.CreateTablespaceStmt) error {
 			// (ERRCODE_INVALID_OBJECT_DEFINITION). Also the path empty
 			// LOCATION takes when allow_in_place_tablespaces is off.
 			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "tablespace location must be an absolute path"}
-		}
-		// An absolute external location is valid in PG but goopg cannot relocate
-		// relation files into an arbitrary directory, so this is unsupported.
-		return &ExecError{
-			Code:    "0A000",
-			Pos:     s.Pos(),
-			Message: "tablespaces with an external location are not supported",
-			Hint:    "Set allow_in_place_tablespaces and use LOCATION '' for an in-place tablespace.",
 		}
 	}
 	// Disallow creation of tablespaces named "pg_xxx"; reserved for system use.
@@ -467,21 +455,19 @@ func (o *ddlOp) execCreateTablespace(s *parser.CreateTablespaceStmt) error {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
 	o.ctx.Catalog.SetTablespaceOptions(s.Name, spcoptions)
-	// Create the in-place directory pg_tblspc/<oid> under the data dir. When no
+	// create_tablespace_directories: pg_tblspc/<oid> (a directory in place, a
+	// symlink to an external location) and its version subdirectory. When no
 	// data dir is configured (embedded/test contexts), the registry entry stands
 	// alone — matching how other DDL operators skip cluster-filesystem effects.
 	if o.ctx.DataDir != "" {
-		dir := filepath.Join(o.ctx.DataDir, "pg_tblspc", strconv.FormatUint(uint64(oid), 10))
-		// Create the per-tablespace version subdirectory PG_<major>_<catversion>
-		// inside pg_tblspc/<oid>, faithful to create_tablespace_directories
-		// (tablespace.c). Relation files for this tablespace live under it;
-		// pg_basebackup expects it present so a restored cluster's relfiles
-		// resolve. MkdirAll creates the parent <oid> dir in the same call.
-		versionDir := filepath.Join(dir, misc.TablespaceVersionDirectory)
-		if mkErr := os.MkdirAll(versionDir, 0o700); mkErr != nil {
+		if mkErr := storage.CreateTablespaceDirectories(o.ctx.DataDir, oid, location, false); mkErr != nil {
 			// Roll back the registry insert so a retry can succeed.
 			o.ctx.Catalog.DropTablespace(s.Name)
-			return &ExecError{Code: "58P01", Pos: s.Pos(), Message: fmt.Sprintf("could not create directory %q: %v", versionDir, mkErr)}
+			var te *storage.TablespaceDirError
+			if errors.As(mkErr, &te) {
+				return &ExecError{Code: te.Code, Pos: s.Pos(), Message: te.Message, Hint: te.Hint}
+			}
+			return &ExecError{Code: "58P01", Pos: s.Pos(), Message: mkErr.Error()}
 		}
 	}
 	// B4.1: faithful CREATE TABLESPACE journaling (standby-complete), replacing
@@ -567,9 +553,10 @@ func (o *ddlOp) execDropTablespace(s *parser.DropTablespaceStmt) error {
 		}
 	}
 	if o.ctx.DataDir != "" {
-		dir := filepath.Join(o.ctx.DataDir, "pg_tblspc", strconv.FormatUint(uint64(oid), 10))
-		if rmErr := os.RemoveAll(dir); rmErr != nil {
-			return &ExecError{Code: "58P01", Pos: s.Pos(), Message: fmt.Sprintf("could not remove directory %q: %v", dir, rmErr)}
+		// destroy_tablespace_directories: the version directory and
+		// pg_tblspc/<oid> (the symlink, for an external location).
+		if rmErr := storage.DestroyTablespaceDirectories(o.ctx.DataDir, oid); rmErr != nil {
+			return &ExecError{Code: "58P01", Pos: s.Pos(), Message: fmt.Sprintf("could not remove tablespace directories: %v", rmErr)}
 		}
 	}
 	return nil
@@ -2576,6 +2563,30 @@ func (o *ddlOp) createTableHonoringPendingDrop(name parser.ObjectName, cols []ca
 // (`could not open file ...: No such file or directory`). A nil Pool (the
 // storage-less CTAS probe path, execCreateTableAs's "no storage" branch) is a
 // no-op — there is nothing to touch. M0119-0006.
+// placeTableInTablespace sets tbl's tablespace. The main-fork file was
+// created (touchHeapMainForkFile) before the TABLESPACE clause was applied,
+// under base/; PG's heap_create creates it in the relation's own tablespace.
+// The empty file therefore moves: it is removed from base/ and created
+// under pg_tblspc/<oid>/... M0149-0003.
+func (o *ddlOp) placeTableInTablespace(tbl *catalog.Table, tablespaceOID uint32) error {
+	if tbl == nil || tbl.Tablespace == tablespaceOID {
+		return nil
+	}
+	if o.ctx.Pool == nil {
+		tbl.Tablespace = tablespaceOID
+		return nil
+	}
+	old := o.ctx.Catalog.RelFileNode(tbl)
+	tbl.Tablespace = tablespaceOID
+	if n, err := o.ctx.Pool.Manager().NBlocks(old); err == nil && n == 0 {
+		o.ctx.Pool.InvalidateRel(old)
+		if err := o.ctx.Pool.Manager().DropRelation(old); err != nil {
+			return &ExecError{Code: "XX000", Message: err.Error()}
+		}
+	}
+	return o.touchHeapMainForkFile(tbl)
+}
+
 func (o *ddlOp) touchHeapMainForkFile(tbl *catalog.Table) error {
 	if o.ctx.Pool == nil || tbl == nil {
 		return nil
@@ -4390,7 +4401,9 @@ afterExistsCheck:
 	if o.ctx.NonSuperuserRole != "" {
 		tbl.Owner = o.ctx.NonSuperuserRole
 	}
-	tbl.Tablespace = tablespaceOID
+	if err := o.placeTableInTablespace(tbl, tablespaceOID); err != nil {
+		return err
+	}
 	if s.ForeignServer != "" {
 		tbl.ForeignServerName = s.ForeignServer
 		tbl.ForeignOptions = s.ForeignOptions
@@ -5814,7 +5827,9 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 	if o.ctx.NonSuperuserRole != "" {
 		tbl.Owner = o.ctx.NonSuperuserRole
 	}
-	tbl.Tablespace = tablespaceOID
+	if err := o.placeTableInTablespace(tbl, tablespaceOID); err != nil {
+		return err
+	}
 	// The INTO clause's relpersistence (createas.c create_ctas_internal →
 	// DefineRelation): TEMP makes a session-local relation in the backend's
 	// pg_temp namespace, UNLOGGED an unlogged one — set exactly as
@@ -5979,7 +5994,9 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	if o.ctx.NonSuperuserRole != "" {
 		tbl.Owner = o.ctx.NonSuperuserRole
 	}
-	tbl.Tablespace = tablespaceOID
+	if err := o.placeTableInTablespace(tbl, tablespaceOID); err != nil {
+		return err
+	}
 	// If the table was created without an explicit schema qualifier, record the
 	// resolved writable schema so TablesInSchema() can find it for DROP CASCADE.
 	// M0097-0022.

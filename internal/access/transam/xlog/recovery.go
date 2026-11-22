@@ -2790,11 +2790,11 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// real PG standby's tblspc_redo does the same from the ts_path;
 			// goopg's own dirs persist on disk across restart, so this is a
 			// defensive MkdirAll for the basebackup-restore edge.
-			oid, _, err := decodeXLogTblspcCreate(xlog.MainData)
+			oid, location, err := decodeXLogTblspcCreate(xlog.MainData)
 			if err != nil {
 				return false, err
 			}
-			if err := applyTblspcCreate(mgr, oid); err != nil {
+			if err := applyTblspcCreate(mgr, oid, location); err != nil {
 				return false, err
 			}
 			return true, nil
@@ -6810,19 +6810,19 @@ func decodeXLogTblspcDrop(mainData []byte) (uint32, error) {
 // persist on disk across a restart, so this MkdirAll is a defensive no-op in
 // the common case and only materializes the directory when replaying onto a
 // basebackup that lacks it. B4.1d.
-func applyTblspcCreate(mgr *storage.Manager, oid uint32) error {
-	dir := filepath.Join(mgr.DataDir(), "pg_tblspc", strconv.FormatUint(uint64(oid), 10))
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("wal: tblspc-create replay MkdirAll %q: %w", dir, err)
+func applyTblspcCreate(mgr *storage.Manager, oid uint32, location string) error {
+	// tblspc_redo: create_tablespace_directories(location, oid) in recovery
+	// mode — the symlink for an external location (M0149-0003).
+	if err := storage.CreateTablespaceDirectories(mgr.DataDir(), oid, location, true); err != nil {
+		return fmt.Errorf("wal: tblspc-create replay: %w", err)
 	}
 	return nil
 }
 
 // applyTblspcDrop removes the pg_tblspc/<oid> directory (idempotent). B4.1d.
 func applyTblspcDrop(mgr *storage.Manager, oid uint32) error {
-	dir := filepath.Join(mgr.DataDir(), "pg_tblspc", strconv.FormatUint(uint64(oid), 10))
-	if err := os.RemoveAll(dir); err != nil {
-		return fmt.Errorf("wal: tblspc-drop replay RemoveAll %q: %w", dir, err)
+	if err := storage.DestroyTablespaceDirectories(mgr.DataDir(), oid); err != nil {
+		return fmt.Errorf("wal: tblspc-drop replay: %w", err)
 	}
 	return nil
 }

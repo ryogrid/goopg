@@ -15526,6 +15526,20 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/recovery/t/014_unlogged_reinit.pl` — unlogged tables/sequences reinitialised from `_init` forks after crash, incl. tablespaces.
   Likely prerequisites \(verify at start\): on-disk `_init` forks, `ResetUnloggedRelations` \(`reinit.c`\) at crash-recovery start, in-place tablespace layout under `pg_tblspc/`.
+  - 2026\-11\-23 \(partial, still open\): ported as TestPort\_Recovery014UnloggedReinit, listed in
+    ci/batch/expected\-failures.csv. Movement: tap 014 4/27 → 5/27 all\-goopg; regress tablespace 171 → 164.
+    Design: docs/design/0100\-0149/0149\-0003\-unlogged\-reinit.md.
+    - Path\-to\-TAP:
+      - 014 ← external CREATE TABLESPACE refused \(the test aborted\). Fixed: create\_tablespace\_directories port
+        \(symlink \+ version dir\), also in tblspc\_redo; DROP removes both.
+      - 014 ← the main fork of a table created in a tablespace landed under base/ \(failing assertion\). Fixed:
+        placeTableInTablespace.
+      - 014 ← no `_init` forks \(3 pre\-crash assertions\), and goopg cannot start once a main fork is removed. Open.
+    - Next slices:
+      - init forks for unlogged heaps \(empty \+ XLOG\_SMGR\_CREATE INIT\), their indexes \(metapage\) and sequences
+        \(initial page\);
+      - ResetUnloggedRelations: cleanup before redo, init after redo, over base/ and every tablespace;
+      - nextval state taken from the reset sequence page.
 - [ ] **M0149-0004 — port recovery/t/022_crash_temp_files.pl**
   Kind: impl
   Parent: none
