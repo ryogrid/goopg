@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/storage"
@@ -124,6 +125,9 @@ func pgProcArgOIDs(cat catalog.Catalog, r *catalog.Routine) []uint32 {
 // consulted first and the text fallback is kept only when they know nothing
 // either.
 func PGProcTypeOID(cat catalog.Catalog, spelling string, routineDB uint32) uint32 {
+	if oid, ok := pgProcPseudoTypeOIDs[strings.ToLower(strings.TrimSpace(spelling))]; ok {
+		return oid
+	}
 	builtin := catalog.TypeNameToOID(spelling)
 	base, isArray := depTypeRef(spelling)
 	if builtin != catalog.OIDText || base == "text" || base == "" {
@@ -133,6 +137,23 @@ func PGProcTypeOID(cat catalog.Catalog, spelling string, routineDB uint32) uint3
 		return oid
 	}
 	return builtin
+}
+
+// pgProcPseudoTypeOIDs are PG's pseudo-types (typtype 'p', pg_type.dat) a
+// routine's signature can name. TypeNameToOID knows none of them and falls
+// back to text, so a `RETURNS void` function was written with prorettype 25;
+// a PG standby then saw a text-returning function and CREATE OR REPLACE
+// failed with "cannot change return type of existing function".
+// M0149-0015e.
+var pgProcPseudoTypeOIDs = map[string]uint32{
+	"void": 2278, "trigger": 2279, "event_trigger": 3838, "record": 2249,
+	"cstring": 2275, "\"any\"": 2276, "any": 2276, "anyarray": 2277,
+	"anyelement": 2283, "anynonarray": 2776, "anyenum": 3500, "anyrange": 3831,
+	"anymultirange": 4537, "anycompatible": 5077, "anycompatiblearray": 5078,
+	"anycompatiblenonarray": 5079, "anycompatiblerange": 5080,
+	"anycompatiblemultirange": 4538, "language_handler": 2280, "fdw_handler": 3115,
+	"table_am_handler": 269, "index_am_handler": 325, "tsm_handler": 3310,
+	"pg_ddl_command": 32, "internal": 2281,
 }
 
 // userTypeOID is PGProcTypeOID's user-registry arm: the OID (or, for isArray,

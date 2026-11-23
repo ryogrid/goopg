@@ -1868,6 +1868,14 @@ func pgSingletonArrayElement(blob []byte, t catalog.Type) (Datum, bool) {
 // pgTextArrayBytes builds a PG text[] (OID 25) ArrayType blob from a slice of strings.
 // Each element is a varlena with 4-byte header (total_size << 2) followed by UTF-8 bytes.
 func pgTextArrayBytes(strs []string) []byte {
+	if len(strs) == 0 {
+		// construct_empty_array: ndim 0, no dims — the 16-byte
+		// ARR_OVERHEAD_NONULLS(0) header.
+		buf := make([]byte, 16)
+		binary.LittleEndian.PutUint32(buf[0:4], 16<<2)
+		binary.LittleEndian.PutUint32(buf[12:16], 25)
+		return buf
+	}
 	const hdrSize = 24
 	totalData := 0
 	for _, s := range strs {
@@ -1878,6 +1886,11 @@ func pgTextArrayBytes(strs []string) []byte {
 	total := hdrSize + totalData
 	buf := make([]byte, 0, total)
 	hdr := make([]byte, hdrSize)
+	// ndim = 1: without it PG reads the array as empty ({}) — a goopg
+	// primary's proargnames / reloptions / proconfig were invisible to a PG
+	// standby, which then refused the function ("proargnames must have the
+	// same number of elements as the function has arguments"). M0149-0015e.
+	binary.LittleEndian.PutUint32(hdr[4:8], 1)
 	binary.LittleEndian.PutUint32(hdr[12:16], 25) // text OID
 	binary.LittleEndian.PutUint32(hdr[16:20], uint32(len(strs)))
 	binary.LittleEndian.PutUint32(hdr[20:24], 1) // lbound=1

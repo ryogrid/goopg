@@ -15879,7 +15879,7 @@ verify each at HEAD when the task starts.
       - 007 ← sync\_priority/sync\_state per SyncRepGetCandidateStandbys \(walsender slots, `*`, num\_sync over the
         list, quorum\): SyncRep rewritten around slots;
       - 007 ← ALTER SYSTEM \+ reload: SIGHUP re\-applies synchronous\_standby\_names.
-- [ ] **M0149-0015 — port recovery/t/012_subtransactions.pl**
+- [x] **M0149-0015 — port recovery/t/012_subtransactions.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/012_subtransactions.pl` — subtransactions \(incl. overflowed and prepared\) across replay and promotion.
@@ -15912,19 +15912,37 @@ verify each at HEAD when the task starts.
   - Movement: 012 all\-goopg 0 → full pass, pg18\-primary\-goopg\-standby → full pass \(GOOPG\_TAP\_012=1\);
     TestE2E\_PreparedXactSurvivesPromotion 2/2.
   - Restore runs before the production stamp: restoring after it let COMMIT PREPARED race pg\_ctl promote.
-- [ ] **M0149-0015e — a rejoined goopg standby stops replaying after following a timeline**
+- [x] **M0149-0015e — PG refuses goopg\-written pg\_proc rows \(was filed as a rejoined\-standby replay stall\)** \(2026\-11\-24\)
   Kind: impl
   Parent: M0149-0015
-  Proof: 012 goopg\-primary/PG\-standby pairing, lines 178/182. The old goopg primary rejoins PG's TLI 2 and replays
-  PG's DELETE \(127 heap records \+ commit\). After that its stream replayer sees only rmid 0 info 0xA0 \(XLOG\_FPI\)
-  records every ~8 kB up to the end, and none of PG's PREPARE or its inserts. apply\_lsn still advances to the end.
-  Suspect the walreceiver's rewrite of the segment from 16777216 \("WALData start mismatch"\) and the iterator's
-  file/TLI choice after followUpstreamTimeline. Fixing this un\-gates the 012 port \(R\-012 → port\).
+  - Diagnosis: pg\_waldump of the rejoined node's WAL showed PG never ran the segment. Its CREATE OR REPLACE /
+    hs\_subxids failed: "cannot change return type of existing function"; "proargnames must have the same number of
+    elements as the function has arguments".
+  - Fixes: `pgTextArrayBytes` writes ndim 1 \(and PG's empty array\); `PGProcTypeOID` maps pseudo\-types \(void
+    → 2278, …\). Unit tests for both.
+  - Movement: 012 goopg\-primary/PG\-standby 2 not\-ok → 0; 012 3/3 pairings; R\-012 `port`, env gate removed.
+  - Regress, same build vs HEAD worktree: create\_function\_sql 39→39, create\_procedure 28→28 \(inventory said 33\);
+    reloptions 28, polymorphism 683, rangefuncs 796, stats\_ext 432 all equal to the inventory.
+- [ ] **M0149-0015f — CREATE OR REPLACE FUNCTION panics on a node promoted from a PG backup**
+  Kind: impl
+  Parent: M0149-0015
+  `cmpKeyProcNameArgsNsp` \(executor/sys\_catalog\_btree\_insert\_split.go descent\) slices a\[:64\] of a PG
+  suffix\-truncated pivot tuple in pg\_proc\_proname\_args\_nsp\_index \(capacity 16\). It needs \_bt\_compare's
+  truncated\-attribute semantics: compare only BTreeTupleGetNAtts attributes; missing ones are minus infinity. Seen in
+  012's pg18\-primary pairing \(the error is ignored, so the test passes\). Reproduce: PG primary creates a function;
+  promote the goopg standby; CREATE OR REPLACE it.
+- [ ] **M0149-0015g — create\_function\_sql is recorded `pass` but fails 39/761 at HEAD**
+  Kind: test
+  Parent: M0149-0015
+  The inventory row says pass/pass\_required, but pg\-regress\-runner fails it identically at HEAD and on this branch
+  \(SQL\-body deparse, EXPLAIN of SQL functions\). Re\-measure with \-\-update\-inventory and file the deparse gap.
 - [ ] **M0149-0013a — TestPort\_Recovery005ReplayDelay flaked once**
   Kind: test
   Parent: M0149-0013
   It failed once, 2026\-11\-24, inside the large replication regression set; the failing check was not captured. Five
   reruns, alone and in the set, passed. Rerun the set with \-v until a failure shows its check.
+  - Same pattern 2026\-11\-24 for TestE2E\_PhysicalStandbyRestartPointAdvancesPgControl: it failed once in the 18\-min
+    set and passed 4/4 alone.
 - [x] **M0149-0015c — a stopped goopg primary rejoins its promoted standby**
   Kind: impl
   Parent: M0149-0015

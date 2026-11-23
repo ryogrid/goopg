@@ -1,6 +1,6 @@
 # 0149-0015 — Port recovery/t/012\_subtransactions.pl
 
-Status: in progress. The port exists and is skipped unless `GOOPG_TAP_012=1`. All\-goopg and PG\-primary pairings pass. The goopg\-primary / PG\-standby pairing still fails on 0015e.
+Status: done. `TestPort_Recovery012Subtransactions` passes all\-goopg and with PG 18.3 as primary or standby.
 
 Upstream: `postgres/src/test/recovery/t/012_subtransactions.pl`; walsender.c `WalSndDone`, postmaster.c
 `PM_SHUTDOWN` → `PM_SHUTDOWN_2`, xlog.c `StartupXLOG` (`recoveryTargetTLI`, `writeTimeLineHistory`), twophase.c.
@@ -20,8 +20,9 @@ Upstream: `postgres/src/test/recovery/t/012_subtransactions.pl`; walsender.c `Wa
 |---|---|
 | `log_checkpoints` was not a registered GUC; goopg refused the test's postgresql.conf | fixed: registered \(bool, on, sighup\) |
 | the old primary could not rejoin \(0015c\) | fixed, see below |
-| goopg 2PC is in\-memory only: no PREPARE record, no pg\_twophase, lost at restart \(0015a\) | open |
-| a goopg standby drops a replayed PREPARE; promotion cannot COMMIT/ROLLBACK PREPARED it \(0015b\) | open |
+| PG refused goopg\-written pg\_proc rows: text\[\] ndim 0, pseudo\-type prorettype 25 \(0015e\) | fixed |
+| goopg 2PC is in\-memory only: no PREPARE record, no pg\_twophase, lost at restart \(0015a\) | fixed |
+| a goopg standby drops a replayed PREPARE; promotion cannot COMMIT/ROLLBACK PREPARED it \(0015b\) | fixed |
 
 ## 0015c — rejoining after promotion
 
@@ -96,6 +97,21 @@ Slices:
    - Tests: `TestE2E_PreparedXactSurvivesPromotion` \(goopg primary → goopg standby, commit and rollback\). 012's
      all\-goopg and pg18\-primary pairings pass end to end.
 
+## 0015e — the last pairing \(goopg primary, PG 18.3 standby\)
+
+- The baton's "replay stall" was wrong. pg\_waldump of the rejoined node's WAL showed PG never ran the segment's
+  statements. The test's `psql` ignores errors \(Cluster.pm's `psql` does too\), so logging stderr showed PG refusing
+  the function goopg had created:
+  - "cannot change return type of existing function";
+  - "proargnames must have the same number of elements as the function has arguments".
+- Cause 1: `pgTextArrayBytes` never set the ArrayType `ndim`. Every goopg\-written `text[]` catalog value — proargnames,
+  reloptions, proconfig, pg\_statistic text stavalues — was an empty array to PG. It now writes ndim 1, and PG's 16\-byte
+  empty array for no elements. goopg's own decoders read the dims word and are unaffected.
+- Cause 2: `TypeNameToOID` knows no pseudo\-types and returns text. `RETURNS void` was written as prorettype 25.
+  `PGProcTypeOID` now maps PG's pseudo\-types \(void, trigger, record, any\*, handlers, …\) to their pg\_type OIDs. The
+  change is scoped to the pg\_proc writer.
+- With both fixed, 012 passes in all three pairings, and the env gate is gone \(R\-012 `port`\).
+
 ## Not covered
 
 - The walsender's drain and flush wait are fixed at 10 s instead of following `wal_sender_timeout`. Logical
@@ -103,9 +119,10 @@ Slices:
 - A goopg standby of a PG primary does not see user tables \(M0149\-0015d, filed\): neither one already in the base
   backup, nor one created while the standby streams. One created after the backup but before the standby starts is
   seen.
-- 0015e \(filed\): a former goopg primary that rejoins as a standby replays only up to the first commit after
-  following the new timeline. After that its replayer sees only XLOG\_FPI records every 8 kB, the streamed PREPARE
-  never reaches it, and its apply LSN still advances.
+- 0015f \(filed\): `CREATE OR REPLACE FUNCTION` on a goopg node promoted from a PG primary's backup panics in
+  `cmpKeyProcNameArgsNsp`. PG's suffix\-truncated pivot tuples in `pg_proc_proname_args_nsp_index` are shorter than
+  the key goopg compares. 012 passes regardless: the function already exists, and Cluster.pm's `psql` ignores the
+  error.
 - A standby does not write pg\_twophase files at restartpoints, and its startup does not restore prepared
   transactions from files or WAL: restoreTwoPhaseData runs only on a primary.
 - The PREPARE record carries no resource\-manager records: no lock records for a standby to re\-acquire, and no

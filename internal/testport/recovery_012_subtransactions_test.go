@@ -1,7 +1,6 @@
 package testport
 
 import (
-	"os"
 	"testing"
 
 	"github.com/goopg/goopg/internal/testutil/tapnode"
@@ -13,18 +12,10 @@ import (
 // across a primary restart, streaming replay, promotion and the old
 // primary rejoining as a standby. Run all-goopg and with PG 18.3 as the
 // initial primary or standby (the roles swap twice during the test, so
-// every mixed pairing runs each engine in both roles).
+// every mixed pairing runs each engine in both roles). M0149-0015.
 func TestPort_Recovery012Subtransactions(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping recovery TAP port in short mode")
-	}
-	// Not yet passing: goopg's two-phase commit is in-memory only. A
-	// prepared transaction writes no PREPARE record or pg_twophase file and
-	// does not survive a restart (M0149-0015a), and a goopg standby does not
-	// keep a replayed PREPARE for COMMIT/ROLLBACK PREPARED after promotion
-	// (M0149-0015b). GOOPG_TAP_012=1 runs it anyway.
-	if os.Getenv("GOOPG_TAP_012") == "" {
-		t.Skip("012 needs durable two-phase commit (M0149-0015a/b); set GOOPG_TAP_012=1 to run")
 	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)
@@ -64,7 +55,11 @@ func runSubtransactions(t *testing.T, nodePrimary *tapnode.Node, standbyFromBack
 	// are what the .pl looks at.
 	psql := func(n *tapnode.Node, sql string) (string, int) {
 		t.Helper()
-		out, _, rc := n.PSQLExit("postgres", sql)
+		out, stderr, rc := n.PSQLExit("postgres", sql)
+		if rc != 0 {
+			// $node->psql does not fail on errors; the log shows why.
+			t.Logf("%s: psql exit %d: %s", n.Name(), rc, stderr)
+		}
 		return out, rc
 	}
 
