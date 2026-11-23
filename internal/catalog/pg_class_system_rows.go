@@ -29,3 +29,27 @@ func IsCapturedSystemRelation(oid uint32) bool {
 	_, ok := capturedSystemRelSet[oid]
 	return ok
 }
+
+// SeedRelationStorage reports where a system relation of PG 18.3's initdb
+// keeps its main fork, from its seeded pg_class row: the file number
+// (relfilenode, or the OID for a mapped catalog whose relfilenode is 0), the
+// relkind, and whether it is a shared catalog (reltablespace pg_global, so
+// global/<filenode>). ok is false for an OID that is not a seeded relation.
+// M0149-0006.
+func SeedRelationStorage(oid uint32) (filenode uint32, relkind string, shared bool, ok bool) {
+	key := strconv.FormatUint(uint64(oid), 10)
+	for _, r := range seedPgClassRows {
+		if len(r) < 18 || r[0] != key {
+			continue
+		}
+		fn, err := strconv.ParseUint(r[7], 10, 32)
+		if err != nil {
+			return 0, "", false, false
+		}
+		if fn == 0 {
+			fn = uint64(oid)
+		}
+		return uint32(fn), r[17], r[8] == "1664", true
+	}
+	return 0, "", false, false
+}

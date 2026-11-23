@@ -263,6 +263,7 @@ type BasicSession struct {
 	pendingTruncates    []TruncateUndoEntry        // heap/index page snapshots for TRUNCATE rollback
 	pendingSeqRestores  []SeqRestoreEntry          // sequence counter restores for RESTART IDENTITY rollback
 	savepointDDLDrops   []DDLDropUndoEntry         // DROP TABLE inside savepoints, for ROLLBACK TO (M0097-0023)
+	savepointUndos      []savepointUndo            // undo for ROLLBACK TO and ROLLBACK, by savepoint depth (M0149-0006)
 	pendingIndexDrops   []PendingIndexDrop         // DROP INDEX deferred to COMMIT (M0118-0008)
 	pendingPartAttaches []PendingPartitionAttach   // ATTACH PARTITION deferred to COMMIT (M0118-0008)
 	pendingInheritChng  []PendingInheritanceChange // ALTER TABLE {NO} INHERIT deferred to COMMIT (M0118-0008)
@@ -434,6 +435,7 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.pendingRelStats = nil // committed (or already restored by ROLLBACK)
 	s.pendingCatalogUndos = nil
 	s.savepointDDLDrops = nil
+	s.savepointUndos = nil
 	s.pendingIndexDrops = nil
 	s.pendingPartAttaches = nil
 	s.pendingInheritChng = nil
@@ -959,6 +961,41 @@ func (s *BasicSession) TakePendingSeqRestores() []SeqRestoreEntry {
 // SavepointDepth returns the current number of active savepoint stack entries.
 func (s *BasicSession) SavepointDepth() int {
 	return s.subxactStack.Len()
+}
+
+// savepointUndo is a change ROLLBACK TO the savepoint level it was made at
+// (or a full ROLLBACK) must reverse.
+type savepointUndo struct {
+	depth int
+	fn    func()
+}
+
+// RecordSavepointUndo queues fn to run when the change it reverses is rolled
+// back: by ROLLBACK TO any savepoint at or above the current depth, or by
+// ROLLBACK. RELEASE keeps it, so an enclosing savepoint's rollback still runs
+// it, as a released subtransaction's changes belong to its parent.
+// M0149-0006.
+func (s *BasicSession) RecordSavepointUndo(fn func()) {
+	s.savepointUndos = append(s.savepointUndos, savepointUndo{depth: s.SavepointDepth(), fn: fn})
+}
+
+// RunSavepointUndosToDepth runs, newest first, the undos recorded at
+// savepoint depth >= depth (ROLLBACK TO), or all of them for depth 0
+// (ROLLBACK), and forgets them.
+func (s *BasicSession) RunSavepointUndosToDepth(depth int) {
+	var keep []savepointUndo
+	var run []savepointUndo
+	for _, u := range s.savepointUndos {
+		if u.depth >= depth {
+			run = append(run, u)
+		} else {
+			keep = append(keep, u)
+		}
+	}
+	s.savepointUndos = keep
+	for i := len(run) - 1; i >= 0; i-- {
+		run[i].fn()
+	}
 }
 
 // RecordDDLDrop records a DROP TABLE performed inside an active savepoint

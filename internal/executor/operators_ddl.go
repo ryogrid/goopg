@@ -674,6 +674,34 @@ func (o *ddlOp) relocateRelationPhysicalFile(oldRel, newRel storage.RelFileNode)
 // deliberately non-fatal: it only leaves harmless orphaned bytes on disk,
 // never lost or duplicated data — the caller has already committed to the
 // new location being authoritative.
+// deferTablespaceMove makes ALTER TABLE SET TABLESPACE transactional, as PG's
+// new-relfilenode copy is (ATExecSetTableSpace + RelationCreateStorage /
+// RelationDropStorage). The old file is removed at commit and listed in the
+// commit record. A full ROLLBACK, or a ROLLBACK TO the savepoint that made
+// the move, restores the tablespace and drops the copy. Before this, the
+// rolled-back move stayed in effect, and the rows written afterwards went
+// into a file the catalog no longer named after a restart (018_wal_optimize
+// spc_abort). It reports whether the old file's removal was deferred; outside
+// a transaction-managed context the caller removes it at once.
+// M0149-0006.
+func (o *ddlOp) deferTablespaceMove(tbl *catalog.Table, oldTablespace uint32, oldRel, newRel storage.RelFileNode) bool {
+	if oldRel == newRel || o.ctx.Pool == nil || o.ctx.TxnMgr == nil || o.ctx.WAL == nil {
+		return false
+	}
+	if err := dropRelationStorage(o.ctx, oldRel, true); err != nil {
+		return false
+	}
+	createdRelationStorage(o.ctx, newRel, true)
+	if sess, ok := o.ctx.Session.(*BasicSession); ok && sess.TracksDDLUndo() {
+		pool, fsm, vm := o.ctx.Pool, o.ctx.FSM, o.ctx.VM
+		sess.RecordSavepointUndo(func() {
+			tbl.Tablespace = oldTablespace
+			_ = removeRelationStorage(pool, fsm, vm, newRel, true)
+		})
+	}
+	return true
+}
+
 func (o *ddlOp) relocateRelationPhysicalFileCleanupOld(oldRel storage.RelFileNode) {
 	if o.ctx.Pool == nil {
 		return
@@ -11848,7 +11876,9 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if err := o.relocateRelationPhysicalFile(oldRel, newRel); err != nil {
 				return fmt.Errorf("could not move table %q to tablespace: %w", tbl.Name, err)
 			}
+			oldTablespace := tbl.Tablespace
 			tbl.Tablespace = oid
+			deferred := o.deferTablespaceMove(tbl, oldTablespace, oldRel, newRel)
 			if catalogHeapSyncAvailable(o.ctx) {
 				if err := o.ctx.MaterializeWriterXID(); err == nil {
 					xmax := o.ctx.Tx.XID
@@ -11860,7 +11890,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					return fmt.Errorf("DDL catalog sync: %w", syncErr)
 				}
 			}
-			if oldRel != newRel {
+			if oldRel != newRel && !deferred {
 				o.relocateRelationPhysicalFileCleanupOld(oldRel)
 			}
 		case parser.AlterTableSetAccessMethod:
@@ -19677,6 +19707,18 @@ func stampCatalogRows(ctx *Context, rel storage.RelFileNode, xmax storage.Transa
 // conppeqop, conffeqop, conexclop) and its conrelid sits behind a 64-byte
 // name, so it must be decoded properly.
 func stampCatalogRowsTuple(ctx *Context, rel storage.RelFileNode, xmax storage.TransactionID, match func(storage.HeapTuple) bool) {
+	// Inside a SAVEPOINT the deleting transaction is the subtransaction, as
+	// for every other heap write (effectiveWriterXID): the new row version
+	// carries the subxid as its xmin, so the superseded one must carry it as
+	// its xmax. Stamped with the top-level xid, a ROLLBACK TO left the old
+	// row deleted by a committed transaction and the new one aborted, and
+	// the relation vanished after a restart. M0149-0006.
+	subXmax := false
+	if xmax == ctx.Tx.XID {
+		if w := effectiveWriterXID(ctx); w != storage.InvalidTransactionID && w != xmax {
+			xmax, subXmax = w, true
+		}
+	}
 	nBlocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil || nBlocks == 0 {
 		return
@@ -19717,7 +19759,12 @@ func stampCatalogRowsTuple(ctx *Context, rel storage.RelFileNode, xmax storage.T
 				// suffices for the startup heap reload (scanCatalogHeapRows
 				// checks Xmax!=0), but runtime seq scans need this hint to
 				// reliably hide catalog rows that were re-synced.
-				storage.PageSetHeapTupleXmaxCommitted(page, lineNo)
+				// Not for a subtransaction's stamp: a ROLLBACK TO would leave
+				// the hint claiming a deletion that never happened, and a PG
+				// server trusts hint bits (HeapTupleSatisfiesMVCC).
+				if !subXmax {
+					storage.PageSetHeapTupleXmaxCommitted(page, lineNo)
+				}
 				// M0146-0063b: a deleted row leaves the page not all-visible.
 				if ctx.VM != nil {
 					ctx.VM.ClearBlock(rel, blk)

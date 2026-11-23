@@ -184,7 +184,11 @@ func runCopyToCore(ctx *Context, plan *optimizer.Copy, emit func([]byte) error) 
 		case format.csv:
 			buf, encErr = EncodeCopyCsvRow(buf, row, cols, format, dateStyle, dateOrder, timeZone, byteaMode, cat, qualify, argVisible)
 		default:
-			buf, encErr = EncodeCopyTextRow(buf, row, cols, dateStyle, dateOrder, timeZone, byteaMode, cat, qualify, argVisible)
+			delim, nullStr := format.delim, format.nullStr
+			if delim == 0 {
+				delim = '\t'
+			}
+			buf, encErr = EncodeCopyTextRowDelim(buf, row, cols, delim, nullStr, dateStyle, dateOrder, timeZone, byteaMode, cat, qualify, argVisible)
 		}
 		if encErr != nil {
 			return count, binary, encErr
@@ -486,7 +490,11 @@ func (c *CopyFromExecutor) PushLine(line []byte) error {
 		return c.pushCsvLine(line)
 	}
 	c.lineLen = len(trimCopyLineCR(line))
-	src, err := DecodeCopyTextRow(line, c.listedColumns(), c.format.nullStr, timeZoneFromCtx(c.ctx), dateInputFromCtx(c.ctx).order)
+	delim := c.format.delim
+	if delim == 0 {
+		delim = '\t'
+	}
+	src, err := DecodeCopyTextRowDelim(line, c.listedColumns(), delim, c.format.nullStr, timeZoneFromCtx(c.ctx), dateInputFromCtx(c.ctx).order)
 	if err != nil {
 		return &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: fmt.Sprintf("COPY: %v", err), Context: c.copyContext()}
 	}

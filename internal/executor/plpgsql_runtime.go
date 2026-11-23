@@ -3875,37 +3875,53 @@ func substituteTriggerRefs(sql string, trig *plpgsqlTrigCtx) string {
 				vals[i] = datumToSQLLiteral(val)
 			}
 			replacement := strings.Join(vals, ", ")
-			// Case-insensitive replace.
-			sqlUpper := strings.ToUpper(sql)
-			starUpper := strings.ToUpper(star)
-			idx := strings.Index(sqlUpper, starUpper)
-			for idx != -1 {
-				sql = sql[:idx] + replacement + sql[idx+len(star):]
-				sqlUpper = strings.ToUpper(sql)
-				idx = strings.Index(sqlUpper, starUpper)
-			}
+			sql = replaceRecordRef(sql, star, replacement)
 		}
 		// Replace "OLD.colname" / "NEW.colname" with literal values.
 		for i, col := range trig.Cols {
 			ref := strings.ToUpper(which) + "." + strings.ToUpper(col.Name)
-			sqlUpper := strings.ToUpper(sql)
-			idx := strings.Index(sqlUpper, ref)
-			if idx == -1 {
+			if !strings.Contains(strings.ToUpper(sql), ref) {
 				continue
 			}
 			val := NullDatum
 			if i < len(row) {
 				val = row[i]
 			}
-			literal := datumToSQLLiteral(val)
-			for idx != -1 {
-				sql = sql[:idx] + literal + sql[idx+len(ref):]
-				sqlUpper = strings.ToUpper(sql)
-				idx = strings.Index(sqlUpper, ref)
-			}
+			sql = replaceRecordRef(sql, ref, datumToSQLLiteral(val))
 		}
 	}
 	return sql
+}
+
+// replaceRecordRef replaces every case-insensitive occurrence of ref
+// (NEW.col, OLD.*) that stands as a whole reference: not preceded by an
+// identifier character, and, unless ref ends in '*', not followed by one.
+// A bare substring match replaced NEW.id inside NEW.id2 and left "2"
+// behind (018_wal_optimize's ins_trig). M0149-0006.
+func replaceRecordRef(sql, ref, replacement string) string {
+	isIdent := func(b byte) bool {
+		return b == '_' || b == '$' || b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= 0x80
+	}
+	upperRef := strings.ToUpper(ref)
+	var out strings.Builder
+	i := 0
+	for {
+		j := strings.Index(strings.ToUpper(sql[i:]), upperRef)
+		if j < 0 {
+			out.WriteString(sql[i:])
+			return out.String()
+		}
+		start, end := i+j, i+j+len(ref)
+		before := start > 0 && isIdent(sql[start-1])
+		after := !strings.HasSuffix(ref, "*") && end < len(sql) && isIdent(sql[end])
+		out.WriteString(sql[i:start])
+		if before || after {
+			out.WriteString(sql[start:end])
+		} else {
+			out.WriteString(replacement)
+		}
+		i = end
+	}
 }
 
 // datumToSQLLiteral formats a Datum as a SQL literal string suitable for

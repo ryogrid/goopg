@@ -9793,6 +9793,12 @@ func isLiveForUniqueCheck(ctx *Context, xmin, xmax storage.TransactionID) bool {
 	selfXID := ctx.Tx.XID
 	if ctx.TxnMgr != nil {
 		switch {
+		case xidIsSelf(ctx, xmin) && ctx.TxnMgr.IsSubxact(xmin) && ctx.TxnMgr.IsAborted(xmin):
+			// Inserted by one of our subtransactions that ROLLBACK TO undid:
+			// TransactionIdIsCurrentTransactionId excludes an aborted
+			// subtransaction, so the row is dead, and inserting the same key
+			// again must succeed (018_wal_optimize idx_hint). M0149-0006.
+			xminLive = false
 		case xidIsSelf(ctx, xmin):
 			// Inserted by our own xact (top-level or any subtransaction) in
 			// this transaction — live. A sub-XID stays "self" even after
@@ -9838,6 +9844,11 @@ func isLiveForUniqueCheck(ctx *Context, xmin, xmax storage.TransactionID) bool {
 	// raise 23505 against the row we just deleted.
 	if selfXID != storage.InvalidTransactionID && xmax == selfXID {
 		return false
+	}
+	// A delete by one of our own subtransactions: undone by ROLLBACK TO (the
+	// row is live again), otherwise deleted by us. M0149-0006.
+	if ctx.TxnMgr != nil && xidIsSelf(ctx, xmax) && ctx.TxnMgr.IsSubxact(xmax) {
+		return ctx.TxnMgr.IsAborted(xmax)
 	}
 	if ctx.TxnMgr != nil {
 		if ctx.TxnMgr.IsXIDActive(xmax) {

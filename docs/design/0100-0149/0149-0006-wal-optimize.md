@@ -1,0 +1,63 @@
+# 0149\-0006 — recovery/t/018\_wal\_optimize.pl: crash recovery after WAL\-skipping operations
+
+Status: in progress \(2026\-11\-23\). TestPort\_Recovery018WalOptimize passes 40/42 assertions, 20/21 at each
+wal\_level. Only check\_orphan\_relfilenodes fails. The test is listed in ci/batch/expected\-failures.csv.
+
+## The test
+
+It runs one sequence at wal\_level = minimal and again at replica, each step followed by a crash and a check:
+
+- SET TABLESPACE;
+- TRUNCATE alone, with INSERT, with COPY, with triggers, and with PREPARE TRANSACTION;
+- savepoints around SET TABLESPACE, rolled back, released and nested;
+- a hint\-bit case on a unique index after ROLLBACK TO;
+- triggers firing during COPY.
+
+At the end it checks that every file under base/<db> is a pg\_class relation, and the reverse.
+
+## Fixes \(each named by a failing assertion or a startup failure\)
+
+- **GUCs.** `wal_log_hints` \(bool, postmaster\) and `wal_skip_threshold` \(kB, user\) are registered with PG's
+  defaults. goopg WAL\-logs every relation change at every wal\_level and never skips WAL, so minimal behaves like
+  replica.
+- **COPY DELIMITER.** The text reader split on tab whatever DELIMITER said, in every syntax and both from a file and
+  from STDIN.
+  - `DecodeCopyTextRowDelim` splits on the option.
+  - The writer, its sibling, uses `EncodeCopyTextRowDelim`: it separates fields with the delimiter, escapes the
+    delimiter inside values \(CopyAttributeOutText\) and writes the NULL string. Verified byte for byte against PG.
+- **Subtransactions in commit and abort records.** Commit records listed no subxacts, so a subtransaction's writes
+  had no committed status after a crash. Catalog rows written by an ALTER inside a released savepoint vanished.
+  - `Manager.SubxidsOf` now feeds XACT\\_XINFO\\_HAS\\_SUBXACTS: the commit lists the committed children, the abort
+    all of them.
+  - ROLLBACK TO writes an abort record for the subtransaction and stamps it aborted in clog
+    \(RecordTransactionAbort with isSubXact\).
+- **Aborted subtransactions after a restart.** The rolled\\-back set lived in memory, but the parent links persist, so
+  a rolled\\-back subxid resolved to its committed parent and its rows came back. `Manager.IsAborted` now also trusts
+  clog, as TransactionIdDidCommit does.
+- **Catalog row stamps inside a savepoint.** `stampCatalogRowsTuple` stamped the superseded row with the top\\-level
+  xid while the new version carried the subxid. A ROLLBACK TO therefore left the old row deleted by a committed
+  transaction, and the table disappeared after a restart.
+  - It now stamps with `effectiveWriterXID`.
+  - It no longer sets HEAP\\_XMAX\\_COMMITTED for a subtransaction's stamp, since PG trusts hint bits.
+- **Unique checks after ROLLBACK TO.** `isLiveForUniqueCheck` treated a row inserted by our own rolled\\-back
+  subtransaction as live, so re\\-inserting the key failed with 23505. A delete by a rolled\\-back subtransaction now
+  leaves the row live; a delete by our own live subtransaction removes it.
+- **PL/pgSQL `NEW.col` substitution** matched `NEW.id` inside `NEW.id2`. `replaceRecordRef` now requires identifier
+  boundaries.
+- **SET TABLESPACE is transactional.**
+  - The old file is removed at commit and listed in the commit record.
+  - A ROLLBACK, or a ROLLBACK TO the savepoint that made the move, restores the tablespace in memory and removes the
+    copy \\(`deferTablespaceMove`, `BasicSession.RecordSavepointUndo`\\).
+- **`pg_relation_filepath` / `pg_relation_filenode` for system relations.** They returned NULL for every seeded
+  relation; they now read its pg\\_class seed row \\(`catalog.SeedRelationStorage`\\).
+
+## Remaining: check\_orphan\_relfilenodes
+
+- goopg writes files under base/<db> that PG does not have there:
+  - `0`;
+  - the shared catalogs' indexes 2697, 2698, 6114 and 6115, which PG keeps only in global/;
+  - files numbered 2614, 3765, 3768, 6003, 6101, 6137, 9400 and 9410, which are not PG relations there.
+- The temporary table's files are named `<oid>` where PG uses `t<procno>_<oid>`, and they survive the crash; PG's
+  RemovePgTempFiles removes them.
+- pg\\_class lists TOAST relations \\(OIDs 100000000 plus the table's\\) that have no file; PG creates the TOAST heap
+  with the table.

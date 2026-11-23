@@ -1340,6 +1340,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			// (XACT_XINFO_HAS_RELFILELOCATORS); their files are removed once
 			// the record is written (transam pending_rel_delete.go).
 			dropped := txnMgr.PendingRelDeletes(xid)
+			// The committed subtransactions go into the record
+			// (XACT_XINFO_HAS_SUBXACTS), so replay stamps them committed with
+			// their parent (TransactionIdCommitTree). Without them, catalog
+			// rows an ALTER wrote inside a SAVEPOINT were lost after a crash.
+			// M0149-0006.
 			// If the transaction wrote to a nailed catalog relation (pg_class,
 			// pg_attribute, pg_proc, or pg_type), emit a commit-with-inval
 			// record and unlink both pg_internal.init files so the next backend
@@ -1348,7 +1353,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			// M0106-0010 batched-31.
 			if txnMgr.TakeRelcacheInvalPending() {
 				// A6: PG xl_xact_commit with HAS_INVALS (xid in the header).
-				payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, nil, dropped, true)
+				payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, true)
 				_ = catalog.WithRelCacheInitLock(func() error {
 					if err := catalog.RelcacheInitFileUnlink(abs, catalog.DefaultDBOid); err != nil {
 						return err
@@ -1366,12 +1371,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 					return bootstrapRelcacheInitFiles(abs)
 				})
 			} else {
-				payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, nil, dropped, false)
+				payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, false)
 			}
 		case transam.XactAbort:
 			// The relations the transaction created go into the abort record;
 			// their files are removed once it is written (XactLogAbortRecord).
-			payload, perr = xlog.EncodeXactAbortPGWithRelsAt(stopTime, xid, nil, txnMgr.PendingAbortRelDeletes(xid))
+			payload, perr = xlog.EncodeXactAbortPGWithRelsAt(stopTime, xid, txnMgr.SubxidsOf(xid, false), txnMgr.PendingAbortRelDeletes(xid))
 		default:
 			return fmt.Errorf("goopg: unknown xact marker %v", kind)
 		}

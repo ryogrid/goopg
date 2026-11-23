@@ -125,6 +125,10 @@
 
 #wal_level = replica                    # minimal | replica | logical
                                         # (change requires restart)
+#wal_log_hints = off                    # also do full page writes of non-critical
+                                        # updates; accepted, goopg ignores it
+#wal_skip_threshold = 2MB               # in kB; accepted, goopg WAL-logs every
+                                        # relation change at every wal_level
 #wal_buffers = -1                       # min 32kB, -1 sets based on shared_buffers
                                         # (change requires restart)
                                         # (change requires restart)

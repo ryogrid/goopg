@@ -15609,6 +15609,29 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/recovery/t/018_wal_optimize.pl` — replay after `wal_level=minimal` WAL-skipping operations.
   Likely prerequisites \(verify at start\): `wal_level=minimal` skip-WAL + pending-sync at commit \(`storage.c` `smgrDoPendingSyncs`, `wal_skip_threshold`\), COPY/TRUNCATE/SET TABLESPACE in-xact matrix, PREPARE TRANSACTION. Overlap: SET TABLESPACE copying files without WAL is the M0122-0009b finding \(deferral ledger 2026-10-13; no fix\_plan entry at filing — reference it if filed, else file it here\).
+  - 2026\-11\-23 \(partial, still open\): ported as TestPort\_Recovery018WalOptimize, listed in
+    ci/batch/expected\-failures.csv. Movement: tap 018 0/42 → 40/42. Regress copy2 249 → 248.
+    Design: docs/design/0100\-0149/0149\-0006\-wal\-optimize.md.
+    - Path\-to\-TAP \(each link a failing assertion or a startup failure\):
+      - 018 ← unknown wal\_log\_hints / wal\_skip\_threshold. Fixed.
+      - 018 ← COPY DELIMITER ignored. Fixed, reader and writer.
+      - 018 spc\_\* ← catalog rows lost after an ALTER inside a savepoint. Fixed:
+        - subxacts in the commit record;
+        - ROLLBACK TO's abort record;
+        - stamps with the subxid.
+      - 018 spc\_abort ← SET TABLESPACE not rolled back. Fixed: transactional move.
+      - 018 idx\_hint ← unique check counting a rolled\-back row. Fixed.
+      - 018 ins\_trig ← NEW.id replaced inside NEW.id2. Fixed.
+      - 018 orphan check ← pg\_relation\_filepath NULL for system relations. Fixed; the remainder is below.
+    - Open, the last 2 assertions \(check\_orphan\_relfilenodes at both wal\_levels\):
+      - extra files under base/<db>: `0`, shared\-catalog indexes 2697/2698/6114/6115, and 2614, 3765, 3768,
+        6003, 6101, 6137, 9400, 9410;
+      - temp relation files are not named `t<procno>_<oid>` and are not removed at a crash restart
+        \(RemovePgTempFiles\);
+      - TOAST relations listed in pg\_class have no file.
+    - Also found and fixed on the way, because the path above required them:
+      - data rolled back to a savepoint came back after a crash;
+      - a re\-insert after ROLLBACK TO raised 23505.
 - [ ] **M0149-0007 — port recovery/t/029_stats_restart.pl**
   Kind: impl
   Parent: none

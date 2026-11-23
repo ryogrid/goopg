@@ -7433,7 +7433,9 @@ func evalPgRelationFilenode(x *optimizer.FuncCall, slot SlotView, ctx *Context) 
 	}
 	rel, ok := relationStorageForOID(cat, oid)
 	if !ok {
-		return NullDatum, nil
+		if rel, ok = seedRelationStorage(ctx, oid); !ok {
+			return NullDatum, nil
+		}
 	}
 	return Datum{Kind: KindInt, Int: int64(rel.RelOid)}, nil
 }
@@ -7461,9 +7463,32 @@ func evalPgRelationFilepath(x *optimizer.FuncCall, slot SlotView, ctx *Context) 
 	}
 	rel, ok := relationStorageForOID(cat, oid)
 	if !ok {
-		return NullDatum, nil
+		if rel, ok = seedRelationStorage(ctx, oid); !ok {
+			return NullDatum, nil
+		}
 	}
 	return NewStringDatum(storage.RelMainPath(rel)), nil
+}
+
+// seedRelationStorage is the storage of a system relation known only by its
+// seeded pg_class row (catalog.SeedRelationStorage): base/<database>/<filenode>
+// in the session's database, or global/<filenode> for a shared catalog.
+// pg_relation_filepath returned NULL for these, so a check comparing the
+// files under base/<db> with pg_class saw every system relation as an orphan
+// (018_wal_optimize's check_orphan_relfilenodes). M0149-0006.
+func seedRelationStorage(ctx *Context, oid uint32) (storage.RelFileNode, bool) {
+	fn, relkind, shared, ok := catalog.SeedRelationStorage(oid)
+	if !ok || !catalog.RelkindHasStorage(relkind) {
+		return storage.RelFileNode{}, false
+	}
+	if shared {
+		return storage.RelFileNode{DBOid: 0, RelOid: fn}, true
+	}
+	db := ctx.CurrentDatabaseOid
+	if db == 0 {
+		db = catalog.DefaultDBOid
+	}
+	return storage.RelFileNode{DBOid: db, RelOid: fn}, true
 }
 
 // evalPgRelationSize implements pg_relation_size(relation [, fork]) → bigint,

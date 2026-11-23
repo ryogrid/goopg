@@ -34,23 +34,31 @@ import (
 // for a bytea column ("hex", the boot default, or "escape" —
 // M0134-0001 S12); pass "hex" (or "") for the boot default.
 func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, dateOrder, timeZone, byteaMode string, cat catalog.Catalog, qualify bool, visible ...func(schema string) bool) ([]byte, error) {
+	return EncodeCopyTextRowDelim(dst, row, cols, '\t', `\N`, dateStyle, dateOrder, timeZone, byteaMode, cat, qualify, visible...)
+}
+
+// EncodeCopyTextRowDelim is EncodeCopyTextRow with the COPY's DELIMITER and
+// NULL strings (CopyOneRowTo / CopyAttributeOutText): fields are separated by
+// delim, a delimiter inside a value is backslash-escaped, and NULL is written
+// as nullStr. M0149-0006.
+func EncodeCopyTextRowDelim(dst []byte, row Row, cols []catalog.Column, delim byte, nullStr string, dateStyle, dateOrder, timeZone, byteaMode string, cat catalog.Catalog, qualify bool, visible ...func(schema string) bool) ([]byte, error) {
 	if len(row) != len(cols) {
 		return nil, fmt.Errorf("EncodeCopyTextRow: %d cols vs %d datums", len(cols), len(row))
 	}
 	for i, c := range cols {
 		if i > 0 {
-			dst = append(dst, '\t')
+			dst = append(dst, delim)
 		}
 		d := row[i]
 		if d.IsNull() {
-			dst = append(dst, '\\', 'N')
+			dst = append(dst, nullStr...)
 			continue
 		}
 		s, err := datumToCopyText(c.Type, d, dateStyle, dateOrder, timeZone, byteaMode, cat, qualify, visible...)
 		if err != nil {
 			return nil, err
 		}
-		dst = appendCopyTextEscaped(dst, s)
+		dst = appendCopyTextEscapedDelim(dst, s, delim)
 	}
 	dst = append(dst, '\n')
 	return dst, nil
@@ -66,7 +74,14 @@ func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, da
 // consumed by the types whose input function reads the GUC when the text itself
 // carries no zone field (today: timetz). M0119-0006 (48th slice).
 func DecodeCopyTextRow(line []byte, cols []catalog.Column, nullStr string, timeZone string, dateOrder ...string) (Row, error) {
-	fields, err := splitCopyTextFields(line, nullStr)
+	return DecodeCopyTextRowDelim(line, cols, '\t', nullStr, timeZone, dateOrder...)
+}
+
+// DecodeCopyTextRowDelim is DecodeCopyTextRow with the COPY's DELIMITER
+// (CopyReadAttributesText splits on cstate->opts.delim[0], tab by default).
+// M0149-0006.
+func DecodeCopyTextRowDelim(line []byte, cols []catalog.Column, delim byte, nullStr string, timeZone string, dateOrder ...string) (Row, error) {
+	fields, err := splitCopyTextFields(line, delim, nullStr)
 	if err != nil {
 		return nil, err
 	}
@@ -103,12 +118,13 @@ type copyField struct {
 	isNull bool
 }
 
-// splitCopyTextFields splits one COPY-text row on unescaped tabs and
+// splitCopyTextFields splits one COPY-text row on the delimiter (tab by
+// default) and
 // decodes per-byte backslash escapes. A field whose only content is
 // the unescaped sequence `\N` is the SQL NULL sentinel; that's
 // distinct from the literal two-byte string "\N", which would have
 // to be written `\\N` on the wire.
-func splitCopyTextFields(line []byte, nullStr string) ([]copyField, error) {
+func splitCopyTextFields(line []byte, delim byte, nullStr string) ([]copyField, error) {
 	// Phase 1: split on unescaped tabs. Backslash escapes are NOT
 	// processed here — we first find tab boundaries, then unescape
 	// each field in phase 2. This prevents a trailing `\` in a
@@ -116,7 +132,7 @@ func splitCopyTextFields(line []byte, nullStr string) ([]copyField, error) {
 	var rawFields [][]byte
 	start := 0
 	for i := 0; i < len(line); i++ {
-		if line[i] == '\t' {
+		if line[i] == delim {
 			rawFields = append(rawFields, line[start:i])
 			start = i + 1
 		}
@@ -244,7 +260,17 @@ func decodeHexEscape(rest []byte) (byte, int) {
 // applied. Backslash, newline, carriage return, and tab are escaped;
 // other characters pass through unchanged.
 func appendCopyTextEscaped(dst []byte, s string) []byte {
+	return appendCopyTextEscapedDelim(dst, s, '\t')
+}
+
+// appendCopyTextEscapedDelim also escapes the delimiter, as
+// CopyAttributeOutText does for any c == delimc.
+func appendCopyTextEscapedDelim(dst []byte, s string, delim byte) []byte {
 	for i := 0; i < len(s); i++ {
+		if s[i] == delim && delim != '\t' {
+			dst = append(dst, '\\', delim)
+			continue
+		}
 		switch s[i] {
 		case '\\':
 			dst = append(dst, '\\', '\\')

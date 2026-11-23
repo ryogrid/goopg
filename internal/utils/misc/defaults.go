@@ -1634,6 +1634,21 @@ func BuildDefaultRegistry() *Registry {
 		Context:     ContextPostmaster,
 		Scope:       ScopeServer,
 	}))
+	// wal_log_hints and wal_skip_threshold (guc_tables.c): accepted. goopg
+	// WAL-logs every relation change at every wal_level, so it never skips
+	// WAL for a relation created in the same transaction (the minimal-level
+	// optimisation wal_skip_threshold tunes). M0149-0006.
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_log_hints", Type: TypeBool, BootVal: "off",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_skip_threshold", Type: TypeInt, Unit: UnitKB, BootVal: "2MB",
+		MinVal: 0, MaxVal: 2147483647,
+		Context: ContextUserset,
+		Scope:   ScopeServer | ScopeSession | ScopeTransaction,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "max_wal_senders", Type: TypeInt, BootVal: "10",
 		MinVal: 0, MaxVal: 262143,
