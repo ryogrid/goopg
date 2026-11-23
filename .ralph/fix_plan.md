@@ -15983,13 +15983,23 @@ verify each at HEAD when the task starts.
     Parent: M0149-0016
     PG keeps them in KnownAssignedXids. 009: a RR snapshot taken before COMMIT PREPARED replays must still see 0 rows.
     Resume: recovery snapshots capture the prepared registry xids \(and subxids\) in xip.
-  - [ ] **M0149-0016b — prepared rows lost across promotion / standby restart**
+  - [x] **M0149-0016b — prepared rows lost across promotion / standby restart** \(2026\-11\-24\)
+    - Root cause \(general, not 2PC\): after a standby crash, the startup clog pass started at the newest checkpoint
+      record in the received WAL rather than at pg\_control's redo \(its last restartpoint\). Commits replayed in
+      between were swept aborted. Fixed in initdb xact\_recovery.go replayStartFromControl.
+    - Movement: 009 all\-goopg final data checks fail → pass, 2 runs; TestE2E\_StandbyCrashKeepsCommitsBeforePrimaryCheckpoint
+      fails at the old HEAD and passes now.
     Kind: impl
     Parent: M0149-0016
     009 all\-goopg final check misses row 22 \(subxact row of xact\_009\_10, prepared on london, torn down, committed on
     promoted paris\) and rows 23–24 \(xact\_009\_11, prepared on paris, restored from files on restarted london,
     committed after promotion\). TestE2E\_PreparedXactSurvivesPromotion does not hit it, so the missing ingredient is
     the teardown or the standby restart.
+  - [ ] **M0149-0016d — the xmin system column is rejected \("column xmin does not exist"\)**
+    Kind: impl
+    Parent: M0149-0016
+    Found while probing 009 \(not a 009 requirement\). PG exposes xmin, xmax, cmin, cmax, ctid and tableoid on every
+    table.
   - [ ] **M0149-0016c — pg\_ls\_dir / pg\_stat\_file and pg\_subtrans files**
     Kind: impl
     Parent: M0149-0016
