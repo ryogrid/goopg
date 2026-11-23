@@ -15776,7 +15776,7 @@ verify each at HEAD when the task starts.
     - Path\-to\-TAP: 015 ← `truncate test1` on the promoted standby fails "relation \"test1\" does not exist" ←
       a table created on the primary after the standby attached never appears in the goopg standby's catalog,
       before or after promotion, and not even after a standby restart → **M0149-0010a** \(next\).
-  - [ ] **M0149-0010a — a goopg streaming standby must see tables the primary creates after it attached**
+  - [x] **M0149-0010a — a goopg streaming standby must see tables the primary creates after it attached**
     Kind: impl
     Parent: M0149-0010
     Proven by: TestPort\_Recovery015PromotionPages — after wait\_for\_catchup \(replay\_lsn ≥ the primary's
@@ -15788,6 +15788,25 @@ verify each at HEAD when the task starts.
       does not see the replayed pg\_class/pg\_attribute rows — whether the rows are not replayed into the
       standby's catalog heaps, or the standby's clog does not mark the creating xid committed
       \(catalogRowLive\) — then make the running standby pick up new relations during replay.
+    - 2026\-11\-23 DONE. Two causes, both fixed:
+      - the running standby never refreshed its catalog: StreamReplayer now notes system\-catalog block
+        references \(relfilenode < 16384\) and, at the next replayed commit, calls Runtime.RefreshCatalogAfterReplay
+        for each such database \(idempotent loadUserTablesFromHeapForDB\) — PG's relcache invalidation;
+      - replayed commits never reached clog \(ReplayXactCommit only advanced nextXID\), so after promotion a restart's
+        implicit\-abort sweep \(MarkUnknownAsAborted\) declared the primary's DDL xids aborted and the table vanished.
+        ReplayXactCommit/Abort now stamp clog, for the record's subtransactions too \(xact\_redo\_commit,
+        TransactionIdCommitTree\).
+      - Found by: a PG 18.3 cold start on a copy of the standby saw test1 with all rows, so replay into the heaps
+        was right.
+    - Movement: tap 015 0/1 → 1/1 all\-goopg.
+  - [ ] **M0149-0010b — 015 mixed runs: PG 18.3 primary → goopg standby, and goopg primary → PG 18.3 standby**
+    Kind: impl
+    Parent: M0149-0010
+    Required by the milestone's PASS condition \(mixed runs against real PG 18.3 nodes\) before R\-015 can be `port`.
+    - Needs tapnode `NewPG` \(fresh PG init with allows\_streaming\) and `InitFromBackupPG`.
+    - Known risk: PG 18.3 started in standby mode on a copy of a goopg standby crashed in standby\_redo
+      \(TRAP in standby\_redo\+0x124 on the cassert build\) — a goopg RM\_STANDBY record PG cannot replay. Reproduce in
+      the goopg\-primary → PG\-standby run before fixing.
 - [ ] **M0149-0011 — port recovery/t/016_min_consistency.pl**
   Kind: impl
   Parent: none

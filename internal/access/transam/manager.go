@@ -185,6 +185,12 @@ func (m *Manager) SetNextXID(x storage.TransactionID) {
 // committed XID, causing "xid >= Xmax → invisible" for every replayed tuple.
 func (m *Manager) ReplayXactCommit(xid storage.TransactionID) {
 	m.xidgen.SetNext(xid + 1)
+	// xact_redo_commit stamps the commit in clog (TransactionIdCommitTree),
+	// so a promoted standby's restart finds the primary's transactions
+	// committed rather than sweeping them to aborted. M0149-0010a.
+	if c := m.CLog(); c != nil {
+		_ = c.SetCommitted(xid)
+	}
 }
 
 // ReplayXactAbort is called by the standby's StreamReplayer when it applies a
@@ -193,6 +199,9 @@ func (m *Manager) ReplayXactCommit(xid storage.TransactionID) {
 // (so its heap tuples remain invisible to queries on the standby).
 func (m *Manager) ReplayXactAbort(xid storage.TransactionID) {
 	m.xidgen.SetNext(xid + 1)
+	if c := m.CLog(); c != nil {
+		_ = c.SetAborted(xid)
+	}
 	m.abortedMu.Lock()
 	m.abortedXIDs = insertSortedXID(m.abortedXIDs, xid)
 	m.abortedMu.Unlock()
@@ -222,6 +231,14 @@ func (m *Manager) SetCLog(c *CLog) {
 // SetCLog had no production caller at all for the whole of M0117..M0131, which
 // made the entire durable-abort visibility fallback dead code on every live
 // server (docs/design/0131-0027).
+// CLog returns the manager's commit log, or nil when none is wired. The
+// standby's live catalog refresh reads catalog rows through it (M0149-0010a).
+func (m *Manager) CLog() *CLog {
+	m.abortedMu.RLock()
+	defer m.abortedMu.RUnlock()
+	return m.clog
+}
+
 func (m *Manager) HasCLog() bool {
 	m.abortedMu.RLock()
 	defer m.abortedMu.RUnlock()

@@ -3683,3 +3683,25 @@ func reloadUserExtensionsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemo
 	}
 	return nil
 }
+
+// RefreshCatalogAfterReplay is the running standby's relcache invalidation:
+// after a replayed commit changed database dbOid's system catalogs, it reloads
+// that database's user tables from the replayed pg_class/pg_attribute heaps,
+// registering relations the primary created since the standby started.
+// Registration is idempotent (TryRegisterUserTable), so tables already known
+// are left as they are. M0149-0010a.
+func (r *Runtime) RefreshCatalogAfterReplay(dbOid uint32) error {
+	cat, ok := r.Catalog.(*catalog.InMemory)
+	if !ok || cat == nil || r.StorageMgr == nil {
+		return nil
+	}
+	var clog *transam.CLog
+	if r.TxnMgr != nil {
+		clog = r.TxnMgr.CLog()
+	}
+	heapDB := storage.StorageDBOid(dbOid)
+	if heapDB == storage.StorageDBOid(cat.DBOID()) {
+		return loadUserTablesFromHeapForDB(r.StorageMgr, cat, clog, cat.DBOID(), 0)
+	}
+	return loadUserTablesFromHeapForDB(r.StorageMgr, cat, clog, dbOid, dbOid)
+}

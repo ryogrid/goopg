@@ -1,4 +1,4 @@
 case_id,scope,reason,since,tracking
 deadlock-parallel.spec,isolation,known-fail per upstream-isolation-coverage (120/121 pass),2026-07-06,docs/test-port/upstream-isolation-coverage.md
 TestPort_Recovery018WalOptimize,testport,port in progress (M0149-0006): 40/42 assertions; check_orphan_relfilenodes fails only on the goopg-private 9410 stats sidecar in base/<db> (M0149-0006b, owner-gated),2026-11-23,.ralph/fix_plan.md M0149-0006
-TestPort_Recovery015PromotionPages,testport,port in progress (M0149-0010): a goopg streaming standby never sees tables created on the primary after it attached (M0149-0010a),2026-11-23,.ralph/fix_plan.md M0149-0010
+TestPort_Recovery015PromotionPages,testport,passes all-goopg; listed until the mixed PG 18.3 runs land (M0149-0010b) and R-015 becomes port,2026-11-23,.ralph/fix_plan.md M0149-0010

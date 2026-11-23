@@ -46,6 +46,9 @@ type StreamReplayer struct {
 	// abort. Used by the standby to advance the local MVCC manager's
 	// nextXID so replayed tuples become visible to queries.
 	onXactReplay func(xid storage.TransactionID, committed bool)
+	// onCatalogReplay / catalogDBs: the live catalog refresh (M0149-0010a).
+	onCatalogReplay func(dbOid uint32)
+	catalogDBs      map[uint32]struct{}
 
 	mu       sync.Mutex
 	applyLSN uint64
@@ -109,6 +112,32 @@ func NewStreamReplayer(mgr *storage.Manager, baselineLSN uint64) *StreamReplayer
 // Must be called before Run.
 func (sr *StreamReplayer) SetXactReplayHook(fn func(xid storage.TransactionID, committed bool)) {
 	sr.onXactReplay = fn
+}
+
+// SetCatalogReplayHook installs a callback invoked, after a replayed commit,
+// for every database whose system catalogs the replayed WAL changed since the
+// previous commit. It is the standby's counterpart of the relcache
+// invalidation PG's commit records carry (XACT_XINFO_HAS_INVALS): the hook
+// refreshes the running standby's catalog so relations the primary created
+// become visible without a restart. Must be called before Run. M0149-0010a.
+func (sr *StreamReplayer) SetCatalogReplayHook(fn func(dbOid uint32)) {
+	sr.onCatalogReplay = fn
+}
+
+// noteCatalogBlocks records the databases of the system-catalog relations
+// (relfilenode below FirstNormalObjectId) rec changed.
+func (sr *StreamReplayer) noteCatalogBlocks(rec Record) {
+	if sr.onCatalogReplay == nil || rec.XLog == nil {
+		return
+	}
+	for _, b := range rec.XLog.Blocks {
+		if b.Rel.RelOid != 0 && b.Rel.RelOid < 16384 && b.Rel.DBOid != 0 {
+			if sr.catalogDBs == nil {
+				sr.catalogDBs = make(map[uint32]struct{})
+			}
+			sr.catalogDBs[b.Rel.DBOid] = struct{}{}
+		}
+	}
 }
 
 // ApplyLSN returns the LSN of the most recently applied record (or
@@ -196,9 +225,22 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 		// visibility). The hook is called outside the replayer's mutex
 		// because the mvcc.Manager has its own lock; holding both would
 		// risk a deadlock with concurrent snapshot takers.
-		if sr.onXactReplay != nil {
-			if xid, committed, ok := replayedXactInfo(rec); ok {
+		sr.noteCatalogBlocks(rec)
+		if xid, committed, ok := replayedXactInfo(rec); ok {
+			if sr.onXactReplay != nil {
+				// xact_redo_commit / xact_redo_abort mark the whole
+				// transaction tree: the record's subtransactions first, then
+				// the top-level xid (TransactionIdCommitTree). M0149-0010a.
+				for _, sub := range replayedSubxacts(rec) {
+					sr.onXactReplay(sub, committed)
+				}
 				sr.onXactReplay(xid, committed)
+			}
+			if committed && sr.onCatalogReplay != nil && len(sr.catalogDBs) > 0 {
+				for db := range sr.catalogDBs {
+					sr.onCatalogReplay(db)
+				}
+				sr.catalogDBs = nil
 			}
 		}
 		// RecoveryRestartPoint (xlog.c): remember the checkpoint for the
@@ -249,4 +291,21 @@ func replayedXactInfo(rec Record) (storage.TransactionID, bool, bool) {
 	default:
 		return 0, false, false
 	}
+}
+
+// replayedSubxacts returns the subtransaction xids a PG commit or abort record
+// lists (XACT_XINFO_HAS_SUBXACTS), or nil.
+func replayedSubxacts(rec Record) []storage.TransactionID {
+	if rec.XLog == nil || rec.XLog.Header.Rmid != RmgrXact {
+		return nil
+	}
+	parsed, err := ParseXactRecord(rec.XLog.Header.Info, rec.XLog.MainData)
+	if err != nil || len(parsed.Subxacts) == 0 {
+		return nil
+	}
+	out := make([]storage.TransactionID, len(parsed.Subxacts))
+	for i, x := range parsed.Subxacts {
+		out[i] = storage.TransactionID(x)
+	}
+	return out
 }
