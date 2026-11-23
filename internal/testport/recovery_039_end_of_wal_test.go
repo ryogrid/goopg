@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/testutil/tapnode"
@@ -29,6 +30,9 @@ func TestPort_Recovery039EndOfWal(t *testing.T) {
 	const xlpFirstIsContrecord = 0x0001 // XLP_FIRST_IS_CONTRECORD
 
 	node := tapnode.NewGoopg(t, repo, "node")
+	// Cluster.pm init (no allows_streaming) writes max_wal_senders = 0; PG
+	// refuses wal_level = minimal without it.
+	node.AppendConf("max_wal_senders = 0")
 	node.AppendConf("wal_level = minimal")
 	node.AppendConf("autovacuum = off")
 	node.AppendConf("checkpoint_timeout = '30min'")
@@ -151,21 +155,34 @@ func TestPort_Recovery039EndOfWal(t *testing.T) {
 		}
 		return regexp.MustCompile(pattern).Match(data[offset:])
 	}
-	ok := func(cond bool, name string) {
-		t.Helper()
-		if !cond {
-			t.Errorf("not ok: %s", name)
-		}
-	}
+	pgCase := 0
 	restartAndCheck := func(pattern, name string, corrupt func()) {
 		t.Helper()
 		node.Stop(tapnode.StopImmediate)
 		if corrupt != nil {
 			corrupt()
 		}
+		// M0149 C3: PG 18.3 recovering a copy of the same doctored
+		// directory stops at the same defect with the same message.
+		pgCase++
+		pg := tapnode.ColdStartPG(t, node, fmt.Sprintf("pg-case-%02d", pgCase))
+		if data, err := os.ReadFile(pg.LogPath()); err != nil || !regexp.MustCompile(pattern).Match(data) {
+			t.Errorf("not ok: %s (pg18 on the doctored goopg WAL)", name)
+		}
+		pg.Stop(tapnode.StopFast)
 		size := logSize()
 		node.Start()
-		ok(logContains(pattern, size), name)
+		if !logContains(pattern, size) {
+			t.Errorf("not ok: %s", name)
+			// Show what recovery logged instead.
+			if data, err := os.ReadFile(node.LogPath()); err == nil && int64(len(data)) >= size {
+				for _, line := range strings.Split(string(data[size:]), "\n") {
+					if strings.Contains(strings.ToLower(line), "wal") || strings.Contains(line, "record") {
+						t.Logf("  log: %s", line)
+					}
+				}
+			}
+		}
 	}
 	const big = 2 * 1024 * 1024 * 1024
 

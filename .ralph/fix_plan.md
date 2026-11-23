@@ -15711,7 +15711,7 @@ verify each at HEAD when the task starts.
     backend crash\-restart of M0149\-0004, is `[!]` on architecture. 013's central steps `pg_ctl kill` QUIT/KILL a
     backend by its OS PID and expect the postmaster to survive and run restart\_after\_crash \(milestone C4 names
     013\_crash\_restart\). The inventory row stays `port` \(shortcut port\) until this closes.
-- [ ] **M0149-0076 — re-port recovery/t/039_end_of_wal.pl to the M0149 contract**
+- [x] **M0149-0076 — re-port recovery/t/039_end_of_wal.pl to the M0149 contract**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/039_end_of_wal.pl` — end-of-WAL detection with hand-crafted defective page and record headers written into WAL files.
@@ -15725,10 +15725,14 @@ verify each at HEAD when the task starts.
       - 039 setup ← `pg_settings` lacked wal\_segment\_size / wal\_block\_size. Fixed: preset rows.
       - 039 setup ← `pg_control_checkpoint()` not a table function. Fixed.
       - 039 setup ← `pg_switch_wal()` does not exist: no XLOG\_SWITCH in the WAL writer. Fixed in slice 2.
-      - 039 every case ← goopg's end\-of\-WAL log text is its own, not xlogreader.c's. NEXT.
+      - 039 every case ← goopg's end\-of\-WAL log text is its own, not xlogreader.c's. Fixed in slice 3.
   - 2026\-11\-23 slice 2: Writer.SwitchSegment \(XLOG\_SWITCH + zero\-filled segment tail + xl\_prev = switch record,
     flushed\); pg\_switch\_wal\(\); readAllPageAware and the writer's position scan step to the next segment after
     a switch. Movement: tap 039 0/14 → 0/14, now running all 14 cases \(before: stopped in setup\).
+  - 2026\-11\-23 slice 3, DONE: pgDecodeFailure / PGEndOfWALMessage reproduce XLogDecodeNextRecord's checks and
+    texts at goopg's replay stop point, logged after crash recovery. Each case also runs PG 18.3 on a copy of the
+    doctored directory \(C3\). Movement: tap 039 0/14 → 14/14. Inventory R\-039 stays `port` with the new
+    rationale; the expected\-failures row is removed.
     - Filed nearby, not worked: `pg_settings` is a hard\-coded list of \~60 rows, not the GUC registry \(PG's
       show\_all\_settings\); the other pg\_control\_\* functions \(system, init, recovery\) are missing.
 - [ ] **M0149-0009 — port recovery/t/008_fsm_truncation.pl**

@@ -514,6 +514,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: wal replay: %w", err)
 	}
+	// M0149-0076: crash recovery ends where the WAL stops decoding, and
+	// PostgreSQL logs xlogreader.c's reason at LOG ("invalid record length at
+	// 0/...: expected at least 24, got 0" for an ordinary zero tail).
+	if recov.crashRecovery {
+		if msg := xlog.PGEndOfWALMessage(filepath.Join(abs, "pg_wal"), 0); msg != "" {
+			slog.Default().Info(msg)
+		}
+	}
 	// A standby keeps replaying; PG runs the init pass when recovery ends
 	// (promotion), which this startup path does not reach.
 	if inRecovery && !startStandby {
