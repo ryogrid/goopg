@@ -69,3 +69,45 @@ func TestE2E_PreparedXactSurvivesPromotion(t *testing.T) {
 		})
 	}
 }
+
+// TestE2E_HotStandbyOldSnapshotHidesLaterCommitPrepared: a REPEATABLE READ
+// snapshot taken on a hot standby while a transaction is prepared keeps its
+// rows invisible after the COMMIT PREPARED replays; a new snapshot sees them.
+// The standby holds prepared xids as running in its snapshots, as PG's
+// KnownAssignedXids does. M0149-0016a (009's standby-MVCC check).
+func TestE2E_HotStandbyOldSnapshotHidesLaterCommitPrepared(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E in short mode")
+	}
+	repo := repoRoot(t)
+	tapnode.Available(t, repo)
+	p := tapnode.NewGoopg(t, repo, "primary")
+	p.AppendConf("max_prepared_transactions = 10")
+	p.Start()
+	bkp := p.Backup("b")
+	p.SafePSQL("postgres", "CREATE TABLE m (id int)")
+	s := tapnode.InitFromBackupGoopg(t, repo, "standby", p, bkp, true)
+	s.Start()
+	p.SafePSQL("postgres", "BEGIN; INSERT INTO m VALUES (1); SAVEPOINT a; INSERT INTO m VALUES (2); PREPARE TRANSACTION 'mv';")
+	waitForCatchup(t, p, s)
+	// As 009 does: restart the standby while the transaction is prepared.
+	// Its restore moves nextXid past the prepared xid, so the snapshot below
+	// cannot hide the rows as "future" — only holding the prepared xid as
+	// running does.
+	s.Restart()
+	sess := s.BackgroundPSQL("postgres", true)
+	defer func() { _ = sess.Quit() }()
+	sess.QuerySafe("BEGIN ISOLATION LEVEL REPEATABLE READ")
+	if got := sess.QuerySafe("SELECT count(*) FROM m"); got != "0" {
+		t.Fatalf("prepared rows visible on standby: %s", got)
+	}
+	p.SafePSQL("postgres", "COMMIT PREPARED 'mv'")
+	waitForCatchup(t, p, s)
+	if got := sess.QuerySafe("SELECT count(*) FROM m"); got != "0" {
+		t.Fatalf("old snapshot sees the committed prepared rows: %s", got)
+	}
+	sess.QuerySafe("COMMIT")
+	if got := sess.QuerySafe("SELECT count(*) FROM m"); got != "2" {
+		t.Fatalf("new snapshot sees %s rows, want 2", got)
+	}
+}

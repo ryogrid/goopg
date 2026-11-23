@@ -1408,6 +1408,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// written.
 		stopTime := xlog.TimestampTzNow()
 		finishedPrepared := false
+		var finishedSubs []storage.TransactionID
 		switch kind {
 		case transam.XactCommit:
 			// The relations the transaction dropped go into the commit record
@@ -1427,12 +1428,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			// M0106-0010 batched-31.
 			// A prepared transaction finishes with COMMIT PREPARED: the
 			// record names it in xl_xact_twophase (RecordTransactionCommitPrepared).
-			twoPhase := txnMgr.TakeTwoPhase(xid)
+			prepEntry, twoPhase := txnMgr.TakeTwoPhaseEntry(xid)
 			finishedPrepared = twoPhase
+			commitSubs := txnMgr.SubxidsOf(xid, true)
+			if twoPhase {
+				commitSubs = mergeSubxids(prepEntry.Subxacts, commitSubs)
+				finishedSubs = commitSubs
+			}
 			if txnMgr.TakeRelcacheInvalPending() {
 				// A6: PG xl_xact_commit with HAS_INVALS (xid in the header).
 				if twoPhase {
-					payload, perr = xlog.EncodeXactCommitPreparedPGAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, true)
+					payload, perr = xlog.EncodeXactCommitPreparedPGAt(stopTime, xid, commitSubs, dropped, true)
 				} else {
 					payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, true)
 				}
@@ -1453,7 +1459,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 					return bootstrapRelcacheInitFiles(abs)
 				})
 			} else if twoPhase {
-				payload, perr = xlog.EncodeXactCommitPreparedPGAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, false)
+				payload, perr = xlog.EncodeXactCommitPreparedPGAt(stopTime, xid, commitSubs, dropped, false)
 			} else {
 				payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, false)
 			}
@@ -1461,9 +1467,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			// The relations the transaction created go into the abort record;
 			// their files are removed once it is written (XactLogAbortRecord).
 			// A prepared transaction finishes with ABORT PREPARED.
-			if txnMgr.TakeTwoPhase(xid) {
+			if prepEntry, ok := txnMgr.TakeTwoPhaseEntry(xid); ok {
 				finishedPrepared = true
-				payload, perr = xlog.EncodeXactAbortPreparedPGAt(stopTime, xid, txnMgr.SubxidsOf(xid, false), txnMgr.PendingAbortRelDeletes(xid))
+				finishedSubs = mergeSubxids(prepEntry.Subxacts, txnMgr.SubxidsOf(xid, false))
+				payload, perr = xlog.EncodeXactAbortPreparedPGAt(stopTime, xid, finishedSubs, txnMgr.PendingAbortRelDeletes(xid))
 			} else {
 				payload, perr = xlog.EncodeXactAbortPGWithRelsAt(stopTime, xid, txnMgr.SubxidsOf(xid, false), txnMgr.PendingAbortRelDeletes(xid))
 			}
@@ -1537,6 +1544,21 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// Persist commit/abort status in clog (M0030-0007). Non-fatal: the
 		// WAL XactCommit record is the primary durability mechanism (or, for
 		// an async commit, the CLOG write barrier — see above).
+		// RecordTransactionCommitPrepared / AbortPrepared stamp the whole
+		// tree (TransactionIdCommitTree / AbortTree): a prepared
+		// transaction's children were kept out of the startup sweep while it
+		// was prepared, and a restored one has no live subtransaction
+		// tracking to fall back on, so they get their clog status here
+		// (M0149-0016a).
+		if finishedPrepared {
+			for _, sub := range finishedSubs {
+				if kind == transam.XactCommit {
+					_ = clog.SetCommittedWithLSN(sub, endLSN)
+				} else {
+					_ = clog.SetAborted(sub)
+				}
+			}
+		}
 		switch kind {
 		case transam.XactCommit:
 			// C2 (S2..S4): sync and async commits stamp identically —

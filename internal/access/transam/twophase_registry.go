@@ -83,18 +83,27 @@ func (m *Manager) RegisterPrepared(p PreparedXact) {
 // (RecordTransactionCommitPrepared), not a plain one. The caller removes the
 // state file once that record is written (RemoveTwoPhaseFile).
 func (m *Manager) TakeTwoPhase(xid storage.TransactionID) bool {
+	_, ok := m.TakeTwoPhaseEntry(xid)
+	return ok
+}
+
+// TakeTwoPhaseEntry is TakeTwoPhase returning the prepared transaction's
+// registry entry, whose Subxacts — from its two-phase state — are the
+// children RecordTransactionCommitPrepared lists (hdr->nsubxacts), whether
+// or not this process tracked them as live subtransactions.
+func (m *Manager) TakeTwoPhaseEntry(xid storage.TransactionID) (PreparedXact, bool) {
 	r := &m.twoPhase
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	p, ok := r.byXID[xid]
 	if !ok {
-		return false
+		return PreparedXact{}, false
 	}
 	delete(r.byXID, xid)
 	for _, s := range p.Subxacts {
 		delete(r.subToXx, s)
 	}
-	return true
+	return *p, true
 }
 
 // IsPreparedXID reports whether xid is a prepared transaction or one of its
@@ -120,6 +129,25 @@ func (m *Manager) PreparedXacts() []PreparedXact {
 		out = append(out, *p)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].XID < out[j].XID })
+	return out
+}
+
+// preparedRunningXIDs lists every registered prepared transaction's xid and
+// subtransaction xids — what a hot-standby snapshot must treat as running.
+func (m *Manager) preparedRunningXIDs() []storage.TransactionID {
+	r := &m.twoPhase
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.byXID) == 0 {
+		return nil
+	}
+	out := make([]storage.TransactionID, 0, len(r.byXID)+len(r.subToXx))
+	for x := range r.byXID {
+		out = append(out, x)
+	}
+	for sub := range r.subToXx {
+		out = append(out, sub)
+	}
 	return out
 }
 

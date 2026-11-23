@@ -47,11 +47,18 @@ func TestE2E_PreparedXactSurvivesRestart(t *testing.T) {
 			// prepared transaction's subxid.
 			n.SafePSQL("postgres", "BEGIN; INSERT INTO p VALUES (142); ROLLBACK;")
 			n.SafePSQL("postgres", tc.finish)
-			if got := n.SafePSQL("postgres", "SELECT coalesce(string_agg(id::text, ',' ORDER BY id), '') FROM p"); got != tc.want {
-				t.Fatalf("after %s: rows %q, want %q", tc.finish, got, tc.want)
-			}
 			if _, _, rc := n.PSQLExit("postgres", tc.finish); rc == 0 {
 				t.Fatal("finishing twice succeeded")
+			}
+			// The finish stamps the subtransaction too (TransactionIdCommitTree):
+			// with no read in between to set hint bits, a checkpoint past the
+			// finish record and a crash restart — whose clog replay starts
+			// after it — must still show the savepoint row (M0149-0016a).
+			n.SafePSQL("postgres", "CHECKPOINT")
+			n.Stop(tapnode.StopImmediate)
+			n.Start()
+			if got := n.SafePSQL("postgres", "SELECT coalesce(string_agg(id::text, ',' ORDER BY id), '') FROM p"); got != tc.want {
+				t.Fatalf("after %s, checkpoint and crash restart: rows %q, want %q", tc.finish, got, tc.want)
 			}
 			n.Stop(tapnode.StopFast)
 		})

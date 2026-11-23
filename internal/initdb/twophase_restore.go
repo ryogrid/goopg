@@ -169,3 +169,22 @@ func restoreTwoPhaseData(dataDir string, txnMgr *transam.Manager, standby bool) 
 	}
 	return out, nil
 }
+
+// mergeSubxids is a ∪ b in a's order then b's — a prepared transaction's
+// children from its two-phase state plus any the manager tracked live.
+func mergeSubxids(a, b []storage.TransactionID) []storage.TransactionID {
+	if len(b) == 0 {
+		return a
+	}
+	seen := make(map[storage.TransactionID]bool, len(a)+len(b))
+	out := make([]storage.TransactionID, 0, len(a)+len(b))
+	for _, l := range [][]storage.TransactionID{a, b} {
+		for _, x := range l {
+			if !seen[x] {
+				seen[x] = true
+				out = append(out, x)
+			}
+		}
+	}
+	return out
+}

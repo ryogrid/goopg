@@ -15978,7 +15978,12 @@ verify each at HEAD when the task starts.
       - regression set ← WalSndDone requests a reply \(a fast stop overran 10 s\).
     - Movement \(all\-goopg\): failures went from \(start refused\) to 3 groups: old\-snapshot MVCC; rows 22–24 \(a
       subxact row after promotion, a xact restored from files\); pg\_ls\_dir/pg\_stat\_file \+ pg\_subtrans files.
-  - [ ] **M0149-0016a — hot\-standby snapshots keep prepared/in\-progress xids invisible after their commit replays**
+  - [x] **M0149-0016a — hot\-standby snapshots keep prepared/in\-progress xids invisible after their commit replays** \(2026\-11\-24\)
+    - Recovery snapshots add the prepared registry's xids/subxids to in\-progress. Finishing a prepared xact stamps its
+      subxacts' clog from the 2PC state: the second fix closes the intermittent savepoint\-row loss \(0016b's
+      remainder, masked by hint bits whenever something read the rows\).
+    - Movement: 009 all\-goopg: 3 not\-ok \+ pg\_subtrans Fatal → only the pg\_subtrans step \(0016c\), 2/2 runs. Two
+      E2Es fail at the old HEAD and pass now.
     Kind: impl
     Parent: M0149-0016
     PG keeps them in KnownAssignedXids. 009: a RR snapshot taken before COMMIT PREPARED replays must still see 0 rows.

@@ -1447,6 +1447,23 @@ func (m *Manager) captureSnapshot() Snapshot {
 			xmin = xid
 		}
 	}
+	// A hot standby's snapshot holds the prepared transactions replay knows
+	// about as running (KnownAssignedXids, which keeps prepared xacts until
+	// their COMMIT/ABORT PREPARED replays): once captured, the snapshot keeps
+	// them invisible even after the finish record later stamps clog — a
+	// REPEATABLE READ snapshot taken before COMMIT PREPARED replays must not
+	// start seeing its rows. M0149-0016a.
+	if m.inRecovery.Load() {
+		for _, x := range m.preparedRunningXIDs() {
+			if x >= xmax {
+				continue
+			}
+			inProgress = append(inProgress, x)
+			if x < xmin {
+				xmin = x
+			}
+		}
+	}
 	if len(inProgress) == 0 {
 		xmin = xmax
 	}
