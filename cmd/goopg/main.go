@@ -37,6 +37,7 @@ import (
 	"github.com/goopg/goopg/internal/postmaster/walsummarizer"
 	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
@@ -1122,6 +1123,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	srv := postmaster.New(cfg)
+	if sc != nil {
+		add := srv.AddRecoveredPrepared
+		sc.onRecoveredPrepared.Store(&add)
+	}
 	quit.setServer(srv)
 	if quit.Requested() {
 		return 0
@@ -1178,6 +1183,25 @@ func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Ru
 			txnMgr.ReplayXactCommit(xid)
 		} else {
 			txnMgr.ReplayXactAbort(xid)
+		}
+	})
+	// M0149-0015b: a replayed PREPARE leaves a prepared transaction the
+	// standby keeps (PrepareRedoAdd), so after promotion it can still be
+	// committed or rolled back; COMMIT/ABORT PREPARED replay drops it
+	// (PrepareRedoRemove). Its xid stays unknown in clog, so hot-standby
+	// snapshots keep treating it as in progress.
+	sr.SetTwoPhaseReplayHooks(func(endLSN uint64, state []byte) {
+		st, err := xlog.ParseTwoPhaseState(state)
+		if err != nil {
+			logger.Warn("standby replay: unreadable prepare record", "err", err)
+			return
+		}
+		txnMgr.RegisterPrepared(transam.PreparedXact{
+			XID: st.XID, Subxacts: st.Subxacts, GID: st.GID, State: state, PrepareEndLSN: endLSN,
+		})
+	}, func(xid storage.TransactionID) {
+		if txnMgr.TakeTwoPhase(xid) {
+			txnMgr.RemoveTwoPhaseFile(xid)
 		}
 	})
 	// M0149-0010a: a replayed commit that changed a database's system

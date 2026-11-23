@@ -48,6 +48,10 @@ type StreamReplayer struct {
 	// abort. Used by the standby to advance the local MVCC manager's
 	// nextXID so replayed tuples become visible to queries.
 	onXactReplay func(xid storage.TransactionID, committed bool)
+	// onPrepareReplay / onPreparedFinish: two-phase replay (PrepareRedoAdd /
+	// PrepareRedoRemove). M0149-0015b.
+	onPrepareReplay  func(endLSN uint64, state []byte)
+	onPreparedFinish func(xid storage.TransactionID)
 	// onCatalogReplay / catalogDBs: the live catalog refresh (M0149-0010a).
 	onCatalogReplay func(dbOid uint32)
 	catalogDBs      map[uint32]struct{}
@@ -118,6 +122,15 @@ func NewStreamReplayer(mgr *storage.Manager, baselineLSN uint64) *StreamReplayer
 // Must be called before Run.
 func (sr *StreamReplayer) SetXactReplayHook(fn func(xid storage.TransactionID, committed bool)) {
 	sr.onXactReplay = fn
+}
+
+// SetTwoPhaseReplayHooks installs the two-phase replay callbacks: prepare
+// is called with each XLOG_XACT_PREPARE record's end LSN and state buffer
+// (xact_redo's PrepareRedoAdd), finish with the xid each COMMIT/ABORT
+// PREPARED record finishes (PrepareRedoRemove). Must be called before Run.
+func (sr *StreamReplayer) SetTwoPhaseReplayHooks(prepare func(endLSN uint64, state []byte), finish func(xid storage.TransactionID)) {
+	sr.onPrepareReplay = prepare
+	sr.onPreparedFinish = finish
 }
 
 // SetCatalogReplayHook installs a callback invoked, after a replayed commit,
@@ -238,6 +251,17 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 		// because the mvcc.Manager has its own lock; holding both would
 		// risk a deadlock with concurrent snapshot takers.
 		sr.noteCatalogBlocks(rec)
+		finishesPrepared := false
+		if rec.XLog != nil && rec.XLog.Header.Rmid == RmgrXact {
+			switch rec.XLog.Header.Info & xlogXactOpMask {
+			case xlogXactPrepare:
+				if sr.onPrepareReplay != nil {
+					sr.onPrepareReplay(rec.EndLSN, append([]byte(nil), rec.XLog.MainData...))
+				}
+			case xlogXactCommitPrepared, xlogXactAbortPrepared:
+				finishesPrepared = true
+			}
+		}
 		if xid, committed, ok := replayedXactInfo(rec); ok {
 			if sr.onXactReplay != nil {
 				// xact_redo_commit / xact_redo_abort mark the whole
@@ -247,6 +271,9 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 					sr.onXactReplay(sub, committed)
 				}
 				sr.onXactReplay(xid, committed)
+			}
+			if finishesPrepared && sr.onPreparedFinish != nil {
+				sr.onPreparedFinish(xid)
 			}
 			if committed && sr.onCatalogReplay != nil && len(sr.catalogDBs) > 0 {
 				for db := range sr.catalogDBs {

@@ -1,6 +1,6 @@
 # 0149-0015 — Port recovery/t/012\_subtransactions.pl
 
-Status: in progress. The port exists and is skipped unless `GOOPG_TAP_012=1`. It still needs 0015b \(0015a is done\).
+Status: in progress. The port exists and is skipped unless `GOOPG_TAP_012=1`. All\-goopg and PG\-primary pairings pass. The goopg\-primary / PG\-standby pairing still fails on 0015e.
 
 Upstream: `postgres/src/test/recovery/t/012_subtransactions.pl`; walsender.c `WalSndDone`, postmaster.c
 `PM_SHUTDOWN` → `PM_SHUTDOWN_2`, xlog.c `StartupXLOG` (`recoveryTargetTLI`, `writeTimeLineHistory`), twophase.c.
@@ -83,14 +83,31 @@ Slices:
    - Tests: `TestE2E_PreparedXactSurvivesRestart` \(fast stop via the file, immediate stop via WAL\), plus registry
      unit tests.
    - Movement: 012 check 1 passes in all three pairings \(0 → 6 rows\).
-3. **Standby \(0015b\).** PREPARE replay keeps the state \(`PrepareRedoAdd`\), and promotion goes through slice 2's
-   restore.
+3. **Standby \(0015b, done 2026\-11\-24\).**
+   - The stream replayer hands each `XLOG_XACT_PREPARE` to a two\-phase hook \(`SetTwoPhaseReplayHooks`\), and the
+     standby registers it \(`PrepareRedoAdd`\). Each COMMIT/ABORT PREPARED removes the entry and its file
+     \(`PrepareRedoRemove`\). The xid stays unknown in clog, so hot\-standby snapshots keep it invisible.
+   - Promotion runs `restorePreparedAtPromotion` inside `finalizePromotion`, before pg\_control is stamped
+     `DB_IN_PRODUCTION` \(when `pg_ctl promote` returns\) and before recovery snapshots end. Each survivor gets a
+     dedicated slot and is handed to the running server \(`Server.AddRecoveredPrepared`\).
+   - The order matters twice. Restoring after the stamp let a COMMIT PREPARED race ahead and find no gid. Restoring
+     after recovery snapshots end made the prepared rows read as committed: an unknown xid below xmin counts as
+     committed.
+   - Tests: `TestE2E_PreparedXactSurvivesPromotion` \(goopg primary → goopg standby, commit and rollback\). 012's
+     all\-goopg and pg18\-primary pairings pass end to end.
 
 ## Not covered
 
 - The walsender's drain and flush wait are fixed at 10 s instead of following `wal_sender_timeout`. Logical
   walsenders do not drain at shutdown.
-- A goopg standby of a PG primary does not see user tables \(M0149\-0015d, filed\).
+- A goopg standby of a PG primary does not see user tables \(M0149\-0015d, filed\): neither one already in the base
+  backup, nor one created while the standby streams. One created after the backup but before the standby starts is
+  seen.
+- 0015e \(filed\): a former goopg primary that rejoins as a standby replays only up to the first commit after
+  following the new timeline. After that its replayer sees only XLOG\_FPI records every 8 kB, the streamed PREPARE
+  never reaches it, and its apply LSN still advances.
+- A standby does not write pg\_twophase files at restartpoints, and its startup does not restore prepared
+  transactions from files or WAL: restoreTwoPhaseData runs only on a primary.
 - The PREPARE record carries no resource\-manager records: no lock records for a standby to re\-acquire, and no
   pgstat or predicate\-lock records. It is not followed by a synchronous\-replication wait.
 - `COMMIT PREPARED` / `ROLLBACK PREPARED` answer with the command tags `COMMIT` / `ROLLBACK`; PG sends

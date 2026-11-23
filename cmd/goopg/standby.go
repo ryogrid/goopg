@@ -98,6 +98,9 @@ type standbyController struct {
 	promoted   atomic.Bool
 	// promoteTriggered: Promote was called (PromoteIsTriggered). M0149-0013.
 	promoteTriggered atomic.Bool
+	// onRecoveredPrepared hands the prepared transactions restored at
+	// promotion to the running server (Server.AddRecoveredPrepared).
+	onRecoveredPrepared atomic.Pointer[func([]initdb.RecoveredPrepared)]
 
 	// lastReceived is the highest WAL position a walreceiver reported. PG's
 	// pg_last_wal_receive_lsn keeps answering WalRcv->flushedUpto after the
@@ -315,6 +318,33 @@ func (sc *standbyController) Promote(ctx context.Context) error {
 	return err
 }
 
+// restorePreparedAtPromotion is RecoverPreparedTransactions at the end of
+// recovery: every prepared transaction the standby replayed and has not seen
+// finished gets a dedicated proc slot holding its xid (and its subxacts),
+// and is handed to the server so COMMIT/ROLLBACK PREPARED can finish it.
+// M0149-0015b.
+func (sc *standbyController) restorePreparedAtPromotion() {
+	var out []initdb.RecoveredPrepared
+	for _, p := range sc.rt.TxnMgr.PreparedXacts() {
+		tx, err := sc.rt.TxnMgr.RestorePrepared(p)
+		if err != nil {
+			sc.logger.Warn("promote: could not restore prepared transaction", "xid", p.XID, "gid", p.GID, "err", err)
+			continue
+		}
+		st, _ := xlog.ParseTwoPhaseState(p.State)
+		sc.logger.Info("recovering prepared transaction", "xid", p.XID, "gid", p.GID, "subxacts", len(p.Subxacts))
+		out = append(out, initdb.RecoveredPrepared{
+			GID: p.GID, XID: p.XID, Tx: tx, Database: st.Database, Owner: st.Owner, PreparedAt: st.PreparedAt,
+		})
+	}
+	if len(out) == 0 {
+		return
+	}
+	if fn := sc.onRecoveredPrepared.Load(); fn != nil {
+		(*fn)(out)
+	}
+}
+
 func (sc *standbyController) runPromote(ctx context.Context) error {
 	sc.logger.Info("promote: starting; cancelling walreceiver")
 	sc.receiverCancel()
@@ -488,6 +518,15 @@ func (sc *standbyController) finalizePromotion() error {
 	}
 	if err := runRecoveryEndCommand(sc.rt, endCmd, sc.logger); err != nil {
 		return fmt.Errorf("promote: %w", err)
+	}
+	// RecoverPreparedTransactions runs before StartupXLOG ends recovery:
+	// the prepared transactions replay kept are back in progress, and
+	// finishable, before pg_control says DB_IN_PRODUCTION — which is when
+	// pg_ctl promote returns — and before recovery snapshots end, after
+	// which an xid with no clog status below a snapshot's xmin would read as
+	// committed. M0149-0015b.
+	if sc.rt.TxnMgr != nil {
+		sc.restorePreparedAtPromotion()
 	}
 	// Recovery is over: pg_control leaves DB_IN_ARCHIVE_RECOVERY for
 	// DB_IN_PRODUCTION, as the end of StartupXLOG stamps it after promotion

@@ -209,4 +209,3 @@ func runSubtransactions(t *testing.T, nodePrimary *tapnode.Node, standbyFromBack
 	nodeStandby.Stop(tapnode.StopFast)
 	nodePrimary.Stop(tapnode.StopFast)
 }
-

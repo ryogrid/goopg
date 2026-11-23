@@ -89,6 +89,14 @@ func (p *preparedXactStore) putRecovered(r initdb.RecoveredPrepared) {
 	p.mu.Unlock()
 }
 
+// AddRecoveredPrepared registers prepared transactions restored after the
+// server started — a standby's promotion (RecoverPreparedTransactions).
+func (s *Server) AddRecoveredPrepared(list []initdb.RecoveredPrepared) {
+	for _, rp := range list {
+		s.preparedXacts.putRecovered(rp)
+	}
+}
+
 // takeRecovered removes and returns the restored prepared transaction gid.
 func (p *preparedXactStore) takeRecovered(gid string) (initdb.RecoveredPrepared, bool) {
 	p.mu.Lock()

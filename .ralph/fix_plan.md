@@ -15908,12 +15908,23 @@ verify each at HEAD when the task starts.
     - Movement: 012 check 1 \(nextXid handling for prepared subtransactions\) 0 → 6 rows, passing in all three
       pairings; TestE2E\_PreparedXactSurvivesRestart 2/2.
     - pg\_prepared\_xacts not fed \(not a 012 requirement; ledger\).
-- [ ] **M0149-0015b — a goopg standby keeps replayed prepared transactions**
+- [x] **M0149-0015b — a goopg standby keeps replayed prepared transactions** \(2026\-11\-24\)
+  - Movement: 012 all\-goopg 0 → full pass, pg18\-primary\-goopg\-standby → full pass \(GOOPG\_TAP\_012=1\);
+    TestE2E\_PreparedXactSurvivesPromotion 2/2.
+  - Restore runs before the production stamp: restoring after it let COMMIT PREPARED race pg\_ctl promote.
+- [ ] **M0149-0015e — a rejoined goopg standby stops replaying after following a timeline**
   Kind: impl
   Parent: M0149-0015
-  XLOG\_XACT\_PREPARE replay records the prepared state \(PrepareRedoAdd\); promotion and restart restore it
-  \(restoreTwoPhaseData\) so COMMIT/ROLLBACK PREPARED work on the promoted node. Proof: 012 pg18\-primary pairing, COMMIT
-  PREPARED rc=3 on the promoted goopg standby.
+  Proof: 012 goopg\-primary/PG\-standby pairing, lines 178/182. The old goopg primary rejoins PG's TLI 2 and replays
+  PG's DELETE \(127 heap records \+ commit\). After that its stream replayer sees only rmid 0 info 0xA0 \(XLOG\_FPI\)
+  records every ~8 kB up to the end, and none of PG's PREPARE or its inserts. apply\_lsn still advances to the end.
+  Suspect the walreceiver's rewrite of the segment from 16777216 \("WALData start mismatch"\) and the iterator's
+  file/TLI choice after followUpstreamTimeline. Fixing this un\-gates the 012 port \(R\-012 → port\).
+- [ ] **M0149-0013a — TestPort\_Recovery005ReplayDelay flaked once**
+  Kind: test
+  Parent: M0149-0013
+  It failed once, 2026\-11\-24, inside the large replication regression set; the failing check was not captured. Five
+  reruns, alone and in the set, passed. Rerun the set with \-v until a failure shows its check.
 - [x] **M0149-0015c — a stopped goopg primary rejoins its promoted standby**
   Kind: impl
   Parent: M0149-0015
@@ -15927,6 +15938,8 @@ verify each at HEAD when the task starts.
 - [ ] **M0149-0015d — a goopg standby of a PG primary cannot see a user table after promotion**
   Kind: impl
   Parent: M0149-0015
+  2026\-11\-24: seen \(table in the base backup\) and \(table created while the standby streams\); a table created after
+  the backup but before the standby starts is visible.
   Found nearby, not a proven 012 blocker \(012's pg18\-primary pairing reads its table\). In
   TestE2E\_OldPrimaryRejoinsAfterPromotion's PG\-primary variant, a table created before the base backup, or after it,
   gave `relation "r" does not exist` on the goopg standby and after its promotion. Filed per the detour guard; not
