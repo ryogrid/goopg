@@ -194,3 +194,66 @@ func parseHistoryLSN(s string) (uint64, error) {
 	}
 	return (hi << 32) | lo, nil
 }
+
+// ReplayTimelineAt is the timeline whose WAL recovery reads at lsn when it
+// started on base and pg_wal holds newer timelines' history files
+// (expectedTLEs with recovery_target_timeline = latest): the newest timeline
+// that has a segment covering lsn and whose history descends from base. A
+// standby that streamed onto a newer timeline, was restarted, and replayed
+// that timeline's segments from its own pg_wal is on that timeline even
+// though its timeline_id file still names base; base when no newer timeline
+// qualifies. M0149-0016.
+func ReplayTimelineAt(walDir string, lsn uint64, segSize int64, base uint32) uint32 {
+	if segSize <= 0 {
+		return base
+	}
+	segno := lsn / uint64(segSize)
+	for t := FindNewestTimeline(walDir, base); t > base; t-- {
+		if _, err := os.Stat(filepath.Join(walDir, XLogFileName(t, segno, segSize))); err != nil {
+			continue
+		}
+		hist, err := ReadHistory(walDir, t)
+		if err != nil {
+			continue
+		}
+		for _, e := range hist {
+			if e.TLI == base {
+				return t
+			}
+		}
+	}
+	return base
+}
+
+// LatestLocalTimeline is recoveryTargetTLI = latest for a standby's own
+// pg_wal at startup: the newest timeline that has at least one segment there
+// and whose history descends from base. A standby that streamed onto its
+// primary's newer timeline before stopping resumes replay — and writes — on
+// that timeline, although its timeline_id file still names base. M0149-0016.
+func LatestLocalTimeline(walDir string, base uint32) uint32 {
+	entries, err := os.ReadDir(walDir)
+	if err != nil {
+		return base
+	}
+	has := map[uint32]bool{}
+	for _, e := range entries {
+		if tli, _, ok := ParseXLogFileName(e.Name(), 0); ok {
+			has[tli] = true
+		}
+	}
+	for t := FindNewestTimeline(walDir, base); t > base; t-- {
+		if !has[t] {
+			continue
+		}
+		hist, err := ReadHistory(walDir, t)
+		if err != nil {
+			continue
+		}
+		for _, e := range hist {
+			if e.TLI == base {
+				return t
+			}
+		}
+	}
+	return base
+}

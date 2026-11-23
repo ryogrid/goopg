@@ -996,6 +996,13 @@ func (s *Handler) handleStandbyCopyData(slotName string, payload []byte, senderH
 // sentPtr, then end the COPY stream so the standby sees a clean end of
 // streaming rather than a dropped connection.
 func (s *Handler) walSndDone(w *libpq.FrameWriter, senderHandle *xlog.Sender, sentPtr uint64, receiveDone <-chan struct{}, streamCancel context.CancelFunc) error {
+	// WalSndDone asks for a reply (WalSndKeepalive(true, …)) so the standby
+	// reports its flush now instead of at its next status interval.
+	if senderHandle != nil && senderHandle.FlushLSN() < sentPtr {
+		if err := w.WriteCopyData(libpq.EncodeKeepalive(sentPtr, time.Now().UTC(), true)); err == nil {
+			_ = w.Flush()
+		}
+	}
 	deadline := time.Now().Add(10 * time.Second)
 	for senderHandle != nil && senderHandle.FlushLSN() < sentPtr && time.Now().Before(deadline) {
 		select {

@@ -389,6 +389,12 @@ func (s *Server) execFinalizePrepared(w *libpq.FrameWriter, ctx *executor.Contex
 			s.preparedXacts.putRecovered(rp)
 			return s.writeQueryError(w, errcodes.InternalError, ferr.Error())
 		}
+		// FinishPreparedTransaction → SyncRepWaitForLSN: the finish record
+		// waits for the synchronous standbys like any commit (M0149-0016).
+		if ctx != nil && ctx.SyncRep != nil && ctx.WAL != nil &&
+			ctx.SyncCommitMode != xlog.SyncRepOff && ctx.SyncRep.NeedsWait() {
+			_ = ctx.SyncRep.WaitForLSN(ctx.Ctx, ctx.WAL.WrittenLSN(), ctx.SyncCommitMode)
+		}
 		if isCommit {
 			return w.WriteCommandComplete("COMMIT PREPARED")
 		}

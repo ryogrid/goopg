@@ -174,3 +174,28 @@ func InitFromBackupPG(t testing.TB, repo, name string, root *Node, backupPath st
 	}
 	return n
 }
+
+// Pgbench is Cluster.pm's pgbench(opts, expected_ret, …, files): it runs PG
+// 18.3's pgbench against the node with the given options and custom script
+// files (name → contents), and fails the test unless it exits 0.
+func (n *Node) Pgbench(opts []string, scripts map[string]string) {
+	n.t.Helper()
+	host, port, user := n.connParams()
+	args := []string{"-h", host, "-p", port, "-U", user}
+	args = append(args, opts...)
+	dir := n.t.TempDir()
+	for name, body := range scripts {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			n.t.Fatalf("tapnode %s: pgbench script %s: %v", n.name, name, err)
+		}
+		args = append(args, "-f", path)
+	}
+	args = append(args, "postgres")
+	cmd := exec.Command(filepath.Join(n.binDir, "pgbench"), args...)
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C", "PGPASSWORD=",
+		"LD_LIBRARY_PATH="+filepath.Join(n.repo, "postgres", "local_install", "lib"))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		n.t.Fatalf("tapnode %s: pgbench %v: %v\n%s", n.name, opts, err, out)
+	}
+}

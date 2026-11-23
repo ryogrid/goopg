@@ -449,6 +449,15 @@ func (sc *standbyController) finalizePromotion() error {
 			oldTLI = sc.rt.WAL.TimelineID()
 		}
 		walDir := walDirFor(sc.rt)
+		// A standby restarted after it had streamed onto a newer timeline
+		// replays that timeline's segments from pg_wal while timeline_id and
+		// the writer still name the older one; recovery is on the newer
+		// timeline (expectedTLEs, recovery_target_timeline = latest), and the
+		// new history must descend from it (M0149-0016).
+		if sc.rt.WAL != nil {
+			endLSN, _ := sc.endOfLog()
+			oldTLI = xlog.ReplayTimelineAt(walDir, endLSN, sc.rt.WAL.SegmentSize(), oldTLI)
+		}
 		// StartupXLOG: newTLI = findNewestTimeLine(recoveryTargetTLI) + 1.
 		// The walreceiver fetches the primary's history files, so a
 		// timeline the primary (or a sibling standby) already used is

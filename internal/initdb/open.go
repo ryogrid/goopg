@@ -600,6 +600,20 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// timeline_id. Skip in standby mode — finalizePromotion handles the bump.
 	if abs != "" {
 		isStby, _ := IsStandby(abs)
+		if isStby {
+			// A standby resumes on the newest timeline its own pg_wal
+			// carries (recovery_target_timeline = latest): after streaming
+			// onto the primary's new timeline, its next start must replay
+			// and write there, or a later promotion copies the switch
+			// segment's prefix from the older timeline's file (M0149-0016).
+			if t := xlog.LatestLocalTimeline(filepath.Join(abs, "pg_wal"), tli); t > tli {
+				if err := WriteTimelineID(abs, t); err != nil {
+					_ = mgr.Close()
+					return nil, fmt.Errorf("goopg: adopt standby timeline %d: %w", t, err)
+				}
+				tli = t
+			}
+		}
 		if !isStby {
 			walDir := filepath.Join(abs, "pg_wal")
 			if newTLI, wrote, tliErr := xlog.WriteHistoryAfterRecovery(walDir, tli, 0); tliErr != nil {
@@ -1636,16 +1650,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// restoreTwoPhaseData + the PREPARE records after redo: prepared
 		// transactions come back in progress before the sweep below, which
 		// must not abort them (M0149-0015a).
-		if sb, _ := IsStandby(abs); !sb {
-			restored, terr := restoreTwoPhaseData(abs, txnMgr)
-			if terr != nil {
-				_ = pool.Close()
-				_ = walWriter.Close()
-				_ = mgr.Close()
-				return nil, fmt.Errorf("goopg: restore prepared transactions: %w", terr)
-			}
-			recoveredPrepared = restored
+		sb, _ := IsStandby(abs)
+		restored, terr := restoreTwoPhaseData(abs, txnMgr, sb)
+		if terr != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: restore prepared transactions: %w", terr)
 		}
+		recoveredPrepared = restored
 		// (M0106-0011) Crash-recovery implicit abort: WAL replay
 		// restored the on-disk pg_class / pg_attribute heap pages,
 		// but the JSON catalog snapshot at last clean shutdown does
@@ -2486,6 +2499,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// the in-process Senders registry — walsender goroutines
 	// register themselves on entry and unregister on exit.
 	if err := registerStatReplicationView(cat, walSenders, walWriter, syncRep); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
+	// pg_prepared_xacts over the prepared-transaction registry (M0149-0016).
+	if err := registerPreparedXactsView(cat, txnMgr); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()

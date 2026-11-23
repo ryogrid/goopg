@@ -11,6 +11,7 @@ import (
 	"strconv"
 
 	"github.com/goopg/goopg/internal/access/transam"
+	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -40,7 +41,7 @@ type RecoveredPrepared struct {
 //
 // A file for a transaction whose finishing record is replayed is removed.
 // M0149-0015a.
-func restoreTwoPhaseData(dataDir string, txnMgr *transam.Manager) ([]RecoveredPrepared, error) {
+func restoreTwoPhaseData(dataDir string, txnMgr *transam.Manager, standby bool) ([]RecoveredPrepared, error) {
 	type pending struct {
 		st     xlog.ParsedTwoPhaseState
 		raw    []byte
@@ -83,7 +84,20 @@ func restoreTwoPhaseData(dataDir string, txnMgr *transam.Manager) ([]RecoveredPr
 		if rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
 			return nil, rerr
 		}
+		// Replay starts at this node's own redo point — pg_control's
+		// checkpoint copy, which on a standby is its last restartpoint, not
+		// the primary's newest checkpoint in the received WAL. The state
+		// files cover every PREPARE before it (CheckPointTwoPhase(redo)).
 		startIdx, _ := xlog.ExportedReplayStart(records)
+		if cd, cerr := control.ReadControlFile(dataDir); cerr == nil && cd != nil && cd.CheckPointCopyRedo != 0 {
+			startIdx = len(records)
+			for i, r := range records {
+				if r.StartLSN >= cd.CheckPointCopyRedo {
+					startIdx = i
+					break
+				}
+			}
+		}
 		for _, r := range records[startIdx:] {
 			if r.XLog == nil || r.XLog.Header.Rmid != xlog.RmgrXact {
 				continue
@@ -125,10 +139,26 @@ func restoreTwoPhaseData(dataDir string, txnMgr *transam.Manager) ([]RecoveredPr
 	var out []RecoveredPrepared
 	for _, x := range xids {
 		p := found[x]
-		tx, rerr := txnMgr.RestorePrepared(transam.PreparedXact{
+		px := transam.PreparedXact{
 			XID: x, Subxacts: p.st.Subxacts, GID: p.st.GID, State: p.raw,
 			PrepareEndLSN: p.end, OnDisk: p.onDisk,
-		})
+		}
+		if standby {
+			// A standby keeps them as replay does (StandbyRecoverPreparedTransactions):
+			// registered, xids unknown in clog so recovery snapshots treat them
+			// in progress; promotion gives them proc slots.
+			txnMgr.RegisterPrepared(px)
+			high := x
+			for _, sub := range p.st.Subxacts {
+				high = max(high, sub)
+			}
+			if txnMgr.NextXID() <= high {
+				txnMgr.SetNextXID(high + 1)
+			}
+			slog.Info("recovering prepared transaction", "xid", x, "gid", p.st.GID, "subxacts", len(p.st.Subxacts), "standby", true)
+			continue
+		}
+		tx, rerr := txnMgr.RestorePrepared(px)
 		if rerr != nil {
 			return nil, rerr
 		}

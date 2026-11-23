@@ -417,6 +417,17 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
 	}))
+	// subtransaction_buffers sizes the pg_subtrans SLRU (guc_tables.c:
+	// PGC_POSTMASTER, GUC_UNIT_BLOCKS, 0 = a fraction of shared_buffers,
+	// max SLRU_MAX_ALLOWED_BUFFERS). Accepted so a postgresql.conf that sets
+	// it loads; goopg's subtransaction map is not an SLRU of this size.
+	// M0149-0016.
+	r.MustRegister(NewVariable(Variable{
+		Name: "subtransaction_buffers", Type: TypeInt, BootVal: "0",
+		MinVal: 0, MaxVal: (1 << 30) / 8192,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
 
 	// WAL & checkpointer GUCs (milestone 0002). Names, units, ranges,
 	// and defaults mirror upstream's

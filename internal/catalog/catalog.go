@@ -10347,15 +10347,16 @@ func (c *InMemory) registerSystemTables() {
 	pgPrepStmts.VirtualRows = func() [][]string { return nil }
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_prepared_statements"] = pgPrepStmts
 
-	// pg_prepared_xacts — 0 rows is fine.
+	// pg_prepared_xacts — rows come from the transaction manager's
+	// prepared-transaction registry (initdb registerPreparedXactsView).
 	pgPrepXacts := &Table{
 		Schema: "pg_catalog", Name: "pg_prepared_xacts", Virtual: true,
 		Columns: []Column{
 			{Name: "transaction", Type: Type{Name: "xid"}, Ordinal: 0},
 			{Name: "gid", Type: Type{Name: "text"}, Ordinal: 1},
 			{Name: "prepared", Type: Type{Name: "timestamptz"}, Ordinal: 2},
-			{Name: "owner", Type: Type{Name: "text"}, Ordinal: 3},
-			{Name: "database", Type: Type{Name: "text"}, Ordinal: 4},
+			{Name: "owner", Type: Type{Name: "name"}, Ordinal: 3},
+			{Name: "database", Type: Type{Name: "name"}, Ordinal: 4},
 		},
 		OID: 3400,
 	}
@@ -13480,6 +13481,20 @@ func (c *InMemory) RegisterVirtualTable(t *Table) error {
 		t.Columns[i].Ordinal = i
 	}
 	c.ns(DefaultDBOid).tables[k] = t
+	return nil
+}
+
+// SetVirtualRows replaces the row provider of a built-in virtual table
+// (pg_catalog stubs registered at catalog construction whose rows a runtime
+// subsystem supplies, e.g. pg_prepared_xacts from the transaction manager).
+func (c *InMemory) SetVirtualRows(schema, name string, rows func() [][]string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t, ok := c.ns(DefaultDBOid).tables[key(parser.ObjectName{Schema: schema, Name: name})]
+	if !ok || !t.Virtual {
+		return fmt.Errorf("SetVirtualRows: %s.%s is not a virtual table", schema, name)
+	}
+	t.VirtualRows = rows
 	return nil
 }
 

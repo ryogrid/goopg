@@ -1446,6 +1446,15 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context, shutdown bool) erro
 			return fmt.Errorf("sync recovery data files: %w", err)
 		}
 	}
+	// CreateRestartPoint → CheckPointGuts → CheckPointTwoPhase(redo): a
+	// standby writes the state files of prepared transactions replayed
+	// before the restartpoint's redo, so a restarted standby restores them
+	// (M0149-0016).
+	if fn := c.twoPhaseFn.Load(); fn != nil && haveRP {
+		if err := (*fn)(rp.Fields.RedoLSN0); err != nil {
+			return fmt.Errorf("restartpoint two-phase state: %w", err)
+		}
+	}
 	if c.cfg.DataDir != "" && (haveRP || shutdown) {
 		adopted, priorRedo, err := adoptRestartPointPrior(c.cfg.DataDir, rp, haveRP, shutdown)
 		if err != nil {

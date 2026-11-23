@@ -15967,6 +15967,35 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/recovery/t/009_twophase.pl` — two-phase commit across crashes and primary/standby role swaps.
   Likely prerequisites \(verify at start\): `pg_twophase/` state files in PG format, `XLOG_XACT_PREPARE` replay, checkpoint-time state-file writes, standby→primary role swap via `primary_conninfo`.
+  - 2026\-11\-24 slice 1 \(port written, gated by GOOPG\_TAP\_009\). Design docs/design/0100\-0149/0149\-0016\-twophase.md.
+    - Path\-to\-TAP, each proven by the probe and fixed:
+      - 009 ← subtransaction\_buffers GUC;
+      - 009 ← pg\_prepared\_xacts fed from the registry;
+      - 009 ← standby pg\_twophase files at restartpoints and standby\-start restore, scanning from pg\_control redo;
+      - 009 ← rejoin after the third swap ← a standby adopts its latest local timeline; promotion uses the replayed
+        timeline;
+      - 009 mvcc ← COMMIT PREPARED of a restored xact waits for sync rep;
+      - regression set ← WalSndDone requests a reply \(a fast stop overran 10 s\).
+    - Movement \(all\-goopg\): failures went from \(start refused\) to 3 groups: old\-snapshot MVCC; rows 22–24 \(a
+      subxact row after promotion, a xact restored from files\); pg\_ls\_dir/pg\_stat\_file \+ pg\_subtrans files.
+  - [ ] **M0149-0016a — hot\-standby snapshots keep prepared/in\-progress xids invisible after their commit replays**
+    Kind: impl
+    Parent: M0149-0016
+    PG keeps them in KnownAssignedXids. 009: a RR snapshot taken before COMMIT PREPARED replays must still see 0 rows.
+    Resume: recovery snapshots capture the prepared registry xids \(and subxids\) in xip.
+  - [ ] **M0149-0016b — prepared rows lost across promotion / standby restart**
+    Kind: impl
+    Parent: M0149-0016
+    009 all\-goopg final check misses row 22 \(subxact row of xact\_009\_10, prepared on london, torn down, committed on
+    promoted paris\) and rows 23–24 \(xact\_009\_11, prepared on paris, restored from files on restarted london,
+    committed after promotion\). TestE2E\_PreparedXactSurvivesPromotion does not hit it, so the missing ingredient is
+    the teardown or the standby restart.
+  - [ ] **M0149-0016c — pg\_ls\_dir / pg\_stat\_file and pg\_subtrans files**
+    Kind: impl
+    Parent: M0149-0016
+    009's last step lists pg\_subtrans/ with pg\_ls\_dir \+ pg\_stat\_file and expects the contents to change after
+    pgbench with a prepared xact open. Neither function exists in goopg; pg\_subtrans/ holds a static 0000. Check the
+    detour guard: this is depth 2 \(functions, then SLRU files\).
 - [ ] **M0149-0017 — port recovery/t/026_overwrite_contrecord.pl**
   Kind: impl
   Parent: none
