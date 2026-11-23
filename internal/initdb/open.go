@@ -2401,6 +2401,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 	executor.PgStatResetCheckpointer = cp.ResetStats
 	installPgStatWal(cat, walWriter)
+	// The startup process's WAL reads (pg_stat_io startup/wal/normal): the
+	// pages from the redo point to the end of WAL. M0149-0007.
+	if abs != "" {
+		executor.RecordStartupWALReads(recov.redoLSN, walWriter.WrittenLSN())
+	}
 	if err := registerStatCheckpointerView(cat, cp); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()

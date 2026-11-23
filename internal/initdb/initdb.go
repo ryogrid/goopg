@@ -1602,6 +1602,12 @@ func Init(opts Options) error {
 	// the mapped-local-catalog heaps — is final, and before the trailing fsync
 	// so the checksummed bytes are flushed durably. A version-0 cluster (the
 	// default) skips this entirely and is byte-identical to before.
+	// M0149-0007: initdb's standalone backend leaves pg_stat/pgstat.stat
+	// behind with the IO it did — the bootstrap WAL segment's write — which
+	// the first server start loads into pg_stat_io.
+	if err := executor.WriteInitStatsFile(abs, xlog.DefaultSegmentSize, time.Now()); err != nil {
+		return fmt.Errorf("goopg init: statistics file: %w", err)
+	}
 	if opts.DataChecksums {
 		if err := stampClusterChecksums(abs); err != nil {
 			return fmt.Errorf("goopg init: data-page checksums: %w", err)

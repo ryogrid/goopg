@@ -132,6 +132,19 @@ SELECT pg_stat_force_next_flush();`)
 		t.Fatalf("Copy failed: %v", rerr)
 	}
 
+	// M0149 C3: PG 18.3 cold-starts on a copy of the cleanly stopped goopg
+	// directory and must load goopg's pg_stat/pgstat.stat as its own: the
+	// file is written in PG's layout, so the restored entries are visible.
+	t.Run("pg18-cold-start", func(t *testing.T) {
+		pg := tapnode.ColdStartPG(t, node, "pg-on-goopg-copy")
+		for kind, objid := range map[string]string{"database": "0", "function": funcoid, "relation": tableoid} {
+			if got := pg.SafePSQL(connectDB, "SELECT pg_stat_have_stats('"+kind+"', "+dboid+", "+objid+")"); got != "t" {
+				t.Errorf("not ok: pg18 on goopg's stats file: %s stats: got %q, want \"t\"", kind, got)
+			}
+		}
+		pg.Stop(tapnode.StopFast)
+	})
+
 	// test discarding of stats file after crash etc
 	node.Start()
 	checkAll("copy", "t")

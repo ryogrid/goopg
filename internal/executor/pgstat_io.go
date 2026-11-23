@@ -363,6 +363,11 @@ func fetchIOStatRows(ctx *Context) [][]string {
 							timeMillis = strconv.FormatFloat(nsToMs(poolCheckpointWriteTimeNanos), 'f', 3, 64)
 						}
 					}
+					if bt != ioBktClientBackend {
+						c, b := ioCumulativeGet(bt, obj, ctxIdx, op)
+						count += c
+						bytes += b
+					}
 					cells[countCol] = strconv.FormatInt(count, 10)
 					if byteCol != ioColNone {
 						cells[byteCol] = strconv.FormatInt(bytes, 10)

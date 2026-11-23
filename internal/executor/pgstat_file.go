@@ -285,6 +285,10 @@ func WritePgStatFile(dataDir string) {
 			w.Write(encodeCheckpointerChunk(PgStatCheckpointerSnapshot()))
 			continue
 		}
+		if fk.kind == pgstatKindIO {
+			w.Write(encodeIOChunk())
+			continue
+		}
 		if fk.kind == pgstatKindWAL && PgStatWalSnapshot != nil {
 			w.Write(encodeWalChunk(PgStatWalSnapshot()))
 			continue
@@ -421,6 +425,7 @@ func resetAllCumulativeStats() {
 	restoredFixed.checkpointer = nil
 	restoredFixed.wal = nil
 	restoredFixed.mu.Unlock()
+	resetIOCumulative()
 }
 
 // pgStatResetShared is pg_stat_reset_shared(target) (pgstatfuncs.c): NULL
@@ -428,7 +433,7 @@ func resetAllCumulativeStats() {
 // checkpointer; the other kinds report fixed values.
 func pgStatResetShared(target string, isNull bool) error {
 	if isNull {
-		for _, t := range []string{"checkpointer", "wal"} {
+		for _, t := range []string{"checkpointer", "io", "wal"} {
 			if err := pgStatResetShared(t, false); err != nil {
 				return err
 			}
@@ -444,7 +449,9 @@ func pgStatResetShared(target string, isNull bool) error {
 		if PgStatResetWal != nil {
 			PgStatResetWal()
 		}
-	case "archiver", "bgwriter", "io", "recovery_prefetch", "slru":
+	case "io":
+		resetIOCumulative()
+	case "archiver", "bgwriter", "recovery_prefetch", "slru":
 	default:
 		return &ExecError{Code: "22023", Message: `unrecognized reset target: "` + target + `"`,
 			Hint: `Target must be "archiver", "bgwriter", "checkpointer", "io", "recovery_prefetch", "slru", or "wal".`}
@@ -476,6 +483,8 @@ func loadPgStatFile(data []byte) error {
 	funcDB := make(map[uint32]uint32)
 	var ckpt *PgStatCheckpointer
 	var walc *PgStatWal
+	var iostats *[pgBackendTypeCount]pgBktypeIO
+	var ioreset time.Time
 	get := func(b []byte, off int) int64 { return int64(le.Uint64(b[off:])) }
 	for {
 		t, err := take(1)
@@ -509,6 +518,10 @@ func loadPgStatFile(data []byte) error {
 			if kind == pgstatKindWAL {
 				c := decodeWalChunk(body)
 				walc = &c
+			}
+			if kind == pgstatKindIO {
+				st, rs := decodeIOChunk(body)
+				iostats, ioreset = &st, rs
 			}
 		case pgstatFileEntryHash:
 			k, err := take(16)
@@ -586,9 +599,34 @@ func loadPgStatFile(data []byte) error {
 			restoredFixed.checkpointer = ckpt
 			restoredFixed.wal = walc
 			restoredFixed.mu.Unlock()
+			if iostats != nil {
+				ioCumulative.mu.Lock()
+				ioCumulative.stats = *iostats
+				ioCumulative.reset = ioreset
+				ioCumulative.mu.Unlock()
+			}
 			return nil
 		default:
 			return errCorruptStatsFile
 		}
 	}
+}
+
+// writeStatsFileRaw writes a statistics file holding only fixed-kind chunks,
+// each supplied by chunk(kind, len), and no entries.
+func writeStatsFileRaw(dataDir string, chunk func(kind uint32, n int) []byte) error {
+	path := filepath.Join(dataDir, pgstatStatFile)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	le := binary.LittleEndian
+	var buf []byte
+	buf = le.AppendUint32(buf, pgstatFileFormatID)
+	for _, fk := range pgstatFixedKinds {
+		buf = append(buf, pgstatFileEntryFixed)
+		buf = le.AppendUint32(buf, fk.kind)
+		buf = append(buf, chunk(fk.kind, fk.len)...)
+	}
+	buf = append(buf, pgstatFileEntryEnd)
+	return os.WriteFile(path, buf, 0o600)
 }

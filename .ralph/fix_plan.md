@@ -15659,7 +15659,7 @@ verify each at HEAD when the task starts.
     - Also found and fixed on the way, because the path above required them:
       - data rolled back to a savepoint came back after a crash;
       - a re\-insert after ROLLBACK TO raised 23505.
-- [ ] **M0149-0007 — port recovery/t/029_stats_restart.pl**
+- [x] **M0149-0007 — port recovery/t/029_stats_restart.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/029_stats_restart.pl` — cumulative stats across clean/crash restarts and invalid stats files.
@@ -15684,6 +15684,10 @@ verify each at HEAD when the task starts.
       creation, persisted through initdb's own pgstat.stat\) and the startup process's `normal`/`wal` reads. Needs the
       51848\-byte IO 'F' chunk \(PgStat\_IO: stat\_reset + 18 × PgStat\_BktypeIO of bytes/counts/times\[3\]\[5\]\[8\]\)
       written by `goopg init` and accumulated by startup WAL reads.
+  - 2026\-11\-23 slice 3, DONE: PgStat\_IO chunk \(ioCumulative, layout measured with offsetof\); `goopg init` writes
+    pgstat.stat with the standalone backend's init WAL write; startup WAL reads counted; pg\_stat\_reset\_shared\('io'\).
+    Movement: tap 029 42 → 44/44, plus a pg18\-cold\-start subtest in which PG 18.3 loads goopg's pgstat.stat.
+    Inventory R\-029 `port`; expected\-failures row removed. Regress stats 236 → 235.
 - [ ] **M0149-0008 — port recovery/t/017_shm.pl**
   Kind: impl
   Parent: none

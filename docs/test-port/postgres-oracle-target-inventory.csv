@@ -186,7 +186,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale,mismatch_l
 ,regress-sql,regress,postgres/src/test/regress/sql/sqljson.sql,failed,no,-,,753,1223
 ,regress-sql,regress,postgres/src/test/regress/sql/sqljson_jsontable.sql,failed,no,-,,622,1129
 ,regress-sql,regress,postgres/src/test/regress/sql/sqljson_queryfuncs.sql,failed,no,-,,821,1286
-,regress-sql,regress,postgres/src/test/regress/sql/stats.sql,failed,no,-,,236,1616
+,regress-sql,regress,postgres/src/test/regress/sql/stats.sql,failed,no,-,,235,1616
 ,regress-sql,regress,postgres/src/test/regress/sql/stats_ext.sql,failed,no,-,,432,3161
 ,regress-sql,regress,postgres/src/test/regress/sql/stats_import.sql,failed,no,-,RUN 2026-08-29 (M0134-0173): 1461 diff lines / 74 ^+ERROR at HEAD; PARKED — ~100% of the residual is the PG 18 statistics-import function family (pg_restore_relation_stats / pg_restore_attribute_stats / pg_clear_*_stats) plus the absence of a queryable pg_statistic relation. See deferral ledger rows 0173c/0173d.,133,1260
 ,regress-sql,regress,postgres/src/test/regress/sql/strings.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope,71,2546
@@ -412,7 +412,7 @@ R-019,recovery-tap,tap,postgres/src/test/recovery/t/019_replslot_limit.pl,port,y
 ,recovery-tap,tap,postgres/src/test/recovery/t/026_overwrite_contrecord.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/027_stream_regress.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/028_pitr_timelines.pl,not-tried,no,-,,,
-R-029,recovery-tap,tap,postgres/src/test/recovery/t/029_stats_restart.pl,failed,no,-,Port in progress as TestPort_Recovery029StatsRestart (internal/testport/recovery_029_stats_restart_test.go): 42/44; only the startup pg_stat_io assertions fail (M0149-0007),,
+R-029,recovery-tap,tap,postgres/src/test/recovery/t/029_stats_restart.pl,port,yes,-,Ported as TestPort_Recovery029StatsRestart in internal/testport/recovery_029_stats_restart_test.go: all-goopg (44/44) and a PG 18.3 cold start on the cleanly stopped goopg directory that loads goopg's pg_stat/pgstat.stat (M0149-0007),,
 ,recovery-tap,tap,postgres/src/test/recovery/t/030_stats_cleanup_replica.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/031_recovery_conflict.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/032_relfilenode_reuse.pl,not-tried,no,-,,,
