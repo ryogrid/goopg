@@ -45,6 +45,7 @@ import (
 	"sync"
 
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 	"github.com/goopg/goopg/internal/parser"
@@ -60,10 +61,14 @@ import (
 type preparedXactStore struct {
 	mu sync.Mutex
 	m  map[string]*connTxState
+	// recovered holds the prepared transactions a restart restored
+	// (RecoverPreparedTransactions): no session, only the xid's dedicated
+	// proc slot. M0149-0015a.
+	recovered map[string]initdb.RecoveredPrepared
 }
 
 func newPreparedXactStore() *preparedXactStore {
-	return &preparedXactStore{m: make(map[string]*connTxState)}
+	return &preparedXactStore{m: make(map[string]*connTxState), recovered: map[string]initdb.RecoveredPrepared{}}
 }
 
 // has reports whether a prepared transaction with this gid is registered.
@@ -71,7 +76,28 @@ func (p *preparedXactStore) has(gid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	_, ok := p.m[gid]
+	if !ok {
+		_, ok = p.recovered[gid]
+	}
 	return ok
+}
+
+// putRecovered registers a restored prepared transaction.
+func (p *preparedXactStore) putRecovered(r initdb.RecoveredPrepared) {
+	p.mu.Lock()
+	p.recovered[r.GID] = r
+	p.mu.Unlock()
+}
+
+// takeRecovered removes and returns the restored prepared transaction gid.
+func (p *preparedXactStore) takeRecovered(gid string) (initdb.RecoveredPrepared, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	r, ok := p.recovered[gid]
+	if ok {
+		delete(p.recovered, gid)
+	}
+	return r, ok
 }
 
 // put registers a parked prepared transaction. The caller has already verified
@@ -257,13 +283,14 @@ func (s *Server) logPrepare(ctx *executor.Context, connTx *connTxState, tx trans
 	if ctx != nil {
 		db = ctx.CurrentDatabaseOid
 	}
+	subxacts := s.cfg.TxnMgr.SubxidsOf(xid, true)
 	state := xlog.EncodeTwoPhaseState(xlog.TwoPhaseState{
 		XID:        xid,
 		Database:   db,
 		PreparedAt: xlog.TimestampTzNow(),
 		Owner:      s.resolveActingRoleOID(connTx.NonSuperuserRole),
 		GID:        gid,
-		Subxacts:   s.cfg.TxnMgr.SubxidsOf(xid, true),
+		Subxacts:   subxacts,
 		CommitRels: s.cfg.TxnMgr.PendingRelDeletes(xid),
 		AbortRels:  s.cfg.TxnMgr.PendingAbortRelDeletes(xid),
 	})
@@ -278,7 +305,9 @@ func (s *Server) logPrepare(ctx *executor.Context, connTx *connTxState, tx trans
 	if err := s.cfg.WAL.FlushUpTo(end); err != nil {
 		return fmt.Errorf("PREPARE TRANSACTION: flush prepare record: %w", err)
 	}
-	s.cfg.TxnMgr.MarkTwoPhase(xid)
+	s.cfg.TxnMgr.RegisterPrepared(transam.PreparedXact{
+		XID: xid, Subxacts: subxacts, GID: gid, State: state, PrepareEndLSN: end,
+	})
 	return nil
 }
 
@@ -335,6 +364,27 @@ func (s *Server) execFinalizePrepared(w *libpq.FrameWriter, ctx *executor.Contex
 		// its side effect here. M0134-0057.
 		s.preparedXacts.take(gid)
 		return s.executeOneSimpleStmt(w, ctx, finalize, connTx, autoCommitPtr)
+	}
+	// A prepared transaction a restart restored has no session: finishing it
+	// is FinishPreparedTransaction's record + clog work alone, through the
+	// manager's commit/abort of its dedicated slot (the xact-marker hook
+	// writes COMMIT/ABORT PREPARED and drops the state file).
+	if rp, ok := s.preparedXacts.takeRecovered(gid); ok {
+		_, isCommit := finalize.(*parser.CommitStmt)
+		var ferr error
+		if isCommit {
+			ferr = s.cfg.TxnMgr.Commit(rp.Tx)
+		} else {
+			ferr = s.cfg.TxnMgr.Rollback(rp.Tx)
+		}
+		if ferr != nil {
+			s.preparedXacts.putRecovered(rp)
+			return s.writeQueryError(w, errcodes.InternalError, ferr.Error())
+		}
+		if isCommit {
+			return w.WriteCommandComplete("COMMIT PREPARED")
+		}
+		return w.WriteCommandComplete("ROLLBACK PREPARED")
 	}
 	// Detached path (RC/RR): look the gid up in the process-wide registry and
 	// finalise the parked transaction through the canonical commit/rollback path,

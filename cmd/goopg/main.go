@@ -730,6 +730,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			cfg.Timeline = tli
 		}
 		cfg.SyncRep = rt.SyncRep
+		cfg.RecoveredPrepared = rt.RecoveredPrepared
 		// M0102-0005: prime the SyncRep rule from the GUC value so the
 		// first commit on a freshly-started cluster sees the configured
 		// synchronous_standby_names. A parse error is logged but does not

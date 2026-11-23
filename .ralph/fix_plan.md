@@ -15891,7 +15891,7 @@ verify each at HEAD when the task starts.
       - 012 ← the old primary cannot rejoin the promoted standby: 0015c, done;
       - 012 check 1 / goopg\-primary pairing ← durable 2PC on a goopg primary: 0015a;
       - 012 pg18\-primary pairing ← replayed PREPARE kept and restored at promotion: 0015b.
-- [ ] **M0149-0015a — durable two\-phase commit on a goopg primary**
+- [x] **M0149-0015a — durable two\-phase commit on a goopg primary**
   Kind: impl
   Parent: M0149-0015
   PREPARE TRANSACTION writes PG's XLOG\_XACT\_PREPARE record \(TwoPhaseFileHeader \+ subxacts \+ locks\), state goes to
@@ -15903,8 +15903,11 @@ verify each at HEAD when the task starts.
     - Movement: 012 goopg\-primary/PG\-standby pairing now passes its third segment \(PG standby finishes goopg's
       PREPARE after promotion\); failures there 3, all slice\-2 / 0015b.
     - Byte oracle: a PG 18.3 pg\_twophase file in xlog/testdata; pg\_waldump decodes goopg's records.
-  - [ ] **M0149-0015a2 — pg\_twophase files at checkpoint, restart restore, finish without a live transaction,
-    pg\_prepared\_xacts** \(next; proof: 012 check 1, 0 rows vs 6\)
+  - [x] **M0149-0015a2 — pg\_twophase files at checkpoint, restart restore, finish without a live transaction**
+    \(2026\-11\-24\)
+    - Movement: 012 check 1 \(nextXid handling for prepared subtransactions\) 0 → 6 rows, passing in all three
+      pairings; TestE2E\_PreparedXactSurvivesRestart 2/2.
+    - pg\_prepared\_xacts not fed \(not a 012 requirement; ledger\).
 - [ ] **M0149-0015b — a goopg standby keeps replayed prepared transactions**
   Kind: impl
   Parent: M0149-0015

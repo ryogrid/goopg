@@ -62,8 +62,8 @@ type Manager struct {
 	xidgen    XidGen
 	procArray ProcArray
 
-	// twoPhaseXIDs holds the xids of prepared transactions (MarkTwoPhase).
-	twoPhaseXIDs sync.Map
+	// twoPhase is the prepared-transaction registry (twophase_registry.go).
+	twoPhase twoPhaseRegistry
 
 	abortedMu   sync.RWMutex
 	abortedXIDs []storage.TransactionID
@@ -1422,20 +1422,6 @@ func (m *Manager) SetXactMarkerLogger(fn func(storage.TransactionID, XactMarker,
 // pg_internal.init files so the next backend reloads fresh descriptors.
 func (m *Manager) SetRelcacheInvalPending() {
 	m.relcacheInvalPending.Store(true)
-}
-
-// MarkTwoPhase records that xid has been prepared (PREPARE TRANSACTION
-// wrote its XLOG_XACT_PREPARE record).
-func (m *Manager) MarkTwoPhase(xid storage.TransactionID) {
-	m.twoPhaseXIDs.Store(xid, struct{}{})
-}
-
-// TakeTwoPhase reports whether xid is a prepared transaction and forgets it:
-// its commit or abort record is then COMMIT PREPARED / ABORT PREPARED
-// (RecordTransactionCommitPrepared), not a plain one. M0149-0015a.
-func (m *Manager) TakeTwoPhase(xid storage.TransactionID) bool {
-	_, ok := m.twoPhaseXIDs.LoadAndDelete(xid)
-	return ok
 }
 
 // TakeRelcacheInvalPending atomically reads and clears the relcache-inval

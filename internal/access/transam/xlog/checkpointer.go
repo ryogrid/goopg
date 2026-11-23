@@ -291,6 +291,9 @@ func (c *CheckpointerConfig) withDefaults() {
 // Checkpointer periodically flushes dirty pages and writes a
 // checkpoint marker to WAL.
 type Checkpointer struct {
+	// twoPhaseFn is CheckPointTwoPhase (SetTwoPhaseCheckpointFn).
+	twoPhaseFn atomic.Pointer[func(redo uint64) error]
+
 	flusher DirtyPageFlusher
 	wal     checkpointWAL
 	cfg     CheckpointerConfig
@@ -545,6 +548,12 @@ func (c *Checkpointer) CheckpointRedoLSN() uint64 {
 // against the original interval and a change here only affects a
 // subsequent Run invocation. The control-socket reload path will
 // hook into this once it observes the GUC registry.
+// SetTwoPhaseCheckpointFn installs CheckPointTwoPhase, called with each
+// checkpoint's redo pointer once the data files are synced.
+func (c *Checkpointer) SetTwoPhaseCheckpointFn(fn func(redo uint64) error) {
+	c.twoPhaseFn.Store(&fn)
+}
+
 func (c *Checkpointer) SetInterval(d time.Duration) {
 	if d <= 0 {
 		return
@@ -1131,6 +1140,15 @@ func (c *Checkpointer) runCheckpointOpts(ctx context.Context, o checkpointOpts) 
 		}
 	}
 	c.writeTimeMs.Add(time.Since(flushStart).Milliseconds())
+	// CheckPointGuts → CheckPointTwoPhase(checkPointRedo): prepared
+	// transactions whose PREPARE record precedes the redo point get their
+	// state files, since that WAL may be recycled after this checkpoint.
+	// M0149-0015a.
+	if fn := c.twoPhaseFn.Load(); fn != nil {
+		if err := (*fn)(redoLSN0); err != nil {
+			return fmt.Errorf("checkpoint two-phase state: %w", err)
+		}
+	}
 	// M0102-0007: redoLSN0 (computed and published above, BEFORE the flush)
 	// is what the PG-compatible checkpoint record carries — PG's xlogreader
 	// validates it.

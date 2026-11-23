@@ -34,6 +34,11 @@ import (
 // production entry point that constructs the four together against
 // a real data directory.
 type Runtime struct {
+	// RecoveredPrepared are the prepared transactions restored at startup
+	// (pg_twophase files and PREPARE records after redo), still waiting for
+	// COMMIT PREPARED or ROLLBACK PREPARED. M0149-0015a.
+	RecoveredPrepared []RecoveredPrepared
+
 	StorageMgr *storage.Manager
 	Pool       *storage.Pool
 	TxnMgr     *transam.Manager
@@ -1256,6 +1261,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return int64(n), true
 	})
 	txnMgr := transam.NewManager()
+	txnMgr.SetTwoPhaseDir(filepath.Join(abs, transam.TwoPhaseDirName))
+	var recoveredPrepared []RecoveredPrepared
 	// M0130-S11.5d-3c: b-tree page deletion's recycle horizon. `next` is
 	// upstream's ReadNextFullTransactionId (stamped into the deleted page as
 	// its BTDeletedPageData.safexid); `oldestVisible` is the boundary
@@ -1386,6 +1393,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// (GetCurrentTransactionStopTimestamp), taken as its end record is
 		// written.
 		stopTime := xlog.TimestampTzNow()
+		finishedPrepared := false
 		switch kind {
 		case transam.XactCommit:
 			// The relations the transaction dropped go into the commit record
@@ -1406,6 +1414,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			// A prepared transaction finishes with COMMIT PREPARED: the
 			// record names it in xl_xact_twophase (RecordTransactionCommitPrepared).
 			twoPhase := txnMgr.TakeTwoPhase(xid)
+			finishedPrepared = twoPhase
 			if txnMgr.TakeRelcacheInvalPending() {
 				// A6: PG xl_xact_commit with HAS_INVALS (xid in the header).
 				if twoPhase {
@@ -1439,6 +1448,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			// their files are removed once it is written (XactLogAbortRecord).
 			// A prepared transaction finishes with ABORT PREPARED.
 			if txnMgr.TakeTwoPhase(xid) {
+				finishedPrepared = true
 				payload, perr = xlog.EncodeXactAbortPreparedPGAt(stopTime, xid, txnMgr.SubxidsOf(xid, false), txnMgr.PendingAbortRelDeletes(xid))
 			} else {
 				payload, perr = xlog.EncodeXactAbortPGWithRelsAt(stopTime, xid, txnMgr.SubxidsOf(xid, false), txnMgr.PendingAbortRelDeletes(xid))
@@ -1525,6 +1535,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			_ = clog.SetCommittedWithLSN(xid, endLSN)
 		case transam.XactAbort:
 			_ = clog.SetAborted(xid)
+		}
+		// FinishPreparedTransaction: the state file goes once the
+		// COMMIT/ABORT PREPARED record is written (RemoveTwoPhaseFile).
+		if finishedPrepared {
+			txnMgr.RemoveTwoPhaseFile(xid)
 		}
 		return nil
 	})
@@ -1618,6 +1633,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			_ = mgr.Close()
 			return nil, fmt.Errorf("goopg: clog replay from WAL: %w", rerr)
 		}
+		// restoreTwoPhaseData + the PREPARE records after redo: prepared
+		// transactions come back in progress before the sweep below, which
+		// must not abort them (M0149-0015a).
+		if sb, _ := IsStandby(abs); !sb {
+			restored, terr := restoreTwoPhaseData(abs, txnMgr)
+			if terr != nil {
+				_ = pool.Close()
+				_ = walWriter.Close()
+				_ = mgr.Close()
+				return nil, fmt.Errorf("goopg: restore prepared transactions: %w", terr)
+			}
+			recoveredPrepared = restored
+		}
 		// (M0106-0011) Crash-recovery implicit abort: WAL replay
 		// restored the on-disk pg_class / pg_attribute heap pages,
 		// but the JSON catalog snapshot at last clean shutdown does
@@ -1645,7 +1673,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		if highXID >= txnMgr.NextXID() {
 			txnMgr.SetNextXID(highXID + 1)
 		}
-		if aerr := clog.MarkUnknownAsAborted(txnMgr.NextXID()); aerr != nil {
+		if aerr := clog.MarkUnknownAsAbortedExcept(txnMgr.NextXID(), txnMgr.IsPreparedXID); aerr != nil {
 			_ = pool.Close()
 			_ = walWriter.Close()
 			_ = mgr.Close()
@@ -2997,6 +3025,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// The promotion leaves recovery mode before its end-of-recovery
 	// checkpoint.
 	cp.SetRecoveryMode(standby || recovery)
+	cp.SetTwoPhaseCheckpointFn(txnMgr.CheckPointTwoPhase)
 
 	rt := &Runtime{
 		StorageMgr:     mgr,
@@ -3020,6 +3049,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		FSM:            storage.NewFSM(),
 		VM:             vm,
 	}
+	rt.RecoveredPrepared = recoveredPrepared
 	// M0149-0010b: FSM fork files carry pd_checksum on a checksummed cluster.
 	rt.FSM.SetChecksums(checksumsEnabled)
 

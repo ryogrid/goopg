@@ -1,6 +1,6 @@
 # 0149-0015 — Port recovery/t/012\_subtransactions.pl
 
-Status: in progress. The port exists and is skipped unless `GOOPG_TAP_012=1`. It still needs 0015a \(slice 1 of 3 done\) and 0015b.
+Status: in progress. The port exists and is skipped unless `GOOPG_TAP_012=1`. It still needs 0015b \(0015a is done\).
 
 Upstream: `postgres/src/test/recovery/t/012_subtransactions.pl`; walsender.c `WalSndDone`, postmaster.c
 `PM_SHUTDOWN` → `PM_SHUTDOWN_2`, xlog.c `StartupXLOG` (`recoveryTargetTLI`, `writeTimeLineHistory`), twophase.c.
@@ -67,14 +67,22 @@ Slices:
    - pg\_waldump decodes goopg's records as `PREPARE gid …; subxacts: …` and `COMMIT_PREPARED <xid> …`.
    - Movement: in 012's goopg\-primary / PG\-standby pairing, the PG standby now replays a goopg PREPARE and finishes it
      after promotion \(ROLLBACK PREPARED of the 201\-subxact transaction\). Before, the run stopped earlier.
-2. **Restart restore \(next\).**
-   - `CheckPointTwoPhase` writes `pg_twophase/<XID>` with a CRC for prepared transactions whose PREPARE is older than
-     the redo point.
-   - Startup reads those files \(`restoreTwoPhaseData`\) and the PREPARE records after redo. Their xids and subxids
-     must stay in progress: neither swept aborted nor visible.
-   - The gids are registered, so COMMIT/ROLLBACK PREPARED can finish them from any backend; this needs a finishing
-     path that works without a live `Transaction`.
-   - `pg_prepared_xacts` lists them.
+2. **Restart restore \(done 2026\-11\-24\).**
+   - `transam` keeps a prepared\-transaction registry \(`twophase_registry.go`, twophase.c's `TwoPhaseState`\): xid,
+     subxacts, gid, state bytes and the PREPARE end LSN.
+   - `CheckPointTwoPhase` runs inside each checkpoint once the data files are synced. It writes `pg_twophase/<XID>`
+     \(state \+ CRC\-32C, fsynced\) for every transaction whose PREPARE ended at or before the redo point. The CRC was
+     checked against a PG 18.3 file.
+   - At a primary's startup, between the clog replay and the abort sweep, `initdb.restoreTwoPhaseData` reads the
+     files. It then walks the WAL from redo: PREPARE adds an entry, COMMIT/ABORT PREPARED removes it and its file.
+   - Each survivor gets a dedicated proc slot holding its xid, with its subxacts linked and nextXid moved past them
+     \(`Manager.RestorePrepared`\). The sweep skips those xids \(`MarkUnknownAsAbortedExcept`\).
+   - The server registers the survivors by gid. COMMIT/ROLLBACK PREPARED finishes one through `Manager.Commit` /
+     `Rollback` of its slot, which writes the `*_PREPARED` record. The state file is removed once that record is
+     written.
+   - Tests: `TestE2E_PreparedXactSurvivesRestart` \(fast stop via the file, immediate stop via WAL\), plus registry
+     unit tests.
+   - Movement: 012 check 1 passes in all three pairings \(0 → 6 rows\).
 3. **Standby \(0015b\).** PREPARE replay keeps the state \(`PrepareRedoAdd`\), and promotion goes through slice 2's
    restore.
 
@@ -88,3 +96,6 @@ Slices:
 - `COMMIT PREPARED` / `ROLLBACK PREPARED` answer with the command tags `COMMIT` / `ROLLBACK`; PG sends
   `COMMIT PREPARED` / `ROLLBACK PREPARED`.
 - No `XACT_XINFO_HAS_GID` under wal\_level=logical.
+- `pg_prepared_xacts` / `pg_prepared_xact\(\)` list nothing: the view is in the catalog, but no function feeds it.
+- A restored prepared transaction holds none of its locks again \(`lock_twophase_recover`\). Its pgstat counters are
+  lost. The state file is removed after the end record is appended, without waiting for the abort's flush.

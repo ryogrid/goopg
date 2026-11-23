@@ -58,6 +58,7 @@ import (
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/port/gls"
 	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/utils/mmgr"
@@ -249,6 +250,9 @@ type Config struct {
 	// have exited and before the walsenders finish, so standbys receive
 	// the checkpoint record (M0149-0015).
 	ShutdownCheckpoint func()
+	// RecoveredPrepared are the prepared transactions the runtime restored
+	// at startup; COMMIT/ROLLBACK PREPARED can finish them (M0149-0015a).
+	RecoveredPrepared []initdb.RecoveredPrepared
 
 	// AutovacuumLauncher, when set, is started as a background
 	// goroutine during Run. nil disables autovacuum.
@@ -574,6 +578,9 @@ func New(cfg Config) *Server {
 			Checkpointer:   cfg.Checkpointer,
 		}, s.writeQueryError),
 	)
+	for _, rp := range cfg.RecoveredPrepared {
+		s.preparedXacts.putRecovered(rp)
+	}
 	s.walsndHardCtx, s.walsndHardCancel = context.WithCancel(context.Background())
 	return s
 }
