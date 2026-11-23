@@ -11,8 +11,6 @@ package testport
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -287,73 +285,6 @@ func TestPort_Recovery038SaveLogicalSlots(t *testing.T) {
 	}
 	if rows2[0][1] != "logical" {
 		t.Errorf("slot_type=%q want logical", rows2[0][1])
-	}
-}
-
-// TestPort_Recovery039EndOfWal ports postgres/src/test/recovery/t/039_end_of_wal.pl
-// Upstream: injects defective WAL page and record headers to test end-of-WAL
-// detection; verifies the server correctly identifies truncated/corrupt WAL
-// at recovery start.
-//
-// Adaptation: v0 WAL segment handling is tested at the segment-file level.
-// This port verifies that WAL segments are created on disk after write
-// operations and a checkpoint, confirming the WAL writer creates segment
-// files correctly — the precondition for end-of-WAL detection. The
-// defective-header injection from the upstream test requires direct WAL
-// file hex-editing, which is out of scope for the v0 adaptation.
-func TestPort_Recovery039EndOfWal(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping end-of-wal test in short mode")
-	}
-	// upstream: postgres/src/test/recovery/t/039_end_of_wal.pl
-
-	c := newDurableCluster(t, "recovery039")
-	mustInitStart(t, c)
-	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-
-	ctx := context.Background()
-
-	// Generate WAL by inserting data (mirrors upstream's INSERT rows).
-	if _, err := c.Query(ctx, "CREATE TABLE wal_test (id int)"); err != nil {
-		t.Fatalf("create table: %v", err)
-	}
-	for i := 0; i < 10; i++ {
-		if _, err := c.Query(ctx, "INSERT INTO wal_test VALUES ("+string(rune('0'+i))+")"); err != nil {
-			t.Fatalf("insert %d: %v", i, err)
-		}
-	}
-
-	// Checkpoint to flush WAL and ensure segment files exist.
-	if err := c.Checkpoint(); err != nil {
-		t.Fatalf("checkpoint: %v", err)
-	}
-
-	// Verify WAL segment files exist in pg_wal directory.
-	walDir := filepath.Join(c.DataDir(), "pg_wal")
-	entries, err := os.ReadDir(walDir)
-	if err != nil {
-		t.Fatalf("read pg_wal: %v", err)
-	}
-	var segFiles []string
-	for _, e := range entries {
-		// WAL segment files: 24 hex chars (3 components × 8 hex digits each)
-		// e.g. 000000010000000000000001
-		if !e.IsDir() && len(e.Name()) == 24 {
-			segFiles = append(segFiles, e.Name())
-		}
-	}
-	if len(segFiles) == 0 {
-		t.Fatalf("no WAL segment files found in %s", walDir)
-	}
-	t.Logf("WAL segment files: %v", segFiles)
-
-	// Verify the server still responds after WAL write + checkpoint.
-	rows, err := c.Query(ctx, "SELECT count(*) FROM wal_test")
-	if err != nil {
-		t.Fatalf("count query: %v", err)
-	}
-	if len(rows) != 1 || rows[0][0] != "10" {
-		t.Errorf("count=%v want 10", rows)
 	}
 }
 

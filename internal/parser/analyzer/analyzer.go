@@ -2664,6 +2664,25 @@ func tableFuncBaseColumns(tf *parser.TableFuncRef, alias string, colAliases []st
 			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
 		}
 		return cols
+	case "pg_control_checkpoint":
+		// pg_control_checkpoint() → pg_controldata's checkpoint fields
+		// (misc/pg_controldata.c). Mirrors planPgControlCheckpoint. M0149-0076.
+		names := []string{"checkpoint_lsn", "redo_lsn", "redo_wal_file", "timeline_id",
+			"prev_timeline_id", "full_page_writes", "next_xid", "next_oid", "next_multixact_id", "next_multi_offset",
+			"oldest_xid", "oldest_xid_dbid", "oldest_active_xid", "oldest_multi_xid", "oldest_multi_dbid",
+			"oldest_commit_ts_xid", "newest_commit_ts_xid", "checkpoint_time"}
+		types := []string{"pg_lsn", "pg_lsn", "text", "int4", "int4", "bool", "text", "oid",
+			"xid", "xid", "xid", "oid", "xid", "xid", "oid", "xid", "xid", "timestamptz"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
 	case "pg_get_wal_summarizer_state":
 		// pg_get_wal_summarizer_state() → (summarized_tli int8, summarized_lsn
 		// pg_lsn, pending_lsn pg_lsn, summarizer_pid int4). Mirrors

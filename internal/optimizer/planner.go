@@ -7376,6 +7376,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_get_wal_summarizer_state") {
 		return planPgGetWalSummarizerState(rv, sourceIdx)
 	}
+	if strings.EqualFold(tf.Name, "pg_control_checkpoint") {
+		return planPgControlCheckpoint(rv, sourceIdx)
+	}
 	if strings.EqualFold(tf.Name, "pg_get_catalog_foreign_keys") {
 		return planPgGetCatalogForeignKeys(rv, sourceIdx)
 	}
@@ -8292,6 +8295,43 @@ func planPgGetWalSummarizerState(rv parser.RangeVar, sourceIdx int16) (Node, ran
 	}
 	tbl := &catalog.Table{Name: alias, Columns: cols}
 	node := &PgAvailableWalSummaries{pos: tf.Pos(), Func: "pg_get_wal_summarizer_state", schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// PgControlCheckpointColumns are pg_control_checkpoint()'s OUT columns and
+// types (pg_proc.dat, misc/pg_controldata.c). M0149-0076.
+var PgControlCheckpointColumns = []string{"checkpoint_lsn", "redo_lsn", "redo_wal_file", "timeline_id",
+	"prev_timeline_id", "full_page_writes", "next_xid", "next_oid", "next_multixact_id", "next_multi_offset",
+	"oldest_xid", "oldest_xid_dbid", "oldest_active_xid", "oldest_multi_xid", "oldest_multi_dbid",
+	"oldest_commit_ts_xid", "newest_commit_ts_xid", "checkpoint_time"}
+
+// PgControlCheckpointTypes are the types of PgControlCheckpointColumns.
+var PgControlCheckpointTypes = []string{"pg_lsn", "pg_lsn", "text", "int4", "int4", "bool", "text", "oid",
+	"xid", "xid", "xid", "oid", "xid", "xid", "oid", "xid", "xid", "timestamptz"}
+
+// planPgControlCheckpoint routes pg_control_checkpoint() into the shared
+// zero-argument SRF node (PgAvailableWalSummaries with Func set). M0149-0076.
+func planPgControlCheckpoint(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_control_checkpoint"
+	}
+	colNames := append([]string(nil), PgControlCheckpointColumns...)
+	for i := range colNames {
+		if i < len(rv.Columns) {
+			colNames[i] = rv.Columns[i]
+		}
+	}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: catalog.Type{Name: PgControlCheckpointTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: catalog.Type{Name: PgControlCheckpointTypes[i]}, Ordinal: i}
+	}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	node := &PgAvailableWalSummaries{pos: tf.Pos(), Func: "pg_control_checkpoint", schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }

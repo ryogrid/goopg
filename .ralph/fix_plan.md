@@ -15717,6 +15717,16 @@ verify each at HEAD when the task starts.
   Upstream: `postgres/src/test/recovery/t/039_end_of_wal.pl` — end-of-WAL detection with hand-crafted defective page and record headers written into WAL files.
   Current shortcut \(audit\): `TestPort_Recovery039EndOfWal` only checks that 24-character segment files exist after a checkpoint. None of the upstream defective-header cases \(`write_wal` page/record corruption\) and none of the "invalid magic number" / "invalid record length" / "invalid contrecord length" / "invalid info bits" log matches are ported \(\~14 upstream assertions\). No PG 18.3 cross-check.
   Likely prerequisites \(verify at start\): PG-exact WAL page/record layout so byte-level writes land where PG's would \(`pg_logical_emit_message`, insert-LSN arithmetic\); PG 18.3 end-of-WAL log texts from `xlogreader.c`; a PG 18.3 server recovering the same doctored goopg WAL in the mixed run. Inventory row stays `port` until this closes.
+  - 2026\-11\-23 slice 1 \(partial, still open\): TestPort\_Recovery039EndOfWal is now a full transcription of the .pl
+    \(the shortcut is removed\), listed in ci/batch/expected\-failures.csv; inventory R\-039 stays `port`. Design
+    docs/design/0100\-0149/0149\-0076\-end\-of\-wal.md. Movement: tap 039 assertions 0/14 → 0/14; the run now gets past
+    the setup queries. Regress misc\_functions 207 → 203.
+    - Path\-to\-TAP:
+      - 039 setup ← `pg_settings` lacked wal\_segment\_size / wal\_block\_size. Fixed: preset rows.
+      - 039 setup ← `pg_control_checkpoint()` not a table function. Fixed.
+      - 039 setup ← `pg_switch_wal()` does not exist: no XLOG\_SWITCH in the WAL writer. NEXT.
+    - Filed nearby, not worked: `pg_settings` is a hard\-coded list of \~60 rows, not the GUC registry \(PG's
+      show\_all\_settings\); the other pg\_control\_\* functions \(system, init, recovery\) are missing.
 - [ ] **M0149-0009 — port recovery/t/008_fsm_truncation.pl**
   Kind: impl
   Parent: none

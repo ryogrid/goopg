@@ -13038,6 +13038,19 @@ func (c *InMemory) registerSystemTables() {
 				"Sets the list of allowed TLSv1.3 cipher suites.", "An empty string means use the default cipher suites.",
 				"sighup", "string", "default", "", "", "", "", "", "", "", "f"},
 		}
+		// Preset options (guc_tables.c PGC_INTERNAL): compile-time constants
+		// of the build, so their rows are fixed. Values as PG 18.3 reports
+		// them with goopg's 8 kB blocks and 16 MB WAL segments. M0149-0076.
+		rows = append(rows,
+			[]string{"block_size", "8192", "", "Preset Options", "Shows the size of a disk block.", "",
+				"internal", "integer", "default", "8192", "8192", "", "8192", "8192", "", "", "f"},
+			[]string{"segment_size", "131072", "8kB", "Preset Options", "Shows the number of pages per disk file.", "",
+				"internal", "integer", "default", "131072", "131072", "", "131072", "131072", "", "", "f"},
+			[]string{"wal_block_size", "8192", "", "Preset Options", "Shows the block size in the write ahead log.", "",
+				"internal", "integer", "default", "8192", "8192", "", "8192", "8192", "", "", "f"},
+			[]string{"wal_segment_size", "16777216", "B", "Preset Options", "Shows the size of write ahead log segments.", "",
+				"internal", "integer", "default", "1048576", "1073741824", "", "16777216", "16777216", "", "", "f"},
+		)
 		// PostgreSQL's pg_settings view is backed by the alphabetically
 		// sorted GUC table, so callers that query it without ORDER BY (e.g.
 		// sysviews.sql's `... where name like 'enable%'`) still receive rows
