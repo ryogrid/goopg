@@ -102,14 +102,16 @@ func (m *functionStatsManager) peekPending(sessionID uint64, oid uint32) (funcSt
 // flush merges a session's pending counters into the shared store and clears
 // the pending set. Mirrors pgstat_report_stat flushing function stats; the
 // `stats` spec triggers this via pg_stat_force_next_flush().
-func (m *functionStatsManager) flush(sessionID uint64) {
+func (m *functionStatsManager) flush(sessionID uint64) []uint32 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	sess := m.pending[sessionID]
 	if sess == nil {
-		return
+		return nil
 	}
+	flushed := make([]uint32, 0, len(sess))
 	for oid, c := range sess {
+		flushed = append(flushed, oid)
 		s := m.shared[oid]
 		if s == nil {
 			s = &funcStatCounters{}
@@ -120,6 +122,7 @@ func (m *functionStatsManager) flush(sessionID uint64) {
 		s.selfTime += c.selfTime
 	}
 	delete(m.pending, sessionID)
+	return flushed
 }
 
 // get returns a copy of the shared counters for an OID, or (nil,false) when no

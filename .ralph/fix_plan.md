@@ -15664,6 +15664,18 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/recovery/t/029_stats_restart.pl` — cumulative stats across clean/crash restarts and invalid stats files.
   Likely prerequisites \(verify at start\): `pg_stat/pgstat.stat` in PG format \(`PGSTAT_FILE_FORMAT_ID`, `pgstat.c` write/read\), discard on crash, replication-slot stats persistence.
+  - 2026\-11\-23 slice 1 \(partial, still open\): ported as TestPort\_Recovery029StatsRestart, listed in
+    ci/batch/expected\-failures.csv; inventory R\-029 `failed`. Design docs/design/0100\-0149/0149\-0007\-stats\-restart.md.
+    - Landed: PG 18 pgstat.stat writer/reader \(exact layout, sizes measured against the PG 18.3 headers\),
+      written at clean shutdown, restored and removed at startup, discarded on crash or invalid file;
+      pg\_stat\_have\_stats; database entries created at flush.
+    - Movement: the 21 assertions from `initial` to `invalid_append` pass \(the run stopped at the first
+      checkpointer query before\). Regress stats 314 → 266.
+    - Path\-to\-TAP \(open\):
+      - 029 post restart ← `num_timed + num_requested` errors: pg\_stat\_checkpointer columns are text; `num_done`
+        missing → fix the view types and persist the checkpointer chunk \(next\).
+      - 029 wal\_\* ← pg\_stat\_wal is constant zeros → WAL record/byte accounting plus the WAL chunk and reset.
+      - 029 startup ← pg\_stat\_io has no startup / standalone backend WAL rows.
 - [ ] **M0149-0008 — port recovery/t/017_shm.pl**
   Kind: impl
   Parent: none

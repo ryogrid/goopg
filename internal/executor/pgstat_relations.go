@@ -448,14 +448,16 @@ func (m *relationStatsManager) finalizePrepared(gid string, sessionID uint64, is
 // pending set. Mirrors pgstat_relation_flush_cb; the `stats` spec triggers it via
 // pg_stat_force_next_flush(). A truncdropped pending entry first resets the
 // shared live/dead totals to zero (forgetting already-flushed counts).
-func (m *relationStatsManager) flush(sessionID uint64) {
+func (m *relationStatsManager) flush(sessionID uint64) []uint32 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	sess := m.pending[sessionID]
 	if sess == nil {
-		return
+		return nil
 	}
+	flushed := make([]uint32, 0, len(sess))
 	for oid, c := range sess {
+		flushed = append(flushed, oid)
 		s := m.shared[oid]
 		if s == nil {
 			s = &relStatCounters{}
@@ -480,6 +482,7 @@ func (m *relationStatsManager) flush(sessionID uint64) {
 		s.insSinceVacuum += c.tuplesInserted
 	}
 	delete(m.pending, sessionID)
+	return flushed
 }
 
 // get returns a copy of the shared counters for an OID. The bool is false when

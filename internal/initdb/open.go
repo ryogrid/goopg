@@ -492,6 +492,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	if abs != "" {
 		storage.RemovePgTempRelationFiles(abs)
 	}
+	// M0149-0007: StartupXLOG's pgstat_discard_stats / pgstat_restore_stats
+	// — a crash throws the cumulative statistics away, a clean start loads
+	// pg_stat/pgstat.stat (and removes it).
+	if abs != "" {
+		if recov.crashRecovery {
+			executor.DiscardPgStatFile(abs)
+		} else {
+			executor.RestorePgStatFile(abs)
+		}
+	}
 	inRecovery := abs != "" && (recov.crashRecovery || startStandby || startRecovery)
 	if inRecovery {
 		if err := storage.ResetUnloggedRelations(abs, storage.UnloggedRelationCleanup); err != nil {
@@ -4122,6 +4132,10 @@ func (r *Runtime) Close() error {
 				"note", "data files may not be fully durable on disk",
 			)
 		}
+		// M0149-0007: after the shutdown checkpoint the checkpointer writes
+		// the cumulative statistics (pgstat_before_server_shutdown →
+		// pgstat_write_statsfile).
+		executor.WritePgStatFile(r.DataDir)
 	}
 	// Stop the background page-writer before draining the pool (M0048-0003).
 	if r.bgwriter != nil {

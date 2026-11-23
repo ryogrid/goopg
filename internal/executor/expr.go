@@ -18283,9 +18283,33 @@ case "pg_char_to_encoding":
 	// (and other sessions) observe them. The `stats` isolation spec calls it
 	// between mutating and observing steps. Design 0118-0124 (M0118-0009 rung 2).
 	case "pg_stat_force_next_flush":
-		funcStats.flush(sessionStatsID(ctx))
-		relStats.flush(sessionStatsID(ctx))
+		funcs := funcStats.flush(sessionStatsID(ctx))
+		rels := relStats.flush(sessionStatsID(ctx))
+		dbStats.noteFlush(ctx.CurrentDatabaseOid, rels, funcs)
 		return NewStringDatum(""), nil
+	// pg_stat_have_stats(kind text, dboid oid, objid int8) → boolean: whether
+	// the cumulative statistics system holds an entry (pgstatfuncs.c,
+	// pgstat_have_entry). STRICT. M0149-0007.
+	case "pg_stat_have_stats":
+		if len(x.Args) != 3 {
+			return NullDatum, nil
+		}
+		var args [3]Datum
+		for i := range args {
+			d, err := evalExprSlot(x.Args[i], slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			if d.IsNull() {
+				return NullDatum, nil
+			}
+			args[i] = d
+		}
+		have, err := haveStats(args[0].StringValue(), uint32(args[1].Int), uint64(args[2].Int))
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewBoolDatum(have), nil
 	// pg_stat_get_function_calls(oid) → bigint: number of times the function has
 	// been called (flushed), or NULL when no stats exist for it. Design 0118-0124.
 	case "pg_stat_get_function_calls":
