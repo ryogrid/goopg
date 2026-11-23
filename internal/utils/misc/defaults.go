@@ -1536,6 +1536,21 @@ func BuildDefaultRegistry() *Registry {
 	// above. goopg's statement/duration log lines
 	// (internal/server/statement_log.go) expand the %m/%p/%u/%d/%a/%x subset
 	// of PG's escape set against it; BootVal mirrors upstream's own default.
+	// log_connections / log_disconnections (PG 18 guc_tables.c, both
+	// PGC_SU_BACKEND). log_connections became a list of connection-setup
+	// aspects in PG 18; check_log_connections still accepts the pre-18
+	// booleans, alone. goopg logs every connection regardless. M0149-0005.
+	r.MustRegister(NewVariable(Variable{
+		Name: "log_connections", Type: TypeString, BootVal: "",
+		Context: ContextSuBackend,
+		Scope:   ScopeServer | ScopeSession,
+		CheckFn: checkLogConnections,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "log_disconnections", Type: TypeBool, BootVal: "off",
+		Context: ContextSuBackend,
+		Scope:   ScopeServer | ScopeSession,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "log_line_prefix", Type: TypeString, BootVal: "%m [%p] ",
 		Context: ContextSigHup,
@@ -1830,6 +1845,39 @@ func registerSSLGUCs(r *Registry) {
 func checkSSL(value string) error {
 	if value == "on" {
 		return &ValidationError{Msg: "SSL is not supported by this build"}
+	}
+	return nil
+}
+
+// checkLogConnections is check_log_connections (tcop/backend_startup.c): a
+// comma list of receipt, authentication, authorization, setup_durations and
+// all, or one of the pre-18 boolean spellings on its own.
+func checkLogConnections(v string) error {
+	var items []string
+	for _, it := range strings.Split(v, ",") {
+		it = strings.TrimSpace(it)
+		if it == "" {
+			if strings.TrimSpace(v) == "" {
+				return nil
+			}
+			return fmt.Errorf("invalid value for parameter \"log_connections\": \"%s\"", v)
+		}
+		items = append(items, strings.ToLower(strings.Trim(it, `"`)))
+	}
+	for _, b := range []string{"off", "false", "no", "0", "on", "true", "yes", "1"} {
+		if items[0] == b {
+			if len(items) > 1 {
+				return fmt.Errorf("invalid value for parameter \"log_connections\": \"%s\"", v)
+			}
+			return nil
+		}
+	}
+	for _, it := range items {
+		switch it {
+		case "receipt", "authentication", "authorization", "setup_durations", "all":
+		default:
+			return fmt.Errorf("invalid value for parameter \"log_connections\": \"%s\"", v)
+		}
 	}
 	return nil
 }

@@ -15566,16 +15566,44 @@ verify each at HEAD when the task starts.
     checkpoint flushed.
   - XLOG\_SEQ\_LOG's encoder writes spcOid 1663 for every sequence; a sequence in a tablespace is mis\-addressed.
   - Sequence pages written by an older goopg for a never\-called sequence hold last\_value = start \- increment.
-- [ ] **M0149-0004 — port recovery/t/022_crash_temp_files.pl**
+- [!] **M0149-0004 — port recovery/t/022_crash_temp_files.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/022_crash_temp_files.pl` — temp-file removal after a backend crash.
   Likely prerequisites \(verify at start\): postmaster crash-restart cycle after a killed backend \(`restart_after_crash`; `013` port substituted whole-server SIGKILL\), `remove_temp_files_after_crash`, PG `pgsql_tmp<PID>.<N>` naming. Never `kill()` a goopg "backend pid" — `pg_backend_pid()` is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID; a backend-kill step that needs per-backend OS processes goes to `[!] blocked-on owner: architecture`.
-- [ ] **M0149-0005 — port recovery/t/037_invalid_database.pl**
+  - **PARKED `[!]` 2026\-11\-23 — blocked\-on owner: architecture.**
+    - The test's central step is `pg_ctl kill KILL <pg_backend_pid()>`, run twice. The postmaster must survive
+      the killed backend and run its restart\_after\_crash cycle, terminating the other session with "terminating
+      connection because of crash of another server process".
+    - goopg serves every connection from one OS process, and pg\_backend\_pid\(\) is a synthetic per\-connection
+      number, so there is no per\-backend process to kill:
+      - signalling that number would hit an unrelated process;
+      - signalling goopg's own PID would end the whole server, with no postmaster left to restart it.
+    - Reopen when the owner decides a process model for backends.
+- [x] **M0149-0005 — port recovery/t/037_invalid_database.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/037_invalid_database.pl` — interrupted DROP DATABASE leaves an invalid database.
   Likely prerequisites \(verify at start\): `datconnlimit = -2` invalid marker \(`DATCONNLIMIT_INVALID_DB`\) and its replay, connect/ALTER refusal texts, prepared-xact lock interplay, `vacuumdb` against goopg. `pg_backend_pid()` is used only at SQL level here \(fine\); never `kill()` it — on goopg it is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID.
+  - 2026\-11\-23 \(done\): TestPort\_Recovery037InvalidDatabase passes 11/11. Movement: tap 037 0/11 → 11/11.
+    Design: docs/design/0100\-0149/0149\-0005\-invalid\-database.md.
+    - Path\-to\-TAP \(each link a failing assertion or a startup failure\):
+      - 037 ← start refused `log_connections`. Fixed: GUC registered.
+      - 037 ← ALTER of an invalid database succeeded. Fixed: AlterDatabase's FATAL.
+      - 037 ← an invalid database was usable as a template. Fixed: createdb's ERROR.
+      - 037 ← the DROP did not wait for pg\_tablespace. Fixed: dropdb's invalid mark and lock, plus PREPARE
+        TRANSACTION's lock hand\-off.
+    - Regress A/B \(database, prepared\_xacts, lock, guc, sysviews, tablespace\): all equal HEAD.
+    - Isolation prepared\-transactions, prepared\-transactions\-cic, stats and the 2PC same\-backend port pass.
+    - Remaining PG differences are filed as M0149\-0005a.
+- [ ] **M0149-0005a — database DDL residue from 037** (filed 2026-11-23 by M0149-0005)
+  Kind: impl
+  Parent: none
+  - Not a TAP prerequisite: 037 passes. Do not select under M0149 \(ANTI\-DETOUR RULE\) unless a TAP test names one.
+  - The extended\-protocol path reports AlterDatabase's invalid\-database refusal as an ERROR, not a FATAL.
+  - DROP DATABASE is not one transaction: PG deletes the pg\_database tuple transactionally.
+  - The shared\-catalog lock\-tag list omits the shared catalogs' indexes and TOAST relations.
+  - A SERIALIZABLE prepared transaction is not detached and keeps its connection's lock identity.
 - [ ] **M0149-0006 — port recovery/t/018_wal_optimize.pl**
   Kind: impl
   Parent: none

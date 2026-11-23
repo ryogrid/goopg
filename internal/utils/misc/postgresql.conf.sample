@@ -306,6 +306,12 @@
 
 #log_error_verbosity = default          # terse | default | verbose; accepted,
                                         # goopg's log does not format by it
+#log_connections = ''                   # log aspects of connection setup:
+                                        # receipt, authentication, authorization,
+                                        # setup_durations, all; accepted, goopg
+                                        # logs every connection
+#log_disconnections = off               # accepted; goopg logs every
+                                        # disconnection
 #log_line_prefix = '%m [%p] '           # supported escapes: %m %p %u %d %a %x %%
 #log_timezone = 'GMT'                   # accepted; goopg log timestamps are
                                         # not zone-formatted

@@ -162,6 +162,9 @@ func New(name string, opts Options) (*Cluster, error) {
 func (c *Cluster) Name() string       { return c.name }
 func (c *Cluster) DataDir() string    { return c.dataDir }
 func (c *Cluster) ListenAddr() string { return c.listenAddr }
+
+// User is the role the cluster's psql and lib/pq helpers connect as.
+func (c *Cluster) User() string { return c.user }
 func (c *Cluster) LogPath() string    { return c.logPath }
 
 // DSN returns a lib/pq connection string for the cluster's user/database.

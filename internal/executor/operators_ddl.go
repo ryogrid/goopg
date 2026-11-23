@@ -29108,7 +29108,7 @@ func lockRelationTransitively(ctx *Context, sess Session, dbOID uint32, mode str
 		globalRelLockMgr.AddRelationLock(sess, dbOID, tbl.OID, mode)
 	}
 	if lmMode != lmgr.NoLock {
-		rel := storage.RelFileNode{DBOid: dbOID, RelOid: tbl.OID}
+		rel := storage.RelFileNode{DBOid: lockTagDBOid(dbOID, tbl.OID), RelOid: tbl.OID}
 		if err := ctx.acquireRelLockTxn(rel, lmMode, nowait); err != nil {
 			return err
 		}

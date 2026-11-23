@@ -1829,7 +1829,8 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 	// SHARE) held on the executor's tableLockMgr surface in pg_locks with a PID
 	// that joins pg_stat_activity (design 0118-0070). Dropped at teardown.
 	executor.RegisterLockBackendPID(connTx.LockBackendID, pid)
-	defer executor.UnregisterLockBackendPID(connTx.LockBackendID)
+	// A closure: PREPARE TRANSACTION gives the connection a new identity.
+	defer func() { executor.UnregisterLockBackendPID(connTx.LockBackendID) }()
 	// On connection teardown, release EVERY advisory lock this backend still
 	// holds — session-scoped as well as transaction-scoped. PostgreSQL frees all
 	// advisory locks at backend exit; without this a session-scoped

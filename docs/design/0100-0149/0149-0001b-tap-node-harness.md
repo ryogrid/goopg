@@ -82,3 +82,16 @@ port\-facing surface.
     affected.
 - `AppendConf(line)` is Cluster.pm's append\_conf\('postgresql.conf', line\)
   for a goopg node.
+
+## Background sessions, exit codes and tablespace snapshots \(M0149\-0003, M0149\-0005\)
+
+- `BackgroundPSQL(db, onErrorStop)` is BackgroundPsql.pm: a psql whose stdin stays open.
+  - `Query` sends a statement and a banner and returns stdout up to the banner.
+  - `QuerySafe` also fails on stderr output.
+  - `Send` writes without waiting \(query\_until\).
+  - `WaitStderr` is pump\_until on stderr.
+- `PSQLExit(db, sql)` is Cluster.pm's psql: it returns the exit code \(0, 2 for a lost connection or FATAL, 3 for an
+  error under ON\_ERROR\_STOP\) with stdout and stderr.
+- `SnapshotDir(dir)` copies a directory aside and returns a restore function. ColdStartPG cannot isolate an external
+  tablespace: PG's redo of XLOG\_TBLSPC\_CREATE points the copy's link at the logged location. A test therefore
+  restores the tablespace between the PG cold start and its own restart.

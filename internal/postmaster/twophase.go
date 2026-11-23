@@ -47,6 +47,7 @@ import (
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/libpq"
+	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/utils/errcodes"
 )
 
@@ -193,6 +194,15 @@ func (s *Server) execPrepareTransaction(w *libpq.FrameWriter, ctx *executor.Cont
 		sess.RelocateTransaction(newTx)
 	}
 	px := connTx.DetachPrepared(st.Gid, newTx)
+	// The prepared transaction is the dummy PGPROC of PostgreSQL's
+	// MarkAsPreparing / PostPrepare_Locks: the locks it holds belong to it,
+	// not to the backend that prepared it. It keeps the lock identity they
+	// were taken under, and the connection gets a fresh one, so a later
+	// statement on this same connection waits for them like any other
+	// backend (037_invalid_database's DROP DATABASE). M0149-0005.
+	executor.UnregisterLockBackendPID(px.LockBackendID)
+	connTx.LockBackendID = lmgr.BackendID(s.nextBackendID.Add(1))
+	executor.RegisterLockBackendPID(connTx.LockBackendID, connTx.BackendPID)
 	s.preparedXacts.put(st.Gid, px)
 	// M0118-0009 (`stats`, rung 7; design 0118-0131): move the originating
 	// backend's staged relation-stat counters into a per-gid 2PC record so the
