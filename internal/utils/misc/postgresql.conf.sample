@@ -219,6 +219,8 @@
                                         # (SIGHUP to apply)
 #hot_standby = on                       # allow read-only queries during recovery
                                         # (change requires restart)
+#recovery_min_apply_delay = 0           # minimum delay for applying changes during recovery
+                                        # (SIGHUP to apply)
 
 # - Subscribers -
 

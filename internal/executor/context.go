@@ -778,6 +778,12 @@ type Context struct {
 	// which the functions return as NULL (xlogfuncs.c).
 	RecoveryLSNs func() (receive, replay uint64)
 
+	// RecoveryPause, when non-nil, is the standby's replay pause control for
+	// pg_wal_replay_pause / pg_wal_replay_resume ("pause", "resume") and
+	// pg_get_wal_replay_pause_state ("state"), returning the pause state text
+	// or a non-empty refusal (promotion triggered). M0149-0013.
+	RecoveryPause func(action string) (state string, promoteTriggered bool)
+
 	// MaterializedCTEs holds rows from data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE
 	// with RETURNING). Populated by cteDMLPrefixOp before the outer query runs.
 	// Key is the lowercase CTE name; value is the materialized RETURNING rows.

@@ -226,6 +226,9 @@ type Config struct {
 	// pg_last_wal_replay_lsn (0 = none, returned as NULL).
 	RecoveryLSNs func() (receive, replay uint64)
 
+	// RecoveryPause is the standby's replay pause control (M0149-0013).
+	RecoveryPause func(action string) (state string, promoteTriggered bool)
+
 	// OnStopImmediate, when set, is invoked by the control-plane
 	// STOPIMMEDIATE command (`goopg stop -mode immediate`) BEFORE the
 	// run context is cancelled. It must mark the runtime so the final

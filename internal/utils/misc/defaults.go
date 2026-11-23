@@ -1730,6 +1730,14 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
+	// recovery_min_apply_delay (guc_tables.c): a standby holds each replayed
+	// commit until its commit time plus this delay. M0149-0013.
+	r.MustRegister(NewVariable(Variable{
+		Name: "recovery_min_apply_delay", Type: TypeInt, Unit: UnitMs, BootVal: "0",
+		MinVal: 0, MaxVal: 2147483647,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "wal_receiver_status_interval", Type: TypeInt, Unit: UnitS, BootVal: "10",
 		MinVal: 0, MaxVal: 2147483,

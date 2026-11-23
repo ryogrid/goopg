@@ -96,6 +96,8 @@ type standbyController struct {
 	promoting  atomic.Bool
 	promoteErr atomic.Pointer[error]
 	promoted   atomic.Bool
+	// promoteTriggered: Promote was called (PromoteIsTriggered). M0149-0013.
+	promoteTriggered atomic.Bool
 
 	// lastReceived is the highest WAL position a walreceiver reported. PG's
 	// pg_last_wal_receive_lsn keeps answering WalRcv->flushedUpto after the
@@ -180,6 +182,10 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 		rt.TxnMgr.SetInRecovery(true)
 	}
 	replayer := startStandbyReplayer(rplCtx, rplDone, rt, logger)
+	// M0149-0013: recovery_min_apply_delay (SIGHUP; re-read per commit).
+	replayer.SetApplyDelay(func() time.Duration {
+		return time.Duration(intGUC(registry, "recovery_min_apply_delay", 0)) * time.Millisecond
+	})
 	// Recovery flushes become restartpoints: the checkpointer adopts the
 	// last checkpoint record replay applied into pg_control
 	// (CreateRestartPoint), so a restarted standby replays from there.
@@ -275,6 +281,12 @@ func standbyApplyLSNFunc(replayer *xlog.StreamReplayer) func() uint64 {
 // runs the sequence again (steps 1-2 are idempotent — the receiver
 // context stays cancelled and its done channel stays closed).
 func (sc *standbyController) Promote(ctx context.Context) error {
+	// CheckForStandbyTrigger: a promotion ends a replay pause and an apply
+	// delay (recoveryPausesHere, recoveryApplyDelay). M0149-0013.
+	sc.promoteTriggered.Store(true)
+	if sc.replayer != nil {
+		sc.replayer.TriggerPromote()
+	}
 	if sc.promoted.Load() {
 		return nil
 	}
@@ -1246,4 +1258,23 @@ func endInterruptedCrashRecovery(dataDir string, immediate bool, logger *slog.Lo
 	}
 	logger.Info("database system is shut down")
 	return 0
+}
+
+// recoveryPause serves pg_wal_replay_pause / pg_wal_replay_resume /
+// pg_get_wal_replay_pause_state (xlogfuncs.c) from the stream replayer's
+// pause state. M0149-0013.
+func (sc *standbyController) recoveryPause(action string) (string, bool) {
+	if sc.replayer == nil {
+		return "not paused", false
+	}
+	if sc.promoted.Load() || sc.promoteTriggered.Load() {
+		return sc.replayer.PauseState(), true
+	}
+	switch action {
+	case "pause":
+		sc.replayer.RequestPause()
+	case "resume":
+		sc.replayer.Resume()
+	}
+	return sc.replayer.PauseState(), false
 }

@@ -27,6 +27,8 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -49,6 +51,10 @@ type StreamReplayer struct {
 	// onCatalogReplay / catalogDBs: the live catalog refresh (M0149-0010a).
 	onCatalogReplay func(dbOid uint32)
 	catalogDBs      map[uint32]struct{}
+	// Recovery pause / apply delay (stream_replayer_pause.go). M0149-0013.
+	applyDelay       atomic.Pointer[func() time.Duration]
+	pauseState       atomic.Int32
+	promoteTriggered atomic.Bool
 
 	mu       sync.Mutex
 	applyLSN uint64
@@ -216,6 +222,12 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 			}
 			return fmt.Errorf("wal: stream replay read: %w", err)
 		}
+		// The recovery loop checks for a requested pause before each record,
+		// and holds commit records for recovery_min_apply_delay
+		// (xlogrecovery.c PerformWalRecovery). M0149-0013.
+		sr.recoveryPausesHere(ctx)
+		sr.recoveryApplyDelay(ctx, rec)
+		sr.recoveryPausesHere(ctx)
 		applied, err := ApplyRecord(sr.mgr, rec)
 		if err != nil {
 			return fmt.Errorf("wal: stream replay record lsn[%d,%d]: %w", rec.StartLSN, rec.EndLSN, err)

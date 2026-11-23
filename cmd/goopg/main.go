@@ -1075,6 +1075,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.IsStandby = func() bool { return sc.rt.Standby }
 		cfg.HotStandbyConsistent = sc.Consistent
 		cfg.RecoveryLSNs = sc.recoveryLSNs
+		cfg.RecoveryPause = sc.recoveryPause
 	}
 
 	// A reload that arrived during startup is applied before the server

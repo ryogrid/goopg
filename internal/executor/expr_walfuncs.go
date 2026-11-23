@@ -78,3 +78,36 @@ func evalPgSwitchWAL(ctx *Context) (Datum, error) {
 	}
 	return NewStringDatum(formatPgLSN(lsn)), nil
 }
+
+// evalPgWalReplayPause implements pg_wal_replay_pause, pg_wal_replay_resume
+// and pg_get_wal_replay_pause_state (xlogfuncs.c). Outside recovery they raise
+// 55000 "recovery is not in progress"; once promotion is triggered pause and
+// resume raise "standby promotion is ongoing". M0149-0013.
+func evalPgWalReplayPause(name string, ctx *Context) (Datum, error) {
+	if !ctx.IsStandby || ctx.RecoveryPause == nil {
+		return Datum{}, &ExecError{
+			Code:    "55000",
+			Message: "recovery is not in progress",
+			Hint:    "Recovery control functions can only be executed during recovery.",
+		}
+	}
+	action := "state"
+	switch name {
+	case "pg_wal_replay_pause":
+		action = "pause"
+	case "pg_wal_replay_resume":
+		action = "resume"
+	}
+	state, promoting := ctx.RecoveryPause(action)
+	if promoting && action != "state" {
+		return Datum{}, &ExecError{
+			Code:    "55000",
+			Message: "standby promotion is ongoing",
+			Hint:    name + "() cannot be executed after promotion is triggered.",
+		}
+	}
+	if action == "state" {
+		return NewStringDatum(state), nil
+	}
+	return NewStringDatum(""), nil
+}

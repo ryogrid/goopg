@@ -15852,11 +15852,19 @@ verify each at HEAD when the task starts.
         stamp the record's twophase xid \(ParseXactRecord parses xl\_xact\_twophase\) in the stream replayer and
         the crash\-recovery clog pass.
     - Harness: tapnode PumpedPSQL \(IPC::Run psql + send\_query\_and\_wait\).
-- [ ] **M0149-0013 — port recovery/t/005_replay_delay.pl**
+- [x] **M0149-0013 — port recovery/t/005_replay_delay.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/005_replay_delay.pl` — `recovery_min_apply_delay` and recovery pause.
   Likely prerequisites \(verify at start\): apply-delay wait in the startup loop, `pg_wal_replay_pause/resume`, `pg_get_wal_replay_pause_state`, pause-at-promotion semantics.
+  - 2026\-11\-23 DONE: TestPort\_Recovery005ReplayDelay \(three pairings\) passes. Design
+    docs/design/0100\-0149/0149\-0013\-replay\-delay.md; inventory R\-005 `port`. Movement: tap 005 0/5 → 5/5 in each
+    pairing.
+    - Path\-to\-TAP, both proven and fixed:
+      - 005 goopg standby ← postgresql.conf rejected `recovery_min_apply_delay` \(unregistered GUC\): registered
+        \(int, ms, sighup\) and applied in the stream replayer to COMMIT/COMMIT PREPARED records;
+      - 005 pause checks ← `pg_wal_replay_pause/resume` and `pg_get_wal_replay_pause_state` missing: added with PG's
+        not\-in\-recovery and promotion\-ongoing errors; promotion releases a paused standby.
 - [ ] **M0149-0014 — port recovery/t/007_sync_rep.pl**
   Kind: impl
   Parent: none

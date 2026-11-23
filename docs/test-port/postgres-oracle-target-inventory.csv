@@ -389,7 +389,7 @@ R-001,recovery-tap,tap,postgres/src/test/recovery/t/001_stream_rep.pl,port,yes,-
 ,recovery-tap,tap,postgres/src/test/recovery/t/002_archiving.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/003_recovery_targets.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/004_timeline_switch.pl,not-tried,no,-,,,
-,recovery-tap,tap,postgres/src/test/recovery/t/005_replay_delay.pl,not-tried,no,-,,,
+R-005,recovery-tap,tap,postgres/src/test/recovery/t/005_replay_delay.pl,port,yes,-,Ported as TestPort_Recovery005ReplayDelay in internal/testport/recovery_005_replay_delay_test.go (M0149-0013): all-goopg and with PG 18.3 as primary or standby,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/006_logical_decoding.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/007_sync_rep.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/008_fsm_truncation.pl,not-tried,no,-,,,
