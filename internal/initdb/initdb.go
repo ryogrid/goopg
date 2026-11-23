@@ -1742,6 +1742,9 @@ func bootstrapSharedCatalogPlaceholders(dataDir string) error {
 //	2753 pg_opfamily        (bootstrapPgOpfamilyTuples)
 //	3456 pg_collation       (bootstrapPgCollationTuples)
 //	3541 pg_range           (bootstrapPgRangeTuples)
+// M0149-0006: the stale entries (2614, 3765, 3768, 6003, 6101, 6137, 9400 —
+// no PG 18 catalog has these OIDs; 3764 is pg_ts_template, kept once) are
+// gone: each was a file under base/<db> that no pg_class row names.
 func mappedLocalCatalogPlaceholderOIDs() []uint32 {
 	return []uint32{
 		826,  // pg_default_acl (M0106-0010 step 3ak)
@@ -1750,9 +1753,6 @@ func mappedLocalCatalogPlaceholderOIDs() []uint32 {
 		2609, // pg_description
 		2611, // pg_inherits
 		2613, // pg_largeobject
-		2614, // pg_largeobject_metadata (MISLABEL — 2614 is no catalog in PG18;
-		//	  the real LargeObjectMetadataRelationId is 2995, below. Kept because
-		//	  removing a laid-down file is not this slice's business.)
 		2619, // pg_statistic
 		2620, // pg_trigger
 		3394, // pg_init_privs (M0149-0001g slice 3)
@@ -1764,13 +1764,10 @@ func mappedLocalCatalogPlaceholderOIDs() []uint32 {
 		3501, // pg_enum (M0106-0010 step 3an)
 		3596, // pg_seclabel
 		3602, // pg_ts_config (M0106-0010 step 3ck)
-		3764, // pg_ts_config (stale — true pg_ts_config OID is 3602)
 		3603, // pg_ts_config_map (M0106-0010 step 3cj)
-		3765, // pg_ts_config_map (stale — true pg_ts_config_map OID is 3603)
 		3600, // pg_ts_dict (M0106-0010 step 3cm)
 		3601, // pg_ts_parser (M0106-0010 step 3cn)
 		3764, // pg_ts_template (M0106-0010 step 3co)
-		3768, // pg_ts_template (stale — true pg_ts_template OID is 3764)
 		3466, // pg_event_trigger (M0106-0010 step 3ar)
 		3079, // pg_extension (M0106-0010 step 3aw)
 		2328, // pg_foreign_data_wrapper (M0106-0010 step 3bb)
@@ -1784,11 +1781,7 @@ func mappedLocalCatalogPlaceholderOIDs() []uint32 {
 		2224, // pg_sequence (M0106-0010 step 3cb)
 		3429, // pg_statistic_ext_data (M0106-0010 step 3cc)
 		3576, // pg_transform (M0106-0010 step 3ci)
-		6003, // pg_publication (stale — no upstream catalog at OID 6003)
-		6101, // pg_publication_rel
 		6102, // pg_subscription_rel
-		6137, // pg_transform (stale — true pg_transform OID is 3576)
-		9400, // pg_db_role_setting
 		// M0149-0001g slice 6: never list an index OID here — this runs after
 		// bootstrapPostgresDatabase and would overwrite its btree page with a
 		// heap page. 3766/3767 (pg_ts_template indexes) were listed and PG
@@ -2339,6 +2332,13 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		175,  // pg_user_mapping_user_server_index (Step 3cp)
 	}
 	for _, oid := range perDBIndexOIDs {
+		// A shared catalog's index lives only in global/ (written below):
+		// a copy under base/<db> is a file no pg_class row of that
+		// database names (018_wal_optimize check_orphan_relfilenodes).
+		// M0149-0006.
+		if isSharedRelOID(oid) {
+			continue
+		}
 		if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
 		}
@@ -2467,6 +2467,9 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		return err
 	}
 	for _, oid := range perDBIndexOIDs {
+		if isSharedRelOID(oid) {
+			continue
+		}
 		if err := os.WriteFile(filepath.Join(tmpl0Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
 		}
@@ -7218,4 +7221,16 @@ func templateDatacl(name string) executor.Datum {
 		return executor.NullDatum
 	}
 	return executor.NewBytesDatum(blob)
+}
+
+// isSharedRelOID reports whether oid is one of PG 18.3's shared catalogs or
+// their indexes / TOAST relations (pg_class.relisshared), whose files live
+// only in global/.
+func isSharedRelOID(oid uint32) bool {
+	for _, o := range pgGlobalRelMapOIDs {
+		if o == oid {
+			return true
+		}
+	}
+	return false
 }

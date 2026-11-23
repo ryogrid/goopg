@@ -15623,12 +15623,26 @@ verify each at HEAD when the task starts.
       - 018 idx\_hint ← unique check counting a rolled\-back row. Fixed.
       - 018 ins\_trig ← NEW.id replaced inside NEW.id2. Fixed.
       - 018 orphan check ← pg\_relation\_filepath NULL for system relations. Fixed; the remainder is below.
-    - Open, the last 2 assertions \(check\_orphan\_relfilenodes at both wal\_levels\):
-      - extra files under base/<db>: `0`, shared\-catalog indexes 2697/2698/6114/6115, and 2614, 3765, 3768,
-        6003, 6101, 6137, 9400, 9410;
-      - temp relation files are not named `t<procno>_<oid>` and are not removed at a crash restart
-        \(RemovePgTempFiles\);
-      - TOAST relations listed in pg\_class have no file.
+    - 2026\-11\-23 slice 2: the orphan set shrank from 16 files plus 2 file\-less TOAST rows to 3 files. Fixed:
+      `base/<db>/0` \(sizer on RelOid 0\), shared\-catalog indexes in base/<db>, 7 stale placeholder heaps
+      \(fresh base/5 now equals PG's 224 files\), TOAST heap file created at CREATE TABLE. Still 40/42.
+    - Open, the last 2 assertions \(check\_orphan\_relfilenodes at both wal\_levels\), remaining orphans
+      `base/5/16860`, `base/5/16865`, `base/5/9410`:
+      - Path\-to\-TAP: 018 orphan check ← temp relation files named `<oid>`, not `t<procno>_<oid>`, and not
+        removed at startup → **M0149-0006a**.
+      - Path\-to\-TAP: 018 orphan check ← goopg\-private stats sidecar 9410 in base/<db> \(owner waiver
+        M0125-0029\) → **M0149-0006b** \[!\] owner.
+  - [ ] **M0149-0006a — temp relation file naming `t<procno>_<oid>` + RemovePgTempFiles at startup**
+    Kind: impl
+    Parent: M0149-0006
+    Upstream: `relpath.c` GetRelationPath \(backend != INVALID\_PROC\_NUMBER\), `fd.c` RemovePgTempRelationFiles.
+    Proven by: 018 check\_orphan\_relfilenodes lists the temp table's `16860`/`16865` at both wal\_levels.
+    Also: skip of eager TOAST creation for temp tables \(`createToastStorage`\) is lifted once temp files carry
+    the `t` prefix.
+  - [!] **M0149-0006b — relocate the goopg relation\-stats sidecar 9410 out of base/<db>**
+    Kind: impl \(owner\-gated: owner waiver M0125-0029 placed it there\)
+    Parent: M0149-0006
+    Proven by: 018 check\_orphan\_relfilenodes lists `base/5/9410` \(no pg\_class row\) at both wal\_levels.
     - Also found and fixed on the way, because the path above required them:
       - data rolled back to a savepoint came back after a crash;
       - a re\-insert after ROLLBACK TO raised 23505.

@@ -51,13 +51,24 @@ At the end it checks that every file under base/<db> is a pg\_class relation, an
 - **`pg_relation_filepath` / `pg_relation_filenode` for system relations.** They returned NULL for every seeded
   relation; they now read its pg\\_class seed row \\(`catalog.SeedRelationStorage`\\).
 
+## Orphan check: fixed in slice 2
+
+- **`base/<db>/0`.** The planner's relation sizer called `pool.NBlocks` with relfilenode 0 for a function scan, and the
+  smgr open \(O\_CREATE\) created the file. `SetRelationSizer` now returns "unknown" for RelOid 0.
+- **Shared-catalog indexes under base/<db>.** The per-database index loop wrote 2697, 2698, 6114 and 6115 into every
+  database directory. It now skips every OID in the global relmap \(`isSharedRelOID`\).
+- **Stale placeholder heaps.** 2614, 3765, 3768, 6003, 6101, 6137 and 9400 were removed from
+  `mappedLocalCatalogPlaceholderOIDs`; none is a relfilenode PG 18 keeps in base/<db>. A fresh goopg base/5 now holds
+  exactly PG's 224 files, and PG 18.3 still cold\-starts on the directory \(014/034/036/037 pass\).
+- **TOAST heaps at CREATE TABLE.** `createToastStorage` creates the empty TOAST heap file with the table, as PG's
+  `heap_create` does, and DROP TABLE removes it. It is skipped for temporary tables \(see below\).
+
 ## Remaining: check\_orphan\_relfilenodes
 
-- goopg writes files under base/<db> that PG does not have there:
-  - `0`;
-  - the shared catalogs' indexes 2697, 2698, 6114 and 6115, which PG keeps only in global/;
-  - files numbered 2614, 3765, 3768, 6003, 6101, 6137, 9400 and 9410, which are not PG relations there.
+Three files are still orphans at both wal\_levels: `base/5/16860`, `base/5/16865` and `base/5/9410`.
+
 - The temporary table's files are named `<oid>` where PG uses `t<procno>_<oid>`, and they survive the crash; PG's
-  RemovePgTempFiles removes them.
-- pg\\_class lists TOAST relations \\(OIDs 100000000 plus the table's\\) that have no file; PG creates the TOAST heap
-  with the table.
+  RemovePgTempFiles removes them at startup. Fixing this needs a backend id in the relation file locator
+  \(filed M0149-0006a\).
+- 9410 is the goopg\-private relation\-stats sidecar \(`catalog.GoopgRelStatsRelationId`\), stored in base/<db> under
+  owner waiver M0125-0029. Moving it is owner\-gated \(filed M0149-0006b\).

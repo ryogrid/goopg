@@ -2617,6 +2617,31 @@ func (o *ddlOp) createHeapInitFork(tbl *catalog.Table) error {
 	return nil
 }
 
+// createToastStorage is AlterTableCreateToastTable at CREATE TABLE: a table
+// pg_class gives a TOAST relation gets that relation's (empty) file now, as
+// PG creates the toast heap with the table, and the file is removed if the
+// transaction aborts. goopg used to create it on the first out-of-line
+// value, so pg_class named a relation without a file (018_wal_optimize
+// check_orphan_relfilenodes). It returns true so it can join the caller's
+// StorageScheduled expression. M0149-0006.
+func (o *ddlOp) createToastStorage(tbl *catalog.Table) bool {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	// Temp tables are skipped: goopg names temp relation files like
+	// permanent ones (PG uses t<procno>_<oid>, swept by RemovePgTempFiles),
+	// so an eager TOAST file would only add an orphan. M0149-0006.
+	if !ok || o.ctx.Pool == nil || tbl == nil || tbl.Temp {
+		return true
+	}
+	toastRel, has := im.ToastRelFileNode(o.ctx.Catalog.RelFileNode(tbl))
+	if !has {
+		return true
+	}
+	if err := o.ctx.Pool.CreateFile(toastRel); err == nil {
+		createdRelationStorage(o.ctx, toastRel, true)
+	}
+	return true
+}
+
 // placeTableInTablespace sets tbl's tablespace. The main-fork file was
 // created (touchHeapMainForkFile) before the TABLESPACE clause was applied,
 // under base/; PG's heap_create creates it in the relation's own tablespace.
@@ -4753,7 +4778,7 @@ afterExistsCheck:
 	// entry is already live and must be cleaned up on ROLLBACK.
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow,
-			StorageScheduled: createdRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)})
+			StorageScheduled: o.createToastStorage(tbl) && createdRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)})
 	}
 	createUndoRecorded = true
 	if catalogHeapSyncAvailable(o.ctx) {
@@ -5926,7 +5951,7 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 	}
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow,
-			StorageScheduled: createdRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)})
+			StorageScheduled: o.createToastStorage(tbl) && createdRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)})
 		// Register ON COMMIT {DELETE ROWS|DROP} for the commit-time pass.
 		// Mirrors DefineRelation → register_on_commit_action (tablecmds.c:19261).
 		// The 42P16 guard at the top of this function already rejected a
@@ -6214,7 +6239,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	// Record for rollback.
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false,
-			StorageScheduled: createdRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)})
+			StorageScheduled: o.createToastStorage(tbl) && createdRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)})
 	}
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
@@ -8431,6 +8456,15 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 	// (dropRelationStorage), so a rolled-back DROP keeps the data.
 	if err := dropRelationStorage(o.ctx, rel, true); err != nil {
 		return err
+	}
+	// The TOAST relation goes with its table (heap_drop_with_catalog drops
+	// the toast heap through its dependency). M0149-0006.
+	if o.ctx.Pool != nil {
+		if toastRel := ToastRelFor(rel); o.ctx.Pool.Manager().Exists(toastRel) {
+			if err := dropRelationStorage(o.ctx, toastRel, true); err != nil {
+				return err
+			}
+		}
 	}
 	for _, idxRel := range idxRels {
 		if err := dropRelationStorage(o.ctx, idxRel, false); err != nil {
@@ -22045,7 +22079,7 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 	tbl.ViewDef = s.RawDef
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false,
-			StorageScheduled: createdRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)})
+			StorageScheduled: o.createToastStorage(tbl) && createdRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)})
 	}
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {

@@ -1197,6 +1197,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// Installed on this catalog instance, not process-wide: a test binary
 	// starts several servers and each must see its own storage.
 	cat.SetRelationSizer(func(rfn storage.RelFileNode) (int64, bool) {
+		// A relation without storage (a function scan's or VALUES'
+		// pseudo-table, OID 0) has no file; NBlocks would create base/<db>/0
+		// through the smgr's O_CREATE open (018_wal_optimize
+		// check_orphan_relfilenodes). M0149-0006.
+		if rfn.RelOid == 0 {
+			return 0, false
+		}
 		n, err := pool.NBlocks(rfn)
 		if err != nil {
 			return 0, false
