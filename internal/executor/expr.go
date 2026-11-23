@@ -18168,6 +18168,10 @@ case "pg_char_to_encoding":
 		return NewTimeDatum(misc.TimestampTZToTimestamp(ctx.Now, timeZoneFromCtx(ctx))), nil
 	case "pg_is_in_recovery":
 		return NewBoolDatum(ctx.IsStandby), nil
+	// pg_switch_wal() → pg_lsn (xlogfuncs.c): XLOG_SWITCH, the end of the
+	// switch record. M0149-0076.
+	case "pg_switch_wal":
+		return evalPgSwitchWAL(ctx)
 	case "pg_current_wal_lsn", "pg_current_wal_insert_lsn", "pg_current_wal_flush_lsn":
 		return evalPgCurrentWALLSN(name, ctx)
 	case "pg_last_wal_receive_lsn", "pg_last_wal_replay_lsn":

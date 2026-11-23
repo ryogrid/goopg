@@ -15724,7 +15724,11 @@ verify each at HEAD when the task starts.
     - Path\-to\-TAP:
       - 039 setup ← `pg_settings` lacked wal\_segment\_size / wal\_block\_size. Fixed: preset rows.
       - 039 setup ← `pg_control_checkpoint()` not a table function. Fixed.
-      - 039 setup ← `pg_switch_wal()` does not exist: no XLOG\_SWITCH in the WAL writer. NEXT.
+      - 039 setup ← `pg_switch_wal()` does not exist: no XLOG\_SWITCH in the WAL writer. Fixed in slice 2.
+      - 039 every case ← goopg's end\-of\-WAL log text is its own, not xlogreader.c's. NEXT.
+  - 2026\-11\-23 slice 2: Writer.SwitchSegment \(XLOG\_SWITCH + zero\-filled segment tail + xl\_prev = switch record,
+    flushed\); pg\_switch\_wal\(\); readAllPageAware and the writer's position scan step to the next segment after
+    a switch. Movement: tap 039 0/14 → 0/14, now running all 14 cases \(before: stopped in setup\).
     - Filed nearby, not worked: `pg_settings` is a hard\-coded list of \~60 rows, not the GUC registry \(PG's
       show\_all\_settings\); the other pg\_control\_\* functions \(system, init, recovery\) are missing.
 - [ ] **M0149-0009 — port recovery/t/008_fsm_truncation.pl**

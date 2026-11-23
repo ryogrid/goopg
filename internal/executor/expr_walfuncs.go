@@ -56,3 +56,25 @@ func evalPgLastWALLSN(name string, ctx *Context) Datum {
 	}
 	return NewStringDatum(formatPgLSN(lsn))
 }
+
+// evalPgSwitchWAL implements pg_switch_wal (xlogfuncs.c): it refuses to run
+// during recovery and returns RequestXLogSwitch's position, the end of the
+// XLOG_SWITCH record (or the segment boundary when the current segment is
+// still empty). M0149-0076.
+func evalPgSwitchWAL(ctx *Context) (Datum, error) {
+	if ctx.IsStandby {
+		return Datum{}, &ExecError{
+			Code:    "55000",
+			Message: "recovery is in progress",
+			Hint:    "WAL control functions cannot be executed during recovery.",
+		}
+	}
+	if ctx.WAL == nil {
+		return NewStringDatum(formatPgLSN(0)), nil
+	}
+	lsn, err := ctx.WAL.SwitchSegment()
+	if err != nil {
+		return Datum{}, &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	return NewStringDatum(formatPgLSN(lsn)), nil
+}

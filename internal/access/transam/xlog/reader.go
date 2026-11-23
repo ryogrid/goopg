@@ -316,8 +316,23 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		end := baseOffset + uint64(off) + uint64(consumed)
 		records = append(records, Record{StartLSN: start, EndLSN: end, Payload: decoded.Payload, XLog: decoded.XLog})
 		off += consumed
+		// An XLOG_SWITCH record ends its segment: the next record starts at
+		// the next segment boundary (XLogDecodeNextRecord, xlogreader.c).
+		// baseOffset is a whole multiple of segSize, so the boundary is
+		// stream-relative too. M0149-0076.
+		if isXLogSwitchHeader(h) && segSize > 0 {
+			if rem := int64(off) % segSize; rem != 0 {
+				off += int(segSize - rem)
+			}
+		}
 	}
 	return records, early
+}
+
+// isXLogSwitchHeader reports whether h is an RM_XLOG_ID / XLOG_SWITCH record
+// header.
+func isXLogSwitchHeader(h XLogRecord) bool {
+	return h.Rmid == RmgrXLog && h.Info&0xF0 == xlogXLogSwitch
 }
 
 // (afterCorruptIsZeroTail was removed in A9 with the legacy ReadAll walk; the

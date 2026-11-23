@@ -1692,6 +1692,13 @@ func scanLastSegmentEnd(walDir string, segNo uint64, tli uint32, segSize int64, 
 		}
 		lastRecPtr = uint64(pos) + 1
 		off += consumed
+		// Sibling of readAllPageAware: after XLOG_SWITCH the write position
+		// is the next segment boundary. M0149-0076.
+		if isXLogSwitchHeader(h) && cfgSegSize > 0 {
+			if rem := (streamBase + int64(off)) % cfgSegSize; rem != 0 {
+				off += int(cfgSegSize - rem)
+			}
+		}
 	}
 	return int64(off), lastRecPtr, nil
 }
