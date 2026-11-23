@@ -174,6 +174,11 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 	rplDone := make(chan struct{})
 	sigDone := make(chan struct{})
 
+	// M0149-0012: hot-standby snapshots see a primary transaction only once
+	// its replayed commit has stamped the commit log.
+	if rt.TxnMgr != nil {
+		rt.TxnMgr.SetInRecovery(true)
+	}
 	replayer := startStandbyReplayer(rplCtx, rplDone, rt, logger)
 	// Recovery flushes become restartpoints: the checkpointer adopts the
 	// last checkpoint record replay applied into pg_control
@@ -291,6 +296,9 @@ func (sc *standbyController) Promote(ctx context.Context) error {
 	sc.promoteErr.Store(&err)
 	if err == nil {
 		sc.promoted.Store(true)
+		if sc.rt != nil && sc.rt.TxnMgr != nil {
+			sc.rt.TxnMgr.SetInRecovery(false)
+		}
 	}
 	return err
 }

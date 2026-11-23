@@ -132,14 +132,24 @@ func replayCLogFromWAL(walDir string, clog *transam.CLog, txnMgr *transam.Manage
 			// COMMIT/ABORT (and their two-phase variants, which goopg refuses
 			// in the physical pass).
 			op := r.XLog.Header.Info & xlog.XlogXactOpMask
-			if op != xlog.XlogXactCommit && op != xlog.XlogXactAbort {
-				continue
-			}
-			if r.XLog.Header.XID == 0 {
+			prepared := op == xlog.XlogXactCommitPrepared || op == xlog.XlogXactAbortPrepared
+			if op != xlog.XlogXactCommit && op != xlog.XlogXactAbort && !prepared {
 				continue
 			}
 			xid := storage.TransactionID(r.XLog.Header.XID)
-			isCommit := op == xlog.XlogXactCommit
+			if prepared {
+				// COMMIT/ABORT PREPARED finish the record's twophase xid, not
+				// the header xid (xact_redo, xact.c). M0149-0012.
+				parsed, perr := xlog.ParseXactRecord(r.XLog.Header.Info, r.XLog.MainData)
+				if perr != nil || parsed.TwophaseXid == 0 {
+					continue
+				}
+				xid = storage.TransactionID(parsed.TwophaseXid)
+			}
+			if xid == 0 {
+				continue
+			}
+			isCommit := op == xlog.XlogXactCommit || op == xlog.XlogXactCommitPrepared
 			xactStampAndAdvance(clog, txnMgr, xid, isCommit)
 			// M0131-S22: stamp the whole transaction TREE, as
 			// TransactionIdCommitTree / TransactionIdAbortTree do

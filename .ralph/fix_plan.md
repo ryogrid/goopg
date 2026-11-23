@@ -15837,11 +15837,21 @@ verify each at HEAD when the task starts.
   - 2026\-11\-23 DONE: TestPort\_Recovery016MinConsistency, three subtests \(all\-goopg, PG 18.3 primary → goopg
     standby, goopg primary → PG 18.3 standby\), all pass with no product change. Movement: tap 016 0/1 → 1/1 in each
     pairing. Design docs/design/0100\-0149/0149\-0011\-min\-consistency.md; inventory R\-016 `port`.
-- [ ] **M0149-0012 — port recovery/t/021_row_visibility.pl**
+- [x] **M0149-0012 — port recovery/t/021_row_visibility.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/021_row_visibility.pl` — hot-standby snapshot visibility incl. prepared transactions.
   Likely prerequisites \(verify at start\): `XLOG_RUNNING_XACTS` + KnownAssignedXids, prepared-xact replay, `background_psql` harness method.
+  - 2026\-11\-23 DONE: TestPort\_Recovery021RowVisibility \(three pairings\) passes. Design
+    docs/design/0100\-0149/0149\-0012\-row\-visibility.md; inventory R\-021 `port`. Movement: tap 021 0/9 → 9/9 in each
+    pairing.
+    - Path\-to\-TAP, both proven and fixed:
+      - 021 all\-goopg "uncommitted update invisible" ← the goopg standby showed the primary's uncommitted UPDATE:
+        recovery snapshots now require a committed clog status \(Manager.SetInRecovery\);
+      - 021 PG primary ← goopg replay refused XLOG\_XACT\_PREPARE: PREPARE is a page no\-op; COMMIT/ABORT PREPARED
+        stamp the record's twophase xid \(ParseXactRecord parses xl\_xact\_twophase\) in the stream replayer and
+        the crash\-recovery clog pass.
+    - Harness: tapnode PumpedPSQL \(IPC::Run psql + send\_query\_and\_wait\).
 - [ ] **M0149-0013 — port recovery/t/005_replay_delay.pl**
   Kind: impl
   Parent: none

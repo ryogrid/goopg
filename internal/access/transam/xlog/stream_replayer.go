@@ -288,6 +288,15 @@ func replayedXactInfo(rec Record) (storage.TransactionID, bool, bool) {
 		return storage.TransactionID(rec.XLog.Header.XID), true, true
 	case xlogXactAbort:
 		return storage.TransactionID(rec.XLog.Header.XID), false, true
+	case xlogXactCommitPrepared, xlogXactAbortPrepared:
+		// The finished transaction is the record's twophase xid, not the
+		// header xid of the backend that ran COMMIT/ROLLBACK PREPARED.
+		// M0149-0012.
+		parsed, err := ParseXactRecord(rec.XLog.Header.Info, rec.XLog.MainData)
+		if err != nil || parsed.TwophaseXid == 0 {
+			return 0, false, false
+		}
+		return storage.TransactionID(parsed.TwophaseXid), rec.XLog.Header.Info&xlogXactOpMask == xlogXactCommitPrepared, true
 	default:
 		return 0, false, false
 	}

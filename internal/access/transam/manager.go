@@ -88,6 +88,9 @@ type Manager struct {
 	// installed by the server/initdb.Open recovery wiring via SetCLog. Read under
 	// abortedMu (cheap, already taken in captureSnapshot's neighbourhood).
 	clog *CLog
+	// inRecovery: hot-standby snapshots require a committed CLOG status
+	// (SetInRecovery). M0149-0012.
+	inRecovery atomic.Bool
 
 	xactMarkerMu sync.RWMutex
 	// The bool parameter is waitLocalFlush: true (every existing caller —
@@ -231,6 +234,13 @@ func (m *Manager) SetCLog(c *CLog) {
 // SetCLog had no production caller at all for the whole of M0117..M0131, which
 // made the entire durable-abort visibility fallback dead code on every live
 // server (docs/design/0131-0027).
+// SetInRecovery marks the manager as serving a hot standby (true) or a
+// primary (false). Snapshots taken in recovery see a transaction only once
+// the commit log records its commit — the primary's in-progress xids are not
+// in this manager's own in-progress list, as PG's KnownAssignedXids are not
+// in its ProcArray (procarray.c). M0149-0012.
+func (m *Manager) SetInRecovery(on bool) { m.inRecovery.Store(on) }
+
 // CLog returns the manager's commit log, or nil when none is wired. The
 // standby's live catalog refresh reads catalog rows through it (M0149-0010a).
 func (m *Manager) CLog() *CLog {
@@ -1458,6 +1468,7 @@ func (m *Manager) captureSnapshot() Snapshot {
 		InProgress:           inProgress,
 		Aborted:              aborted,
 		clog:                 clog,
+		inRecovery:           m.inRecovery.Load(),
 		PartitionDetachEpoch: CurrentPartitionDetachEpoch(),
 	}
 }

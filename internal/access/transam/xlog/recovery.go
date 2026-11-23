@@ -2629,17 +2629,23 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// (see the xlogXactCommit arm above), which is the message set
 			// that actually became visible.
 			return false, nil
-		case xlogXactPrepare, xlogXactCommitPrepared, xlogXactAbortPrepared:
-			// M0131-S21a: two-phase commit is out of scope — goopg's
-			// max_prepared_transactions BootVal is "0", so it can neither
-			// produce these records nor rebuild the pg_twophase state a
-			// PREPARED transaction needs. Refuse with a message that names
-			// the reason: replaying the COMMIT_PREPARED of a transaction
-			// whose PREPARE we skipped would stamp an XID committed whose
-			// heap changes were never applied.
-			return false, fmt.Errorf("%w: %s (two-phase commit recovery is not supported; "+
-				"max_prepared_transactions must be 0 on a cluster goopg starts)",
-				ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
+		case xlogXactPrepare:
+			// xact_redo's PREPARE arm (PrepareRedoAdd) records the prepared
+			// transaction's state; it changes no page. The transaction's heap
+			// changes arrive as their own records and are already applied.
+			// M0149-0012: replayed as a no-op; goopg keeps no pg_twophase state
+			// for a primary's prepared transaction on a standby (ledger).
+			return false, nil
+		case xlogXactCommitPrepared:
+			// xact_redo_commit for the prepared xid: same page work as a
+			// commit; the CLOG stamp is the stream replayer's / recovery
+			// pass's, for the record's twophase xid. M0149-0012.
+			if xactCommitCarriesInvals(xlog.Header.Info, xlog.MainData) {
+				_ = ProcessCommittedInvalidationMessages(mgr.DataDir(), defaultRecoveryDBOid)
+			}
+			return false, dropXactRelFiles(mgr, xlog)
+		case xlogXactAbortPrepared:
+			return false, dropXactRelFiles(mgr, xlog)
 		default:
 			return false, unsupportedDecodedXLogOpcode(r)
 		}
