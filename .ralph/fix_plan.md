@@ -15865,11 +15865,20 @@ verify each at HEAD when the task starts.
         \(int, ms, sighup\) and applied in the stream replayer to COMMIT/COMMIT PREPARED records;
       - 005 pause checks ← `pg_wal_replay_pause/resume` and `pg_get_wal_replay_pause_state` missing: added with PG's
         not\-in\-recovery and promotion\-ongoing errors; promotion releases a paused standby.
-- [ ] **M0149-0014 — port recovery/t/007_sync_rep.pl**
+- [x] **M0149-0014 — port recovery/t/007_sync_rep.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/007_sync_rep.pl` — `sync_priority`/`sync_state` transitions.
   Likely prerequisites \(verify at start\): `synchronous_standby_names` FIRST/ANY/priority over ≥3 standbys, `application_name` from `primary_conninfo`, `pg_stat_replication` sync columns \(design 0102-0005 exists — verify against PG\).
+  - 2026\-11\-23 DONE: TestPort\_Recovery007SyncRep \(three pairings\) passes. Design
+    docs/design/0100\-0149/0149\-0014\-sync\-rep.md; inventory R\-007 `port`. Movement: tap 007 0/11 → 11/11 in each
+    pairing.
+    - Path\-to\-TAP, each a single link:
+      - 007 ← standbys must report their node name: `cluster_name` GUC, `goopg start --cluster-name` / `-c`,
+        walreceiver fallback\_application\_name; the harness passes `--cluster-name` like Cluster.pm;
+      - 007 ← sync\_priority/sync\_state per SyncRepGetCandidateStandbys \(walsender slots, `*`, num\_sync over the
+        list, quorum\): SyncRep rewritten around slots;
+      - 007 ← ALTER SYSTEM \+ reload: SIGHUP re\-applies synchronous\_standby\_names.
 - [ ] **M0149-0015 — port recovery/t/012_subtransactions.pl**
   Kind: impl
   Parent: none

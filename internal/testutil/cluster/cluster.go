@@ -81,6 +81,7 @@ type Cluster struct {
 	initArgs     []string
 	syncInit     bool
 	syncRuntime  bool
+	startArgs    []string
 
 	mu  sync.Mutex
 	cmd *exec.Cmd
@@ -90,6 +91,11 @@ type Cluster struct {
 type BackgroundPSQL struct {
 	cmd *exec.Cmd
 }
+
+// SetStartArgs sets extra `goopg start` arguments for every later Start —
+// e.g. Cluster.pm's `--cluster-name=<node>`, which it passes on the command
+// line so a base backup does not carry it to standbys.
+func (c *Cluster) SetStartArgs(args ...string) { c.startArgs = append([]string(nil), args...) }
 
 // New builds a cluster handle.
 func New(name string, opts Options) (*Cluster, error) {
@@ -243,6 +249,7 @@ func (c *Cluster) Start() error {
 		return err
 	}
 	args := append(append([]string{}, c.goopgCommand[1:]...), "start", "-D", c.dataDir, "-listen", c.listenAddr)
+	args = append(args, c.startArgs...)
 	cmd := exec.Command(c.goopgCommand[0], args...)
 	cmd.Dir = c.repoRoot
 	cmd.Stdout = f

@@ -85,7 +85,12 @@ type Cluster struct {
 	startupWait time.Duration
 	postgresCmd *exec.Cmd
 	logFile     *os.File
+	startArgs   []string
 }
+
+// SetStartArgs sets extra postgres command-line arguments for every later
+// Start — e.g. Cluster.pm's `--cluster-name=<node>`.
+func (c *Cluster) SetStartArgs(args ...string) { c.startArgs = append([]string(nil), args...) }
 
 // Available skips the calling test when the upstream PG bin directory
 // is missing the binaries pgcluster needs.
@@ -242,10 +247,8 @@ func (c *Cluster) Start() error {
 	if err != nil {
 		return fmt.Errorf("pgcluster: open log: %w", err)
 	}
-	cmd := exec.Command(filepath.Join(c.bin, "postgres"),
-		"-D", c.dataDir,
-		"-p", fmt.Sprintf("%d", c.port),
-		"-h", "127.0.0.1")
+	pgArgs := append([]string{"-D", c.dataDir, "-p", fmt.Sprintf("%d", c.port), "-h", "127.0.0.1"}, c.startArgs...)
+	cmd := exec.Command(filepath.Join(c.bin, "postgres"), pgArgs...)
 	env := c.env()
 	if soPath, ok, errPre := segvBacktraceLDPreload(); ok {
 		env = appendLDPreload(env, soPath)

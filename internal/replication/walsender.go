@@ -652,8 +652,15 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 	// connection drops so a disconnected standby no longer counts toward
 	// the FIRST/ANY quorum. Empty appName is harmless (ForgetStandby
 	// removes the "" key, which never matches any rule entry).
-	if s.cfg.SyncRep != nil && appName != "" {
-		defer s.cfg.SyncRep.ForgetStandby(appName)
+	// The walsender takes a SyncRep slot (WalSndCtl->walsnds) and frees it
+	// on exit, so a disconnected standby no longer counts toward
+	// synchronous_standby_names and the next one reuses the lowest slot.
+	if s.cfg.SyncRep != nil {
+		syncStandby := s.cfg.SyncRep.RegisterStandby(appName)
+		defer syncStandby.Release()
+		if senderHandle != nil {
+			senderHandle.SetSyncStandby(syncStandby)
+		}
 	}
 	defer func() {
 		if s.cfg.Logger == nil {
@@ -929,7 +936,9 @@ func (s *Handler) handleStandbyCopyData(slotName string, payload []byte, senderH
 		// M0102-0005: feed the SyncRep wait primitive so any commit
 		// blocking on this standby gets released as soon as the
 		// acknowledged LSN reaches the commit target.
-		if syncRep != nil && appName != "" {
+		if h := senderHandle.SyncStandby(); h != nil {
+			h.Update(st.WriteLSN, st.FlushLSN, st.ApplyLSN)
+		} else if syncRep != nil && appName != "" {
 			syncRep.UpdateStandbyProgress(appName, st.WriteLSN, st.FlushLSN, st.ApplyLSN)
 		}
 	}

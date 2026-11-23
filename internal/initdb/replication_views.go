@@ -102,13 +102,13 @@ func registerStatReplicationView(cat *catalog.InMemory, senders *xlog.Senders, w
 				formatLSN(s.WriteLSN),
 				formatLSN(s.FlushLSN),
 				formatLSN(s.ReplayLSN),
-				"00:00:00",                               // write_lag: lag intervals not wired in v0
-				"00:00:00",                               // flush_lag
-				"00:00:00",                               // replay_lag
-				syncPriority(syncRep, s.ApplicationName), // sync_priority
-				syncState(syncRep, s.ApplicationName),    // sync_state
-				"",                                       // reply_time: not tracked per-message in v0
-				s.SlotName,                               // slot_name
+				"00:00:00",               // write_lag: lag intervals not wired in v0
+				"00:00:00",               // flush_lag
+				"00:00:00",               // replay_lag
+				syncPriority(syncRep, s), // sync_priority
+				syncState(syncRep, s),    // sync_state
+				"",                       // reply_time: not tracked per-message in v0
+				s.SlotName,               // slot_name
 				hitsStr,
 				missesStr,
 				residentStr,
@@ -119,22 +119,30 @@ func registerStatReplicationView(cat *catalog.InMemory, senders *xlog.Senders, w
 	return cat.RegisterVirtualTable(tbl)
 }
 
-// syncState returns the pg_stat_replication.sync_state string for appName.
-// Returns "async" when syncRep is nil (no synchronous replication configured).
-func syncState(syncRep *xlog.SyncRep, appName string) string {
+// syncState returns the pg_stat_replication.sync_state string for the
+// walsender's SyncRep slot ("async" without synchronous replication).
+func syncState(syncRep *xlog.SyncRep, s xlog.SenderState) string {
 	if syncRep == nil {
 		return "async"
 	}
-	return syncRep.SyncStateFor(appName)
+	if s.SyncSlot < 0 {
+		return syncRep.SyncStateFor(s.ApplicationName)
+	}
+	_, st := syncRep.SlotSyncState(s.SyncSlot)
+	return st
 }
 
 // syncPriority returns the pg_stat_replication.sync_priority integer string
-// for appName. Returns "0" when syncRep is nil.
-func syncPriority(syncRep *xlog.SyncRep, appName string) string {
+// for the walsender's SyncRep slot ("0" without synchronous replication).
+func syncPriority(syncRep *xlog.SyncRep, s xlog.SenderState) string {
 	if syncRep == nil {
 		return "0"
 	}
-	return fmt.Sprintf("%d", syncRep.SyncPriorityFor(appName))
+	if s.SyncSlot < 0 {
+		return fmt.Sprintf("%d", syncRep.SyncPriorityFor(s.ApplicationName))
+	}
+	p, _ := syncRep.SlotSyncState(s.SyncSlot)
+	return fmt.Sprintf("%d", p)
 }
 
 // registerStatWalReceiverView installs `pg_catalog.pg_stat_wal_receiver`

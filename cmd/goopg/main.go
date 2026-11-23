@@ -257,7 +257,21 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	confPath := fs.String("config", "", "path to postgresql.conf (default: built-in defaults)")
 	addr := fs.String("listen", "127.0.0.1:5432", "TCP listen address (host:port)")
 	hbaPath := fs.String("hba", "", "path to pg_hba.conf (default: built-in loopback-trust policy)")
+	// postgres -c NAME=VALUE / --cluster-name=NAME: command-line settings,
+	// applied over postgresql.conf and postgresql.auto.conf (PGC_S_ARGV
+	// outranks PGC_S_FILE). Cluster.pm starts every node with
+	// --cluster-name=<node> (M0149-0014).
+	var argGUC gucFlag
+	fs.Var(&argGUC, "c", "set run-time parameter NAME=VALUE (may be repeated)")
+	fs.Func("cluster-name", "set cluster_name", func(v string) error {
+		argGUC.settings = append(argGUC.settings, initdb.GUCSetting{Name: "cluster_name", Value: v})
+		return nil
+	})
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if argGUC.err != "" {
+		fmt.Fprintf(stderr, "goopg start: %s\n", argGUC.err)
 		return 2
 	}
 
@@ -440,6 +454,13 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			cfg.Registry = registry
 			logger.Info("loaded "+misc.AutoConfFileName, "entries", len(autoEntries))
 		}
+	}
+	for _, g := range argGUC.settings {
+		if err := registry.Set(g.Name, g.Value, misc.SourceCommandLine); err != nil {
+			fmt.Fprintf(stderr, "goopg start: FATAL: %v\n", err)
+			return 1
+		}
+		cfg.Registry = registry
 	}
 	// CreateDataDirLockFile (PostmasterMain): postmaster.pid is created
 	// before the data directory is touched — before crash or archive
@@ -803,6 +824,14 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// this when the GUC changes — today the registry value is
 	// frozen at startup.
 	applyCheckpointGUCs := func() {
+		// synchronous_standby_names is PGC_SIGHUP: every walsender re-reads
+		// it on a reload (SyncRepInitConfig), so the sync priorities and the
+		// set of standbys commits wait for follow the new value (M0149-0014).
+		if rt != nil && rt.SyncRep != nil && cfg.Registry != nil {
+			if err := rt.SyncRep.SetStandbyNames(stringGUC(cfg.Registry, "synchronous_standby_names", "")); err != nil {
+				logger.Warn("invalid synchronous_standby_names; disabling sync replication", "err", err)
+			}
+		}
 		if rt == nil || rt.Checkpointer == nil {
 			return
 		}

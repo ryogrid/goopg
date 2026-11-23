@@ -80,6 +80,15 @@ func (n *Node) Promote() {
 	}
 }
 
+// Reload is Cluster.pm's reload: pg_ctl reload (SIGHUP to the postmaster).
+func (n *Node) Reload() {
+	n.t.Helper()
+	cmd := exec.Command(filepath.Join(n.binDir, "pg_ctl"), "-D", n.DataDir(), "reload")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		n.t.Fatalf("tapnode %s: pg_ctl reload: %v\n%s", n.name, err, out)
+	}
+}
+
 // Restart is Cluster.pm's restart: a fast stop and a start.
 func (n *Node) Restart() {
 	n.t.Helper()

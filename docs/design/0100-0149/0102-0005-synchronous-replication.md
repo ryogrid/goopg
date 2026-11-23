@@ -1,5 +1,10 @@
 # 0102-0005 — Synchronous Replication (`synchronous_standby_names` + commit-wait + standby feedback)
 
+> **M0149\-0014 note \(2026\-11\-23\)**: standby selection now follows PG's syncrep.c, replacing the name\-keyed
+> rule described below. Walsenders hold slots like `WalSndCtl->walsnds`. The candidates are the connected standbys
+> with a priority and a flush position \(`SyncRepGetCandidateStandbys`\), and `*` matches any name. `num_sync` may
+> exceed the list length. Reload re\-applies the setting. See [0149\-0014](0149-0014-sync-rep.md).
+
 > **perf-optimize3-dash S4 note (2026-07-13)**: the goopg→real-PG sync_remote_apply
 > e2e is DEFERRED under the native-only WAL default (assert-skip unless
 > GOOPG_WAL_CANONICAL=on); goopg→goopg sync replication is unaffected.

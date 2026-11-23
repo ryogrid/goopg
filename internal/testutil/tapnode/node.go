@@ -124,10 +124,15 @@ func (n *Node) LogPath() string {
 // come up, with the log tail.
 func (n *Node) Start() {
 	n.t.Helper()
+	// Cluster.pm's start passes --cluster-name=<node> on the command line
+	// (not in postgresql.conf, so a backup does not copy it to standbys);
+	// a standby's walreceiver reports it as its application_name.
 	var err error
 	if n.g != nil {
+		n.g.SetStartArgs("--cluster-name=" + n.name)
 		err = n.g.Start()
 	} else {
+		n.p.SetStartArgs("--cluster-name=" + n.name)
 		err = n.p.Start()
 		if err == nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)

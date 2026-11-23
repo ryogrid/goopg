@@ -326,6 +326,8 @@
 
 # - Process Title / I/O Timing -
 
+#cluster_name = ''                      # walreceiver application_name fallback
+                                        # (change requires restart)
 #track_activities = on                  # collect info in pg_stat_activity
 #track_counts = on                      # collect per-relation row statistics
 #track_functions = none                 # none | pl | all

@@ -2,6 +2,7 @@ package xlog
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -27,7 +28,7 @@ func TestSyncRepParseRule(t *testing.T) {
 		{in: `"name with spaces"`, wantMode: syncRepRuleFirst, wantN: 1, wantList: []string{"name with spaces"}},
 		{in: "FIRST (a, b)", wantMode: syncRepRuleFirst, wantN: 1, wantList: []string{"a", "b"}}, // default count = 1
 		{in: "2 (a, b, c)", wantMode: syncRepRuleFirst, wantN: 2, wantList: []string{"a", "b", "c"}},
-		{in: "FIRST 4 (a, b, c)", wantErr: true}, // n > len(names)
+		{in: "FIRST 4 (a, b, c)", wantMode: syncRepRuleFirst, wantN: 4, wantList: []string{"a", "b", "c"}}, // PG accepts num_sync > members
 		{in: "ANY 0 (a)", wantErr: true},
 		{in: "FIRST 1 a, b", wantErr: true}, // missing parens
 		{in: `"unterminated`, wantErr: true},
@@ -164,16 +165,21 @@ func TestSyncRepFirstNQuorumOrderMatters(t *testing.T) {
 	if err := s.SetStandbyNames("FIRST 2 (a, b, c)"); err != nil {
 		t.Fatalf("SetStandbyNames: %v", err)
 	}
+	// All three are streaming (valid flush), so the two with the best
+	// priority — a and b — are the sync standbys (SyncRepGetCandidateStandbys).
+	a, b, c := s.RegisterStandby("a"), s.RegisterStandby("b"), s.RegisterStandby("c")
+	a.Update(1, 1, 1)
+	b.Update(1, 1, 1)
+	c.Update(1, 1, 1)
 
 	done := make(chan error, 1)
 	go func() {
 		done <- s.WaitForLSN(context.Background(), 100, SyncRepRemoteFlush)
 	}()
 
-	// b and c caught up but a didn't — FIRST 2 means the first two named
-	// (a, b) must both ack. So we are NOT released.
-	s.UpdateStandbyProgress("b", 100, 100, 100)
-	s.UpdateStandbyProgress("c", 100, 100, 100)
+	// b and c caught up but a didn't: c is only potential, so not released.
+	b.Update(100, 100, 100)
+	c.Update(100, 100, 100)
 	select {
 	case <-done:
 		t.Fatalf("FIRST 2 released without a's ack")
@@ -181,7 +187,7 @@ func TestSyncRepFirstNQuorumOrderMatters(t *testing.T) {
 	}
 
 	// a finally catches up — released.
-	s.UpdateStandbyProgress("a", 100, 100, 100)
+	a.Update(100, 100, 100)
 	select {
 	case err := <-done:
 		if err != nil {
@@ -189,6 +195,32 @@ func TestSyncRepFirstNQuorumOrderMatters(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("WaitForLSN did not return after a's ack")
+	}
+}
+
+// TestSyncRepFirstFallsBackToConnectedStandby: with the first-listed standby
+// absent, the next connected one by priority is the sync standby and its
+// ack releases the commit (PG: candidates are connected walsenders only).
+func TestSyncRepFirstFallsBackToConnectedStandby(t *testing.T) {
+	s := NewSyncRep()
+	if err := s.SetStandbyNames("FIRST 1 (a, b)"); err != nil {
+		t.Fatalf("SetStandbyNames: %v", err)
+	}
+	b := s.RegisterStandby("b")
+	b.Update(1, 1, 1)
+	if p, st := s.SlotSyncState(b.Slot()); p != 2 || st != "sync" {
+		t.Fatalf("b = %d|%s, want 2|sync", p, st)
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.WaitForLSN(context.Background(), 50, SyncRepRemoteFlush) }()
+	b.Update(50, 50, 50)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitForLSN: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("not released by b's ack")
 	}
 }
 
@@ -355,77 +387,64 @@ func TestSyncRepSetStandbyNamesReleasesOnRelaxation(t *testing.T) {
 	}
 }
 
-func TestSyncStateForFirstMode(t *testing.T) {
+// TestSyncRepSlotSyncState follows 007_sync_rep.pl's expectations through
+// pg_stat_get_wal_senders' rules: priority from the first matching list
+// member or "*", candidates in walsender slot order, freed slots reused.
+func TestSyncRepSlotSyncState(t *testing.T) {
 	s := NewSyncRep()
-	// No rule: all async.
-	if got := s.SyncStateFor("any"); got != "async" {
-		t.Fatalf("no-rule: got %q want async", got)
+	reg := func(name string) *SyncRepStandby {
+		h := s.RegisterStandby(name)
+		h.Update(1, 1, 1)
+		return h
 	}
-	// FIRST 1 (a, b): a=sync, b=potential, c=async.
-	if err := s.SetStandbyNames("FIRST 1 (a, b)"); err != nil {
-		t.Fatalf("SetStandbyNames: %v", err)
-	}
-	cases := []struct {
-		name string
-		want string
-	}{
-		{"a", "sync"},
-		{"b", "potential"},
-		{"c", "async"},
-	}
-	for _, tc := range cases {
-		if got := s.SyncStateFor(tc.name); got != tc.want {
-			t.Errorf("SyncStateFor(%q) = %q, want %q", tc.name, got, tc.want)
+	s1, s2, s3 := reg("standby1"), reg("standby2"), reg("standby3")
+	check := func(msg string, want map[*SyncRepStandby]string) {
+		t.Helper()
+		for h, w := range want {
+			p, st := s.SlotSyncState(h.Slot())
+			if got := fmt.Sprintf("%d|%s", p, st); got != w {
+				t.Errorf("%s: slot %d = %s, want %s", msg, h.Slot(), got, w)
+			}
 		}
 	}
-}
-
-func TestSyncStateForAnyMode(t *testing.T) {
-	s := NewSyncRep()
-	if err := s.SetStandbyNames("ANY 1 (a, b)"); err != nil {
-		t.Fatalf("SetStandbyNames: %v", err)
-	}
-	if got := s.SyncStateFor("a"); got != "sync" {
-		t.Errorf("ANY: a = %q, want sync", got)
-	}
-	if got := s.SyncStateFor("b"); got != "sync" {
-		t.Errorf("ANY: b = %q, want sync", got)
-	}
-	if got := s.SyncStateFor("c"); got != "async" {
-		t.Errorf("ANY: c = %q, want async", got)
-	}
-}
-
-func TestSyncPriorityFor(t *testing.T) {
-	s := NewSyncRep()
-	if err := s.SetStandbyNames("FIRST 1 (a, b)"); err != nil {
-		t.Fatalf("SetStandbyNames: %v", err)
-	}
-	cases := []struct {
-		name string
-		want int
-	}{
-		{"a", 1},
-		{"b", 2},
-		{"c", 0},
-	}
-	for _, tc := range cases {
-		if got := s.SyncPriorityFor(tc.name); got != tc.want {
-			t.Errorf("SyncPriorityFor(%q) = %d, want %d", tc.name, got, tc.want)
+	set := func(v string) {
+		t.Helper()
+		if err := s.SetStandbyNames(v); err != nil {
+			t.Fatalf("SetStandbyNames(%q): %v", v, err)
 		}
 	}
-}
+	if p, st := s.SlotSyncState(s1.Slot()); p != 0 || st != "async" {
+		t.Errorf("no rule: %d|%s, want 0|async", p, st)
+	}
+	set("standby1,standby2")
+	check("old syntax", map[*SyncRepStandby]string{s1: "1|sync", s2: "2|potential", s3: "0|async"})
+	set("*")
+	check("asterisk", map[*SyncRepStandby]string{s1: "1|sync", s2: "1|potential", s3: "1|potential"})
 
-func TestSyncStateForBareList(t *testing.T) {
-	// Bare list "pg_standby" parses as FIRST 1 ['pg_standby'].
-	s := NewSyncRep()
-	if err := s.SetStandbyNames("pg_standby"); err != nil {
-		t.Fatalf("SetStandbyNames: %v", err)
-	}
-	if got := s.SyncStateFor("pg_standby"); got != "sync" {
-		t.Errorf("bare-list pg_standby = %q, want sync", got)
-	}
-	if got := s.SyncStateFor("other"); got != "async" {
-		t.Errorf("bare-list other = %q, want async", got)
+	// Re-register in the order 2, 3, 1, 4: freed slots are reused lowest first.
+	s1.Release()
+	s2.Release()
+	s3.Release()
+	s2, s3 = reg("standby2"), reg("standby3")
+	set("2(standby1,standby2,standby3)")
+	check("2 sync", map[*SyncRepStandby]string{s2: "2|sync", s3: "3|sync"})
+	s1 = reg("standby1")
+	s4 := reg("standby4")
+	check("2 sync 1 potential 1 async", map[*SyncRepStandby]string{s1: "1|sync", s2: "2|sync", s3: "3|potential", s4: "0|async"})
+	set("6(standby4,standby0,standby3,standby2)")
+	check("num_sync over members", map[*SyncRepStandby]string{s1: "0|async", s2: "4|sync", s3: "3|sync", s4: "1|sync"})
+	set("2(standby1,*,standby2)")
+	check("asterisk before name", map[*SyncRepStandby]string{s1: "1|sync", s2: "2|sync", s3: "2|potential", s4: "2|potential"})
+	set("2(*)")
+	check("same priority by slot", map[*SyncRepStandby]string{s1: "1|potential", s2: "1|sync", s3: "1|sync", s4: "1|potential"})
+	s3.Release()
+	check("earlier slot promoted", map[*SyncRepStandby]string{s1: "1|sync", s2: "1|sync", s4: "1|potential"})
+	set("ANY 2(standby1, standby2)")
+	check("quorum", map[*SyncRepStandby]string{s1: "1|quorum", s2: "1|quorum", s4: "0|async"})
+
+	// A standby that has not reported a flush position is async.
+	s5 := s.RegisterStandby("standby1")
+	if p, st := s.SlotSyncState(s5.Slot()); p != 0 || st != "async" {
+		t.Errorf("no flush yet: %d|%s, want 0|async", p, st)
 	}
 }

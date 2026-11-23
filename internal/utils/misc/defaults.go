@@ -659,6 +659,17 @@ func BuildDefaultRegistry() *Registry {
 		Flags:   FlagListInput,
 	}))
 
+	// cluster_name (PGC_POSTMASTER, guc_tables.c) names the server. PG puts
+	// it in process titles; a standby's walreceiver also sends it as its
+	// fallback_application_name (libpqwalreceiver.c), so a primary sees the
+	// standby under that name in pg_stat_replication and
+	// synchronous_standby_names (M0149-0014).
+	r.MustRegister(NewVariable(Variable{
+		Name: "cluster_name", Type: TypeString, BootVal: "",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
 	// wal_writer_delay sets the period (in milliseconds) of the
 	// background WAL writer loop. The loop calls FlushUpTo to drain
 	// buffered WAL bytes so they are not held in RAM indefinitely.

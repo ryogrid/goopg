@@ -924,6 +924,9 @@ func StartWalReceiver(ctx context.Context, done chan struct{}, cfg WalReceiverLa
 		}
 	}
 	addr, appName, user, sslmode := parsePrimaryConninfoFull(conninfo)
+	if appName == "" {
+		appName = fallbackApplicationName(registry)
+	}
 	if addr == "" {
 		logger.Info("standby mode: primary_conninfo empty or missing host:port; walreceiver not started")
 		close(done)
@@ -1046,6 +1049,19 @@ func followEndOfTimeline(ctx context.Context, cfg WalReceiverLauncherConfig, log
 func parsePrimaryConninfo(conninfo string) string {
 	addr, _, _, _ := parsePrimaryConninfoFull(conninfo)
 	return addr
+}
+
+// fallbackApplicationName is libpqwalreceiver's fallback_application_name:
+// cluster_name when set, else "walreceiver". It applies when
+// primary_conninfo names no application_name, so the primary sees the
+// standby under that name (pg_stat_replication, synchronous_standby_names).
+func fallbackApplicationName(registry *misc.Registry) string {
+	if registry != nil {
+		if v, ok := registry.Get("cluster_name"); ok && v.Display() != "" {
+			return v.Display()
+		}
+	}
+	return "walreceiver"
 }
 
 // parsePrimaryConninfoFull extracts host:port, application_name, user

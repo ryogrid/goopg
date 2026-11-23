@@ -127,10 +127,6 @@ func (p *syncRepParser) parse() (syncRepRule, error) {
 		if err != nil {
 			return syncRepRule{}, err
 		}
-		if count > len(names) {
-			return syncRepRule{}, fmt.Errorf(
-				"synchronous_standby_names: requested %d, only %d names listed", count, len(names))
-		}
 		return syncRepRule{mode: mode, count: count, names: names}, nil
 
 	case !first.quoted && isDecimal(first.val):
@@ -143,10 +139,6 @@ func (p *syncRepParser) parse() (syncRepRule, error) {
 		names, err := p.parseParenNameList()
 		if err != nil {
 			return syncRepRule{}, err
-		}
-		if count > len(names) {
-			return syncRepRule{}, fmt.Errorf(
-				"synchronous_standby_names: requested %d, only %d names listed", count, len(names))
 		}
 		return syncRepRule{mode: syncRepRuleFirst, count: count, names: names}, nil
 
