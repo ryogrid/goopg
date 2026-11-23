@@ -186,6 +186,15 @@ func RelForkPath(dataDir string, rfn RelFileNode) string {
 //
 // The file is written atomically (temp + rename) to path.
 func WriteFSMFork(path string, freeSpace []uint16) error {
+	return writeFSMFork(path, freeSpace, false)
+}
+
+// writeFSMFork is WriteFSMFork with checksums: when the cluster has data
+// checksums enabled every FSM page carries pd_checksum for its block number,
+// as PG's buffer manager writes it (PageSetChecksumInplace) — a checksummed
+// cluster (a PG 18 primary's, by default) otherwise fails verification on
+// the next read of the fork. M0149-0010b.
+func writeFSMFork(path string, freeSpace []uint16, checksums bool) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("fsm fork: mkdir: %w", err)
 	}
@@ -214,7 +223,10 @@ func WriteFSMFork(path string, freeSpace []uint16) error {
 		}
 	}()
 
-	for _, pg := range pages {
+	for i, pg := range pages {
+		if checksums {
+			pg = PageSetChecksumCopy(pg, BlockNumber(i))
+		}
 		if _, err := tmp.Write(pg); err != nil {
 			return fmt.Errorf("fsm fork: write page: %w", err)
 		}
@@ -370,7 +382,7 @@ func (f *FSM) FSMSaveForks(dataDir string, prevKeys map[fsmKey]bool) error {
 	for key, pages := range f.pages {
 		rfn := RelFileNode{DBOid: key.DBOid, RelOid: key.RelOid, Fork: FSMFork}
 		path := RelForkPath(dataDir, rfn)
-		if err := WriteFSMFork(path, pages); err != nil {
+		if err := writeFSMFork(path, pages, f.checksums.Load()); err != nil {
 			return fmt.Errorf("fsm: save fork for %d/%d: %w", key.DBOid, key.RelOid, err)
 		}
 	}

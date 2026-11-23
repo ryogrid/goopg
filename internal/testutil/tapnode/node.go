@@ -286,7 +286,19 @@ func (n *Node) logTail(lines int) string {
 func (n *Node) AppendConf(line string) {
 	n.t.Helper()
 	if n.g == nil {
-		n.t.Fatalf("tapnode %s: AppendConf on a %s node", n.name, n.flavor)
+		// PG node: append to its postgresql.conf, as Cluster.pm's
+		// append_conf does (M0149-0010b).
+		f, err := os.OpenFile(filepath.Join(n.p.DataDir(), "postgresql.conf"), os.O_APPEND|os.O_WRONLY, 0)
+		if err == nil {
+			_, err = fmt.Fprintln(f, line)
+			if cerr := f.Close(); err == nil {
+				err = cerr
+			}
+		}
+		if err != nil {
+			n.t.Fatalf("tapnode %s: append_conf %q: %v", n.name, line, err)
+		}
+		return
 	}
 	if err := n.g.AppendPostgresqlConf(line); err != nil {
 		n.t.Fatalf("tapnode %s: append_conf %q: %v", n.name, line, err)

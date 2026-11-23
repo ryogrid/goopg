@@ -1,6 +1,8 @@
 package testport
 
 import (
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/testutil/tapnode"
@@ -20,14 +22,37 @@ func TestPort_Recovery015PromotionPages(t *testing.T) {
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)
 
+	// M0149 C3: the all-goopg run plus both mixed pairings with PG 18.3.
+	t.Run("all-goopg", func(t *testing.T) {
+		alpha := tapnode.NewGoopg(t, repo, "alpha")
+		runPromotionPages(t, alpha, func(bkp string) *tapnode.Node {
+			return tapnode.InitFromBackupGoopg(t, repo, "bravo", alpha, bkp, true)
+		})
+	})
+	t.Run("pg18-primary-goopg-standby", func(t *testing.T) {
+		alpha := tapnode.NewPG(t, repo, "alpha")
+		runPromotionPages(t, alpha, func(bkp string) *tapnode.Node {
+			return tapnode.InitFromBackupGoopg(t, repo, "bravo", alpha, bkp, true)
+		})
+	})
+	t.Run("goopg-primary-pg18-standby", func(t *testing.T) {
+		alpha := tapnode.NewGoopg(t, repo, "alpha")
+		runPromotionPages(t, alpha, func(bkp string) *tapnode.Node {
+			return tapnode.InitFromBackupPG(t, repo, "bravo", alpha, bkp, true)
+		})
+	})
+}
+
+// runPromotionPages is the body of 015_promotion_pages.pl for one
+// primary/standby pairing.
+func runPromotionPages(t *testing.T, alpha *tapnode.Node, standbyFromBackup func(bkp string) *tapnode.Node) {
 	// Initialize primary node
-	alpha := tapnode.NewGoopg(t, repo, "alpha")
 	alpha.AppendConf("wal_log_hints = off")
 	alpha.Start()
 
 	// setup/start a standby
 	bkp := alpha.Backup("bkp")
-	bravo := tapnode.InitFromBackupGoopg(t, repo, "bravo", alpha, bkp, true)
+	bravo := standbyFromBackup(bkp)
 	bravo.AppendConf("checkpoint_timeout=1h")
 	bravo.Start()
 
@@ -97,6 +122,14 @@ func waitForCatchup(t *testing.T, primary, standby *tapnode.Node) {
 	target := primary.SafePSQL("postgres", "SELECT pg_current_wal_lsn()")
 	q := "SELECT '" + target + "'::pg_lsn <= replay_lsn AND state = 'streaming' FROM pg_catalog.pg_stat_replication"
 	if !primary.PollQueryUntil("postgres", q, "t") {
-		t.Fatalf("timed out waiting for %s to catch up to %s", standby.Name(), target)
+		st, _, _ := primary.PSQLExit("postgres", "SELECT application_name, state, sent_lsn, write_lsn, flush_lsn, replay_lsn FROM pg_catalog.pg_stat_replication")
+		if data, err := os.ReadFile(standby.LogPath()); err == nil {
+			for _, l := range strings.Split(string(data), "\n") {
+				if strings.Contains(l, "replay") && (strings.Contains(l, "ERROR") || strings.Contains(l, "error") || strings.Contains(l, "WARN")) {
+					t.Logf("standby log: %s", l)
+				}
+			}
+		}
+		t.Fatalf("timed out waiting for %s to catch up to %s; pg_stat_replication: %q", standby.Name(), target, st)
 	}
 }

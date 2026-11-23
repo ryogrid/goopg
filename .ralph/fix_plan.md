@@ -15807,6 +15807,23 @@ verify each at HEAD when the task starts.
     - Known risk: PG 18.3 started in standby mode on a copy of a goopg standby crashed in standby\_redo
       \(TRAP in standby\_redo\+0x124 on the cassert build\) — a goopg RM\_STANDBY record PG cannot replay. Reproduce in
       the goopg\-primary → PG\-standby run before fixing.
+    - 2026\-11\-23 slice 1 \(partial, still open\): tapnode `NewPG` \(init allows\_streaming\), `InitFromBackupPG`, PG
+      `AppendConf`; the 015 port runs three subtests. Movement: tap 015 mixed 0/2 → 1/2 \(all\-goopg 1/1,
+      pg18\-primary\-goopg\-standby 1/1, goopg\-primary\-pg18\-standby 0/1\).
+      - Path\-to\-TAP \(PG primary → goopg standby\), each a proven failure, all fixed:
+        - goopg replay stopped on a PG FPI past the fork's end \("replay gap block=2 nblocks=0"\):
+          writeBlockOrExtend now zero\-extends as XLogReadBufferExtended does;
+        - the table had no columns: the startup/refresh pg\_attribute loader tried goopg's logical decoder first,
+          which misreads a PG\-physical row as garbage without an error; it is now physical\-first like its
+          executor siblings. The live refresh also counts only committed catalog rows;
+        - a restart failed on a checksummed \(PG 18 default\) cluster: WriteFSMFork wrote FSM pages without
+          pd\_checksum; FSM pages are now stamped when the cluster has checksums.
+      - Path\-to\-TAP \(goopg primary → PG standby\): the PG standby asserts
+        `TransactionIdIsNormal\(running->latestCompletedXid\)` \(procarray.c ProcArrayApplyRecoveryInfo\) on goopg's
+        XLOG\_RUNNING\_XACTS: a fresh goopg cluster has nextXid 3, so latestCompletedXid = nextXid−1 = 2. PG never
+        reaches that state, since its initdb consumes hundreds of xids. NEXT. Options: start goopg's nextXid past
+        FirstNormalTransactionId at init as PG does \(check what depends on xid 3\), or skip logging running xacts
+        until a normal xid has completed. Compare with PG initdb's pg\_control nextXid.
 - [ ] **M0149-0011 — port recovery/t/016_min_consistency.pl**
   Kind: impl
   Parent: none

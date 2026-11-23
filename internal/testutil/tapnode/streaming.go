@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/testutil/cluster"
+	"github.com/goopg/goopg/internal/testutil/pgcluster"
 )
 
 // Backup is Cluster.pm's backup(name): pg_basebackup --no-sync
@@ -100,4 +101,56 @@ func (n *Node) PollQueryUntil(db, query, expected string) bool {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return false
+}
+
+// NewPG is Cluster.pm's new() + init(allows_streaming => 1) for a PG 18.3
+// node: wal_level replica, max_wal_senders/max_replication_slots 10 and
+// hot_standby on, as init writes them. M0149-0010b.
+func NewPG(t testing.TB, repo, name string) *Node {
+	t.Helper()
+	p, err := pgcluster.New(name, pgcluster.Options{
+		RepoRoot:            repo,
+		DataDir:             filepath.Join(t.TempDir(), name),
+		User:                "postgres",
+		WalLevel:            "replica",
+		MaxWalSenders:       10,
+		MaxReplicationSlots: 10,
+		ExtraConf:           []string{"hot_standby = on", "wal_log_hints = on"},
+		StartupWait:         90 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("tapnode %s: pgcluster.New: %v", name, err)
+	}
+	n := &Node{t: t, name: name, flavor: PG, repo: repo, binDir: BinDir(repo), p: p}
+	t.Cleanup(n.cleanup)
+	return n
+}
+
+// InitFromBackupPG is init_from_backup(root, backup, has_streaming) for a
+// PG 18.3 node. The backup may come from a goopg or a PG primary.
+func InitFromBackupPG(t testing.TB, repo, name string, root *Node, backupPath string, hasStreaming bool) *Node {
+	t.Helper()
+	dataDir := filepath.Join(t.TempDir(), name)
+	if out, err := exec.Command("cp", "-a", backupPath, dataDir).CombinedOutput(); err != nil {
+		t.Fatalf("tapnode %s: copy backup %s: %v\n%s", name, backupPath, err, out)
+	}
+	_ = os.Chmod(dataDir, 0o700)
+	p, err := pgcluster.OpenExisting(name, pgcluster.Options{
+		RepoRoot:    repo,
+		DataDir:     dataDir,
+		User:        "postgres",
+		StartupWait: 90 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("tapnode %s: pgcluster.OpenExisting: %v", name, err)
+	}
+	n := &Node{t: t, name: name, flavor: PG, repo: repo, binDir: BinDir(repo), p: p}
+	t.Cleanup(n.cleanup)
+	if hasStreaming {
+		n.AppendConf("primary_conninfo='" + root.connstr() + "'")
+		if err := os.WriteFile(filepath.Join(dataDir, "standby.signal"), nil, 0o600); err != nil {
+			t.Fatalf("tapnode %s: standby.signal: %v", name, err)
+		}
+	}
+	return n
 }

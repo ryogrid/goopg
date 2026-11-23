@@ -6471,7 +6471,28 @@ func writeBlockOrExtend(mgr *storage.Manager, rel storage.RelFileNode, blk stora
 		}
 		return nil
 	default:
-		return fmt.Errorf("wal: replay gap block=%d nblocks=%d", blk, nblocks)
+		// XLogReadBufferExtended (xlogutils.c) zero-extends the fork up to
+		// a block past its end — the relation was extended on the primary
+		// without WAL (a PG primary's FPI routinely lands there) — and then
+		// installs the page. M0149-0010b.
+		zero := make(storage.Page, storage.BlockSize)
+		for b := nblocks; b < blk; b++ {
+			got, err := mgr.Extend(rel, zero)
+			if err != nil {
+				return err
+			}
+			if got != b {
+				return fmt.Errorf("wal: zero-extend returned block %d, want %d", got, b)
+			}
+		}
+		got, err := mgr.Extend(rel, page)
+		if err != nil {
+			return err
+		}
+		if got != blk {
+			return fmt.Errorf("wal: extend returned block %d, want %d", got, blk)
+		}
+		return nil
 	}
 }
 

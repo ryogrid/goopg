@@ -2986,6 +2986,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		FSM:            storage.NewFSM(),
 		VM:             vm,
 	}
+	// M0149-0010b: FSM fork files carry pd_checksum on a checksummed cluster.
+	rt.FSM.SetChecksums(checksumsEnabled)
 
 	// M0130-S1: load persistent Visibility Map state from per-relation
 	// _vm fork files if present. A missing
@@ -3777,6 +3779,16 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *t
 // under CREATE DATABASE reloads into that database's namespace with its
 // data-file routing (Table.DBOid → base/<dbOid>/<relOid>) intact.
 func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid, nsDBOid uint32) error {
+	return loadUserTablesFromHeapForDBMode(mgr, cat, clog, heapDBOid, nsDBOid, false)
+}
+
+// loadUserTablesFromHeapForDBMode is loadUserTablesFromHeapForDB with
+// committedOnly: a running standby's refresh (RefreshCatalogAfterReplay) must
+// see a relation only once the transaction that created it has committed,
+// or a refresh between its pg_class and pg_attribute inserts would register
+// it without columns — and registration is idempotent, so it would stay that
+// way. Startup keeps the historical rules. M0149-0010b.
+func loadUserTablesFromHeapForDBMode(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid, nsDBOid uint32, committedOnly bool) error {
 	// B0.1: both scan passes ride the generic catalog-heap reload loop
 	// (catalog_heap_reload.go) — the per-tuple walk, xmin/xmax liveness and
 	// the M0030-0007/M0106-0010 CLOG rules (aborted-xmin filter for every
@@ -3829,7 +3841,7 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 			// Legacy-layout rows require a locally-committed xmin
 			// (requireCommittedXmin = !physicalRow); PG18-canonical rows
 			// keep the basebackup pass-through.
-			return recoveredPGClassRow{row: row, physical: physicalRow}, !physicalRow, nil
+			return recoveredPGClassRow{row: row, physical: physicalRow}, !physicalRow || committedOnly, nil
 		})
 	if err != nil {
 		return fmt.Errorf("loadUserTablesFromHeap: %w", err)
@@ -3868,14 +3880,20 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 	}
 	attrRows2, err := scanCatalogHeapRows(mgr, attrRel, clog, "pg_attribute",
 		func(ht storage.HeapTuple, _ storage.ItemPointer) (any, bool, error) {
-			row, err := catalog.DecodePGAttributeRow(ht.Data)
+			// PG-physical decoder first, as the executor's siblings
+			// (deleteCatalogRowsForOID and its attribute twin) do: the
+			// goopg logical decoder misreads a PG-physical row whose
+			// attrelid's first byte is 0x00 as its null-flag prefix and
+			// returns garbage without an error — a PG primary's column
+			// then vanished from a goopg standby's catalog. M0149-0010b.
+			row, err := catalog.DecodePGAttributePhysicalRow(ht.Data)
 			if err != nil {
-				row, err = catalog.DecodePGAttributePhysicalRow(ht.Data)
+				row, err = catalog.DecodePGAttributeRow(ht.Data)
 				if err != nil {
 					return nil, false, err
 				}
 			}
-			return row, false, nil
+			return row, committedOnly, nil
 		})
 	if err != nil {
 		return fmt.Errorf("loadUserTablesFromHeap: %w", err)

@@ -50,6 +50,28 @@ correct. Two goopg gaps hid the table:
 
 With both, TestPort\_Recovery015PromotionPages passes all\-goopg.
 
+## Slice 3: mixed runs \(M0149\-0010b, partial\)
+
+tapnode gains `NewPG` \(Cluster.pm init with allows\_streaming\), `InitFromBackupPG` and AppendConf for PG nodes.
+The port runs three subtests: all\-goopg, PG 18.3 primary → goopg standby \(passes\), and goopg primary → PG 18.3
+standby \(fails\). Fixes made for the PG\-primary pairing:
+
+- **FPI past the end of a fork.** `writeBlockOrExtend` refused a full\-page image for a block beyond the fork's
+  length. It now zero\-extends, as XLogReadBufferExtended does; a PG primary routinely logs such images.
+- **PG\-physical pg\_attribute rows.** The table\-reload loader tried goopg's logical decoder first, and that
+  decoder returns garbage without an error for a PG\-physical row whose attrelid starts with a zero byte. The
+  column vanished. The loader is now physical\-first, like its executor siblings. The live refresh also counts only
+  rows whose creating transaction committed, so a refresh between a CREATE TABLE's pg\_class and pg\_attribute
+  inserts cannot register a column\-less table.
+- **FSM pages on a checksummed cluster.** WriteFSMFork wrote FSM pages without pd\_checksum. PG 18 enables data
+  checksums by default, so a goopg standby of a PG primary failed verification on its next start. FSM pages are now
+  stamped when the cluster has checksums.
+
+The goopg\-primary pairing stops at the PG standby's
+`Assert(TransactionIdIsNormal(running->latestCompletedXid))`. goopg logs XLOG\_RUNNING\_XACTS with
+latestCompletedXid = nextXid − 1 = 2 on a cluster that has not yet assigned a normal xid; PG's initdb always leaves
+nextXid in the hundreds.
+
 ## Remaining
 
 - Mixed runs \(M0149\-0010b\): PG 18.3 primary with a goopg standby, and a goopg primary with a PG 18.3 standby. A

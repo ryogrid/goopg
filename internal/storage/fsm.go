@@ -1,6 +1,9 @@
 package storage
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // fsmKey identifies a heap relation (without fork) for FSM lookups.
 type fsmKey struct{ DBOid, RelOid uint32 }
@@ -17,8 +20,10 @@ func fsmKeyFor(rel RelFileNode) fsmKey { return fsmKey{StorageDBOid(rel.DBOid), 
 //
 // Thread-safe: all methods serialise through a RWMutex.
 type FSM struct {
-	mu    sync.RWMutex
-	pages map[fsmKey][]uint16 // indexed by BlockNumber
+	// checksums: write FSM fork pages with pd_checksum (SetChecksums).
+	checksums atomic.Bool
+	mu        sync.RWMutex
+	pages     map[fsmKey][]uint16 // indexed by BlockNumber
 	// chunkMax[key][c] is the exact maximum of
 	// pages[key][c*fsmChunkBlocks : (c+1)*fsmChunkBlocks], maintained by
 	// RecordFreeSpace. It is kept only for relations larger than one chunk:
@@ -183,7 +188,6 @@ func (f *FSM) GetPageWithFreeSpace(rel RelFileNode, minFreeBytes uint16) (BlockN
 	}
 	return 0, false
 }
-
 
 // GetCandidates returns up to n block numbers whose registered free-space
 // estimate is ≥ minFreeBytes, ordered by free-space descending (most-free
@@ -383,4 +387,12 @@ func (f *FSM) DropRelation(rel RelFileNode) {
 	delete(f.pages, key)
 	delete(f.chunkMax, key)
 	delete(f.trees, key)
+}
+
+// SetChecksums tells the FSM whether the cluster has data checksums enabled,
+// so the fork files it writes carry pd_checksum. M0149-0010b.
+func (f *FSM) SetChecksums(on bool) {
+	if f != nil {
+		f.checksums.Store(on)
+	}
 }

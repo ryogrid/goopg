@@ -3701,7 +3701,7 @@ func (r *Runtime) RefreshCatalogAfterReplay(dbOid uint32) error {
 	}
 	heapDB := storage.StorageDBOid(dbOid)
 	if heapDB == storage.StorageDBOid(cat.DBOID()) {
-		return loadUserTablesFromHeapForDB(r.StorageMgr, cat, clog, cat.DBOID(), 0)
+		return loadUserTablesFromHeapForDBMode(r.StorageMgr, cat, clog, cat.DBOID(), 0, true)
 	}
-	return loadUserTablesFromHeapForDB(r.StorageMgr, cat, clog, dbOid, dbOid)
+	return loadUserTablesFromHeapForDBMode(r.StorageMgr, cat, clog, dbOid, dbOid, true)
 }
