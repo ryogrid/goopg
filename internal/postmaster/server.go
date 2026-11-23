@@ -244,6 +244,11 @@ type Config struct {
 	// full_page_writes from the registry to the live runtime after a config
 	// reload (parity bundle D-2).
 	ApplyCheckpointGUCs func()
+	// ShutdownCheckpoint, when set, writes the final shutdown checkpoint.
+	// Run calls it on a non-immediate shutdown after the regular backends
+	// have exited and before the walsenders finish, so standbys receive
+	// the checkpoint record (M0149-0015).
+	ShutdownCheckpoint func()
 
 	// AutovacuumLauncher, when set, is started as a background
 	// goroutine during Run. nil disables autovacuum.
@@ -371,7 +376,18 @@ type Server struct {
 	addr     atomic.Pointer[net.TCPAddr]
 
 	connWG        sync.WaitGroup
-	nextPID       atomic.Uint32
+	// walsndConnWG counts connections that became walsenders: they leave
+	// connWG so a shutdown can wait for the regular backends, write the
+	// shutdown checkpoint, and only then let the walsenders finish
+	// (PM_SHUTDOWN → PM_SHUTDOWN_2). walsndStopping is closed after the
+	// shutdown checkpoint; walsndHardCtx is cancelled once they are done
+	// (or at once on an immediate stop) and closes their connections.
+	walsndConnWG     sync.WaitGroup
+	walsndStopping   chan struct{}
+	walsndStopOnce   sync.Once
+	walsndHardCtx    context.Context
+	walsndHardCancel context.CancelFunc
+	nextPID          atomic.Uint32
 	nextBackendID atomic.Uint32
 	closeOnce     sync.Once
 
@@ -451,6 +467,7 @@ func New(cfg Config) *Server {
 		roles:         map[string]struct{}{"postgres": {}},
 		notify:        newNotifyHub(),
 		preparedXacts: newPreparedXactStore(),
+		walsndStopping: make(chan struct{}),
 		logStmtLevel:  lvl,
 	}
 	if !ok {
@@ -547,6 +564,7 @@ func New(cfg Config) *Server {
 			WALSegmentSize: cfg.WALSegmentSize,
 			SystemID:       cfg.SystemID,
 			Timeline:       cfg.Timeline,
+			Stopping:       s.walsndStopping,
 		},
 		s.writeQueryError,
 		backup.NewHandler(backup.Config{
@@ -556,6 +574,7 @@ func New(cfg Config) *Server {
 			Checkpointer:   cfg.Checkpointer,
 		}, s.writeQueryError),
 	)
+	s.walsndHardCtx, s.walsndHardCancel = context.WithCancel(context.Background())
 	return s
 }
 
@@ -740,6 +759,8 @@ func (s *Server) Run(ctx context.Context) error {
 		s.connWG.Wait()
 	}
 
+	s.finishWalsenders()
+
 	s.cfg.Logger.Info("goopg listener stopped")
 	if errors.Is(runCtx.Err(), context.Canceled) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		return nil
@@ -861,6 +882,7 @@ func (s *Server) StopImmediate(reason string) {
 	}
 	s.shutdownDeadline = 0
 	s.immediateStopping.Store(true)
+	s.walsndHardCancel()
 	if cancel := s.runCancel.Load(); cancel != nil {
 		(*cancel)()
 	}
@@ -1012,10 +1034,67 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) error {
 			return fmt.Errorf("accept: %w", err)
 		}
 		s.connWG.Add(1)
+		tr := &connTrack{s: s}
 		go func() {
-			defer s.connWG.Done()
-			s.serveConn(ctx, conn)
+			defer tr.done()
+			s.serveConn(context.WithValue(ctx, connTrackKey{}, tr), conn)
 		}()
+	}
+}
+
+// connTrack moves a connection from connWG to walsndConnWG once its
+// startup packet makes it a walsender. It rides on serveConn's context.
+type connTrack struct {
+	s         *Server
+	once      sync.Once
+	walsender atomic.Bool
+}
+
+type connTrackKey struct{}
+
+// becomeWalsender is a no-op on a nil tracker (a test calling serveConn
+// directly).
+func (t *connTrack) becomeWalsender() {
+	if t == nil {
+		return
+	}
+	t.once.Do(func() {
+		t.s.walsndConnWG.Add(1)
+		t.walsender.Store(true)
+		t.s.connWG.Done()
+	})
+}
+
+func (t *connTrack) done() {
+	if t.walsender.Load() {
+		t.s.walsndConnWG.Done()
+		return
+	}
+	t.once.Do(func() { t.s.connWG.Done() })
+}
+
+// finishWalsenders is the walsender half of a shutdown: after the regular
+// backends have gone, write the shutdown checkpoint (unless this is an
+// immediate stop), let the walsenders send it and confirm (WalSndDone),
+// then close their connections.
+func (s *Server) finishWalsenders() {
+	if !s.immediateStopping.Load() && s.cfg.ShutdownCheckpoint != nil {
+		s.cfg.ShutdownCheckpoint()
+	}
+	s.walsndStopOnce.Do(func() { close(s.walsndStopping) })
+	if s.replHandler != nil && !s.immediateStopping.Load() {
+		s.replHandler.WaitStreams(30 * time.Second)
+	}
+	s.walsndHardCancel()
+	done := make(chan struct{})
+	go func() {
+		s.walsndConnWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		s.cfg.Logger.Warn("walsender connections still open after shutdown")
 	}
 }
 
@@ -1055,15 +1134,31 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		}
 	}()
 
-	connCtx, cancel := context.WithCancel(ctx)
+	// connCtx does not inherit the server's cancellation directly: the
+	// watcher below forwards it, except for a walsender, which stays up
+	// until finishWalsenders releases it.
+	connCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancel()
 
 	// Cancel the connection context when the parent ctx is cancelled. Closing
 	// the conn nudges the goroutine out of any blocking read.
 	stopWatcher := make(chan struct{})
 	defer close(stopWatcher)
+	tr, _ := ctx.Value(connTrackKey{}).(*connTrack)
 	go func() {
 		select {
+		case <-ctx.Done():
+			// A walsender outlives the server's shutdown request: it ends
+			// once it has sent the shutdown checkpoint (finishWalsenders).
+			if tr != nil && tr.walsender.Load() {
+				select {
+				case <-s.walsndHardCtx.Done():
+				case <-stopWatcher:
+					return
+				}
+			}
+			cancel()
+			_ = raw.SetDeadline(time.Now().Add(50 * time.Millisecond))
 		case <-connCtx.Done():
 			_ = raw.SetDeadline(time.Now().Add(50 * time.Millisecond))
 		case <-stopWatcher:
@@ -1134,6 +1229,7 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	}
 	if isReplication {
 		logger = logger.With("replication", true)
+		tr.becomeWalsender()
 	}
 	logger = logger.With("user", user, "application_name", app)
 

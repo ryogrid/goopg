@@ -70,6 +70,17 @@ func InitFromBackupGoopg(t testing.TB, repo, name string, root *Node, backupPath
 	return n
 }
 
+// EnableStreaming is Cluster.pm's enable_streaming(root): append
+// primary_conninfo pointing at root and write standby.signal, so the
+// node's next start follows root as a streaming standby.
+func (n *Node) EnableStreaming(root *Node) {
+	n.t.Helper()
+	n.AppendConf("primary_conninfo='" + root.connstr() + "'")
+	if err := os.WriteFile(filepath.Join(n.DataDir(), "standby.signal"), nil, 0o600); err != nil {
+		n.t.Fatalf("tapnode %s: standby.signal: %v", n.name, err)
+	}
+}
+
 // Promote is Cluster.pm's promote: pg_ctl promote, which waits until the
 // server reports it has left recovery. M0149-0010.
 func (n *Node) Promote() {

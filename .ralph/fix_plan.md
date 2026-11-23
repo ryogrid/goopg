@@ -15884,6 +15884,44 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/recovery/t/012_subtransactions.pl` — subtransactions \(incl. overflowed and prepared\) across replay and promotion.
   Likely prerequisites \(verify at start\): `XLOG_XACT_ASSIGNMENT` + subxid overflow on standby, prepared xact with many subxacts, plpgsql exception blocks, `pg_subtrans` SLRU format.
+  - 2026\-11\-24 probe: TestPort\_Recovery012Subtransactions written \(three pairings\), skipped unless
+    `GOOPG_TAP_012=1` until 0015a/b land. Design docs/design/0100\-0149/0149\-0015\-subtransactions.md.
+    - Path\-to\-TAP, each one link, proven by the probe run:
+      - 012 ← `log_checkpoints` unregistered \(goopg rejected the conf\): registered;
+      - 012 ← the old primary cannot rejoin the promoted standby: 0015c, done;
+      - 012 check 1 / goopg\-primary pairing ← durable 2PC on a goopg primary: 0015a;
+      - 012 pg18\-primary pairing ← replayed PREPARE kept and restored at promotion: 0015b.
+- [ ] **M0149-0015a — durable two\-phase commit on a goopg primary**
+  Kind: impl
+  Parent: M0149-0015
+  PREPARE TRANSACTION writes PG's XLOG\_XACT\_PREPARE record \(TwoPhaseFileHeader \+ subxacts \+ locks\), state goes to
+  pg\_twophase at checkpoint, a restart restores the prepared xact \(xid and subxids in progress, its locks\), COMMIT/ROLLBACK
+  PREPARED write XLOG\_XACT\_COMMIT\_PREPARED / ABORT\_PREPARED, pg\_prepared\_xacts lists them. Today goopg keeps a prepared
+  xact in memory only \(internal/postmaster/twophase.go\). Proof: 012 check 1 reads 0 rows after a restart; PG standby
+  cannot COMMIT PREPARED a goopg primary's xact after promotion.
+- [ ] **M0149-0015b — a goopg standby keeps replayed prepared transactions**
+  Kind: impl
+  Parent: M0149-0015
+  XLOG\_XACT\_PREPARE replay records the prepared state \(PrepareRedoAdd\); promotion and restart restore it
+  \(restoreTwoPhaseData\) so COMMIT/ROLLBACK PREPARED work on the promoted node. Proof: 012 pg18\-primary pairing, COMMIT
+  PREPARED rc=3 on the promoted goopg standby.
+- [x] **M0149-0015c — a stopped goopg primary rejoins its promoted standby**
+  Kind: impl
+  Parent: M0149-0015
+  - 2026\-11\-24 DONE. Movement: TestE2E\_OldPrimaryRejoinsAfterPromotion 0/2 → 2/2 pairings; 012 probe now passes both
+    rejoins.
+    - A fast stop now writes the shutdown checkpoint once regular backends are gone and before the walsenders finish.
+      The walsenders send it and wait for the standby's flush \(WalSndDone\). Before, the old primary's WAL ended one
+      checkpoint record past the promoted standby's switch point.
+    - Promotion chains the new history through the timeline replay is on \(recoveryTargetTLI\), not the stale
+      timeline\_id file.
+- [ ] **M0149-0015d — a goopg standby of a PG primary cannot see a user table after promotion**
+  Kind: impl
+  Parent: M0149-0015
+  Found nearby, not a proven 012 blocker \(012's pg18\-primary pairing reads its table\). In
+  TestE2E\_OldPrimaryRejoinsAfterPromotion's PG\-primary variant, a table created before the base backup, or after it,
+  gave `relation "r" does not exist` on the goopg standby and after its promotion. Filed per the detour guard; not
+  selectable ahead of 0015a/b.
 - [ ] **M0149-0016 — port recovery/t/009_twophase.pl**
   Kind: impl
   Parent: none

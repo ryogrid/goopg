@@ -109,6 +109,26 @@ type Runtime struct {
 	// immediate`), mirroring upstream's immediate (SIGQUIT) shutdown.
 	// (M0110-0004 / RW-002 b.)
 	immediateShutdown bool
+	// shutdownCheckpointDone records that ShutdownCheckpoint already wrote
+	// the final checkpoint, so Close does not write a second one.
+	shutdownCheckpointDone bool
+}
+
+// ShutdownCheckpoint writes the final shutdown checkpoint while the
+// walsenders are still connected, as PG's postmaster does: the checkpointer
+// writes it in PM_SHUTDOWN and only then do the walsenders send the rest of
+// the WAL — the checkpoint included — and exit (PM_SHUTDOWN_2, WalSndDone).
+// A standby so ends on the shutdown checkpoint, and the old primary can later
+// follow it on a new timeline. Close then skips its own (M0149-0015).
+func (r *Runtime) ShutdownCheckpoint() {
+	if r == nil || r.Checkpointer == nil || r.immediateShutdown || r.shutdownCheckpointDone {
+		return
+	}
+	if err := r.Checkpointer.CheckpointShutdown(); err != nil {
+		slog.Default().Warn("final shutdown checkpoint failed", "err", err,
+			"note", "data files may not be fully durable on disk")
+	}
+	r.shutdownCheckpointDone = true
 }
 
 // SetImmediateShutdown marks the runtime so the next Close() skips its
@@ -4176,6 +4196,8 @@ func (r *Runtime) Close() error {
 		// upstream's immediate (SIGQUIT) shutdown. (M0110-0004 / RW-002 b.)
 		slog.Default().Info("immediate shutdown: skipping final checkpoint",
 			"note", "pg_control state left as it was; recovery on next start")
+	} else if r.Checkpointer != nil && r.shutdownCheckpointDone {
+		executor.WritePgStatFile(r.DataDir)
 	} else if r.Checkpointer != nil {
 		// Use the shutdown variant so pg_control's State lands on
 		// DB_SHUTDOWNED — this is the final durable checkpoint of a clean

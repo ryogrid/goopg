@@ -150,6 +150,9 @@ type Sender struct {
 	syncStandby atomic.Pointer[SyncRepStandby]
 }
 
+// FlushLSN is the standby's last reported flush position.
+func (se *Sender) FlushLSN() uint64 { return se.flushLSN.Load() }
+
 // SetSyncStandby attaches the walsender's SyncRep slot, so status replies
 // feed it and pg_stat_replication reads its sync_priority/sync_state.
 func (se *Sender) SetSyncStandby(h *SyncRepStandby) { se.syncStandby.Store(h) }

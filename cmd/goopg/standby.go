@@ -410,6 +410,14 @@ func (sc *standbyController) finalizePromotion() error {
 		if err != nil {
 			return fmt.Errorf("promote: load timeline_id: %w", err)
 		}
+		// The timeline being promoted from is the one replay is on
+		// (StartupXLOG's recoveryTargetTLI). A standby that streamed onto
+		// its primary's newer timeline is on that one even when
+		// timeline_id was not rewritten, and the new history must chain
+		// through it (M0149-0015).
+		if sc.rt.WAL != nil && sc.rt.WAL.TimelineID() > oldTLI {
+			oldTLI = sc.rt.WAL.TimelineID()
+		}
 		walDir := walDirFor(sc.rt)
 		// StartupXLOG: newTLI = findNewestTimeLine(recoveryTargetTLI) + 1.
 		// The walreceiver fetches the primary's history files, so a

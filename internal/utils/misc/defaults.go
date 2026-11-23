@@ -1557,6 +1557,14 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer | ScopeSession,
 		CheckFn: checkLogConnections,
 	}))
+	// log_checkpoints (PGC_SIGHUP, default on since PG 15) is accepted so a
+	// postgresql.conf that sets it loads; goopg's checkpointer logs its
+	// checkpoints regardless. M0149-0015.
+	r.MustRegister(NewVariable(Variable{
+		Name: "log_checkpoints", Type: TypeBool, BootVal: "on",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "log_disconnections", Type: TypeBool, BootVal: "off",
 		Context: ContextSuBackend,

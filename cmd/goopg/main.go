@@ -1110,6 +1110,16 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// A reload that arrived during startup is applied before the server
 	// starts; the server's own SIGHUP handler takes over from here.
 	startupHup.process(registry, cfg.ConfigPath, *dataDir)
+	if rt != nil {
+		// A primary writes its shutdown checkpoint before its walsenders
+		// finish, so standbys receive it (M0149-0015). A standby keeps the
+		// restartpoint in Close, after its replay has stopped.
+		cfg.ShutdownCheckpoint = func() {
+			if !rt.Standby {
+				rt.ShutdownCheckpoint()
+			}
+		}
+	}
 	srv := postmaster.New(cfg)
 	quit.setServer(srv)
 	if quit.Requested() {

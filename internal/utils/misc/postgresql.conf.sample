@@ -312,6 +312,7 @@
 
 #log_error_verbosity = default          # terse | default | verbose; accepted,
                                         # goopg's log does not format by it
+#log_checkpoints = on                   # accepted; goopg logs checkpoints regardless
 #log_connections = ''                   # log aspects of connection setup:
                                         # receipt, authentication, authorization,
                                         # setup_durations, all; accepted, goopg

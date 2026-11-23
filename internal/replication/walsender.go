@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"log/slog"
@@ -53,6 +54,11 @@ import (
 type Config struct {
 	// Logger receives walsender lifecycle events. nil means slog.Default().
 	Logger *slog.Logger
+	// Stopping, when closed, tells physical walsenders the server is
+	// shutting down after its shutdown checkpoint: send the remaining WAL,
+	// wait for the standby to confirm its flush, end the stream
+	// (WalSndDone). nil never closes.
+	Stopping <-chan struct{}
 	// Catalog and PubSub scope the logical walsender's relation lookups and
 	// publication membership. nil PubSub disables logical replication.
 	Catalog catalog.Catalog
@@ -96,6 +102,25 @@ type Handler struct {
 	// bb serves the BASE_BACKUP verb. nil makes that one command report
 	// feature_not_supported while every other verb keeps working.
 	bb *backup.Handler
+	// streams counts physical walsenders currently streaming, so a shutdown
+	// can wait for them to finish sending (WaitStreams).
+	streams sync.WaitGroup
+}
+
+// WaitStreams waits up to timeout for every streaming physical walsender
+// to end its stream; it reports whether they all did.
+func (s *Handler) WaitStreams(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		s.streams.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // NewHandler returns a Handler. werr must be non-nil in production; see
@@ -652,6 +677,8 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 	// connection drops so a disconnected standby no longer counts toward
 	// the FIRST/ANY quorum. Empty appName is harmless (ForgetStandby
 	// removes the "" key, which never matches any rule entry).
+	s.streams.Add(1)
+	defer s.streams.Done()
 	// The walsender takes a SyncRep slot (WalSndCtl->walsnds) and frees it
 	// on exit, so a disconnected standby no longer counts toward
 	// synchronous_standby_names and the next one reuses the lowest slot.
@@ -742,8 +769,26 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 		}
 	}()
 
+	// Shutdown (WalSndInitStopping → WalSndDone): once the server has
+	// written its shutdown checkpoint it closes Stopping; the walsender then
+	// sends whatever WAL is left, waits for the standby to confirm it has
+	// flushed it, and ends the stream with CopyDone.
+	stopping := s.cfg.Stopping
+	draining := false
+	var drainExpired <-chan time.Time
+	sentPtr := args.StartLSN
 	for {
+		if draining && sentPtr >= s.cfg.WAL.FlushedLSN() {
+			return s.walSndDone(w, senderHandle, sentPtr, receiveDone, streamCancel)
+		}
 		select {
+		case <-stopping:
+			stopping = nil
+			draining = true
+			drainExpired = time.After(10 * time.Second)
+			continue
+		case <-drainExpired:
+			return s.walSndDone(w, senderHandle, sentPtr, receiveDone, streamCancel)
 		case <-streamCtx.Done():
 			<-receiveDone
 			if clientSentCopyDone {
@@ -788,6 +833,7 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 			if senderHandle != nil {
 				senderHandle.SetSentLSN(chunk.EndLSN)
 			}
+			sentPtr = max(sentPtr, chunk.EndLSN)
 			if hist.set && chunk.EndLSN >= hist.validUpto {
 				return s.finishHistoricCopy(w, hist, receiveDone, &clientSentCopyDone, streamCancel)
 			}
@@ -943,6 +989,28 @@ func (s *Handler) handleStandbyCopyData(slotName string, payload []byte, senderH
 		}
 	}
 	return nil
+}
+
+// walSndDone is WalSndDone: with all WAL sent, wait (bounded, like
+// wal_sender_timeout) until the standby reports it has flushed up to
+// sentPtr, then end the COPY stream so the standby sees a clean end of
+// streaming rather than a dropped connection.
+func (s *Handler) walSndDone(w *libpq.FrameWriter, senderHandle *xlog.Sender, sentPtr uint64, receiveDone <-chan struct{}, streamCancel context.CancelFunc) error {
+	deadline := time.Now().Add(10 * time.Second)
+	for senderHandle != nil && senderHandle.FlushLSN() < sentPtr && time.Now().Before(deadline) {
+		select {
+		case <-receiveDone:
+			streamCancel()
+			return nil
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	err := w.WriteCopyDone()
+	if err == nil {
+		err = w.Flush()
+	}
+	streamCancel()
+	return err
 }
 
 // walsenderClientAddr returns a best-effort `host:port` string for
