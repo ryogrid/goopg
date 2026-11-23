@@ -145,8 +145,8 @@ func encodeCheckPointBody(dst []byte, now time.Time) {
 	// offset 17..19: 3-byte alignment padding (zero — dst pre-zeroed)
 	// offset 20: wal_level (int/uint32) — WAL_LEVEL_REPLICA = 1
 	le.PutUint32(dst[20:], 1)
-	// offset 24: nextXid (FullTransactionId=uint64) — FirstNormalTransactionId=3
-	le.PutUint64(dst[24:], pgFirstNormalXID)
+	// offset 24: nextXid (FullTransactionId=uint64) — PG 18.3 initdb's 752
+	le.PutUint64(dst[24:], pgInitdbNextXID)
 	// offset 32: nextOid (Oid=uint32) — FirstGenbkiObjectId=10000
 	le.PutUint32(dst[32:], pgFirstGenbkiOID)
 	// offset 36: nextMulti (MultiXactId=uint32) — FirstMultiXactId=1

@@ -51,6 +51,15 @@ const (
 
 	// Bootstrap values from BootStrapXLOG (xlog.c:5115-5132).
 	pgFirstNormalXID = uint64(3)     // FirstNormalTransactionId
+	// pgInitdbNextXID is the NextXID a PG 18.3 initdb leaves in pg_control:
+	// BootStrapXLOG starts at FirstNormalTransactionId, and initdb's
+	// post-bootstrap steps commit transactions up to 751. goopg's init has no
+	// post-bootstrap transactions, but a cluster that has never assigned a
+	// normal xid is a state PG never runs in: its XLOG_RUNNING_XACTS would
+	// carry latestCompletedXid = nextXid - 1 = 2, which a PG 18.3 standby
+	// rejects (TransactionIdIsNormal assertion in
+	// ProcArrayApplyRecoveryInfo). M0149-0010b.
+	pgInitdbNextXID = uint64(752)
 	pgFirstGenbkiOID = uint32(10000) // FirstGenbkiObjectId
 	pgFirstMultiXact = uint32(1)     // FirstMultiXactId
 	pgTemplate1DbOID = uint32(1)     // Template1DbOid
@@ -228,8 +237,8 @@ func buildPgControl(systemID uint64, now time.Time, cfg *misc.Registry, dataChec
 	// offset 57-59: padding (zero)
 	// offset 60: CheckPoint.wal_level (int) — live GUC
 	le.PutUint32(hdr[60:], walLevelInt(cfg))
-	// offset 64: CheckPoint.nextXid (FullTransactionId=uint64) — FirstNormalTransactionId=3
-	le.PutUint64(hdr[64:], pgFirstNormalXID)
+	// offset 64: CheckPoint.nextXid (FullTransactionId=uint64) — PG 18.3 initdb's 752
+	le.PutUint64(hdr[64:], pgInitdbNextXID)
 	// offset 72: CheckPoint.nextOid (Oid=uint32) — FirstGenbkiObjectId=10000
 	le.PutUint32(hdr[72:], pgFirstGenbkiOID)
 	// offset 76: CheckPoint.nextMulti (MultiXactId=uint32) — FirstMultiXactId=1

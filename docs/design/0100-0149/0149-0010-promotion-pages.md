@@ -1,6 +1,6 @@
 # 0149-0010 — Port recovery/t/015\_promotion\_pages.pl
 
-Status: in progress \(all\-goopg 1/1; mixed PG runs remain, M0149\-0010b\).
+Status: done \(all\-goopg and both mixed PG 18.3 pairings pass\).
 
 Upstream: `postgres/src/test/recovery/t/015_promotion_pages.pl`; Cluster.pm `backup`, `init_from_backup`,
 `enable_streaming`, `promote`, `wait_for_catchup`, `poll_query_until`.
@@ -71,6 +71,15 @@ The goopg\-primary pairing stops at the PG standby's
 `Assert(TransactionIdIsNormal(running->latestCompletedXid))`. goopg logs XLOG\_RUNNING\_XACTS with
 latestCompletedXid = nextXid − 1 = 2 on a cluster that has not yet assigned a normal xid; PG's initdb always leaves
 nextXid in the hundreds.
+
+## Slice 4: a PG standby of a fresh goopg primary \(landed\)
+
+The PG standby asserted `TransactionIdIsNormal(running->latestCompletedXid)` replaying goopg's
+XLOG\_RUNNING\_XACTS. A fresh goopg cluster had nextXid 3, so latestCompletedXid = nextXid − 1 = 2; PG never runs
+in that state, because initdb's post\-bootstrap transactions leave NextXID at 752 \(pg\_controldata on a fresh PG
+18.3\). goopg's init now writes NextXID 752 into pg\_control and the bootstrap checkpoint record; oldestXID stays 3,
+consistent with goopg's datfrozenxid. Xids 3–751 have no rows and are swept to aborted at the first start, which
+nothing reads. The earlier standby\_redo crash was the same assertion.
 
 ## Remaining
 

@@ -15763,7 +15763,7 @@ verify each at HEAD when the task starts.
   - Verification: postmaster/testport test on a goopg standby \(writes, DDL, `txid\_current\(\)`, `SET TRANSACTION
     READ WRITE` all fail with PG's SQLSTATEs and texts; `SHOW transaction\_read\_only` = `on`\), then the same
     statements succeed after `pg\_ctl promote`; mixed variant with a PG 18.3 primary → goopg standby.
-- [ ] **M0149-0010 — port recovery/t/015_promotion_pages.pl**
+- [x] **M0149-0010 — port recovery/t/015_promotion_pages.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/015_promotion_pages.pl` — WAL generated after promotion before the first checkpoint.
@@ -15799,7 +15799,7 @@ verify each at HEAD when the task starts.
       - Found by: a PG 18.3 cold start on a copy of the standby saw test1 with all rows, so replay into the heaps
         was right.
     - Movement: tap 015 0/1 → 1/1 all\-goopg.
-  - [ ] **M0149-0010b — 015 mixed runs: PG 18.3 primary → goopg standby, and goopg primary → PG 18.3 standby**
+  - [x] **M0149-0010b — 015 mixed runs: PG 18.3 primary → goopg standby, and goopg primary → PG 18.3 standby**
     Kind: impl
     Parent: M0149-0010
     Required by the milestone's PASS condition \(mixed runs against real PG 18.3 nodes\) before R\-015 can be `port`.
@@ -15824,6 +15824,11 @@ verify each at HEAD when the task starts.
         reaches that state, since its initdb consumes hundreds of xids. NEXT. Options: start goopg's nextXid past
         FirstNormalTransactionId at init as PG does \(check what depends on xid 3\), or skip logging running xacts
         until a normal xid has completed. Compare with PG initdb's pg\_control nextXid.
+    - 2026\-11\-23 DONE: goopg init now leaves NextXID 752 in pg\_control and the bootstrap checkpoint, as a PG 18.3
+      initdb does \(pg\_controldata on a fresh PG: `0:752`\); oldestXID stays 3, matching goopg's datfrozenxid. The
+      earlier standby\_redo crash was the same assertion \(standby\_redo → ProcArrayApplyRecoveryInfo\). Movement:
+      tap 015 mixed 1/2 → 2/2; all three subtests pass. M0149\-0010 closed: R\-015 `port`, expected\-failures row
+      removed.
 - [ ] **M0149-0011 — port recovery/t/016_min_consistency.pl**
   Kind: impl
   Parent: none
