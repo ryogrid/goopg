@@ -593,7 +593,39 @@ func openIndexBTree(ctx *Context, idx *catalog.Index, idxRel storage.RelFileNode
 func createIndexBTree(ctx *Context, idx *catalog.Index, idxRel storage.RelFileNode) (*nbtree.BTree, error) {
 	opts := indexBTreeOptions(ctx, idx)
 	opts.CreateXID = ctx.Tx.XID
-	return nbtree.CreateWithOptions(ctx.Pool, idxRel, opts)
+	markIndexUnlogged(ctx, idx, idxRel)
+	bt, err := nbtree.CreateWithOptions(ctx.Pool, idxRel, opts)
+	if err == nil {
+		err = buildEmptyIndexInitFork(ctx, idx, idxRel, opts)
+	}
+	return bt, err
+}
+
+// markIndexUnlogged registers an index on an UNLOGGED table as unlogged
+// before its build, so the main fork is written without WAL as PG writes it.
+func markIndexUnlogged(ctx *Context, idx *catalog.Index, idxRel storage.RelFileNode) {
+	if ctx.Pool != nil && idx != nil && idx.Table != nil && idx.Table.Unlogged {
+		ctx.Pool.SetRelUnlogged(idxRel, true)
+	}
+}
+
+// buildEmptyIndexInitFork is index_build's ambuildempty call (btbuildempty)
+// for an index on an UNLOGGED table: an empty btree, its metapage, in the
+// init fork, logged like any init fork. After a crash,
+// ResetUnloggedRelations copies it over the main fork while the heap is
+// emptied, so the index never points at rows the reset removed.
+// M0149-0003.
+func buildEmptyIndexInitFork(ctx *Context, idx *catalog.Index, idxRel storage.RelFileNode, opts nbtree.Options) error {
+	if ctx.Pool == nil || idx == nil || idx.Table == nil || !idx.Table.Unlogged {
+		return nil
+	}
+	initRel := idxRel
+	initRel.Fork = storage.InitFork
+	if n, err := ctx.Pool.NBlocks(initRel); err == nil && n > 0 {
+		return nil // already built (TRUNCATE rebuilds only the main fork)
+	}
+	_, err := nbtree.CreateWithOptions(ctx.Pool, initRel, opts)
+	return err
 }
 
 // bulkCreateIndexBTree sort-builds a btree for a catalog index (CREATE INDEX /
@@ -603,7 +635,12 @@ func createIndexBTree(ctx *Context, idx *catalog.Index, idxRel storage.RelFileNo
 func bulkCreateIndexBTree(ctx *Context, idx *catalog.Index, idxRel storage.RelFileNode, entries []nbtree.BulkEntry) (*nbtree.BTree, error) {
 	opts := indexBTreeOptions(ctx, idx)
 	opts.CreateXID = ctx.Tx.XID
-	return nbtree.BulkCreateWithOptions(ctx.Pool, idxRel, entries, opts)
+	markIndexUnlogged(ctx, idx, idxRel)
+	bt, err := nbtree.BulkCreateWithOptions(ctx.Pool, idxRel, entries, opts)
+	if err == nil {
+		err = buildEmptyIndexInitFork(ctx, idx, idxRel, opts)
+	}
+	return bt, err
 }
 
 // nullStopRangeBound builds the bound that keeps a range scan with an OPEN

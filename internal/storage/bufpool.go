@@ -113,6 +113,9 @@ func (s *Slot) getPinCount() int32 { return int32(statePin(s.state.Load())) }
 
 // Pool is the buffer manager. It is goroutine-safe.
 type Pool struct {
+	// unloggedRels holds the main-fork RelFileNodes of UNLOGGED relations,
+	// whose changes are not WAL-logged (RelationNeedsWAL). M0149-0003.
+	unloggedRels sync.Map
 	mgr   *Manager
 	arena *arena
 	slots []Slot
@@ -910,11 +913,60 @@ func (p *Pool) LogBtreeSplit() LogBtreeSplitFunc { return p.logBtreeSplit }
 
 // LogPageImage returns the configured full-page-image hook.
 func (p *Pool) LogPageImage() func(rel RelFileNode, blk BlockNumber, page Page) (LSN, error) {
-	return p.logFPI
+	if p.logFPI == nil {
+		return nil
+	}
+	return func(rel RelFileNode, blk BlockNumber, page Page) (LSN, error) {
+		if p.relSkipsWAL(rel) {
+			return 0, nil
+		}
+		return p.logFPI(rel, blk, page)
+	}
+}
+
+// SetRelUnlogged marks rel (any fork; the relation is meant) as UNLOGGED, or
+// clears the mark. Its main, FSM and VM forks are then written without WAL,
+// as PG does for a relation whose RelationNeedsWAL is false; its init fork is
+// still logged, because a crash restart rebuilds the relation from it.
+// M0149-0003.
+func (p *Pool) SetRelUnlogged(rel RelFileNode, on bool) {
+	if p == nil {
+		return
+	}
+	key := rel.Canonical()
+	key.Fork = MainFork
+	if on {
+		p.unloggedRels.Store(key, struct{}{})
+	} else {
+		p.unloggedRels.Delete(key)
+	}
+}
+
+// relSkipsWAL reports whether a change to rel is written without WAL: any
+// fork but the init fork of an UNLOGGED relation.
+func (p *Pool) relSkipsWAL(rel RelFileNode) bool {
+	if rel.Fork == InitFork {
+		return false
+	}
+	key := rel.Canonical()
+	key.Fork = MainFork
+	_, ok := p.unloggedRels.Load(key)
+	return ok
 }
 
 // LogHeapInsert returns the configured heap-insert change-record hook.
 func (p *Pool) LogHeapInsert() LogHeapInsertFunc { return p.logHeapInsert }
+
+// LogSmgrCreate emits XLOG_SMGR_CREATE for rel (its fork included), for a
+// caller that creates a fork file without pinning a new block, such as an
+// unlogged heap's empty init fork (heap_create_init_fork). No-op without a
+// hook. M0149-0003.
+func (p *Pool) LogSmgrCreate(rel RelFileNode, xid TransactionID) error {
+	if p == nil || p.logSmgrCreate == nil {
+		return nil
+	}
+	return p.logSmgrCreate(rel.Canonical(), xid)
+}
 
 // LogChangeRecord appends a pre-encoded WAL change record.
 func (p *Pool) LogChangeRecord(payload []byte) (LSN, error) {
@@ -1450,7 +1502,7 @@ func (p *Pool) TruncateRelationTail(rel RelFileNode, keep BlockNumber) error {
 	if keep >= oldN {
 		return nil
 	}
-	if p.logSmgrTruncateTo != nil {
+	if p.logSmgrTruncateTo != nil && !p.relSkipsWAL(rel) {
 		if err := p.logSmgrTruncateTo(rel, keep); err != nil {
 			return err
 		}
@@ -1962,7 +2014,7 @@ func (p *Pool) pinNewXID(rel RelFileNode, createXID TransactionID) (*Slot, Block
 	p.pinMu.Lock()
 
 	// Emit SmgrCreate WAL record on first block creation.
-	if blk == 0 && p.logSmgrCreate != nil {
+	if blk == 0 && p.logSmgrCreate != nil && !p.relSkipsWAL(rel) {
 		if emitErr := p.logSmgrCreate(rel, createXID); emitErr != nil {
 			p.logger.Error("SmgrCreate WAL emission failed", "rel", rel, "err", emitErr)
 		}
@@ -2051,7 +2103,7 @@ func (p *Pool) ExtendRelationBatchWithXID(rel RelFileNode, n int, createXID Tran
 	if err != nil {
 		return InvalidBlockNumber, err
 	}
-	if first == 0 && p.logSmgrCreate != nil {
+	if first == 0 && p.logSmgrCreate != nil && !p.relSkipsWAL(rel) {
 		if emitErr := p.logSmgrCreate(rel, createXID); emitErr != nil {
 			p.logger.Error("SmgrCreate WAL emission failed",
 				"rel", rel, "err", emitErr)
@@ -2590,8 +2642,11 @@ func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error
 	// redo publication cannot land between them (PublishRedoBarrier).
 	p.fpiPublishMu.RLock()
 	err := func() error {
-		needFPI := p.needsImage(s)
 		tag := s.tag
+		if p.relSkipsWAL(tag.Rel) {
+			return nil // RelationNeedsWAL is false: no record (M0149-0003)
+		}
+		needFPI := p.needsImage(s)
 
 		if needFPI {
 			if p.logFPI != nil && p.fullPageWrites.Load() {
@@ -2653,8 +2708,11 @@ func (p *Pool) MarkDirtyLogicalChange(s *Slot, emitter func() (LSN, error)) erro
 	// RLock spans decision + both appends (see MarkDirtyChangeRecord).
 	p.fpiPublishMu.RLock()
 	err := func() error {
-		needFPI := p.needsImage(s)
 		tag := s.tag
+		if p.relSkipsWAL(tag.Rel) {
+			return nil // RelationNeedsWAL is false: no record (M0149-0003)
+		}
+		needFPI := p.needsImage(s)
 
 		lsn, err := emitter()
 		if err != nil {
@@ -2695,7 +2753,7 @@ func (p *Pool) MarkDirtyLogicalChange(s *Slot, emitter func() (LSN, error)) erro
 // maybeEmitFPI runs the FPI side-effect of MarkDirty for the first
 // mutation of a page since the published redo pointer.
 func (p *Pool) maybeEmitFPI(s *Slot) {
-	if p.logFPI == nil || !p.fullPageWrites.Load() {
+	if p.logFPI == nil || !p.fullPageWrites.Load() || p.relSkipsWAL(s.tag.Rel) {
 		return
 	}
 	// RLock spans decision + append (see MarkDirtyChangeRecord).

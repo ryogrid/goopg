@@ -45,7 +45,7 @@ func pgDependRel() storage.RelFileNode {
 // (pg_class, seqrelid, 0) depends-auto-on (pg_class, tableOID, attnum).
 // Any previous ownership row for the sequence is stamped first so
 // re-pointing OWNED BY never leaves two live rows.
-func writeSequenceOwnedByDependRow(ctx *Context, seqrelid, tableOID uint32, attnum int32) error {
+func writeSequenceOwnedByDependRow(ctx *Context, seqrelid, tableOID uint32, attnum int32, deptype string) error {
 	if err := ctx.MaterializeWriterXID(); err != nil {
 		return err
 	}
@@ -57,7 +57,7 @@ func writeSequenceOwnedByDependRow(ctx *Context, seqrelid, tableOID uint32, attn
 		NewIntDatum(int64(catalog.RelationRelationId)), // refclassid
 		NewIntDatum(int64(tableOID)),                   // refobjid
 		NewIntDatum(int64(attnum)),                     // refobjsubid
-		NewStringDatum("a"),                            // deptype = DEPENDENCY_AUTO
+		NewStringDatum(deptype),                        // 'a' (serial / OWNED BY) or 'i' (identity)
 	}
 	_, err := writeHeapRowCanonical(ctx, pgDependRel(), PGDependColumnsPG18(), row)
 	return err

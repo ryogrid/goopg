@@ -2648,7 +2648,11 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 		case xlogSeqLog:
 			// B1.3b: rebuild the 1-tuple sequence page from the logged
 			// tuple (seq_redo analog; whole-page replace = idempotent).
-			if err := replayDecodedXLogSeqLog(mgr, xlog.MainData); err != nil {
+			fork := storage.MainFork
+			if b, ok := xlogBlockRefByID(xlog, 0); ok {
+				fork = b.Rel.Fork
+			}
+			if err := replayDecodedXLogSeqLog(mgr, xlog.MainData, fork); err != nil {
 				return false, err
 			}
 			return true, nil
@@ -6696,6 +6700,12 @@ func decodeXLogSmgrCreate(mainData []byte) (storage.RelFileNode, error) {
 // Shared by the native replaySmgrCreate and the A9 decoded
 // RmgrStorage/XLOG_SMGR_CREATE arm.
 func applySmgrCreate(mgr *storage.Manager, rel storage.RelFileNode) error {
+	if rel.Fork == storage.InitFork {
+		// smgr_redo's XLOG_SMGR_CREATE only creates the file: an unlogged
+		// heap's init fork is empty, and the pages of an index's or a
+		// sequence's init fork arrive in their own records (M0149-0003).
+		return mgr.CreateFile(rel)
+	}
 	n, err := mgr.NBlocks(rel)
 	if err != nil {
 		return fmt.Errorf("wal: smgr-create replay NBlocks: %w", err)

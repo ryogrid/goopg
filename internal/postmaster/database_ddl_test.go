@@ -823,7 +823,7 @@ func TestTryHandleDatabaseDDLCreateTemplateWithSequenceCopies(t *testing.T) {
 	// rows, and every real sequence's relation IS Virtual).
 	executor.RegisterSequence("s", 1, 1, 1, 9223372036854775807, false, srcOid)
 	executor.CreateSequenceCatalogRelation(im, parser.ObjectName{Name: "s"}, "s", srcOid)
-	if !executor.SetSequenceCurrentValue("s", 5, srcOid) {
+	if !executor.SetSequenceCurrentValue("s", 5, true, srcOid) {
 		t.Fatal("SetSequenceCurrentValue(s, 5) under seqsrc failed")
 	}
 
@@ -843,7 +843,7 @@ func TestTryHandleDatabaseDDLCreateTemplateWithSequenceCopies(t *testing.T) {
 		t.Fatalf("cloned sequence \"s\" current = %d, want 5 (the source's counter at copy time)", clonedPayload.Current)
 	}
 	// Advancing the clone must not alias the source's own counter.
-	if !executor.SetSequenceCurrentValue("s", 42, newOid) {
+	if !executor.SetSequenceCurrentValue("s", 42, true, newOid) {
 		t.Fatal("SetSequenceCurrentValue(s, 42) under foo failed")
 	}
 	srcPayload, ok := executor.SnapshotSequenceState("s", srcOid)

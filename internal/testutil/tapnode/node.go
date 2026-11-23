@@ -231,13 +231,12 @@ func ColdStartPG(t testing.TB, src *Node, name string) *Node {
 	if out, err := exec.Command("cp", "-a", src.DataDir(), dst).CombinedOutput(); err != nil {
 		t.Fatalf("tapnode: copy %s → %s: %v\n%s", src.DataDir(), dst, err, out)
 	}
-	// cp -a copies pg_tblspc's symlinks as symlinks, which would point the
-	// copy at src's own tablespace directories. Copy each external
-	// tablespace too and re-point the copy's link at it, as a base backup's
-	// tablespace mapping would (M0149-0003).
-	if err := copyTablespaces(dst, filepath.Join(t.TempDir(), name+"-tblspc")); err != nil {
-		t.Fatalf("tapnode: copy tablespaces of %s: %v", dst, err)
-	}
+	// cp -a copies pg_tblspc's symlinks as symlinks, so the copy shares
+	// src's external tablespaces. Re-pointing the links would not isolate
+	// them: redo of XLOG_TBLSPC_CREATE recreates each link to the logged
+	// location (tblspc_redo). A test with external tablespaces snapshots
+	// them with SnapshotDir and restores them before src restarts
+	// (M0149-0003).
 	// A goopg immediate stop or SIGKILL leaves its lock file, as PG's
 	// postmaster does after a crash; the copy is a different directory, so
 	// the stale file only blocks PG's start. PG removes it itself when the
@@ -294,40 +293,24 @@ func (n *Node) AppendConf(line string) {
 	}
 }
 
-// copyTablespaces copies every external tablespace of dataDir (a symlink
-// pg_tblspc/<oid> -> location) into root/<oid> and re-points the link there.
-func copyTablespaces(dataDir, root string) error {
-	dir := filepath.Join(dataDir, "pg_tblspc")
-	ents, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
+// SnapshotDir copies dir aside and returns a function that restores it,
+// replacing whatever the directory then holds. A test that cold-starts PG
+// on a copy of a node sharing an external tablespace restores the
+// tablespace before the node itself restarts, so each server recovers the
+// same crashed state.
+func SnapshotDir(t testing.TB, dir string) (restore func()) {
+	t.Helper()
+	saved := filepath.Join(t.TempDir(), "snapshot")
+	if out, err := exec.Command("cp", "-a", dir, saved).CombinedOutput(); err != nil {
+		t.Fatalf("tapnode: snapshot %s: %v\n%s", dir, err, out)
 	}
-	for _, e := range ents {
-		link := filepath.Join(dir, e.Name())
-		st, err := os.Lstat(link)
-		if err != nil || st.Mode()&os.ModeSymlink == 0 {
-			continue
+	return func() {
+		t.Helper()
+		if err := os.RemoveAll(dir); err != nil {
+			t.Fatalf("tapnode: restore %s: %v", dir, err)
 		}
-		target, err := os.Readlink(link)
-		if err != nil {
-			return err
-		}
-		if err := os.MkdirAll(root, 0o700); err != nil {
-			return err
-		}
-		copyDst := filepath.Join(root, e.Name())
-		if out, err := exec.Command("cp", "-a", target, copyDst).CombinedOutput(); err != nil {
-			return fmt.Errorf("copy %s: %v: %s", target, err, out)
-		}
-		if err := os.Remove(link); err != nil {
-			return err
-		}
-		if err := os.Symlink(copyDst, link); err != nil {
-			return err
+		if out, err := exec.Command("cp", "-a", saved, dir).CombinedOutput(); err != nil {
+			t.Fatalf("tapnode: restore %s: %v\n%s", dir, err, out)
 		}
 	}
-	return nil
 }

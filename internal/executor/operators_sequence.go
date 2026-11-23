@@ -62,6 +62,13 @@ func (s *seqState) nextVal() (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur := s.current.Load()
+	// current is the sequence page's last_value and called its is_called,
+	// as in PG (M0149-0003): a sequence not yet called hands out
+	// last_value itself (nextval_internal's `if (!is_called)` branch).
+	if !s.called.Load() {
+		s.called.Store(true)
+		return cur, nil
+	}
 	next := cur + s.increment
 	// review/260831-2 EO2-2: int64 addition wraps silently, so a large
 	// increment near the ceiling produced a NEGATIVE "next" that passed the
@@ -136,8 +143,9 @@ func RegisterSequence(name string, start, increment, min, max int64, cycle bool,
 		dataType:  "bigint",
 		dbOid:     oid,
 	}
-	// current starts at start-increment so that the first nextval returns start.
-	s.current.Store(start - increment)
+	// A new sequence's page holds last_value = start, is_called = false
+	// (DefineSequence), so the first nextval returns start.
+	s.current.Store(start)
 	seqRegistry.Store(seqKey(name, oid), s)
 }
 
@@ -272,21 +280,12 @@ func SequenceRowData(name string, dbOid ...uint32) (lastValue int64, logCnt int6
 	s := v.(*seqState)
 	s.mu.Lock()
 	isCalled = s.called.Load()
+	// current is last_value in both states (M0149-0003): for a sequence
+	// not yet called it is the value the next nextval returns (start, or N
+	// after setval(N, false) / RESTART WITH N), as pg_dump reads it.
+	lastValue = s.current.Load()
 	if isCalled {
-		lastValue = s.current.Load()
 		logCnt = 32
-	} else {
-		// Not-yet-called: last_value is the value the next nextval will
-		// return. The registry stores `current = nextTarget - increment`
-		// (RegisterSequence seeds start-increment; setval(N,false) /
-		// RESTART WITH N seed N-increment), so the on-disk last_value is
-		// `current + increment`. For a fresh sequence this equals start;
-		// after setval('seq', N, false) it equals N — matching what real
-		// pg_dump reads from the sequence relation (`SELECT last_value`).
-		// Returning the bare `start` here silently dropped any non-default
-		// setval(N,false) / RESTART WITH N, corrupting the dumped setval.
-		lastValue = s.current.Load() + s.increment
-		logCnt = 0
 	}
 	s.mu.Unlock()
 	return lastValue, logCnt, isCalled, true
@@ -377,18 +376,21 @@ func ResetSequence(name string, dbOid ...uint32) bool {
 	s := v.(*seqState)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.current.Store(s.start - s.increment)
+	// ResetSequence: last_value = start, is_called = false.
+	s.current.Store(s.start)
+	s.called.Store(false)
 	return true
 }
 
-// GetSequenceCurrentValue returns the raw internal current counter of the sequence.
-// The next nextval() call will return current+increment. Returns (0, false) if not found.
-func GetSequenceCurrentValue(name string, dbOid ...uint32) (int64, bool) {
+// GetSequenceCurrentValue returns the sequence's last_value and is_called.
+// Returns ok=false if not found.
+func GetSequenceCurrentValue(name string, dbOid ...uint32) (int64, bool, bool) {
 	v, ok := seqRegistry.Load(seqKey(name, resolveSeqDBOid(dbOid)))
 	if !ok {
-		return 0, false
+		return 0, false, false
 	}
-	return v.(*seqState).current.Load(), true
+	s := v.(*seqState)
+	return s.current.Load(), s.called.Load(), true
 }
 
 // ─── Restart persistence (RecordKindSequenceState / RecordKindDropSequence) ───
@@ -449,6 +451,17 @@ func (s *seqState) payloadLocked(current int64, called bool) xlog.SequenceStateP
 // ... RESTART IDENTITY). Temporary sequences are session-scoped and never
 // logged. A nil ctx/WAL (tests, WAL-less servers) is a no-op.
 func WALLogSequenceState(ctx *Context, name string) {
+	walLogSequenceState(ctx, name, true)
+}
+
+// walLogSequenceStateInPlace is WALLogSequenceState for setval, which PG
+// applies to the main fork's page in place (do_setval): an unlogged
+// sequence's init fork keeps the state of its last definition rewrite.
+func walLogSequenceStateInPlace(ctx *Context, name string) {
+	walLogSequenceState(ctx, name, false)
+}
+
+func walLogSequenceState(ctx *Context, name string, rewriteInit bool) {
 	if ctx == nil || ctx.WAL == nil {
 		return
 	}
@@ -462,14 +475,21 @@ func WALLogSequenceState(ctx *Context, name string) {
 		return
 	}
 	cur := s.current.Load()
-	p := s.payloadLocked(cur, s.called.Load())
-	s.logHorizon = cur
+	called := s.called.Load()
+	p := s.payloadLocked(cur, called)
+	s.logHorizon = s.loggedHorizonLocked(cur, called)
 	s.hasLogged = true
 	s.mu.Unlock()
 	// B1.3b: the COUNTER journals as XLOG_SEQ_LOG — a rewrite of the
 	// sequence relation's single physical page (replacing the retired
 	// RecordKindSequenceState). Best-effort like the walLog* helpers.
 	WriteSequencePageAndLog(ctx, name, p.DBOid, p.Current, 0, p.Called)
+	// An unlogged sequence's definition rewrite (DefineSequence,
+	// AlterSequence, ResetSequence) fills its init fork too
+	// (fill_seq_with_data). M0149-0003.
+	if rewriteInit && sequenceIsUnlogged(ctx, name, p.DBOid) {
+		writeSequenceInitFork(ctx, name, p.DBOid, p.Current, p.Called)
+	}
 	// B1.3 (doc 02c §3): the DEFINITION journals as a real pg_sequence heap
 	// row (INSERT/UPDATE via the fingerprint-gated upsert; counter-only
 	// snapshots skip).
@@ -601,18 +621,32 @@ func RestoreSequenceFromWAL(p xlog.SequenceStatePayload) {
 	s.current.Store(p.Current)
 	s.called.Store(p.Called)
 	s.mu.Lock()
-	s.logHorizon = p.Current
+	s.logHorizon = s.loggedHorizonLocked(p.Current, p.Called)
 	s.hasLogged = true
 	s.mu.Unlock()
 }
 
-// SetSequenceCurrentValue directly sets the internal counter (used for ROLLBACK of RESTART IDENTITY).
-func SetSequenceCurrentValue(name string, val int64, dbOid ...uint32) bool {
+// loggedHorizonLocked is the last value a logged page state covers. A page
+// that is not yet called covers nothing: its last_value is the value the
+// next nextval hands out, which must still be logged as called (or a crash
+// or restart would hand it out again).
+func (s *seqState) loggedHorizonLocked(lastValue int64, called bool) int64 {
+	if called {
+		return lastValue
+	}
+	return lastValue - s.increment
+}
+
+// SetSequenceCurrentValue restores last_value and is_called (ROLLBACK of
+// RESTART IDENTITY).
+func SetSequenceCurrentValue(name string, val int64, called bool, dbOid ...uint32) bool {
 	v, ok := seqRegistry.Load(seqKey(name, resolveSeqDBOid(dbOid)))
 	if !ok {
 		return false
 	}
-	v.(*seqState).current.Store(val)
+	s := v.(*seqState)
+	s.current.Store(val)
+	s.called.Store(called)
 	return true
 }
 
@@ -834,18 +868,13 @@ func evalSetval(args []Datum, ctx *Context) (Datum, error) {
 		return Datum{}, &ExecError{Code: "22003",
 			Message: fmt.Sprintf("setval: value %d is out of bounds for sequence \"%s\" (%d..%d)", value, name, seqMin, seqMax)}
 	}
-	if isCalled {
-		// Next nextval returns value+increment.
-		s.current.Store(value)
-		s.called.Store(true)
-	} else {
-		// Next nextval returns value.
-		s.current.Store(value - s.increment)
-		s.called.Store(false)
-	}
+	// do_setval: last_value = value, is_called as given; the next nextval
+	// returns value+increment when called, value itself otherwise.
+	s.current.Store(value)
+	s.called.Store(isCalled)
 	// Restart persistence: setval is a definition-level counter change —
 	// log the exact new state (mirrors sequence.c do_setval's XLogInsert).
-	WALLogSequenceState(ctx, name)
+	walLogSequenceStateInPlace(ctx, name)
 	// Update session state.
 	if ctx != nil {
 		if ctx.CurrSeqVals == nil {
@@ -919,12 +948,12 @@ func UpdateSequenceParams(name string, increment, minVal, maxVal, startWith, res
 		s.start = *startWith
 	}
 	if restartWith != nil {
-		// RESTART WITH n: set current so next nextval returns n.
-		s.current.Store(*restartWith - s.increment)
+		// RESTART WITH n: last_value = n, not called, so nextval returns n.
+		s.current.Store(*restartWith)
 		s.called.Store(false)
 	} else if restart {
-		// RESTART: reset to stored start.
-		s.current.Store(s.start - s.increment)
+		// RESTART: last_value = start, not called.
+		s.current.Store(s.start)
 		s.called.Store(false)
 	}
 	return nil
@@ -1155,4 +1184,18 @@ func seqTypeOID(dataType string) uint32 {
 	default: // "bigint", "int8"
 		return 20
 	}
+}
+
+// sequenceIsUnlogged reports whether the sequence's relation is UNLOGGED.
+func sequenceIsUnlogged(ctx *Context, name string, dbOid uint32) bool {
+	if ctx == nil || ctx.Catalog == nil {
+		return false
+	}
+	tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: name}, dbOid)
+	if !ok || tbl == nil {
+		if i := strings.LastIndexByte(name, '.'); i > 0 {
+			tbl, ok = ctx.Catalog.LookupTable(parser.ObjectName{Schema: name[:i], Name: name[i+1:]}, dbOid)
+		}
+	}
+	return ok && tbl != nil && tbl.Unlogged
 }

@@ -176,6 +176,23 @@ func (m *Manager) Close() error {
 	return firstErr
 }
 
+// CloseAllRelations closes every open file and forgets it, leaving the
+// Manager usable: the next access reopens the file and re-reads its size.
+// ResetUnloggedRelations replaces main forks underneath open handles, whose
+// cached block counts would otherwise be stale (M0149-0003).
+func (m *Manager) CloseAllRelations() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var firstErr error
+	for rel, f := range m.files {
+		if err := f.close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("close %v: %w", rel, err)
+		}
+		delete(m.files, rel)
+	}
+	return firstErr
+}
+
 // DataDir returns the root data directory this Manager was configured with.
 func (m *Manager) DataDir() string { return m.cfg.DataDir }
 

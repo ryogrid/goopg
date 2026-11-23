@@ -398,7 +398,7 @@ func ProcessRollbackUndos(ctx *Context, sess *BasicSession) {
 		}
 	}
 	for _, sr := range sess.TakePendingSeqRestores() {
-		SetSequenceCurrentValue(sr.Name, sr.OldCurr, sr.DBOid)
+		SetSequenceCurrentValue(sr.Name, sr.OldCurr, sr.OldCalled, sr.DBOid)
 	}
 	// Restore catalog entries for any DROP TABLEs that happened inside savepoints.
 	// On full ROLLBACK these are all being undone (the top-level transaction aborts).

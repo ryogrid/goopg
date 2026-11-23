@@ -16,8 +16,8 @@ import (
 //
 // Variants (M0149 contract C3, single-node): after the crash and the file
 // manipulations, a PostgreSQL 18.3 server cold-starts on a copy of the goopg
-// directory (tablespaces copied too) and must pass the post-restart
-// assertions; then the goopg node itself restarts and passes them.
+// directory and must pass the post-restart assertions; then the goopg node
+// itself restarts, on the crashed tablespace state restored, and passes them.
 func TestPort_Recovery014UnloggedReinit(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping recovery TAP port in short mode")
@@ -153,10 +153,16 @@ func TestPort_Recovery014UnloggedReinit(t *testing.T) {
 		is(t, n.SafePSQL("postgres", "SELECT * FROM tab_seq_unlogged3"), "1\n2", "reset sequence nextval after restart")
 	}
 
+	// The PG copy shares the external tablespace (its redo of
+	// XLOG_TBLSPC_CREATE points the link at the logged location), so the
+	// tablespace's crashed state is restored before goopg recovers it.
+	restoreTablespace := tapnode.SnapshotDir(t, tablespaceDir)
 	t.Run("pg18-cold-start", func(t *testing.T) {
 		pg := tapnode.ColdStartPG(t, node, "pg-on-goopg-copy")
 		after(t, pg)
+		pg.Stop(tapnode.StopFast)
 	})
+	restoreTablespace()
 	t.Run("all-goopg", func(t *testing.T) {
 		node.Start()
 		after(t, node)

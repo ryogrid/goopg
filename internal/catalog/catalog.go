@@ -7385,6 +7385,37 @@ func (c *InMemory) LookupTableByOID(oid uint32, dbOid ...uint32) (*Table, bool) 
 // (view/matview/column-default records key on TableOID only, with no dbOid
 // field) so state restores onto a table that reloaded into a distinct-dbOid
 // namespace, not just DefaultDBOid's. M0122-0007 4e follow-up 39.
+// UnloggedRelFileNodes returns the main-fork RelFileNodes of every UNLOGGED
+// relation in every database: tables, sequences and the indexes of
+// unlogged tables. Startup registers them with the buffer pool, whose
+// writes to them skip WAL (RelationNeedsWAL). M0149-0003.
+func (c *InMemory) UnloggedRelFileNodes() []storage.RelFileNode {
+	var tables []*Table
+	var indexes []*Index
+	c.mu.RLock()
+	for _, ns := range c.namespaces {
+		for _, t := range ns.tables {
+			if t.Unlogged {
+				tables = append(tables, t)
+			}
+		}
+		for _, idx := range ns.indexes {
+			if idx.Table != nil && idx.Table.Unlogged {
+				indexes = append(indexes, idx)
+			}
+		}
+	}
+	c.mu.RUnlock()
+	out := make([]storage.RelFileNode, 0, len(tables)+len(indexes))
+	for _, t := range tables {
+		out = append(out, c.RelFileNode(t))
+	}
+	for _, idx := range indexes {
+		out = append(out, c.IndexRelFileNode(idx))
+	}
+	return out
+}
+
 func (c *InMemory) LookupTableByOIDAllDBs(oid uint32) (*Table, uint32, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

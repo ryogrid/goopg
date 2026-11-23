@@ -86,21 +86,31 @@ func BuildSequencePage(tupleBytes []byte) (storage.Page, error) {
 // replayDecodedXLogSeqLog applies XLOG_SEQ_LOG: rebuild the 1-tuple page
 // from the logged tuple and write it as block 0 of the sequence relation
 // (mirrors seq_redo). The locator comes from xl_seq_rec in the main data.
-func replayDecodedXLogSeqLog(mgr *storage.Manager, mainData []byte) error {
+func replayDecodedXLogSeqLog(mgr *storage.Manager, mainData []byte, fork storage.ForkNumber) error {
 	if len(mainData) < sizeOfXlSeqRec+1 {
 		return fmt.Errorf("wal: seq-log main data too short (%d bytes)", len(mainData))
 	}
 	le := binary.LittleEndian
+	// The fork comes from block reference 0, as seq_redo's
+	// XLogInitBufferForRedo takes it: an unlogged sequence's init fork is
+	// logged with the same record (fill_seq_fork_with_data). M0149-0003.
 	rel := storage.RelFileNode{
 		DBOid:  le.Uint32(mainData[4:8]),
 		RelOid: le.Uint32(mainData[8:12]),
-		Fork:   storage.MainFork,
+		Fork:   fork,
 	}
 	page, err := BuildSequencePage(mainData[sizeOfXlSeqRec:])
 	if err != nil {
 		return err
 	}
-	// WriteBlock extends the file as needed (block 0 of a fresh relation).
+	// XLogInitBufferForRedo creates block 0 when the file is empty or gone
+	// (the crash-start cleanup removes an unlogged sequence's main fork).
+	if n, nerr := mgr.NBlocks(rel); nerr == nil && n == 0 {
+		if _, err := mgr.Extend(rel, page); err != nil {
+			return fmt.Errorf("seq-log replay: extend: %w", err)
+		}
+		return nil
+	}
 	if err := mgr.WriteBlock(rel, 0, page); err != nil {
 		return fmt.Errorf("seq-log replay: write: %w", err)
 	}

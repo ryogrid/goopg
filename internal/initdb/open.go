@@ -481,9 +481,33 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// instead of being reconstructed by scanning the stream for a record
 	// goopg's own isCheckpointRecord recognises. The scan survives as the
 	// fallback for redo == 0 (fresh cluster / no control file).
+	// M0149-0003: StartupXLOG resets unlogged relations around redo when it
+	// is in recovery: ResetUnloggedRelations(UNLOGGED_RELATION_CLEANUP)
+	// removes every fork but _init before the first record replays, and
+	// UNLOGGED_RELATION_INIT copies each _init over its main fork once redo
+	// is done (storage/file/reinit.c).
+	inRecovery := abs != "" && (recov.crashRecovery || startStandby || startRecovery)
+	if inRecovery {
+		if err := storage.ResetUnloggedRelations(abs, storage.UnloggedRelationCleanup); err != nil {
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: reset unlogged relations (cleanup): %w", err)
+		}
+	}
 	if _, err := xlog.ReplayFromDirWithMgrAtInterruptible(mgr, filepath.Join(abs, "pg_wal"), 0, recov.redoLSN, opts.Interrupted); err != nil {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: wal replay: %w", err)
+	}
+	// A standby keeps replaying; PG runs the init pass when recovery ends
+	// (promotion), which this startup path does not reach.
+	if inRecovery && !startStandby {
+		if err := mgr.CloseAllRelations(); err != nil {
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: reset unlogged relations: %w", err)
+		}
+		if err := storage.ResetUnloggedRelations(abs, storage.UnloggedRelationInit); err != nil {
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: reset unlogged relations (init): %w", err)
+		}
 	}
 	xlog.SetLegacyLayoutWALEnd(0, nil)
 	if template1MigrationPending {
@@ -1856,6 +1880,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			_ = walWriter.Close()
 			_ = mgr.Close()
 			return nil, fmt.Errorf("goopg: sequence heap reload: %w", err)
+		}
+	}
+	// M0149-0003: the reloaded UNLOGGED relations write without WAL again
+	// (RelationNeedsWAL), as they did before the restart.
+	if cat != nil {
+		for _, rel := range cat.UnloggedRelFileNodes() {
+			pool.SetRelUnlogged(rel, true)
 		}
 	}
 

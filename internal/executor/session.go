@@ -238,9 +238,10 @@ type TruncateUndoEntry struct {
 
 // SeqRestoreEntry records the pre-restart sequence counter for rollback.
 type SeqRestoreEntry struct {
-	Name    string
-	OldCurr int64  // seqState.current value before RESTART
-	DBOid   uint32 // owning database oid (M0122-0007 4e)
+	Name      string
+	OldCurr   int64  // last_value before RESTART
+	OldCalled bool   // is_called before RESTART
+	DBOid     uint32 // owning database oid (M0122-0007 4e)
 }
 
 // OnCommitAction records one CREATE TEMP TABLE ... ON COMMIT {DELETE ROWS|DROP}

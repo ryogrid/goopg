@@ -15521,7 +15521,7 @@ verify each at HEAD when the task starts.
     and keeps xmin, so after replay the pages differ in xmin only.
   - The executor's truncate record is not flushed before the file shrinks; RelationTruncate flushes when a VM or FSM
     exists.
-- [ ] **M0149-0003 — port recovery/t/014_unlogged_reinit.pl**
+- [x] **M0149-0003 — port recovery/t/014_unlogged_reinit.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/014_unlogged_reinit.pl` — unlogged tables/sequences reinitialised from `_init` forks after crash, incl. tablespaces.
@@ -15540,6 +15540,32 @@ verify each at HEAD when the task starts.
         \(initial page\);
       - ResetUnloggedRelations: cleanup before redo, init after redo, over base/ and every tablespace;
       - nextval state taken from the reset sequence page.
+  - 2026\-11\-23 \(done\): TestPort\_Recovery014UnloggedReinit passes 27/27 all\-goopg and on the PG 18\.3 cold start.
+    Movement: tap 014 5/27 → 27/27, and the PG variant 0 → 27/27.
+    - Path\-to\-TAP \(each link a failing assertion or a PG error\):
+      - 014 ← no `_init` forks / goopg cannot start without the main fork. Fixed by init forks and
+        ResetUnloggedRelations.
+      - 014 seq\_unlogged2 ← ALTER SEQUENCE moved the first nextval. Fixed: sequence state is PG's
+        last\_value/is\_called.
+      - 014 identity sequence ← not unlogged. Fixed.
+      - 014 PG ← `File exists` in the init pass. Fixed: no WAL for unlogged forks.
+      - 014 PG ← `cache lookup failed for sequence`. Fixed: pg\_sequence index entry on update.
+      - 014 PG ← `no owned sequence found`. Fixed: identity deptype 'i'.
+    - Regress same\-list A/B \(sequence, identity, truncate, alter\_table, create\_table, tablespace, vacuum,
+      create\_index, plpgsql\): all equal HEAD except plpgsql 1218 → 1221 \(flaky\).
+    - Follow\-ups are filed as M0149\-0003a.
+- [ ] **M0149-0003a — remaining unlogged-relation and sequence-persistence gaps** (filed 2026-11-23 by M0149-0003)
+  Kind: impl
+  Parent: none
+  - Not a TAP prerequisite: 014 passes. Do not select under M0149 \(ANTI\-DETOUR RULE\) unless a TAP test names one.
+  - Init forks exist only for btree indexes; other access methods need their ambuildempty.
+  - ALTER TABLE SET LOGGED / UNLOGGED neither creates nor removes init forks, and does not change the pool's
+    unlogged set.
+  - A standby does not run ResetUnloggedRelations' init pass at promotion.
+  - A clean restart resumes a sequence at its WAL pre\-log horizon; PG resumes from the page its shutdown
+    checkpoint flushed.
+  - XLOG\_SEQ\_LOG's encoder writes spcOid 1663 for every sequence; a sequence in a tablespace is mis\-addressed.
+  - Sequence pages written by an older goopg for a never\-called sequence hold last\_value = start \- increment.
 - [ ] **M0149-0004 — port recovery/t/022_crash_temp_files.pl**
   Kind: impl
   Parent: none

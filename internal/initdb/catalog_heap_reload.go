@@ -1903,7 +1903,9 @@ func reloadSequencesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, depCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
 				return nil, false, derr
 			}
-			if uint32(decoded[0].Int) != catalog.RelationRelationId || decoded[6].StringValue() != "a" {
+			// 'a' is a serial / OWNED BY sequence, 'i' an identity column's
+			// (DEPENDENCY_INTERNAL, M0149-0003).
+			if dt := decoded[6].StringValue(); uint32(decoded[0].Int) != catalog.RelationRelationId || (dt != "a" && dt != "i") {
 				return nil, false, errSkipBuiltinRow
 			}
 			return depRow{

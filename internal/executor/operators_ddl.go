@@ -2563,6 +2563,32 @@ func (o *ddlOp) createTableHonoringPendingDrop(name parser.ObjectName, cols []ca
 // (`could not open file ...: No such file or directory`). A nil Pool (the
 // storage-less CTAS probe path, execCreateTableAs's "no storage" branch) is a
 // no-op — there is nothing to touch. M0119-0006.
+// createHeapInitFork is heap_create_init_fork (heap.c) for an UNLOGGED heap:
+// an empty init fork, logged as XLOG_SMGR_CREATE for INIT_FORKNUM so a
+// replay (goopg's or a PG standby's) recreates it. After a crash,
+// ResetUnloggedRelations removes the other forks and copies the init fork
+// over the main fork, emptying the table. M0149-0003.
+func (o *ddlOp) createHeapInitFork(tbl *catalog.Table) error {
+	if tbl == nil || !tbl.Unlogged || o.ctx.Pool == nil {
+		return nil
+	}
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	// From here the heap's own forks are written without WAL
+	// (RelationNeedsWAL); only the init fork is logged.
+	o.ctx.Pool.SetRelUnlogged(rel, true)
+	rel.Fork = storage.InitFork
+	if err := o.ctx.Pool.CreateFile(rel); err != nil {
+		return &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	if err := o.ctx.MaterializeWriterXID(); err != nil {
+		return err
+	}
+	if err := o.ctx.Pool.LogSmgrCreate(rel, o.ctx.Tx.XID); err != nil {
+		return &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	return nil
+}
+
 // placeTableInTablespace sets tbl's tablespace. The main-fork file was
 // created (touchHeapMainForkFile) before the TABLESPACE clause was applied,
 // under base/; PG's heap_create creates it in the relation's own tablespace.
@@ -4409,6 +4435,9 @@ afterExistsCheck:
 		tbl.ForeignOptions = s.ForeignOptions
 	}
 	tbl.Unlogged = s.Unlogged
+	if err := o.createHeapInitFork(tbl); err != nil {
+		return err
+	}
 	tbl.OfTypeOID = ofTypeOID // typed table `OF type` → pg_class.reloftype (DU-002 slice 374)
 	tbl.Temp = s.Temporary
 	if s.Temporary {
@@ -4637,6 +4666,16 @@ afterExistsCheck:
 				SetSequenceTemporary(seqName, true, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			}
 			o.createSeqCatalogTable(parser.ObjectName{Schema: s.Name.Schema, Name: seqName}, seqName, tbl.Temp)
+			// An UNLOGGED table's serial / identity sequence is unlogged too
+			// (generateSerialExtraStmts copies the relpersistence), so a crash
+			// restart resets it with the table (M0149-0003).
+			if tbl.Unlogged {
+				seqObj := parser.ObjectName{Schema: s.Name.Schema, Name: seqName}
+				if seqTbl, ok := o.ctx.Catalog.LookupTable(seqObj, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok && seqTbl != nil {
+					seqTbl.Unlogged = true
+					syncTableToCatalogHeap(o.ctx, seqTbl)
+				}
+			}
 		}
 		// Restart persistence: mark which column this implicit sequence backs
 		// (the serial spelling / identity kind — replay restores the column's
@@ -5836,6 +5875,9 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 	// execCreateTable does, before the catalog sync below persists the row.
 	// M0146-0039a.
 	tbl.Unlogged = s.Unlogged
+	if err := o.createHeapInitFork(tbl); err != nil {
+		return err
+	}
 	tbl.Temp = s.Temporary
 	if s.Temporary {
 		tbl.TempOwner = sessionTempOwner(o.ctx)
@@ -6007,6 +6049,9 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	}
 	// Set persistence flags on the child.
 	tbl.Unlogged = s.Unlogged
+	if err := o.createHeapInitFork(tbl); err != nil {
+		return err
+	}
 	tbl.Temp = s.Temporary
 	if s.Temporary {
 		tbl.TempOwner = sessionTempOwner(o.ctx)
@@ -17650,8 +17695,8 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt, tempTables bool) error {
 				if seqName != "" {
 					if inExplicitTx {
 						// Save old counter so ROLLBACK can restore it.
-						if oldCurr, ok := GetSequenceCurrentValue(seqName, seqDBOid); ok {
-							sess.RecordSeqRestore(SeqRestoreEntry{Name: seqName, OldCurr: oldCurr, DBOid: seqDBOid})
+						if oldCurr, oldCalled, ok := GetSequenceCurrentValue(seqName, seqDBOid); ok {
+							sess.RecordSeqRestore(SeqRestoreEntry{Name: seqName, OldCurr: oldCurr, OldCalled: oldCalled, DBOid: seqDBOid})
 						}
 					}
 					if ResetSequence(seqName, seqDBOid) {
