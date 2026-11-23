@@ -15688,17 +15688,29 @@ verify each at HEAD when the task starts.
     pgstat.stat with the standalone backend's init WAL write; startup WAL reads counted; pg\_stat\_reset\_shared\('io'\).
     Movement: tap 029 42 → 44/44, plus a pg18\-cold\-start subtest in which PG 18.3 loads goopg's pgstat.stat.
     Inventory R\-029 `port`; expected\-failures row removed. Regress stats 236 → 235.
-- [ ] **M0149-0008 — port recovery/t/017_shm.pl**
+- [!] **M0149-0008 — port recovery/t/017_shm.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/017_shm.pl` — shared-memory interlock via `postmaster.pid` key and orphaned backends.
   Likely prerequisites \(verify at start\): `postmaster.pid` shmem-key line and `PGSharedMemoryIsInUse` interlock semantics for goopg's process model \(design doc must decide a PG-faithful answer\), `kill9` of postmaster with a live backend. Never `kill()` a goopg "backend pid" — `pg_backend_pid()` is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID; a backend-kill step that needs per-backend OS processes goes to `[!] blocked-on owner: architecture`.
-- [ ] **M0149-0075 — re-port recovery/t/013_crash_restart.pl to the M0149 contract**
+  - **PARKED `[!]` 2026\-11\-23 — blocked\-on owner: architecture.** Design docs/design/0100\-0149/0149\-0008\-shm.md.
+    - All three assertions need a backend that outlives a SIGKILLed postmaster: the restart must detect it through
+      the SysV segment's attach count \(PGSharedMemoryIsInUse\), normally and in `postgres --single`.
+    - goopg serves every connection from one OS process and has no SysV segment, so a kill9 ends every backend and
+      there is nothing to detect. The last step also kills a backend by OS PID, and assertion 1 needs the C
+      `wait_pid` function from regress.so.
+    - The milestone's C4 escape hatch names 017\_shm. Path\-to\-TAP: 017 ← orphan backend after postmaster kill9 ←
+      per\-backend OS processes \(architecture\). Reopen with M0149\-0004's process\-model decision.
+- [!] **M0149-0075 — re-port recovery/t/013_crash_restart.pl to the M0149 contract**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/013_crash_restart.pl` — postmaster crash-restart after a backend is killed with SIGQUIT and then SIGKILL.
   Current shortcut \(audit\): `TestPort_Recovery013CrashRestart` kills the whole server \(`c.Kill()`\) and restarts it by hand instead of killing one backend and letting the postmaster run its crash-restart cycle. It makes 1 assertion against \~18 upstream: the in-progress-transaction loss, the client "server closed the connection" / "terminating connection" errors and the second SIGKILL round are dropped. No PG 18.3 cross-check.
   Likely prerequisites \(verify at start\): the backend crash-restart child of M0149-0004 \(`restart_after_crash`\). Never `kill()` the synthetic `pg_backend_pid()` \(`internal/executor/expr.go`\); if a faithful backend kill needs per-backend OS processes, escalate `[!] blocked-on owner: architecture`. If its dependency \(the backend crash-restart child of M0149-0004\) is `[!]` on architecture, 0075 is too. Inventory row stays `port` until this closes.
+  - **PARKED `[!]` 2026\-11\-23 — blocked\-on owner: architecture**, by this entry's own rule: its dependency, the
+    backend crash\-restart of M0149\-0004, is `[!]` on architecture. 013's central steps `pg_ctl kill` QUIT/KILL a
+    backend by its OS PID and expect the postmaster to survive and run restart\_after\_crash \(milestone C4 names
+    013\_crash\_restart\). The inventory row stays `port` \(shortcut port\) until this closes.
 - [ ] **M0149-0076 — re-port recovery/t/039_end_of_wal.pl to the M0149 contract**
   Kind: impl
   Parent: none
