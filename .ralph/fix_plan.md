@@ -15768,6 +15768,26 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/recovery/t/015_promotion_pages.pl` — WAL generated after promotion before the first checkpoint.
   Likely prerequisites \(verify at start\): `XLOG_END_OF_RECOVERY` / fast promotion, crash recovery of a just-promoted node, `minRecoveryPoint` handling. Overlap: the ledger's M0122-0009 review found VM bits logged with a goopg-private HeapVisible record — PG `XLOG_HEAP2_VISIBLE` is required.
+  - 2026\-11\-23 slice 1 \(partial, still open\): ported as TestPort\_Recovery015PromotionPages \(expected failure\);
+    design docs/design/0100\-0149/0149\-0010\-promotion\-pages.md. The tapnode harness gains Cluster.pm's `backup`
+    \(pg\_basebackup\), `init_from_backup\(has_streaming\)` for goopg nodes, `promote` \(pg\_ctl promote\),
+    `restart`, `poll_query_until`, and the test's wait\_for\_catchup. Backup, streaming and pg\_ctl promote all work
+    against goopg. Movement: tap 015 0/1 → 0/1 \(the run now reaches the post\-promotion statements\).
+    - Path\-to\-TAP: 015 ← `truncate test1` on the promoted standby fails "relation \"test1\" does not exist" ←
+      a table created on the primary after the standby attached never appears in the goopg standby's catalog,
+      before or after promotion, and not even after a standby restart → **M0149-0010a** \(next\).
+  - [ ] **M0149-0010a — a goopg streaming standby must see tables the primary creates after it attached**
+    Kind: impl
+    Parent: M0149-0010
+    Proven by: TestPort\_Recovery015PromotionPages — after wait\_for\_catchup \(replay\_lsn ≥ the primary's
+    current LSN\), `SELECT count\(\*\) FROM test1` on the standby fails 42P01; a standby restart does not help.
+    Every existing goopg→goopg replication test creates its tables before the clone \(PreCloneHook\), so none
+    covered this. PG: the catalog rows arrive as ordinary heap WAL and the relcache sees them after replay
+    \(invalidation records\).
+    - Resume: find why startup's heap catalog reload \(internal/initdb/catalog\_heap\_reload.go\) on the standby
+      does not see the replayed pg\_class/pg\_attribute rows — whether the rows are not replayed into the
+      standby's catalog heaps, or the standby's clog does not mark the creating xid committed
+      \(catalogRowLive\) — then make the running standby pick up new relations during replay.
 - [ ] **M0149-0011 — port recovery/t/016_min_consistency.pl**
   Kind: impl
   Parent: none
