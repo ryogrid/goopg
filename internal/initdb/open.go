@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2376,6 +2377,30 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// a debugger. Column shape mirrors PG 18.x's view; the
 	// upstream-aligned columns we don't track in v0 (restartpoints*,
 	// buffers_written, slru_written) report literal 0.
+	// M0149-0007: the checkpointer's chunk of pg_stat/pgstat.stat — restored
+	// counters, the snapshot written at shutdown, and
+	// pg_stat_reset_shared('checkpointer').
+	if rs, ok := executor.RestoredCheckpointerStats(); ok {
+		cp.RestoreStats(xlog.Stats{
+			NumTimed:     uint64(rs.NumTimed),
+			NumRequested: uint64(rs.NumRequested),
+			NumDone:      uint64(rs.NumPerformed),
+			WriteTimeMs:  uint64(rs.WriteTime),
+			StatsResetAt: rs.StatResetTimestamp,
+		})
+	}
+	executor.PgStatCheckpointerSnapshot = func() executor.PgStatCheckpointer {
+		st := cp.Stats()
+		return executor.PgStatCheckpointer{
+			NumTimed:           int64(st.NumTimed),
+			NumRequested:       int64(st.NumRequested),
+			NumPerformed:       int64(st.NumDone),
+			WriteTime:          int64(st.WriteTimeMs),
+			StatResetTimestamp: st.StatsResetAt,
+		}
+	}
+	executor.PgStatResetCheckpointer = cp.ResetStats
+	installPgStatWal(cat, walWriter)
 	if err := registerStatCheckpointerView(cat, cp); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
@@ -3445,21 +3470,24 @@ func (a walAIOHandleAdapter) Wait() (int, error) {
 // `pg_catalog.pg_stat_checkpointer` virtual table backed by
 // `Checkpointer.Stats`. Column ordering matches upstream PG 18.x.
 func registerStatCheckpointerView(cat *catalog.InMemory, cp *xlog.Checkpointer) error {
+	// Column names and types follow system_views.sql's pg_stat_checkpointer
+	// (PG 18): bigint counters, double precision times in milliseconds, and a
+	// timestamptz stats_reset. M0149-0007.
 	tbl := &catalog.Table{
 		Schema: "pg_catalog",
 		Name:   "pg_stat_checkpointer",
 		Columns: []catalog.Column{
-			{Name: "num_timed", Type: catalog.Type{Name: "text"}},
-			{Name: "num_requested", Type: catalog.Type{Name: "text"}},
-			{Name: "restartpoints_timed", Type: catalog.Type{Name: "text"}},
-			{Name: "restartpoints_req", Type: catalog.Type{Name: "text"}},
-			{Name: "restartpoints_done", Type: catalog.Type{Name: "text"}},
-			{Name: "write_time", Type: catalog.Type{Name: "text"}},
-			{Name: "sync_time", Type: catalog.Type{Name: "text"}},
-			{Name: "total_time", Type: catalog.Type{Name: "text"}},
-			{Name: "buffers_written", Type: catalog.Type{Name: "text"}},
-			{Name: "slru_written", Type: catalog.Type{Name: "text"}},
-			{Name: "stats_reset", Type: catalog.Type{Name: "text"}},
+			{Name: "num_timed", Type: catalog.Type{Name: "int8"}},
+			{Name: "num_requested", Type: catalog.Type{Name: "int8"}},
+			{Name: "num_done", Type: catalog.Type{Name: "int8"}},
+			{Name: "restartpoints_timed", Type: catalog.Type{Name: "int8"}},
+			{Name: "restartpoints_req", Type: catalog.Type{Name: "int8"}},
+			{Name: "restartpoints_done", Type: catalog.Type{Name: "int8"}},
+			{Name: "write_time", Type: catalog.Type{Name: "float8"}},
+			{Name: "sync_time", Type: catalog.Type{Name: "float8"}},
+			{Name: "buffers_written", Type: catalog.Type{Name: "int8"}},
+			{Name: "slru_written", Type: catalog.Type{Name: "int8"}},
+			{Name: "stats_reset", Type: catalog.Type{Name: "timestamptz"}},
 		},
 		Virtual: true,
 	}
@@ -3468,15 +3496,15 @@ func registerStatCheckpointerView(cat *catalog.InMemory, cp *xlog.Checkpointer) 
 		return [][]string{{
 			fmt.Sprintf("%d", s.NumTimed),
 			fmt.Sprintf("%d", s.NumRequested),
-			"0", // restartpoints_timed (no replication in v0)
+			fmt.Sprintf("%d", s.NumDone),
+			"0", // restartpoints_timed (restartpoints are counted in num_requested)
 			"0", // restartpoints_req
 			"0", // restartpoints_done
 			fmt.Sprintf("%d", s.WriteTimeMs),
-			"0", // sync_time (not separated from write_time in v0)
-			fmt.Sprintf("%d", s.WriteTimeMs),
+			"0", // sync_time (not separated from write_time)
 			"0", // buffers_written (per-checkpoint counter not yet wired)
 			"0", // slru_written
-			s.StatsResetAt.UTC().Format("2006-01-02 15:04:05.000-07"),
+			s.StatsResetAt.UTC().Format("2006-01-02 15:04:05.999999-07"),
 		}}
 	}
 	return cat.RegisterVirtualTable(tbl)
@@ -4739,4 +4767,52 @@ func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 		cat.SetTableStats(tbl, stats)
 	}
 	return nil
+}
+
+// pgStatWalState is the WAL kind of the cumulative statistics: the counters
+// a clean shutdown saved (base) plus what this writer appended since startup
+// or the last pg_stat_reset_shared('wal') (live minus liveBase). M0149-0007.
+type pgStatWalState struct {
+	mu                         sync.Mutex
+	base                       executor.PgStatWal
+	liveBaseRecs, liveBaseByts int64
+}
+
+// installPgStatWal seeds the WAL stats from the restored chunk (or starts
+// them, with stats_reset now, after a crash or on a fresh cluster) and wires
+// pg_stat_wal, the shutdown snapshot and the reset.
+func installPgStatWal(cat *catalog.InMemory, w *xlog.Writer) {
+	st := &pgStatWalState{}
+	if rs, ok := executor.RestoredWalStats(); ok {
+		st.base = rs
+	}
+	if st.base.StatResetTimestamp.IsZero() {
+		st.base.StatResetTimestamp = time.Now()
+	}
+	st.liveBaseRecs, st.liveBaseByts = w.WalRecords(), w.WalBytes()
+	snapshot := func() executor.PgStatWal {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		out := st.base
+		out.Records += w.WalRecords() - st.liveBaseRecs
+		out.Bytes += w.WalBytes() - st.liveBaseByts
+		return out
+	}
+	executor.PgStatWalSnapshot = snapshot
+	executor.PgStatResetWal = func() {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		st.base = executor.PgStatWal{StatResetTimestamp: time.Now()}
+		st.liveBaseRecs, st.liveBaseByts = w.WalRecords(), w.WalBytes()
+	}
+	catalog.PgStatWalRowFunc = func() []string {
+		s := snapshot()
+		return []string{
+			strconv.FormatInt(s.Records, 10),
+			strconv.FormatInt(s.FPI, 10),
+			strconv.FormatInt(s.Bytes, 10),
+			strconv.FormatInt(s.BuffersFull, 10),
+			s.StatResetTimestamp.UTC().Format("2006-01-02 15:04:05.999999-07"),
+		}
+	}
 }

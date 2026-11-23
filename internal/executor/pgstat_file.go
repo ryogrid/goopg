@@ -76,6 +76,103 @@ const (
 	dbOffStatReset        = 32 * 8 // PgStat_StatDBEntry.stat_reset_timestamp
 )
 
+// PgStatCheckpointer is PgStat_CheckpointerStats, the checkpointer's
+// fixed-numbered chunk of the statistics file.
+type PgStatCheckpointer struct {
+	NumTimed, NumRequested, NumPerformed                               int64
+	RestartpointsTimed, RestartpointsRequested, RestartpointsPerformed int64
+	WriteTime, SyncTime, BuffersWritten, SLRUWritten                   int64
+	StatResetTimestamp                                                 time.Time
+}
+
+// PgStatCheckpointerSnapshot, when set (initdb wires it to the
+// xlog.Checkpointer), supplies the checkpointer chunk written at shutdown.
+var PgStatCheckpointerSnapshot func() PgStatCheckpointer
+
+// PgStatResetCheckpointer, when set, is pg_stat_reset_shared('checkpointer').
+var PgStatResetCheckpointer func()
+
+// PgStatWal is PgStat_WalStats: PgStat_WalCounters (wal_records, wal_fpi,
+// wal_bytes, wal_buffers_full) and stat_reset_timestamp.
+type PgStatWal struct {
+	Records, FPI, Bytes, BuffersFull int64
+	StatResetTimestamp               time.Time
+}
+
+// PgStatWalSnapshot / PgStatResetWal, when set (initdb wires them to the WAL
+// writer's counters), supply the WAL chunk written at shutdown and implement
+// pg_stat_reset_shared('wal').
+var (
+	PgStatWalSnapshot func() PgStatWal
+	PgStatResetWal    func()
+)
+
+// RestoredWalStats returns the WAL chunk the startup restore loaded, if any.
+func RestoredWalStats() (PgStatWal, bool) {
+	restoredFixed.mu.Lock()
+	defer restoredFixed.mu.Unlock()
+	if restoredFixed.wal == nil {
+		return PgStatWal{}, false
+	}
+	return *restoredFixed.wal, true
+}
+
+func encodeWalChunk(c PgStatWal) []byte {
+	b := make([]byte, 40)
+	le := binary.LittleEndian
+	for i, v := range []int64{c.Records, c.FPI, c.Bytes, c.BuffersFull, timestampTz(c.StatResetTimestamp)} {
+		le.PutUint64(b[i*8:], uint64(v))
+	}
+	return b
+}
+
+func decodeWalChunk(b []byte) PgStatWal {
+	le := binary.LittleEndian
+	g := func(i int) int64 { return int64(le.Uint64(b[i*8:])) }
+	return PgStatWal{Records: g(0), FPI: g(1), Bytes: g(2), BuffersFull: g(3), StatResetTimestamp: fromTimestampTz(g(4))}
+}
+
+// restoredFixed holds the fixed-kind chunks the last RestorePgStatFile
+// loaded, for the subsystems constructed after it (the checkpointer).
+var restoredFixed struct {
+	mu           sync.Mutex
+	checkpointer *PgStatCheckpointer
+	wal          *PgStatWal
+}
+
+// RestoredCheckpointerStats returns the checkpointer chunk the startup
+// restore loaded, if any.
+func RestoredCheckpointerStats() (PgStatCheckpointer, bool) {
+	restoredFixed.mu.Lock()
+	defer restoredFixed.mu.Unlock()
+	if restoredFixed.checkpointer == nil {
+		return PgStatCheckpointer{}, false
+	}
+	return *restoredFixed.checkpointer, true
+}
+
+func encodeCheckpointerChunk(c PgStatCheckpointer) []byte {
+	b := make([]byte, 88)
+	le := binary.LittleEndian
+	for i, v := range []int64{c.NumTimed, c.NumRequested, c.NumPerformed, c.RestartpointsTimed,
+		c.RestartpointsRequested, c.RestartpointsPerformed, c.WriteTime, c.SyncTime,
+		c.BuffersWritten, c.SLRUWritten, timestampTz(c.StatResetTimestamp)} {
+		le.PutUint64(b[i*8:], uint64(v))
+	}
+	return b
+}
+
+func decodeCheckpointerChunk(b []byte) PgStatCheckpointer {
+	le := binary.LittleEndian
+	g := func(i int) int64 { return int64(le.Uint64(b[i*8:])) }
+	return PgStatCheckpointer{
+		NumTimed: g(0), NumRequested: g(1), NumPerformed: g(2),
+		RestartpointsTimed: g(3), RestartpointsRequested: g(4), RestartpointsPerformed: g(5),
+		WriteTime: g(6), SyncTime: g(7), BuffersWritten: g(8), SLRUWritten: g(9),
+		StatResetTimestamp: fromTimestampTz(g(10)),
+	}
+}
+
 // dbStatsManager holds the database-wide entries (PGSTAT_KIND_DATABASE) and
 // the database each flushed relation and function entry belongs to: the
 // relation and function stores key on the object OID alone.
@@ -184,6 +281,14 @@ func WritePgStatFile(dataDir string) {
 		w.WriteByte(pgstatFileEntryFixed)
 		le.PutUint32(u32[:], fk.kind)
 		w.Write(u32[:])
+		if fk.kind == pgstatKindCheckpointer && PgStatCheckpointerSnapshot != nil {
+			w.Write(encodeCheckpointerChunk(PgStatCheckpointerSnapshot()))
+			continue
+		}
+		if fk.kind == pgstatKindWAL && PgStatWalSnapshot != nil {
+			w.Write(encodeWalChunk(PgStatWalSnapshot()))
+			continue
+		}
 		w.Write(make([]byte, fk.len))
 	}
 	writeKey := func(kind, dboid uint32, objid uint64) {
@@ -312,6 +417,39 @@ func resetAllCumulativeStats() {
 	dbStats.relDB = make(map[uint32]uint32)
 	dbStats.funcDB = make(map[uint32]uint32)
 	dbStats.mu.Unlock()
+	restoredFixed.mu.Lock()
+	restoredFixed.checkpointer = nil
+	restoredFixed.wal = nil
+	restoredFixed.mu.Unlock()
+}
+
+// pgStatResetShared is pg_stat_reset_shared(target) (pgstatfuncs.c): NULL
+// resets every shared kind. goopg keeps real counters only for the
+// checkpointer; the other kinds report fixed values.
+func pgStatResetShared(target string, isNull bool) error {
+	if isNull {
+		for _, t := range []string{"checkpointer", "wal"} {
+			if err := pgStatResetShared(t, false); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	switch target {
+	case "checkpointer":
+		if PgStatResetCheckpointer != nil {
+			PgStatResetCheckpointer()
+		}
+	case "wal":
+		if PgStatResetWal != nil {
+			PgStatResetWal()
+		}
+	case "archiver", "bgwriter", "io", "recovery_prefetch", "slru":
+	default:
+		return &ExecError{Code: "22023", Message: `unrecognized reset target: "` + target + `"`,
+			Hint: `Target must be "archiver", "bgwriter", "checkpointer", "io", "recovery_prefetch", "slru", or "wal".`}
+	}
+	return nil
 }
 
 // loadPgStatFile parses a whole statistics file and, only when it is valid,
@@ -336,6 +474,8 @@ func loadPgStatFile(data []byte) error {
 	dbs := make(map[uint32]time.Time)
 	relDB := make(map[uint32]uint32)
 	funcDB := make(map[uint32]uint32)
+	var ckpt *PgStatCheckpointer
+	var walc *PgStatWal
 	get := func(b []byte, off int) int64 { return int64(le.Uint64(b[off:])) }
 	for {
 		t, err := take(1)
@@ -358,8 +498,17 @@ func loadPgStatFile(data []byte) error {
 			if n < 0 {
 				return errCorruptStatsFile
 			}
-			if _, err := take(n); err != nil {
+			body, err := take(n)
+			if err != nil {
 				return errCorruptStatsFile
+			}
+			if kind == pgstatKindCheckpointer {
+				c := decodeCheckpointerChunk(body)
+				ckpt = &c
+			}
+			if kind == pgstatKindWAL {
+				c := decodeWalChunk(body)
+				walc = &c
 			}
 		case pgstatFileEntryHash:
 			k, err := take(16)
@@ -433,6 +582,10 @@ func loadPgStatFile(data []byte) error {
 			dbStats.relDB = relDB
 			dbStats.funcDB = funcDB
 			dbStats.mu.Unlock()
+			restoredFixed.mu.Lock()
+			restoredFixed.checkpointer = ckpt
+			restoredFixed.wal = walc
+			restoredFixed.mu.Unlock()
 			return nil
 		default:
 			return errCorruptStatsFile

@@ -18396,6 +18396,23 @@ case "pg_char_to_encoding":
 		return evalPgRestoreAttributeStats(x, slot, ctx)
 	case "pg_restore_relation_stats":
 		return evalPgRestoreRelationStats(x, slot, ctx)
+	// pg_stat_reset_shared([target text]) → void (pgstatfuncs.c). NULL or no
+	// argument resets every shared kind. M0149-0007.
+	case "pg_stat_reset_shared":
+		target, isNull := "", true
+		if len(x.Args) > 0 {
+			d, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			if !d.IsNull() {
+				target, isNull = d.StringValue(), false
+			}
+		}
+		if err := pgStatResetShared(target, isNull); err != nil {
+			return Datum{}, err
+		}
+		return NewStringDatum(""), nil
 	case "pg_stat_reset":
 		funcStats.resetAll()
 		relStats.resetAll()

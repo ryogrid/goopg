@@ -10398,7 +10398,10 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_slru"] = pgStatSlru
 
-	// pg_stat_wal — exactly 1 row expected.
+	// pg_stat_wal — exactly 1 row. PG 18's shape (system_views.sql:
+	// pg_stat_get_wal()): wal_records, wal_fpi, wal_bytes, wal_buffers_full,
+	// stats_reset. The row comes from PgStatWalRowFunc, which initdb wires to
+	// the WAL writer's counters and the persisted WAL stats (M0149-0007).
 	pgStatWal := &Table{
 		Schema: "pg_catalog", Name: "pg_stat_wal", Virtual: true,
 		Columns: []Column{
@@ -10406,17 +10409,16 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "wal_fpi", Type: Type{Name: "int8"}, Ordinal: 1},
 			{Name: "wal_bytes", Type: Type{Name: "numeric"}, Ordinal: 2},
 			{Name: "wal_buffers_full", Type: Type{Name: "int8"}, Ordinal: 3},
-			{Name: "wal_write", Type: Type{Name: "int8"}, Ordinal: 4},
-			{Name: "wal_sync", Type: Type{Name: "int8"}, Ordinal: 5},
-			{Name: "wal_write_time", Type: Type{Name: "float8"}, Ordinal: 6},
-			{Name: "wal_sync_time", Type: Type{Name: "float8"}, Ordinal: 7},
-			{Name: "stats_reset", Type: Type{Name: "timestamptz"}, Ordinal: 8},
+			{Name: "stats_reset", Type: Type{Name: "timestamptz"}, Ordinal: 4},
 		},
 		OID: 3402,
 	}
 	pgStatWal.VirtualRows = func() [][]string {
+		if f := PgStatWalRowFunc; f != nil {
+			return [][]string{f()}
+		}
 		return [][]string{
-			{"0", "0", "0", "0", "0", "0", "0", "0", "2026-01-01 00:00:00+00"},
+			{"0", "0", "0", "0", "2026-01-01 00:00:00+00"},
 		}
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_wal"] = pgStatWal
@@ -17593,6 +17595,11 @@ func (c *InMemory) PGNamespaceRowsForDBOid(dbOid uint32) [][]string {
 	}
 	return out
 }
+
+// PgStatWalRowFunc, when set, renders pg_stat_wal's single row
+// (wal_records, wal_fpi, wal_bytes, wal_buffers_full, stats_reset).
+// initdb installs it over the WAL writer's counters. M0149-0007.
+var PgStatWalRowFunc func() []string
 
 // tempNamespaceName renders the pg_temp_<id> namespace name for a temp-owner
 // token ("s<id>" → "pg_temp_<id>"). Mirrors PostgreSQL's pg_temp_N naming.

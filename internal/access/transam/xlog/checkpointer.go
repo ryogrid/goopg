@@ -379,6 +379,7 @@ type Checkpointer struct {
 	//                 (currently only set at construction)
 	numTimed     stats.Counter
 	numRequested stats.Counter
+	numDone      stats.Counter // num_performed: checkpoints completed (M0149-0007)
 	writeTimeMs  stats.Counter
 	statsResetAt atomic.Int64 // unix nanos
 }
@@ -387,6 +388,7 @@ type Checkpointer struct {
 type Stats struct {
 	NumTimed          uint64
 	NumRequested      uint64
+	NumDone           uint64
 	WriteTimeMs       uint64
 	LastCheckpointLSN uint64
 	StatsResetAt      time.Time
@@ -399,9 +401,38 @@ func (c *Checkpointer) Stats() Stats {
 	return Stats{
 		NumTimed:          uint64(c.numTimed.Sum()),
 		NumRequested:      uint64(c.numRequested.Sum()),
+		NumDone:           uint64(c.numDone.Sum()),
 		WriteTimeMs:       uint64(c.writeTimeMs.Sum()),
 		LastCheckpointLSN: c.lastCheckpointLSN.Load(),
 		StatsResetAt:      time.Unix(0, c.statsResetAt.Load()),
+	}
+}
+
+// ResetStats is pgstat_reset_of_kind(PGSTAT_KIND_CHECKPOINTER)
+// (pg_stat_reset_shared('checkpointer')): the counters restart from zero and
+// stats_reset is now. M0149-0007.
+func (c *Checkpointer) ResetStats() {
+	c.numTimed.Reset()
+	c.numRequested.Reset()
+	c.numDone.Reset()
+	c.writeTimeMs.Reset()
+	c.statsResetAt.Store(time.Now().UnixNano())
+}
+
+// RestoreStats loads the counters a clean shutdown saved in
+// pg_stat/pgstat.stat (pgstat_read_statsfile's checkpointer chunk). A zero
+// StatsResetAt keeps the current one. M0149-0007.
+func (c *Checkpointer) RestoreStats(s Stats) {
+	c.numTimed.Reset()
+	c.numRequested.Reset()
+	c.numDone.Reset()
+	c.writeTimeMs.Reset()
+	c.numTimed.Add(int64(s.NumTimed))
+	c.numRequested.Add(int64(s.NumRequested))
+	c.numDone.Add(int64(s.NumDone))
+	c.writeTimeMs.Add(int64(s.WriteTimeMs))
+	if !s.StatsResetAt.IsZero() {
+		c.statsResetAt.Store(s.StatsResetAt.UnixNano())
 	}
 }
 
@@ -1270,6 +1301,7 @@ func (c *Checkpointer) runCheckpointOpts(ctx context.Context, o checkpointOpts) 
 	} else {
 		c.numRequested.Add(1)
 	}
+	c.numDone.Add(1)
 	// NOTE (perf-optimize3-dash/03): the FPI epoch boundary is the redo
 	// publication at checkpoint START above — there is no post-record epoch
 	// reset any more (the old ResetCheckpointEpoch sweep here raced writers

@@ -15673,9 +15673,17 @@ verify each at HEAD when the task starts.
       checkpointer query before\). Regress stats 314 → 266.
     - Path\-to\-TAP \(open\):
       - 029 post restart ← `num_timed + num_requested` errors: pg\_stat\_checkpointer columns are text; `num_done`
-        missing → fix the view types and persist the checkpointer chunk \(next\).
-      - 029 wal\_\* ← pg\_stat\_wal is constant zeros → WAL record/byte accounting plus the WAL chunk and reset.
-      - 029 startup ← pg\_stat\_io has no startup / standalone backend WAL rows.
+        missing. Fixed in slice 2.
+      - 029 wal\_\* ← pg\_stat\_wal is constant zeros. Fixed in slice 2.
+      - 029 startup ← pg\_stat\_io has no startup / standalone backend WAL rows. Open.
+  - 2026\-11\-23 slice 2: PG 18 pg\_stat\_checkpointer \(types, num\_done\) and pg\_stat\_wal \(5 columns over the WAL
+    writer's counters\) shapes; both persisted through their 'F' chunks; pg\_stat\_reset\_shared with PG's target
+    check. Movement: tap 029 31 → 42/44 \(the run had stopped at the first checkpointer query\). Regress stats
+    266 → 236.
+    - Open, the last 2 assertions \(startup\): the standalone backend's `init`/`wal` writes \(initdb's WAL segment
+      creation, persisted through initdb's own pgstat.stat\) and the startup process's `normal`/`wal` reads. Needs the
+      51848\-byte IO 'F' chunk \(PgStat\_IO: stat\_reset + 18 × PgStat\_BktypeIO of bytes/counts/times\[3\]\[5\]\[8\]\)
+      written by `goopg init` and accumulated by startup WAL reads.
 - [ ] **M0149-0008 — port recovery/t/017_shm.pl**
   Kind: impl
   Parent: none
