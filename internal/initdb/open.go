@@ -1403,9 +1403,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			// reloads fresh relcache descriptors. Mirrors PG's commit-path
 			// AtEOXact_Inval → RelationCacheInitFilePreInvalidate sequence.
 			// M0106-0010 batched-31.
+			// A prepared transaction finishes with COMMIT PREPARED: the
+			// record names it in xl_xact_twophase (RecordTransactionCommitPrepared).
+			twoPhase := txnMgr.TakeTwoPhase(xid)
 			if txnMgr.TakeRelcacheInvalPending() {
 				// A6: PG xl_xact_commit with HAS_INVALS (xid in the header).
-				payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, true)
+				if twoPhase {
+					payload, perr = xlog.EncodeXactCommitPreparedPGAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, true)
+				} else {
+					payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, true)
+				}
 				_ = catalog.WithRelCacheInitLock(func() error {
 					if err := catalog.RelcacheInitFileUnlink(abs, catalog.DefaultDBOid); err != nil {
 						return err
@@ -1422,13 +1429,20 @@ func Open(opts OpenOptions) (*Runtime, error) {
 					// M0106-0010 batched-35.
 					return bootstrapRelcacheInitFiles(abs)
 				})
+			} else if twoPhase {
+				payload, perr = xlog.EncodeXactCommitPreparedPGAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, false)
 			} else {
 				payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, false)
 			}
 		case transam.XactAbort:
 			// The relations the transaction created go into the abort record;
 			// their files are removed once it is written (XactLogAbortRecord).
-			payload, perr = xlog.EncodeXactAbortPGWithRelsAt(stopTime, xid, txnMgr.SubxidsOf(xid, false), txnMgr.PendingAbortRelDeletes(xid))
+			// A prepared transaction finishes with ABORT PREPARED.
+			if txnMgr.TakeTwoPhase(xid) {
+				payload, perr = xlog.EncodeXactAbortPreparedPGAt(stopTime, xid, txnMgr.SubxidsOf(xid, false), txnMgr.PendingAbortRelDeletes(xid))
+			} else {
+				payload, perr = xlog.EncodeXactAbortPGWithRelsAt(stopTime, xid, txnMgr.SubxidsOf(xid, false), txnMgr.PendingAbortRelDeletes(xid))
+			}
 		default:
 			return fmt.Errorf("goopg: unknown xact marker %v", kind)
 		}

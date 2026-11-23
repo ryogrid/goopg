@@ -15899,6 +15899,12 @@ verify each at HEAD when the task starts.
   PREPARED write XLOG\_XACT\_COMMIT\_PREPARED / ABORT\_PREPARED, pg\_prepared\_xacts lists them. Today goopg keeps a prepared
   xact in memory only \(internal/postmaster/twophase.go\). Proof: 012 check 1 reads 0 rows after a restart; PG standby
   cannot COMMIT PREPARED a goopg primary's xact after promotion.
+  - [x] **M0149-0015a1 — PREPARE / COMMIT PREPARED / ABORT PREPARED WAL records** \(2026\-11\-24\)
+    - Movement: 012 goopg\-primary/PG\-standby pairing now passes its third segment \(PG standby finishes goopg's
+      PREPARE after promotion\); failures there 3, all slice\-2 / 0015b.
+    - Byte oracle: a PG 18.3 pg\_twophase file in xlog/testdata; pg\_waldump decodes goopg's records.
+  - [ ] **M0149-0015a2 — pg\_twophase files at checkpoint, restart restore, finish without a live transaction,
+    pg\_prepared\_xacts** \(next; proof: 012 check 1, 0 rows vs 6\)
 - [ ] **M0149-0015b — a goopg standby keeps replayed prepared transactions**
   Kind: impl
   Parent: M0149-0015

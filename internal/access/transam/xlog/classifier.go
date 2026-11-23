@@ -169,6 +169,19 @@ func classifyDecodedXLog(d *Decoder, r Record) error {
 			return d.ApplyCommit(storage.TransactionID(h.XID), r.EndLSN)
 		case xlogXactAbort:
 			d.ApplyAbort(storage.TransactionID(h.XID))
+		case xlogXactCommitPrepared, xlogXactAbortPrepared:
+			// Without two-phase decoding, a prepared transaction is decoded
+			// when it is finished (DecodeCommit / DecodeAbort with the
+			// xl_xact_twophase xid); its PREPARE record decodes nothing.
+			// M0149-0015a.
+			p, err := ParseXactRecord(h.Info, r.XLog.MainData)
+			if err != nil {
+				return err
+			}
+			if h.Info&xlogXactOpMask == xlogXactCommitPrepared {
+				return d.ApplyCommit(storage.TransactionID(p.TwophaseXid), r.EndLSN)
+			}
+			d.ApplyAbort(storage.TransactionID(p.TwophaseXid))
 		}
 		return nil
 	}

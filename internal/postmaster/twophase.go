@@ -41,10 +41,12 @@ package postmaster
 // hand-off.
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/access/transam"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/libpq"
 	"github.com/goopg/goopg/internal/storage/lmgr"
@@ -155,6 +157,9 @@ func (s *Server) execPrepareTransaction(w *libpq.FrameWriter, ctx *executor.Cont
 				return s.abortForPrepareSSIFailure(w, ctx, connTx, explicitTx, ssiErr)
 			}
 		}
+		if err := s.logPrepare(ctx, connTx, explicitTx, st.Gid); err != nil {
+			return s.writeQueryError(w, errcodes.InternalError, err.Error())
+		}
 		// Keep the transaction open on its slot; record the gid. The connection
 		// stays "in a transaction block" from goopg's view (invisible to the
 		// isolation tester, which does not inspect the ReadyForQuery status byte)
@@ -174,6 +179,9 @@ func (s *Server) execPrepareTransaction(w *libpq.FrameWriter, ctx *executor.Cont
 			*autoCommitPtr = false
 		}
 		return w.WriteCommandComplete("PREPARE TRANSACTION")
+	}
+	if err := s.logPrepare(ctx, connTx, explicitTx, st.Gid); err != nil {
+		return s.writeQueryError(w, errcodes.InternalError, err.Error())
 	}
 	// READ COMMITTED / REPEATABLE READ: detach the transaction to a dedicated
 	// proc slot and park it in the registry so the originating connection is
@@ -228,6 +236,50 @@ func (s *Server) execPrepareTransaction(w *libpq.FrameWriter, ctx *executor.Cont
 		*autoCommitPtr = false
 	}
 	return w.WriteCommandComplete("PREPARE TRANSACTION")
+}
+
+// logPrepare is EndPrepare's WAL half: the transaction gets an xid if it has
+// none (PrepareTransaction calls GetCurrentTransactionId), its two-phase
+// state — gid, committed subtransactions, relations to drop on commit or
+// abort — is written as an XLOG_XACT_PREPARE record and flushed, and the
+// manager remembers the xid so its eventual end record is COMMIT PREPARED /
+// ABORT PREPARED. A standby, PG's included, replays the record into a
+// prepared transaction it can finish after promotion. M0149-0015a.
+func (s *Server) logPrepare(ctx *executor.Context, connTx *connTxState, tx transam.Transaction, gid string) error {
+	if s.cfg.WAL == nil || s.cfg.TxnMgr == nil {
+		return nil
+	}
+	xid, err := s.cfg.TxnMgr.AssignXID(tx)
+	if err != nil {
+		return fmt.Errorf("PREPARE TRANSACTION: assign xid: %w", err)
+	}
+	var db uint32
+	if ctx != nil {
+		db = ctx.CurrentDatabaseOid
+	}
+	state := xlog.EncodeTwoPhaseState(xlog.TwoPhaseState{
+		XID:        xid,
+		Database:   db,
+		PreparedAt: xlog.TimestampTzNow(),
+		Owner:      s.resolveActingRoleOID(connTx.NonSuperuserRole),
+		GID:        gid,
+		Subxacts:   s.cfg.TxnMgr.SubxidsOf(xid, true),
+		CommitRels: s.cfg.TxnMgr.PendingRelDeletes(xid),
+		AbortRels:  s.cfg.TxnMgr.PendingAbortRelDeletes(xid),
+	})
+	payload, err := xlog.EncodeXactPreparePG(xid, state)
+	if err != nil {
+		return err
+	}
+	_, end, err := s.cfg.WAL.Append(payload)
+	if err != nil {
+		return fmt.Errorf("PREPARE TRANSACTION: write prepare record: %w", err)
+	}
+	if err := s.cfg.WAL.FlushUpTo(end); err != nil {
+		return fmt.Errorf("PREPARE TRANSACTION: flush prepare record: %w", err)
+	}
+	s.cfg.TxnMgr.MarkTwoPhase(xid)
+	return nil
 }
 
 // abortForPrepareSSIFailure rolls back the transaction whose PREPARE failed the

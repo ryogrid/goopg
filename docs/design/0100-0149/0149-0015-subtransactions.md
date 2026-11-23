@@ -1,6 +1,6 @@
 # 0149-0015 — Port recovery/t/012\_subtransactions.pl
 
-Status: in progress. The port exists and is skipped unless `GOOPG_TAP_012=1`. It still needs 0015a and 0015b.
+Status: in progress. The port exists and is skipped unless `GOOPG_TAP_012=1`. It still needs 0015a \(slice 1 of 3 done\) and 0015b.
 
 Upstream: `postgres/src/test/recovery/t/012_subtransactions.pl`; walsender.c `WalSndDone`, postmaster.c
 `PM_SHUTDOWN` → `PM_SHUTDOWN_2`, xlog.c `StartupXLOG` (`recoveryTargetTLI`, `writeTimeLineHistory`), twophase.c.
@@ -48,8 +48,43 @@ Upstream: `postgres/src/test/recovery/t/012_subtransactions.pl`; walsender.c `Wa
 - Test: `TestE2E_OldPrimaryRejoinsAfterPromotion`, two role swaps, all\-goopg and goopg primary over a PG 18.3
   standby.
 
+## 0015a — durable two\-phase commit on a goopg primary
+
+Slices:
+
+1. **WAL records \(done 2026\-11\-24\).**
+   - PREPARE TRANSACTION assigns an xid if the transaction has none. It then writes PG's `XLOG_XACT_PREPARE` and
+     flushes it: the main data is twophase.c's state buffer, `xlog.EncodeTwoPhaseState`.
+   - The buffer holds the 72\-byte `TwoPhaseFileHeader`, the gid, the committed subtransactions, the relations to
+     drop on commit and on abort, and the `TWOPHASE_RM_END_ID` sentinel. Each segment is MAXALIGN'd, and total\_len
+     counts the CRC.
+   - The manager remembers the xid \(`MarkTwoPhase`\), so the transaction's end record is `XLOG_XACT_COMMIT_PREPARED`
+     or `XLOG_XACT_ABORT_PREPARED`. That record has header xid 0 and the prepared xid in `xl_xact_twophase`.
+   - The logical decoder and the slot restart anchor treat the `*_PREPARED` records like a commit or abort of that
+     xid.
+   - Byte oracle: a `pg_twophase` file PG 18.3 wrote is in `xlog/testdata`. The header, gid and subxact segments
+     match; padding bytes are uninitialised in PG.
+   - pg\_waldump decodes goopg's records as `PREPARE gid …; subxacts: …` and `COMMIT_PREPARED <xid> …`.
+   - Movement: in 012's goopg\-primary / PG\-standby pairing, the PG standby now replays a goopg PREPARE and finishes it
+     after promotion \(ROLLBACK PREPARED of the 201\-subxact transaction\). Before, the run stopped earlier.
+2. **Restart restore \(next\).**
+   - `CheckPointTwoPhase` writes `pg_twophase/<XID>` with a CRC for prepared transactions whose PREPARE is older than
+     the redo point.
+   - Startup reads those files \(`restoreTwoPhaseData`\) and the PREPARE records after redo. Their xids and subxids
+     must stay in progress: neither swept aborted nor visible.
+   - The gids are registered, so COMMIT/ROLLBACK PREPARED can finish them from any backend; this needs a finishing
+     path that works without a live `Transaction`.
+   - `pg_prepared_xacts` lists them.
+3. **Standby \(0015b\).** PREPARE replay keeps the state \(`PrepareRedoAdd`\), and promotion goes through slice 2's
+   restore.
+
 ## Not covered
 
 - The walsender's drain and flush wait are fixed at 10 s instead of following `wal_sender_timeout`. Logical
   walsenders do not drain at shutdown.
 - A goopg standby of a PG primary does not see user tables \(M0149\-0015d, filed\).
+- The PREPARE record carries no resource\-manager records: no lock records for a standby to re\-acquire, and no
+  pgstat or predicate\-lock records. It is not followed by a synchronous\-replication wait.
+- `COMMIT PREPARED` / `ROLLBACK PREPARED` answer with the command tags `COMMIT` / `ROLLBACK`; PG sends
+  `COMMIT PREPARED` / `ROLLBACK PREPARED`.
+- No `XACT_XINFO_HAS_GID` under wal\_level=logical.

@@ -180,5 +180,6 @@ func recordIsXactCommit(rec Record) bool {
 		return false
 	}
 	h := rec.XLog.Header
-	return h.Rmid == RmgrXact && h.Info&xlogXactOpMask == xlogXactCommit
+	op := h.Info & xlogXactOpMask
+	return h.Rmid == RmgrXact && (op == xlogXactCommit || op == xlogXactCommitPrepared)
 }
