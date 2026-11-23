@@ -94,6 +94,10 @@ type Manager struct {
 	mu    sync.Mutex
 	files map[RelFileNode]*relFile
 
+	// tempRels maps a temporary relation's main-fork RelFileNode to its
+	// backend number, which names its files (SetRelTemp). M0149-0006a.
+	tempRels sync.Map
+
 	aio AIOEngine
 
 	// OnReadWait / OnWriteWait / OnExtendWait / OnSyncWait are optional
@@ -575,18 +579,19 @@ func (m *Manager) CreateFile(rel RelFileNode) error {
 // fork is found missing (the pg_amcheck heap file-removal corruption scenario).
 func (m *Manager) RelPath(rel RelFileNode) string {
 	rel = rel.Canonical()
+	stem := m.relFileStem(rel)
 	base := relDir(rel)
 	switch rel.Fork {
 	case MainFork:
-		return base + "/" + fmt.Sprint(rel.RelOid)
+		return base + "/" + stem
 	case FSMFork:
-		return base + "/" + fmt.Sprintf("%d_fsm", rel.RelOid)
+		return base + "/" + stem + "_fsm"
 	case VisibilityMapFork:
-		return base + "/" + fmt.Sprintf("%d_vm", rel.RelOid)
+		return base + "/" + stem + "_vm"
 	case InitFork:
-		return base + "/" + fmt.Sprintf("%d_init", rel.RelOid)
+		return base + "/" + stem + "_init"
 	}
-	return base + "/" + fmt.Sprintf("%d_fork%d", rel.RelOid, rel.Fork)
+	return base + "/" + fmt.Sprintf("%s_fork%d", stem, rel.Fork)
 }
 
 // Sync issues fdatasync(2) on rel's backing file. Used by the
@@ -844,18 +849,19 @@ func RelMainPath(rel RelFileNode) string {
 
 func (m *Manager) relPath(rel RelFileNode) string {
 	rel = rel.Canonical()
+	stem := m.relFileStem(rel)
 	base := filepath.Join(m.cfg.DataDir, relDir(rel))
 	switch rel.Fork {
 	case MainFork:
-		return filepath.Join(base, fmt.Sprint(rel.RelOid))
+		return filepath.Join(base, stem)
 	case FSMFork:
-		return filepath.Join(base, fmt.Sprintf("%d_fsm", rel.RelOid))
+		return filepath.Join(base, stem+"_fsm")
 	case VisibilityMapFork:
-		return filepath.Join(base, fmt.Sprintf("%d_vm", rel.RelOid))
+		return filepath.Join(base, stem+"_vm")
 	case InitFork:
-		return filepath.Join(base, fmt.Sprintf("%d_init", rel.RelOid))
+		return filepath.Join(base, stem+"_init")
 	}
-	return filepath.Join(base, fmt.Sprintf("%d_fork%d", rel.RelOid, rel.Fork))
+	return filepath.Join(base, fmt.Sprintf("%s_fork%d", stem, rel.Fork))
 }
 
 // ErrShortRead indicates a ReadBlock landed past EOF.

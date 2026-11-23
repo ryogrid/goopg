@@ -7443,9 +7443,8 @@ func evalPgRelationFilenode(x *optimizer.FuncCall, slot SlotView, ctx *Context) 
 // evalPgRelationFilepath implements pg_relation_filepath(regclass) → text
 // (dbsize.c): the main fork's path relative to the data directory, NULL when
 // pg_relation_filenode is NULL. It names the file goopg actually stores the
-// relation in. One divergence: PG puts a temporary relation's file under a
-// per-backend name (base/<db>/t<procnumber>_<n>, relpathbackend); goopg
-// stores temporary relations like permanent ones, so the path has no t prefix.
+// relation in, including a temporary relation's per-backend name
+// (base/<db>/t<backend>_<n>, relpathbackend; M0149-0006a).
 func evalPgRelationFilepath(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) < 1 {
 		return NullDatum, nil
@@ -7466,6 +7465,10 @@ func evalPgRelationFilepath(x *optimizer.FuncCall, slot SlotView, ctx *Context) 
 		if rel, ok = seedRelationStorage(ctx, oid); !ok {
 			return NullDatum, nil
 		}
+	}
+	rel.Fork = storage.MainFork
+	if ctx.Pool != nil {
+		return NewStringDatum(ctx.Pool.Manager().RelPath(rel)), nil
 	}
 	return NewStringDatum(storage.RelMainPath(rel)), nil
 }

@@ -15632,13 +15632,26 @@ verify each at HEAD when the task starts.
         removed at startup → **M0149-0006a**.
       - Path\-to\-TAP: 018 orphan check ← goopg\-private stats sidecar 9410 in base/<db> \(owner waiver
         M0125-0029\) → **M0149-0006b** \[!\] owner.
-  - [ ] **M0149-0006a — temp relation file naming `t<procno>_<oid>` + RemovePgTempFiles at startup**
+  - [x] **M0149-0006a — temp relation file naming `t<procno>_<oid>` + RemovePgTempFiles at startup**
     Kind: impl
     Parent: M0149-0006
     Upstream: `relpath.c` GetRelationPath \(backend != INVALID\_PROC\_NUMBER\), `fd.c` RemovePgTempRelationFiles.
     Proven by: 018 check\_orphan\_relfilenodes lists the temp table's `16860`/`16865` at both wal\_levels.
     Also: skip of eager TOAST creation for temp tables \(`createToastStorage`\) is lifted once temp files carry
     the `t` prefix.
+    - 2026\-11\-23 done: Manager/Pool.SetRelTemp \(t<backend>\_<n> naming, no WAL\), adoptTempStorage at the 3
+      CREATE TEMP sites, TOAST and btree indexes marked before creation, storage.RemovePgTempRelationFiles at
+      every startup, pg\_relation\_filepath reports the temp name. Movement: 018 orphan set 3 files → 1
+      \(`base/5/9410`, owner\-gated M0149-0006b\); assertions still 40/42.
+    - Filed, not worked \(nearby\): temp files are kept until the next startup, where PG removes them at backend
+      exit; non\-btree indexes and sequences on temp tables still get permanent names; pg\_relation\_filepath gives
+      base/<db>/<n> for shared catalogs \(PG: global/<n>\) — see M0149-0006c.
+  - [ ] **M0149-0006c — temp-relation and relation-path residuals \(filed from M0149-0006a\)**
+    Kind: impl
+    Parent: M0149-0006
+    Not a proven 018 blocker; do not self-select under the anti-detour rule unless a TAP assertion needs it.
+    - RemoveTempRelations at backend exit \(namespace.c\); non\-btree index AMs and temp sequences via
+      Pool.SetRelTemp; pg\_relation\_filepath for shared catalogs \(global/<n>, relpath.c\).
   - [!] **M0149-0006b — relocate the goopg relation\-stats sidecar 9410 out of base/<db>**
     Kind: impl \(owner\-gated: owner waiver M0125-0029 placed it there\)
     Parent: M0149-0006

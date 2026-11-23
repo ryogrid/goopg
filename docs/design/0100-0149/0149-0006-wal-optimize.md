@@ -63,12 +63,33 @@ At the end it checks that every file under base/<db> is a pg\_class relation, an
 - **TOAST heaps at CREATE TABLE.** `createToastStorage` creates the empty TOAST heap file with the table, as PG's
   `heap_create` does, and DROP TABLE removes it. It is skipped for temporary tables \(see below\).
 
+## Temporary relations: slice 3 \(M0149-0006a\)
+
+- **File names.** A temporary relation's forks are named `t<backend>_<relfilenode>[_<fork>]`, as `relpathbackend`
+  \(common/relpath.c\) names them. The storage manager keeps a temp\-relation map \(`Manager.SetRelTemp`\) that
+  `relPath` / `RelPath` consult; `Pool.SetRelTemp` also marks the relation as written without WAL, since
+  `RelationNeedsWAL` is false for RELPERSISTENCE\_TEMP. The backend number is the session id of the table's
+  temp\-owner token, the number its `pg_temp_<id>` namespace carries.
+- **Registration before the first open.** The manager caches open files by RelFileNode, so the mark must precede the
+  first open. CREATE TABLE creates the main\-fork file before the table is marked temporary; `adoptTempStorage`
+  removes that empty file and recreates it under the temp name. The TOAST heap \(`createToastStorage`\) and btree
+  indexes \(`markIndexUnlogged`\) are marked before their files are created.
+- **Startup sweep.** `storage.RemovePgTempRelationFiles` ports the relation\-file half of RemovePgTempFiles
+  \(storage/file/fd.c\), with `looksLikeTempRelName` = `looks_like_temp_rel_name`. It runs on every startup before redo,
+  over base/<db> and every pg\_tblspc/<oid>/<version>/<db>.
+- **pg\_relation\_filepath** now reports the temp name.
+
 ## Remaining: check\_orphan\_relfilenodes
 
-Three files are still orphans at both wal\_levels: `base/5/16860`, `base/5/16865` and `base/5/9410`.
+Only `base/5/9410` is still an orphan, at both wal\_levels. It is the goopg\-private relation\-stats sidecar
+\(`catalog.GoopgRelStatsRelationId`\), stored in base/<db> under owner waiver M0125-0029; moving it is owner\-gated
+\(M0149-0006b\).
 
-- The temporary table's files are named `<oid>` where PG uses `t<procno>_<oid>`, and they survive the crash; PG's
-  RemovePgTempFiles removes them at startup. Fixing this needs a backend id in the relation file locator
-  \(filed M0149-0006a\).
-- 9410 is the goopg\-private relation\-stats sidecar \(`catalog.GoopgRelStatsRelationId`\), stored in base/<db> under
-  owner waiver M0125-0029. Moving it is owner\-gated \(filed M0149-0006b\).
+## Not yet ported \(filed\)
+
+- PG removes a temporary relation's files when its backend exits \(RemoveTempRelations at backend exit\); goopg keeps
+  them until the next startup.
+- Only btree indexes are marked temporary; hash, GiST, GIN, SP\-GiST and BRIN indexes on a temporary table, and
+  temporary sequences, still get permanent names and WAL.
+- `pg_relation_filepath` reports `base/<db>/<n>` for shared catalogs such as pg\_database, where PG reports
+  `global/<n>`. This predates the slice.

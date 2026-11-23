@@ -2617,6 +2617,46 @@ func (o *ddlOp) createHeapInitFork(tbl *catalog.Table) error {
 	return nil
 }
 
+// adoptTempStorage gives a temporary table its PG file name. CREATE TABLE
+// creates the (empty) main-fork file before the table is marked temporary;
+// that file is removed and recreated as t<backend>_<relfilenode>
+// (relpathbackend, common/relpath.c), and from here the relation is written
+// without WAL, as RelationNeedsWAL is false for RELPERSISTENCE_TEMP. The
+// startup sweep (RemovePgTempFiles) deletes such files, so a temporary table
+// leaves no file behind after a crash. M0149-0006a.
+func (o *ddlOp) adoptTempStorage(tbl *catalog.Table) {
+	if o.ctx.Pool == nil || tbl == nil || !tbl.Temp {
+		return
+	}
+	backend, ok := tempBackendNumber(tbl.TempOwner)
+	if !ok {
+		return
+	}
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	o.ctx.Pool.InvalidateRel(rel)
+	if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
+		slog.Warn("could not remove temporary relation's placeholder file", "rel", rel, "err", err)
+	}
+	o.ctx.Pool.SetRelTemp(rel, backend)
+	if err := o.ctx.Pool.CreateFile(rel); err != nil {
+		slog.Warn("could not create temporary relation file", "rel", rel, "err", err)
+	}
+}
+
+// tempBackendNumber is the backend number that names a temporary relation's
+// files: the session id of its temp-owner token ("s<id>"), the number its
+// pg_temp_<id> namespace carries.
+func tempBackendNumber(owner string) (uint32, bool) {
+	if !strings.HasPrefix(owner, "s") {
+		return 0, false
+	}
+	id, err := strconv.ParseUint(owner[1:], 10, 32)
+	if err != nil {
+		return 0, false
+	}
+	return uint32(id), true
+}
+
 // createToastStorage is AlterTableCreateToastTable at CREATE TABLE: a table
 // pg_class gives a TOAST relation gets that relation's (empty) file now, as
 // PG creates the toast heap with the table, and the file is removed if the
@@ -2626,15 +2666,21 @@ func (o *ddlOp) createHeapInitFork(tbl *catalog.Table) error {
 // StorageScheduled expression. M0149-0006.
 func (o *ddlOp) createToastStorage(tbl *catalog.Table) bool {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
-	// Temp tables are skipped: goopg names temp relation files like
-	// permanent ones (PG uses t<procno>_<oid>, swept by RemovePgTempFiles),
-	// so an eager TOAST file would only add an orphan. M0149-0006.
-	if !ok || o.ctx.Pool == nil || tbl == nil || tbl.Temp {
+	if !ok || o.ctx.Pool == nil || tbl == nil {
 		return true
 	}
 	toastRel, has := im.ToastRelFileNode(o.ctx.Catalog.RelFileNode(tbl))
 	if !has {
 		return true
+	}
+	// A temporary table's TOAST relation is temporary too: its file is
+	// named t<backend>_<oid> and written without WAL. M0149-0006a.
+	if tbl.Temp {
+		backend, ok := tempBackendNumber(tbl.TempOwner)
+		if !ok {
+			return true
+		}
+		o.ctx.Pool.SetRelTemp(toastRel, backend)
 	}
 	if err := o.ctx.Pool.CreateFile(toastRel); err == nil {
 		createdRelationStorage(o.ctx, toastRel, true)
@@ -4495,6 +4541,7 @@ afterExistsCheck:
 	tbl.Temp = s.Temporary
 	if s.Temporary {
 		tbl.TempOwner = sessionTempOwner(o.ctx)
+		o.adoptTempStorage(tbl)
 		// Lazily establish the session's per-backend temp namespace
 		// (pg_temp_<id>) so the relation renders in it and
 		// pg_my_temp_schema() resolves. M0118-0009 (temp-schema-cleanup).
@@ -5934,6 +5981,7 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 	tbl.Temp = s.Temporary
 	if s.Temporary {
 		tbl.TempOwner = sessionTempOwner(o.ctx)
+		o.adoptTempStorage(tbl)
 		if tbl.TempOwner != "" {
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				im.EnsureTempNamespace(tbl.TempOwner)
@@ -6108,6 +6156,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	tbl.Temp = s.Temporary
 	if s.Temporary {
 		tbl.TempOwner = sessionTempOwner(o.ctx)
+		o.adoptTempStorage(tbl)
 		if tbl.TempOwner != "" {
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				im.EnsureTempNamespace(tbl.TempOwner)

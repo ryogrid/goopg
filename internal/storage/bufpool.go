@@ -942,6 +942,19 @@ func (p *Pool) SetRelUnlogged(rel RelFileNode, on bool) {
 	}
 }
 
+// SetRelTemp marks rel as a temporary relation of backend: its files are
+// named t<backend>_<relfilenode> (Manager.SetRelTemp) and, as
+// RelationNeedsWAL is false for RELPERSISTENCE_TEMP, its changes are written
+// without WAL. Call it before the relation's first file is created.
+// M0149-0006a.
+func (p *Pool) SetRelTemp(rel RelFileNode, backend uint32) {
+	if p == nil {
+		return
+	}
+	p.Manager().SetRelTemp(rel, backend, true)
+	p.SetRelUnlogged(rel, true)
+}
+
 // relSkipsWAL reports whether a change to rel is written without WAL: any
 // fork but the init fork of an UNLOGGED relation.
 func (p *Pool) relSkipsWAL(rel RelFileNode) bool {

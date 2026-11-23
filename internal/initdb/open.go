@@ -486,6 +486,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// removes every fork but _init before the first record replays, and
 	// UNLOGGED_RELATION_INIT copies each _init over its main fork once redo
 	// is done (storage/file/reinit.c).
+	// M0149-0006a: PostmasterMain's RemovePgTempFiles (storage/file/fd.c)
+	// deletes every temporary relation's file at startup; no backend that
+	// could use one survives a restart.
+	if abs != "" {
+		storage.RemovePgTempRelationFiles(abs)
+	}
 	inRecovery := abs != "" && (recov.crashRecovery || startStandby || startRecovery)
 	if inRecovery {
 		if err := storage.ResetUnloggedRelations(abs, storage.UnloggedRelationCleanup); err != nil {

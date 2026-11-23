@@ -607,6 +607,13 @@ func markIndexUnlogged(ctx *Context, idx *catalog.Index, idxRel storage.RelFileN
 	if ctx.Pool != nil && idx != nil && idx.Table != nil && idx.Table.Unlogged {
 		ctx.Pool.SetRelUnlogged(idxRel, true)
 	}
+	// An index on a temporary table is temporary: t<backend>_<oid>, no WAL.
+	// M0149-0006a.
+	if ctx.Pool != nil && idx != nil && idx.Table != nil && idx.Table.Temp {
+		if backend, ok := tempBackendNumber(idx.Table.TempOwner); ok {
+			ctx.Pool.SetRelTemp(idxRel, backend)
+		}
+	}
 }
 
 // buildEmptyIndexInitFork is index_build's ambuildempty call (btbuildempty)
