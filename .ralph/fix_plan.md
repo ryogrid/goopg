@@ -15829,11 +15829,14 @@ verify each at HEAD when the task starts.
       earlier standby\_redo crash was the same assertion \(standby\_redo → ProcArrayApplyRecoveryInfo\). Movement:
       tap 015 mixed 1/2 → 2/2; all three subtests pass. M0149\-0010 closed: R\-015 `port`, expected\-failures row
       removed.
-- [ ] **M0149-0011 — port recovery/t/016_min_consistency.pl**
+- [x] **M0149-0011 — port recovery/t/016_min_consistency.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/016_min_consistency.pl` — on-disk page LSNs never exceed `minRecoveryPoint` on a standby.
   Likely prerequisites \(verify at start\): `UpdateMinRecoveryPoint` on buffer flush during recovery, PG page-header LSN layout read straight from relation files, PG `pg_controldata` on the goopg standby dir.
+  - 2026\-11\-23 DONE: TestPort\_Recovery016MinConsistency, three subtests \(all\-goopg, PG 18.3 primary → goopg
+    standby, goopg primary → PG 18.3 standby\), all pass with no product change. Movement: tap 016 0/1 → 1/1 in each
+    pairing. Design docs/design/0100\-0149/0149\-0011\-min\-consistency.md; inventory R\-016 `port`.
 - [ ] **M0149-0012 — port recovery/t/021_row_visibility.pl**
   Kind: impl
   Parent: none
