@@ -144,7 +144,7 @@ func appendSysBtreePage(ctx *Context, rel storage.RelFileNode, page []byte) (uin
 
 // descendSysBtreeWithPath is descendSysBtreeToLeaf that also returns the
 // internal pages visited, root first (_bt_search's BTStack).
-func descendSysBtreeWithPath(ctx *Context, rel storage.RelFileNode, rootBlk uint32, level uint32, newKey []byte, cmp keyCompareFn) (uint32, []uint32, error) {
+func descendSysBtreeWithPath(ctx *Context, rel storage.RelFileNode, rootBlk uint32, level uint32, newKey []byte, cmp tupleCmpFn) (uint32, []uint32, error) {
 	var path []uint32
 	cur := rootBlk
 	for lvl := int(level); lvl >= 1; lvl-- {
@@ -161,7 +161,7 @@ func descendSysBtreeWithPath(ctx *Context, rel storage.RelFileNode, rootBlk uint
 			if len(it) <= sysIndexTupleHoff {
 				continue
 			}
-			if cmp(newKey, it[sysIndexTupleHoff:]) < 0 {
+			if cmp(newKey, it) < 0 {
 				break
 			}
 			next = decodeChildFromTID(it)
@@ -178,7 +178,7 @@ func insertSysBtreeMultiLevel(ctx *Context, indexOID uint32, rel storage.RelFile
 	if !ok {
 		return fmt.Errorf("split: unsupported system btree OID %d", indexOID)
 	}
-	leafBlk, path, err := descendSysBtreeWithPath(ctx, rel, rootBlk, level, indexTuple[sysIndexTupleHoff:], cmp)
+	leafBlk, path, err := descendSysBtreeWithPath(ctx, rel, rootBlk, level, indexTuple[sysIndexTupleHoff:], pivotAwareCmp(indexOID, cmp))
 	if err != nil {
 		return fmt.Errorf("descend: %w", err)
 	}

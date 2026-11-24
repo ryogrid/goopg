@@ -16005,6 +16005,18 @@ verify each at HEAD when the task starts.
     Parent: M0149-0016
     Found while probing 009 \(not a 009 requirement\). PG exposes xmin, xmax, cmin, cmax, ctid and tableoid on every
     table.
+  - [x] **M0149-0016f — 009 mixed pairings: PREPARE waits for sync standbys; catalog btree descent handles truncated pivots** \(2026\-11\-24\)
+    - Movement: 009 goopg\-london/pg18\-paris: FAIL \(xact\_009\_10 missing on promoted PG, then a 24\-min hang\) → PASS.
+    - pivotAwareCmp \(sys\_catalog\_btree\_pivot.go\) and its unit test; descent uses it.
+  - [ ] **M0149-0016e — catalog name\_ops index keys are cstring in PG, 64\-byte NameData in goopg**
+    Kind: impl
+    Parent: M0149-0016
+    PG's btree name\_ops has opckeytype = cstring \(pg\_opclass.dat\), so PG\-built catalog indexes on name columns
+    \(pg\_class\_relname\_nsp, pg\_type\_typname\_nsp, pg\_proc\_proname\_args\_nsp, …\) store variable\-length cstring
+    keys. goopg's cmpKey\*/buildIndexTuple\* assume 64\-byte NameData. Proof: 009 pg18\-london/goopg\-paris pairing —
+    CREATE TABLE on paris, promoted from a PG backup, panics in leaf compare \(insertIntoExistingLeaf → cmpKeyNameOid\).
+    0015f is the same family on pg\_proc. First check which format goopg's own initdb\-built catalog indexes use; PG
+    standbys read them.
   - [ ] **M0149-0016c — pg\_ls\_dir / pg\_stat\_file and pg\_subtrans files**
     Kind: impl
     Parent: M0149-0016

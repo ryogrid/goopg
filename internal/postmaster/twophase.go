@@ -316,6 +316,12 @@ func (s *Server) logPrepare(ctx *executor.Context, connTx *connTxState, tx trans
 	s.cfg.TxnMgr.RegisterPrepared(transam.PreparedXact{
 		XID: xid, Subxacts: subxacts, GID: gid, State: state, PrepareEndLSN: end,
 	})
+	// EndPrepare → SyncRepWaitForLSN(prepare_end_lsn): PREPARE TRANSACTION
+	// returns only once the synchronous standbys have the record, so a
+	// standby promoted right after can still finish it (M0149-0016).
+	if ctx != nil && ctx.SyncRep != nil && ctx.SyncCommitMode != xlog.SyncRepOff && ctx.SyncRep.NeedsWait() {
+		_ = ctx.SyncRep.WaitForLSN(ctx.Ctx, end, ctx.SyncCommitMode)
+	}
 	return nil
 }
 
