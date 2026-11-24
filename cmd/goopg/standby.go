@@ -63,6 +63,9 @@ type standbyController struct {
 	// recoveryEndCommand reads recovery_end_command (PGC_SIGHUP) at
 	// promotion time; nil reads as empty (M0122-0013).
 	recoveryEndCommand func() string
+	// restoreCommand reads restore_command (PGC_SIGHUP): promotion probes
+	// the archive for timelines a sibling already took (M0149-0018c).
+	restoreCommand func() string
 
 	receiverCancel context.CancelFunc
 	receiverDone   chan struct{}
@@ -216,6 +219,7 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 		rt:                 rt,
 		logger:             logger,
 		recoveryEndCommand: func() string { return stringGUC(registry, "recovery_end_command", "") },
+		restoreCommand:     func() string { return stringGUC(registry, "restore_command", "") },
 		receiverCancel:     rcvCancel,
 		receiverDone:       rcvDone,
 		replayerCancel:     rplCancel,
@@ -452,7 +456,17 @@ func (sc *standbyController) finalizePromotion() error {
 		// The walreceiver fetches the primary's history files, so a
 		// timeline the primary (or a sibling standby) already used is
 		// skipped instead of reused.
-		newTLI := xlog.FindNewestTimeline(walDir, oldTLI) + 1
+		// A standby restoring from the archive probes it too
+		// (existsTimeLineHistory under ArchiveRecoveryRequested): a
+		// sibling that promoted first has archived <tli>.history.
+		newestTLI := xlog.FindNewestTimeline(walDir, oldTLI)
+		if sc.restoreCommand != nil && sc.rt.WAL != nil {
+			if rc := sc.restoreCommand(); rc != "" {
+				newestTLI = max(newestTLI, xlog.FindNewestTimelineArchive(context.Background(), walDir, rc,
+					lastRestartPointFileName(sc.rt, sc.rt.WAL.SegmentSize()), oldTLI))
+			}
+		}
+		newTLI := newestTLI + 1
 
 		// The switch point is the end of the last record replay
 		// applied: received bytes past it are a partial record, which
@@ -502,6 +516,9 @@ func (sc *standbyController) finalizePromotion() error {
 		return fmt.Errorf("promote: remove standby.signal: %w", err)
 	}
 	sc.rt.Standby = false
+	// exitArchiveRecovery: the files archive recovery restored into are
+	// removed once it ends.
+	removeRecoveryFiles(walDirFor(sc.rt))
 	// Out of recovery: with archive_mode = on the archiver starts now.
 	walArchiver.Wakeup()
 	// Recovery-mode checkpoints intentionally avoid creating local WAL. Once
@@ -1076,14 +1093,16 @@ func runRecoveryEndCommand(rt *initdb.Runtime, command string, logger *slog.Logg
 	if rt.WAL != nil && rt.WAL.SegmentSize() > 0 {
 		segSize = rt.WAL.SegmentSize()
 	}
-	anySignal, err := xlog.ExecuteRecoveryCommand(command, "recovery_end_command", cd.CheckPointCopyRedo, cd.CheckPointCopyThisTLI, segSize)
+	anySignal, err := xlog.ExecuteRecoveryCommandIn(rt.DataDir, command, "recovery_end_command", cd.CheckPointCopyRedo, cd.CheckPointCopyThisTLI, segSize)
 	if err == nil {
 		return nil
 	}
 	if anySignal {
 		return err
 	}
-	logger.Warn("recovery_end_command failed", "err", err)
+	// ExecuteRecoveryCommand's WARNING (xlogarchive.c): the message is PG's
+	// `recovery_end_command "<command>": <wait_result_to_str>`.
+	logger.Warn(err.Error())
 	return nil
 }
 
@@ -1360,4 +1379,11 @@ func startWalReceiverForStandby(rcvCtx context.Context, rcvDone chan struct{}, r
 			}
 		},
 	})
+}
+
+// removeRecoveryFiles drops pg_wal/RECOVERYXLOG and RECOVERYHISTORY, as
+// exitArchiveRecovery does at the end of archive recovery (M0149-0018c).
+func removeRecoveryFiles(walDir string) {
+	_ = os.Remove(filepath.Join(walDir, xlog.RecoveryXLogName))
+	_ = os.Remove(filepath.Join(walDir, xlog.RecoveryHistoryName))
 }

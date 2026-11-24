@@ -85,7 +85,6 @@ func feedFromArchive(ctx context.Context, rt *initdb.Runtime, registry *misc.Reg
 		if int64(len(data)) != segSize {
 			return fmt.Errorf("archive file \"%s\" has wrong size: %d instead of %d", name, len(data), segSize)
 		}
-		logger.Info(fmt.Sprintf("restored log file \"%s\" from archive", name))
 		if off < uint64(len(data)) {
 			if _, _, err := rt.WAL.AppendRaw(data[off:]); err != nil {
 				return fmt.Errorf("could not write restored WAL file \"%s\": %w", name, err)

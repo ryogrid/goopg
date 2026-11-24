@@ -16399,7 +16399,7 @@ verify each at HEAD when the task starts.
     minRecoveryPoint as the backup end. goopg's BuildBackupLabel always writes "primary".
   - BASE\_BACKUP on a standby also skips PG's checks: the full\_page\_writes requirement, and "the standby was
     promoted during online backup".
-- [ ] **M0149-0018 — port recovery/t/002_archiving.pl**
+- [x] **M0149-0018 — port recovery/t/002_archiving.pl** \(2026\-11\-25\)
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/002_archiving.pl` — WAL archiving with a hot standby restoring from the archive.
@@ -16440,7 +16440,18 @@ verify each at HEAD when the task starts.
     The standby starts, logs "walreceiver not started" and never replays; "Timed out while waiting for standby to catch
     up". PG's WaitForWALToBecomeAvailable polls the archive \(XLOG\_FROM\_ARCHIVE\), then pg\_wal, then streaming, every
     wal\_retrieve\_retry\_interval.
-  - [ ] **M0149-0018c — archive\_cleanup\_command, recovery\_end\_command and the promotion checks of 002**
+  - [x] **M0149-0018c — archive\_cleanup\_command, recovery\_end\_command and the promotion checks of 002** \(2026\-11\-25\)
+    - Recovery commands now run in the data directory \(ExecuteRecoveryCommandIn\), and their failure WARNING is PG's
+      `<name> "<command>": <wait_result_to_str>`.
+    - Every successful restore logs "restored log file … from archive" \(RestoreArchivedFile's LOG\).
+    - Promotion probes the archive for history files \(FindNewestTimelineArchive, findNewestTimeLine under archive
+      recovery\). standby2 now skips the timeline 2 that standby1 already took and promotes onto 3; before, it
+      reused 2.
+    - Promotion removes RECOVERYXLOG / RECOVERYHISTORY \(exitArchiveRecovery\).
+    - Harness: tapnode LogSize / LogFrom render goopg's structured log lines in PG's `LEVEL:  message` form for the
+      ported log assertions.
+    - All three pairings pass 3/3 and run ungated. Inventory row 002 → port.
+    Movement: yes — tap 002 all\-goopg and pg18\-primary/goopg\-standbys: 4 not ok → PASS; TestPort\_Recovery002ArchivingFull PASS on all three pairings \(M0149 contract\)
     Kind: impl
     Parent: M0149-0018
     Path\-to\-TAP: after 0018b, 002 checks:

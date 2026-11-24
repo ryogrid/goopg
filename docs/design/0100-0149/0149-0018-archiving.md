@@ -1,9 +1,8 @@
 # 0149-0018 — Port recovery/t/002\_archiving.pl
 
-Status: in progress. `TestPort_Recovery002ArchivingFull` \(`internal/testport/recovery_002_archiving_test.go`\)
-ports 002 in three pairings: all\-goopg; a PG 18.3 primary with goopg standbys; a goopg primary with PG 18.3
-standbys. The goopg\-primary/PG\-standbys pairing passes and always runs. The two pairings with goopg standbys run
-only with `GOOPG_TAP_002=1`.
+Status: done \(2026\-11\-25\). `TestPort_Recovery002ArchivingFull`
+\(`internal/testport/recovery_002_archiving_test.go`\) ports 002 in three pairings, all passing and ungated: all\-goopg;
+a PG 18.3 primary with goopg standbys; a goopg primary with PG 18.3 standbys.
 
 Harness: `tapnode` gains `EnableArchiving`, `EnableRestoring` and `ArchiveDir`, mirroring Cluster.pm's
 enable\_archiving and enable\_restoring \(archive\_mode = on with a `cp` archive\_command; a `cp` restore\_command plus
@@ -68,8 +67,30 @@ Not done:
   - timeline following from the archive \(history files, recovery\_target\_timeline = latest\);
   - restore\_command for missing segments at crash recovery on a standby.
 
+## Slice 3 \(0018c, landed\): recovery commands and the promotion timeline
+
+- Working directory: archive\_cleanup\_command \(the restartpoint's last step\) and recovery\_end\_command \(end of
+  archive recovery\) run in the data directory, as from PG's postmaster after ChangeToDataDir
+  \(`ExecuteRecoveryCommandIn`\). A relative path in the command therefore names a file there.
+- Warning text: a failure logs PG's WARNING, `<name> "<command>": <wait_result_to_str>`.
+- Restore log: every successful restore logs "restored log file "<file>" from archive" at LOG, like
+  RestoreArchivedFile.
+- New timeline at promotion: PG takes findNewestTimeLine\(recoveryTargetTLI\) \+ 1. Under archive recovery,
+  existsTimeLineHistory restores each `<tli>.history` from the archive into RECOVERYHISTORY, falling back to pg\_wal.
+  - `xlog.FindNewestTimelineArchive` does the same, and a standby with restore\_command uses it at promotion.
+  - Before this, a standby fed only from the archive did not see that a sibling had already promoted onto timeline
+    2, and reused it. Now it takes 3.
+- Promotion removes RECOVERYXLOG and RECOVERYHISTORY \(exitArchiveRecovery\).
+- Harness: `Node.LogSize` / `LogFrom` read a node's log from an offset. A goopg node's structured lines \(slog's
+  `level=WARN msg="…"` and the log package's `… WARN …`\) render in PG's stderr form `WARNING:  <message>`, so
+  upstream patterns such as `qr/WARNING:.*recovery_end_command/` apply to both flavours. The message wording itself is
+  the server's.
+- Not done:
+  - the archive\-recovery \(recovery.signal\) promotion still takes its new timeline from the archive scan
+    `RunArchiveRecovery` makes, not from a probe at the end;
+  - restored history files are not kept in pg\_wal for cascading standbys \(restoreTimeLineHistoryFiles\) on the
+    standby path.
+
 ## Open \(children in fix\_plan\)
 
-- 0018c: archive\_cleanup\_command at a standby restartpoint, recovery\_end\_command at promotion \(including the
-  failure WARNING\), recovery commands running in the data directory, and the history\-file restore at promotion
-  with RECOVERYHISTORY / RECOVERYXLOG cleanup.
+None.

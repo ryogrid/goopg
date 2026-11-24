@@ -23,6 +23,7 @@ package xlog
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -256,4 +257,35 @@ func LatestLocalTimeline(walDir string, base uint32) uint32 {
 		}
 	}
 	return base
+}
+
+// FindNewestTimelineArchive is findNewestTimeLine under archive recovery
+// (timeline.c): starting after start, a timeline exists when its history
+// file can be restored from the archive into RECOVERYHISTORY
+// (existsTimeLineHistory → RestoreArchivedFile), or — restore_command unset
+// or the archive without it — when pg_wal has it. The newest one found is
+// returned; a promotion takes the next. Without the archive probe a
+// standby fed only from the archive could not see that a sibling had
+// already promoted onto start+1 and reused it (M0149-0018c).
+func FindNewestTimelineArchive(ctx context.Context, walDir, restoreCommand, lastRestartPointFname string, start uint32) uint32 {
+	newest := start
+	for probe := start + 1; probe != 0; probe++ {
+		name := TimelineHistoryFileName(probe)
+		exists := false
+		if restoreCommand != "" {
+			if err := RestoreArchivedFileTemp(ctx, restoreCommand, walDir, name, RecoveryHistoryName, lastRestartPointFname); err == nil {
+				exists = true
+			}
+		}
+		if !exists {
+			if _, err := os.Stat(filepath.Join(walDir, name)); err == nil {
+				exists = true
+			}
+		}
+		if !exists {
+			break
+		}
+		newest = probe
+	}
+	return newest
 }

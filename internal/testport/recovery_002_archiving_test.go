@@ -19,15 +19,11 @@ import (
 // fails with a WARNING. It runs in three pairings: all-goopg, a PG 18.3
 // primary with goopg standbys, and a goopg primary with PG 18.3 standbys.
 //
-// The goopg-primary/PG-standbys pairing passes (goopg's WAL archiver,
-// M0149-0018a) and always runs; the two pairings with goopg standbys restore
-// from the archive (M0149-0018b) but still miss the recovery-command and
-// promotion checks (M0149-0018c), and run only with GOOPG_TAP_002=1.
+// All three pairings pass (M0149-0018).
 func TestPort_Recovery002ArchivingFull(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping recovery TAP port in short mode")
 	}
-	gated := os.Getenv("GOOPG_TAP_002") != ""
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)
 	goopg := func(t *testing.T, name string) *tapnode.Node { return tapnode.NewGoopg(t, repo, name) }
@@ -49,9 +45,6 @@ func TestPort_Recovery002ArchivingFull(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.name != "goopg-primary-pg18-standbys" && !gated {
-				t.Skip("goopg-standby pairing not passing yet (M0149-0018c); set GOOPG_TAP_002=1 to run")
-			}
 			runArchiving(t, tc.primary(t, "primary"), func(name, bkp string, root *tapnode.Node) *tapnode.Node {
 				return tc.standby(t, name, root, bkp)
 			})
@@ -165,20 +158,14 @@ func runArchiving(t *testing.T, nodePrimary *tapnode.Node, standbyFromBackup fun
 	nodeStandby2.Start()
 
 	// Save the log location, to see the failure of recovery_end_command.
-	logLocation := int64(0)
-	if fi, err := os.Stat(nodeStandby2.LogPath()); err == nil {
-		logLocation = fi.Size()
-	}
+	logLocation := nodeStandby2.LogSize()
 
 	// Now promote standby2, and check that temporary files specifically
 	// generated during archive recovery are removed by the end of recovery.
 	nodeStandby2.Promote()
 
 	// Check the logs of the standby to see that the commands have failed.
-	logContents := ""
-	if b, err := os.ReadFile(nodeStandby2.LogPath()); err == nil && int64(len(b)) >= logLocation {
-		logContents = string(b[logLocation:])
-	}
+	logContents := nodeStandby2.LogFrom(logLocation)
 	standby2Data := nodeStandby2.DataDir()
 	ok(regexp.MustCompile(`(?s)restored log file "00000002.history" from archive`).MatchString(logContents),
 		"00000002.history retrieved from the archives")
