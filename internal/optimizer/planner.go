@@ -17966,6 +17966,9 @@ func exprType(e Expr) catalog.Type {
 			// xlogfuncs.c; pg_proc.dat oids 2849/2852/3330: prorettype pg_lsn.
 			// M0122-0009 S7.
 			return catalog.Type{Name: "pg_lsn"}
+		case "pg_walfile_name":
+			// pg_walfile_name(pg_lsn) -> text (pg_proc.dat oid 2851). M0149-0017.
+			return catalog.Type{Name: "text"}
 		case "crc32", "crc32c", "bit_count":
 			// crc32/crc32c(bytea) -> int8 (pg_proc.dat:7954/7957); bit_count(bytea|bit)
 			// -> int8 (pg_proc.dat:1534/4201). Untyped these fall through to TypeOID 25,

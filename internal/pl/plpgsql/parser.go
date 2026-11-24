@@ -861,7 +861,7 @@ func (p *bodyParser) scanExprTo(ctx string, stop func(parser.Token) bool) (parse
 	if exprSrc == "" {
 		return nil, p.errAt(exprStart, "%s requires a non-empty expression", ctx)
 	}
-	expr, err := parser.ParseExpr(exprSrc)
+	expr, err := parsePLExpr(exprSrc)
 	if err != nil {
 		return nil, p.errAt(exprStart, "%s: %v", ctx, err)
 	}
@@ -1527,6 +1527,24 @@ func (p *bodyParser) parseTypeRef() (parser.ColumnType, error) {
 	return typ, nil
 }
 
+// parsePLExpr parses a PL/pgSQL expression. PL/pgSQL evaluates every
+// expression as the query `SELECT <expr>` (pl_exec.c exec_eval_expr; the
+// expression is any text that completes a SELECT target list), so
+// `setting::int FROM pg_settings WHERE name = 'block_size'` is a valid
+// initializer or IF condition. A source that is not a plain expression is
+// therefore read as the scalar subquery `(SELECT <expr>)`: one row gives its
+// value, zero rows NULL. M0149-0017 (026_overwrite_contrecord's DO block).
+func parsePLExpr(src string) (parser.Expr, error) {
+	expr, err := parser.ParseExpr(src)
+	if err == nil {
+		return expr, nil
+	}
+	if sub, serr := parser.ParseExpr("(SELECT " + src + ")"); serr == nil {
+		return sub, nil
+	}
+	return nil, err
+}
+
 // scanExprToSemicolon scans tokens up to (but not including) the
 // next top-level `;`, slices the original source over those
 // bytes, and feeds the slice through `parser.ParseExpr` so the
@@ -1551,7 +1569,7 @@ func (p *bodyParser) scanExprToSemicolon(ctx string) (parser.Expr, error) {
 	if exprSrc == "" {
 		return nil, p.errAt(exprStart, "%s requires a non-empty expression", ctx)
 	}
-	expr, err := parser.ParseExpr(exprSrc)
+	expr, err := parsePLExpr(exprSrc)
 	if err != nil {
 		return nil, p.errAt(exprStart, "%s: %v", ctx, err)
 	}

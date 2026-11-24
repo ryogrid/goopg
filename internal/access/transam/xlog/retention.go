@@ -90,6 +90,12 @@ type SlotAwareRetainer struct {
 	// segments are not removed before they are summarized.
 	KeepLSNFn func() uint64
 
+	// KeepMB mirrors `wal_keep_size` (MB): at least this much WAL behind
+	// the checkpoint record's segment stays in pg_wal for standbys
+	// (KeepLogSeg's "keep at least wal_keep_size" clamp, xlog.c). <= 0
+	// disables. M0149-0017.
+	KeepMB int64
+
 	// CompletionTarget mirrors checkpoint_completion_target, one of the
 	// XLOGfileslop distance-formula inputs. Only consulted when
 	// CheckPointDistanceEstimateFn is non-nil.
@@ -158,6 +164,8 @@ func (r *SlotAwareRetainer) Retain(checkpointLSN uint64) error {
 		}
 	}
 
+	keepLSN = r.applyWalKeepSize(checkpointLSN, keepLSN)
+
 	// Step 4: retire obsolete segments (unlink, or recycle-by-rename up to
 	// a spares count sized by min_wal_size/max_wal_size and — when a
 	// distance estimate is wired — the same XLOGfileslop-style formula
@@ -185,6 +193,36 @@ func (r *SlotAwareRetainer) Retain(checkpointLSN uint64) error {
 		)
 	}
 	return nil
+}
+
+// applyWalKeepSize is KeepLogSeg's wal_keep_size clamp: with currSegNo the
+// segment of recptr (the checkpoint record) and keep_segs = wal_keep_size
+// in segments (XLogMBVarToSegs), the oldest kept segment is pulled back to
+// currSegNo - keep_segs (but not below segment 1) when fewer than keep_segs
+// segments would otherwise remain.
+func (r *SlotAwareRetainer) applyWalKeepSize(recptr, keepLSN uint64) uint64 {
+	if r.KeepMB <= 0 || r.Writer == nil {
+		return keepLSN
+	}
+	segSize := uint64(r.Writer.SegmentSize())
+	if segSize == 0 {
+		return keepLSN
+	}
+	keepSegs := uint64(r.KeepMB) / (segSize / (1024 * 1024))
+	currSeg := recptr / segSize
+	segno := keepLSN / segSize
+	if currSeg-segno >= keepSegs {
+		return keepLSN
+	}
+	if currSeg <= keepSegs {
+		segno = 1
+	} else {
+		segno = currSeg - keepSegs
+	}
+	if lsn := segno * segSize; lsn < keepLSN {
+		return lsn
+	}
+	return keepLSN
 }
 
 // warnLaggingSlots emits an INFO event for any slot whose lag has

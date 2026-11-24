@@ -18176,6 +18176,16 @@ case "pg_char_to_encoding":
 		return evalPgWalReplayPause(x.Name, ctx)
 	case "pg_current_wal_lsn", "pg_current_wal_insert_lsn", "pg_current_wal_flush_lsn":
 		return evalPgCurrentWALLSN(name, ctx)
+	case "pg_walfile_name":
+		// pg_walfile_name(pg_lsn) → text (xlogfuncs.c). M0149-0017.
+		if len(x.Args) != 1 {
+			return Datum{}, &ExecError{Code: "42883", Message: "function pg_walfile_name does not exist"}
+		}
+		d, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || d.IsNull() {
+			return NullDatum, err
+		}
+		return evalPgWalfileName(d, ctx)
 	case "pg_last_wal_receive_lsn", "pg_last_wal_replay_lsn":
 		return evalPgLastWALLSN(name, ctx), nil
 	case "pg_promote":

@@ -930,6 +930,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				retainer.CompletionTarget = f
 			}
 		}
+		if v, ok := cfg.Registry.Get("wal_keep_size"); ok {
+			if mb, err := strconv.Atoi(v.Display()); err == nil && mb > 0 {
+				retainer.KeepMB = int64(mb)
+			}
+		}
 		if v, ok := cfg.Registry.Get("max_slot_wal_keep_size"); ok {
 			// Stored in MB (matching upstream guc_tables.c). -1
 			// is the unlimited sentinel.

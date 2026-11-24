@@ -28,6 +28,21 @@ func (n *Node) Backup(name string) string {
 	return dst
 }
 
+// BackupFsCold is Cluster.pm's backup_fs_cold(name): a file-level copy of
+// the stopped node's data directory, without postmaster.pid and log/, into a
+// fresh directory whose path it returns. M0149-0017.
+func (n *Node) BackupFsCold(name string) string {
+	n.t.Helper()
+	dst := filepath.Join(n.t.TempDir(), "backup-"+name)
+	if out, err := exec.Command("cp", "-a", n.DataDir(), dst).CombinedOutput(); err != nil {
+		n.t.Fatalf("tapnode %s: backup_fs_cold %s: %v\n%s", n.name, name, err, out)
+	}
+	for _, skip := range []string{"postmaster.pid", "log"} {
+		_ = os.RemoveAll(filepath.Join(dst, skip))
+	}
+	return dst
+}
+
 // connstr is Cluster.pm's connstr: the libpq string a standby's
 // primary_conninfo points at.
 func (n *Node) connstr() string {

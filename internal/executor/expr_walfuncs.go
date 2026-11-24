@@ -1,5 +1,7 @@
 package executor
 
+import "fmt"
+
 // WAL position functions (xlogfuncs.c): pg_current_wal_lsn reports
 // GetXLogWriteRecPtr (written to the kernel), pg_current_wal_insert_lsn
 // GetXLogInsertRecPtr (the end of the last inserted record) and
@@ -110,4 +112,41 @@ func evalPgWalReplayPause(name string, ctx *Context) (Datum, error) {
 		return NewStringDatum(state), nil
 	}
 	return NewStringDatum(""), nil
+}
+
+// evalPgWalfileName is xlogfuncs.c pg_walfile_name: the name of the WAL
+// file holding lsn (XLByteToSeg, as PG 18 computes it, so an LSN exactly at
+// a segment boundary names the segment that starts there) on the current
+// insert timeline.
+// Like the other WAL control functions it refuses to run during recovery.
+// M0149-0017 (026_overwrite_contrecord).
+func evalPgWalfileName(d Datum, ctx *Context) (Datum, error) {
+	if ctx.IsStandby {
+		return Datum{}, &ExecError{
+			Code:    "55000",
+			Message: "recovery is in progress",
+			Hint:    "pg_walfile_name() cannot be executed during recovery.",
+		}
+	}
+	lsn, err := parsePgLSN(d.StringValue())
+	if err != nil {
+		return Datum{}, &ExecError{Code: "22P02", Message: err.Error()}
+	}
+	segSize := uint64(16 * 1024 * 1024)
+	tli := uint32(1)
+	if w := ctx.WAL; w != nil {
+		if s := w.SegmentSize(); s > 0 {
+			segSize = uint64(s)
+		}
+		if t := w.TimelineID(); t != 0 {
+			tli = t
+		}
+	}
+	return NewStringDatum(xlogFileName(tli, lsn/segSize, segSize)), nil
+}
+
+// xlogFileName is xlog_internal.h XLogFileName.
+func xlogFileName(tli uint32, segno, segSize uint64) string {
+	perID := uint64(0x100000000) / segSize
+	return fmt.Sprintf("%08X%08X%08X", tli, uint32(segno/perID), uint32(segno%perID))
 }

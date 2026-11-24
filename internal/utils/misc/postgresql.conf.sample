@@ -193,6 +193,8 @@
                                         # (change requires restart)
 #wal_sender_timeout = 60s               # 0-1073741824 ms; 0 disables timeout
                                         # (SIGHUP to apply)
+#wal_keep_size = 0                      # in megabytes; 0 disables
+                                        # (SIGHUP to apply)
 #max_slot_wal_keep_size = -1            # -1 to 2147483647 MB; -1 = no limit
                                         # (SIGHUP to apply)
 #synchronous_standby_names = ''         # standby selection grammar;

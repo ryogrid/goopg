@@ -1709,6 +1709,14 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextUserset, // PGC_USERSET (guc_tables.c); the walsender has no timeout yet
 		Scope:   ScopeServer,
 	}))
+	// wal_keep_size: the minimum past WAL kept in pg_wal for standbys
+	// (xlog.c KeepLogSeg). PGC_SIGHUP, MB, 0 disables. M0149-0017.
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_keep_size", Type: TypeInt, Unit: UnitMB, BootVal: "0",
+		MinVal: 0, MaxVal: math.MaxInt32,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "max_slot_wal_keep_size", Type: TypeInt, Unit: UnitMB, BootVal: "-1",
 		MinVal: -1, MaxVal: 2147483647,

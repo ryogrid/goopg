@@ -16086,6 +16086,31 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/recovery/t/026_overwrite_contrecord.pl` — segments ending in an incomplete record propagated to a replica.
   Likely prerequisites \(verify at start\): `XLOG_OVERWRITE_CONTRECORD` + `XLP_FIRST_IS_OVERWRITE_CONTRECORD` emission after torn-record recovery \(see `e2e_pg_torn_contrecord_test.go`\), `backup_fs_cold`.
+  - 2026\-11\-24 slice 1 \(port written, gated by GOOPG\_TAP\_026\). Design docs/design/0100\-0149/0149\-0017\-overwrite\-contrecord.md.
+    - Path\-to\-TAP, each a failing step of the port, fixed:
+      - 026 ← unknown wal\_keep\_size \(goopg refused to start\): registered, with KeepLogSeg retention;
+      - 026 goopg primary ← DO block "declaration initializer: syntax error": PL/pgSQL SELECT\-shaped expressions;
+      - 026 goopg primary ← "function pg\_walfile\_name does not exist": implemented.
+    Movement: yes — tap 026 all\-goopg: start refused → only the "successfully skipped missing contrecord" log assertion fails \(data replays\)
+  - [ ] **M0149-0017a — goopg crash recovery writes XLOG\_OVERWRITE\_CONTRECORD at the missing continuation**
+    Kind: impl
+    Parent: M0149-0017
+    Path\-to\-TAP: 026 goopg\-primary/PG\-standby ← PG standby asks for 0/2000000, goopg's walsender cannot open
+    segment 2: goopg resumed at segment 3 \(detectWritePos drops everything below a segment hole\).
+    Upstream: xlogreader.c assembled\-record error \(abortedRecPtr, missingContrecPtr\); xlog.c StartupXLOG EndOfLog =
+    missingContrecPtr; CreateOverwriteContrecordRecord.
+  - [ ] **M0149-0017b — goopg standby skips an overwritten contrecord and logs it**
+    Kind: impl
+    Parent: M0149-0017
+    Path\-to\-TAP: 026 PG\-primary/goopg\-standby ← standby never catches up past PG's overwrite record; 026 all\-goopg ←
+    missing "successfully skipped missing contrecord at" log line.
+    Upstream: xlogreader.c XLP\_FIRST\_IS\_OVERWRITE\_CONTRECORD restart \(overwrittenRecPtr\); xlogrecovery.c
+    xlogrecovery\_redo verify \+ LOG.
+  - [ ] **M0149-0017c — RAISE LOG reaches the client as NOTICE**
+    Kind: impl
+    Parent: M0149-0017
+    Found while porting 026 \(not a 026 blocker: safe\_psql ignores stderr\). PG sends LOG to the server log only
+    \(below client\_min\_messages=notice\); goopg prints "NOTICE:  exiting after …" to psql.
 - [ ] **M0149-0077 — re-port recovery/t/001_stream_rep.pl to the M0149 contract**
   Kind: impl
   Parent: none
