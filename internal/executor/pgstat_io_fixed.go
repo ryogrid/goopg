@@ -163,3 +163,22 @@ func RecordStartupWALReads(redoLSN, endLSN uint64) {
 	pages := int64(endLSN/xlogBlcksz-redoLSN/xlogBlcksz) + 1
 	countIO(ioBktStartup, ioObjWal, ioCtxNormal, ioOpRead, pages, pages*xlogBlcksz)
 }
+
+// CountWALSenderRead is the walsender's WALRead accounting
+// (xlogreader.c WALRead → pgstat_count_io_op_time(IOOBJECT_WAL,
+// IOCONTEXT_NORMAL, IOOP_READ, …, 1, readbytes)): one read of n bytes of
+// WAL sent to a standby. M0149-0077d.
+func CountWALSenderRead(n int) {
+	if n > 0 {
+		countIO(ioBktWalSender, ioObjWal, ioCtxNormal, ioOpRead, 1, int64(n))
+	}
+}
+
+// CountWALReceiverWrite is XLogWalRcvWrite's accounting
+// (pgstat_count_io_op_time(IOOBJECT_WAL, IOCONTEXT_NORMAL, IOOP_WRITE, …,
+// 1, byteswritten)): one write of n bytes of received WAL. M0149-0077d.
+func CountWALReceiverWrite(n int) {
+	if n > 0 {
+		countIO(ioBktWalReceiver, ioObjWal, ioCtxNormal, ioOpWrite, 1, int64(n))
+	}
+}

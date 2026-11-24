@@ -41,6 +41,7 @@ import (
 
 	"github.com/goopg/goopg/internal/backup"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/libpq"
 	"github.com/goopg/goopg/internal/utils/errcodes"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
@@ -760,6 +761,8 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 				recErrCh <- err
 				return
 			}
+			// WALRead's pg_stat_io accounting (IOOP_READ on wal). M0149-0077d.
+			executor.CountWALSenderRead(int(chunk.EndLSN - chunk.StartLSN))
 			select {
 			case chunkCh <- chunk:
 			case <-streamCtx.Done():

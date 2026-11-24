@@ -42,6 +42,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/libpq"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
@@ -731,6 +732,8 @@ func (r *WalReceiver) handleCopyData(payload []byte) error {
 		if err != nil {
 			return fmt.Errorf("walreceiver: append local WAL: %w", err)
 		}
+		// XLogWalRcvWrite's pg_stat_io accounting (IOOP_WRITE on wal). M0149-0077d.
+		executor.CountWALReceiverWrite(len(data))
 		r.mu.Lock()
 		if end > r.applyLSN {
 			r.applyLSN = end

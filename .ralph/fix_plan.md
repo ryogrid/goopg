@@ -16205,11 +16205,22 @@ verify each at HEAD when the task starts.
     Kind: impl
     Parent: M0149-0077
     Path\-to\-TAP: 001 target\_session\_attrs "connect to node … " compares SHOW port with the node's port.
-  - [ ] **M0149-0077d — the walsender records no pg\_stat\_io WAL reads**
+  - [x] **M0149-0077d — the walsender records no pg\_stat\_io WAL reads** \(2026\-11\-24\)
+    - The walsender counts each WAL chunk it reads for a standby as one walsender/wal/normal read with its bytes
+      \(WALRead's pgstat\_count\_io\_op\_time\). The walreceiver counts each received chunk it writes as one
+      walreceiver/wal/normal write \(XLogWalRcvWrite\). executor.CountWALSenderRead / CountWALReceiverWrite feed the
+      cumulative pg\_stat\_io store.
+    Movement: yes — tap 001 all\-goopg: fatal walsender pg\_stat\_io timeout → passes; the run now stops at the slot xmin wait \(0077g\)
     Kind: impl
     Parent: M0149-0077
     Path\-to\-TAP: 001 waits for `sum(reads) > 0 FROM pg_stat_io WHERE backend_type = 'walsender' AND object = 'wal'`
     \(fatal timeout\); later the walreceiver `writes` check.
+  - [ ] **M0149-0077g — pg\_replication\_slots.xmin is 0 instead of NULL**
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 get\_slot\_xmins waits for `xmin IS NULL AND catalog_xmin IS NULL` on the primary's physical
+    slot \(fatal timeout\): goopg shows `standby_1|t|0||…` — xmin 0, catalog\_xmin NULL. PG prints NULL for
+    InvalidTransactionId \(pg\_get\_replication\_slots: `nulls[i] = true` when !TransactionIdIsValid\).
   - [ ] **M0149-0077e — PG 18.3 standby of a goopg primary cannot read an unlogged sequence**
     Kind: impl
     Parent: M0149-0077
@@ -16234,6 +16245,12 @@ verify each at HEAD when the task starts.
   Parent: none \(found while fixing M0149-0077c; not a 001 requirement\)
   `SELECT … FROM pg_settings WHERE name IN \('port', 'wal\_keep\_size', 'work\_mem'\)` returns no row on goopg. PG lists
   every GUC with setting and source \(`port|5545|command line`\). pg\_settings should come from the GUC registry.
+- [ ] **M0149-0086 — pg\_basebackup's temporary slot survives the backup**
+  Kind: impl
+  Parent: none \(found while fixing M0149-0077d; not a 001 assertion\)
+  After `pg_basebackup` against a goopg primary, pg\_replication\_slots still lists `pg_basebackup_<pid>`
+  \(inactive\). PG creates it TEMPORARY \(CREATE\_REPLICATION\_SLOT … TEMPORARY\) and drops it when the walsender
+  session ends \(ReplicationSlotCleanup\).
 - [ ] **M0149-0018 — port recovery/t/002_archiving.pl**
   Kind: impl
   Parent: none
