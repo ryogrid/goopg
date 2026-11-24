@@ -94,8 +94,31 @@ second backup is taken from the standby while the primary is down. The test then
   because no local DDL runs during recovery, so the replayed heap is the only source of truth. The rebuild covers
   CREATE, ALTER \(ENABLE, RENAME, OWNER\) and DROP.
 
+## Slice 8 \(0077i, landed\): hot\_standby\_feedback
+
+- GUC `hot_standby_feedback` \(PGC\_SIGHUP, off\). The walreceiver reads it with each status tick and sends
+  XLogWalRcvSendHSFeedback's 'h' message: `'h' | sendTime | xmin | epoch | catalog_xmin | epoch`, epochs 0 because
+  goopg xids are 32\-bit. xmin is GetReplicationHorizons: `transam.Manager.ReplicationHorizons` returns the data
+  horizon \(snapshots, nextXID, physical slots' xmin\) and the logical slots' catalog\_xmin separately. After the GUC
+  is turned off, one message with both values invalid clears the upstream's copy; nothing is sent after that
+  \(primary\_has\_standby\_xmin\).
+- The walsender's ProcessStandbyHSFeedbackMessage for a slot: `Slots.SetPhysicalXmins` replaces the slot's xmin and
+  catalog\_xmin \(PhysicalReplicationSlotNewXmin\) and persists them in slotdata.xmin. pg\_replication\_slots shows
+  them. `Slots.MinXmin` is installed as the transaction manager's replication\-slot xmin source, so it floors
+  OldestXmin like PG's replication\_slot\_xmin. A cascading standby's own feedback therefore carries its
+  downstream slot's xmin.
+- Walreceiver restart on reload: primary\_conninfo and primary\_slot\_name are re\-read per connection, and a
+  watcher ends the current connection when a reload changes either \(StartupRereadConfig, pendingWalRcvRestart\).
+- Not done:
+  - feedback without a slot does not hold the horizon \(PG sets the walsender's MyProc\-\>xmin, shown as
+    pg\_stat\_replication.backend\_xmin\);
+  - TransactionIdInRecentPast is not checked;
+  - the slot file is written on every change instead of being marked dirty for the next checkpoint;
+  - a reload does not trigger immediate feedback \(the next status tick sends it\).
+
 ## Open \(children in fix\_plan\)
 
-- 0077i: hot\_standby\_feedback is missing \(GUC, feedback messages, physical\-slot xmin\).
+- 0077j: pg\_replication\_slot\_advance, its persistence, and segment recycling after the advance.
+- 0077k: pg\_backup\_start / pg\_backup\_stop and BASE\_BACKUP cancel.
 - 0077e: on a PG 18.3 standby of a goopg primary, reading an unlogged sequence fails with "could not open file".
 - 0077f: a goopg standby does not serve a cascading standby \(PG\-primary pairing\).

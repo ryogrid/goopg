@@ -2315,6 +2315,9 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// honour a logical decoder's catalog-tuple retention. See
 	// docs/design/0008-0001-logical-decoding-pipeline.md.
 	txnMgr.SetCatalogXminSource(slotsReg.MinCatalogXmin)
+	// Physical slots' hot_standby_feedback xmin floors every xid horizon
+	// (PG's replication_slot_xmin). M0149-0077i.
+	txnMgr.SetReplicationSlotXminSource(slotsReg.MinXmin)
 
 	// Replication monitoring registries. Senders are registered by
 	// each walsender goroutine on entry; the (single) Receivers

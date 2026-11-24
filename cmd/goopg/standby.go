@@ -210,8 +210,17 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 		Registry:     registry,
 		Logger:       logger,
 		ApplyLSNFunc: standbyApplyLSNFunc(replayer),
-		SystemID:     systemID,
-		WALDir:       rcvWALDir,
+		// M0149-0077i: hot_standby_feedback (SIGHUP, read per message) and
+		// GetReplicationHorizons for the 'h' message.
+		HSFeedbackFunc: func() (bool, uint32, uint32) {
+			if rt.TxnMgr == nil {
+				return false, 0, 0
+			}
+			xmin, catalogXmin := rt.TxnMgr.ReplicationHorizons()
+			return boolGUC(registry, "hot_standby_feedback", false), uint32(xmin), uint32(catalogXmin)
+		},
+		SystemID: systemID,
+		WALDir:   rcvWALDir,
 		OnEndOfTimeline: func(eot *replication.EndOfTimeline) {
 			if rcvWALDir == "" {
 				return

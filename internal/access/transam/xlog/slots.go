@@ -75,6 +75,13 @@ type Slot struct {
 	// pg_replication_slots.catalog_xmin.
 	CatalogXmin uint64 `json:"catalog_xmin,omitempty"`
 
+	// Xmin is a physical slot's data xmin: the oldest xid the standby
+	// streaming from it still needs, set from its hot_standby_feedback
+	// messages (PhysicalReplicationSlotNewXmin). Zero is
+	// InvalidTransactionId. Maps to pg_replication_slots.xmin and holds the
+	// vacuum horizon back, as PG's replication_slot_xmin does. M0149-0077i.
+	Xmin uint64 `json:"xmin,omitempty"`
+
 	// DatabaseOID is the PG Oid of the database a logical slot is
 	// anchored in (0 = InvalidOid for physical slots). Stored in the
 	// binary state file but not in the JSON fallback format.
@@ -346,6 +353,49 @@ func (s *Slots) MinCatalogXmin() uint64 {
 		}
 	}
 	return min
+}
+
+// MinXmin returns the oldest data xmin any valid slot holds (0 = none):
+// PG's ReplicationSlotsComputeRequiredXmin over effective_xmin, which
+// ProcArraySetReplicationSlotXmin folds into every xid horizon.
+func (s *Slots) MinXmin() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var min uint64
+	for _, slot := range s.m {
+		if slot.Invalidated || slot.Xmin == 0 {
+			continue
+		}
+		if min == 0 || slot.Xmin < min {
+			min = slot.Xmin
+		}
+	}
+	return min
+}
+
+// SetPhysicalXmins applies a standby's hot_standby_feedback to the physical
+// slot it streams from: PhysicalReplicationSlotNewXmin replaces both
+// data.xmin and data.catalog_xmin with the reported values (0 clears them,
+// which is what a standby sends after hot_standby_feedback is turned off).
+// Unlike the logical catalog_xmin, the values may move backward — the
+// standby reports its current horizon. The state file is rewritten only
+// when a value changes. Returns ErrSlotNotFound for an unknown slot.
+func (s *Slots) SetPhysicalXmins(name string, xmin, catalogXmin uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	slot, ok := s.m[name]
+	if !ok {
+		return ErrSlotNotFound
+	}
+	if slot.Kind != SlotPhysical {
+		return ErrSlotKindMismatch
+	}
+	if slot.Xmin == xmin && slot.CatalogXmin == catalogXmin {
+		return nil
+	}
+	slot.Xmin = xmin
+	slot.CatalogXmin = catalogXmin
+	return s.writeSlotLocked(slot)
 }
 
 // AdvanceCatalogXmin pins (or advances) the named slot's catalog_xmin to

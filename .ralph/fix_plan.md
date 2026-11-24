@@ -16247,12 +16247,35 @@ verify each at HEAD when the task starts.
     Parent: M0149-0077
     Path\-to\-TAP: 001 all\-goopg "Name of login trigger": `SELECT evtname FROM pg_event_trigger WHERE evtevent='login'`
     returned "" on the never\-restarted standby\_2. Non\-fatal assertion.
-  - [ ] **M0149-0077i — hot\_standby\_feedback is not implemented**
+  - [x] **M0149-0077i — hot\_standby\_feedback is not implemented** \(2026\-11\-24\)
+    - hot\_standby\_feedback GUC \(SIGHUP, off\). The walreceiver sends PG's 'h' message after each status update
+      with the standby's GetReplicationHorizons xmin \(transam.Manager.ReplicationHorizons\), and one invalid
+      message after the GUC is turned off \(primary\_has\_standby\_xmin\).
+    - The walsender sets the physical slot's xmin and catalog\_xmin from it \(Slots.SetPhysicalXmins, persisted in
+      slotdata.xmin\). Slots.MinXmin floors OldestXmin, as replication\_slot\_xmin does, so a cascading standby
+      forwards its downstream slot's xmin.
+    - Second link found on the way: standby\_2 changes primary\_slot\_name by reload only. The walreceiver read it once
+      at start, so the cascaded slot stayed inactive. The launcher now re\-reads primary\_conninfo and
+      primary\_slot\_name per connection and restarts the connection when a reload changes either
+      \(StartupRereadConfig pendingWalRcvRestart\). This also passes 001's "change primary\_conninfo without restart".
+    Movement: yes — tap 001 all\-goopg: fatal ALTER SYSTEM SET hot\_standby\_feedback → all 12 hs\_feedback slot xmin assertions, the primary\_conninfo reload and the walreceiver pg\_stat\_io writes check pass; next not ok is pg\_replication\_slot\_advance \(0077j\)
     Kind: impl
     Parent: M0149-0077
     Path\-to\-TAP: 001 all\-goopg `ALTER SYSTEM SET hot_standby_feedback = on` on standby\_1 fails "unrecognized
     configuration parameter" \(fatal\). Then get\_slot\_xmins needs a non\-null xmin on the primary's slot and on
     standby\_1's slot: the GUC, walreceiver feedback messages and slot xmin tracking \(PhysicalReplicationSlotNewXmin\).
+  - [ ] **M0149-0077j — pg\_replication\_slot\_advance does not exist**
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 all\-goopg "slot advancing with physical slot": `SELECT pg_replication_slot_advance('phys_slot', lsn)`
+    fails "function does not exist". Then the advance must persist across a clean restart, and the shutdown checkpoint
+    must recycle the segment the slot no longer holds \("WAL segment … recycled after physical slot advancing"\).
+  - [ ] **M0149-0077k — pg\_backup\_start / pg\_backup\_stop do not exist; BASE\_BACKUP cancel**
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 all\-goopg: BASE\_BACKUP in a replication session after `SELECT pg_backup_start('backup', true)`
+    must fail "a backup is already in progress in this session"; pg\_cancel\_backend on a walsender running BASE\_BACKUP
+    must end it, and pg\_backup\_stop afterwards must fail "backup is not in progress".
 
 - [ ] **M0149-0084 — read\-only transactions do not restrict DML on a primary**
   Kind: impl
@@ -16278,6 +16301,12 @@ verify each at HEAD when the task starts.
   `SELECT ctid, xmin, xmax FROM pg_event_trigger` fails with `column "xmin" does not exist`. On PG every catalog is a
   heap with system attributes. goopg renders pg\_event\_trigger from the in\-memory registry
   \(catalog.go VirtualRows\), so the heap's system columns are not reachable.
+- [ ] **M0149-0088 — data race on the server's frame reader in the START\_REPLICATION path**
+  Kind: impl
+  Parent: none \(found while fixing M0149-0077i; pre\-existing — HEAD fails 3 of 10 runs\)
+  `go test -race ./internal/replication/ -run TestReplicationStartReplicationStreamsRecord` reports a race between
+  postmaster runPostStartupLoop's FrameReader.ReadFrame and the walsender's standby\-reply reader goroutine on the
+  same bufio.Reader.
 - [ ] **M0149-0018 — port recovery/t/002_archiving.pl**
   Kind: impl
   Parent: none

@@ -223,6 +223,8 @@
                                         # (SIGHUP to apply)
 #hot_standby = on                       # allow read-only queries during recovery
                                         # (change requires restart)
+#hot_standby_feedback = off             # send info from standby to prevent query conflicts
+                                        # (SIGHUP to apply)
 #recovery_min_apply_delay = 0           # minimum delay for applying changes during recovery
                                         # (SIGHUP to apply)
 

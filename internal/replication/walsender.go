@@ -991,7 +991,32 @@ func (s *Handler) handleStandbyCopyData(slotName string, payload []byte, senderH
 			syncRep.UpdateStandbyProgress(appName, st.WriteLSN, st.FlushLSN, st.ApplyLSN)
 		}
 	}
+	if kind == libpq.ReplMsgHotStandbyFeedback {
+		hs := parsed.(*libpq.HotStandbyFeedback)
+		s.processHSFeedback(slotName, hs)
+	}
 	return nil
+}
+
+// processHSFeedback is ProcessStandbyHSFeedbackMessage for a physical slot:
+// the standby's reported xmin and catalog_xmin become the slot's
+// (PhysicalReplicationSlotNewXmin), so pg_replication_slots shows them and
+// the vacuum horizon (Slots.MinXmin via the transaction manager) keeps the
+// row versions the standby's queries still need. A value that is not a
+// normal xid (< FirstNormalTransactionId) is stored as invalid; both invalid
+// — the standby turned hot_standby_feedback off — clears the slot's
+// horizon. M0149-0077i.
+func (s *Handler) processHSFeedback(slotName string, hs *libpq.HotStandbyFeedback) {
+	if slotName == "" || s.cfg.Slots == nil {
+		return
+	}
+	normal := func(x uint32) uint64 {
+		if x < 3 { // FirstNormalTransactionId
+			return 0
+		}
+		return uint64(x)
+	}
+	_ = s.cfg.Slots.SetPhysicalXmins(slotName, normal(hs.Xmin), normal(hs.CatalogXmin))
 }
 
 // walSndDone is WalSndDone: with all WAL sent, wait (bounded, like

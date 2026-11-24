@@ -130,6 +130,11 @@ type Manager struct {
 	// (initdb.Open) via SetCatalogXminSource; nil keeps the pure in-memory v0
 	// behaviour. Read lock-free via atomic.Pointer on the hot prune path.
 	catalogXminSource atomic.Pointer[func() uint64]
+	// slotXminSource, when installed, returns the oldest data xmin any
+	// physical replication slot holds from a standby's hot_standby_feedback
+	// (0 = none). PG's procArray->replication_slot_xmin: it floors every xid
+	// horizon. M0149-0077i.
+	slotXminSource atomic.Pointer[func() uint64]
 
 	// WaitForXID uses waitMu + commitCond only.
 	waitMu     sync.Mutex
@@ -271,6 +276,54 @@ func (m *Manager) SetCatalogXminSource(fn func() uint64) {
 		return
 	}
 	m.catalogXminSource.Store(&fn)
+}
+
+// SetReplicationSlotXminSource installs (or, with nil, clears) the hook that
+// returns the oldest physical-slot xmin (wal.Slots.MinXmin). OldestXmin and
+// ReplicationHorizons both honour it, as PG's ComputeXidHorizons honours
+// replication_slot_xmin. fn must be non-blocking.
+func (m *Manager) SetReplicationSlotXminSource(fn func() uint64) {
+	if fn == nil {
+		m.slotXminSource.Store(nil)
+		return
+	}
+	m.slotXminSource.Store(&fn)
+}
+
+// ReplicationHorizons is GetReplicationHorizons: the xmin a walreceiver
+// reports in hot_standby_feedback (the oldest xid any snapshot here or any
+// standby downstream of a slot here still needs — the data horizon without
+// the logical slots' catalog_xmin) and, separately, the logical slots'
+// catalog_xmin (0 when none). M0149-0077i.
+func (m *Manager) ReplicationHorizons() (xmin, catalogXmin storage.TransactionID) {
+	xmin = m.oldestDataXmin()
+	if src := m.catalogXminSource.Load(); src != nil {
+		catalogXmin = storage.TransactionID((*src)())
+	}
+	return xmin, catalogXmin
+}
+
+// oldestDataXmin is OldestXmin without the logical-slot catalog_xmin floor.
+func (m *Manager) oldestDataXmin() storage.TransactionID {
+	result := storage.TransactionID(m.xidgen.Peek())
+	for i := range m.procArray.slots {
+		s := &m.procArray.slots[i]
+		if s.inTxn.Load() == 0 {
+			continue
+		}
+		if xid := s.xid.Load(); xid != 0 && storage.TransactionID(xid) < result {
+			result = storage.TransactionID(xid)
+		}
+		if xmin := s.xmin.Load(); xmin != ^uint64(0) && storage.TransactionID(xmin) < result {
+			result = storage.TransactionID(xmin)
+		}
+	}
+	if src := m.slotXminSource.Load(); src != nil {
+		if sx := (*src)(); sx != 0 && storage.TransactionID(sx) < result {
+			result = storage.TransactionID(sx)
+		}
+	}
+	return result
 }
 
 // xidWarnAge is how many XIDs before uint32 overflow to emit a warning.
@@ -729,20 +782,9 @@ func (m *Manager) ActiveCount() int {
 // (b) the xmin of any active txn that has taken a snapshot
 // but not yet been assigned an XID.
 func (m *Manager) OldestXmin() storage.TransactionID {
-	result := storage.TransactionID(m.xidgen.Peek())
-	for i := range m.procArray.slots {
-		s := &m.procArray.slots[i]
-		// Skip idle slots — their zero xmin value would falsely pin VACUUM at 0.
-		if s.inTxn.Load() == 0 {
-			continue
-		}
-		if xid := s.xid.Load(); xid != 0 && storage.TransactionID(xid) < result {
-			result = storage.TransactionID(xid)
-		}
-		if xmin := s.xmin.Load(); xmin != ^uint64(0) && storage.TransactionID(xmin) < result {
-			result = storage.TransactionID(xmin)
-		}
-	}
+	// Active snapshots and xids, nextXID, and the physical slots' xmin
+	// (hot_standby_feedback, M0149-0077i).
+	result := m.oldestDataXmin()
 	// Hold the horizon back to the oldest catalog_xmin pinned by any active
 	// logical replication slot (0 = nothing pinned). A logical decoder rebuilds
 	// historic catalog snapshots from tuple versions at/after this xid; letting

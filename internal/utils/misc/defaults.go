@@ -1776,6 +1776,14 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
+	// hot_standby_feedback (guc_tables.c): a standby reports its xmin
+	// upstream so the primary's VACUUM keeps the rows its queries need.
+	// M0149-0077i.
+	r.MustRegister(NewVariable(Variable{
+		Name: "hot_standby_feedback", Type: TypeBool, BootVal: "off",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "wal_receiver_status_interval", Type: TypeInt, Unit: UnitS, BootVal: "10",
 		MinVal: 0, MaxVal: 2147483,
