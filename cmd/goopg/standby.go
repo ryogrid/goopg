@@ -1096,7 +1096,7 @@ func runRecoveryEndCommand(rt *initdb.Runtime, command string, logger *slog.Logg
 	if cd == nil {
 		return fmt.Errorf("recovery_end_command: pg_control missing")
 	}
-	segSize := xlog.DefaultSegmentSize
+	segSize := xlog.WALSegmentSize()
 	if rt.WAL != nil && rt.WAL.SegmentSize() > 0 {
 		segSize = rt.WAL.SegmentSize()
 	}

@@ -65,7 +65,7 @@ func readAllUncached(walDir string, segmentSize int64) ([]Record, error) {
 		segmentSize = detectSegmentSizeAt(walDir, firstSegNo)
 	}
 	if segmentSize <= 0 {
-		segmentSize = DefaultSegmentSize
+		segmentSize = WALSegmentSize()
 	}
 
 	stream, err := readStreamFrom(walDir, segmentSize, firstSegNo)

@@ -657,7 +657,7 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 	}
 	segSize := s.cfg.WALSegmentSize
 	if segSize <= 0 {
-		segSize = xlog.DefaultSegmentSize
+		segSize = xlog.WALSegmentSize()
 	}
 
 	it, err := xlog.NewRecordIterator(s.cfg.WAL, walDir, segSize, args.StartLSN)

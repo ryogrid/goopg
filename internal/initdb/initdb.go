@@ -368,6 +368,11 @@ type Options struct {
 	// (possibly commented) assignment in place, or appends a new line.
 	ExtraGUC []GUCSetting
 
+	// WALSegSizeMB is initdb --wal-segsize: the WAL segment size in MB, a
+	// power of two between 1 and 1024. 0 means the default (16). It is
+	// recorded in pg_control's xlog_seg_size and sizes every segment.
+	WALSegSizeMB int
+
 	// AuthMethodHost and AuthMethodLocal select the authentication
 	// methods written into pg_hba.conf for host and local connections,
 	// mirroring upstream initdb's -A/--auth (sets both), --auth-host, and
@@ -898,6 +903,24 @@ func Init(opts Options) error {
 	abs, err := filepath.Abs(opts.DataDir)
 	if err != nil {
 		return fmt.Errorf("goopg init: resolve %q: %w", opts.DataDir, err)
+	}
+	// --wal-segsize (initdb.c): validated before anything is written; the
+	// bootstrap WAL, pg_control and the WAL-size GUCs follow it.
+	// The process-wide size is set either way, so an in-process caller
+	// never inherits an earlier Init's.
+	if opts.WALSegSizeMB == 0 {
+		xlog.SetWALSegmentSize(xlog.DefaultSegmentSize)
+	} else {
+		if !xlog.IsValidWalSegSize(int64(opts.WALSegSizeMB) << 20) {
+			return fmt.Errorf("argument of %s must be a power of two between 1 and 1024", "--wal-segsize")
+		}
+		xlog.SetWALSegmentSize(int64(opts.WALSegSizeMB) << 20)
+		// setup_config: min_wal_size / max_wal_size depend on the segment
+		// size (DEFAULT_MIN_WAL_SEGS, DEFAULT_MAX_WAL_SEGS).
+		opts.ExtraGUC = append([]GUCSetting{
+			{Name: "min_wal_size", Value: prettyWALSize(opts.WALSegSizeMB, 5)},
+			{Name: "max_wal_size", Value: prettyWALSize(opts.WALSegSizeMB, 64)},
+		}, opts.ExtraGUC...)
 	}
 	// Validate the sync method up front (mirrors parse_sync_method, which
 	// initdb runs during option parsing) so both the sync-only and full-init
@@ -1605,7 +1628,7 @@ func Init(opts Options) error {
 	// M0149-0007: initdb's standalone backend leaves pg_stat/pgstat.stat
 	// behind with the IO it did — the bootstrap WAL segment's write — which
 	// the first server start loads into pg_stat_io.
-	if err := executor.WriteInitStatsFile(abs, xlog.DefaultSegmentSize, time.Now()); err != nil {
+	if err := executor.WriteInitStatsFile(abs, xlog.WALSegmentSize(), time.Now()); err != nil {
 		return fmt.Errorf("goopg init: statistics file: %w", err)
 	}
 	if opts.DataChecksums {
@@ -7239,4 +7262,14 @@ func isSharedRelOID(oid uint32) bool {
 		}
 	}
 	return false
+}
+
+// prettyWALSize is initdb's pretty_wal_size: segments × segment size in MB,
+// as "<n>GB" when a whole number of GB, else "<n>MB".
+func prettyWALSize(segSizeMB, segments int) string {
+	sz := segSizeMB * segments
+	if sz%1024 == 0 {
+		return fmt.Sprintf("%dGB", sz/1024)
+	}
+	return fmt.Sprintf("%dMB", sz)
 }

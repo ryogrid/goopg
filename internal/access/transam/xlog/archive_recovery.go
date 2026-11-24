@@ -20,7 +20,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"github.com/goopg/goopg/internal/access/transam/control"
@@ -161,7 +160,7 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 		}
 		segmentSize = detectSegmentSizeAt(walDir, firstSeg)
 		if segmentSize <= 0 {
-			segmentSize = DefaultSegmentSize
+			segmentSize = WALSegmentSize()
 		}
 	}
 
@@ -560,8 +559,10 @@ func highestLocalSegment(walDir string) (int, error) {
 		if len(name) != 24 {
 			continue
 		}
-		// Extract segment number (last 8 hex digits).
-		if segNo, err := strconv.ParseUint(name[16:24], 16, 64); err == nil {
+		// The absolute segment number: log and segment-in-log, at the
+		// cluster's segment size (the low 8 hex digits alone wrap every
+		// 4 GB of WAL).
+		if _, segNo, ok := ParseXLogFileName(name, WALSegmentSize()); ok {
 			if int(segNo) > highest {
 				highest = int(segNo)
 			}

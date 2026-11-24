@@ -878,7 +878,7 @@ func (r *WalReceiver) Close() error {
 // prefix up to written is trimmed on receipt (handleCopyData).
 func streamingStartLSN(written uint64, segSize int64) uint64 {
 	if segSize <= 0 {
-		segSize = xlog.DefaultSegmentSize
+		segSize = xlog.WALSegmentSize()
 	}
 	return written - written%uint64(segSize)
 }

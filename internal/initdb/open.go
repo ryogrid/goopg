@@ -390,6 +390,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	if err := verifyInitialized(abs); err != nil {
 		return nil, err
 	}
+	// wal_segment_size comes from pg_control's xlog_seg_size
+	// (ReadControlFile), as initdb --wal-segsize recorded it (M0149-0022a).
+	if cd, cerr := control.ReadControlFile(abs); cerr == nil && cd != nil {
+		xlog.SetWALSegmentSize(int64(cd.XLogSegSize))
+	}
+	if opts.WALSegmentSize <= 0 {
+		opts.WALSegmentSize = xlog.WALSegmentSize()
+	}
 	// M0149-0001a1 S1: consolidate the postgres namespace's base/1 relation
 	// files into base/5 before any relation is opened or WAL replayed.
 	if err := migratePostgresCatalogsToBase5(abs); err != nil {

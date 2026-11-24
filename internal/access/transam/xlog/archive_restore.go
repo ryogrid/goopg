@@ -284,7 +284,7 @@ func ExecuteRecoveryCommand(command, commandName string, restartRedo uint64, res
 // <wait_result_to_str>`.
 func ExecuteRecoveryCommandIn(dir, command, commandName string, restartRedo uint64, restartTLI uint32, segSize int64) (anySignal bool, err error) {
 	if segSize <= 0 {
-		segSize = DefaultSegmentSize
+		segSize = WALSegmentSize()
 	}
 	fname := XLogFileName(restartTLI, restartRedo/uint64(segSize), segSize)
 	cmd, err := ReplacePercentPlaceholders(command, commandName, map[byte]string{'r': fname})

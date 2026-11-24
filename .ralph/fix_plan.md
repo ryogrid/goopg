@@ -16495,6 +16495,26 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/recovery/t/045_archive_restartpoint.pl` — restartpoints during archive recovery.
   Likely prerequisites \(verify at start\): `CreateRestartPoint` during archive recovery, segment recycling/removal on the recovering node.
+  - 2026\-11\-25: ported as TestPort\_Recovery045ArchiveRestartpointFull \(gated GOOPG\_TAP\_045\). Path\-to\-TAP links, each a direct requirement of the one 045 assertion \(the restore node reachable and paused at the target\): goopg cannot init with `--wal-segsize 1` \(0022a\); a goopg restore node shuts down at recovery\_target\_action = pause \(0022b\); a PG 18.3 restore of the goopg primary never becomes ready \(0022c\). PG oracle note: upstream 045 needs a record in the target's segment — on PG the bgwriter's RUNNING\_XACTS \(LogStandbySnapshot, every 15 s\) lands there during the 320 checkpoints and the final pg\_switch\_wal archives it; a short loop makes real PG FATAL "recovery ended before configured recovery target was reached" too.
+- [x] **M0149-0022a — configurable WAL segment size \(initdb --wal-segsize, wal\_segment\_size from pg\_control\)**
+  Kind: impl
+  Parent: M0149-0022
+  - Path\-to\-TAP: 045 ← init `--wal-segsize 1` and a server running 1 MB segments ← M0149\-0022.
+  - 2026\-11\-25 \(done\): `goopg init --wal-segsize` \(PG's power\-of\-two validation\) writes xlog\_seg\_size into pg\_control, a bootstrap segment of that size \(checkpoint at segment 1 \+ 40\) and min/max\_wal\_size via pretty\_wal\_size. initdb.Open adopts xlog\_seg\_size as the process\-wide `xlog.WALSegmentSize\(\)` \(PG's wal\_segment\_size global\); segment naming \(FormatSegmentNameTLI\), highestLocalSegment and every segSize==0 fallback use it; SHOW wal\_segment\_size reports it. A 1 MB cluster runs, restarts, serves pg\_basebackup and archive recovery of PG 1 MB WAL.
+- [ ] **M0149-0022b — recovery\_target\_action = pause: stay in recovery and serve hot\-standby reads at the target**
+  Kind: impl
+  Parent: M0149-0022
+  - Path\-to\-TAP: 045 \(goopg restore pairings\) ← pause at the target with read\-only connections and pg\_last\_wal\_replay\_lsn\(\) ← M0149\-0022.
+  - goopg's start\-time archive recovery runs before the listener and turns pause into a shutdown \(shutdownAtRecoveryTarget, cmd/goopg/standby.go\). PG: recoveryPausesHere at the end of recovery, "pausing at the end of recovery" / HINT "Execute pg\_wal\_replay\_resume\(\) to promote.", ready for read\-only connections; pg\_wal\_replay\_resume\(\) then promotes. Verified oracle: PG replays to 0/1E00060 and reports pg\_is\_in\_recovery = t, pg\_is\_wal\_replay\_paused = t.
+- [ ] **M0149-0022c — a PG 18.3 node restoring a goopg primary's 045 archive never becomes ready**
+  Kind: impl
+  Parent: M0149-0022
+  - Path\-to\-TAP: 045 \(goopg\-primary\-pg18\-restore\) ← PG reaches the target in the archive ← M0149\-0022.
+  - Not diagnosed. First check whether the goopg primary leaves any record in the target's segment \(PG's bgwriter LogStandbySnapshot cadence; ShutdownXLOG's RequestXLogSwitch with archiving\), then read the PG restore node's log.
+- [ ] **M0149-0093 — a TEMPORARY physical slot survives as a permanent one**
+  Kind: impl
+  Parent: none \(found while porting 045; not a 045 assertion\)
+  - After a failed pg\_basebackup against a goopg primary, its `pg_basebackup_<pid>` slot \(CREATE\_REPLICATION\_SLOT … TEMPORARY\) was still listed after a restart with temporary = f. PG drops temporary slots at session end and never persists them \(ReplicationSlotCleanup, RS\_TEMPORARY\). goopg's per\-start backend PIDs then make the next pg\_basebackup's slot name collide: "replication slot already exists".
 - [ ] **M0149-0023 — port recovery/t/003_recovery_targets.pl**
   Kind: impl
   Parent: none

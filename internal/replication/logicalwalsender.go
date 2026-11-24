@@ -60,7 +60,7 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 	}
 	segSize := s.cfg.WALSegmentSize
 	if segSize <= 0 {
-		segSize = xlog.DefaultSegmentSize
+		segSize = xlog.WALSegmentSize()
 	}
 
 	// M0103-0005: forget the subscriber's last reported progress when the

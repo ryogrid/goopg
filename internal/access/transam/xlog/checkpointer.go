@@ -718,7 +718,7 @@ func (c *Checkpointer) segmentSize() uint64 {
 	if c.cfg.SegmentSize > 0 {
 		return uint64(c.cfg.SegmentSize)
 	}
-	return uint64(DefaultSegmentSize)
+	return uint64(WALSegmentSize())
 }
 
 // checkpointSegments mirrors upstream's CalculateCheckpointSegments
@@ -1062,7 +1062,7 @@ func (c *Checkpointer) runCheckpointOpts(ctx context.Context, o checkpointOpts) 
 		}
 		segSize := c.cfg.SegmentSize
 		if segSize <= 0 {
-			segSize = DefaultSegmentSize
+			segSize = WALSegmentSize()
 		}
 		leading := 0
 		if pos%XLOGBlockSize == 0 {

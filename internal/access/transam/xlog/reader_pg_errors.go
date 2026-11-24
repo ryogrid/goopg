@@ -181,7 +181,7 @@ func PGEndOfWALMessage(walDir string, segmentSize int64) string {
 		segmentSize = detectSegmentSizeAt(walDir, firstSegNo)
 	}
 	if segmentSize <= 0 {
-		segmentSize = DefaultSegmentSize
+		segmentSize = WALSegmentSize()
 	}
 	stream, err := readStreamFrom(walDir, segmentSize, firstSegNo)
 	if err != nil || len(stream) == 0 {

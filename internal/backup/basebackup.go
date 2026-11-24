@@ -402,7 +402,7 @@ func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, arg
 	// --- stream tar bytes through CopyData 'd' frames ---
 	segSize := s.cfg.WALSegmentSize
 	if segSize <= 0 {
-		segSize = xlog.DefaultSegmentSize
+		segSize = xlog.WALSegmentSize()
 	}
 	streamer := &baseBackupStreamer{
 		w:                w,

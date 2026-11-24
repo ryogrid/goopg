@@ -173,7 +173,7 @@ func evalPgBackupStop(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum
 	b := v.(*sessionBackup)
 	var stop uint64
 	stopTLI := b.tli
-	segSize := int64(xlog.DefaultSegmentSize)
+	segSize := xlog.WALSegmentSize()
 	walDir := ""
 	if ctx.DataDir != "" {
 		walDir = filepath.Join(ctx.DataDir, "pg_wal")

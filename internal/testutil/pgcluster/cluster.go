@@ -64,6 +64,9 @@ type Options struct {
 	// line. Use it for synchronous_standby_names / synchronous_commit
 	// / etc.
 	ExtraConf []string
+	// InitDBArgs are extra initdb arguments (e.g. Cluster.pm's init
+	// extra => ['--wal-segsize' => 1]).
+	InitDBArgs []string
 	// StartupWait bounds the pg_ctl start invocation. Defaults to 30s.
 	StartupWait time.Duration
 	// RepoRoot resolves the default BinDir. Required when BinDir is
@@ -86,6 +89,7 @@ type Cluster struct {
 	postgresCmd *exec.Cmd
 	logFile     *os.File
 	startArgs   []string
+	initDBArgs  []string
 }
 
 // SetStartArgs sets extra postgres command-line arguments for every later
@@ -182,6 +186,7 @@ func newClusterHandle(name string, opts Options) (*Cluster, error) {
 		database:    db,
 		libDir:      filepath.Join(filepath.Dir(bin), "lib"),
 		startupWait: opts.StartupWait,
+		initDBArgs:  opts.InitDBArgs,
 	}
 	return c, nil
 }
@@ -193,6 +198,7 @@ func (c *Cluster) runInitdb() error {
 		"--auth-local=trust", "--auth-host=trust",
 		"--no-sync",
 	)
+	cmd.Args = append(cmd.Args, c.initDBArgs...)
 	cmd.Env = c.env()
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("pgcluster: initdb: %v\n%s", err, out)

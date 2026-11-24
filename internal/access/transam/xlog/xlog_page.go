@@ -325,7 +325,7 @@ func (v *xlogPageValidator) checkSpan(data []byte, off int, consumed int, base u
 // so each "log" holds 256 segments — exactly upstream's behaviour.
 func XLogFileName(tli uint32, segno uint64, segSize int64) string {
 	if segSize <= 0 {
-		segSize = DefaultSegmentSize
+		segSize = WALSegmentSize()
 	}
 	// Total byte position = segno * segSize. Split into 32-bit
 	// log_no (high) and seg_in_log (low).
@@ -346,7 +346,7 @@ func ParseXLogFileName(name string, segSize int64) (tli uint32, segno uint64, ok
 		return 0, 0, false
 	}
 	if segSize <= 0 {
-		segSize = DefaultSegmentSize
+		segSize = WALSegmentSize()
 	}
 	// strconv.ParseUint with base=16 is strict — it rejects any
 	// non-hex character and partial parses, unlike fmt.Sscanf

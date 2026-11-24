@@ -44,7 +44,7 @@ type MissingContrecord struct {
 func FindMissingContrecord(walDir string, segSize int64, redoLSN uint64) (MissingContrecord, bool, error) {
 	var mc MissingContrecord
 	if segSize <= 0 {
-		segSize = DefaultSegmentSize
+		segSize = WALSegmentSize()
 	}
 	firstSeg := redoLSN / uint64(segSize)
 	stream, err := readStreamFrom(walDir, segSize, firstSeg)
@@ -138,7 +138,7 @@ const overwriteContrecordInfo = xlogXLogOverwriteContrecord
 // resume scan stops right after the record. It returns the record's end.
 func WriteOverwriteContrecord(walDir string, segSize int64, mc MissingContrecord, overwriteTime int64) (uint64, error) {
 	if segSize <= 0 {
-		segSize = DefaultSegmentSize
+		segSize = WALSegmentSize()
 	}
 	page := mc.MissingContrecPtr
 	if page%XLOGBlockSize != 0 {
@@ -198,7 +198,7 @@ func WriteOverwriteContrecord(walDir string, segSize int64, mc MissingContrecord
 // fetched, not the end of WAL.
 func RemoveSegmentsAfterGap(walDir string, segSize int64, redoLSN uint64) ([]string, error) {
 	if segSize <= 0 {
-		segSize = DefaultSegmentSize
+		segSize = WALSegmentSize()
 	}
 	entries, err := os.ReadDir(walDir)
 	if err != nil {

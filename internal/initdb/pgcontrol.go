@@ -29,6 +29,7 @@ import (
 
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/access/transam/control"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // pgControlFile is the path (relative to the data directory) for the
@@ -221,13 +222,13 @@ func buildPgControl(systemID uint64, now time.Time, cfg *misc.Registry, dataChec
 	le.PutUint64(hdr[24:], uint64(now.Unix()))
 	// checkPoint (XLogRecPtr): offset 32.
 	// Initial LSN is wal_segment_size + SizeOfXLogLongPHD = 0x01000028.
-	le.PutUint64(hdr[32:], pgInitCheckpointLSN)
+	le.PutUint64(hdr[32:], initCheckpointLSN())
 
 	// checkPointCopy (CheckPoint struct, 88 bytes): offset 40..128.
 	// Mirrors BootStrapXLOG (xlog.c:5115-5132).
 
 	// offset 40: CheckPoint.redo (XLogRecPtr)
-	le.PutUint64(hdr[40:], pgInitCheckpointLSN)
+	le.PutUint64(hdr[40:], initCheckpointLSN())
 	// offset 48: CheckPoint.ThisTimeLineID (uint32) — BootstrapTimeLineID=1
 	le.PutUint32(hdr[48:], 1)
 	// offset 52: CheckPoint.PrevTimeLineID (uint32) — BootstrapTimeLineID=1
@@ -306,8 +307,9 @@ func buildPgControl(systemID uint64, now time.Time, cfg *misc.Registry, dataChec
 	le.PutUint32(hdr[220:], 131072)
 	// xlog_blcksz (uint32): offset 224
 	le.PutUint32(hdr[224:], 8192)
-	// xlog_seg_size (uint32): offset 228 — 16 MiB
-	le.PutUint32(hdr[228:], 16*1024*1024)
+	// xlog_seg_size (uint32): offset 228 — wal_segment_size (initdb
+	// --wal-segsize; 16 MiB by default)
+	le.PutUint32(hdr[228:], uint32(xlog.WALSegmentSize()))
 	// nameDataLen (uint32): offset 232
 	le.PutUint32(hdr[232:], 64)
 	// indexMaxKeys (uint32): offset 236
@@ -343,4 +345,11 @@ func buildPgControl(systemID uint64, now time.Time, cfg *misc.Registry, dataChec
 	le.PutUint32(hdr[pgControlCRCOffset:], crc)
 
 	return file
+}
+
+// initCheckpointLSN is the bootstrap checkpoint's LSN at the cluster's
+// segment size: segment 1's first byte plus the long page header
+// (pgInitCheckpointLSN at the default 16 MiB).
+func initCheckpointLSN() uint64 {
+	return uint64(xlog.WALSegmentSize()) + 40
 }

@@ -119,7 +119,7 @@ func NewRecordIterator(w *Writer, walDir string, segSize int64, startLSN uint64)
 		return nil, errors.New("wal: NewRecordIterator: nil writer")
 	}
 	if segSize <= 0 {
-		segSize = DefaultSegmentSize
+		segSize = WALSegmentSize()
 	}
 	// startLSN==0 maps to byte offset 0; startLSN==N maps to offset N-1.
 	//

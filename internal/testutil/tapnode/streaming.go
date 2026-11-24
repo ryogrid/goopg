@@ -141,9 +141,12 @@ func (n *Node) PollQueryUntil(db, query, expected string) bool {
 // NewPG is Cluster.pm's new() + init(allows_streaming => 1) for a PG 18.3
 // node: wal_level replica, max_wal_senders/max_replication_slots 10 and
 // hot_standby on, as init writes them. M0149-0010b.
-func NewPG(t testing.TB, repo, name string) *Node {
+//
+// initArgs are extra initdb arguments (Cluster.pm's init extra).
+func NewPG(t testing.TB, repo, name string, initArgs ...string) *Node {
 	t.Helper()
 	p, err := pgcluster.New(name, pgcluster.Options{
+		InitDBArgs:          initArgs,
 		RepoRoot:            repo,
 		DataDir:             filepath.Join(t.TempDir(), name),
 		User:                "postgres",

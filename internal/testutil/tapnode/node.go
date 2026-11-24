@@ -76,9 +76,12 @@ func BinDir(repo string) string { return filepath.Join(repo, "postgres", "local_
 // durable (synchronous initdb and fsync on), because ported recovery tests
 // assert the durable path itself (test-gate-speedups/02 §4). It is stopped
 // immediately at test cleanup if still running.
-func NewGoopg(t testing.TB, repo, name string) *Node {
+//
+// initArgs are extra `goopg init` arguments (Cluster.pm's init extra).
+func NewGoopg(t testing.TB, repo, name string, initArgs ...string) *Node {
 	t.Helper()
 	g, err := cluster.New(name, cluster.Options{
+		InitArgs:     initArgs,
 		RepoRoot:     repo,
 		DataDir:      filepath.Join(t.TempDir(), name),
 		PSQLPath:     filepath.Join(BinDir(repo), "psql"),

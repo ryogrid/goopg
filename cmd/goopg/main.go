@@ -186,6 +186,8 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	dataChecksums := fs.Bool("k", true, "use data page checksums")
 	fs.BoolVar(dataChecksums, "data-checksums", true, "use data page checksums")
 	noDataChecksums := fs.Bool("no-data-checksums", false, "do not use data page checksums")
+	// --wal-segsize (initdb): the WAL segment size in megabytes.
+	walSegSize := fs.Int("wal-segsize", 0, "size of WAL segments, in megabytes")
 	// Authentication methods written into pg_hba.conf (upstream initdb
 	// -A/--auth, --auth-host, --auth-local) and the superuser password file
 	// (--pwfile). -A/--auth sets both host and local; the per-side flags
@@ -239,7 +241,7 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	// -k/--data-checksums enables; --no-data-checksums overrides it back off
 	// (and is the current goopg default).
 	useDataChecksums := *dataChecksums && !*noDataChecksums
-	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly, SyncMethod: *syncMethod, NoSyncDataFiles: *noSyncDataFiles, TextSearchConfig: *tsConfig, Encoding: *encoding, AllowGroupAccess: *allowGroupAccess, DataChecksums: useDataChecksums, AuthMethodHost: resolvedAuthHost, AuthMethodLocal: resolvedAuthLocal, PwFile: *pwFile, ExtraGUC: extraGUC.settings, LocaleProvider: *localeProvider, Locale: *locale, LCCollate: *lcCollate, LCCtype: *lcCtype, LCMessages: *lcMessages, LCMonetary: *lcMonetary, LCNumeric: *lcNumeric, LCTime: *lcTime, BuiltinLocale: *builtinLocale, ICULocale: *icuLocale, ICURules: *icuRules}); err != nil {
+	if err := initdb.Init(initdb.Options{DataDir: *dataDir, WALSegSizeMB: *walSegSize, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly, SyncMethod: *syncMethod, NoSyncDataFiles: *noSyncDataFiles, TextSearchConfig: *tsConfig, Encoding: *encoding, AllowGroupAccess: *allowGroupAccess, DataChecksums: useDataChecksums, AuthMethodHost: resolvedAuthHost, AuthMethodLocal: resolvedAuthLocal, PwFile: *pwFile, ExtraGUC: extraGUC.settings, LocaleProvider: *localeProvider, Locale: *locale, LCCollate: *lcCollate, LCCtype: *lcCtype, LCMessages: *lcMessages, LCMonetary: *lcMonetary, LCNumeric: *lcNumeric, LCTime: *lcTime, BuiltinLocale: *builtinLocale, ICULocale: *icuLocale, ICURules: *icuRules}); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}
@@ -1380,10 +1382,20 @@ func recordClusterStateGUCs(registry *misc.Registry, dataDir string) {
 		return
 	}
 	checksums := "off"
-	if ctl, err := control.ReadControlFile(dataDir); err == nil && ctl != nil && ctl.DataChecksumVersion != 0 {
+	ctl, err := control.ReadControlFile(dataDir)
+	if err == nil && ctl != nil && ctl.DataChecksumVersion != 0 {
 		checksums = "on"
 	}
 	_ = registry.Set("data_checksums", checksums, misc.SourceDefault)
+	// wal_segment_size from pg_control's xlog_seg_size (ReadControlFile),
+	// shown in its largest whole unit as SHOW does (M0149-0022a).
+	if err == nil && ctl != nil && xlog.IsValidWalSegSize(int64(ctl.XLogSegSize)) {
+		size := fmt.Sprintf("%dMB", ctl.XLogSegSize>>20)
+		if ctl.XLogSegSize%(1<<30) == 0 {
+			size = fmt.Sprintf("%dGB", ctl.XLogSegSize>>30)
+		}
+		_ = registry.Set("wal_segment_size", size, misc.SourceDefault)
+	}
 	_ = registry.Set("huge_pages_status", "off", misc.SourceDefault)
 }
 
@@ -1414,7 +1426,7 @@ func resolveWALBuffers(registry *misc.Registry, sharedBufferSlots int) int64 {
 			nbuffers = 16384
 		}
 		n = nbuffers / 32
-		if segPages := int(xlog.DefaultSegmentSize / xlogBlockSize); n > segPages {
+		if segPages := int(xlog.WALSegmentSize() / xlogBlockSize); n > segPages {
 			n = segPages
 		}
 		if n < 8 {

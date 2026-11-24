@@ -250,7 +250,7 @@ func (c *Config) withDefaults() {
 		c.WALDir = filepath.Join(".", "pg_wal")
 	}
 	if c.SegmentSize <= 0 {
-		c.SegmentSize = DefaultSegmentSize
+		c.SegmentSize = WALSegmentSize()
 	}
 	// A9: the legacy IEEE-CRC frame (encodeRecord/decodeRecord, PageHeaders=false)
 	// is retired — goopg always emits the PostgreSQL page-headered stream. Force
