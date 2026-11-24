@@ -80,6 +80,7 @@ import (
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/libpq"
 	"github.com/goopg/goopg/internal/utils/errcodes"
+	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
@@ -302,6 +303,23 @@ func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, arg
 		// standby reads the record AT that LSN and rejects anything that
 		// is not an RM_XLOG checkpoint.
 		ckptRecLSN = s.cfg.Checkpointer.LastCheckpointRecordLSN()
+	}
+	// No checkpoint or restartpoint has completed in this process — a
+	// standby that has not adopted a restartpoint yet. do_pg_backup_start
+	// then starts at pg_control's checkpoint (ControlFile->checkPoint /
+	// checkPointCopy.redo, the base backup's own checkpoint on a fresh
+	// standby), whose WAL the node still keeps. Falling back to the end of
+	// WAL started the backup where no WAL exists yet: pg_basebackup -X
+	// stream received nothing and the label named a redo point that was
+	// never written, so a cascading standby built from it could not start
+	// (M0149-0077f). pg_control stores PG byte LSNs; these are 1-based.
+	if redoLSN == 0 && s.cfg.DataDir != "" {
+		if cd, err := control.ReadControlFile(s.cfg.DataDir); err == nil && cd != nil && cd.CheckPointCopyRedo != 0 {
+			redoLSN = cd.CheckPointCopyRedo + 1
+			if cd.CheckPoint != 0 {
+				ckptRecLSN = cd.CheckPoint + 1
+			}
+		}
 	}
 	if redoLSN == 0 && s.cfg.WAL != nil {
 		redoLSN = s.cfg.WAL.WrittenLSN()

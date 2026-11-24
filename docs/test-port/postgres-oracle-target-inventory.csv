@@ -385,7 +385,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale,mismatch_l
 ,isolation-specs,isolation,postgres/src/test/isolation/specs/vacuum-conflict.spec,pass,yes,-,Promoted to pass-required via runIsoSpecStrict TestPort_IsolationVacuumConflict (internal/testport/isolation_port_test.go); matches PG 18.3 byte-for-byte across all generated permutations. M0118.,,
 ,isolation-specs,isolation,postgres/src/test/isolation/specs/vacuum-no-cleanup-lock.spec,pass,yes,-,Promoted to pass-required via runIsoSpecStrict TestPort_IsolationVacuumNoCleanupLock (internal/testport/isolation_port_test.go); matches PG 18.3 byte-for-byte across all generated permutations. M0118.,,
 ,isolation-specs,isolation,postgres/src/test/isolation/specs/vacuum-skip-locked.spec,pass,yes,-,Promoted to pass-required via runIsoSpecStrict TestPort_IsolationVacuumSkipLocked (internal/testport/isolation_port_test.go); matches PG 18.3 byte-for-byte across all generated permutations. M0118.,,
-R-001,recovery-tap,tap,postgres/src/test/recovery/t/001_stream_rep.pl,port,yes,-,Ported as TestPort_Recovery001StreamRep in internal/testport/recovery_port_test.go,,
+R-001,recovery-tap,tap,postgres/src/test/recovery/t/001_stream_rep.pl,port,yes,-,Ported as TestPort_Recovery001StreamRepFull in internal/testport/recovery_001_stream_rep_test.go (all three pairings: all-goopg; PG 18.3 primary with goopg standbys; goopg primary with PG 18.3 standbys — M0149-0077); TestPort_Recovery001StreamRep keeps the earlier smoke,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/002_archiving.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/003_recovery_targets.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/004_timeline_switch.pl,not-tried,no,-,,,

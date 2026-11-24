@@ -2885,6 +2885,11 @@ type InMemory struct {
 	namespaces map[uint32]*tableNamespace
 	nextOID    uint32
 	dbOid      uint32
+
+	// nextSystemViewOID counts down from FirstUserOID-1 for goopg-only
+	// system views (RegisterVirtualTable, M0149-0077f).
+	nextSystemViewOID uint32
+
 	// routines holds user-defined routines (M0015 Stage A step 2).
 	// Separate registry — not part of the table/index map space —
 	// so existing CRUD on those types stays untouched. Accessed
@@ -13479,6 +13484,20 @@ func (c *InMemory) RegisterVirtualTable(t *Table) error {
 	if _, exists := c.ns(DefaultDBOid).tables[k]; exists {
 		return fmt.Errorf("relation %q already exists", k)
 	}
+	if t.OID == 0 && (t.Schema == "pg_catalog" || t.Schema == "information_schema") {
+		t.OID = builtinCatalogRelOID(t.Schema, t.Name)
+		if t.OID == 0 {
+			// A goopg-only system view (no PG counterpart): take an OID
+			// from the top of the FirstUnpinnedObjectId..FirstNormalObjectId
+			// band, counting down, so it can never equal a user object's
+			// OID — goopg's or a PG primary's.
+			if c.nextSystemViewOID == 0 {
+				c.nextSystemViewOID = FirstUserOID - 1
+			}
+			t.OID = c.nextSystemViewOID
+			c.nextSystemViewOID--
+		}
+	}
 	if t.OID == 0 {
 		t.OID = c.nextOID
 		c.nextOID++
@@ -13488,6 +13507,47 @@ func (c *InMemory) RegisterVirtualTable(t *Table) error {
 	}
 	c.ns(DefaultDBOid).tables[k] = t
 	return nil
+}
+
+// SystemRelOIDResolver, when set, returns PG 18.3's initdb-assigned OID for a
+// pg_catalog or information_schema system view (initdb's pinned view tables,
+// M0131-S8a / M0133-S4), or 0. initdb installs it; catalog cannot import
+// initdb.
+var SystemRelOIDResolver func(schema, name string) uint32
+
+var (
+	builtinRelOIDOnce sync.Once
+	builtinRelOIDs    map[string]uint32
+)
+
+// builtinCatalogRelOID is PG's own OID for a pg_catalog relation: the seeded
+// pg_class row for a system catalog, else the pinned system-view OID. A
+// virtual relation registered without an OID used to take the next
+// user-range OID (>= FirstNormalObjectId), which collides with the OIDs a PG
+// primary assigns to user objects: on a goopg standby of a PG primary,
+// pg_subscription_rel held 16397, the OID PG gave a user sequence, and the
+// standby's OID lookups found the catalog instead of the sequence
+// (M0149-0077f). 0 when the name is not a PG system relation.
+func builtinCatalogRelOID(schema, name string) uint32 {
+	builtinRelOIDOnce.Do(func() {
+		builtinRelOIDs = make(map[string]uint32, len(seedPgClassRows))
+		for _, r := range seedPgClassRows {
+			if len(r) > 2 && r[2] == "11" { // relnamespace = pg_catalog
+				if oid, err := strconv.ParseUint(r[0], 10, 32); err == nil {
+					builtinRelOIDs[r[1]] = uint32(oid)
+				}
+			}
+		}
+	})
+	if schema == "pg_catalog" {
+		if oid, ok := builtinRelOIDs[name]; ok {
+			return oid
+		}
+	}
+	if SystemRelOIDResolver != nil {
+		return SystemRelOIDResolver(schema, name)
+	}
+	return 0
 }
 
 // SetVirtualRows replaces the row provider of a built-in virtual table

@@ -1,8 +1,9 @@
 # 0149-0077 — Re-port recovery/t/001\_stream\_rep.pl to the M0149 contract
 
-Status: in progress. `TestPort_Recovery001StreamRepFull`
-\(`internal/testport/recovery_001_stream_rep_test.go`\) ports all of 001 in three pairings. It is gated by
-`GOOPG_TAP_001=1` until it passes; the shortcut `TestPort_Recovery001StreamRep` stays until then.
+Status: done \(2026\-11\-25\). `TestPort_Recovery001StreamRepFull`
+\(`internal/testport/recovery_001_stream_rep_test.go`\) ports all of 001 in three pairings, all passing and ungated:
+all\-goopg; a PG 18.3 primary with goopg standbys; a goopg primary with PG 18.3 standbys. The earlier smoke
+`TestPort_Recovery001StreamRep` remains.
 
 ## Shape
 
@@ -193,6 +194,30 @@ second backup is taken from the standby while the primary is down. The test then
 - Result: the goopg\-primary/PG\-standbys pairing of 001 passes end to end and runs ungated.
 - The ALTER SEQUENCE … SET LOGGED/UNLOGGED path still re\-runs the insert\-only funnel \(M0149\-0091\).
 
+## Slice 13 \(0077f, landed\): cascading from a goopg standby of a PG primary
+
+- Base backup from a standby:
+  - standby\_2 is built from a pg\_basebackup of standby\_1, a goopg standby that had not adopted a restartpoint;
+  - the checkpointer had no redo of its own, so BASE\_BACKUP fell back to the end of WAL;
+  - the backup started where no WAL existed: pg\_basebackup \-X stream received nothing, backup\_label named an
+    unwritten redo, and standby\_2's walreceiver asked for segment 0;
+  - do\_pg\_backup\_start in recovery uses pg\_control's checkPoint / checkPointCopy.redo — on a fresh standby, the
+    base backup's checkpoint, whose WAL the standby still keeps. BASE\_BACKUP now falls back to pg\_control the same
+    way.
+- OIDs of virtual catalog relations:
+  - virtual pg\_catalog relations registered through `RegisterVirtualTable` without an OID took the next
+    user\-range OID: pg\_subscription\_rel 16397, pg\_stat\_wal\_io 16387, and others;
+  - a PG primary assigns those same OIDs to user objects, so on the goopg standby `LookupTableByOIDAllDBs` sometimes
+    returned the catalog instead of the replayed sequence. Map iteration order decided which, so `SELECT * FROM
+    seq1` came back empty in some runs.
+  - PG never allocates system relations in the user range. RegisterVirtualTable now takes PG's own OID: the
+    seeded pg\_class row for a system catalog, or the pinned system and information\_schema view OIDs through
+    `catalog.SystemRelOIDResolver`, which initdb installs.
+  - A goopg\-only system view \(pg\_stat\_aio, pg\_stat\_aio\_targets, pg\_stat\_wal\_io\) counts down from 16383,
+    below FirstNormalObjectId.
+- Result: all three pairings pass 3/3 and the GOOPG\_TAP\_001 gate is gone. The must\-pass regress cases are
+  identical to HEAD.
+
 ## Open \(children in fix\_plan\)
 
-- 0077f: a goopg standby does not serve a cascading standby \(PG\-primary pairing\).
+None. Nearby defects filed during the port: M0149\-0084 to M0149\-0092.

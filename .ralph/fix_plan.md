@@ -16154,7 +16154,7 @@ verify each at HEAD when the task starts.
     Parent: none \(re\-parented 2026\-11\-24: a nearby defect, not a 026 requirement\)
     Found while porting 026 \(not a 026 blocker: safe\_psql ignores stderr\). PG sends LOG to the server log only
     \(below client\_min\_messages=notice\); goopg prints "NOTICE:  exiting after …" to psql.
-- [ ] **M0149-0077 — re-port recovery/t/001_stream_rep.pl to the M0149 contract**
+- [x] **M0149-0077 — re-port recovery/t/001_stream_rep.pl to the M0149 contract** \(2026\-11\-25\)
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/001_stream_rep.pl` — streaming replication with a cascading standby, hot-standby feedback, read-only checks and replication-connection commands.
@@ -16240,7 +16240,21 @@ verify each at HEAD when the task starts.
     Path\-to\-TAP: 001 goopg\-primary/pg18\-standbys: pg\_sequence\_last\_value\('ulseq'\) on the PG standby fails "could
     not open file base/5/<n>". PG returns NULL for an unlogged sequence in recovery, so its relpersistence must
     not read 'u'; check goopg's pg\_class row and init fork for unlogged sequences.
-  - [ ] **M0149-0077f — goopg standby does not serve a cascading standby**
+  - [x] **M0149-0077f — goopg standby does not serve a cascading standby** \(2026\-11\-25\)
+    - Two causes behind the timed\-out cascade wait.
+    - First cause, BASE\_BACKUP from a goopg standby that has not adopted a restartpoint:
+      - the checkpointer reports no redo, so BASE\_BACKUP started at the end of WAL;
+      - pg\_basebackup \-X stream got nothing, the label named an unwritten redo, and standby\_2 asked for segment 0;
+      - fix: BASE\_BACKUP now falls back to pg\_control's checkPoint/checkPointCopy.redo, as do\_pg\_backup\_start does.
+    - Second cause, intermittent, behind "SELECT \* FROM seq1" being empty:
+      - virtual pg\_catalog relations registered without an OID took user\-range OIDs \(pg\_subscription\_rel 16397,
+        pg\_stat\_wal\_io 16387\);
+      - a PG primary assigns those OIDs to user objects, so the standby's OID lookup sometimes found the catalog
+        instead of the sequence \(map order\);
+      - fix: RegisterVirtualTable gives such relations PG's own OID \(seeded pg\_class row, or the pinned system and
+        information\_schema view OIDs\). goopg\-only system views count down from 16383.
+    - All three 001 pairings pass 3/3 and run ungated. The must\-pass regress cases are identical to HEAD.
+    Movement: yes — tap 001 pg18\-primary/goopg\-standbys: fatal cascade catch\-up timeout → pairing PASS; TestPort\_Recovery001StreamRepFull PASS on all three pairings \(M0149 contract met\)
     Kind: impl
     Parent: M0149-0077
     Path\-to\-TAP: 001 pg18\-primary/goopg\-standbys: standby\_2 never appears in standby\_1's pg\_stat\_replication
@@ -16378,6 +16392,13 @@ verify each at HEAD when the task starts.
   - PG's ATExecSetRelPersistence rewrites the relation into a new relfilenode and updates the pg\_class row in place
     \(heap\_update\).
   - Audit the other callers that run syncTableToCatalogHeap on an already\-written relation.
+- [ ] **M0149-0092 — a backup taken from a goopg standby says "BACKUP FROM: primary"**
+  Kind: impl
+  Parent: none \(found while fixing M0149-0077f; not a 001 assertion\)
+  - do\_pg\_backup\_start in recovery writes "BACKUP FROM: standby", which tells a restoring server to treat
+    minRecoveryPoint as the backup end. goopg's BuildBackupLabel always writes "primary".
+  - BASE\_BACKUP on a standby also skips PG's checks: the full\_page\_writes requirement, and "the standby was
+    promoted during online backup".
 - [ ] **M0149-0018 — port recovery/t/002_archiving.pl**
   Kind: impl
   Parent: none
