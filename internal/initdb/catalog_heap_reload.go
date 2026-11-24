@@ -3090,6 +3090,16 @@ func languageNameForOID(oid uint32) string {
 // no WHEN TAG filter). Seeds the TID cache so a post-restart ALTER updates
 // the row in place.
 func reloadUserEventTriggersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	return reloadUserEventTriggersFromHeapMode(mgr, cat, clog, false)
+}
+
+// reloadUserEventTriggersFromHeapMode is reloadUserEventTriggersFromHeap with
+// sync: a running standby's refresh (RefreshCatalogAfterReplay) reads only
+// rows of committed transactions and replaces the whole user event trigger
+// registry with them, so a replayed CREATE, ALTER (ENABLE/RENAME/OWNER) or
+// DROP EVENT TRIGGER shows in pg_event_trigger without a restart — on PG the
+// standby reads the replayed pg_event_trigger heap directly. M0149-0077h.
+func reloadUserEventTriggersFromHeapMode(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, sync bool) error {
 	cols := executor.PGEventTriggerColumnsPG18()
 	type etRow struct {
 		et  catalog.EventTrigger
@@ -3121,10 +3131,21 @@ func reloadUserEventTriggersFromHeap(mgr *storage.Manager, cat *catalog.InMemory
 					Tags:    tags,
 				},
 				tid: tid,
-			}, false, nil
+			}, sync, nil
 		})
 	if err != nil {
 		return err
+	}
+	if sync {
+		ets := make([]catalog.EventTrigger, 0, len(rows))
+		tids := make(map[uint32]catalog.SchemaHeapTID, len(rows))
+		for _, raw := range rows {
+			er := raw.(etRow)
+			ets = append(ets, er.et)
+			tids[er.et.OID] = catalog.SchemaHeapTID{Block: uint32(er.tid.Block), Offset: er.tid.Offset}
+		}
+		cat.ReplaceEventTriggersDuringRecovery(ets, tids)
+		return nil
 	}
 	for _, raw := range rows {
 		er := raw.(etRow)
@@ -3752,6 +3773,11 @@ func (r *Runtime) RefreshCatalogAfterReplay(dbOid uint32) error {
 	heapDB := storage.StorageDBOid(dbOid)
 	if heapDB == storage.StorageDBOid(cat.DBOID()) {
 		if err := loadUserTablesFromHeapForDBMode(r.StorageMgr, cat, clog, cat.DBOID(), 0, true); err != nil {
+			return err
+		}
+		// Event triggers follow the replayed pg_event_trigger heap
+		// (M0149-0077h).
+		if err := reloadUserEventTriggersFromHeapMode(r.StorageMgr, cat, clog, true); err != nil {
 			return err
 		}
 		// Sequences the primary created register here, with their counters

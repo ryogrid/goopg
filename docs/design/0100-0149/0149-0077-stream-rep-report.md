@@ -82,9 +82,20 @@ second backup is taken from the standby while the primary is down. The test then
   on the slot that standby\_2 uses on standby\_1. goopg does not track physical\-slot xmin yet, so it stays NULL
   until hot\_standby\_feedback lands \(0077i\).
 
+## Slice 7 \(0077h, landed\): event triggers on a running standby
+
+- goopg renders pg\_event\_trigger from the in\-memory registry. At startup the registry is loaded from the heap.
+  A streaming standby refreshes its catalog after each replayed commit that changed a system catalog
+  \(RefreshCatalogAfterReplay, goopg's relcache invalidation\), but that refresh only registered new tables and
+  sequences. A trigger created on the primary therefore appeared on a standby only after the standby restarted:
+  001 passed on standby\_1, which restarts, and failed on standby\_2, which does not.
+- The refresh now rebuilds the registry and the TID cache from the replayed heap's committed rows
+  \(`reloadUserEventTriggersFromHeapMode` with sync, `catalog.ReplaceEventTriggersDuringRecovery`\). This is safe
+  because no local DDL runs during recovery, so the replayed heap is the only source of truth. The rebuild covers
+  CREATE, ALTER \(ENABLE, RENAME, OWNER\) and DROP.
+
 ## Open \(children in fix\_plan\)
 
-- 0077h: standby\_1 does not show the login event trigger after its restart.
 - 0077i: hot\_standby\_feedback is missing \(GUC, feedback messages, physical\-slot xmin\).
 - 0077e: on a PG 18.3 standby of a goopg primary, reading an unlogged sequence fails with "could not open file".
 - 0077f: a goopg standby does not serve a cascading standby \(PG\-primary pairing\).

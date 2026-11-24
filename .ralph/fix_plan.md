@@ -16235,11 +16235,18 @@ verify each at HEAD when the task starts.
     Parent: M0149-0077
     Path\-to\-TAP: 001 pg18\-primary/goopg\-standbys: standby\_2 never appears in standby\_1's pg\_stat\_replication
     \(the first cascaded catch\-up wait times out\).
-  - [ ] **M0149-0077h — standby\_1 loses the login event trigger after its restart**
+  - [x] **M0149-0077h — a running standby does not see replayed event triggers** \(2026\-11\-24\)
+    - Corrected diagnosis: the failing assertion was standby\_2's, not standby\_1's. standby\_1 restarts, and its
+      startup reload reads pg\_event\_trigger from the heap; standby\_2 never restarts, and the running standby's
+      catalog refresh \(RefreshCatalogAfterReplay\) reloaded tables and sequences only.
+    - The refresh now replaces the event trigger registry and TID cache with the replayed heap's committed rows
+      \(reloadUserEventTriggersFromHeapMode sync, catalog.ReplaceEventTriggersDuringRecovery\). Verified live:
+      CREATE, ENABLE ALWAYS, RENAME and DROP on the primary all show on the streaming standby without a restart.
+    Movement: yes — tap 001 all\-goopg: "Name of login trigger" not ok → ok on both standbys; the run now stops at ALTER SYSTEM SET hot\_standby\_feedback \(0077i\)
     Kind: impl
     Parent: M0149-0077
     Path\-to\-TAP: 001 all\-goopg "Name of login trigger": `SELECT evtname FROM pg_event_trigger WHERE evtevent='login'`
-    on standby\_1 returns "" after standby\_1 restarts \(standby\_2 returns on\_login\_trigger\). Non\-fatal assertion.
+    returned "" on the never\-restarted standby\_2. Non\-fatal assertion.
   - [ ] **M0149-0077i — hot\_standby\_feedback is not implemented**
     Kind: impl
     Parent: M0149-0077
@@ -16265,6 +16272,12 @@ verify each at HEAD when the task starts.
   After `pg_basebackup` against a goopg primary, pg\_replication\_slots still lists `pg_basebackup_<pid>`
   \(inactive\). PG creates it TEMPORARY \(CREATE\_REPLICATION\_SLOT … TEMPORARY\) and drops it when the walsender
   session ends \(ReplicationSlotCleanup\).
+- [ ] **M0149-0087 — system columns are missing on virtual catalogs such as pg\_event\_trigger**
+  Kind: impl
+  Parent: none \(found while fixing M0149-0077h; not a 001 assertion\)
+  `SELECT ctid, xmin, xmax FROM pg_event_trigger` fails with `column "xmin" does not exist`. On PG every catalog is a
+  heap with system attributes. goopg renders pg\_event\_trigger from the in\-memory registry
+  \(catalog.go VirtualRows\), so the heap's system columns are not reachable.
 - [ ] **M0149-0018 — port recovery/t/002_archiving.pl**
   Kind: impl
   Parent: none

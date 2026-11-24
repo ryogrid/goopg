@@ -19878,6 +19878,26 @@ func (c *InMemory) RegisterEventTriggerDuringRecovery(et *EventTrigger) {
 	c.advanceNextOIDLocked(et.OID)
 }
 
+// ReplaceEventTriggersDuringRecovery replaces the whole event trigger
+// registry and its heap TID cache with ets/tids — a running standby's
+// refresh from the replayed pg_event_trigger heap, which is the only source
+// of truth there (no local DDL runs during recovery). M0149-0077h.
+func (c *InMemory) ReplaceEventTriggersDuringRecovery(ets []EventTrigger, tids map[uint32]SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.eventTriggers = make(map[string]*EventTrigger, len(ets))
+	c.eventTriggerHeapTIDs = make(map[uint32]SchemaHeapTID, len(tids))
+	for i := range ets {
+		out := ets[i]
+		out.Tags = append([]string(nil), ets[i].Tags...)
+		c.eventTriggers[out.Name] = &out
+		c.advanceNextOIDLocked(out.OID)
+	}
+	for oid, tid := range tids {
+		c.eventTriggerHeapTIDs[oid] = tid
+	}
+}
+
 // DropEventTriggerDuringRecovery is the idempotent counterpart used for
 // replaying RecordKindDropEventTrigger. Identical to DropEventTrigger but
 // discards the found/not-found result — replay does not care whether the
