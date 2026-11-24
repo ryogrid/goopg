@@ -535,6 +535,34 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			return nil, fmt.Errorf("goopg: reset unlogged relations (cleanup): %w", err)
 		}
 	}
+	// M0149-0017a: crash recovery that ends inside a record whose
+	// continuation never reached disk writes XLOG_OVERWRITE_CONTRECORD where
+	// the continuation should have begun, and WAL continues from there
+	// (xlog.c StartupXLOG: EndOfLog = missingContrecPtr,
+	// CreateOverwriteContrecordRecord). Not under archive recovery or as a
+	// standby (xlogrecovery.c). Written before replay: replay stops at the
+	// incomplete record either way, and the segment run stays contiguous for
+	// the reader and the WAL writer's resume scan.
+	if abs != "" && recov.crashRecovery && !startStandby && !startRecovery {
+		walDir := filepath.Join(abs, "pg_wal")
+		if removed, rerr := xlog.RemoveSegmentsAfterGap(walDir, opts.WALSegmentSize, recov.redoLSN); rerr != nil {
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: end of WAL at a missing segment: %w", rerr)
+		} else if len(removed) > 0 {
+			slog.Default().Info("WAL ends at a missing segment after the redo point; removed the segments past it", "removed", removed)
+		}
+		if mc, ok, ferr := xlog.FindMissingContrecord(walDir, opts.WALSegmentSize, recov.redoLSN); ferr != nil {
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: find missing contrecord: %w", ferr)
+		} else if ok {
+			if _, werr := xlog.WriteOverwriteContrecord(walDir, opts.WALSegmentSize, mc, xlog.TimestampTzNow()); werr != nil {
+				_ = mgr.Close()
+				return nil, fmt.Errorf("goopg: write overwrite contrecord: %w", werr)
+			}
+			slog.Default().Info(fmt.Sprintf("wrote XLOG_OVERWRITE_CONTRECORD at %X/%X for the missing continuation of the record at %X/%X",
+				uint32(mc.MissingContrecPtr>>32), uint32(mc.MissingContrecPtr), uint32(mc.AbortedRecPtr>>32), uint32(mc.AbortedRecPtr)))
+		}
+	}
 	if _, err := xlog.ReplayFromDirWithMgrAtInterruptible(mgr, filepath.Join(abs, "pg_wal"), 0, recov.redoLSN, opts.Interrupted); err != nil {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: wal replay: %w", err)

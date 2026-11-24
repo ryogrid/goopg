@@ -30,15 +30,31 @@ Pairings: all-goopg, PG 18.3 primary with a goopg standby, goopg primary with a 
   timeline. It refuses to run during recovery.
 - tapnode `BackupFsCold`.
 
+## Slice 2 \(0017a, landed\)
+
+- **End of WAL at a missing segment.** In crash recovery only \(not as a standby, not under archive recovery\), a
+  segment missing after the redo segment ends the WAL. The segment files past it are removed
+  \(`RemoveSegmentsAfterGap`\), because goopg's reader and writer locate the stream by the files present:
+  `liveSegmentRunStart` keeps the last contiguous run. Before this, a stale pre\-allocated segment past the hole made
+  recovery replay nothing from the redo segment, which lost the test's whole `filler` table, and resume writing in the
+  stale file. PG recycles such files and overwrites them.
+- **Overwrite record.** `FindMissingContrecord` reproduces xlogreader.c's assembled\-record failure: a record whose
+  header is on its first page and whose continuation page is absent, zero, or not its continuation. That gives
+  `abortedRecPtr` and `missingContrecPtr`. Before replay and before the WAL writer opens,
+  `WriteOverwriteContrecord` writes a page header flagged `XLP_FIRST_IS_OVERWRITE_CONTRECORD` and
+  `XLOG_OVERWRITE_CONTRECORD` \(`overwritten_lsn`, `overwrite_time`, xl\_prev = the last complete record\) and fsyncs
+  it. PG does this after replay; the order does not matter, because replay stops at the incomplete record either way.
+- **Resume scan.** `scanLastSegmentEnd` drops a record that runs onto a flagged page and restarts there, as
+  xlogreader.c does, so the writer resumes after the overwrite record. PG 18.3 `pg_waldump` decodes the result
+  \(unit test\).
+
 ## Open
 
-- **0017a — goopg primary.** `detectWritePos` \(xlog/writer.go\) derives the resume position from segment files. A
-  hole in the segment run is taken as a retention leftover and everything below it is dropped. Here that discards
-  the segment holding redo and the torn record, and the primary resumes in the next pre\-allocated segment. The
-  resume position must come from where recovery's reader stopped:
-  - `abortedRecPtr` / `missingContrecPtr` from the assembled\-record error;
-  - EndOfLog = `missingContrecPtr`, and xl\_prev = the last complete record;
-  - then the overwrite record on a flagged page.
+- **0017d — records across segment boundaries.** goopg's stripe WAL insert \(M0107\) never lets a reservation cross a
+  segment boundary. It pads the rest of the segment with `XLOG_NOOP` \(`segment_pad_emit.go`\), so 026's 600 kB message
+  starts exactly in the deleted segment. A goopg primary therefore reaches a clean end of WAL at the boundary, writes
+  no overwrite record, and its standby never logs the skip. PG pads only for `XLOG_SWITCH`. Changing this touches the
+  perf\-critical insert path and needs a design pass.
 - **0017b — goopg standby.** The reader must restart at an `XLP_FIRST_IS_OVERWRITE_CONTRECORD` page while assembling
   a record, keeping `overwrittenRecPtr`. Replay must verify `overwritten_lsn` and log the skip line. With a PG
   primary the goopg standby never catches up; all\-goopg replays the data but logs nothing.

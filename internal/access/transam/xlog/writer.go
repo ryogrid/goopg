@@ -1671,6 +1671,13 @@ func scanLastSegmentEnd(walDir string, segNo uint64, tli uint32, segSize int64, 
 		// trailing pad bytes (zero-filled by the encoder). The
 		// scanner advances by `consumed` so the next iteration
 		// lands on the next record header.
+		// M0149-0017a: a record whose continuation was replaced by
+		// XLOG_OVERWRITE_CONTRECORD is dropped and the scan restarts at the
+		// flagged page, as xlogreader.c does on XLP_FIRST_IS_OVERWRITE_CONTRECORD.
+		if next, ok := overwritePageWithin(data, off, pos, total, cfgSegSize); ok {
+			off = next
+			continue
+		}
 		paddedTotal := maxAlignXLog(total)
 		fullBytes, consumed := extractRecordBytes(data[off:], pos, cfgSegSize, paddedTotal)
 		if len(fullBytes) < total {

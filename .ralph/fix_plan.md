@@ -16092,7 +16092,17 @@ verify each at HEAD when the task starts.
       - 026 goopg primary ← DO block "declaration initializer: syntax error": PL/pgSQL SELECT\-shaped expressions;
       - 026 goopg primary ← "function pg\_walfile\_name does not exist": implemented.
     Movement: yes — tap 026 all\-goopg: start refused → only the "successfully skipped missing contrecord" log assertion fails \(data replays\)
-  - [ ] **M0149-0017a — goopg crash recovery writes XLOG\_OVERWRITE\_CONTRECORD at the missing continuation**
+  - [x] **M0149-0017a — goopg crash recovery writes XLOG\_OVERWRITE\_CONTRECORD at the missing continuation** \(2026\-11\-24\)
+    - Crash recovery ends the WAL at the first segment missing after redo \(RemoveSegmentsAfterGap\). goopg had kept
+      the LAST contiguous run, so it replayed nothing from the redo segment: the test's `filler` table, 24430 rows,
+      vanished. It also resumed writing in a stale pre\-allocated segment.
+    - A record whose continuation page never reached disk is detected \(FindMissingContrecord\).
+      XLOG\_OVERWRITE\_CONTRECORD is written first on that page, under XLP\_FIRST\_IS\_OVERWRITE\_CONTRECORD, with
+      xl\_prev at the last complete record \(WriteOverwriteContrecord\). The writer's resume scan restarts at a
+      flagged page. Unit test: PG 18.3 pg\_waldump decodes "OVERWRITE\_CONTRECORD lsn 0/218".
+    - goopg never writes a record across a segment boundary \(NOOP pad, 0017d\), so 026's own shape is a clean end
+      of WAL at the boundary on a goopg primary.
+    Movement: yes — tap 026 goopg\-primary/pg18\-standby: standby catch\-up timeout → only the "successfully skipped missing contrecord" log assertion fails \(1 of 4\)
     Kind: impl
     Parent: M0149-0017
     Path\-to\-TAP: 026 goopg\-primary/PG\-standby ← PG standby asks for 0/2000000, goopg's walsender cannot open
@@ -16106,6 +16116,13 @@ verify each at HEAD when the task starts.
     missing "successfully skipped missing contrecord at" log line.
     Upstream: xlogreader.c XLP\_FIRST\_IS\_OVERWRITE\_CONTRECORD restart \(overwrittenRecPtr\); xlogrecovery.c
     xlogrecovery\_redo verify \+ LOG.
+  - [ ] **M0149-0017d — WAL records cross segment boundaries \(no XLOG\_NOOP segment pad\)**
+    Kind: impl \(design first: the M0107 stripe WAL insert path\)
+    Parent: M0149-0017
+    Path\-to\-TAP: 026 goopg\-primary pairings ← "successfully skipped missing contrecord" needs the 600 kB message to
+    start in one segment and continue into the deleted one ← goopg pads the segment tail with XLOG\_NOOP and starts
+    the record at the next segment \(segment\_pad\_emit.go, insertPosTracker.onCrossSegment\). PG records span
+    segments freely; only XLOG\_SWITCH pads.
   - [ ] **M0149-0017c — RAISE LOG reaches the client as NOTICE**
     Kind: impl
     Parent: M0149-0017
