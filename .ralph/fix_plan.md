@@ -16157,6 +16157,42 @@ verify each at HEAD when the task starts.
   Upstream: `postgres/src/test/recovery/t/001_stream_rep.pl` — streaming replication with a cascading standby, hot-standby feedback, read-only checks and replication-connection commands.
   Current shortcut \(audit\): `TestPort_Recovery001StreamRep` covers 2 of \~47 upstream assertions \(walreceiver streaming, one row visible\). Missing: the cascading `standby_2`; read-only transaction errors; `hot_standby_feedback` xmin/catalog\_xmin on slots; sequence and unlogged checks on the standby; replication-connection `SHOW` and `READ_REPLICATION_SLOT`; the `pg_backup_start` checks. The slot is pre-created by the harness. All-goopg only — no PG 18.3 primary/standby variant.
   Likely prerequisites \(verify at start\): the Tier 2 substrate \(streaming, promotion, harness `wait_for_catchup` / `background_psql`\), a cascading walsender on a standby, `READ_REPLICATION_SLOT`, mixed goopg↔PG streaming \(`e2e_failover_*` precedents\). Inventory row stays `port` until this closes.
+  - 2026\-11\-24 slice 1: full port TestPort\_Recovery001StreamRepFull \(gated by GOOPG\_TAP\_001\), three pairings.
+    Design docs/design/0100\-0149/0149\-0077\-stream\-rep\-report.md.
+    - Path\-to\-TAP, fixed: 001 ← "function pg\_sequence\_last\_value does not exist" \(fatal\): implemented.
+    Movement: yes — tap 001 all\-goopg: fatal at the unlogged\-sequence check → runs to the walsender pg\_stat\_io wait \(25 of \~47 assertions evaluated, 19 not ok\)
+  - [ ] **M0149-0077a — goopg standby shows no sequence state \(SELECT \* FROM seq1 is empty\)**
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 "check streamed sequence content on standby 1/2" ← sequence state lives in memory
+    \(Table.VirtualRows\) and is not rebuilt from replayed WAL \(seq\_redo, sequence.c\).
+  - [ ] **M0149-0077b — goopg standby is not read\-only**
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 "read\-only queries on standby 1/2" \(INSERT exits 0, want 3\); the target\_session\_attrs
+    read\-only/standby/read\-write cases ← the standby must reject writes \(cannot execute INSERT in a read\-only
+    transaction\) and report in\_hot\_standby=on and default\_transaction\_read\_only=on in ParameterStatus.
+  - [ ] **M0149-0077c — SHOW port reports 5432, not the listening port**
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 target\_session\_attrs "connect to node … " compares SHOW port with the node's port.
+  - [ ] **M0149-0077d — the walsender records no pg\_stat\_io WAL reads**
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 waits for `sum(reads) > 0 FROM pg_stat_io WHERE backend_type = 'walsender' AND object = 'wal'`
+    \(fatal timeout\); later the walreceiver `writes` check.
+  - [ ] **M0149-0077e — PG 18.3 standby of a goopg primary cannot read an unlogged sequence**
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 goopg\-primary/pg18\-standbys: pg\_sequence\_last\_value\('ulseq'\) on the PG standby fails "could
+    not open file base/5/<n>". PG returns NULL for an unlogged sequence in recovery, so its relpersistence must
+    not read 'u'; check goopg's pg\_class row and init fork for unlogged sequences.
+  - [ ] **M0149-0077f — goopg standby does not serve a cascading standby**
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 pg18\-primary/goopg\-standbys: standby\_2 never appears in standby\_1's pg\_stat\_replication
+    \(the first cascaded catch\-up wait times out\).
+
 - [ ] **M0149-0018 — port recovery/t/002_archiving.pl**
   Kind: impl
   Parent: none

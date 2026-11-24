@@ -17966,6 +17966,9 @@ func exprType(e Expr) catalog.Type {
 			// xlogfuncs.c; pg_proc.dat oids 2849/2852/3330: prorettype pg_lsn.
 			// M0122-0009 S7.
 			return catalog.Type{Name: "pg_lsn"}
+		case "pg_sequence_last_value":
+			// pg_sequence_last_value(regclass) -> int8 (pg_proc.dat oid 4032). M0149-0077.
+			return catalog.Type{Name: "int8"}
 		case "pg_walfile_name":
 			// pg_walfile_name(pg_lsn) -> text (pg_proc.dat oid 2851). M0149-0017.
 			return catalog.Type{Name: "text"}

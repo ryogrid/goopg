@@ -14692,6 +14692,59 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 	case "pg_sequence_parameters":
 		// SRF returning sequence parameters — stub returns NULL.
 		return NullDatum, nil
+	case "pg_sequence_last_value":
+		// pg_sequence_last_value(regclass) → int8 (sequence.c): last_value
+		// when is_called, else NULL. NULL as well for another session's
+		// temporary sequence and for an unlogged sequence during recovery,
+		// for the benefit of the pg_sequences view. M0149-0077.
+		if len(x.Args) != 1 || ctx == nil || ctx.Catalog == nil {
+			return NullDatum, nil
+		}
+		v, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || v.IsNull() {
+			return NullDatum, err
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		tbl, ok := verifyHeapamResolveTable(v, im, ctx.CurrentDatabaseOid)
+		if !ok {
+			return NullDatum, nil
+		}
+		if !tbl.IsSequence {
+			// sequence_open → validate_relation_kind (sequence.c):
+			// errdetail_relkind_not_supported.
+			kind := "tables"
+			switch {
+			case tbl.IsMatView:
+				kind = "materialized views"
+			case tbl.View != nil:
+				kind = "views"
+			case tbl.PartitionKey != nil:
+				kind = "partitioned tables"
+			}
+			return Datum{}, &ExecError{Code: "42809", Message: fmt.Sprintf("cannot open relation \"%s\"", tbl.Name),
+				Detail: fmt.Sprintf("This operation is not supported for %s.", kind)}
+		}
+		if tbl.Temp && tbl.TempOwner != "" && tbl.TempOwner != sessionTempOwner(ctx) {
+			return NullDatum, nil
+		}
+		if tbl.Unlogged && ctx.IsStandby {
+			return NullDatum, nil
+		}
+		if tbl.VirtualRows == nil {
+			return NullDatum, nil
+		}
+		rows := tbl.VirtualRows()
+		if len(rows) == 0 || len(rows[0]) < 3 || rows[0][2] != "t" {
+			return NullDatum, nil
+		}
+		n, perr := strconv.ParseInt(rows[0][0], 10, 64)
+		if perr != nil {
+			return NullDatum, nil
+		}
+		return NewIntDatum(n), nil
 
 	// ── Partition metadata functions (M0097-0015) ─────────────────────────
 	case "pg_partition_tree", "pg_partition_ancestors":
