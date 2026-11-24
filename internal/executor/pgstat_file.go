@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/goopg/goopg/internal/utils/activity"
 )
 
 // The permanent statistics file (utils/activity/pgstat.c). goopg writes it in
@@ -433,7 +435,7 @@ func resetAllCumulativeStats() {
 // checkpointer; the other kinds report fixed values.
 func pgStatResetShared(target string, isNull bool) error {
 	if isNull {
-		for _, t := range []string{"checkpointer", "io", "wal"} {
+		for _, t := range []string{"archiver", "checkpointer", "io", "wal"} {
 			if err := pgStatResetShared(t, false); err != nil {
 				return err
 			}
@@ -451,7 +453,11 @@ func pgStatResetShared(target string, isNull bool) error {
 		}
 	case "io":
 		resetIOCumulative()
-	case "archiver", "bgwriter", "recovery_prefetch", "slru":
+	case "archiver":
+		// pgstat_reset_of_kind(PGSTAT_KIND_ARCHIVER): counters to zero,
+		// stats_reset to now. M0149-0019a.
+		activity.ResetArchiverStats(time.Now())
+	case "bgwriter", "recovery_prefetch", "slru":
 	default:
 		return &ExecError{Code: "22023", Message: `unrecognized reset target: "` + target + `"`,
 			Hint: `Target must be "archiver", "bgwriter", "checkpointer", "io", "recovery_prefetch", "slru", or "wal".`}

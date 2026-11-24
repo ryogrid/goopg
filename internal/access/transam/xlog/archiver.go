@@ -163,6 +163,9 @@ func (a *Archiver) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			a.copyLoop(context.Background())
+			// shell_archive_shutdown: the shell archive module's shutdown
+			// callback (elog DEBUG1).
+			a.cfg.Logger.Debug("archiver process shutting down")
 			return
 		case <-a.wake:
 		case <-t.C:

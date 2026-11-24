@@ -16461,11 +16461,23 @@ verify each at HEAD when the task starts.
     - standby2 restores 00000002.history from the archive at promotion \("restored log file … from archive"\), and
       RECOVERYHISTORY / RECOVERYXLOG are removed.
     Recovery commands currently run in the server's working directory, not the data directory.
-- [ ] **M0149-0019 — port recovery/t/020_archive_status.pl**
+- [x] **M0149-0019 — port recovery/t/020_archive_status.pl** \(2026\-11\-25\)
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/020_archive_status.pl` — archiver failure/retry and `.ready`/`.done` on primary and standby.
   Likely prerequisites \(verify at start\): `archive_mode=on|always` on standby, `.done` for streamed segments, `pg_stat_archiver` failure columns, archive status kept across `backup_fs_cold` restore.
+  - TestPort\_Recovery020ArchiveStatusFull ports 020 in three pairings, all passing 3/3 and ungated; inventory row → port.
+    Design docs/design/0100\-0149/0149\-0019\-archive\-status.md.
+  - Blockers found and fixed \(each a direct 020 requirement\):
+    - pg\_wal\_lsn\_diff did not exist \(every replay wait uses it\);
+    - after an XLOG\_SWITCH the replay position stopped at the switch record, not at the next segment boundary
+      \(XLogReadRecord's "pretend it extends to end of segment"\);
+    - a segment restored from the archive was never flushed, so it got no .done / .ready
+      \(KeepFileRestoredFromArchive marks it at once\);
+    - pg\_stat\_reset\_shared\('archiver'\) reset nothing;
+    - log\_min\_messages did not change the server log level, and the archiver's DEBUG1 shutdown message did not
+      exist, nor did the wait for the archiver's last pass at shutdown.
+  Movement: yes — tap 020: all\-goopg and pg18\-primary/goopg\-standbys fatal "Timed out while waiting for xlog replay on standby1" → PASS; 020 PASS on all three pairings \(M0149 contract\)
 - [ ] **M0149-0020 — port recovery/t/024_archive_recovery.pl**
   Kind: impl
   Parent: none

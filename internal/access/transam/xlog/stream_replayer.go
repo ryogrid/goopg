@@ -319,8 +319,20 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 		if applied {
 			sr.applied++
 		}
-		if rec.EndLSN > sr.applyLSN {
-			sr.applyLSN = rec.EndLSN
+		end := rec.EndLSN
+		// XLogReadRecord: "Pretend it extends to end of segment" — after an
+		// XLOG_SWITCH record the replay position is the next segment
+		// boundary (lastReplayedEndRecPtr), so pg_last_wal_replay_lsn()
+		// reaches what pg_switch_wal() returned on the primary without
+		// waiting for the next segment (M0149-0019a).
+		if rec.XLog != nil && isXLogSwitchHeader(rec.XLog.Header) && iter.segSize > 0 {
+			seg := uint64(iter.segSize)
+			if off := end % seg; off != 0 {
+				end += seg - off
+			}
+		}
+		if end > sr.applyLSN {
+			sr.applyLSN = end
 			sr.lastStart = rec.StartLSN
 		}
 		sr.mu.Unlock()

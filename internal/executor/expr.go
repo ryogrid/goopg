@@ -18229,6 +18229,33 @@ case "pg_char_to_encoding":
 		return evalPgWalReplayPause(x.Name, ctx)
 	case "pg_current_wal_lsn", "pg_current_wal_insert_lsn", "pg_current_wal_flush_lsn":
 		return evalPgCurrentWALLSN(name, ctx)
+	case "pg_wal_lsn_diff":
+		// pg_wal_lsn_diff(lsn1 pg_lsn, lsn2 pg_lsn) → numeric: lsn1 - lsn2,
+		// the same function as the pg_lsn - pg_lsn operator (pg_lsn_mi).
+		// STRICT. M0149-0019a.
+		if len(x.Args) != 2 {
+			return Datum{}, &ExecError{Code: "42883", Message: "function pg_wal_lsn_diff does not exist"}
+		}
+		a, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || a.IsNull() {
+			return NullDatum, err
+		}
+		b, err := evalExprSlot(x.Args[1], slot, ctx)
+		if err != nil || b.IsNull() {
+			return NullDatum, err
+		}
+		lu, lerr := parsePgLSN(a.StringValue())
+		ru, rerr := parsePgLSN(b.StringValue())
+		if lerr != nil {
+			return Datum{}, &ExecError{Code: "22P02", Message: fmt.Sprintf("invalid input syntax for type pg_lsn: \"%s\"", a.StringValue())}
+		}
+		if rerr != nil {
+			return Datum{}, &ExecError{Code: "22P02", Message: fmt.Sprintf("invalid input syntax for type pg_lsn: \"%s\"", b.StringValue())}
+		}
+		if lu >= ru {
+			return NewStringDatum(strconv.FormatUint(lu-ru, 10)), nil
+		}
+		return NewStringDatum("-" + strconv.FormatUint(ru-lu, 10)), nil
 	case "pg_walfile_name":
 		// pg_walfile_name(pg_lsn) → text (xlogfuncs.c). M0149-0017.
 		if len(x.Args) != 1 {

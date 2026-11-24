@@ -17972,6 +17972,9 @@ func exprType(e Expr) catalog.Type {
 		case "pg_walfile_name":
 			// pg_walfile_name(pg_lsn) -> text (pg_proc.dat oid 2851). M0149-0017.
 			return catalog.Type{Name: "text"}
+		case "pg_wal_lsn_diff":
+			// pg_wal_lsn_diff(pg_lsn, pg_lsn) -> numeric (pg_proc.dat oid 3165). M0149-0019a.
+			return catalog.Type{Name: "numeric"}
 		case "crc32", "crc32c", "bit_count":
 			// crc32/crc32c(bytea) -> int8 (pg_proc.dat:7954/7957); bit_count(bytea|bit)
 			// -> int8 (pg_proc.dat:1534/4201). Untyped these fall through to TypeOID 25,

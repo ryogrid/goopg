@@ -276,7 +276,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// serverLogLevel follows log_min_messages (applyLogMinMessages): a
+	// debugN setting enables the server's debug messages.
+	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: serverLogLevel}))
 
 	// M0054-0004: optional mutex / block profile activation. The
 	// goroutine, heap, and CPU profiles work without runtime
@@ -917,6 +919,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	applyCheckpointGUCs()
 	cfg.ApplyCheckpointGUCs = func() {
 		applyCheckpointGUCs()
+		applyLogMinMessages(cfg.Registry)
 		// pgarch's SIGHUP sets its latch: a reload (a fixed archive_command)
 		// retries the ready files at once, not at the next minute's wakeup.
 		walArchiver.Wakeup()
@@ -1143,8 +1146,23 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			Logger:     logger,
 		})
 		rt.WAL.SetArchiver(walArchiver)
-		go walArchiver.Run(ctx)
+		archCtx, archCancel := context.WithCancel(ctx)
+		archDone := make(chan struct{})
+		go func() {
+			defer close(archDone)
+			walArchiver.Run(archCtx)
+		}()
+		// The archiver's last pass and shutdown message happen before the
+		// server process exits, as pgarch exits before the postmaster.
+		stopArchiver = func() {
+			archCancel()
+			select {
+			case <-archDone:
+			case <-time.After(30 * time.Second):
+			}
+		}
 	}
+	applyLogMinMessages(registry)
 
 	// A reload that arrived during startup is applied before the server
 	// starts; the server's own SIGHUP handler takes over from here.
@@ -1169,6 +1187,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	runErr := srv.Run(ctx)
+	stopArchiver()
 	cpCancel()
 	if sc != nil {
 		sc.Close()
@@ -1766,3 +1785,22 @@ func runVersion(args []string, stdout, stderr io.Writer) int {
 // walArchiver is the server's WAL archiver (nil before startup and in
 // tools); its methods tolerate nil. M0149-0018a.
 var walArchiver *xlog.Archiver
+
+// stopArchiver ends the WAL archiver and waits for its final pass; a no-op
+// until the archiver starts (M0149-0019a).
+var stopArchiver = func() {}
+
+// serverLogLevel is the server log's threshold.
+var serverLogLevel = new(slog.LevelVar)
+
+// applyLogMinMessages maps log_min_messages onto the server log's level:
+// debug5..debug1 show the server's debug messages (elog DEBUG1..5), anything
+// else keeps them hidden. goopg's INFO lines are PG's LOG messages, which
+// every non-debug setting shows. M0149-0019a.
+func applyLogMinMessages(registry *misc.Registry) {
+	if strings.HasPrefix(strings.ToLower(stringGUC(registry, "log_min_messages", "warning")), "debug") {
+		serverLogLevel.Set(slog.LevelDebug)
+		return
+	}
+	serverLogLevel.Set(slog.LevelInfo)
+}

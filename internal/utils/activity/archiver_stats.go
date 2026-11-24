@@ -68,3 +68,14 @@ func ArchiverStatsRow(null, defaultReset string) []string {
 		strconv.FormatInt(s.failedCount, 10), str(s.lastFailed), ts(s.lastFailedAt), reset,
 	}
 }
+
+// ResetArchiverStats is pg_stat_reset_shared('archiver'): every counter and
+// last_* column cleared, stats_reset set to at.
+func ResetArchiverStats(at time.Time) {
+	archiverStats.mu.Lock()
+	archiverStats.archivedCount, archiverStats.failedCount = 0, 0
+	archiverStats.lastArchived, archiverStats.lastFailed = "", ""
+	archiverStats.lastArchivedAt, archiverStats.lastFailedAt = time.Time{}, time.Time{}
+	archiverStats.statsReset = at
+	archiverStats.mu.Unlock()
+}
