@@ -4562,6 +4562,16 @@ func nodeReferencesOuter(n Node) bool {
 		return exprContainsColumnRef(x.StringExpr) ||
 			exprContainsColumnRef(x.PatternExpr) ||
 			exprContainsColumnRef(x.FlagsExpr)
+	case *BuiltinSRFScan:
+		// `FROM pg_ls_dir(d) f, pg_stat_file(d || '/' || f) s`
+		// (009_twophase): builtinSRFScanOp.Open reads ctx.OuterRows, the
+		// same driver as *FromUnnest. M0149-0016c.
+		for _, a := range x.Args {
+			if exprContainsColumnRef(a) {
+				return true
+			}
+		}
+		return false
 	case *PgOptionsToTable:
 		// `FROM t, LATERAL pg_options_to_table(t.opts)`: the argument is a
 		// plain *ColumnRef against the left sibling, so the wrapping Join has
@@ -7471,6 +7481,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	}
 	if strings.EqualFold(tf.Name, "regexp_split_to_table") {
 		return planFromRegexpSplitToTable(rv, cat, sourceIdx, lateralCtx)
+	}
+	if IsBuiltinSRF(tf.Name) {
+		return planBuiltinSRF(rv, cat, sourceIdx, lateralCtx)
 	}
 	if strings.EqualFold(tf.Name, "generate_subscripts") {
 		return planGenerateSubscripts(rv, sourceIdx, lateralCtx)

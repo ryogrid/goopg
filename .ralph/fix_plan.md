@@ -15968,7 +15968,9 @@ verify each at HEAD when the task starts.
   TestE2E\_OldPrimaryRejoinsAfterPromotion's PG\-primary variant, a table created before the base backup, or after it,
   gave `relation "r" does not exist` on the goopg standby and after its promotion. Filed per the detour guard; not
   selectable ahead of 0015a/b.
-- [ ] **M0149-0016 — port recovery/t/009_twophase.pl**
+- [x] **M0149-0016 — port recovery/t/009_twophase.pl** \(2026\-11\-24\)
+  - Done: TestPort\_Recovery009Twophase passes ungated in all three pairings \(all\-goopg 330 s, PG london 268 s, PG
+    paris 188 s\). Inventory R\-009 → port/pass\_required.
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/009_twophase.pl` — two-phase commit across crashes and primary/standby role swaps.
@@ -15991,6 +15993,7 @@ verify each at HEAD when the task starts.
     - Movement: 009 all\-goopg: 3 not\-ok \+ pg\_subtrans Fatal → only the pg\_subtrans step \(0016c\), 2/2 runs. Two
       E2Es fail at the old HEAD and pass now.
     Kind: impl
+    Movement: yes — tap 009 all\-goopg: 3 not\-ok \+ pg\_subtrans Fatal → only the pg\_subtrans step, 2/2 runs
     Parent: M0149-0016
     PG keeps them in KnownAssignedXids. 009: a RR snapshot taken before COMMIT PREPARED replays must still see 0 rows.
     Resume: recovery snapshots capture the prepared registry xids \(and subxids\) in xip.
@@ -16001,6 +16004,7 @@ verify each at HEAD when the task starts.
     - Movement: 009 all\-goopg final data checks fail → pass, 2 runs; TestE2E\_StandbyCrashKeepsCommitsBeforePrimaryCheckpoint
       fails at the old HEAD and passes now.
     Kind: impl
+    Movement: yes — tap 009 all\-goopg final data checks: 3 rows missing → 0, 2 runs
     Parent: M0149-0016
     009 all\-goopg final check misses row 22 \(subxact row of xact\_009\_10, prepared on london, torn down, committed on
     promoted paris\) and rows 23–24 \(xact\_009\_11, prepared on paris, restored from files on restarted london,
@@ -16023,6 +16027,7 @@ verify each at HEAD when the task starts.
     - Movement: 009 pg18\-london/goopg\-paris: CREATE TABLE panic → \(after 0016g\) only the pg\_subtrans step
       \(0016c\), the same as all\-goopg. goopg\-london/pg18\-paris still PASS; 012 all three pairings PASS.
     Kind: impl
+    Movement: yes — tap 009 pg18\-london: CREATE TABLE panic → past it \(with 0016g\); tap 012 3/3 pairings PASS
     Parent: M0149-0016
     PG's btree name\_ops has opckeytype = cstring \(pg\_opclass.dat\), so PG\-built catalog indexes on name columns
     store cstring keys. goopg's cmpKey\*/buildIndexTuple\* assume 64\-byte NameData.
@@ -16031,6 +16036,7 @@ verify each at HEAD when the task starts.
       and skipped. Unit test TestSelectFSMCandidatePageSkipsBlockPastEOF.
     - Movement: 009 pg18\-london CREATE TABLE on promoted paris: "pg\_type \(rowtype\): short read at block" → OK.
     Kind: impl
+    Movement: yes — tap 009 pg18\-london: "short read at block" → only the pg\_subtrans step remains
     Parent: M0149-0016
     Path\-to\-TAP: 009 pg18\-london ← CREATE TABLE on promoted paris ← FSM names pg\_type block 4069 of 15.
   - [ ] **M0149-0016h — ReadFSMFork misreads a PG\-built FSM file**
@@ -16053,12 +16059,28 @@ verify each at HEAD when the task starts.
     Self\-consistent, so PG nodes read goopg's indexes, but the bytes and pg\_attribute rows differ from PG's. Check
     user indexes on name columns too \(buildUserPGAttributeRowsForIndex\). Owner call: changing the format
     touches every existing goopg cluster.
-  - [ ] **M0149-0016c — pg\_ls\_dir / pg\_stat\_file and pg\_subtrans files**
+  - [x] **M0149-0016c — pg\_ls\_dir / pg\_stat\_file and pg\_subtrans files** \(2026\-11\-24\)
+    - pg\_ls\_dir \(1/3 args\) and pg\_stat\_file \(1/2 args\) in FROM, ported from genfile.c
+      \(convert\_and\_check\_filename, missing\_ok, include\_dot\_dirs, second\-resolution times, creation NULL\).
+      They use a generic BuiltinSRFScan node; the column list is shared by planner and analyzer
+      \(catalog.LookupBuiltinSRFColumns\). The lateral driver detects correlated arguments.
+    - ExtendSUBTRANS: every assigned XID that starts a pg\_subtrans page zeroes the page \(SubtransSLRU.ExtendForXID\).
+    - Movement: 009 all\-goopg and PG\-london: "column s.size does not exist" → PASS; 009 3/3 pairings PASS.
+    Kind: impl
+    Movement: yes — tap 009 3/3 pairings PASS \(all\-goopg and pg18\-london were failing at "column s.size"\)
+    Parent: M0149-0016
+    Path\-to\-TAP: 009 ← pg\_ls\_dir/pg\_stat\_file ← pg\_subtrans pages extended per XID \(2 links\).
+  - [ ] **M0149-0016k — FROM regexp\_split\_to\_table with a lateral argument fails \("column ref f/0 on nil slot"\)**
     Kind: impl
     Parent: M0149-0016
-    009's last step lists pg\_subtrans/ with pg\_ls\_dir \+ pg\_stat\_file and expects the contents to change after
-    pgbench with a prepared xact open. Neither function exists in goopg; pg\_subtrans/ holds a static 0000. Check the
-    detour guard: this is depth 2 \(functions, then SLRU files\).
+    Found while fixing 0016c. nodeReferencesOuter has no FromRegexpSplitToTable case, so `FROM t,
+    regexp\_split\_to\_table\(t.x, ','\)` never gets the per\-outer\-row driver. Audit the other FROM SRF nodes too.
+  - [ ] **M0149-0016l — pg\_ls\_dir / pg\_stat\_file in the select list**
+    Kind: impl
+    Parent: M0149-0016
+    Only the FROM form exists. `SELECT pg\_ls\_dir\('x'\)` errors "function pg\_ls\_dir does not exist", and
+    `\(pg\_stat\_file\('x'\)\).size` does not resolve. The privilege check treats only superusers as members of
+    pg\_read\_server\_files \(has\_privs\_of\_role is not consulted\).
 - [ ] **M0149-0017 — port recovery/t/026_overwrite_contrecord.pl**
   Kind: impl
   Parent: none

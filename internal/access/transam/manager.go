@@ -409,6 +409,9 @@ func (m *Manager) AssignXID(tx Transaction) (storage.TransactionID, error) {
 			"mvcc: database must be vacuumed within %d transactions to prevent XID wraparound",
 			^storage.TransactionID(0)-newXID)
 	}
+	if err := m.extendSubtrans(newXID); err != nil {
+		return 0, err
+	}
 	s.xid.Store(uint64(newXID))
 
 	// M0104-0002: stamp the new top-level XID onto the SSI
@@ -426,6 +429,17 @@ func (m *Manager) AssignXID(tx Transaction) (storage.TransactionID, error) {
 		m.ssiMu.Unlock()
 	}
 	return newXID, nil
+}
+
+// extendSubtrans is GetNewTransactionId's ExtendSUBTRANS call for a newly
+// allocated XID: the pg_subtrans page that will hold it exists before the
+// XID is used. M0149-0016c.
+func (m *Manager) extendSubtrans(xid storage.TransactionID) error {
+	sm := m.subxactMap.Load()
+	if sm == nil {
+		return nil
+	}
+	return sm.ExtendSubtrans(xid)
 }
 
 // FreshSnapshot captures a brand-new "latest" MVCC snapshot reflecting every
@@ -680,6 +694,9 @@ func (m *Manager) AllocateSubXid(parentXid storage.TransactionID) (storage.Trans
 		return 0, fmt.Errorf(
 			"mvcc: database must be vacuumed within %d transactions to prevent XID wraparound",
 			^storage.TransactionID(0)-subXid)
+	}
+	if err := m.extendSubtrans(subXid); err != nil {
+		return 0, err
 	}
 	// Register through RegisterSubXid (not addSubxactEntry directly) so the
 	// subxid→parent link lands in the persistent SubxactMap when one is attached

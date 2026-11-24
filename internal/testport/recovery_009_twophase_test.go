@@ -2,7 +2,6 @@ package testport
 
 import (
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 
@@ -20,12 +19,6 @@ import (
 func TestPort_Recovery009Twophase(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping recovery TAP port in short mode")
-	}
-	// Not yet passing: see M0149-0016 in fix_plan (old-snapshot MVCC on a
-	// hot standby, subtransaction rows after promotion, pg_ls_dir /
-	// pg_stat_file). GOOPG_TAP_009=1 runs it anyway.
-	if os.Getenv("GOOPG_TAP_009") == "" {
-		t.Skip("009 is not passing yet (M0149-0016); set GOOPG_TAP_009=1 to run")
 	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)

@@ -2568,6 +2568,9 @@ func userFuncColumns(cat catalog.Catalog, tf *parser.TableFuncRef, alias string,
 		"regexp_split_to_table", "generate_subscripts":
 		return nil
 	}
+	if _, ok := catalog.LookupBuiltinSRFColumns(tf.Name); ok {
+		return nil
+	}
 	rs := cat.Routines()
 	if rs == nil {
 		return nil
@@ -2581,6 +2584,11 @@ func userFuncColumns(cat catalog.Catalog, tf *parser.TableFuncRef, alias string,
 // tableFuncBaseColumns dispatches on function name for tableFuncColumns,
 // before any WITH ORDINALITY column is appended.
 func tableFuncBaseColumns(tf *parser.TableFuncRef, alias string, colAliases []string) []catalog.Column {
+	// Built-in table functions planned as optimizer.BuiltinSRFScan share
+	// their column list with the planner (M0149-0016c).
+	if bc, ok := catalog.LookupBuiltinSRFColumns(tf.Name); ok {
+		return bc.Columns(alias, colAliases)
+	}
 	switch strings.ToLower(tf.Name) {
 	case "pg_get_publication_tables":
 		names := []string{"relid", "attrs", "qual"}

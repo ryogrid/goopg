@@ -4027,3 +4027,19 @@ type BitmapOr struct {
 
 func (n *BitmapOr) Pos() int       { return n.pos }
 func (n *BitmapOr) Output() Schema { return n.schema }
+
+// BuiltinSRFScan is the FROM-clause plan node for a built-in table function
+// evaluated by a per-function callback in the executor: the arguments are
+// evaluated once per scan (against the lateral outer row when correlated)
+// and the callback returns every row. Func is the function's lower-case
+// name, which also labels EXPLAIN's "Function Scan on <func>". Used for
+// genfile.c's pg_ls_dir and pg_stat_file (M0149-0016c).
+type BuiltinSRFScan struct {
+	pos    int
+	Func   string
+	Args   []Expr
+	schema Schema
+}
+
+func (n *BuiltinSRFScan) Pos() int       { return n.pos }
+func (n *BuiltinSRFScan) Output() Schema { return n.schema }

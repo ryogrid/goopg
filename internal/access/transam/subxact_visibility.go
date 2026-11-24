@@ -88,6 +88,18 @@ func (m *SubxactMap) SetFsyncDisabled(disabled bool) {
 	}
 }
 
+// ExtendSubtrans is ExtendSUBTRANS for the attached SLRU (see
+// SubtransSLRU.ExtendForXID); without persistence it does nothing.
+func (m *SubxactMap) ExtendSubtrans(newestXact storage.TransactionID) error {
+	m.mu.RLock()
+	slru := m.slru
+	m.mu.RUnlock()
+	if slru == nil {
+		return nil
+	}
+	return slru.ExtendForXID(newestXact)
+}
+
 // RestoreFromSLRU reloads every persisted parent link from the on-disk
 // pg_subtrans SLRU into the in-memory map (gap G5 read path / restore-on-restart).
 // It must be called after EnablePersistence; a nil SLRU returns an error so a

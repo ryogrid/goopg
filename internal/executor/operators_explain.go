@@ -4914,7 +4914,7 @@ func execParamOwnerChildren(n optimizer.Node) (children []optimizer.Node, recogn
 		*optimizer.PgAvailableWalSummaries, *optimizer.PgGetCatalogForeignKeys,
 		*optimizer.ScalarFuncScan, *optimizer.PgPartitionTree,
 		*optimizer.PgOptionsToTable, *optimizer.FromRegexpMatches,
-		*optimizer.FromRegexpSplitToTable, *optimizer.VerifyHeapam,
+		*optimizer.FromRegexpSplitToTable, *optimizer.VerifyHeapam, *optimizer.BuiltinSRFScan,
 		*optimizer.WorkTableScan, *optimizer.BitmapIndexScan:
 		return nil, true
 	default:
@@ -9004,6 +9004,8 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		return srfFunctionScanLabel("regexp_matches", "")
 	case *optimizer.FromRegexpSplitToTable:
 		return srfFunctionScanLabel("regexp_split_to_table", "")
+	case *optimizer.BuiltinSRFScan:
+		return srfFunctionScanLabel(n.(*optimizer.BuiltinSRFScan).Func, "")
 	case *optimizer.PgAvailableWalSummaries:
 		if f := n.(*optimizer.PgAvailableWalSummaries).Func; f != "" {
 			return srfFunctionScanLabel(f, "")
