@@ -645,6 +645,13 @@ func (c *Cluster) libpqEnv() string {
 
 // PSQL runs a foreground psql command against this cluster.
 func (c *Cluster) PSQL(args ...string) (util.CommandResult, error) {
+	return c.PSQLTimeout(30*time.Second, args...)
+}
+
+// PSQLTimeout is PSQL with a caller-chosen time limit — the TAP harness
+// passes PostgreSQL::Test::Utils' $timeout_default (180 s), which upstream's
+// psql calls run under.
+func (c *Cluster) PSQLTimeout(timeout time.Duration, args ...string) (util.CommandResult, error) {
 	host, port, err := splitHostPort(c.listenAddr)
 	if err != nil {
 		return util.CommandResult{}, err
@@ -656,7 +663,7 @@ func (c *Cluster) PSQL(args ...string) (util.CommandResult, error) {
 		Args:    base,
 		Dir:     c.repoRoot,
 		Env:     []string{"PGPASSWORD=", c.libpqEnv()},
-		Timeout: 30 * time.Second,
+		Timeout: timeout,
 	})
 }
 

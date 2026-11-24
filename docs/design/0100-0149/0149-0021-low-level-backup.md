@@ -1,8 +1,12 @@
 # 0149-0021 — Port recovery/t/042\_low\_level\_backup.pl
 
-Status: done \(2026\-11\-25\). `TestPort_Recovery042LowLevelBackupFull`
-\(`internal/testport/recovery_042_low_level_backup_test.go`\) ports 042 in three pairings, all passing and ungated:
-all\-goopg; a PG 18.3 primary with goopg recovery nodes; a goopg primary with PG 18.3 recovery nodes.
+Status: reopened \(2026\-11\-25\). The port first restored replica\_success with recovery.signal, but Cluster.pm
+init\_from\_backup's has\_restoring defaults to `standby => 1`. With the faithful standby only the goopg\-primary
+pairing passes; a goopg standby restored from backup\_label never accepts connections \(M0149\-0021a\). The test is
+gated by `GOOPG_TAP_042` again. Everything below landed and stays: it is PG behaviour archive recovery and PG
+restore nodes use. `TestPort_Recovery042LowLevelBackupFull`
+\(`internal/testport/recovery_042_low_level_backup_test.go`\) has three pairings: all\-goopg, a PG 18.3 primary with
+goopg recovery nodes, and a goopg primary with PG 18.3 recovery nodes.
 
 042 takes a backup with pg\_backup\_start, a file copy and pg\_backup\_stop. It copies pg\_control last, after a
 checkpoint that follows the creation of a `canary` table. Without backup\_label the copy recovers from pg\_control's
@@ -34,6 +38,8 @@ there. The gaps:
 
 Not done:
 
+- M0149\-0021a: backup\_label on the standby path \(startStandby, the archive feeder and stream replayer\), so a
+  standby restored from a low\-level backup with an empty pg\_wal replays from the label and becomes consistent;
 - backup\_label in crash recovery \(no recovery.signal\) and on a standby \(standby.signal\): only archive recovery
   reads it;
 - PG renames backup\_label as recovery starts and copies the label's checkpoint into pg\_control; goopg renames

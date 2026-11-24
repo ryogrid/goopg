@@ -2,7 +2,6 @@ package testport
 
 import (
 	"fmt"
-	"os"
 	"testing"
 
 	"github.com/goopg/goopg/internal/testutil/tapnode"
@@ -16,15 +15,13 @@ import (
 // recovery — up to recovery_target_lsn with recovery_target_action = pause,
 // where it must be reachable and report the target as replayed. It runs in
 // three pairings: all-goopg, a PG 18.3 primary with a goopg restore node,
-// and a goopg primary with a PG 18.3 restore node.
-//
-// Gated by GOOPG_TAP_045=1 until it passes (M0149-0022).
+// and a goopg primary with a PG 18.3 restore node. The restore node is a
+// standby (Cluster.pm init_from_backup has_restoring: standby => 1), so it
+// waits for more WAL at the end of the archive instead of ending recovery
+// (M0149-0022).
 func TestPort_Recovery045ArchiveRestartpointFull(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping recovery TAP port in short mode")
-	}
-	if os.Getenv("GOOPG_TAP_045") == "" {
-		t.Skip("045 re-port is not passing yet (M0149-0022); set GOOPG_TAP_045=1 to run")
 	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)
@@ -78,7 +75,7 @@ func runArchiveRestartpoint(t *testing.T, walSegsize int, nodePrimary *tapnode.N
 
 	// Archive recovery
 	nodeRestore := fromBackup("restore", bkp, nodePrimary)
-	nodeRestore.EnableRestoring(nodePrimary, false)
+	nodeRestore.EnableRestoring(nodePrimary, true) // init_from_backup has_restoring: standby => 1
 	nodeRestore.AppendConf(fmt.Sprintf("recovery_target_lsn = '%s'", untilLSN))
 	nodeRestore.AppendConf("recovery_target_action = pause")
 	nodeRestore.AppendConf(fmt.Sprintf("max_wal_size = %d", 2*walSegsize))

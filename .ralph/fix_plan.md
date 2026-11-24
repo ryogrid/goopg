@@ -16484,18 +16484,25 @@ verify each at HEAD when the task starts.
   Upstream: `postgres/src/test/recovery/t/024_archive_recovery.pl` — archive recovery refusing WAL generated with `wal_level=minimal`.
   Likely prerequisites \(verify at start\): `XLOG_PARAMETER_CHANGE` record + PG FATAL text, restart with changed `wal_level`.
   - 2026\-11\-25 \(done\): TestPort\_Recovery024ArchiveRecoveryFull passes on all three pairings \(3 of 3 runs\), ungated; inventory row 024 → port. XLogReportParameters at startup, the wal\_level=minimal FATAL, archive recovery replays from the pg\_control redo. Design: docs/design/0100\-0149/0149\-0020\-archive\-recovery\-wal\-level.md.
-- [x] **M0149-0021 — port recovery/t/042_low_level_backup.pl**
+- [ ] **M0149-0021 — port recovery/t/042_low_level_backup.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/042_low_level_backup.pl` — `pg_backup_start`/`pg_backup_stop` backups restored with/without `backup_label`.
   Likely prerequisites \(verify at start\): non-exclusive low-level backup returning PG-exact `backup_label`/`tablespace_map` text, recovery from caller-written `backup_label`, the "missing backup\_label" behaviour.
   - 2026\-11\-25 \(done\): TestPort\_Recovery042LowLevelBackupFull passes on all three pairings \(3 of 3 runs\), ungated; inventory row 042 → port. pg\_backup\_stop\(\) in FROM, XLOG\_BACKUP\_END \+ history file \+ archive wait, archive recovery from backup\_label, replayed commit status and catalog refresh. Design: docs/design/0100\-0149/0149\-0021\-low\-level\-backup.md.
-- [ ] **M0149-0022 — port recovery/t/045_archive_restartpoint.pl**
+  - 2026\-11\-25 \(REOPENED\): the 042 port closed in d45d3a8b0 used recovery.signal for replica\_success, but Cluster.pm init\_from\_backup has\_restoring defaults to standby => 1. With the faithful standby, goopg\-primary\-pg18\-recovery passes and both goopg\-recovery pairings fail: "the database system is not yet accepting connections". The test is gated again \(GOOPG\_TAP\_042\) and the inventory row is back to failed. The archive\-recovery pieces of d45d3a8b0 \(pg\_backup\_stop in FROM, XLOG\_BACKUP\_END, history file, archive wait, backup\_label in archive recovery, commit stamping and catalog refresh\) stay: they are PG behaviour 042's PG\-restore pairing needs and archive recovery uses.
+- [ ] **M0149-0021a — a goopg standby restored from backup\_label \(empty pg\_wal\) reaches consistency and serves reads**
+  Kind: impl
+  Parent: M0149-0021
+  - Path\-to\-TAP: 042 \(goopg recovery pairings\) ← a goopg standby \(standby.signal \+ restore\_command\) starting from backup\_label replays from the label's redo, reaches consistency and accepts read\-only connections ← M0149\-0021.
+  - Start: the standby path \(startStandby, runArchiveFeeder, StreamReplayer in cmd/goopg\) ignores backup\_label; the feeder starts at the writer's position \(0 for an empty pg\_wal\); the consistency point comes from pg\_control \(recoveryConsistencyPoint\), whose checkpoint is later than the WAL the label needs.
+- [x] **M0149-0022 — port recovery/t/045_archive_restartpoint.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/045_archive_restartpoint.pl` — restartpoints during archive recovery.
   Likely prerequisites \(verify at start\): `CreateRestartPoint` during archive recovery, segment recycling/removal on the recovering node.
   - 2026\-11\-25: ported as TestPort\_Recovery045ArchiveRestartpointFull \(gated GOOPG\_TAP\_045\). Path\-to\-TAP links, each a direct requirement of the one 045 assertion \(the restore node reachable and paused at the target\): goopg cannot init with `--wal-segsize 1` \(0022a\); a goopg restore node shuts down at recovery\_target\_action = pause \(0022b\); a PG 18.3 restore of the goopg primary never becomes ready \(0022c\). PG oracle note: upstream 045 needs a record in the target's segment — on PG the bgwriter's RUNNING\_XACTS \(LogStandbySnapshot, every 15 s\) lands there during the 320 checkpoints and the final pg\_switch\_wal archives it; a short loop makes real PG FATAL "recovery ended before configured recovery target was reached" too.
+  - 2026\-11\-25 \(done\): TestPort\_Recovery045ArchiveRestartpointFull passes on all three pairings \(3 of 3 runs, plus 7 of 7 goopg\-primary\-pg18\-restore\), ungated; inventory row 045 → port. The restore node is a standby — Cluster.pm init\_from\_backup has\_restoring defaults to standby => 1 \(verified by running the real upstream 045 with PG 18.3: "entering standby mode", "waiting for WAL to become available"\) — so at the end of the archive it waits for WAL and pg\_last\_wal\_replay\_lsn\(\) reaches the boundary after the last XLOG\_SWITCH. The port first used recovery.signal, which made 0022b and 0022c look like 045 blockers; they are not. The only blocker was 0022a. Harness: tapnode psql runs under PostgreSQL::Test::Utils' $timeout\_default \(180 s, PG\_TEST\_TIMEOUT\_DEFAULT\) instead of cluster.PSQL's 30 s — the 320\-checkpoint loop takes ~30 s on goopg.
 - [x] **M0149-0022a — configurable WAL segment size \(initdb --wal-segsize, wal\_segment\_size from pg\_control\)**
   Kind: impl
   Parent: M0149-0022
@@ -16503,14 +16510,12 @@ verify each at HEAD when the task starts.
   - 2026\-11\-25 \(done\): `goopg init --wal-segsize` \(PG's power\-of\-two validation\) writes xlog\_seg\_size into pg\_control, a bootstrap segment of that size \(checkpoint at segment 1 \+ 40\) and min/max\_wal\_size via pretty\_wal\_size. initdb.Open adopts xlog\_seg\_size as the process\-wide `xlog.WALSegmentSize\(\)` \(PG's wal\_segment\_size global\); segment naming \(FormatSegmentNameTLI\), highestLocalSegment and every segSize==0 fallback use it; SHOW wal\_segment\_size reports it. A 1 MB cluster runs, restarts, serves pg\_basebackup and archive recovery of PG 1 MB WAL.
 - [ ] **M0149-0022b — recovery\_target\_action = pause: stay in recovery and serve hot\-standby reads at the target**
   Kind: impl
-  Parent: M0149-0022
-  - Path\-to\-TAP: 045 \(goopg restore pairings\) ← pause at the target with read\-only connections and pg\_last\_wal\_replay\_lsn\(\) ← M0149\-0022.
+  Parent: none \(found while porting 045; NOT a 045 blocker — 045's restore node is a standby\)
   - goopg's start\-time archive recovery runs before the listener and turns pause into a shutdown \(shutdownAtRecoveryTarget, cmd/goopg/standby.go\). PG: recoveryPausesHere at the end of recovery, "pausing at the end of recovery" / HINT "Execute pg\_wal\_replay\_resume\(\) to promote.", ready for read\-only connections; pg\_wal\_replay\_resume\(\) then promotes. Verified oracle: PG replays to 0/1E00060 and reports pg\_is\_in\_recovery = t, pg\_is\_wal\_replay\_paused = t.
-- [ ] **M0149-0022c — a PG 18.3 node restoring a goopg primary's 045 archive never becomes ready**
+- [ ] **M0149-0022c — the bgwriter's periodic standby snapshot \(LogStandbySnapshot every LOG\_SNAPSHOT\_INTERVAL\_MS\)**
   Kind: impl
-  Parent: M0149-0022
-  - Path\-to\-TAP: 045 \(goopg\-primary\-pg18\-restore\) ← PG reaches the target in the archive ← M0149\-0022.
-  - Not diagnosed. First check whether the goopg primary leaves any record in the target's segment \(PG's bgwriter LogStandbySnapshot cadence; ShutdownXLOG's RequestXLogSwitch with archiving\), then read the PG restore node's log.
+  Parent: none \(found while porting 045; NOT a 045 blocker\)
+  - Diagnosed 2026\-11\-25: an idle goopg primary writes no XLOG\_RUNNING\_XACTS between checkpoints. PG's bgwriter writes one every 15 s when important WAL was written since the last \(bgwriter.c, GetLastImportantRecPtr\), so a hot standby reaches a consistent snapshot without a checkpoint, and WAL ending at a switch gets a record in the next segment. A tested implementation \(Checkpointer.LogStandbySnapshot \+ a 1 s ticker goroutine in cmd/goopg/main.go, compared with the snapshot's own end because goopg has no XLOG\_MARK\_UNIMPORTANT\) was written and set aside as off\-path: it reproduced PG's oracle output \(RUNNING\_XACTS at 0/1500028, PG restore paused at 0/1500060\).
 - [ ] **M0149-0093 — a TEMPORARY physical slot survives as a permanent one**
   Kind: impl
   Parent: none \(found while porting 045; not a 045 assertion\)

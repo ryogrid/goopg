@@ -1,8 +1,11 @@
 # 0149-0022 — Configurable WAL segment size \(045 prerequisite\)
 
-Status: 0022a done \(2026\-11\-25\); 0022b and 0022c open. The 045 port
-`TestPort_Recovery045ArchiveRestartpointFull` \(`internal/testport/recovery_045_archive_restartpoint_test.go`\) is
-gated by `GOOPG_TAP_045` until all three are done.
+Status: done \(2026\-11\-25\). `TestPort_Recovery045ArchiveRestartpointFull`
+\(`internal/testport/recovery_045_archive_restartpoint_test.go`\) passes on all three pairings and is ungated. Its only
+blocker was 0022a. The restore node is a standby: Cluster.pm init\_from\_backup's has\_restoring defaults to
+`standby => 1`, as the real upstream run shows \("entering standby mode", "waiting for WAL to become available"\). At
+the end of the archive it waits for more WAL, and pg\_last\_wal\_replay\_lsn\(\) reaches the segment boundary after the
+last XLOG\_SWITCH.
 
 045 initialises its primary with 1 MB WAL segments \(`--wal-segsize 1`\), so 320 checkpoint\-and\-switch rounds archive
 320 small segments. goopg could only run 16 MB segments.
@@ -24,15 +27,20 @@ gated by `GOOPG_TAP_045` until all three are done.
   segments at 1 MB. It now parses the absolute segment number.
 - **SHOW wal\_segment\_size** reports the size from pg\_control \(`1MB`\).
 
-## 0022b, 0022c — open
+## Not 045 blockers \(filed\)
 
-- 0022b: goopg runs start\-time archive recovery before its listener and turns `recovery_target_action = pause`
-  into a shutdown. PG instead pauses at the end of recovery ready for read\-only connections, with
-  pg\_is\_wal\_replay\_paused\(\) true, and pg\_wal\_replay\_resume\(\) promotes.
-- 0022c: a PG 18.3 node restoring a goopg primary's 045 archive never becomes ready; not yet diagnosed.
-- Oracle note: 045 needs a record in the target's segment. On PG that is the bgwriter's RUNNING\_XACTS
-  \(LogStandbySnapshot every 15 s\), written during the 320 checkpoints and archived by the final pg\_switch\_wal. A
-  short loop makes real PG fail with "recovery ended before configured recovery target was reached" too.
+The port first restored with recovery.signal, so two gaps looked like 045 blockers. Neither is one. Both stay
+filed as PG behaviour goopg lacks:
+
+- 0022b: goopg runs start\-time archive recovery before its listener and turns `recovery_target_action = pause` into
+  a shutdown. PG instead pauses at the end of recovery ready for read\-only connections, and
+  pg\_wal\_replay\_resume\(\) promotes.
+- 0022c: an idle goopg primary writes no XLOG\_RUNNING\_XACTS between checkpoints. PG's bgwriter writes one every
+  15 s \(LOG\_SNAPSHOT\_INTERVAL\_MS\) after important WAL. With archive recovery to a target at a switch boundary, this
+  is what puts a record in the target's segment; without it real PG fails too, with "recovery ended before
+  configured recovery target was reached".
+- Harness: tapnode's psql now runs under PostgreSQL::Test::Utils' $timeout\_default \(180 s\). cluster.PSQL's 30 s
+  cut off the 320\-checkpoint loop intermittently.
 
 Not done in 0022a: pg\_settings' wal\_segment\_size row is still the static 16777216, and initdb writes
 min/max\_wal\_size only when `--wal-segsize` is given \(PG always writes them\).

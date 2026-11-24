@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -203,7 +204,7 @@ func (n *Node) PSQL(db, sqlText string) (string, error) {
 	}
 	args := []string{"-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1", "-d", db, "-f", f.Name()}
 	if n.g != nil {
-		res, err := n.g.PSQL(args...)
+		res, err := n.g.PSQLTimeout(TimeoutDefault(), args...)
 		if err != nil {
 			return "", err
 		}
@@ -333,4 +334,14 @@ func SnapshotDir(t testing.TB, dir string) (restore func()) {
 			t.Fatalf("tapnode: restore %s: %v\n%s", dir, err, out)
 		}
 	}
+}
+
+// TimeoutDefault is PostgreSQL::Test::Utils' $timeout_default:
+// PG_TEST_TIMEOUT_DEFAULT seconds, 180 when unset — the limit upstream's
+// psql calls run under.
+func TimeoutDefault() time.Duration {
+	if v, err := strconv.Atoi(os.Getenv("PG_TEST_TIMEOUT_DEFAULT")); err == nil && v > 0 {
+		return time.Duration(v) * time.Second
+	}
+	return 180 * time.Second
 }
