@@ -2804,6 +2804,9 @@ func selectPrivilegeCheckRole(ctx *Context, roleSet bool, role string) string {
 }
 
 func (o *insertOp) Open(ctx *Context) error {
+	if err := preventCommandDuringRecovery(ctx, "INSERT"); err != nil {
+		return err
+	}
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "Insert requires storage handles in Context"}
 	}
@@ -5047,6 +5050,9 @@ func (o *updateOp) appendUpdateRetRowWithFrom(newRow Row, fromPortion Row) {
 }
 
 func (o *updateOp) Open(ctx *Context) error {
+	if err := preventCommandDuringRecovery(ctx, "UPDATE"); err != nil {
+		return err
+	}
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "Update requires storage handles in Context"}
 	}
@@ -6949,6 +6955,9 @@ func (o *deleteOp) appendDeleteRetRowWithUsing(oldRow Row, usingPortion Row) {
 }
 
 func (o *deleteOp) Open(ctx *Context) error {
+	if err := preventCommandDuringRecovery(ctx, "DELETE"); err != nil {
+		return err
+	}
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "Delete requires storage handles in Context"}
 	}

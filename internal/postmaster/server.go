@@ -1493,6 +1493,12 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	if isSuperuserRoleName(user) {
 		_ = sess.SetInternal("is_superuser", "on")
 	}
+	// in_hot_standby (GUC_REPORT): on while the server is a hot standby,
+	// which is what libpq's target_session_attrs reads from the startup
+	// ParameterStatus block to tell a standby from a primary. M0149-0077b.
+	if s.cfg.IsStandby != nil && s.cfg.IsStandby() {
+		_ = sess.SetInternal("in_hot_standby", "on")
+	}
 
 	// Apply generic startup-packet GUC settings. These values are the
 	// session-start values (PG's PGC_S_CLIENT source) and become the per-session

@@ -134,6 +134,9 @@ func (o *upsertOp) appendUpsertRetRow(row Row) {
 }
 
 func (o *upsertOp) Open(ctx *Context) error {
+	if err := preventCommandDuringRecovery(ctx, "INSERT"); err != nil {
+		return err
+	}
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "Insert requires storage handles in Context"}
 	}

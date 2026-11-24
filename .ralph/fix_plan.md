@@ -16181,7 +16181,15 @@ verify each at HEAD when the task starts.
     Parent: M0149-0077
     Path\-to\-TAP: 001 "check streamed sequence content on standby 1/2" ← sequence state lives in memory
     \(Table.VirtualRows\) and is not rebuilt from replayed WAL \(seq\_redo, sequence.c\).
-  - [ ] **M0149-0077b — goopg standby is not read\-only**
+  - [x] **M0149-0077b — goopg standby is not read\-only** \(2026\-11\-24\)
+    - INSERT, UPDATE, DELETE, MERGE and upsert on a hot standby fail "cannot execute <CMD> in a read\-only transaction"
+      \(25006\), as ExecCheckXactReadOnly does while recovery forces XactReadOnly \(preventCommandDuringRecovery\).
+      The goopg standby had applied the INSERT.
+    - A standby session reports in\_hot\_standby=on in its startup ParameterStatus, which libpq's
+      target\_session\_attrs reads.
+    - Regression: postmaster package; 007, 009, 012, 026, 039 and the physical/hot\-standby/failover/standby/prepared
+      E2Es PASS.
+    Movement: yes — tap 001 all\-goopg: "read\-only queries on standby 1/2" not ok → ok; target\_session\_attrs routing now connects to the right node in all 17 cases \(13 still not ok only on SHOW port, 0077c\)
     Kind: impl
     Parent: M0149-0077
     Path\-to\-TAP: 001 "read\-only queries on standby 1/2" \(INSERT exits 0, want 3\); the target\_session\_attrs
@@ -16208,6 +16216,13 @@ verify each at HEAD when the task starts.
     Path\-to\-TAP: 001 pg18\-primary/goopg\-standbys: standby\_2 never appears in standby\_1's pg\_stat\_replication
     \(the first cascaded catch\-up wait times out\).
 
+- [ ] **M0149-0084 — read\-only transactions do not restrict DML on a primary**
+  Kind: impl
+  Parent: none \(found while fixing M0149-0077b; not a 001 requirement\)
+  `BEGIN READ ONLY; INSERT …` and `SET default_transaction_read_only = on; INSERT …` succeed on goopg. PG raises
+  "cannot execute INSERT in a read\-only transaction" \(ExecCheckXactReadOnly / PreventCommandIfReadOnly, also for
+  DDL\). `SHOW transaction_read_only` is unrecognised. On a standby, DDL is not refused either, and in\_hot\_standby
+  is not re\-reported to existing sessions at promotion.
 - [ ] **M0149-0018 — port recovery/t/002_archiving.pl**
   Kind: impl
   Parent: none
