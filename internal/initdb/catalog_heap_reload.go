@@ -1958,17 +1958,7 @@ func reloadSequencesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 		// USER-DATA location base/<cat.DBOID()> (the session's physical
 		// database), not the catalog-heap base/1 + mirror scheme.
 		seqFile := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: seqrelid, Fork: storage.MainFork}
-		last, called := int64(0), false
-		haveCounter := false
-		if n, nerr := mgr.NBlocks(seqFile); nerr == nil && n > 0 {
-			if rerr := mgr.ReadBlock(seqFile, 0, page); rerr == nil {
-				if ht, herr := storage.PageGetHeapTuple(page, 1); herr == nil && len(ht.Data) >= 17 {
-					last = int64(binary.LittleEndian.Uint64(ht.Data[0:8]))
-					called = ht.Data[16] != 0
-					haveCounter = true
-				}
-			}
-		}
+		last, logCnt, called, haveCounter := readSequencePageTuple(mgr, seqFile, page)
 		p := xlog.SequenceStatePayload{
 			Name:      name,
 			Start:     d[2].Int,
@@ -2015,6 +2005,11 @@ func reloadSequencesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			}
 		}
 		executor.RestoreSequenceFromWAL(p)
+		if haveCounter {
+			// SELECT * FROM seq shows the page as PG does, log_cnt included
+			// (M0149-0077a).
+			executor.SetSequencePageState(name, last, logCnt, called, dbOid)
+		}
 		executor.CreateSequenceCatalogRelation(cat, parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name}, name, dbOid)
 		// Restore the owning column's serial spelling (heap-reloaded columns
 		// read back as the base integer type).
@@ -3684,6 +3679,49 @@ func reloadUserExtensionsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemo
 	return nil
 }
 
+// readSequencePageTuple reads a sequence relation's block 0 tuple
+// (FormData_pg_sequence_data: last_value int8, log_cnt int8, is_called
+// bool), as read_seq_tuple does.
+func readSequencePageTuple(mgr *storage.Manager, rel storage.RelFileNode, page storage.Page) (last, logCnt int64, called, ok bool) {
+	if n, err := mgr.NBlocks(rel); err != nil || n == 0 {
+		return 0, 0, false, false
+	}
+	if err := mgr.ReadBlock(rel, 0, page); err != nil {
+		return 0, 0, false, false
+	}
+	ht, err := storage.PageGetHeapTuple(page, 1)
+	if err != nil || len(ht.Data) < 17 {
+		return 0, 0, false, false
+	}
+	return int64(binary.LittleEndian.Uint64(ht.Data[0:8])), int64(binary.LittleEndian.Uint64(ht.Data[8:16])), ht.Data[16] != 0, true
+}
+
+// RefreshSequenceAfterReplay is seq_redo's visible effect on a running
+// standby: after XLOG_SEQ_LOG rebuilt the sequence page of rel, the
+// sequence's counter is taken from that page, so SELECT * FROM seq and
+// pg_sequence_last_value show what PG's standby reads from the buffer. A
+// sequence not registered yet (created in a transaction still open) is
+// picked up by the catalog refresh at its commit. M0149-0077a.
+func (r *Runtime) RefreshSequenceAfterReplay(rel storage.RelFileNode) {
+	cat, ok := r.Catalog.(*catalog.InMemory)
+	if !ok || cat == nil || r.StorageMgr == nil {
+		return
+	}
+	tbl, dbOid, ok := cat.LookupTableByOIDAllDBs(rel.RelOid)
+	if !ok || tbl == nil || !tbl.IsSequence {
+		return
+	}
+	name := tbl.Name
+	if tbl.Schema != "" && tbl.Schema != "public" {
+		name = tbl.Schema + "." + tbl.Name
+	}
+	page := make(storage.Page, storage.BlockSize)
+	rel.Fork = storage.MainFork
+	if last, logCnt, called, ok := readSequencePageTuple(r.StorageMgr, rel, page); ok {
+		executor.SetSequencePageState(name, last, logCnt, called, dbOid)
+	}
+}
+
 // RefreshCatalogAfterReplay is the running standby's relcache invalidation:
 // after a replayed commit changed database dbOid's system catalogs, it reloads
 // that database's user tables from the replayed pg_class/pg_attribute heaps,
@@ -3701,7 +3739,12 @@ func (r *Runtime) RefreshCatalogAfterReplay(dbOid uint32) error {
 	}
 	heapDB := storage.StorageDBOid(dbOid)
 	if heapDB == storage.StorageDBOid(cat.DBOID()) {
-		return loadUserTablesFromHeapForDBMode(r.StorageMgr, cat, clog, cat.DBOID(), 0, true)
+		if err := loadUserTablesFromHeapForDBMode(r.StorageMgr, cat, clog, cat.DBOID(), 0, true); err != nil {
+			return err
+		}
+		// Sequences the primary created register here, with their counters
+		// from the replayed pages (M0149-0077a).
+		return reloadSequencesFromHeap(r.StorageMgr, cat, clog)
 	}
 	return loadUserTablesFromHeapForDBMode(r.StorageMgr, cat, clog, dbOid, dbOid, true)
 }

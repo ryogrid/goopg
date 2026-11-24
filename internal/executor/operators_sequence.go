@@ -55,12 +55,21 @@ type seqState struct {
 	identityKind byte
 	logHorizon   int64
 	hasLogged    bool
+
+	// pageLogCnt is the on-page log_cnt, valid while hasPageLogCnt: after
+	// the counter was restored from the sequence page (startup reload, or
+	// a standby replaying XLOG_SEQ_LOG) SELECT * FROM seq shows the page
+	// as PG's read_seq_tuple does, until this server advances or sets the
+	// sequence itself. Guarded by mu. M0149-0077a.
+	pageLogCnt    int64
+	hasPageLogCnt bool
 }
 
 // nextVal atomically advances the sequence and returns the new value.
 func (s *seqState) nextVal() (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.hasPageLogCnt = false
 	cur := s.current.Load()
 	// current is the sequence page's last_value and called its is_called,
 	// as in PG (M0149-0003): a sequence not yet called hands out
@@ -286,6 +295,9 @@ func SequenceRowData(name string, dbOid ...uint32) (lastValue int64, logCnt int6
 	lastValue = s.current.Load()
 	if isCalled {
 		logCnt = 32
+	}
+	if s.hasPageLogCnt {
+		logCnt = s.pageLogCnt
 	}
 	s.mu.Unlock()
 	return lastValue, logCnt, isCalled, true
@@ -645,8 +657,32 @@ func SetSequenceCurrentValue(name string, val int64, called bool, dbOid ...uint3
 		return false
 	}
 	s := v.(*seqState)
+	s.mu.Lock()
+	s.hasPageLogCnt = false
+	s.mu.Unlock()
 	s.current.Store(val)
 	s.called.Store(called)
+	return true
+}
+
+// SetSequencePageState sets a sequence's counter from its on-disk page
+// tuple (last_value, log_cnt, is_called), as the startup reload and a
+// standby's XLOG_SEQ_LOG replay see it. SELECT * FROM seq then shows the
+// page, the way PG reads the sequence buffer (read_seq_tuple). It returns
+// false when the sequence is not registered. M0149-0077a.
+func SetSequencePageState(name string, lastValue, logCnt int64, called bool, dbOid ...uint32) bool {
+	v, ok := seqRegistry.Load(seqKey(name, resolveSeqDBOid(dbOid)))
+	if !ok {
+		return false
+	}
+	s := v.(*seqState)
+	s.mu.Lock()
+	s.current.Store(lastValue)
+	s.called.Store(called)
+	s.pageLogCnt, s.hasPageLogCnt = logCnt, true
+	s.logHorizon = s.loggedHorizonLocked(lastValue, called)
+	s.hasLogged = true
+	s.mu.Unlock()
 	return true
 }
 

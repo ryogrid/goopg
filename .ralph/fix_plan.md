@@ -16140,6 +16140,9 @@ verify each at HEAD when the task starts.
     - Regression: 039 and every recovery TAP and E2E PASS except 018 \(known, owner\-gated 0006b\); xlog under
       \-race PASS.
     Movement: yes — tap 026 all\-goopg and goopg\-primary/pg18\-standby: log assertion failing → PASS 4/4 each
+    - pgbench smoke A/B \(c=2\), new layout vs old pad layout: TPC\-B 303/372/308 vs 362 tps; simple update
+      294/299/281 vs 336; select only 7737/7437/7670 vs 7254. Within fsync noise: a 30 s smoke crosses about one
+      segment boundary.
     Kind: impl
     Parent: M0149-0017
     Path\-to\-TAP: 026 goopg\-primary pairings ← "successfully skipped missing contrecord" needs the 600 kB message to
@@ -16161,7 +16164,19 @@ verify each at HEAD when the task starts.
     Design docs/design/0100\-0149/0149\-0077\-stream\-rep\-report.md.
     - Path\-to\-TAP, fixed: 001 ← "function pg\_sequence\_last\_value does not exist" \(fatal\): implemented.
     Movement: yes — tap 001 all\-goopg: fatal at the unlogged\-sequence check → runs to the walsender pg\_stat\_io wait \(25 of \~47 assertions evaluated, 19 not ok\)
-  - [ ] **M0149-0077a — goopg standby shows no sequence state \(SELECT \* FROM seq1 is empty\)**
+  - [x] **M0149-0077a — goopg standby shows no sequence state \(SELECT \* FROM seq1 is empty\)** \(2026\-11\-24\)
+    - Two gaps:
+      - the heap catalog reload registers a relkind S relation first, and CreateSequenceCatalogRelation then bailed
+        out on "already exists", so the sequence had no reader at all;
+      - nothing updated the sequence registry from replayed XLOG\_SEQ\_LOG.
+    - Now: the reader is wired onto the existing relation; a StreamReplayer sequence hook
+      \(Runtime.RefreshSequenceAfterReplay\) takes the counter from the replayed page; the standby's catalog refresh
+      reloads sequences.
+    - SELECT \* FROM seq shows the page \(last\_value, log\_cnt, is\_called\) as read\_seq\_tuple does, until this
+      server's own nextval/setval \(SetSequencePageState\). That also holds after a primary restart.
+    - Regression: 005 flaked 1 of 2 alone \(0013a timing\); 007, 009, 012, 026 and the physical/hot\-standby/failover
+      E2Es PASS.
+    Movement: yes — tap 001 all\-goopg: "check streamed sequence content on standby 1/2" not ok → ok \(2 assertions\)
     Kind: impl
     Parent: M0149-0077
     Path\-to\-TAP: 001 "check streamed sequence content on standby 1/2" ← sequence state lives in memory

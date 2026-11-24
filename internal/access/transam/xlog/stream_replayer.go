@@ -54,6 +54,7 @@ type StreamReplayer struct {
 	onPreparedFinish func(xid storage.TransactionID)
 	// onCatalogReplay / catalogDBs: the live catalog refresh (M0149-0010a).
 	onCatalogReplay func(dbOid uint32)
+	onSeqReplay     func(rel storage.RelFileNode) // M0149-0077a
 	catalogDBs      map[uint32]struct{}
 	// Recovery pause / apply delay (stream_replayer_pause.go). M0149-0013.
 	applyDelay       atomic.Pointer[func() time.Duration]
@@ -139,6 +140,15 @@ func (sr *StreamReplayer) SetTwoPhaseReplayHooks(prepare func(endLSN uint64, sta
 // invalidation PG's commit records carry (XACT_XINFO_HAS_INVALS): the hook
 // refreshes the running standby's catalog so relations the primary created
 // become visible without a restart. Must be called before Run. M0149-0010a.
+// SetSequenceReplayHook installs fn, called after an XLOG_SEQ_LOG record
+// rebuilt the page of sequence relation rel (seq_redo), so the server's
+// sequence state follows the replayed page. M0149-0077a.
+func (sr *StreamReplayer) SetSequenceReplayHook(fn func(rel storage.RelFileNode)) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	sr.onSeqReplay = fn
+}
+
 func (sr *StreamReplayer) SetCatalogReplayHook(fn func(dbOid uint32)) {
 	sr.onCatalogReplay = fn
 }
@@ -254,6 +264,12 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 		// because the mvcc.Manager has its own lock; holding both would
 		// risk a deadlock with concurrent snapshot takers.
 		sr.noteCatalogBlocks(rec)
+		if sr.onSeqReplay != nil && rec.XLog != nil && rec.XLog.Header.Rmid == RmgrSeq &&
+			rec.XLog.Header.Info&XLRRmgrInfoMask == xlogSeqLog {
+			if b, ok := xlogBlockRefByID(rec.XLog, 0); ok {
+				sr.onSeqReplay(b.Rel)
+			}
+		}
 		finishesPrepared := false
 		if rec.XLog != nil && rec.XLog.Header.Rmid == RmgrXact {
 			switch rec.XLog.Header.Info & xlogXactOpMask {

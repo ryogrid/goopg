@@ -1212,6 +1212,7 @@ func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Ru
 	// M0149-0010a: a replayed commit that changed a database's system
 	// catalogs refreshes the standby's catalog (PG's relcache invalidation),
 	// so relations the primary creates become visible while it streams.
+	sr.SetSequenceReplayHook(rt.RefreshSequenceAfterReplay)
 	sr.SetCatalogReplayHook(func(dbOid uint32) {
 		if err := rt.RefreshCatalogAfterReplay(dbOid); err != nil {
 			logger.Warn("standby replay: catalog refresh failed", "db", dbOid, "err", err)

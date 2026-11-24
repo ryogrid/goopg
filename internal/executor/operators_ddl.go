@@ -21710,9 +21710,19 @@ func CreateSequenceCatalogRelation(cat catalog.Catalog, seqObjName parser.Object
 		{Name: "log_cnt", Type: catalog.Type{Name: "int8"}, Ordinal: 1},
 		{Name: "is_called", Type: catalog.Type{Name: "bool"}, Ordinal: 2},
 	}
-	seqTbl, err2 := cat.(*catalog.InMemory).CreateSequenceRelation(seqObjName, seqCols, dbOid)
+	im := cat.(*catalog.InMemory)
+	seqTbl, err2 := im.CreateSequenceRelation(seqObjName, seqCols, dbOid)
 	if err2 != nil {
-		return
+		// Already registered: the heap catalog reload (startup, or a
+		// standby's refresh after a replayed commit) registers the relkind S
+		// relation before the sequences are reloaded. Wire the reader onto
+		// that relation instead of leaving it without one; SELECT * FROM seq
+		// on a standby read nothing (M0149-0077a).
+		existing, ok := im.LookupTable(seqObjName, dbOid)
+		if !ok || existing == nil || !existing.IsSequence {
+			return
+		}
+		seqTbl = existing
 	}
 	seqTbl.Virtual = true
 	seqTbl.IsSequence = true
