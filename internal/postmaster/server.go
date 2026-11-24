@@ -1872,6 +1872,14 @@ func (s *Server) cleanupSessionTempObjects(sess *misc.SessionRegistry) {
 
 func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw net.Conn, r *libpq.FrameReader, w *libpq.FrameWriter, sess *misc.SessionRegistry, logger *slog.Logger, isReplication, replDatabase bool, appName, dbName string, sessCtx *mmgr.Context, pid uint32, procNum int32, loginUser string) {
 	extended := newExtendedState()
+	// do_pg_abort_backup at backend exit: a session that called
+	// pg_backup_start and disconnects without pg_backup_stop ends its backup
+	// (the ProcArray slot is reused by the next connection). M0149-0077k.
+	defer func() {
+		if executor.AbortSessionBackup(procNum) {
+			logger.Warn("aborting backup due to backend exiting before pg_backup_stop was called")
+		}
+	}()
 	// procNum is the connection-lifetime ProcArray slot acquired by
 	// serveConn via mvcc.AcquireConnSlot (M0107-0004; the slot is reused
 	// across all transactions on this connection; Begin clears and
@@ -2059,7 +2067,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 				// connection's dbName down so the logical walsender can scope
 				// every catalog lookup to the slot's database instead of the
 				// DefaultDBOid fallback (DB 1).
-				handled, err := s.replHandler.HandleCommand(ctx, r, w, f.Payload, appName, dbName, replDatabase)
+				handled, err := s.replHandler.HandleCommand(ctx, r, w, f.Payload, appName, dbName, replDatabase, procNum)
 				if err != nil {
 					entry.clearQueryCancel()
 					queryCancel()

@@ -1124,20 +1124,8 @@ func buildBackupLabel(label string, startLSN, ckptLSN uint64, tli uint32, segSiz
 	if label == "" {
 		label = "goopg base backup"
 	}
-	if ckptLSN == 0 {
-		ckptLSN = startLSN
-	}
-	segno := startLSN / uint64(segSize)
-	walFile := xlog.XLogFileName(tli, segno, segSize)
-	var b bytes.Buffer
-	fmt.Fprintf(&b, "START WAL LOCATION: %s (file %s)\n", formatLSN(startLSN), walFile)
-	fmt.Fprintf(&b, "CHECKPOINT LOCATION: %s\n", formatLSN(ckptLSN))
-	fmt.Fprintf(&b, "BACKUP METHOD: streamed\n")
-	fmt.Fprintf(&b, "BACKUP FROM: primary\n")
-	fmt.Fprintf(&b, "START TIME: %s\n", time.Now().UTC().Format("2006-01-02 15:04:05 MST"))
-	fmt.Fprintf(&b, "LABEL: %s\n", label)
-	fmt.Fprintf(&b, "START TIMELINE: %d\n", tli)
-	return b.Bytes()
+	// Shared with pg_backup_stop's labelfile (M0149-0077k).
+	return executor.BuildBackupLabel(label, startLSN, ckptLSN, tli, segSize, time.Now())
 }
 
 // buildBackupManifest renders a PG-version-2 backup manifest (the JSON

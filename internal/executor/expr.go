@@ -18271,6 +18271,12 @@ case "pg_char_to_encoding":
 		return evalPgDropReplicationSlot(x, slot, ctx)
 	case "pg_replication_slot_advance":
 		return evalPgReplicationSlotAdvance(x, slot, ctx)
+	// Session-level online backups (xlogfuncs.c). See session_backup.go.
+	// M0149-0077k.
+	case "pg_backup_start":
+		return evalPgBackupStart(x, slot, ctx)
+	case "pg_backup_stop":
+		return evalPgBackupStop(x, slot, ctx)
 	// currtid2(relname text, tid tid) → tid: returns the latest visible TID
 	// for a row in the named relation. M0097-0038.
 	case "currtid2":

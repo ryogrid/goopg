@@ -175,8 +175,9 @@ func extractCString(buf []byte) (string, error) {
 // likely dead); SQLSTATE-level command failures are reported via
 // ErrorResponse and still return (true, nil).
 // dbBound reports a database-bound walsender (replication=database,
-// am_db_walsender); IDENTIFY_SYSTEM then names dbName.
-func (s *Handler) HandleCommand(ctx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, payload []byte, appName, dbName string, dbBound bool) (bool, error) {
+// am_db_walsender); IDENTIFY_SYSTEM then names dbName. procNum is the
+// connection's ProcArray slot, which keys its session-level backup state.
+func (s *Handler) HandleCommand(ctx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, payload []byte, appName, dbName string, dbBound bool, procNum int32) (bool, error) {
 	q, err := extractCString(payload)
 	if err != nil {
 		return false, nil // let the regular handler emit the error
@@ -204,6 +205,12 @@ func (s *Handler) HandleCommand(ctx context.Context, r *libpq.FrameReader, w *li
 		if s.bb == nil {
 			return true, s.writeQueryError(w, errcodes.FeatureNotSupported,
 				"BASE_BACKUP is not configured on this server")
+		}
+		// SendBaseBackup: a session that called pg_backup_start cannot also
+		// run BASE_BACKUP. M0149-0077k.
+		if executor.SessionBackupRunning(procNum) {
+			return true, s.writeQueryError(w, errcodes.ObjectNotInPrerequisiteState,
+				"a backup is already in progress in this session")
 		}
 		return true, s.bb.ReplyBaseBackup(ctx, w, args)
 	}

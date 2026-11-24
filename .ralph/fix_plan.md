@@ -16278,12 +16278,30 @@ verify each at HEAD when the task starts.
     Path\-to\-TAP: 001 all\-goopg "slot advancing with physical slot": `SELECT pg_replication_slot_advance('phys_slot', lsn)`
     fails "function does not exist". Then the advance must persist across a clean restart, and the shutdown checkpoint
     must recycle the segment the slot no longer holds \("WAL segment … recycled after physical slot advancing"\).
-  - [ ] **M0149-0077k — pg\_backup\_start / pg\_backup\_stop do not exist; BASE\_BACKUP cancel**
+  - [x] **M0149-0077k — pg\_backup\_start / pg\_backup\_stop do not exist** \(2026\-11\-24\)
+    - Session\-level online backups, keyed by the connection's ProcNum \(PG's backend\-local sessionBackupState\).
+      - pg\_backup\_start\(label, fast\): refuses a second backup in the session, a too\-long label and wal\_level
+        minimal; checkpoints and returns the redo LSN.
+      - pg\_backup\_stop\(wait\): without a backup, "backup is not in progress" plus PG's hint; otherwise it switches
+        WAL and returns \(lsn, labelfile, spcmapfile\), with the archiving NOTICE.
+      - BASE\_BACKUP refuses while the session's backup runs; a disconnect aborts it with PG's WARNING.
+    - The label builder is shared with BASE\_BACKUP \(executor.BuildBackupLabel\).
+    Movement: yes — tap 001 all\-goopg: "BASE\_BACKUP cannot run in session already running backup" and "base backup cleanly canceled" not ok → ok; the only remaining all\-goopg not ok is "WAL sender sending base backup killed" \(0077l\)
     Kind: impl
     Parent: M0149-0077
     Path\-to\-TAP: 001 all\-goopg: BASE\_BACKUP in a replication session after `SELECT pg_backup_start('backup', true)`
-    must fail "a backup is already in progress in this session"; pg\_cancel\_backend on a walsender running BASE\_BACKUP
-    must end it, and pg\_backup\_stop afterwards must fail "backup is not in progress".
+    must fail "a backup is already in progress in this session"; pg\_backup\_stop with no backup must fail "backup is
+    not in progress".
+  - [ ] **M0149-0077l — a running BASE\_BACKUP cannot be found and cancelled**
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 all\-goopg "WAL sender sending base backup killed": the poll joins pg\_stat\_activity
+    \(`query ~ 'BASE_BACKUP'`\) with pg\_stat\_progress\_basebackup \(`phase = 'streaming database files'`\) and runs
+    pg\_cancel\_backend on the pid. Needs:
+    - live progress rows for a walsender running BASE\_BACKUP;
+    - the walsender's query text in pg\_stat\_activity;
+    - MAX\_RATE throttling, so the backup stays in that phase long enough;
+    - a cancel that reaches the BASE\_BACKUP stream, which runs on the connection ctx, not on queryCtx.
 
 - [ ] **M0149-0084 — read\-only transactions do not restrict DML on a primary**
   Kind: impl

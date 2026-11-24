@@ -131,8 +131,34 @@ second backup is taken from the standby while the primary is down. The test then
   pg\_current\_wal\_lsn\(\) after pg\_switch\_wal — kept the previous segment as well. The retainer now converts with
   \+1, as KeepLogSeg's XLByteToSeg\(restart\_lsn\) does.
 
+## Slice 10 \(0077k, landed\): session\-level backups
+
+- `pg_backup_start(label, fast)` and `pg_backup_stop(wait_for_archive)` follow xlogfuncs.c. The state is per session,
+  keyed by the connection's ProcArray slot, which is fixed for the connection's lifetime — PG keeps it in the
+  backend\-local `sessionBackupState` \(`executor/session_backup.go`\).
+- Start:
+  - refuses a second backup in the session \("a backup is already in progress in this session"\), labels of
+    MAXPGPATH or more, and wal\_level minimal;
+  - otherwise checkpoints and returns the redo LSN, converted to a PG byte LSN as BASE\_BACKUP does for
+    backup\_label.
+- Stop:
+  - without a running backup, "backup is not in progress" with the hint "Did you call pg\_backup\_start\(\)?";
+  - otherwise it switches to a new WAL segment and returns `(lsn, labelfile, spcmapfile)` as composite text. With
+    wait\_for\_archive and archiving off, it emits PG's NOTICE.
+- BASE\_BACKUP checks the same state and refuses inside a session with a running backup \(SendBaseBackup\).
+- A disconnect without pg\_backup\_stop aborts the backup and logs "aborting backup due to backend exiting before
+  pg\_backup\_stop was called".
+- Not done:
+  - no XLOG\_BACKUP\_END record;
+  - no backup history file in pg\_wal;
+  - no forcePageWrites while a backup runs;
+  - no wait for archiving;
+  - no standby\-side restrictions \(do\_pg\_backup\_start in recovery\);
+  - the fast flag is ignored, because the checkpoint is always immediate.
+
 ## Open \(children in fix\_plan\)
 
-- 0077k: pg\_backup\_start / pg\_backup\_stop and BASE\_BACKUP cancel.
+- 0077l: finding and cancelling a running BASE\_BACKUP \(progress view, walsender query text, MAX\_RATE, cancel
+  delivery\).
 - 0077e: on a PG 18.3 standby of a goopg primary, reading an unlogged sequence fails with "could not open file".
 - 0077f: a goopg standby does not serve a cascading standby \(PG\-primary pairing\).
