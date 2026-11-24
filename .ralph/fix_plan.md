@@ -16215,7 +16215,10 @@ verify each at HEAD when the task starts.
     Parent: M0149-0077
     Path\-to\-TAP: 001 waits for `sum(reads) > 0 FROM pg_stat_io WHERE backend_type = 'walsender' AND object = 'wal'`
     \(fatal timeout\); later the walreceiver `writes` check.
-  - [ ] **M0149-0077g — pg\_replication\_slots.xmin is 0 instead of NULL**
+  - [x] **M0149-0077g — pg\_replication\_slots.xmin is 0 instead of NULL** \(2026\-11\-24\)
+    - pg\_replication\_slots renders xmin and catalog\_xmin as NULL for InvalidTransactionId \(catalog.VirtualNull\),
+      as pg\_get\_replication\_slots does; physical\-slot xmin is not tracked yet, so it is always NULL.
+    Movement: yes — tap 001 all\-goopg: fatal get\_slot\_xmins timeout → the 4 null\-xmin assertions pass on both slots; the run now stops at ALTER SYSTEM SET hot\_standby\_feedback \(0077i\)
     Kind: impl
     Parent: M0149-0077
     Path\-to\-TAP: 001 get\_slot\_xmins waits for `xmin IS NULL AND catalog_xmin IS NULL` on the primary's physical
@@ -16232,6 +16235,17 @@ verify each at HEAD when the task starts.
     Parent: M0149-0077
     Path\-to\-TAP: 001 pg18\-primary/goopg\-standbys: standby\_2 never appears in standby\_1's pg\_stat\_replication
     \(the first cascaded catch\-up wait times out\).
+  - [ ] **M0149-0077h — standby\_1 loses the login event trigger after its restart**
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 all\-goopg "Name of login trigger": `SELECT evtname FROM pg_event_trigger WHERE evtevent='login'`
+    on standby\_1 returns "" after standby\_1 restarts \(standby\_2 returns on\_login\_trigger\). Non\-fatal assertion.
+  - [ ] **M0149-0077i — hot\_standby\_feedback is not implemented**
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 all\-goopg `ALTER SYSTEM SET hot_standby_feedback = on` on standby\_1 fails "unrecognized
+    configuration parameter" \(fatal\). Then get\_slot\_xmins needs a non\-null xmin on the primary's slot and on
+    standby\_1's slot: the GUC, walreceiver feedback messages and slot xmin tracking \(PhysicalReplicationSlotNewXmin\).
 
 - [ ] **M0149-0084 — read\-only transactions do not restrict DML on a primary**
   Kind: impl

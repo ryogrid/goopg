@@ -227,8 +227,13 @@ func TestPgReplicationSlotsViewRendersBothKinds(t *testing.T) {
 	if phys[4] != "" {
 		t.Errorf("physical database=%q want empty", phys[4])
 	}
-	if phys[9] != "" {
-		t.Errorf("physical catalog_xmin=%q want empty", phys[9])
+	// InvalidTransactionId renders as NULL (pg_get_replication_slots),
+	// not as an empty string (M0149-0077g).
+	if phys[8] != catalog.VirtualNull {
+		t.Errorf("physical xmin=%q want NULL", phys[8])
+	}
+	if phys[9] != catalog.VirtualNull {
+		t.Errorf("physical catalog_xmin=%q want NULL", phys[9])
 	}
 }
 

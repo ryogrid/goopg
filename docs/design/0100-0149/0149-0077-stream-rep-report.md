@@ -74,8 +74,17 @@ second backup is taken from the standby while the primary is down. The test then
   serves chunks from its WAL iterator, and the walreceiver appends them to the local WAL. Each now counts one op of the
   chunk's size into the cumulative pg\_stat\_io store \(`executor.CountWALSenderRead` / `CountWALReceiverWrite`\).
 
+## Slice 6 \(0077g, landed\): NULL slot xmins
+
+- pg\_get\_replication\_slots sets the xmin and catalog\_xmin columns to NULL when the xid is not valid. goopg
+  printed 0 for a physical slot's xmin and an empty string for catalog\_xmin. Both now render
+  `catalog.VirtualNull`, so 001's `xmin IS NULL AND catalog_xmin IS NULL` check passes on the primary's slot and
+  on the slot that standby\_2 uses on standby\_1. goopg does not track physical\-slot xmin yet, so it stays NULL
+  until hot\_standby\_feedback lands \(0077i\).
+
 ## Open \(children in fix\_plan\)
 
-- 0077g: `pg_replication_slots.xmin` shows 0 instead of NULL.
+- 0077h: standby\_1 does not show the login event trigger after its restart.
+- 0077i: hot\_standby\_feedback is missing \(GUC, feedback messages, physical\-slot xmin\).
 - 0077e: on a PG 18.3 standby of a goopg primary, reading an unlogged sequence fails with "could not open file".
 - 0077f: a goopg standby does not serve a cascading standby \(PG\-primary pairing\).

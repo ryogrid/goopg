@@ -386,7 +386,10 @@ func registerReplicationSlotsView(cat *catalog.InMemory, slots *xlog.Slots) erro
 				"f", // temporary: temp slots deferred
 				boolText(sl.Active),
 				"",  // active_pid: not yet tracked per-slot
-				"0", // xmin: physical-slot xmin tracking deferred
+				// xmin: physical-slot xmin (hot_standby_feedback) is not
+				// tracked yet, so it is InvalidTransactionId — NULL, as
+				// pg_get_replication_slots renders it (M0149-0077g).
+				catalog.VirtualNull,
 				formatXmin(sl.CatalogXmin),
 				formatLSN(sl.RestartLSN),
 				formatLSN(sl.ConfirmedFlushLSN),
@@ -718,9 +721,11 @@ func slotWalStatus(s xlog.Slot) string {
 	return "reserved"
 }
 
+// formatXmin renders a slot xid column: NULL for InvalidTransactionId
+// (pg_get_replication_slots: `nulls[i] = true` when !TransactionIdIsValid).
 func formatXmin(xid uint64) string {
 	if xid == 0 {
-		return ""
+		return catalog.VirtualNull
 	}
 	return fmt.Sprintf("%d", xid)
 }
