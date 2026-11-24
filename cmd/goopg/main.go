@@ -391,6 +391,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// for the whole of goopg start.
 	quit := newImmediateShutdown(logger, cancel)
 	defer quit.stop()
+	fatalShutdown = cancel
 
 	cfg := postmaster.Config{
 		Address: *addr,
@@ -533,6 +534,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		// EffectiveCLOGBuffers. Unit-less integer count of BLCKSZ buffers.
 		transactionBuffers := intGUC(registry, "transaction_buffers", 0)
 		var err error
+		// ArchiveRecoveryRequested: a standby.signal or recovery.signal
+		// makes every WAL record replayed from here on — local WAL at Open
+		// included — subject to archive recovery's checks (M0149-0020).
+		xlog.SetArchiveRecoveryRequested(fileExists(filepath.Join(*dataDir, "standby.signal")) ||
+			fileExists(filepath.Join(*dataDir, "recovery.signal")))
 		rt, err = initdb.Open(initdb.OpenOptions{
 			DataDir: *dataDir,
 			// A shutdown request (SIGTERM/SIGINT/SIGQUIT cancel ctx) stops
@@ -1104,6 +1110,15 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 	}
+	// XLogReportParameters (end of StartupXLOG): a primary whose settings
+	// differ from pg_control's WAL-logs the change and updates pg_control
+	// (M0149-0020).
+	if rt != nil && !rt.Standby {
+		if err := reportParameters(rt, registry, logger); err != nil {
+			fmt.Fprintf(stderr, "goopg start: %v\n", err)
+			return 1
+		}
+	}
 
 	// Standby mode: when `<DataDir>/standby.signal` was present at
 	// Open time, dial the configured `primary_conninfo` and spawn a
@@ -1280,6 +1295,14 @@ func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Ru
 		logger.Info("standby mode: starting continuous WAL replay",
 			"start_lsn", iterStartLSN)
 		if err := sr.Run(ctx, iter); err != nil {
+			// A FATAL during replay stops the server, as the postmaster
+			// shuts down when the startup process fails (M0149-0020).
+			var fatal *xlog.RecoveryFatalError
+			if errors.As(err, &fatal) {
+				logger.Log(context.Background(), xlog.LogLevelFatal, fatal.Msg, "detail", fatal.Detail, "hint", fatal.Hint)
+				fatalShutdown()
+				return
+			}
 			logger.Error("standby replay: stopped on error",
 				"event", xlog.EventStandbyReplayError,
 				"apply_lsn", sr.ApplyLSN(), "err", err)
@@ -1803,4 +1826,83 @@ func applyLogMinMessages(registry *misc.Registry) {
 		return
 	}
 	serverLogLevel.Set(slog.LevelInfo)
+}
+
+// fatalShutdown stops the server after a FATAL during standby replay, as the
+// postmaster shuts down when the startup process fails; set by goopg start.
+var fatalShutdown = func() {}
+
+// fileExists reports whether path names an existing file.
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// gucParameters reads the settings pg_control echoes.
+func gucParameters(registry *misc.Registry) xlog.GUCParameters {
+	return xlog.GUCParameters{
+		MaxConnections:       int32(intGUC(registry, "max_connections", 100)),
+		MaxWorkerProcesses:   int32(intGUC(registry, "max_worker_processes", 8)),
+		MaxWalSenders:        int32(intGUC(registry, "max_wal_senders", 10)),
+		MaxPreparedXacts:     int32(intGUC(registry, "max_prepared_transactions", 0)),
+		MaxLocksPerXact:      int32(intGUC(registry, "max_locks_per_transaction", 64)),
+		WalLevel:             walLevelEnum(stringGUC(registry, "wal_level", "replica")),
+		WalLogHints:          boolGUC(registry, "wal_log_hints", false),
+		TrackCommitTimestamp: boolGUC(registry, "track_commit_timestamp", false),
+	}
+}
+
+// reportParameters is XLogReportParameters (xlog.c): when the server's
+// settings differ from the ones pg_control records, the change is
+// WAL-logged as XLOG_PARAMETER_CHANGE — always when wal_level changed,
+// otherwise only when wal_level is above minimal (XLogIsNeeded) — and
+// pg_control is updated. Standbys and archive recovery read the record:
+// WAL generated with wal_level=minimal stops archive recovery. The
+// checkpointer echoes the same values at every checkpoint. M0149-0020.
+func reportParameters(rt *initdb.Runtime, registry *misc.Registry, logger *slog.Logger) error {
+	p := gucParameters(registry)
+	if rt.Checkpointer != nil {
+		rt.Checkpointer.SetGUCParams(p)
+	}
+	if rt.DataDir == "" || rt.WAL == nil {
+		return nil
+	}
+	cd, err := control.ReadControlFile(rt.DataDir)
+	if err != nil || cd == nil {
+		return nil
+	}
+	same := cd.WalLevel == uint32(p.WalLevel) && cd.WalLogHints == p.WalLogHints &&
+		cd.MaxConnections == uint32(p.MaxConnections) && cd.MaxWorkerProcesses == uint32(p.MaxWorkerProcesses) &&
+		cd.MaxWalSenders == uint32(p.MaxWalSenders) && cd.MaxPreparedXacts == uint32(p.MaxPreparedXacts) &&
+		cd.MaxLocksPerXact == uint32(p.MaxLocksPerXact) && cd.TrackCommitTimestamp == p.TrackCommitTimestamp
+	if same {
+		return nil
+	}
+	if cd.WalLevel != uint32(p.WalLevel) || p.WalLevel >= 1 {
+		rec, err := xlog.EncodeParameterChangePG(p)
+		if err != nil {
+			return fmt.Errorf("encode parameter change record: %w", err)
+		}
+		_, end, err := rt.WAL.Append(rec)
+		if err != nil {
+			return fmt.Errorf("write parameter change record: %w", err)
+		}
+		if err := rt.WAL.FlushUpTo(end); err != nil {
+			return fmt.Errorf("flush parameter change record: %w", err)
+		}
+	}
+	if err := control.UpdateControlFile(rt.DataDir, func(c *control.ControlFileData) {
+		c.WalLevel = uint32(p.WalLevel)
+		c.WalLogHints = p.WalLogHints
+		c.MaxConnections = uint32(p.MaxConnections)
+		c.MaxWorkerProcesses = uint32(p.MaxWorkerProcesses)
+		c.MaxWalSenders = uint32(p.MaxWalSenders)
+		c.MaxPreparedXacts = uint32(p.MaxPreparedXacts)
+		c.MaxLocksPerXact = uint32(p.MaxLocksPerXact)
+		c.TrackCommitTimestamp = p.TrackCommitTimestamp
+	}); err != nil {
+		return fmt.Errorf("update pg_control parameters: %w", err)
+	}
+	logger.Debug("parameter change WAL-logged", "wal_level", p.WalLevel)
+	return nil
 }

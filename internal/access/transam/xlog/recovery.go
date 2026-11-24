@@ -3265,6 +3265,18 @@ func replayXLogParameterChange(mgr *storage.Manager, xlog *XLogDecodedRecord) (b
 	if len(data) < minPayload {
 		return false, fmt.Errorf("wal: XLOG_PARAMETER_CHANGE payload too short: %d bytes", len(data))
 	}
+	le := binary.LittleEndian
+	walLvl := le.Uint32(data[20:])
+	// xlog_redo: WAL generated with wal_level=minimal cannot be used for
+	// archive recovery — it lacks the data needed to reconstruct relations
+	// created or rewritten while it was minimal (M0149-0020).
+	if archiveRecoveryRequested.Load() && walLvl < 1 {
+		return false, &RecoveryFatalError{
+			Msg:    `WAL was generated with "wal_level=minimal", cannot continue recovering`,
+			Detail: `This happens if you temporarily set "wal_level=minimal" on the server.`,
+			Hint:   `Use a backup taken after setting "wal_level" to higher than "minimal".`,
+		}
+	}
 	if mgr == nil {
 		// No storage manager means no pg_control to update (e.g. test stubs).
 		return false, nil
@@ -3273,13 +3285,11 @@ func replayXLogParameterChange(mgr *storage.Manager, xlog *XLogDecodedRecord) (b
 	if dataDir == "" {
 		return false, nil
 	}
-	le := binary.LittleEndian
 	maxConn := le.Uint32(data[0:])
 	maxWorker := le.Uint32(data[4:])
 	maxWalSnd := le.Uint32(data[8:])
 	maxPrepared := le.Uint32(data[12:])
 	maxLocks := le.Uint32(data[16:])
-	walLvl := le.Uint32(data[20:])
 	walLogHints := data[24] != 0
 	trackCommitTS := data[25] != 0
 	if err := control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {

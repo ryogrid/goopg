@@ -83,8 +83,9 @@ type Cluster struct {
 	syncRuntime  bool
 	startArgs    []string
 
-	mu  sync.Mutex
-	cmd *exec.Cmd
+	mu     sync.Mutex
+	cmd    *exec.Cmd
+	exited chan struct{} // closed when the last started process has exited
 }
 
 // BackgroundPSQL is a long-lived psql session started by StartPSQL.
@@ -280,6 +281,7 @@ func (c *Cluster) Start() error {
 		close(exited)
 	}()
 	c.cmd = cmd
+	c.exited = exited
 
 	deadline := time.Now().Add(c.startupWait)
 	for time.Now().Before(deadline) {
@@ -539,6 +541,25 @@ func (c *Cluster) Kill() error {
 	}
 	c.cmd = nil
 	return nil
+}
+
+// WaitExit waits up to timeout for the last started server process to exit
+// on its own — a server that stops itself with a FATAL removes
+// postmaster.pid before its process is gone — and reports whether it did.
+// It is true at once when no server was ever started.
+func (c *Cluster) WaitExit(timeout time.Duration) bool {
+	c.mu.Lock()
+	exited := c.exited
+	c.mu.Unlock()
+	if exited == nil {
+		return true
+	}
+	select {
+	case <-exited:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // Restart performs stop+start.

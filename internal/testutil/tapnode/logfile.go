@@ -42,7 +42,7 @@ func (n *Node) LogFrom(offset int64) string {
 }
 
 var (
-	slogLine   = regexp.MustCompile(`^time=\S+ level=(\w+) msg=("(?:[^"\\]|\\.)*"|\S+)(.*)$`)
+	slogLine   = regexp.MustCompile(`^time=\S+ level=(\S+) msg=("(?:[^"\\]|\\.)*"|\S+)(.*)$`)
 	stdlogLine = regexp.MustCompile(`^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} (DEBUG|INFO|WARN|ERROR) (.*)$`)
 )
 
@@ -57,6 +57,9 @@ func pgLevel(level string) string {
 		return "WARNING"
 	case "ERROR":
 		return "ERROR"
+	case "ERROR+4":
+		// xlog.LogLevelFatal: goopg's FATAL reports.
+		return "FATAL"
 	}
 	return strings.ToUpper(level)
 }

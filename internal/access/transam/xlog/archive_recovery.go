@@ -161,9 +161,16 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 	// no backup_label at recovery), which must lie on the start timeline
 	// in the target's history.
 	var checkPointLoc uint64
+	// redoLSN is where replay starts (InitWalRecovery: checkPoint.redo
+	// from pg_control) — not the last checkpoint record of the first
+	// segment, which would skip whatever the archive holds between the
+	// backup's redo and that checkpoint (an XLOG_PARAMETER_CHANGE, for
+	// one). 0 keeps the goopg scan fallback when there is no pg_control.
+	var redoLSN uint64
 	if cd, err := control.ReadControlFile(dataDir); err == nil && cd != nil && cd.CheckPointCopyThisTLI != 0 {
 		startTLI = cd.CheckPointCopyThisTLI
 		checkPointLoc = cd.CheckPoint
+		redoLSN = cd.CheckPointCopyRedo
 		lastRestartPointFname = XLogFileName(cd.CheckPointCopyThisTLI, cd.CheckPointCopyRedo/uint64(segmentSize), segmentSize)
 	}
 	// have reports whether name was restored from the archive or, failing
@@ -414,7 +421,7 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 			}
 		}
 		if len(records) > 0 {
-			if _, err := ReplayRecords(mgr, records); err != nil {
+			if _, err := ReplayRecordsFrom(mgr, records, redoLSN); err != nil {
 				return res, fmt.Errorf("wal: archive recovery: replay segment %s: %w", FormatSegmentNameTLI(seg, chosen), err)
 			}
 			if last := records[len(records)-1]; last.EndLSN > res.EndOfLog {

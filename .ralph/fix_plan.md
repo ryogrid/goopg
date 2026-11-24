@@ -16478,11 +16478,12 @@ verify each at HEAD when the task starts.
     - log\_min\_messages did not change the server log level, and the archiver's DEBUG1 shutdown message did not
       exist, nor did the wait for the archiver's last pass at shutdown.
   Movement: yes — tap 020: all\-goopg and pg18\-primary/goopg\-standbys fatal "Timed out while waiting for xlog replay on standby1" → PASS; 020 PASS on all three pairings \(M0149 contract\)
-- [ ] **M0149-0020 — port recovery/t/024_archive_recovery.pl**
+- [x] **M0149-0020 — port recovery/t/024_archive_recovery.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/024_archive_recovery.pl` — archive recovery refusing WAL generated with `wal_level=minimal`.
   Likely prerequisites \(verify at start\): `XLOG_PARAMETER_CHANGE` record + PG FATAL text, restart with changed `wal_level`.
+  - 2026\-11\-25 \(done\): TestPort\_Recovery024ArchiveRecoveryFull passes on all three pairings \(3 of 3 runs\), ungated; inventory row 024 → port. XLogReportParameters at startup, the wal\_level=minimal FATAL, archive recovery replays from the pg\_control redo. Design: docs/design/0100\-0149/0149\-0020\-archive\-recovery\-wal\-level.md.
 - [ ] **M0149-0021 — port recovery/t/042_low_level_backup.pl**
   Kind: impl
   Parent: none

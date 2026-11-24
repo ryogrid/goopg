@@ -1153,6 +1153,14 @@ func endInterruptedArchiveRecovery(rt *initdb.Runtime, err error, immediate bool
 		logger.Info("database system is shut down")
 		return 0
 	}
+	var recFatal *xlog.RecoveryFatalError
+	if errors.As(err, &recFatal) {
+		// ereport(FATAL) during archive recovery (xlog_redo): PG's message,
+		// detail and hint (M0149-0020).
+		logger.Log(context.Background(), xlog.LogLevelFatal, recFatal.Msg, "detail", recFatal.Detail, "hint", recFatal.Hint)
+		fmt.Fprintf(stderr, "goopg start: FATAL:  %s\nDETAIL:  %s\nHINT:  %s\n", recFatal.Msg, recFatal.Detail, recFatal.Hint)
+		return 1
+	}
 	fmt.Fprintf(stderr, "goopg start: FATAL: %v\n", err)
 	var fatal *xlog.RestoreFatalError
 	if errors.As(err, &fatal) && fatal.Detail != "" {

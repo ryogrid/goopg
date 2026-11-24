@@ -338,6 +338,10 @@ type Checkpointer struct {
 	lastCheckpointRedoLSN  atomic.Uint64
 	lastCheckpointStartLSN atomic.Uint64
 
+	// gucOverride holds the settings pg_control echoes, once the server
+	// has read them (SetGUCParams, M0149-0020).
+	gucOverride atomic.Pointer[GUCParameters]
+
 	// volumeAnchor is the fallback RedoRecPtr for the max_wal_size
 	// trigger before this process has completed its first checkpoint:
 	// the writer position observed when Run started. Upstream always has
@@ -1185,7 +1189,7 @@ func (c *Checkpointer) runCheckpointOpts(ctx context.Context, o checkpointOpts) 
 	cpFields := CheckPointFields{
 		ThisTLI:        c.timelineID(),
 		FullPageWrites: c.fullPageWrites(),
-		WalLevel:       uint32(max(c.cfg.GUCParams.WalLevel, 0)),
+		WalLevel:       uint32(max(c.gucParams().WalLevel, 0)),
 		NextXid:        nextXid,
 		NextOid:        nextOid,
 	}
@@ -1254,7 +1258,7 @@ func (c *Checkpointer) runCheckpointOpts(ctx context.Context, o checkpointOpts) 
 	if c.cfg.DataDir != "" {
 		checkLSN0 := startLSN - 1 // convert 1-based internal to 0-based PG LSN
 		now := time.Now().Unix()
-		guc := c.cfg.GUCParams
+		guc := c.gucParams()
 		if err := control.UpdateControlFile(c.cfg.DataDir, func(cd *control.ControlFileData) {
 			// A shutdown checkpoint leaves the cluster cleanly shut down
 			// (DB_SHUTDOWNED); every other checkpoint runs while the
@@ -1686,4 +1690,18 @@ func (c *Checkpointer) buildPacer(ctx context.Context, spread bool, start time.T
 			return nil
 		}
 	}
+}
+
+// SetGUCParams installs the server's current values of the settings
+// pg_control echoes (XLogReportParameters, M0149-0020); until called the
+// checkpointer echoes cfg.GUCParams (DefaultGUCParameters).
+func (c *Checkpointer) SetGUCParams(p GUCParameters) {
+	c.gucOverride.Store(&p)
+}
+
+func (c *Checkpointer) gucParams() GUCParameters {
+	if p := c.gucOverride.Load(); p != nil {
+		return *p
+	}
+	return c.cfg.GUCParams
 }
