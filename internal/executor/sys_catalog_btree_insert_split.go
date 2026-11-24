@@ -173,12 +173,18 @@ func descendSysBtreeWithPath(ctx *Context, rel storage.RelFileNode, rootBlk uint
 
 // insertSysBtreeMultiLevel inserts indexTuple into a multi-level catalog
 // btree, splitting the target leaf (and its ancestors) when it is full.
-func insertSysBtreeMultiLevel(ctx *Context, indexOID uint32, rel storage.RelFileNode, rootBlk, level uint32, indexTuple []byte, cmp keyCompareFn) error {
+// cmp compares NameData-layout keys; a non-nil conv says the index stores
+// cstring-layout keys (indexTuple is already in that layout).
+func insertSysBtreeMultiLevel(ctx *Context, indexOID uint32, rel storage.RelFileNode, rootBlk, level uint32, indexTuple []byte, cmp keyCompareFn, conv sysKeyConv) error {
 	meta, ok := keyMetaForSysBtree(indexOID)
 	if !ok {
 		return fmt.Errorf("split: unsupported system btree OID %d", indexOID)
 	}
-	leafBlk, path, err := descendSysBtreeWithPath(ctx, rel, rootBlk, level, indexTuple[sysIndexTupleHoff:], pivotAwareCmp(indexOID, cmp))
+	descendCmp := pivotAwareCmp(indexOID, cmp, conv)
+	if conv != nil {
+		cmp = wrapCstringCmp(cmp, conv, int(meta.nkeyatts))
+	}
+	leafBlk, path, err := descendSysBtreeWithPath(ctx, rel, rootBlk, level, indexTuple[sysIndexTupleHoff:], descendCmp)
 	if err != nil {
 		return fmt.Errorf("descend: %w", err)
 	}

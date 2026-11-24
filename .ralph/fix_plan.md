@@ -15926,6 +15926,12 @@ verify each at HEAD when the task starts.
 - [ ] **M0149-0015f — CREATE OR REPLACE FUNCTION panics on a node promoted from a PG backup**
   Kind: impl
   Parent: M0149-0015
+  Update 2026\-11\-24 \(0016e\): truncated pivots \(0016f\) and cstring keys \(0016e\) are handled now. Converting
+  pg\_proc\_proname\_args\_nsp\_index showed the real gap: goopg's catalog does not know functions PG created
+  \(the 0015d family), so CREATE OR REPLACE inserts a second pg\_proc row and PG later says "function
+  hs\_subxids\(integer\) is not unique" \(012 pg18\-primary\). The index stays unconverted until goopg finds the
+  existing function. The enabling switch is the pgProcPronameArgsNspIndexOID check in
+  insertCanonicalSysBtreeLeafInDB.
   `cmpKeyProcNameArgsNsp` \(executor/sys\_catalog\_btree\_insert\_split.go descent\) slices a\[:64\] of a PG
   suffix\-truncated pivot tuple in pg\_proc\_proname\_args\_nsp\_index \(capacity 16\). It needs \_bt\_compare's
   truncated\-attribute semantics: compare only BTreeTupleGetNAtts attributes; missing ones are minus infinity. Seen in
@@ -16008,15 +16014,45 @@ verify each at HEAD when the task starts.
   - [x] **M0149-0016f — 009 mixed pairings: PREPARE waits for sync standbys; catalog btree descent handles truncated pivots** \(2026\-11\-24\)
     - Movement: 009 goopg\-london/pg18\-paris: FAIL \(xact\_009\_10 missing on promoted PG, then a 24\-min hang\) → PASS.
     - pivotAwareCmp \(sys\_catalog\_btree\_pivot.go\) and its unit test; descent uses it.
-  - [ ] **M0149-0016e — catalog name\_ops index keys are cstring in PG, 64\-byte NameData in goopg**
+  - [x] **M0149-0016e — catalog name\_ops index keys are cstring in PG, 64\-byte NameData in goopg** \(2026\-11\-24\)
+    - A PG\-built catalog index is recognised from its leftmost leaf \(INDEX\_VAR\_MASK on a fixed\-layout key\); goopg
+      writes its new tuple in the cstring layout and compares through NameData \(sys\_catalog\_btree\_cstring.go\).
+      Unit tests are pinned to PG 18.3 initdb tuple bytes. PG 18.3, started on the promoted goopg node's files,
+      resolves the new table through pg\_class\_relname\_nsp\_index and creates another table.
+    - pg\_proc\_proname\_args\_nsp\_index is held out \(see 0015f\): with it converted, 012 pg18\-primary regressed.
+    - Movement: 009 pg18\-london/goopg\-paris: CREATE TABLE panic → \(after 0016g\) only the pg\_subtrans step
+      \(0016c\), the same as all\-goopg. goopg\-london/pg18\-paris still PASS; 012 all three pairings PASS.
     Kind: impl
     Parent: M0149-0016
     PG's btree name\_ops has opckeytype = cstring \(pg\_opclass.dat\), so PG\-built catalog indexes on name columns
-    \(pg\_class\_relname\_nsp, pg\_type\_typname\_nsp, pg\_proc\_proname\_args\_nsp, …\) store variable\-length cstring
-    keys. goopg's cmpKey\*/buildIndexTuple\* assume 64\-byte NameData. Proof: 009 pg18\-london/goopg\-paris pairing —
-    CREATE TABLE on paris, promoted from a PG backup, panics in leaf compare \(insertIntoExistingLeaf → cmpKeyNameOid\).
-    0015f is the same family on pg\_proc. First check which format goopg's own initdb\-built catalog indexes use; PG
-    standbys read them.
+    store cstring keys. goopg's cmpKey\*/buildIndexTuple\* assume 64\-byte NameData.
+  - [x] **M0149-0016g — heap insert takes an FSM block past EOF \("short read at block"\)** \(2026\-11\-24\)
+    - selectFSMCandidatePage now does freespace.c fsm\_does\_block\_exist: an entry past the relation's end is zeroed
+      and skipped. Unit test TestSelectFSMCandidatePageSkipsBlockPastEOF.
+    - Movement: 009 pg18\-london CREATE TABLE on promoted paris: "pg\_type \(rowtype\): short read at block" → OK.
+    Kind: impl
+    Parent: M0149-0016
+    Path\-to\-TAP: 009 pg18\-london ← CREATE TABLE on promoted paris ← FSM names pg\_type block 4069 of 15.
+  - [ ] **M0149-0016h — ReadFSMFork misreads a PG\-built FSM file**
+    Kind: impl
+    Parent: M0149-0016
+    Found while fixing 0016g \(not a 009 requirement once 0016g guards it\). The loader assumes goopg's leaves\-first
+    layout. PG's file is root\-first with three levels, so a 3\-page PG FSM is read as two leaf pages: page 1 \(an inner
+    page\) yields free space for heap block 4069, and the real leaf \(page 2\) is dropped. Either read the PG layout
+    \(fsm\_pgtree.go has the addressing\) or detect it.
+  - [ ] **M0149-0016i — a promoted goopg node keeps backup\_label**
+    Kind: impl
+    Parent: M0149-0016
+    Found while verifying 0016e. PG renames backup\_label to backup\_label.old when recovery starts. goopg leaves it, so
+    PG 18.3 refuses to start on the files \("could not locate required checkpoint record"\).
+  - [ ] **M0149-0016j — goopg's catalog name indexes use NameData keys typed name; PG's are cstring**
+    Kind: impl
+    Parent: M0149-0016
+    Found while scoping 0016e. A goopg initdb gives pg\_class\_relname\_nsp\_index attribute 1 atttypid 19 \(name,
+    attlen 64\) and 80\-byte tuples. PG gives atttypid 2275 \(cstring, attlen \-2\) and short var\-width tuples.
+    Self\-consistent, so PG nodes read goopg's indexes, but the bytes and pg\_attribute rows differ from PG's. Check
+    user indexes on name columns too \(buildUserPGAttributeRowsForIndex\). Owner call: changing the format
+    touches every existing goopg cluster.
   - [ ] **M0149-0016c — pg\_ls\_dir / pg\_stat\_file and pg\_subtrans files**
     Kind: impl
     Parent: M0149-0016

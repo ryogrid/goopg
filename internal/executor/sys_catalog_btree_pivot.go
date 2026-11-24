@@ -18,8 +18,10 @@ import "encoding/binary"
 type tupleCmpFn func(newKey, item []byte) int
 
 // pivotAwareCmp wraps a full-key comparator with _bt_compare's handling of
-// truncated pivots for indexOID.
-func pivotAwareCmp(indexOID uint32, cmp keyCompareFn) tupleCmpFn {
+// truncated pivots for indexOID. A non-nil conv says the index stores its
+// keys in the cstring layout: both operands are converted to the NameData
+// layout cmp expects before anything else (M0149-0016e).
+func pivotAwareCmp(indexOID uint32, cmp keyCompareFn, conv sysKeyConv) tupleCmpFn {
 	meta, _ := keyMetaForSysBtree(indexOID)
 	nkeyatts := int(meta.nkeyatts)
 	return func(newKey, item []byte) int {
@@ -28,11 +30,15 @@ func pivotAwareCmp(indexOID uint32, cmp keyCompareFn) tupleCmpFn {
 		}
 		payload := item[sysIndexTupleHoff:]
 		natts, truncated := pivotNAtts(item, nkeyatts)
+		if truncated && natts == 0 {
+			return 1 // all attributes truncated: minus infinity
+		}
+		if conv != nil {
+			newKey = conv(newKey, nkeyatts)
+			payload = conv(payload, natts)
+		}
 		if !truncated {
 			return cmp(newKey, payload)
-		}
-		if natts == 0 {
-			return 1 // all attributes truncated: minus infinity
 		}
 		end, ok := sysBtreeKeyPrefixLen(indexOID, payload, natts)
 		if !ok || end > len(payload) {

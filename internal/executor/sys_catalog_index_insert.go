@@ -472,9 +472,30 @@ func insertCanonicalSysBtreeLeafInDB(ctx *Context, dbOid, indexOID uint32, index
 		return fmt.Errorf("read meta sys btree %d: %w", indexOID, err)
 	}
 
+	// A PG-built index stores name keys as cstrings (name_ops opckeytype):
+	// write the new tuple in that layout and compare through NameData.
+	// M0149-0016e.
+	// pg_proc_proname_args_nsp_index stays out for now: on a node started
+	// from a PG backup, goopg's catalog does not know the functions PG
+	// created, so CREATE OR REPLACE FUNCTION would add a second pg_proc row
+	// for one of them instead of replacing it (012_subtransactions,
+	// M0149-0015f). Until that is fixed the insert keeps failing there.
+	var conv sysKeyConv
+	lay, ok := sysBtreeAttrLayouts(indexOID)
+	if ok && indexOID != pgProcPronameArgsNspIndexOID && layoutHasName(lay) &&
+		sysBtreeUsesCstringKeys(ctx, rel, lay, rootBlk, level) {
+		if cs, ok := nameDataTupleToCstring(lay, indexTuple); ok {
+			indexTuple = cs
+			conv = cstringKeyConv(lay)
+		}
+	}
+
 	if level == 0 {
 		// Single leaf-root path: keep the lightweight in-place insert +
 		// `splitLeafRootAndInsert` fallback that batched-39 introduced.
+		if conv != nil {
+			cmp = wrapCstringCmp(cmp, conv, len(lay))
+		}
 		return insertIntoSingleLeafRoot(ctx, indexOID, rel, indexTuple, cmp)
 	}
 
@@ -483,7 +504,7 @@ func insertCanonicalSysBtreeLeafInDB(ctx *Context, dbOid, indexOID uint32, index
 	// _bt_insert_parent do (sys_catalog_btree_insert_split.go). The former
 	// whole-index rebuild made every insert into a full leaf rewrite the
 	// entire index (M-NIGHTLY-catalog-btree-split).
-	if err := insertSysBtreeMultiLevel(ctx, indexOID, rel, rootBlk, level, indexTuple, cmp); err != nil {
+	if err := insertSysBtreeMultiLevel(ctx, indexOID, rel, rootBlk, level, indexTuple, cmp, conv); err != nil {
 		return fmt.Errorf("insert sys btree %d: %w", indexOID, err)
 	}
 	return nil

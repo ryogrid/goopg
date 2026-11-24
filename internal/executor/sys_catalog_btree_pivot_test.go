@@ -22,7 +22,7 @@ func TestPivotAwareCmpTruncatedPivot(t *testing.T) {
 		binary.LittleEndian.PutUint32(it[sysIndexTupleHoff:], relid)
 		return it[:sysIndexTupleHoff+4] // only the present attribute's bytes
 	}
-	cmp := pivotAwareCmp(pgAttributeRelidAttnumIndexOID, cmpKeyOidInt2)
+	cmp := pivotAwareCmp(pgAttributeRelidAttnumIndexOID, cmpKeyOidInt2, nil)
 	if c := cmp(key, pivot(500, 1)); c <= 0 {
 		t.Fatalf("key equal on the present attribute must sort after the pivot, got %d", c)
 	}

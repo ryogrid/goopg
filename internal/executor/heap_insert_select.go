@@ -68,6 +68,16 @@ func batchExtendAndRegisterFSM(pool *storage.Pool, fsm *storage.FSM, rel storage
 	return first, nil
 }
 
+// fsmBlockExists is freespace.c fsm_does_block_exist: blk is below the
+// relation's cached size, or, failing that, its size on disk.
+func fsmBlockExists(pool *storage.Pool, rel storage.RelFileNode, blk storage.BlockNumber) bool {
+	if n, ok := pool.CachedNBlocks(rel); ok && blk < n {
+		return true
+	}
+	n, err := pool.NBlocks(rel)
+	return err == nil && blk < n
+}
+
 // selectFSMCandidatePage queries the FSM for up to candidatesPerInsert
 // pages with at least minFreeBytes free, ranks them by current pin count
 // (lower is better), and returns the best block. Returns (0, false) when
@@ -104,6 +114,15 @@ func selectFSMCandidatePage(
 		haveBest bool
 	)
 	for _, blk := range candidates {
+		if !fsmBlockExists(pool, rel, blk) {
+			// freespace.c fsm_search: an FSM entry for a block past the end
+			// of the relation is zeroed and skipped, never returned. An FSM
+			// fork read from a PG-built file can carry such an entry (the
+			// legacy loader's layout, M0149-0016h); a truncated relation
+			// leaves them too. M0149-0016g.
+			fsm.RecordFreeSpace(rel, blk, 0)
+			continue
+		}
 		pin := pool.SlotPinCount(storage.BufferTag{Rel: rel, Block: blk})
 		if pin < bestPin {
 			bestPin = pin
