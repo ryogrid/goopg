@@ -45,9 +45,31 @@ Not done:
 - re\-announcing a segment that completed just before a crash, before its status file was written;
 - pg\_stat\_reset\_shared\('archiver'\).
 
+## Slice 2 \(0018b, landed\): a standby restoring from the archive
+
+- With standby.signal, restore\_command and no primary\_conninfo, the standby runs `runArchiveFeeder`
+  \(`cmd/goopg/standby_archive.go`\) in the walreceiver's slot. This is the XLOG\_FROM\_ARCHIVE source of PG's
+  WaitForWALToBecomeAvailable.
+- Each round:
+  - take the segment that holds the next WAL byte \(the writer's WrittenLSN, on the writer's timeline\);
+  - restore it with restore\_command into `pg_wal/RECOVERYXLOG` \(`%p`; `%r` is the segment of pg\_control's
+    checkpoint redo\);
+  - check its size and log "restored log file … from archive";
+  - append the bytes the local WAL lacks through `AppendRaw`, the same entry the walreceiver uses, so the continuous
+    replayer reads them;
+  - remove RECOVERYXLOG.
+- When the archive does not have the segment yet, the feeder waits wal\_retrieve\_retry\_interval. A FATAL restore
+  failure \(a signal, an unrunnable command, a wrong size\) stops it.
+- At promotion it makes a last pass, as PG's startup process reads all available WAL before it finishes recovery.
+- Received segments are marked `.done` by the archiver hook \(archive\_mode = on in recovery\).
+- Not done:
+  - the alternation with streaming when both sources are configured: PG starts from the archive and switches to the
+    stream, then back on failure; goopg uses one or the other;
+  - timeline following from the archive \(history files, recovery\_target\_timeline = latest\);
+  - restore\_command for missing segments at crash recovery on a standby.
+
 ## Open \(children in fix\_plan\)
 
-- 0018b: a goopg standby restoring WAL from the archive \(standby mode with restore\_command\).
 - 0018c: archive\_cleanup\_command at a standby restartpoint, recovery\_end\_command at promotion \(including the
   failure WARNING\), recovery commands running in the data directory, and the history\-file restore at promotion
   with RECOVERYHISTORY / RECOVERYXLOG cleanup.

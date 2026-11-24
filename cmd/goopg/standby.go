@@ -204,32 +204,13 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 		systemID, _ = initdb.LoadOrCreateSystemID(rt.DataDir)
 		rcvWALDir = walDirFor(rt)
 	}
-	replication.StartWalReceiver(rcvCtx, rcvDone, replication.WalReceiverLauncherConfig{
-		WAL:          rt.WAL,
-		Receivers:    rt.WalReceivers,
-		Registry:     registry,
-		Logger:       logger,
-		ApplyLSNFunc: standbyApplyLSNFunc(replayer),
-		// M0149-0077i: hot_standby_feedback (SIGHUP, read per message) and
-		// GetReplicationHorizons for the 'h' message.
-		HSFeedbackFunc: func() (bool, uint32, uint32) {
-			if rt.TxnMgr == nil {
-				return false, 0, 0
-			}
-			xmin, catalogXmin := rt.TxnMgr.ReplicationHorizons()
-			return boolGUC(registry, "hot_standby_feedback", false), uint32(xmin), uint32(catalogXmin)
-		},
-		SystemID: systemID,
-		WALDir:   rcvWALDir,
-		OnEndOfTimeline: func(eot *replication.EndOfTimeline) {
-			if rcvWALDir == "" {
-				return
-			}
-			if _, err := followUpstreamTimeline(rt.WAL, rcvWALDir, rt.DataDir, recoveryTargetTimeline(registry), logger); err != nil {
-				logger.Warn("standby: could not follow the upstream's timeline switch", "err", err)
-			}
-		},
-	})
+	// Without primary_conninfo, a standby with restore_command takes its
+	// WAL from the archive instead (M0149-0018b).
+	if stringGUC(registry, "primary_conninfo", "") == "" && stringGUC(registry, "restore_command", "") != "" {
+		go runArchiveFeeder(rcvCtx, rcvDone, rt, registry, logger)
+	} else {
+		startWalReceiverForStandby(rcvCtx, rcvDone, rt, registry, logger, replayer, systemID, rcvWALDir)
+	}
 
 	sc := &standbyController{
 		rt:                 rt,
@@ -1348,4 +1329,35 @@ func (sc *standbyController) recoveryPause(action string) (string, bool) {
 		sc.replayer.Resume()
 	}
 	return sc.replayer.PauseState(), false
+}
+
+// startWalReceiverForStandby starts the streaming walreceiver (the
+// XLOG_FROM_STREAM source).
+func startWalReceiverForStandby(rcvCtx context.Context, rcvDone chan struct{}, rt *initdb.Runtime, registry *misc.Registry, logger *slog.Logger, replayer *xlog.StreamReplayer, systemID uint64, rcvWALDir string) {
+	replication.StartWalReceiver(rcvCtx, rcvDone, replication.WalReceiverLauncherConfig{
+		WAL:          rt.WAL,
+		Receivers:    rt.WalReceivers,
+		Registry:     registry,
+		Logger:       logger,
+		ApplyLSNFunc: standbyApplyLSNFunc(replayer),
+		// M0149-0077i: hot_standby_feedback (SIGHUP, read per message) and
+		// GetReplicationHorizons for the 'h' message.
+		HSFeedbackFunc: func() (bool, uint32, uint32) {
+			if rt.TxnMgr == nil {
+				return false, 0, 0
+			}
+			xmin, catalogXmin := rt.TxnMgr.ReplicationHorizons()
+			return boolGUC(registry, "hot_standby_feedback", false), uint32(xmin), uint32(catalogXmin)
+		},
+		SystemID: systemID,
+		WALDir:   rcvWALDir,
+		OnEndOfTimeline: func(eot *replication.EndOfTimeline) {
+			if rcvWALDir == "" {
+				return
+			}
+			if _, err := followUpstreamTimeline(rt.WAL, rcvWALDir, rt.DataDir, recoveryTargetTimeline(registry), logger); err != nil {
+				logger.Warn("standby: could not follow the upstream's timeline switch", "err", err)
+			}
+		},
+	})
 }

@@ -16424,7 +16424,16 @@ verify each at HEAD when the task starts.
     Kind: impl
     Parent: M0149-0018
     Path\-to\-TAP: 002 waits for the standby to replay WAL it can only get from the primary's archive.
-  - [ ] **M0149-0018b — a goopg standby does not restore WAL from the archive**
+  - [x] **M0149-0018b — a goopg standby does not restore WAL from the archive** \(2026\-11\-25\)
+    - A standby with restore\_command and no primary\_conninfo runs an archive feeder in the walreceiver's slot
+      \(runArchiveFeeder, the XLOG\_FROM\_ARCHIVE source\):
+      - it restores the segment that holds its next WAL byte into RECOVERYXLOG, %r being the last restartpoint;
+      - it appends the bytes it lacks to the local WAL writer, which the replayer reads;
+      - it logs "restored log file … from archive";
+      - when the archive does not have the segment yet, it waits wal\_retrieve\_retry\_interval;
+      - at promotion it takes what the archive still has.
+    - Ungated witness: TestE2E\_GoopgStandbyRestoresFromArchive \(3/3\).
+    Movement: yes — tap 002 all\-goopg and pg18\-primary/goopg\-standbys: fatal "Timed out while waiting for standby to catch up" → run to the end; content, promotion and the 00000002.history archive pass; 4 not ok left \(0018c\)
     Kind: impl
     Parent: M0149-0018
     Path\-to\-TAP: 002 all\-goopg and pg18\-primary pairings: standby.signal \+ restore\_command and no primary\_conninfo.

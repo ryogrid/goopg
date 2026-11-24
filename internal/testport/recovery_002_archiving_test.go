@@ -20,9 +20,9 @@ import (
 // primary with goopg standbys, and a goopg primary with PG 18.3 standbys.
 //
 // The goopg-primary/PG-standbys pairing passes (goopg's WAL archiver,
-// M0149-0018a) and always runs; the two pairings with goopg standbys need
-// standby-mode archive restore (M0149-0018b) and run only with
-// GOOPG_TAP_002=1.
+// M0149-0018a) and always runs; the two pairings with goopg standbys restore
+// from the archive (M0149-0018b) but still miss the recovery-command and
+// promotion checks (M0149-0018c), and run only with GOOPG_TAP_002=1.
 func TestPort_Recovery002ArchivingFull(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping recovery TAP port in short mode")
@@ -50,7 +50,7 @@ func TestPort_Recovery002ArchivingFull(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.name != "goopg-primary-pg18-standbys" && !gated {
-				t.Skip("goopg-standby pairing not passing yet (M0149-0018b); set GOOPG_TAP_002=1 to run")
+				t.Skip("goopg-standby pairing not passing yet (M0149-0018c); set GOOPG_TAP_002=1 to run")
 			}
 			runArchiving(t, tc.primary(t, "primary"), func(name, bkp string, root *tapnode.Node) *tapnode.Node {
 				return tc.standby(t, name, root, bkp)
@@ -186,4 +186,48 @@ func runArchiving(t *testing.T, nodePrimary *tapnode.Node, standbyFromBackup fun
 	ok(!exists(filepath.Join(standby2Data, "pg_wal", "RECOVERYXLOG")), "RECOVERYXLOG removed after promotion")
 	ok(regexp.MustCompile(`(?s)WARNING:.*recovery_end_command`).MatchString(logContents),
 		"recovery_end_command failure detected in logs after promotion")
+}
+
+// TestE2E_GoopgStandbyRestoresFromArchive pins standby-mode archive restore
+// (M0149-0018b), the first half of 002 with a goopg primary and a goopg
+// standby: the standby has restore_command and no primary_conninfo, takes
+// its WAL from the primary's archive, follows a later pg_switch_wal, and
+// promotes with the archived rows.
+func TestE2E_GoopgStandbyRestoresFromArchive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping archive restore E2E in short mode")
+	}
+	repo := repoRoot(t)
+	tapnode.Available(t, repo)
+	primary := tapnode.NewGoopg(t, repo, "primary")
+	primary.EnableArchiving()
+	primary.Start()
+	bkp := primary.Backup("b")
+	standby := tapnode.InitFromBackupGoopg(t, repo, "standby", primary, bkp, false)
+	standby.EnableRestoring(primary, true)
+	standby.AppendConf("wal_retrieve_retry_interval = '100ms'")
+	standby.Start()
+
+	primary.SafePSQL("postgres", "CREATE TABLE t AS SELECT generate_series(1,500) AS a")
+	lsn := primary.SafePSQL("postgres", "SELECT pg_current_wal_lsn()")
+	primary.SafePSQL("postgres", "SELECT pg_switch_wal()")
+	if !standby.PollQueryUntil("postgres", fmt.Sprintf("SELECT '%s'::pg_lsn <= pg_last_wal_replay_lsn()", lsn), "t") {
+		t.Fatal("standby did not replay the archived segment")
+	}
+	if got := standby.SafePSQL("postgres", "SELECT count(*) FROM t"); got != "500" {
+		t.Fatalf("standby rows = %q, want 500", got)
+	}
+	primary.SafePSQL("postgres", "INSERT INTO t SELECT generate_series(501,700)")
+	lsn = primary.SafePSQL("postgres", "SELECT pg_current_wal_lsn()")
+	primary.SafePSQL("postgres", "SELECT pg_switch_wal()")
+	if !standby.PollQueryUntil("postgres", fmt.Sprintf("SELECT '%s'::pg_lsn <= pg_last_wal_replay_lsn()", lsn), "t") {
+		t.Fatal("standby did not follow the next archived segment")
+	}
+	standby.Promote()
+	if got := standby.SafePSQL("postgres", "SELECT count(*) FROM t"); got != "700" {
+		t.Fatalf("promoted standby rows = %q, want 700", got)
+	}
+	if !primary.PollQueryUntil("postgres", fmt.Sprintf("SELECT size IS NOT NULL FROM pg_stat_file('%s/00000002.history', true)", primary.ArchiveDir()), "t") {
+		t.Fatal("promoted standby did not archive 00000002.history")
+	}
 }
