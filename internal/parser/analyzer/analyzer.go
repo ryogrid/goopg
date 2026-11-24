@@ -2672,6 +2672,22 @@ func tableFuncBaseColumns(tf *parser.TableFuncRef, alias string, colAliases []st
 			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
 		}
 		return cols
+	case "pg_backup_stop":
+		// pg_backup_stop([wait_for_archive]) → (lsn pg_lsn, labelfile text,
+		// spcmapfile text), its OUT parameters (pg_proc.dat). Mirrors the
+		// planner's planRecordFuncScan arm. M0149-0021.
+		names := []string{"lsn", "labelfile", "spcmapfile"}
+		types := []string{"pg_lsn", "text", "text"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
 	case "pg_control_checkpoint":
 		// pg_control_checkpoint() → pg_controldata's checkpoint fields
 		// (misc/pg_controldata.c). Mirrors planPgControlCheckpoint. M0149-0076.

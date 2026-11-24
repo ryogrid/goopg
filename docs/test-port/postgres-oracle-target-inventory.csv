@@ -425,7 +425,7 @@ R-038,recovery-tap,tap,postgres/src/test/recovery/t/038_save_logical_slots_shutd
 R-039,recovery-tap,tap,postgres/src/test/recovery/t/039_end_of_wal.pl,port,yes,-,"Re-ported as TestPort_Recovery039EndOfWal in internal/testport/recovery_039_end_of_wal_test.go (M0149-0076): all 14 defective record/page-header cases, each checked on goopg crash recovery and on a PG 18.3 cold start of the same doctored directory",,
 ,recovery-tap,tap,postgres/src/test/recovery/t/040_standby_failover_slots_sync.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/041_checkpoint_at_promote.pl,not-tried,no,-,,,
-,recovery-tap,tap,postgres/src/test/recovery/t/042_low_level_backup.pl,not-tried,no,-,,,
+,recovery-tap,tap,postgres/src/test/recovery/t/042_low_level_backup.pl,port,yes,-,Ported as TestPort_Recovery042LowLevelBackupFull in internal/testport/recovery_042_low_level_backup_test.go (all three pairings: all-goopg; PG 18.3 primary with goopg recovery nodes; goopg primary with PG 18.3 recovery nodes — M0149-0021),,
 ,recovery-tap,tap,postgres/src/test/recovery/t/043_no_contrecord_switch.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/044_invalidate_inactive_slots.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/045_archive_restartpoint.pl,not-tried,no,-,,,

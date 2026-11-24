@@ -3,6 +3,8 @@ package executor
 import (
 	"bytes"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -170,23 +172,106 @@ func evalPgBackupStop(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum
 	}
 	b := v.(*sessionBackup)
 	var stop uint64
+	stopTLI := b.tli
 	segSize := int64(xlog.DefaultSegmentSize)
+	walDir := ""
+	if ctx.DataDir != "" {
+		walDir = filepath.Join(ctx.DataDir, "pg_wal")
+	}
 	if ctx.WAL != nil {
 		segSize = ctx.WAL.SegmentSize()
 		stop = ctx.WAL.WrittenLSN()
 		if !ctx.IsStandby {
+			// do_pg_backup_stop on a primary: the XLOG_BACKUP_END record —
+			// recovery from the backup is consistent once it replays it —
+			// whose end is the stop point, then a segment switch so the
+			// backup's last segment can be archived, then the backup
+			// history file, announced to the archiver.
+			rec, err := xlog.EncodeBackupEndPG(b.startLSN)
+			if err != nil {
+				return Datum{}, &ExecError{Code: "XX000", Message: err.Error()}
+			}
+			_, end, err := ctx.WAL.Append(rec)
+			if err != nil {
+				return Datum{}, &ExecError{Code: "XX000", Message: err.Error()}
+			}
+			stop, stopTLI = end, ctx.WAL.TimelineID()
 			if _, err := ctx.WAL.SwitchSegment(); err != nil {
 				return Datum{}, &ExecError{Code: "XX000", Message: err.Error()}
+			}
+			if walDir != "" {
+				hist := xlog.BackupHistoryFileName(stopTLI, b.startLSN, segSize)
+				content := BuildBackupHistory(b.label, b.startLSN, b.ckptLSN, b.tli, stop, stopTLI, segSize, b.startTime, time.Now())
+				if err := os.WriteFile(filepath.Join(walDir, hist), content, 0o600); err != nil {
+					return Datum{}, &ExecError{Code: "58030", Message: fmt.Sprintf("could not write file \"%s\": %v", filepath.Join("pg_wal", hist), err)}
+				}
+				ctx.WAL.Archiver().Notify(hist)
 			}
 		}
 	}
 	sessionBackups.Delete(ctx.ProcNum)
-	// do_pg_backup_stop: without archiving there is nothing to wait for.
-	if waitForArchive && backupGUC(ctx, "archive_mode") != "on" && backupGUC(ctx, "archive_mode") != "always" {
+	mode := backupGUC(ctx, "archive_mode")
+	archiving := (!ctx.IsStandby && (mode == "on" || mode == "always")) || (ctx.IsStandby && mode == "always")
+	if waitForArchive && archiving && walDir != "" && ctx.WAL != nil {
+		// Wait until the backup's last segment and its history file are
+		// archived; the alphabetic order of WAL file names covers the
+		// earlier segments.
+		last := xlog.XLogFileName(stopTLI, (stop-1)/uint64(segSize), segSize)
+		hist := xlog.BackupHistoryFileName(stopTLI, b.startLSN, segSize)
+		if err := waitForBackupArchive(ctx, walDir, last, hist); err != nil {
+			return Datum{}, err
+		}
+		ctx.AddNotice("all required WAL segments have been archived")
+	} else if waitForArchive {
 		ctx.AddNotice("WAL archiving is not enabled; you must ensure that all required WAL segments are copied through other means to complete the backup")
 	}
 	labelFile := BuildBackupLabel(b.label, b.startLSN, b.ckptLSN, b.tli, segSize, b.startTime)
-	return NewStringDatum("(" + formatPgLSN(stop) + "," + recordOutField(string(labelFile)) + ",)"), nil
+	return NewStringDatum("(" + formatPgLSN(stop) + "," + recordOutField(string(labelFile)) + "," + recordOutField("") + ")"), nil
+}
+
+// waitForBackupArchive is do_pg_backup_stop's archive wait: poll once a
+// second until neither file is busy, with PG's NOTICE after five waits and
+// WARNING after 60 s (doubling). A cancelled statement ends the wait.
+func waitForBackupArchive(ctx *Context, walDir, last, hist string) error {
+	waits, warnAfter, reported := 0, 60, false
+	for xlog.XLogArchiveIsBusy(walDir, last) || xlog.XLogArchiveIsBusy(walDir, hist) {
+		if !reported && waits > 5 {
+			ctx.AddNotice("base backup done, waiting for required WAL segments to be archived")
+			reported = true
+		}
+		if ctx.Ctx != nil {
+			select {
+			case <-ctx.Ctx.Done():
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			case <-time.After(time.Second):
+			}
+		} else {
+			time.Sleep(time.Second)
+		}
+		waits++
+		if waits >= warnAfter {
+			warnAfter *= 2
+			ctx.AddWarning(fmt.Sprintf("still waiting for all required WAL segments to be archived (%d seconds elapsed)", waits))
+		}
+	}
+	return nil
+}
+
+// BuildBackupHistory renders the backup history file do_pg_backup_stop
+// writes into pg_wal: the backup_label contents plus the stop location
+// (build_backup_content with ishistoryfile).
+func BuildBackupHistory(label string, startLSN, ckptLSN uint64, tli uint32, stopLSN uint64, stopTLI uint32, segSize int64, startTime, stopTime time.Time) []byte {
+	lines := strings.SplitAfter(string(BuildBackupLabel(label, startLSN, ckptLSN, tli, segSize, startTime)), "\n")
+	stopFile := xlog.XLogFileName(stopTLI, stopLSN/uint64(segSize), segSize)
+	var b bytes.Buffer
+	b.WriteString(lines[0])
+	fmt.Fprintf(&b, "STOP WAL LOCATION: %s (file %s)\n", formatPgLSN(stopLSN), stopFile)
+	for _, l := range lines[1:] {
+		b.WriteString(l)
+	}
+	fmt.Fprintf(&b, "STOP TIME: %s\n", stopTime.UTC().Format("2006-01-02 15:04:05 MST"))
+	fmt.Fprintf(&b, "STOP TIMELINE: %d\n", stopTLI)
+	return b.Bytes()
 }
 
 // backupGUC reads a GUC's current value ("" when the context has no settings).

@@ -837,12 +837,19 @@ func appendEndOfRecoveryRecord(rt *initdb.Runtime, oldTLI, newTLI uint32, walLev
 // append up to the timeline's begin, switch the writer onto it there, go on.
 // The switch zero-fills the new timeline's copy of the segment past its
 // begin (copySegmentPrefix), so those restored bytes are read before it.
-func adoptRestoredWAL(rt *initdb.Runtime, endOfLog uint64, timelines []xlog.TimelineSpan) error {
+func adoptRestoredWAL(rt *initdb.Runtime, startOfLog, endOfLog uint64, timelines []xlog.TimelineSpan) error {
 	if rt.WAL == nil || endOfLog <= rt.WAL.WrittenLSN() {
 		return nil
 	}
 	walDir := walDirFor(rt)
 	segSize := uint64(rt.WAL.SegmentSize())
+	// An empty pg_wal (a low-level backup's): the WAL begins at the first
+	// restored segment, the backup's redo segment, not at 0.
+	if rt.WAL.WrittenLSN() == 0 && startOfLog >= segSize {
+		if err := rt.WAL.StartAt(startOfLog / segSize * segSize); err != nil {
+			return fmt.Errorf("adopt restored WAL: %w", err)
+		}
+	}
 	readRestored := func(a, b uint64) ([]byte, error) {
 		segNo, off := a/segSize, a%segSize
 		name, ok, err := xlog.NewestSegmentPath(walDir, segNo)
@@ -973,7 +980,7 @@ func promoteAfterRecovery(rt *initdb.Runtime, end archiveRecoveryEnd, logger *sl
 		_, prevRecPtr = rt.WAL.InsertPosition()
 	}
 	if rec.EndOfLog > endLSN {
-		if err := adoptRestoredWAL(rt, rec.EndOfLog, rec.Timelines); err != nil {
+		if err := adoptRestoredWAL(rt, rec.StartOfLog, rec.EndOfLog, rec.Timelines); err != nil {
 			return fmt.Errorf("promote after recovery: %w", err)
 		}
 		endLSN, prevRecPtr = rec.EndOfLog, rec.LastStart-1

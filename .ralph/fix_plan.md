@@ -16484,11 +16484,12 @@ verify each at HEAD when the task starts.
   Upstream: `postgres/src/test/recovery/t/024_archive_recovery.pl` — archive recovery refusing WAL generated with `wal_level=minimal`.
   Likely prerequisites \(verify at start\): `XLOG_PARAMETER_CHANGE` record + PG FATAL text, restart with changed `wal_level`.
   - 2026\-11\-25 \(done\): TestPort\_Recovery024ArchiveRecoveryFull passes on all three pairings \(3 of 3 runs\), ungated; inventory row 024 → port. XLogReportParameters at startup, the wal\_level=minimal FATAL, archive recovery replays from the pg\_control redo. Design: docs/design/0100\-0149/0149\-0020\-archive\-recovery\-wal\-level.md.
-- [ ] **M0149-0021 — port recovery/t/042_low_level_backup.pl**
+- [x] **M0149-0021 — port recovery/t/042_low_level_backup.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/042_low_level_backup.pl` — `pg_backup_start`/`pg_backup_stop` backups restored with/without `backup_label`.
   Likely prerequisites \(verify at start\): non-exclusive low-level backup returning PG-exact `backup_label`/`tablespace_map` text, recovery from caller-written `backup_label`, the "missing backup\_label" behaviour.
+  - 2026\-11\-25 \(done\): TestPort\_Recovery042LowLevelBackupFull passes on all three pairings \(3 of 3 runs\), ungated; inventory row 042 → port. pg\_backup\_stop\(\) in FROM, XLOG\_BACKUP\_END \+ history file \+ archive wait, archive recovery from backup\_label, replayed commit status and catalog refresh. Design: docs/design/0100\-0149/0149\-0021\-low\-level\-backup.md.
 - [ ] **M0149-0022 — port recovery/t/045_archive_restartpoint.pl**
   Kind: impl
   Parent: none

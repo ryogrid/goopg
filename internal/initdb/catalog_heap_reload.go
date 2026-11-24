@@ -3755,6 +3755,30 @@ func (r *Runtime) RefreshSequenceAfterReplay(rel storage.RelFileNode) {
 	}
 }
 
+// RefreshAllCatalogsAfterReplay refreshes every database's catalog after
+// archive recovery replayed WAL past what initdb.Open loaded: relations
+// created after the backup started (042's canary) exist only in the
+// replayed catalog heaps. template0 never changes and is skipped. M0149-0021.
+func (r *Runtime) RefreshAllCatalogsAfterReplay() error {
+	cat, ok := r.Catalog.(*catalog.InMemory)
+	if !ok || cat == nil {
+		return nil
+	}
+	for _, name := range cat.ListDatabases() {
+		if name == "template0" {
+			continue
+		}
+		oid, ok := cat.ResolveDatabaseOid(name)
+		if !ok {
+			continue
+		}
+		if err := r.RefreshCatalogAfterReplay(oid); err != nil {
+			return fmt.Errorf("database %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
 // RefreshCatalogAfterReplay is the running standby's relcache invalidation:
 // after a replayed commit changed database dbOid's system catalogs, it reloads
 // that database's user tables from the replayed pg_class/pg_attribute heaps,

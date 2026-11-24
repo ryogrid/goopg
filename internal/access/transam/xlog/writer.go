@@ -2923,6 +2923,15 @@ func (s *state) close() error {
 	return firstErr
 }
 
+// Archiver returns the attached WAL archiver, nil when there is none.
+func (w *Writer) Archiver() *Archiver {
+	st := w.stateRef
+	if st == nil {
+		return nil
+	}
+	return st.archive.Load()
+}
+
 // SetArchiver attaches the WAL archiver (M0149-0018a). Segments complete
 // before this call are pre-existing and are not announced again; one that
 // was never archived gets its .ready when removal checks it

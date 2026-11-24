@@ -66,3 +66,26 @@ func TestBuildBackupLabel(t *testing.T) {
 		t.Fatal("label field not quoted")
 	}
 }
+
+// TestBuildBackupHistory pins the backup history file do_pg_backup_stop
+// writes: the label with STOP WAL LOCATION after START WAL LOCATION and STOP
+// TIME / STOP TIMELINE at the end (build_backup_content, ishistoryfile).
+// M0149-0021.
+func TestBuildBackupHistory(t *testing.T) {
+	start := time.Date(2026, 11, 24, 13, 37, 13, 0, time.UTC)
+	stop := start.Add(2 * time.Second)
+	got := string(BuildBackupHistory("test label", 0x10000A0, 0x10000F8, 1, 0x2000130, 1, 16<<20, start, stop))
+	want := "START WAL LOCATION: 0/10000A0 (file 000000010000000000000001)\n" +
+		"STOP WAL LOCATION: 0/2000130 (file 000000010000000000000002)\n" +
+		"CHECKPOINT LOCATION: 0/10000F8\n" +
+		"BACKUP METHOD: streamed\n" +
+		"BACKUP FROM: primary\n" +
+		"START TIME: 2026-11-24 13:37:13 UTC\n" +
+		"LABEL: test label\n" +
+		"START TIMELINE: 1\n" +
+		"STOP TIME: 2026-11-24 13:37:15 UTC\n" +
+		"STOP TIMELINE: 1\n"
+	if got != want {
+		t.Fatalf("history file:\n%s\nwant:\n%s", got, want)
+	}
+}

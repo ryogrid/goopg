@@ -7389,6 +7389,13 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_control_checkpoint") {
 		return planPgControlCheckpoint(rv, sourceIdx)
 	}
+	if strings.EqualFold(tf.Name, "pg_backup_stop") {
+		// pg_backup_stop([wait_for_archive]) is not SETOF: it returns one
+		// record of OUT parameters (lsn, labelfile, spcmapfile), and in FROM
+		// position ExecMakeTableFunctionResult scans it once, one column per
+		// OUT parameter (pg_proc.dat). M0149-0021.
+		return planRecordFuncScan(rv, sourceIdx, []string{"lsn", "labelfile", "spcmapfile"}, []string{"pg_lsn", "text", "text"})
+	}
 	if strings.EqualFold(tf.Name, "pg_get_catalog_foreign_keys") {
 		return planPgGetCatalogForeignKeys(rv, sourceIdx)
 	}
@@ -8170,6 +8177,43 @@ func planScalarFuncScan(rv parser.RangeVar, sourceIdx int16, colType string) (No
 	}
 	node := &ScalarFuncScan{pos: tf.Pos(), Func: fc, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planRecordFuncScan plans a non-SETOF builtin that returns a record of OUT
+// parameters in FROM position: a ScalarFuncScan called once, whose composite
+// result the operator splits into one column per OUT parameter (colNames,
+// colTypes), with rv.Columns overriding the names positionally.
+func planRecordFuncScan(rv parser.RangeVar, sourceIdx int16, colNames, colTypes []string) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	alias := rv.Alias
+	if alias == "" {
+		alias = strings.ToLower(tf.Name)
+	}
+	ctx := &resolveContext{}
+	args := make([]Expr, 0, len(tf.Args))
+	for _, a := range tf.Args {
+		pa, err := resolveExpr(a, ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+		args = append(args, pa)
+	}
+	names := append([]string(nil), colNames...)
+	for i := range names {
+		if i < len(rv.Columns) {
+			names[i] = rv.Columns[i]
+		}
+	}
+	schema := make(Schema, len(names))
+	cols := make([]catalog.Column, len(names))
+	for i := range names {
+		schema[i] = SchemaColumn{Name: names[i], Type: catalog.Type{Name: colTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: colTypes[i]}, Ordinal: i}
+	}
+	fc := &FuncCall{pos: tf.Pos(), Name: strings.ToLower(tf.Name), Args: args}
+	node := &ScalarFuncScan{pos: tf.Pos(), Func: fc, schema: schema}
+	b := rangeBinding{table: &catalog.Table{Name: alias, Columns: cols}, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }
 

@@ -345,6 +345,27 @@ func archiveCheckDone(walDir, name string) bool {
 	return false
 }
 
+// XLogArchiveIsBusy is XLogArchiveIsBusy (xlogarchive.c): whether name in
+// walDir still waits to be archived. A .done file, or a file no longer in
+// pg_wal (archived and recycled), means it is not busy.
+func XLogArchiveIsBusy(walDir, name string) bool {
+	dir := filepath.Join(walDir, archiveStatusDir)
+	if _, err := os.Stat(filepath.Join(dir, name+".done")); err == nil {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(dir, name+".ready")); err == nil {
+		return true
+	}
+	// Race condition: the archiver may have just finished.
+	if _, err := os.Stat(filepath.Join(dir, name+".done")); err == nil {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(walDir, name)); err != nil {
+		return false
+	}
+	return true
+}
+
 // archiveCleanup is XLogArchiveCleanup: drop a removed segment's status
 // files.
 func archiveCleanup(walDir, name string) {

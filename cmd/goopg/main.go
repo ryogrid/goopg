@@ -1082,12 +1082,25 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		recovered, err := xlog.RunArchiveRecoveryWith(ctx, rt.StorageMgr, rt.DataDir, func() string {
 			startupHup.process(registry, cfg.ConfigPath, *dataDir)
 			return stringGUC(registry, "restore_command", "")
-		}, 0, recoveryTargetTimeline(registry), stop)
+		}, 0, recoveryTargetTimeline(registry), stop, xlog.ArchiveReplayHooks{Xact: archiveXactHook(rt)})
 		if err == nil {
 			err = checkRecoveryTargetReached(stop, recovered, localEnd)
 		}
 		if err != nil {
 			return endInterruptedArchiveRecovery(rt, err, quit.Requested(), logger, stderr)
+		}
+		// Relations created after the backup started live only in the
+		// replayed catalog heaps (M0149-0021).
+		if rerr := rt.RefreshAllCatalogsAfterReplay(); rerr != nil {
+			logger.Warn("archive recovery: catalog refresh failed", "err", rerr)
+		}
+		// backup_label has done its job: it is renamed so a later start
+		// recovers from pg_control (StartupXLOG, BACKUP_LABEL_OLD).
+		if _, serr := os.Stat(filepath.Join(rt.DataDir, xlog.BackupLabelFile)); serr == nil {
+			if rerr := os.Rename(filepath.Join(rt.DataDir, xlog.BackupLabelFile), filepath.Join(rt.DataDir, xlog.BackupLabelOld)); rerr != nil {
+				fmt.Fprintf(stderr, "goopg start: FATAL:  could not rename file \"%s\" to \"%s\": %v\n", xlog.BackupLabelFile, xlog.BackupLabelOld, rerr)
+				return 1
+			}
 		}
 		if recovered.ReachedTarget {
 			logger.Info(recovered.StopMessage())
@@ -1905,4 +1918,23 @@ func reportParameters(rt *initdb.Runtime, registry *misc.Registry, logger *slog.
 	}
 	logger.Debug("parameter change WAL-logged", "wal_level", p.WalLevel)
 	return nil
+}
+
+// archiveXactHook stamps archive recovery's replayed commits and aborts into
+// the live transaction manager, as the standby's replay hook does: initdb.Open
+// swept every xid below pg_control's nextXid it had no outcome for to aborted,
+// and a low-level backup's pg_control can be later than the WAL it replays
+// (M0149-0021).
+func archiveXactHook(rt *initdb.Runtime) func(xid storage.TransactionID, committed bool) {
+	if rt == nil || rt.TxnMgr == nil {
+		return nil
+	}
+	txnMgr := rt.TxnMgr
+	return func(xid storage.TransactionID, committed bool) {
+		if committed {
+			txnMgr.ReplayXactCommit(xid)
+		} else {
+			txnMgr.ReplayXactAbort(xid)
+		}
+	}
 }

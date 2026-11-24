@@ -17,6 +17,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -36,6 +37,9 @@ type TimelineSpan struct {
 // ArchiveRecoveryResult is what archive recovery hands the promotion that
 // follows it.
 type ArchiveRecoveryResult struct {
+	// StartOfLog is the start of the first segment recovery read: the
+	// segment of backup_label's redo when there is a label.
+	StartOfLog uint64
 	// EndOfLog is the end of the last record replayed — PG's EndOfLog, the
 	// timeline switch point the promotion writes into the new timeline's
 	// history file (xlog.c StartupXLOG → writeTimeLineHistory) and where the
@@ -133,7 +137,16 @@ func RunArchiveRecovery(mgr *storage.Manager, dataDir, restoreCommand string, se
 // in_restore_command); either way the result wraps ErrRecoveryShutdown and
 // recovery is left unfinished. A *RestoreFatalError from a fetch aborts
 // recovery instead of ending it, as upstream's FATAL does.
-func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir string, restoreCommand func() string, segmentSize int64, target TargetTimeline, stop RecoveryStop) (ArchiveRecoveryResult, error) {
+// ArchiveReplayHooks are optional callbacks archive recovery invokes as it
+// replays. Xact gets every replayed commit or abort, subtransactions first
+// and then the top-level xid — xact_redo_commit / xact_redo_abort's clog
+// stamping (TransactionIdCommitTree), which goopg keeps in the live
+// transaction manager rather than in page replay. M0149-0021.
+type ArchiveReplayHooks struct {
+	Xact func(xid storage.TransactionID, committed bool)
+}
+
+func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir string, restoreCommand func() string, segmentSize int64, target TargetTimeline, stop RecoveryStop, hooks ...ArchiveReplayHooks) (ArchiveRecoveryResult, error) {
 	var res ArchiveRecoveryResult
 	walDir := filepath.Join(dataDir, "pg_wal")
 
@@ -157,8 +170,8 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 	// (GetOldestRestartPoint — pg_control's checkPointCopy). Start-time
 	// recovery takes no restartpoints, so it is fixed for the whole pass.
 	lastRestartPointFname := XLogFileName(0, 0, segmentSize)
-	// CheckPointLoc: the latest checkpoint record (pg_control; goopg reads
-	// no backup_label at recovery), which must lie on the start timeline
+	// CheckPointLoc: the latest checkpoint record (pg_control, or
+	// backup_label's CHECKPOINT LOCATION), which must lie on the start timeline
 	// in the target's history.
 	var checkPointLoc uint64
 	// redoLSN is where replay starts (InitWalRecovery: checkPoint.redo
@@ -172,6 +185,21 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 		checkPointLoc = cd.CheckPoint
 		redoLSN = cd.CheckPointCopyRedo
 		lastRestartPointFname = XLogFileName(cd.CheckPointCopyThisTLI, cd.CheckPointCopyRedo/uint64(segmentSize), segmentSize)
+	}
+	// read_backup_label (InitWalRecovery): a backup_label overrides
+	// pg_control's checkpoint — a low-level backup copies pg_control last,
+	// so its checkpoint may be later than the backup's start, and replay
+	// must begin at the label's redo or everything in between is lost.
+	label, haveLabel, err := ReadBackupLabel(dataDir)
+	if err != nil {
+		return res, err
+	}
+	if haveLabel {
+		redoLSN, checkPointLoc = label.StartLSN, label.CheckpointLSN
+		if label.TLI != 0 {
+			startTLI = label.TLI
+		}
+		slog.Info(label.StartingBackupRecoveryMessage())
 	}
 	// have reports whether name was restored from the archive or, failing
 	// that, is in pg_wal — XLogFileReadAnyTLI tries XLOG_FROM_ARCHIVE
@@ -343,6 +371,10 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 	if highestSeg >= 0 {
 		seg = uint64(highestSeg)
 	}
+	if haveLabel {
+		seg = label.StartLSN / uint64(segmentSize) // the backup's redo segment
+	}
+	res.StartOfLog = seg * uint64(segmentSize)
 	curTLI := startTLI
 	for {
 		chosen := uint32(0)
@@ -423,6 +455,22 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 		if len(records) > 0 {
 			if _, err := ReplayRecordsFrom(mgr, records, redoLSN); err != nil {
 				return res, fmt.Errorf("wal: archive recovery: replay segment %s: %w", FormatSegmentNameTLI(seg, chosen), err)
+			}
+			for _, h := range hooks {
+				if h.Xact == nil {
+					continue
+				}
+				for _, r := range records {
+					if r.EndLSN <= redoLSN {
+						continue // before the redo point: already in pg_xact
+					}
+					if xid, committed, ok := replayedXactInfo(r); ok {
+						for _, sub := range replayedSubxacts(r) {
+							h.Xact(sub, committed)
+						}
+						h.Xact(xid, committed)
+					}
+				}
 			}
 			if last := records[len(records)-1]; last.EndLSN > res.EndOfLog {
 				res.EndOfLog, res.LastStart, res.EndTLI = last.EndLSN, last.StartLSN, chosen
