@@ -2167,6 +2167,9 @@ func replayRecordsFrom(mgr *storage.Manager, records []Record, redoLSN uint64, i
 		if interrupted != nil && interrupted() {
 			return stats, fmt.Errorf("wal: replay stopped before record %d lsn %d: %w", startIdx+i, r.StartLSN, ErrRecoveryShutdown)
 		}
+		if err := verifyOverwriteContrecord(r); err != nil {
+			return stats, err
+		}
 		if legacyEnd != 0 {
 			// A record written before the M0149-0001a1 S3 layout migration
 			// names the old database directories (storage.StorageDBOid).

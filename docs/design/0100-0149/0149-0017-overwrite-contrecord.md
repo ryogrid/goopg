@@ -1,6 +1,6 @@
 # 0149-0017 — Port recovery/t/026\_overwrite\_contrecord.pl
 
-Status: in progress. `TestPort_Recovery026OverwriteContrecord`
+Status: in progress \(1 of 3 pairings passes; the goopg\-primary pairings wait on 0017d\). `TestPort_Recovery026OverwriteContrecord`
 \(`internal/testport/recovery_026_overwrite_contrecord_test.go`\) is gated by `GOOPG_TAP_026=1`.
 
 ## What the test does
@@ -48,6 +48,19 @@ Pairings: all-goopg, PG 18.3 primary with a goopg standby, goopg primary with a 
   xlogreader.c does, so the writer resumes after the overwrite record. PG 18.3 `pg_waldump` decodes the result
   \(unit test\).
 
+## Slice 3 \(0017b, landed\)
+
+- **Reader restart.** The streaming reader \(`RecordIterator.readOneAt` → `overwritePageAhead`\) and the crash\-replay
+  reader \(`readAllPageAware` → `overwritePageWithin`, its sibling\) check every already\-received continuation page
+  of a multi\-page record. A page whose header carries `XLP_FIRST_IS_OVERWRITE_CONTRECORD`, with its own page address,
+  drops the partial record. Reading restarts at that page, and the dropped record's start is handed to the next
+  `Record` as `OverwrittenRecPtr` \(xlogreader.c `overwrittenRecPtr`\).
+- **Verify and log.** Before applying a record, both replay loops run `verifyOverwriteContrecord`
+  \(xlogrecovery.c `xlogrecovery_redo`\). `overwritten_lsn` must equal `OverwrittenRecPtr`, else replay stops with
+  "mismatching overwritten LSN". Then it logs "successfully skipped missing contrecord at %X/%X, overwritten at %s",
+  the time in the ISO `timestamptz_to_str` form.
+- The PG\-primary / goopg\-standby pairing passes.
+
 ## Open
 
 - **0017d — records across segment boundaries.** goopg's stripe WAL insert \(M0107\) never lets a reservation cross a
@@ -55,6 +68,3 @@ Pairings: all-goopg, PG 18.3 primary with a goopg standby, goopg primary with a 
   starts exactly in the deleted segment. A goopg primary therefore reaches a clean end of WAL at the boundary, writes
   no overwrite record, and its standby never logs the skip. PG pads only for `XLOG_SWITCH`. Changing this touches the
   perf\-critical insert path and needs a design pass.
-- **0017b — goopg standby.** The reader must restart at an `XLP_FIRST_IS_OVERWRITE_CONTRECORD` page while assembling
-  a record, keeping `overwrittenRecPtr`. Replay must verify `overwritten_lsn` and log the skip line. With a PG
-  primary the goopg standby never catches up; all\-goopg replays the data but logs nothing.

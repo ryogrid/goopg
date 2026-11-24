@@ -17,6 +17,11 @@ type Record struct {
 	EndLSN   uint64
 	Payload  []byte
 	XLog     *XLogDecodedRecord
+	// OverwrittenRecPtr is xlogreader.c's overwrittenRecPtr: set on the
+	// first record read after the reader dropped a partial record (whose
+	// 0-based start this is) at an XLP_FIRST_IS_OVERWRITE_CONTRECORD page.
+	// Replay of the XLOG_OVERWRITE_CONTRECORD there verifies it.
+	OverwrittenRecPtr uint64
 }
 
 // readAllUncached decodes every record found under walDir across ordered
@@ -101,6 +106,7 @@ func readAllUncached(walDir string, segmentSize int64) ([]Record, error) {
 // LSN-as-byte-offset semantics.
 func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record, error) {
 	var records []Record
+	var overwritten uint64 // M0149-0017b: start of a dropped partial record
 	off := 0
 
 	// M0131-S19: every page header this walk crosses is validated against the
@@ -267,6 +273,14 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 			stop(off, "bad xlog total length", fmt.Errorf("xl_tot_len=%d", total))
 			break
 		}
+		// M0149-0017b: a continuation replaced by XLOG_OVERWRITE_CONTRECORD
+		// drops the partial record; reading restarts at the flagged page
+		// (xlogreader.c), and the next record carries its start.
+		if next, ok := overwritePageWithin(stream, off, pos, total, segSize); ok {
+			overwritten = uint64(pos)
+			off = next
+			continue
+		}
 		paddedTotal := maxAlignXLog(total)
 		fullBytes, consumed := extractRecordBytes(stream[off:], pos, segSize, paddedTotal)
 		if len(fullBytes) < total {
@@ -314,7 +328,8 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		}
 		start := baseOffset + uint64(off) + 1
 		end := baseOffset + uint64(off) + uint64(consumed)
-		records = append(records, Record{StartLSN: start, EndLSN: end, Payload: decoded.Payload, XLog: decoded.XLog})
+		records = append(records, Record{StartLSN: start, EndLSN: end, Payload: decoded.Payload, XLog: decoded.XLog, OverwrittenRecPtr: overwritten})
+		overwritten = 0
 		off += consumed
 		// An XLOG_SWITCH record ends its segment: the next record starts at
 		// the next segment boundary (XLogDecodeNextRecord, xlogreader.c).

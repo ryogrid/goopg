@@ -241,6 +241,9 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 		sr.recoveryPausesHere(ctx)
 		sr.recoveryApplyDelay(ctx, rec)
 		sr.recoveryPausesHere(ctx)
+		if err := verifyOverwriteContrecord(rec); err != nil {
+			return err
+		}
 		applied, err := ApplyRecord(sr.mgr, rec)
 		if err != nil {
 			return fmt.Errorf("wal: stream replay record lsn[%d,%d]: %w", rec.StartLSN, rec.EndLSN, err)

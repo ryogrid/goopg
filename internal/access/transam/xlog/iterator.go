@@ -60,6 +60,10 @@ type RecordIterator struct {
 	segFileNo   uint64
 	segFileTLI  uint32
 	lastWaitPos int64
+	// overwrittenRecPtr is the start of a partial record dropped at an
+	// XLP_FIRST_IS_OVERWRITE_CONTRECORD page, handed to the next record
+	// (M0149-0017b).
+	overwrittenRecPtr uint64
 	lastWaitEnd uint64
 	// parkedAtEnd is set while Next is blocked at the *end of the WAL
 	// stream*: the cursor has either reached the tail, or points at a
@@ -210,6 +214,15 @@ func (it *RecordIterator) Next(ctx context.Context) (Record, error) {
 		// or exceeds `written`, we're at the tail.
 		if int64(written) > it.pos {
 			rec, n, err := it.readOneAt(it.pos)
+			var ow *overwrittenContrecordError
+			if errors.As(err, &ow) {
+				// xlogreader.c: the continuation was overwritten with a
+				// different record — restart at the flagged page, keeping
+				// the dropped record's start for verification.
+				it.overwrittenRecPtr = uint64(it.pos)
+				it.pos = ow.page
+				continue
+			}
 			if err != nil {
 				if errors.Is(err, ErrLSNNotWritten) {
 					if it.pos != it.lastWaitPos || written != it.lastWaitEnd {
@@ -291,6 +304,9 @@ func (it *RecordIterator) Next(ctx context.Context) (Record, error) {
 			it.lastWaitPos = -1
 			it.lastWaitEnd = 0
 			it.pos += int64(n)
+			if it.overwrittenRecPtr != 0 {
+				rec.OverwrittenRecPtr, it.overwrittenRecPtr = it.overwrittenRecPtr, 0
+			}
 			return rec, nil
 		}
 		// At tail: drain any stale wake-up so the next signal is
@@ -460,6 +476,9 @@ func (it *RecordIterator) readOneAt(pos int64) (Record, int, error) {
 		total := int(h.TotLen)
 		if total < xlogRecordHeaderSize {
 			return Record{}, 0, fmt.Errorf("%w: bad xlog total length %d at pos=%d page_off=%d header=%x", ErrCorruptRecord, total, pos, pos%XLOGBlockSize, headerBytes)
+		}
+		if page, ok := it.overwritePageAhead(pos, total); ok {
+			return Record{}, 0, &overwrittenContrecordError{page: page}
 		}
 		// Read MAXALIGN(total) physical bytes to also pick up the
 		// trailing zero pad — the upstream record alignment.
@@ -642,4 +661,42 @@ func (it *RecordIterator) closeSegFile() {
 		_ = it.segFile.Close()
 		it.segFile = nil
 	}
+}
+
+// overwrittenContrecordError tells Next that the record at the cursor runs
+// onto a page flagged XLP_FIRST_IS_OVERWRITE_CONTRECORD (M0149-0017b).
+type overwrittenContrecordError struct{ page int64 }
+
+func (e *overwrittenContrecordError) Error() string {
+	return fmt.Sprintf("wal: continuation overwritten at page %d", e.page)
+}
+
+// overwritePageAhead is xlogreader.c's check on each continuation page of a
+// record of total bytes at pos: the first already-written page that carries
+// XLP_FIRST_IS_OVERWRITE_CONTRECORD (with its own page address) ends the
+// record. Pages not written yet are checked again on a later call.
+func (it *RecordIterator) overwritePageAhead(pos int64, total int) (int64, bool) {
+	avail := int(XLOGBlockSize - pos%XLOGBlockSize)
+	if total <= avail {
+		return 0, false
+	}
+	remaining := total - avail
+	page := pos + int64(avail)
+	for remaining > 0 {
+		hsize := pageHeaderSizeAt(page, it.segSize)
+		hb, err := it.readBytesAt(page, hsize)
+		if err != nil || isZeroBytes(hb) {
+			return 0, false
+		}
+		hdr, err := DecodeXLogPageHeader(hb)
+		if err != nil {
+			return 0, false
+		}
+		if hdr.Info&XLPFirstIsOverwriteContRecord != 0 && hdr.PageAddr == uint64(page) {
+			return page, true
+		}
+		remaining -= int(XLOGBlockSize) - hsize
+		page += XLOGBlockSize
+	}
+	return 0, false
 }

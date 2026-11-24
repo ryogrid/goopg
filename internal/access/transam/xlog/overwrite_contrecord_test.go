@@ -111,6 +111,24 @@ func TestOverwriteContrecordForTornContinuation(t *testing.T) {
 		}
 	}
 
+	// The replay reader drops the partial record at the flagged page and
+	// hands its start to the overwrite record, which then verifies.
+	recs2, err := ReadAll(walDir, DefaultSegmentSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ow := recs2[len(recs2)-1]
+	if ow.StartLSN-1 != nextPage+SizeOfXLogShortPHD || ow.OverwrittenRecPtr != bigStart {
+		t.Fatalf("last record start %#x overwritten %#x; want the overwrite record at %#x for %#x",
+			ow.StartLSN-1, ow.OverwrittenRecPtr, nextPage+SizeOfXLogShortPHD, bigStart)
+	}
+	if err := verifyOverwriteContrecord(ow); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if err := verifyOverwriteContrecord(Record{XLog: ow.XLog}); err == nil {
+		t.Fatalf("verify accepted an overwrite record reached without a dropped partial record")
+	}
+
 	w2, err := NewWriter(Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)

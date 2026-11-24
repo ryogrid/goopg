@@ -16109,7 +16109,15 @@ verify each at HEAD when the task starts.
     segment 2: goopg resumed at segment 3 \(detectWritePos drops everything below a segment hole\).
     Upstream: xlogreader.c assembled\-record error \(abortedRecPtr, missingContrecPtr\); xlog.c StartupXLOG EndOfLog =
     missingContrecPtr; CreateOverwriteContrecordRecord.
-  - [ ] **M0149-0017b — goopg standby skips an overwritten contrecord and logs it**
+  - [x] **M0149-0017b — goopg standby skips an overwritten contrecord and logs it** \(2026\-11\-24\)
+    - The streaming reader \(RecordIterator.readOneAt / overwritePageAhead\) and crash replay \(readAllPageAware,
+      sibling\) drop a partial record that runs onto an XLP\_FIRST\_IS\_OVERWRITE\_CONTRECORD page and restart there.
+      The dropped record's start rides on the next Record \(OverwrittenRecPtr\).
+    - Replay of XLOG\_OVERWRITE\_CONTRECORD verifies overwritten\_lsn \("mismatching overwritten LSN" otherwise) and
+      logs "successfully skipped missing contrecord at %X/%X, overwritten at %s".
+    - Regression: 005 flaked once in all\-goopg and passed 2/2 alone \(0013a\); 007, 009, 012 and the
+      physical/standby/crash/torn E2Es PASS.
+    Movement: yes — tap 026 pg18\-primary/goopg\-standby: standby catch\-up timeout → PASS 4/4
     Kind: impl
     Parent: M0149-0017
     Path\-to\-TAP: 026 PG\-primary/goopg\-standby ← standby never catches up past PG's overwrite record; 026 all\-goopg ←

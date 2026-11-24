@@ -3,8 +3,10 @@ package xlog
 import (
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // Missing continuation records at the end of crash recovery (M0149-0017a).
@@ -251,4 +253,35 @@ func overwritePageWithin(data []byte, off int, pos int64, total int, segSize int
 		pagePos += XLOGBlockSize
 	}
 	return 0, false
+}
+
+// verifyOverwriteContrecord is xlogrecovery.c xlogrecovery_redo's
+// XLOG_OVERWRITE_CONTRECORD arm: the record's overwritten_lsn must be the
+// partial record the reader dropped to reach it (FATAL "mismatching
+// overwritten LSN" otherwise), and the skip is logged. M0149-0017b.
+func verifyOverwriteContrecord(rec Record) error {
+	if rec.XLog == nil || rec.XLog.Header.Rmid != RmgrXLog ||
+		rec.XLog.Header.Info&^XLRInfoMask != overwriteContrecordInfo || len(rec.XLog.MainData) < 16 {
+		return nil
+	}
+	lsn := binary.LittleEndian.Uint64(rec.XLog.MainData[0:8])
+	ts := int64(binary.LittleEndian.Uint64(rec.XLog.MainData[8:16]))
+	if lsn != rec.OverwrittenRecPtr {
+		return fmt.Errorf("mismatching overwritten LSN %X/%X -> %X/%X",
+			uint32(lsn>>32), uint32(lsn), uint32(rec.OverwrittenRecPtr>>32), uint32(rec.OverwrittenRecPtr))
+	}
+	slog.Default().Info(fmt.Sprintf("successfully skipped missing contrecord at %X/%X, overwritten at %s",
+		uint32(lsn>>32), uint32(lsn), timestamptzToStr(ts)))
+	return nil
+}
+
+// timestamptzToStr renders a TimestampTz as timestamptz_to_str does in the
+// ISO style: "2026-11-24 12:00:00.123456+09".
+func timestamptzToStr(ts int64) string {
+	t := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(ts) * time.Microsecond).Local()
+	s := t.Format("2006-01-02 15:04:05.000000-07")
+	if _, off := t.Zone(); off%3600 != 0 {
+		s = t.Format("2006-01-02 15:04:05.000000-07:00")
+	}
+	return s
 }
