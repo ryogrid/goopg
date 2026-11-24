@@ -20,6 +20,7 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/parser/sqlkeywords"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/utils/adt/datetime"
 	"github.com/goopg/goopg/internal/utils/misc"
 )
@@ -10648,6 +10649,11 @@ func (c *InMemory) registerSystemTables() {
 		{"backup_streamed", "int8"}, {"tablespaces_total", "int8"},
 		{"tablespaces_streamed", "int8"},
 	})
+	// BASE_BACKUP does report progress: walsenders running it feed
+	// activity's BASEBACKUP registry (M0149-0077l).
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_progress_basebackup"].VirtualRows = func() [][]string {
+		return activity.BaseBackupProgressRows(VirtualNull)
+	}
 	mkProgressView("pg_stat_progress_copy", 9108, [][2]string{
 		{"pid", "int4"}, {"datid", "oid"}, {"datname", "name"}, {"relid", "oid"},
 		{"command", "text"}, {"type", "text"}, {"bytes_processed", "int8"},

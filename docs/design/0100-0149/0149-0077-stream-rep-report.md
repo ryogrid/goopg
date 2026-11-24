@@ -156,9 +156,30 @@ second backup is taken from the standby while the primary is down. The test then
   - no standby\-side restrictions \(do\_pg\_backup\_start in recovery\);
   - the fast flag is ignored, because the checkpoint is always immediate.
 
+## Slice 11 \(0077l, landed\): finding and cancelling a running BASE\_BACKUP
+
+- Progress:
+  - `utils/activity/progress_basebackup.go` is the BASEBACKUP slot of PG's command\-progress machinery
+    \(pgstat\_progress\_start\_command / basebackup\_progress\_\*\);
+  - ReplyBaseBackup registers a slot under the walsender's pid and moves it through the phases: waiting for
+    checkpoint, streaming database files, waiting for WAL archiving;
+  - the streamer adds each chunk to backup\_streamed and counts finished archives;
+  - `pg_stat_progress_basebackup` reads the registry instead of returning no rows. backup\_total stays NULL,
+    because goopg makes no size estimate.
+- Activity: the postmaster reports every replication command as active with its text, and as idle afterwards
+  \(exec\_replication\_command's pgstat\_report\_activity\).
+- MAX\_RATE is parsed and validated against 32..1048576 kB/s \(22003, PG's message\). The streamer sleeps until
+  the bytes sent fit the rate, like bbsink\_throttle, and wakes early on cancel.
+- Cancel: HandleCommand now receives the statement context as well as the connection context, and BASE\_BACKUP runs
+  under it. A CancelRequest therefore ends the backup with 57014 "canceling statement due to user request", and the
+  session goes on. Streaming commands keep the connection context.
+- Result: `TestPort_Recovery001StreamRepFull/all-goopg` passes end to end and is no longer gated.
+- Not done:
+  - no backup size estimate \(PROGRESS option\);
+  - throttling averages over the whole backup instead of PG's per\-sample sleep;
+  - a walsender's backend\_type is still "client backend" \(M0149\-0090\).
+
 ## Open \(children in fix\_plan\)
 
-- 0077l: finding and cancelling a running BASE\_BACKUP \(progress view, walsender query text, MAX\_RATE, cancel
-  delivery\).
 - 0077e: on a PG 18.3 standby of a goopg primary, reading an unlogged sequence fails with "could not open file".
 - 0077f: a goopg standby does not serve a cascading standby \(PG\-primary pairing\).

@@ -177,7 +177,11 @@ func extractCString(buf []byte) (string, error) {
 // dbBound reports a database-bound walsender (replication=database,
 // am_db_walsender); IDENTIFY_SYSTEM then names dbName. procNum is the
 // connection's ProcArray slot, which keys its session-level backup state.
-func (s *Handler) HandleCommand(ctx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, payload []byte, appName, dbName string, dbBound bool, procNum int32) (bool, error) {
+// stmtCtx is the command's own context — cancelled by a CancelRequest
+// (pg_cancel_backend) — and pid the backend pid; BASE_BACKUP runs under
+// stmtCtx and reports progress under pid (M0149-0077l). Streaming commands
+// keep the connection ctx.
+func (s *Handler) HandleCommand(ctx, stmtCtx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, payload []byte, appName, dbName string, dbBound bool, procNum, pid int32) (bool, error) {
 	q, err := extractCString(payload)
 	if err != nil {
 		return false, nil // let the regular handler emit the error
@@ -212,7 +216,7 @@ func (s *Handler) HandleCommand(ctx context.Context, r *libpq.FrameReader, w *li
 			return true, s.writeQueryError(w, errcodes.ObjectNotInPrerequisiteState,
 				"a backup is already in progress in this session")
 		}
-		return true, s.bb.ReplyBaseBackup(ctx, w, args)
+		return true, s.bb.ReplyBaseBackup(stmtCtx, w, args, pid)
 	}
 	return false, nil
 }

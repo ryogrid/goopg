@@ -76,6 +76,7 @@ import (
 
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/libpq"
 	"github.com/goopg/goopg/internal/utils/errcodes"
@@ -242,7 +243,12 @@ func isExcludedFile(base string) bool {
 // exec_replication_command reaching basebackup.c's SendBaseBackup). `args` is
 // the suffix after `BASE_BACKUP ` (possibly empty for a bare `BASE_BACKUP`
 // command, which upstream also accepts).
-func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, args string) error {
+//
+// pid is the walsender's backend pid: the backup's pg_stat_progress_basebackup
+// row is keyed by it. ctx is the statement's context, so a CancelRequest
+// (pg_cancel_backend) ends the backup with "canceling statement due to user
+// request" and the session stays usable (M0149-0077l).
+func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, args string, pid int32) error {
 	if s.cfg.DataDir == "" {
 		return s.writeQueryError(w, errcodes.FeatureNotSupported,
 			"BASE_BACKUP requires Config.DataDir to be set")
@@ -255,6 +261,17 @@ func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, arg
 		return s.writeQueryError(w, errcodes.FeatureNotSupported,
 			fmt.Sprintf("BASE_BACKUP: unsupported manifest checksum type %q", opts.ManifestChecksums))
 	}
+	if opts.MaxRateSet && (opts.MaxRate < maxRateLower || opts.MaxRate > maxRateUpper) {
+		return s.writeQueryError(w, errcodes.NumericValueOutOfRange,
+			fmt.Sprintf("%d is outside the valid range for parameter \"%s\" (%d .. %d)",
+				opts.MaxRate, "MAX_RATE", maxRateLower, maxRateUpper))
+	}
+
+	// pgstat_progress_start_command(PROGRESS_COMMAND_BASEBACKUP): the row
+	// lives until the command ends, however it ends.
+	progress := activity.StartBaseBackupProgress(pid)
+	defer progress.End()
+	progress.SetPhase(activity.BaseBackupPhaseWaitCheckpoint)
 
 	// Force a synchronous IMMEDIATE checkpoint so the start-LSN we
 	// report names a record whose redo image is on disk. Upstream's
@@ -374,7 +391,12 @@ func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, arg
 		bytesDone:        0,
 		nextProgressMark: baseBackupProgressInterval,
 		ctx:              ctx,
+		progress:         progress,
+		maxRateBytes:     opts.MaxRate * 1024,
+		start:            time.Now(),
 	}
+	progress.SetTablespacesTotal(int64(len(tblspcs) + 1))
+	progress.SetPhase(activity.BaseBackupPhaseStreamBackup)
 	wantManifest := opts.Manifest == "yes" || opts.Manifest == "force-encode"
 	mck, _ := parseManifestChecksumKind(opts.ManifestChecksums) // validated at entry
 
@@ -405,9 +427,13 @@ func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, arg
 
 	entries, err := emitBaseBackupTar(ctx, streamer, s.cfg.DataDir, opts.Label, baseLSN0, ckptLSN0, startTLI, segSize, mck, opts.IncludeWAL, walStartSeg, walEndSeg, pgControlImage)
 	if err != nil {
+		if ctx.Err() != nil {
+			return s.writeStreamingError(w, errcodes.QueryCanceled, "canceling statement due to user request")
+		}
 		return s.writeStreamingError(w, errcodes.InternalError,
 			fmt.Sprintf("BASE_BACKUP: tar: %v", err))
 	}
+	progress.TablespaceDone()
 
 	// --- per-tablespace archives: one <oid>.tar per in-place tablespace,
 	// streamed after base.tar. Each begins with its own 'n' (new-archive)
@@ -420,11 +446,18 @@ func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, arg
 		}
 		tsEntries, err := emitTablespaceTar(ctx, streamer, ts, mck)
 		if err != nil {
+			if ctx.Err() != nil {
+				return s.writeStreamingError(w, errcodes.QueryCanceled, "canceling statement due to user request")
+			}
 			return s.writeStreamingError(w, errcodes.InternalError,
 				fmt.Sprintf("BASE_BACKUP: tablespace %d: %v", ts.oid, err))
 		}
 		entries = append(entries, tsEntries...)
+		progress.TablespaceDone()
 	}
+	// do_pg_backup_stop: PROGRESS_BASEBACKUP_PHASE_WAIT_WAL_ARCHIVE, then
+	// TRANSFER_WAL while the WAL range is handed over.
+	progress.SetPhase(activity.BaseBackupPhaseWaitWALArchive)
 
 	// Final progress report at end-of-archive (upstream parity).
 	if err := writeProgressFrame(w, streamer.bytesDone); err != nil {
@@ -562,6 +595,13 @@ type baseBackupStreamer struct {
 	bytesDone        uint64
 	nextProgressMark uint64
 	ctx              context.Context
+	// progress receives the streamed byte count (backup_streamed).
+	progress *activity.BaseBackupProgress
+	// maxRateBytes is MAX_RATE in bytes per second (0 = unthrottled); the
+	// streamer sleeps so the average since start stays at or below it, as
+	// bbsink_throttle does, and wakes early on cancel.
+	maxRateBytes int64
+	start        time.Time
 	// chunkBuf backs the CopyData payload. review/260831 NB-19: a fresh
 	// baseBackupChunkBytes buffer was allocated per chunk — one per 64 KiB of
 	// backup — even though WriteCopyData writes the bytes out synchronously
@@ -592,6 +632,10 @@ func (s *baseBackupStreamer) Write(p []byte) (int, error) {
 		s.bytesDone += uint64(n)
 		written += n
 		p = p[n:]
+		s.progress.AddStreamed(int64(n))
+		if err := s.throttle(); err != nil {
+			return written, err
+		}
 		if s.bytesDone >= s.nextProgressMark {
 			if err := writeProgressFrame(s.w, s.bytesDone); err != nil {
 				return written, err
@@ -600,6 +644,32 @@ func (s *baseBackupStreamer) Write(p []byte) (int, error) {
 		}
 	}
 	return written, nil
+}
+
+// MAX_RATE bounds in kB/s (basebackup_throttle.h MAX_RATE_LOWER/UPPER).
+const (
+	maxRateLower = 32
+	maxRateUpper = 1048576
+)
+
+// throttle sleeps until the bytes sent so far fit within MAX_RATE.
+func (s *baseBackupStreamer) throttle() error {
+	if s.maxRateBytes <= 0 {
+		return nil
+	}
+	due := s.start.Add(time.Duration(float64(s.bytesDone) / float64(s.maxRateBytes) * float64(time.Second)))
+	wait := time.Until(due)
+	if wait <= 0 {
+		return nil
+	}
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // castagnoliTable is the CRC-32C (Castagnoli) table used for backup
@@ -1243,6 +1313,11 @@ type baseBackupOptions struct {
 	// appends the in-range pg_wal segments to the backup tar instead of
 	// relying on a concurrent `-X stream` walsender connection.
 	IncludeWAL bool
+	// MaxRate is MAX_RATE in kB/s (0 = unthrottled; basebackup_throttle.c).
+	// MaxRateSet records that the option was given, so an out-of-range value
+	// is reported with PG's range error.
+	MaxRate    int64
+	MaxRateSet bool
 }
 
 // parseBaseBackupOptions parses upstream PG17+ grammar
@@ -1300,7 +1375,13 @@ func parseBaseBackupOptionList(body string) (baseBackupOptions, error) {
 			// `-X fetch`. defGetBoolean treats a value-less option as true;
 			// honour an explicit false ('f'/'off'/'0') for completeness.
 			opts.IncludeWAL = parseOptionBool(val, true)
-		case "CHECKPOINT", "TABLESPACE_MAP", "VERIFY_CHECKSUMS", "MAX_RATE",
+		case "MAX_RATE":
+			n, err := strconv.ParseInt(strings.TrimSpace(trimSingleQuotes(val)), 10, 64)
+			if err != nil {
+				return opts, fmt.Errorf("MAX_RATE requires an integer value")
+			}
+			opts.MaxRate, opts.MaxRateSet = n, true
+		case "CHECKPOINT", "TABLESPACE_MAP", "VERIFY_CHECKSUMS",
 			"NOVERIFY_CHECKSUMS", "COMPRESSION",
 			"COMPRESSION_DETAIL", "INCREMENTAL":
 			// Accept but ignore — they don't affect what the v0

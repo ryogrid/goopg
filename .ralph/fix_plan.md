@@ -16292,7 +16292,20 @@ verify each at HEAD when the task starts.
     Path\-to\-TAP: 001 all\-goopg: BASE\_BACKUP in a replication session after `SELECT pg_backup_start('backup', true)`
     must fail "a backup is already in progress in this session"; pg\_backup\_stop with no backup must fail "backup is
     not in progress".
-  - [ ] **M0149-0077l — a running BASE\_BACKUP cannot be found and cancelled**
+  - [x] **M0149-0077l — a running BASE\_BACKUP cannot be found and cancelled** \(2026\-11\-24\)
+    - Every piece is in place:
+      - pg\_stat\_progress\_basebackup reads a live BASEBACKUP progress registry \(phase, backup\_streamed, tablespace
+        counts; backup\_total NULL\);
+      - a walsender reports its replication command in pg\_stat\_activity \(exec\_replication\_command's
+        pgstat\_report\_activity\);
+      - MAX\_RATE is validated \(32..1048576 kB/s, 22003\) and throttles the copy stream;
+      - BASE\_BACKUP runs on the statement context, so pg\_cancel\_backend ends it with 57014 "canceling statement due
+        to user request" and the session continues.
+    - TestPort\_Recovery001StreamRepFull/all\-goopg now passes \(3/3, about 45 s\) and runs ungated. The two mixed
+      pairings stay behind GOOPG\_TAP\_001 until 0077e and 0077f land.
+    - 0077f observation \(not worked\): in the PG\-primary pairing, standby\_2 now appears in standby\_1's
+      pg\_stat\_replication as streaming, but at 0/0.
+    Movement: yes — tap 001 all\-goopg: "WAL sender sending base backup killed" not ok → ok; all\-goopg PASS end to end
     Kind: impl
     Parent: M0149-0077
     Path\-to\-TAP: 001 all\-goopg "WAL sender sending base backup killed": the poll joins pg\_stat\_activity
@@ -16341,6 +16354,11 @@ verify each at HEAD when the task starts.
   - `pg_create_physical_replication_slot(name, true)` reports WrittenLSN\+1 \(0/10000A1\), where PG reports the insert
     position. Without immediately\_reserve, goopg still reserves WAL, so "cannot be advanced" \(never reserved\) cannot
     happen.
+- [ ] **M0149-0090 — a walsender's pg\_stat\_activity backend\_type is "client backend"**
+  Kind: impl
+  Parent: none \(found while fixing M0149-0077l; not a 001 assertion\)
+  A replication connection running BASE\_BACKUP or START\_REPLICATION shows `backend_type = 'client backend'`. PG
+  reports `walsender` \(am\_walsender sets B\_WAL\_SENDER\).
 - [ ] **M0149-0018 — port recovery/t/002_archiving.pl**
   Kind: impl
   Parent: none

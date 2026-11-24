@@ -2067,7 +2067,21 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 				// connection's dbName down so the logical walsender can scope
 				// every catalog lookup to the slot's database instead of the
 				// DefaultDBOid fallback (DB 1).
-				handled, err := s.replHandler.HandleCommand(ctx, r, w, f.Payload, appName, dbName, replDatabase, procNum)
+				// exec_replication_command: pgstat_report_activity(STATE_RUNNING,
+				// cmd_string), so pg_stat_activity shows the walsender's
+				// command while it runs (M0149-0077l).
+				if reg := s.cfg.Activity; reg != nil {
+					if q, qerr := extractCString(f.Payload); qerr == nil {
+						if len(q) > 1024 {
+							q = q[:1024]
+						}
+						reg.UpdateState(procNum, "active", q)
+					}
+				}
+				handled, err := s.replHandler.HandleCommand(ctx, queryCtx, r, w, f.Payload, appName, dbName, replDatabase, procNum, int32(pid))
+				if reg := s.cfg.Activity; reg != nil && (handled || err != nil) {
+					reg.UpdateState(procNum, "idle", "")
+				}
 				if err != nil {
 					entry.clearQueryCancel()
 					queryCancel()
