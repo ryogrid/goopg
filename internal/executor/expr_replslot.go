@@ -162,3 +162,75 @@ func evalPgDropReplicationSlot(x *optimizer.FuncCall, slot SlotView, ctx *Contex
 	}
 	return NullDatum, nil
 }
+
+// evalPgReplicationSlotAdvance implements
+//
+//	pg_replication_slot_advance(slot_name name, upto_lsn pg_lsn)
+//	  → record (slot_name name, end_lsn pg_lsn)
+//
+// (slotfuncs.c). The target is capped at the WAL flushed so far — on a
+// standby, at the WAL replayed (GetXLogReplayRecPtr) — and an invalid
+// (0/0) target is an error. Physical slots move restart_lsn
+// (pg_physical_replication_slot_advance); advancing a logical slot needs
+// a decoding pass up to the target (pg_logical_replication_slot_advance),
+// which goopg does not run here yet — it is refused. M0149-0077j.
+func evalPgReplicationSlotAdvance(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
+	if len(x.Args) != 2 {
+		return Datum{}, &ExecError{Code: "42883",
+			Message: "function pg_replication_slot_advance does not exist"}
+	}
+	if ctx.ReplSlots == nil {
+		return Datum{}, &ExecError{Code: "0A000",
+			Message: "replication slots are not configured on this server"}
+	}
+	nameD, err := evalExprSlot(x.Args[0], slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	lsnD, err := evalExprSlot(x.Args[1], slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if nameD.IsNull() || lsnD.IsNull() {
+		return NullDatum, nil // STRICT
+	}
+	target, err := parsePgLSN(lsnD.StringValue())
+	if err != nil {
+		return Datum{}, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type pg_lsn: %q", lsnD.StringValue())}
+	}
+	if target == 0 {
+		return Datum{}, &ExecError{Code: "22023", Message: "invalid target WAL LSN"}
+	}
+	name := nameD.StringValue()
+	if sl, gerr := ctx.ReplSlots.Get(name); gerr == nil && sl.Kind != xlog.SlotPhysical {
+		return Datum{}, &ExecError{Code: "0A000",
+			Message: "advancing a logical replication slot is not supported"}
+	}
+	var limit uint64
+	if ctx.IsStandby {
+		if ctx.RecoveryLSNs != nil {
+			_, limit = ctx.RecoveryLSNs()
+		}
+	} else if ctx.WAL != nil {
+		limit = ctx.WAL.FlushedLSN()
+	}
+	moveto := min(target, limit)
+	end, err := ctx.ReplSlots.AdvancePhysical(name, moveto)
+	if err != nil {
+		var below *xlog.SlotAdvanceBelowMinimumError
+		switch {
+		case errors.As(err, &below):
+			return Datum{}, &ExecError{Code: "55000", Message: below.Error()}
+		case errors.Is(err, xlog.ErrSlotNotReserved):
+			return Datum{}, &ExecError{Code: "55000",
+				Message: fmt.Sprintf("replication slot \"%s\" cannot be advanced", name),
+				Detail:  "This slot has never previously reserved WAL, or it has been invalidated."}
+		case errors.Is(err, xlog.ErrSlotNotFound):
+			return Datum{}, &ExecError{Code: "42704",
+				Message: fmt.Sprintf("replication slot \"%s\" does not exist", name)}
+		}
+		return Datum{}, replSlotExecError(err, 0, "")
+	}
+	return NewStringDatum(fmt.Sprintf("(%s,%s)", name, formatPgLSN(end))), nil
+}

@@ -289,6 +289,58 @@ func (s *Slots) AdvanceConfirmedFlushLSN(name string, lsn uint64) error {
 	return s.writeSlotLocked(slot)
 }
 
+// ErrSlotNotReserved is pg_replication_slot_advance's "cannot be advanced":
+// the slot never reserved WAL or has been invalidated.
+var ErrSlotNotReserved = errors.New("replication slot cannot be advanced")
+
+// SlotAdvanceBelowMinimumError is pg_replication_slot_advance's refusal to
+// move a slot backward ("cannot advance replication slot to X, minimum is Y").
+type SlotAdvanceBelowMinimumError struct {
+	Target, Minimum uint64
+}
+
+func (e *SlotAdvanceBelowMinimumError) Error() string {
+	return fmt.Sprintf("cannot advance replication slot to %X/%X, minimum is %X/%X",
+		uint32(e.Target>>32), uint32(e.Target), uint32(e.Minimum>>32), uint32(e.Minimum))
+}
+
+// AdvancePhysical is pg_physical_replication_slot_advance under
+// pg_replication_slot_advance's checks (slotfuncs.c): the slot must exist,
+// be physical, not be held by a walsender (ReplicationSlotAcquire), and have
+// reserved WAL; moveto below restart_lsn is an error; otherwise restart_lsn
+// moves forward to moveto (staying put when it is already there). Returns
+// the slot's restart_lsn afterwards — the function's end_lsn. The new
+// position is persisted at once (PG marks the slot dirty and the next
+// checkpoint writes it; a clean shutdown always does). M0149-0077j.
+func (s *Slots) AdvancePhysical(name string, moveto uint64) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	slot, ok := s.m[name]
+	if !ok {
+		return 0, ErrSlotNotFound
+	}
+	if slot.Kind != SlotPhysical {
+		return 0, ErrSlotKindMismatch
+	}
+	if slot.Active {
+		return 0, ErrSlotInUse
+	}
+	if slot.RestartLSN == 0 || slot.Invalidated {
+		return 0, ErrSlotNotReserved
+	}
+	if moveto < slot.RestartLSN {
+		return 0, &SlotAdvanceBelowMinimumError{Target: moveto, Minimum: slot.RestartLSN}
+	}
+	if moveto == slot.RestartLSN {
+		return moveto, nil
+	}
+	slot.RestartLSN = moveto
+	if err := s.writeSlotLocked(slot); err != nil {
+		return 0, err
+	}
+	return moveto, nil
+}
+
 // SetActive marks a slot as owned (or released) by a walsender.
 // Returns ErrSlotNotFound if the slot doesn't exist and ErrSlotInUse
 // if attempting to acquire a slot already held.

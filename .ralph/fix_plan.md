@@ -16264,7 +16264,15 @@ verify each at HEAD when the task starts.
     Path\-to\-TAP: 001 all\-goopg `ALTER SYSTEM SET hot_standby_feedback = on` on standby\_1 fails "unrecognized
     configuration parameter" \(fatal\). Then get\_slot\_xmins needs a non\-null xmin on the primary's slot and on
     standby\_1's slot: the GUC, walreceiver feedback messages and slot xmin tracking \(PhysicalReplicationSlotNewXmin\).
-  - [ ] **M0149-0077j — pg\_replication\_slot\_advance does not exist**
+  - [x] **M0149-0077j — pg\_replication\_slot\_advance does not exist** \(2026\-11\-24\)
+    - pg\_replication\_slot\_advance\(name, pg\_lsn\) for physical slots: the target is capped at the flushed WAL
+      \(the replayed WAL on a standby\). An invalid target, an unknown slot, an unreserved slot or a backward
+      target errors with PG's messages. Slots.AdvancePhysical persists the new restart\_lsn. A logical slot is
+      refused: decoding up to the target is not wired.
+    - Second link: retention read a slot's restart\_lsn \(a PG byte position\) as the writer's 1\-based LSN. A
+      restart\_lsn on a segment boundary therefore kept the previous segment; the retainer now adds 1, matching
+      KeepLogSeg's XLByteToSeg\(restart\_lsn\).
+    Movement: yes — tap 001 all\-goopg: "slot advancing with physical slot" and "WAL segment … recycled after physical slot advancing" not ok → ok; remaining not ok are the three 0077k backup checks
     Kind: impl
     Parent: M0149-0077
     Path\-to\-TAP: 001 all\-goopg "slot advancing with physical slot": `SELECT pg_replication_slot_advance('phys_slot', lsn)`
@@ -16307,6 +16315,14 @@ verify each at HEAD when the task starts.
   `go test -race ./internal/replication/ -run TestReplicationStartReplicationStreamsRecord` reports a race between
   postmaster runPostStartupLoop's FrameReader.ReadFrame and the walsender's standby\-reply reader goroutine on the
   same bufio.Reader.
+- [ ] **M0149-0089 — slot SQL functions: FROM\-clause calls and creation LSN differ from PG**
+  Kind: impl
+  Parent: none \(found while fixing M0149-0077j; not a 001 assertion\)
+  - `SELECT * FROM pg_replication_slot_advance(…)` and the other record\-returning slot functions fail with
+    "table\-valued function … not supported"; the scalar form returns record text, not a composite.
+  - `pg_create_physical_replication_slot(name, true)` reports WrittenLSN\+1 \(0/10000A1\), where PG reports the insert
+    position. Without immediately\_reserve, goopg still reserves WAL, so "cannot be advanced" \(never reserved\) cannot
+    happen.
 - [ ] **M0149-0018 — port recovery/t/002_archiving.pl**
   Kind: impl
   Parent: none

@@ -116,9 +116,23 @@ second backup is taken from the standby while the primary is down. The test then
   - the slot file is written on every change instead of being marked dirty for the next checkpoint;
   - a reload does not trigger immediate feedback \(the next status tick sends it\).
 
+## Slice 9 \(0077j, landed\): physical slot advance and segment recycling
+
+- `pg_replication_slot_advance(slot_name, upto_lsn)` follows slotfuncs.c:
+  - an invalid target \(0/0\) is "invalid target WAL LSN";
+  - the move\-to point is min\(target, flush\), or the replay position on a standby;
+  - an unknown slot, an active slot, a slot that never reserved WAL, or a target below restart\_lsn each error with
+    PG's message;
+  - otherwise restart\_lsn moves forward \(`Slots.AdvancePhysical`\) and is persisted at once. PG marks the slot dirty
+    and writes it at the next checkpoint.
+- Logical slots are refused for now: pg\_logical\_replication\_slot\_advance needs a decoding pass up to the target.
+- Retention bug: a slot's restart\_lsn is a PG byte position, but `SlotAwareRetainer` passed it to the writer, whose
+  keep LSN is 1\-based. A restart\_lsn exactly on a segment boundary — the result of advancing to
+  pg\_current\_wal\_lsn\(\) after pg\_switch\_wal — kept the previous segment as well. The retainer now converts with
+  \+1, as KeepLogSeg's XLByteToSeg\(restart\_lsn\) does.
+
 ## Open \(children in fix\_plan\)
 
-- 0077j: pg\_replication\_slot\_advance, its persistence, and segment recycling after the advance.
 - 0077k: pg\_backup\_start / pg\_backup\_stop and BASE\_BACKUP cancel.
 - 0077e: on a PG 18.3 standby of a goopg primary, reading an unlogged sequence fails with "could not open file".
 - 0077f: a goopg standby does not serve a cascading standby \(PG\-primary pairing\).

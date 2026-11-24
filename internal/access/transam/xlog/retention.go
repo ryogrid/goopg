@@ -154,8 +154,14 @@ func (r *SlotAwareRetainer) Retain(checkpointLSN uint64) error {
 	// otherwise drop.
 	keepLSN := checkpointLSN
 	if r.Slots != nil {
-		if minSlot := r.Slots.MinRestartLSN(); minSlot > 0 && minSlot < keepLSN {
-			keepLSN = minSlot
+		// A slot's restart_lsn is a PG byte position (0-based: the first
+		// byte the slot still needs), while keepLSN follows the writer's
+		// 1-based convention (segmentForLSN subtracts 1). Without the +1 a
+		// restart_lsn on a segment boundary kept the previous segment too,
+		// where KeepLogSeg's XLByteToSeg(restart_lsn) releases it.
+		// M0149-0077j.
+		if minSlot := r.Slots.MinRestartLSN(); minSlot > 0 && minSlot+1 < keepLSN {
+			keepLSN = minSlot + 1
 		}
 	}
 	if r.KeepLSNFn != nil {

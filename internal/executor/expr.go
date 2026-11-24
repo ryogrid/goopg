@@ -18269,6 +18269,8 @@ case "pg_char_to_encoding":
 		return evalPgLogicalEmitMessage(x, slot, ctx)
 	case "pg_drop_replication_slot":
 		return evalPgDropReplicationSlot(x, slot, ctx)
+	case "pg_replication_slot_advance":
+		return evalPgReplicationSlotAdvance(x, slot, ctx)
 	// currtid2(relname text, tid tid) → tid: returns the latest visible TID
 	// for a row in the named relation. M0097-0038.
 	case "currtid2":
