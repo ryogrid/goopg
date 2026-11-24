@@ -58,9 +58,17 @@ second backup is taken from the standby while the primary is down. The test then
   - DDL refusal on a standby;
   - re\-reporting `in_hot_standby` at promotion.
 
+## Slice 4 \(0077c, landed\): SHOW port
+
+- `goopg start --listen host:port` is goopg's \-h/\-p. The `port` GUC \(PGC\_POSTMASTER\) is now set from the listen port
+  with command\-line source, as postmaster's \-p does. libpq's target\_session\_attrs cases compare `SHOW port` with
+  the node's port.
+- Sequence refresh race: a running standby's catalog refresh after a commit could put an older page read back over
+  the counter the sequence replay hook had already set \(1 run in 3\). The refresh now registers only sequences it
+  does not know yet; known sequences follow their replayed pages through the hook alone.
+
 ## Open \(children in fix\_plan\)
 
-- 0077c: `SHOW port` reports 5432, not the listening port.
 - 0077d: the walsender records no `pg_stat_io` WAL reads.
 - 0077e: on a PG 18.3 standby of a goopg primary, reading an unlogged sequence fails with "could not open file".
 - 0077f: a goopg standby does not serve a cascading standby \(PG\-primary pairing\).

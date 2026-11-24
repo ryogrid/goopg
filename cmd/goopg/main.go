@@ -463,6 +463,17 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		cfg.Registry = registry
 	}
+	// --listen host:port is goopg's -h/-p: the port GUC (PGC_POSTMASTER) is
+	// the port the server listens on, set from the command line as
+	// postmaster's -p does (PGC_S_ARGV), so SHOW port and libpq's
+	// target_session_attrs probes see it. M0149-0077c.
+	if _, p, err := net.SplitHostPort(*addr); err == nil && p != "" && p != "0" {
+		if err := registry.Set("port", p, misc.SourceCommandLine); err != nil {
+			fmt.Fprintf(stderr, "goopg start: FATAL: %v\n", err)
+			return 1
+		}
+		cfg.Registry = registry
+	}
 	// CreateDataDirLockFile (PostmasterMain): postmaster.pid is created
 	// before the data directory is touched — before crash or archive
 	// recovery — so a second server on a directory a live one owns stops

@@ -16195,7 +16195,13 @@ verify each at HEAD when the task starts.
     Path\-to\-TAP: 001 "read\-only queries on standby 1/2" \(INSERT exits 0, want 3\); the target\_session\_attrs
     read\-only/standby/read\-write cases ← the standby must reject writes \(cannot execute INSERT in a read\-only
     transaction\) and report in\_hot\_standby=on and default\_transaction\_read\_only=on in ParameterStatus.
-  - [ ] **M0149-0077c — SHOW port reports 5432, not the listening port**
+  - [x] **M0149-0077c — SHOW port reports 5432, not the listening port** \(2026\-11\-24\)
+    - `goopg start --listen host:port` now sets the port GUC from the listen port with command\-line source, as
+      postmaster's \-p does \(PGC\_S\_ARGV\).
+    - Also fixed, found in the same runs: a standby's commit\-time catalog refresh could put an older sequence page
+      read back over the counter the sequence replay hook had set \(1 run in 3 showed 1\|0\|f\). The refresh now registers
+      only sequences not yet known \(reloadSequencesFromHeapMode onlyNew\). 3/3 runs then clean.
+    Movement: yes — tap 001 all\-goopg: 13 target\_session\_attrs "connect to node" not ok → ok; every assertion before the walsender pg\_stat\_io wait now passes \(3/3 runs\)
     Kind: impl
     Parent: M0149-0077
     Path\-to\-TAP: 001 target\_session\_attrs "connect to node … " compares SHOW port with the node's port.
@@ -16223,6 +16229,11 @@ verify each at HEAD when the task starts.
   "cannot execute INSERT in a read\-only transaction" \(ExecCheckXactReadOnly / PreventCommandIfReadOnly, also for
   DDL\). `SHOW transaction_read_only` is unrecognised. On a standby, DDL is not refused either, and in\_hot\_standby
   is not re\-reported to existing sessions at promotion.
+- [ ] **M0149-0085 — pg\_settings has 62 rows; PG 18.3 has 401**
+  Kind: impl
+  Parent: none \(found while fixing M0149-0077c; not a 001 requirement\)
+  `SELECT … FROM pg_settings WHERE name IN \('port', 'wal\_keep\_size', 'work\_mem'\)` returns no row on goopg. PG lists
+  every GUC with setting and source \(`port|5545|command line`\). pg\_settings should come from the GUC registry.
 - [ ] **M0149-0018 — port recovery/t/002_archiving.pl**
   Kind: impl
   Parent: none

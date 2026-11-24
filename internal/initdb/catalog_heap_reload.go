@@ -1892,6 +1892,15 @@ var errSkipBuiltinRow = fmt.Errorf("catalog reload: builtin row skipped")
 // Pre-B1.3b data dirs (sequences journaled only via kind-65) need re-init:
 // their counters have no physical page and the WAL scanner is gone.
 func reloadSequencesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	return reloadSequencesFromHeapMode(mgr, cat, clog, false)
+}
+
+// reloadSequencesFromHeapMode is reloadSequencesFromHeap; with onlyNew it
+// registers only sequences not registered yet. A running standby's
+// catalog refresh uses that: a known sequence's counter follows its replayed
+// XLOG_SEQ_LOG pages through the sequence replay hook, and a refresh must
+// not put an older page read back over it. M0149-0077c.
+func reloadSequencesFromHeapMode(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, onlyNew bool) error {
 	// OWNED BY map: seqrelid → (tableOID, attnum) from pg_depend auto rows.
 	depCols := executor.PGDependColumnsPG18()
 	type depRow struct{ objid, refobjid, refsubid uint32 }
@@ -1953,6 +1962,9 @@ func reloadSequencesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 		name := tbl.Name
 		if tbl.Schema != "" && tbl.Schema != "public" {
 			name = tbl.Schema + "." + tbl.Name
+		}
+		if onlyNew && executor.LookupSequence(name, dbOid) != nil {
+			continue
 		}
 		// Counter from the physical sequence page — it lives at the
 		// USER-DATA location base/<cat.DBOID()> (the session's physical
@@ -3743,8 +3755,9 @@ func (r *Runtime) RefreshCatalogAfterReplay(dbOid uint32) error {
 			return err
 		}
 		// Sequences the primary created register here, with their counters
-		// from the replayed pages (M0149-0077a).
-		return reloadSequencesFromHeap(r.StorageMgr, cat, clog)
+		// from the replayed pages (M0149-0077a); known ones are left to the
+		// sequence replay hook.
+		return reloadSequencesFromHeapMode(r.StorageMgr, cat, clog, true)
 	}
 	return loadUserTablesFromHeapForDBMode(r.StorageMgr, cat, clog, dbOid, dbOid, true)
 }
