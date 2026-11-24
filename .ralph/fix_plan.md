@@ -16081,7 +16081,9 @@ verify each at HEAD when the task starts.
     Only the FROM form exists. `SELECT pg\_ls\_dir\('x'\)` errors "function pg\_ls\_dir does not exist", and
     `\(pg\_stat\_file\('x'\)\).size` does not resolve. The privilege check treats only superusers as members of
     pg\_read\_server\_files \(has\_privs\_of\_role is not consulted\).
-- [ ] **M0149-0017 — port recovery/t/026_overwrite_contrecord.pl**
+- [x] **M0149-0017 — port recovery/t/026_overwrite_contrecord.pl** \(2026\-11\-24\)
+  - Done: TestPort\_Recovery026OverwriteContrecord passes ungated in all three pairings. Inventory R\-026 → port.
+  Movement: yes — tap 026 3/3 pairings PASS \(all\-goopg, pg18\-primary/goopg\-standby, goopg\-primary/pg18\-standby\)
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/026_overwrite_contrecord.pl` — segments ending in an incomplete record propagated to a replica.
@@ -16124,8 +16126,21 @@ verify each at HEAD when the task starts.
     missing "successfully skipped missing contrecord at" log line.
     Upstream: xlogreader.c XLP\_FIRST\_IS\_OVERWRITE\_CONTRECORD restart \(overwrittenRecPtr\); xlogrecovery.c
     xlogrecovery\_redo verify \+ LOG.
-  - [ ] **M0149-0017d — WAL records cross segment boundaries \(no XLOG\_NOOP segment pad\)**
-    Kind: impl \(design first: the M0107 stripe WAL insert path\)
+  - [x] **M0149-0017d — WAL records cross segment boundaries \(no XLOG\_NOOP segment pad\)** \(2026\-11\-24\)
+    - Both append paths let a record continue onto the next segment's first page under XLP\_FIRST\_IS\_CONTRECORD,
+      as PG's ReserveXLogInsertLocation does. The pad\-and\-re\-land layout of M0107/M0131\-S30.6 stays behind a
+      test\-only switch \(crossSegmentPadOn\), because the readers must still read WAL written that way.
+    - Found while closing it:
+      - a goopg standby's cold copy has the same stale segment past the hole, and replay started there. End of local
+        WAL at a missing segment now applies at standby start too;
+      - FindMissingContrecord now validates a whole\-page header first \(ValidXLogRecordHeader: rmid, prev\-link\), so
+        039's planted headers are no longer overwritten;
+      - the overwrite check runs on the raw xl\_tot\_len in all three readers;
+      - readAllPageAware compared a stream\-relative position to absolute page addresses.
+    - Regression: 039 and every recovery TAP and E2E PASS except 018 \(known, owner\-gated 0006b\); xlog under
+      \-race PASS.
+    Movement: yes — tap 026 all\-goopg and goopg\-primary/pg18\-standby: log assertion failing → PASS 4/4 each
+    Kind: impl
     Parent: M0149-0017
     Path\-to\-TAP: 026 goopg\-primary pairings ← "successfully skipped missing contrecord" needs the 600 kB message to
     start in one segment and continue into the deleted one ← goopg pads the segment tail with XLOG\_NOOP and starts
@@ -16133,7 +16148,7 @@ verify each at HEAD when the task starts.
     segments freely; only XLOG\_SWITCH pads.
   - [ ] **M0149-0017c — RAISE LOG reaches the client as NOTICE**
     Kind: impl
-    Parent: M0149-0017
+    Parent: none \(re\-parented 2026\-11\-24: a nearby defect, not a 026 requirement\)
     Found while porting 026 \(not a 026 blocker: safe\_psql ignores stderr\). PG sends LOG to the server log only
     \(below client\_min\_messages=notice\); goopg prints "NOTICE:  exiting after …" to psql.
 - [ ] **M0149-0077 — re-port recovery/t/001_stream_rep.pl to the M0149 contract**

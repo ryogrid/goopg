@@ -246,6 +246,17 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		if isZeroXLogRecordHeader(header) {
 			break
 		}
+		// M0149-0017b: a continuation replaced by XLOG_OVERWRITE_CONTRECORD
+		// drops the partial record; reading restarts at the flagged page
+		// (xlogreader.c), and the next record carries its start. Checked on
+		// the raw xl_tot_len, before header validation.
+		// pos is relative to the stream start; the page addresses and the
+		// dropped record's LSN are absolute (baseOffset is segment-aligned).
+		if next, ok := overwritePageWithin(stream, off, int64(baseOffset)+pos, int(binary.LittleEndian.Uint32(header[0:4])), segSize); ok {
+			overwritten = baseOffset + uint64(off)
+			off = next
+			continue
+		}
 		h, err := DecodeXLogRecordHeader(header)
 		if err != nil {
 			// M0088-0001: see ReadAll. Page-aware path uses
@@ -272,14 +283,6 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 			}
 			stop(off, "bad xlog total length", fmt.Errorf("xl_tot_len=%d", total))
 			break
-		}
-		// M0149-0017b: a continuation replaced by XLOG_OVERWRITE_CONTRECORD
-		// drops the partial record; reading restarts at the flagged page
-		// (xlogreader.c), and the next record carries its start.
-		if next, ok := overwritePageWithin(stream, off, pos, total, segSize); ok {
-			overwritten = uint64(pos)
-			off = next
-			continue
 		}
 		paddedTotal := maxAlignXLog(total)
 		fullBytes, consumed := extractRecordBytes(stream[off:], pos, segSize, paddedTotal)

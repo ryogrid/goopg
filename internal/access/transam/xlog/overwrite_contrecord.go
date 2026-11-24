@@ -73,8 +73,23 @@ func FindMissingContrecord(walDir string, segSize int64, redoLSN uint64) (Missin
 	}
 	totLen := uint64(binary.LittleEndian.Uint32(stream[off : off+4]))
 	avail := pageStart + XLOGBlockSize - next
-	if totLen < uint64(xlogRecordHeaderSize) || totLen <= avail || avail < uint64(xlogRecordHeaderSize) {
+	if totLen < uint64(xlogRecordHeaderSize) || totLen <= avail {
 		return mc, false, nil
+	}
+	// XLogDecodeNextRecord validates a header that lies wholly on this page
+	// before it starts assembling (ValidXLogRecordHeader: a valid rmgr id
+	// and xl_prev equal to the previous record); a broken header is an
+	// ordinary end of WAL, not a missing contrecord. A header split across
+	// the page boundary is only length-checked.
+	if avail >= uint64(xlogRecordHeaderSize) {
+		if off+uint64(xlogRecordHeaderSize) > uint64(len(stream)) {
+			return mc, false, nil
+		}
+		prev := binary.LittleEndian.Uint64(stream[off+8 : off+16])
+		rmid := stream[off+17]
+		if prev != last.StartLSN-1 || !rmgrIDIsValid(rmid) {
+			return mc, false, nil
+		}
 	}
 	tli := uint32(1)
 	if so := pageStart - (pageStart % uint64(segSize)) - base; so+8 <= uint64(len(stream)) {
@@ -285,3 +300,8 @@ func timestamptzToStr(ts int64) string {
 	}
 	return s
 }
+
+// rmgrIDIsValid is RmgrIdIsValid: a built-in resource manager id
+// (RM_MAX_BUILTIN_ID = RM_LOGICALMSG_ID = 21 in PG 18) or a custom one
+// (RM_MIN_CUSTOM_ID 128 .. RM_MAX_CUSTOM_ID 255).
+func rmgrIDIsValid(id uint8) bool { return id <= 21 || id >= 128 }

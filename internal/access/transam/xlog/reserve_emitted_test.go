@@ -101,7 +101,7 @@ func TestReserveEmittedAndPublishSegmentBoundaryGetsLongHeader(t *testing.T) {
 }
 
 func TestReserveEmittedAndPublishCrossSegmentEmitsPadAndRePredicts(t *testing.T) {
-	t.Parallel()
+	withCrossSegmentPad(t) // the pre-M0149-0017d pad layout older WAL still has
 	// segSize=2 pages (16 KiB) so the boundary is reachable in a few
 	// hundred bytes; both segSize and the boundary are XLOGBlockSize-
 	// aligned so predictEmittedSize observes the long header at the
@@ -159,7 +159,7 @@ func TestReserveEmittedAndPublishCrossSegmentEmitsPadAndRePredicts(t *testing.T)
 }
 
 func TestReserveEmittedAndPublishCrossSegmentNoHookSkipsNotify(t *testing.T) {
-	t.Parallel()
+	withCrossSegmentPad(t) // the pre-M0149-0017d pad layout older WAL still has
 	const segSize uint64 = 2 * XLOGBlockSize
 	startPos := 2*segSize - 50
 	pos := newInsertPosTracker(startPos, 999, segSize, nil)
@@ -439,7 +439,7 @@ func TestReserveEmittedAndPublishCrossSegmentChainIntegrity(t *testing.T) {
 }
 
 func TestReserveEmittedAndPublishCrossSegmentLeadingDiffersFromPredictAtCurr(t *testing.T) {
-	t.Parallel()
+	withCrossSegmentPad(t) // the pre-M0149-0017d pad layout older WAL still has
 	// Pins the load-bearing property: when a reservation would
 	// straddle, the re-predict at boundary gives a DIFFERENT leading
 	// header size than predict-at-curr. At a mid-page startPos,
@@ -516,7 +516,7 @@ func TestReserveEmittedAndPublishWatchdog(t *testing.T) {
 // advances prev. This test therefore pins "hook returns false ⇒ prev does not
 // advance onto the gap" rather than "hook is not called".
 func TestReserveEmittedAndPublishSmallGapSkipsNoop(t *testing.T) {
-	t.Parallel()
+	withCrossSegmentPad(t) // the pre-M0149-0017d pad layout older WAL still has
 	// Use segSize = 2 * XLOGBlockSize (16 KiB) so boundary is small enough
 	// to position curr near it without large data. Place curr 8 bytes before
 	// the boundary (gap = 8, below minimum 24).

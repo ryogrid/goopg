@@ -543,7 +543,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// standby (xlogrecovery.c). Written before replay: replay stops at the
 	// incomplete record either way, and the segment run stays contiguous for
 	// the reader and the WAL writer's resume scan.
-	if abs != "" && recov.crashRecovery && !startStandby && !startRecovery {
+	//
+	// A standby's local WAL ends at a missing segment the same way: it
+	// replays up to the hole and streams the rest from the primary, whose WAL
+	// overwrites whatever stale files sit past the hole (026's cold copy has
+	// a pre-allocated segment there, and the standby started replay in it).
+	if abs != "" && (recov.crashRecovery || startStandby) && !startRecovery {
 		walDir := filepath.Join(abs, "pg_wal")
 		if removed, rerr := xlog.RemoveSegmentsAfterGap(walDir, opts.WALSegmentSize, recov.redoLSN); rerr != nil {
 			_ = mgr.Close()
@@ -551,6 +556,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		} else if len(removed) > 0 {
 			slog.Default().Info("WAL ends at a missing segment after the redo point; removed the segments past it", "removed", removed)
 		}
+	}
+	// The end-of-WAL message is xlogreader.c's error for the WAL as it was
+	// read during replay — before any overwrite record repairs the stream
+	// (StartupXLOG writes it only after recovery ends). Compute it first.
+	endOfWALMsg := ""
+	if abs != "" && recov.crashRecovery {
+		endOfWALMsg = xlog.PGEndOfWALMessage(filepath.Join(abs, "pg_wal"), 0)
+	}
+	if abs != "" && recov.crashRecovery && !startStandby && !startRecovery {
+		walDir := filepath.Join(abs, "pg_wal")
 		if mc, ok, ferr := xlog.FindMissingContrecord(walDir, opts.WALSegmentSize, recov.redoLSN); ferr != nil {
 			_ = mgr.Close()
 			return nil, fmt.Errorf("goopg: find missing contrecord: %w", ferr)
@@ -570,10 +585,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// M0149-0076: crash recovery ends where the WAL stops decoding, and
 	// PostgreSQL logs xlogreader.c's reason at LOG ("invalid record length at
 	// 0/...: expected at least 24, got 0" for an ordinary zero tail).
-	if recov.crashRecovery {
-		if msg := xlog.PGEndOfWALMessage(filepath.Join(abs, "pg_wal"), 0); msg != "" {
-			slog.Default().Info(msg)
-		}
+	if recov.crashRecovery && endOfWALMsg != "" {
+		slog.Default().Info(endOfWALMsg)
 	}
 	// A standby keeps replaying; PG runs the init pass when recovery ends
 	// (promotion), which this startup path does not reach.

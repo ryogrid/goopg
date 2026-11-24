@@ -409,7 +409,7 @@ R-021,recovery-tap,tap,postgres/src/test/recovery/t/021_row_visibility.pl,port,y
 ,recovery-tap,tap,postgres/src/test/recovery/t/023_pitr_prepared_xact.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/024_archive_recovery.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/025_stuck_on_old_timeline.pl,not-tried,no,-,,,
-,recovery-tap,tap,postgres/src/test/recovery/t/026_overwrite_contrecord.pl,not-tried,no,-,,,
+R-026,recovery-tap,tap,postgres/src/test/recovery/t/026_overwrite_contrecord.pl,port,yes,-,Ported as TestPort_Recovery026OverwriteContrecord in internal/testport/recovery_026_overwrite_contrecord_test.go (M0149-0017): all-goopg and with PG 18.3 as primary or standby,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/027_stream_regress.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/028_pitr_timelines.pl,not-tried,no,-,,,
 R-029,recovery-tap,tap,postgres/src/test/recovery/t/029_stats_restart.pl,port,yes,-,Ported as TestPort_Recovery029StatsRestart in internal/testport/recovery_029_stats_restart_test.go: all-goopg (44/44) and a PG 18.3 cold start on the cleanly stopped goopg directory that loads goopg's pg_stat/pgstat.stat (M0149-0007),,

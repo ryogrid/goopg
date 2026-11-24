@@ -21,12 +21,6 @@ func TestPort_Recovery026OverwriteContrecord(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping recovery TAP port in short mode")
 	}
-	// Not yet passing: goopg's crash recovery does not write
-	// XLOG_OVERWRITE_CONTRECORD (M0149-0017a) and a goopg standby does not
-	// skip one (M0149-0017b). GOOPG_TAP_026=1 runs it anyway.
-	if os.Getenv("GOOPG_TAP_026") == "" {
-		t.Skip("026 is not passing yet (M0149-0017); set GOOPG_TAP_026=1 to run")
-	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)
 	goopgStandby := func(t *testing.T, name string, root *tapnode.Node, bkp string) *tapnode.Node {
@@ -116,8 +110,9 @@ $$;`)
 			fileTail(standby.LogPath(), 40), fileTail(node.LogPath(), 40))
 	}
 
-	if got := standby.SafePSQL("postgres", "select * from foo"); got != "hello" {
-		t.Errorf("not ok: standby replays past overwritten contrecord: got %q", got)
+	if got, stderr, _ := standby.PSQLExit("postgres", "select * from foo"); got != "hello" {
+		t.Errorf("not ok: standby replays past overwritten contrecord: got %q (%s)\n--- standby log tail ---\n%s",
+			got, strings.TrimSpace(stderr), fileTail(standby.LogPath(), 30))
 	}
 
 	// Verify message appears in standby's log

@@ -1,5 +1,7 @@
 package xlog
 
+import "sync/atomic"
+
 // reserveEmittedAndPublish jointly predicts the PG-compat emitted size
 // of a `recordLen`-byte record at the current `curr` position, reserves
 // that exact emitted byte count in LSN space, optionally handles a
@@ -139,7 +141,13 @@ func (t *insertPosTracker) reserveEmittedAndPublish(
 		panic("wal: insertPosTracker.reserveEmittedAndPublish: emitted size exceeds segSize at curr")
 	}
 
-	if startCandidate+uint64(total) > boundary {
+	// M0149-0017d: a record spans a segment boundary exactly as it spans a
+	// page boundary — PG's ReserveXLogInsertLocation reserves usable bytes
+	// with no segment-boundary rule (only XLOG_SWITCH pads to the boundary),
+	// and the record's continuation starts on the next segment's first page
+	// under XLP_FIRST_IS_CONTRECORD. The pad-and-re-land branch below stays
+	// for a hook that still asks for it (crossSegmentPad).
+	if crossSegmentPadOn.Load() && startCandidate+uint64(total) > boundary {
 		// Re-predict at the boundary first: the caller's ring-window check
 		// (windowEndFn) must cover BOTH the gap the pad will fill AND the
 		// re-landed record, and it must run before the pad is emitted so a
@@ -196,3 +204,10 @@ func (t *insertPosTracker) reserveEmittedAndPublish(
 
 	return start, prev, total, leading, true
 }
+
+// crossSegmentPadOn re-enables the pre-M0149-0017d layout in which a record
+// that would straddle a segment boundary was re-landed at the boundary with
+// an XLOG_NOOP pad over the gap. PostgreSQL never does that; it is off. Only
+// tests of that layout (which older WAL on disk still has) turn it on, and
+// they must not run in parallel with other WAL tests.
+var crossSegmentPadOn atomic.Bool

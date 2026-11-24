@@ -271,7 +271,7 @@ func TestStripeAppendBuiltEmittedNilMemRingStillWritesWalBuf(t *testing.T) {
 }
 
 func TestStripeAppendBuiltEmittedCrossSegmentEmitsPadAndRePredicts(t *testing.T) {
-	t.Parallel()
+	withCrossSegmentPad(t) // the pre-M0149-0017d pad layout older WAL still has
 	// segSize = 2 pages = 16 KiB. Set curr to one page in so the next
 	// boundary is XLOGBlockSize away; a 100-byte record fits in
 	// segment-0 mid-page but at curr=segSize-50 it will cross.

@@ -10,6 +10,7 @@
 package xlog
 
 import (
+	"encoding/binary"
 	"context"
 	"errors"
 	"fmt"
@@ -466,6 +467,12 @@ func (it *RecordIterator) readOneAt(pos int64) (Record, int, error) {
 		if err != nil {
 			return Record{}, 0, err
 		}
+		// M0149-0017b: on the raw xl_tot_len, before header validation.
+		if !isZeroBytes(headerBytes) {
+			if page, ok := it.overwritePageAhead(pos, int(binary.LittleEndian.Uint32(headerBytes[0:4]))); ok {
+				return Record{}, 0, &overwrittenContrecordError{page: page}
+			}
+		}
 		h, err := DecodeXLogRecordHeader(headerBytes)
 		if err != nil {
 			return Record{}, 0, err
@@ -477,9 +484,7 @@ func (it *RecordIterator) readOneAt(pos int64) (Record, int, error) {
 		if total < xlogRecordHeaderSize {
 			return Record{}, 0, fmt.Errorf("%w: bad xlog total length %d at pos=%d page_off=%d header=%x", ErrCorruptRecord, total, pos, pos%XLOGBlockSize, headerBytes)
 		}
-		if page, ok := it.overwritePageAhead(pos, total); ok {
-			return Record{}, 0, &overwrittenContrecordError{page: page}
-		}
+
 		// Read MAXALIGN(total) physical bytes to also pick up the
 		// trailing zero pad — the upstream record alignment.
 		paddedTotal := maxAlignXLog(total)

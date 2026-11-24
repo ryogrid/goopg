@@ -187,7 +187,7 @@ func TestAppendXLogPayloadEmptyByteSliceProceeds(t *testing.T) {
 }
 
 func TestAppendXLogPayloadCrossSegmentBoundary(t *testing.T) {
-	t.Parallel()
+	withCrossSegmentPad(t) // the pre-M0149-0017d pad layout older WAL still has
 	// segSize == 2 pages so the segment boundary coincides with a page
 	// boundary — PG's invariant — and the post-crossing reservation
 	// lands on a segment-aligned page (long PHD).

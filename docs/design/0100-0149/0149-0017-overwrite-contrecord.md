@@ -1,7 +1,7 @@
 # 0149-0017 — Port recovery/t/026\_overwrite\_contrecord.pl
 
-Status: in progress \(1 of 3 pairings passes; the goopg\-primary pairings wait on 0017d\). `TestPort_Recovery026OverwriteContrecord`
-\(`internal/testport/recovery_026_overwrite_contrecord_test.go`\) is gated by `GOOPG_TAP_026=1`.
+Status: done. `TestPort_Recovery026OverwriteContrecord`
+\(`internal/testport/recovery_026_overwrite_contrecord_test.go`\) passes in all three pairings.
 
 ## What the test does
 
@@ -61,10 +61,28 @@ Pairings: all-goopg, PG 18.3 primary with a goopg standby, goopg primary with a 
   the time in the ISO `timestamptz_to_str` form.
 - The PG\-primary / goopg\-standby pairing passes.
 
-## Open
+## Slice 4 \(0017d, landed\): records across segment boundaries
 
-- **0017d — records across segment boundaries.** goopg's stripe WAL insert \(M0107\) never lets a reservation cross a
-  segment boundary. It pads the rest of the segment with `XLOG_NOOP` \(`segment_pad_emit.go`\), so 026's 600 kB message
-  starts exactly in the deleted segment. A goopg primary therefore reaches a clean end of WAL at the boundary, writes
-  no overwrite record, and its standby never logs the skip. PG pads only for `XLOG_SWITCH`. Changing this touches the
-  perf\-critical insert path and needs a design pass.
+- **Layout.** PG's `ReserveXLogInsertLocation` reserves usable bytes with no segment rule. A record continues on the
+  next segment's first page, whose long header carries `XLP_FIRST_IS_CONTRECORD` and `xlp_rem_len`; only `XLOG_SWITCH`
+  pads to the boundary. goopg had instead re\-landed a crossing record at the boundary after an `XLOG_NOOP` pad, in
+  both append paths: the stripe reservation `reserveEmittedAndPublish`, and Path A since M0131\-S30.6, which had
+  copied it believing it was upstream's rule. Both now reserve straight across.
+  - Nothing else depended on the pad: `writeAt` splits per segment, the header schedule \(`pageHeaderSizeAt`\) already
+    emits the long header mid\-record, and the readers already read PG streams that do this.
+  - The old layout stays behind `crossSegmentPadOn` \(test\-only\), because WAL written that way is still on disk.
+- **Standby start.** A cold copy of a crashed primary has the same stale pre\-allocated segment past the hole. The
+  standby had started replay there, skipping the redo segment. The end of local WAL at a missing segment now applies
+  at standby start too \(not under archive recovery\), and the primary streams the rest.
+- **Hardening found by 039\_end\_of\_wal:**
+  - `FindMissingContrecord` validates a header that lies wholly on its page first, as XLogDecodeNextRecord does
+    \(`ValidXLogRecordHeader`: rmid, an exact prev\-link\). A broken header is an ordinary end of WAL;
+  - the overwrite\-page check runs on the raw `xl_tot_len` before header validation, in all three readers;
+  - `readAllPageAware` used a stream\-relative position for absolute page addresses;
+  - the end\-of\-WAL message is computed before the overwrite record changes the files.
+
+## Not covered
+
+- The skip line's time uses the process local zone, not `log_timezone`. An overwritten\-LSN mismatch is a replay error,
+  not a FATAL process exit.
+- `wal_keep_size` is not re\-applied on reload.

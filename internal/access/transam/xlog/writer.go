@@ -1,6 +1,7 @@
 package xlog
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1659,6 +1660,15 @@ func scanLastSegmentEnd(walDir string, segNo uint64, tli uint32, segSize int64, 
 		if isZeroXLogRecordHeader(header) {
 			return int64(off), lastRecPtr, nil
 		}
+		// M0149-0017a: a record whose continuation was replaced by
+		// XLOG_OVERWRITE_CONTRECORD is dropped and the scan restarts at the
+		// flagged page, as xlogreader.c does on XLP_FIRST_IS_OVERWRITE_CONTRECORD.
+		// Checked on the raw xl_tot_len, before header validation: the
+		// dropped record's header need not be one this scan accepts.
+		if next, ok := overwritePageWithin(data, off, pos, int(binary.LittleEndian.Uint32(header[0:4])), cfgSegSize); ok {
+			off = next
+			continue
+		}
 		h, err := DecodeXLogRecordHeader(header)
 		if err != nil {
 			return int64(off), lastRecPtr, nil
@@ -1671,13 +1681,6 @@ func scanLastSegmentEnd(walDir string, segNo uint64, tli uint32, segSize int64, 
 		// trailing pad bytes (zero-filled by the encoder). The
 		// scanner advances by `consumed` so the next iteration
 		// lands on the next record header.
-		// M0149-0017a: a record whose continuation was replaced by
-		// XLOG_OVERWRITE_CONTRECORD is dropped and the scan restarts at the
-		// flagged page, as xlogreader.c does on XLP_FIRST_IS_OVERWRITE_CONTRECORD.
-		if next, ok := overwritePageWithin(data, off, pos, total, cfgSegSize); ok {
-			off = next
-			continue
-		}
 		paddedTotal := maxAlignXLog(total)
 		fullBytes, consumed := extractRecordBytes(data[off:], pos, cfgSegSize, paddedTotal)
 		if len(fullBytes) < total {
@@ -1805,7 +1808,7 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 			// nothing from re-landing (it would straddle the NEXT boundary
 			// too), so leave it where it is — same bound Path B asserts with
 			// its "emitted size exceeds segSize" panic.
-			if total > 0 && int64(total) <= segSize && writePos+int64(total) > boundary {
+			if crossSegmentPadOn.Load() && total > 0 && int64(total) <= segSize && writePos+int64(total) > boundary {
 				gapLen := boundary - writePos
 				// Mirror emitSegmentPad: the gap is a range of STREAM bytes, so
 				// the pad RECORD is the gap minus the page headers the emitter
