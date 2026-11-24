@@ -4765,17 +4765,12 @@ afterExistsCheck:
 			if tbl.Temp {
 				SetSequenceTemporary(seqName, true, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			}
-			o.createSeqCatalogTable(parser.ObjectName{Schema: s.Name.Schema, Name: seqName}, seqName, tbl.Temp)
 			// An UNLOGGED table's serial / identity sequence is unlogged too
 			// (generateSerialExtraStmts copies the relpersistence), so a crash
-			// restart resets it with the table (M0149-0003).
-			if tbl.Unlogged {
-				seqObj := parser.ObjectName{Schema: s.Name.Schema, Name: seqName}
-				if seqTbl, ok := o.ctx.Catalog.LookupTable(seqObj, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok && seqTbl != nil {
-					seqTbl.Unlogged = true
-					syncTableToCatalogHeap(o.ctx, seqTbl)
-				}
-			}
+			// restart resets it with the table (M0149-0003). The persistence
+			// goes into the one pg_class row createSeqCatalogTable writes
+			// (M0149-0077e).
+			o.createSeqCatalogTable(parser.ObjectName{Schema: s.Name.Schema, Name: seqName}, seqName, tbl.Temp, tbl.Unlogged)
 		}
 		// Restart persistence: mark which column this implicit sequence backs
 		// (the serial spelling / identity kind — replay restores the column's
@@ -21640,18 +21635,13 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	// Create a virtual catalog table for SELECT * FROM seq_name. This also
 	// surfaces the sequence in pg_class (relkind='S') / pg_depend / pg_sequence
 	// so pg_dump can discover and dump it. M0097-0024.
-	o.createSeqCatalogTable(s.Name, name, s.Temporary)
-	// CREATE UNLOGGED SEQUENCE: stamp relpersistence on the just-created
-	// catalog row. Post-hoc LookupTable+set (rather than threading unlogged
-	// through createSeqCatalogTable/CreateSequenceCatalogRelation) keeps the
-	// WAL-replay and CREATE-DATABASE-template callers of
-	// CreateSequenceCatalogRelation untouched. M0134-0069.
-	if s.Unlogged {
-		if seqTbl, ok := o.ctx.Catalog.LookupTable(s.Name, seqDBOid); ok && seqTbl != nil {
-			seqTbl.Unlogged = true
-			syncTableToCatalogHeap(o.ctx, seqTbl)
-		}
-	}
+	// CREATE UNLOGGED SEQUENCE: relpersistence 'u' goes into the sequence's
+	// single pg_class row (M0134-0069). It used to be stamped afterwards by a
+	// second syncTableToCatalogHeap, which is insert-only: the heap then held
+	// a 'p' and a 'u' row for the same relation, and a PG standby resolved
+	// the name to the 'p' one and tried to read the unlogged sequence's
+	// missing main fork during recovery (M0149-0077e).
+	o.createSeqCatalogTable(s.Name, name, s.Temporary, s.Unlogged)
 	// Restart persistence: WAL-log the full sequence definition (no-op for
 	// TEMPORARY sequences — session-scoped). See RecordKindSequenceState.
 	WALLogSequenceState(o.ctx, name)
@@ -21666,7 +21656,7 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 // schema-qualified; SequenceRowData resolves both). Shared by the explicit
 // CREATE SEQUENCE path and the implicit IDENTITY-column registration so an
 // identity sequence is discoverable by pg_dump. M0110-0001 (DU-002 slice 120).
-func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string, temp bool) {
+func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string, temp, unlogged bool) {
 	CreateSequenceCatalogRelation(o.ctx.Catalog, seqObjName, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	// B1.3b: the sequence's pg_class row is the reload's ONLY source of its
 	// name/schema (the retired kind-65 carried them before). Write it like
@@ -21677,6 +21667,9 @@ func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string,
 		if temp {
 			seqTbl.Temp = true
 			seqTbl.TempOwner = sessionTempOwner(o.ctx)
+		}
+		if unlogged {
+			seqTbl.Unlogged = true
 		}
 		// Stamp the creating role as owner, mirroring CREATE TABLE's owner
 		// stamp (tablecmds.c DefineRelation -> heap_create_with_catalog

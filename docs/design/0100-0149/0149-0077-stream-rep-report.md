@@ -179,7 +179,20 @@ second backup is taken from the standby while the primary is down. The test then
   - throttling averages over the whole backup instead of PG's per\-sample sleep;
   - a walsender's backend\_type is still "client backend" \(M0149\-0090\).
 
+## Slice 12 \(0077e, landed\): one pg\_class row for an unlogged sequence
+
+- On a PG 18.3 standby of a goopg primary, `pg_sequence_last_value('ulseq')` failed with "could not open file
+  base/5/<n>". PG returns NULL for an unlogged sequence during recovery, but only when the relcache entry says
+  relpersistence 'u'.
+- Cause: the standby's pg\_class held two live rows for ulseq, 'p' and 'u'. CREATE UNLOGGED SEQUENCE, and an
+  UNLOGGED table's serial/identity sequence, wrote the catalog rows once through `createSeqCatalogTable` and then ran
+  `syncTableToCatalogHeap` again after setting Unlogged. That function is an insert\-only funnel for pg\_type,
+  pg\_class, pg\_attribute and their indexes, so the second call inserted a second copy instead of updating.
+- Fix: `createSeqCatalogTable` takes the unlogged flag, and the single write carries relpersistence 'u', as
+  DefineSequence's heap\_create\_with\_catalog does.
+- Result: the goopg\-primary/PG\-standbys pairing of 001 passes end to end and runs ungated.
+- The ALTER SEQUENCE … SET LOGGED/UNLOGGED path still re\-runs the insert\-only funnel \(M0149\-0091\).
+
 ## Open \(children in fix\_plan\)
 
-- 0077e: on a PG 18.3 standby of a goopg primary, reading an unlogged sequence fails with "could not open file".
 - 0077f: a goopg standby does not serve a cascading standby \(PG\-primary pairing\).

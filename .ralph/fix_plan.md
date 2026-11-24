@@ -16224,7 +16224,17 @@ verify each at HEAD when the task starts.
     Path\-to\-TAP: 001 get\_slot\_xmins waits for `xmin IS NULL AND catalog_xmin IS NULL` on the primary's physical
     slot \(fatal timeout\): goopg shows `standby_1|t|0||…` — xmin 0, catalog\_xmin NULL. PG prints NULL for
     InvalidTransactionId \(pg\_get\_replication\_slots: `nulls[i] = true` when !TransactionIdIsValid\).
-  - [ ] **M0149-0077e — PG 18.3 standby of a goopg primary cannot read an unlogged sequence**
+  - [x] **M0149-0077e — PG 18.3 standby of a goopg primary cannot read an unlogged sequence** \(2026\-11\-24\)
+    - Root cause: CREATE UNLOGGED SEQUENCE \(and an UNLOGGED table's serial/identity sequence\) stamped
+      relpersistence 'u' with a second syncTableToCatalogHeap. That function is insert\-only, so the catalog heap held
+      two live pg_class rows for the relation, one 'p' and one 'u', each with its own pg\_attribute rows and index
+      entries. The PG standby resolved the name to the 'p' row, and pg\_sequence\_last\_value read the missing main
+      fork in recovery.
+    - The unlogged flag now goes into createSeqCatalogTable's single write. The PG standby shows one 'u' row and
+      pg\_sequence\_last\_value returns NULL, as in PG.
+    - TestPort\_Recovery001StreamRepFull/goopg\-primary\-pg18\-standbys passes \(3/3, about 15 s\) and runs ungated.
+      Regress sequence 40→39 mismatch lines.
+    Movement: yes — tap 001 goopg\-primary/pg18\-standbys: fatal "could not open file base/5/<n>" → pairing PASS end to end; regress sequence 40→39
     Kind: impl
     Parent: M0149-0077
     Path\-to\-TAP: 001 goopg\-primary/pg18\-standbys: pg\_sequence\_last\_value\('ulseq'\) on the PG standby fails "could
@@ -16359,6 +16369,15 @@ verify each at HEAD when the task starts.
   Parent: none \(found while fixing M0149-0077l; not a 001 assertion\)
   A replication connection running BASE\_BACKUP or START\_REPLICATION shows `backend_type = 'client backend'`. PG
   reports `walsender` \(am\_walsender sets B\_WAL\_SENDER\).
+- [ ] **M0149-0091 — ALTER SEQUENCE … SET LOGGED/UNLOGGED duplicates the sequence's catalog rows**
+  Kind: impl
+  Parent: none \(found while fixing M0149-0077e; not a 001 assertion\)
+  - The ALTER path calls the insert\-only syncTableToCatalogHeap again, as CREATE UNLOGGED SEQUENCE did. The result is
+    a second pg\_class row plus pg\_attribute rows and index entries for the same oid, and a PG standby reads the stale
+    one.
+  - PG's ATExecSetRelPersistence rewrites the relation into a new relfilenode and updates the pg\_class row in place
+    \(heap\_update\).
+  - Audit the other callers that run syncTableToCatalogHeap on an already\-written relation.
 - [ ] **M0149-0018 — port recovery/t/002_archiving.pl**
   Kind: impl
   Parent: none

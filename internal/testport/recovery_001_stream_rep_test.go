@@ -34,9 +34,10 @@ func TestPort_Recovery001StreamRepFull(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping recovery TAP port in short mode")
 	}
-	// The all-goopg pairing passes (M0149-0077l) and always runs; the two
-	// mixed pairings still have open blockers (M0149-0077e, -0077f) and run
-	// only with GOOPG_TAP_001=1.
+	// The all-goopg (M0149-0077l) and goopg-primary/PG-standbys (M0149-0077e)
+	// pairings pass and always run; the PG-primary/goopg-standbys pairing
+	// still has an open blocker (M0149-0077f) and runs only with
+	// GOOPG_TAP_001=1.
 	mixed := os.Getenv("GOOPG_TAP_001") != ""
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)
@@ -59,8 +60,8 @@ func TestPort_Recovery001StreamRepFull(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.name != "all-goopg" && !mixed {
-				t.Skip("mixed PG/goopg pairing not passing yet (M0149-0077e, M0149-0077f); set GOOPG_TAP_001=1 to run")
+			if tc.name == "pg18-primary-goopg-standbys" && !mixed {
+				t.Skip("PG-primary/goopg-standbys pairing not passing yet (M0149-0077f); set GOOPG_TAP_001=1 to run")
 			}
 			runStreamRep(t, tc.primary(t, "primary"), func(name, bkp string, root *tapnode.Node) *tapnode.Node {
 				return tc.standby(t, name, root, bkp)
