@@ -512,12 +512,17 @@ func (sc *standbyController) finalizePromotion() error {
 		sc.logger.Info("promote: timeline bumped",
 			"old_tli", oldTLI, "new_tli", newTLI, "switch_lsn", endLSN,
 			"history_file", filepath.Join(walDir, xlog.TimelineHistoryFileName(newTLI)))
+		// writeTimeLineHistory: XLogArchiveNotify(histfname) — the new
+		// timeline's history file is archived too (M0149-0018a).
+		walArchiver.Notify(xlog.TimelineHistoryFileName(newTLI))
 	}
 
 	if err := initdb.RemoveStandbySignal(sc.rt.DataDir); err != nil {
 		return fmt.Errorf("promote: remove standby.signal: %w", err)
 	}
 	sc.rt.Standby = false
+	// Out of recovery: with archive_mode = on the archiver starts now.
+	walArchiver.Wakeup()
 	// Recovery-mode checkpoints intentionally avoid creating local WAL. Once
 	// promotion completes this runtime owns its timeline again, so restore the
 	// normal checkpoint path before accepting primary writes.
@@ -1032,6 +1037,7 @@ func promoteAfterRecovery(rt *initdb.Runtime, end archiveRecoveryEnd, logger *sl
 	if err := initdb.RemoveRecoverySignal(rt.DataDir); err != nil {
 		return fmt.Errorf("promote after recovery: remove recovery.signal: %w", err)
 	}
+	walArchiver.Notify(xlog.TimelineHistoryFileName(newTLI))
 	logger.Info("archive recovery promotion complete",
 		"old_tli", oldTLI, "new_tli", newTLI, "switch_lsn", endLSN,
 		"history_file", filepath.Join(walDir, xlog.TimelineHistoryFileName(newTLI)))

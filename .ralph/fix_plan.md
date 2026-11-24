@@ -16404,6 +16404,43 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/recovery/t/002_archiving.pl` — WAL archiving with a hot standby restoring from the archive.
   Likely prerequisites \(verify at start\): a WAL archiver \(`pgarch.c`: `.ready` → `archive_command` → `.done`; only the GUC exists today\), `restore_command` `%f`/`%p`, `archive_cleanup_command`, `recovery_end_command`, `pg_stat_archiver`.
+  - 2026\-11\-25 slice 1: TestPort\_Recovery002ArchivingFull in three pairings; harness EnableArchiving / EnableRestoring /
+    ArchiveDir \(Cluster.pm enable\_archiving / enable\_restoring\). The goopg\-primary/PG\-standbys pairing passes and
+    runs ungated; the goopg\-standby pairings run only with GOOPG\_TAP\_002=1. Design
+    docs/design/0100\-0149/0149\-0018\-archiving.md.
+  - [x] **M0149-0018a — goopg has no WAL archiver** \(2026\-11\-25\)
+    - xlog.Archiver \(pgarch.c\):
+      - completed segments become archive\_status/<seg>.ready after their fsync \(XLogArchiveNotifySeg\), and a
+        promotion's history file becomes .ready too;
+      - archive\_command runs in the data directory with %p/%f/%% and history files first;
+      - on success the file is renamed .done; a failure is retried 3 times one second apart, with PG's WARNING and
+        DETAIL;
+      - the archiver wakes at notify, at reload and every 60 s;
+      - removal keeps segments not .done \(XLogArchiveCheckDone\);
+      - on a standby with archive\_mode = on, received segments are .done.
+    - pg\_stat\_archiver reads live counters. New GUCs: archive\_mode, archive\_command, archive\_library,
+      archive\_timeout, wal\_retrieve\_retry\_interval.
+    Movement: yes — tap 002 goopg\-primary/pg18\-standbys: no archive \(standby never catches up\) → pairing PASS
+    Kind: impl
+    Parent: M0149-0018
+    Path\-to\-TAP: 002 waits for the standby to replay WAL it can only get from the primary's archive.
+  - [ ] **M0149-0018b — a goopg standby does not restore WAL from the archive**
+    Kind: impl
+    Parent: M0149-0018
+    Path\-to\-TAP: 002 all\-goopg and pg18\-primary pairings: standby.signal \+ restore\_command and no primary\_conninfo.
+    The standby starts, logs "walreceiver not started" and never replays; "Timed out while waiting for standby to catch
+    up". PG's WaitForWALToBecomeAvailable polls the archive \(XLOG\_FROM\_ARCHIVE\), then pg\_wal, then streaming, every
+    wal\_retrieve\_retry\_interval.
+  - [ ] **M0149-0018c — archive\_cleanup\_command, recovery\_end\_command and the promotion checks of 002**
+    Kind: impl
+    Parent: M0149-0018
+    Path\-to\-TAP: after 0018b, 002 checks:
+    - archive\_cleanup\_command runs at a standby restartpoint, in the data directory;
+    - recovery\_end\_command runs at promotion, and a failing one logs a WARNING;
+    - the promoted standby archives 00000002.history;
+    - standby2 restores 00000002.history from the archive at promotion \("restored log file … from archive"\), and
+      RECOVERYHISTORY / RECOVERYXLOG are removed.
+    Recovery commands currently run in the server's working directory, not the data directory.
 - [ ] **M0149-0019 — port recovery/t/020_archive_status.pl**
   Kind: impl
   Parent: none

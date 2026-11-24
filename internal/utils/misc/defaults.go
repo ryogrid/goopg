@@ -1776,6 +1776,38 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
+	// The WAL archiver's settings (guc_tables.c, pgarch.c). M0149-0018a.
+	r.MustRegister(NewVariable(Variable{
+		Name: "archive_mode", Type: TypeEnum, BootVal: "off",
+		EnumOptions: []string{"always", "on", "off"},
+		Context:     ContextPostmaster,
+		Scope:       ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "archive_command", Type: TypeString, BootVal: "",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "archive_library", Type: TypeString, BootVal: "",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "archive_timeout", Type: TypeInt, Unit: UnitS, BootVal: "0",
+		MinVal: 0, MaxVal: 1073741823,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	// wal_retrieve_retry_interval (guc_tables.c): how long a standby waits
+	// before retrying to fetch WAL from any source (archive, pg_wal,
+	// stream) after a failure. M0149-0018a.
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_retrieve_retry_interval", Type: TypeInt, Unit: UnitMs, BootVal: "5000",
+		MinVal: 1, MaxVal: 2147483647,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
 	// hot_standby_feedback (guc_tables.c): a standby reports its xmin
 	// upstream so the primary's VACUUM keeps the rows its queries need.
 	// M0149-0077i.

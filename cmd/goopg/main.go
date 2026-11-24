@@ -915,7 +915,12 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		})
 	}
 	applyCheckpointGUCs()
-	cfg.ApplyCheckpointGUCs = applyCheckpointGUCs
+	cfg.ApplyCheckpointGUCs = func() {
+		applyCheckpointGUCs()
+		// pgarch's SIGHUP sets its latch: a reload (a fixed archive_command)
+		// retries the ready files at once, not at the next minute's wakeup.
+		walArchiver.Wakeup()
+	}
 
 	// Slot-aware WAL retention. Wired here (rather than inside
 	// initdb.Open) because the GUC values that govern its
@@ -1123,6 +1128,22 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.HotStandbyConsistent = sc.Consistent
 		cfg.RecoveryLSNs = sc.recoveryLSNs
 		cfg.RecoveryPause = sc.recoveryPause
+	}
+
+	// The WAL archiver (pgarch.c): completed segments and new timeline
+	// history files become .ready, and archive_command copies them out.
+	// With archive_mode = on it waits out recovery (M0149-0018a).
+	if rt != nil && rt.WAL != nil && rt.DataDir != "" {
+		walArchiver = xlog.NewArchiver(xlog.ArchiverConfig{
+			DataDir:    rt.DataDir,
+			WALDir:     walDirFor(rt),
+			Mode:       func() string { return stringGUC(registry, "archive_mode", "off") },
+			Command:    func() string { return stringGUC(registry, "archive_command", "") },
+			InRecovery: func() bool { return rt.Standby },
+			Logger:     logger,
+		})
+		rt.WAL.SetArchiver(walArchiver)
+		go walArchiver.Run(ctx)
 	}
 
 	// A reload that arrived during startup is applied before the server
@@ -1741,3 +1762,7 @@ func runVersion(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "goopg %s\n", version)
 	return 0
 }
+
+// walArchiver is the server's WAL archiver (nil before startup and in
+// tools); its methods tolerate nil. M0149-0018a.
+var walArchiver *xlog.Archiver

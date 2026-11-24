@@ -513,6 +513,14 @@ type state struct {
 	// lock.
 	tli atomic.Uint32
 
+	// archive is the WAL archiver's hook (SetArchiver): each segment the
+	// flush completes is announced (XLogArchiveNotifySeg), and segment
+	// removal keeps every segment not yet archived (XLogArchiveCheckDone).
+	// archNotified is the number of segments announced or pre-existing.
+	// M0149-0018a.
+	archive      atomic.Pointer[Archiver]
+	archNotified atomic.Uint64
+
 
 	// core is the slice B stripe writer core, mounted by NewWriter and
 	// shared with Writer.core (same pointer). state.append's PG-compat
@@ -2391,6 +2399,17 @@ func (s *state) walSyncStage(rq writeRqst) error {
 	}
 
 	s.flushedLSN = rq.flush
+	// XLogWrite's finishing_seg arm: a segment whose last byte is now
+	// durable is handed to the archiver.
+	if a := s.archive.Load(); a != nil && a.Enabled() {
+		done := rq.flush / uint64(s.cfg.SegmentSize)
+		for seg := s.archNotified.Load(); seg < done; seg++ {
+			a.NotifySegment(s.tli.Load(), seg, s.cfg.SegmentSize)
+		}
+		if done > s.archNotified.Load() {
+			s.archNotified.Store(done)
+		}
+	}
 	// Publish the durable LSN AFTER the fdatasync loop above so FlushUpTo's
 	// pre-enqueue fast exit only ever observes a genuinely durable value
 	// (analysis/perf-optimize2, fix-03).
@@ -2491,6 +2510,11 @@ func (s *state) removeOldSegments(keepLSN uint64, distanceEstimateBytes, complet
 		}
 		existing[segNo] = true
 		if segNo < keepSeg {
+			// XLogArchiveCheckDone: with archiving on, a segment that is
+			// not archived yet stays (M0149-0018a).
+			if a := s.archive.Load(); a != nil && !a.segmentRemovable(s.cfg.WALDir, e.Name()) {
+				continue
+			}
 			stale = append(stale, staleSeg{segNo, e.Name()})
 		}
 	}
@@ -2537,6 +2561,7 @@ func (s *state) removeOldSegments(keepLSN uint64, distanceEstimateBytes, complet
 			nextTarget++
 			recycled++
 			anyRecycled = true
+			archiveCleanup(s.cfg.WALDir, o.name)
 			continue
 		}
 
@@ -2547,6 +2572,7 @@ func (s *state) removeOldSegments(keepLSN uint64, distanceEstimateBytes, complet
 			return removed, recycled, fmt.Errorf("wal: remove %s: %w", oldPath, rerr)
 		}
 		removed++
+		archiveCleanup(s.cfg.WALDir, o.name)
 	}
 
 	if anyRecycled {
@@ -2895,4 +2921,17 @@ func (s *state) close() error {
 	s.files = nil
 	s.dirty = nil
 	return firstErr
+}
+
+// SetArchiver attaches the WAL archiver (M0149-0018a). Segments complete
+// before this call are pre-existing and are not announced again; one that
+// was never archived gets its .ready when removal checks it
+// (XLogArchiveCheckDone).
+func (w *Writer) SetArchiver(a *Archiver) {
+	st := w.stateRef
+	if st == nil {
+		return
+	}
+	st.archNotified.Store(w.FlushedLSN() / uint64(st.cfg.SegmentSize))
+	st.archive.Store(a)
 }

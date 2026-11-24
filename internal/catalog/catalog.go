@@ -10476,10 +10476,10 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3407,
 	}
+	// The counters come from the WAL archiver (activity.ReportArchived /
+	// ReportArchiveFailed, M0149-0018a).
 	pgStatArchiver.VirtualRows = func() [][]string {
-		return [][]string{
-			{"0", VirtualNull, VirtualNull, "0", VirtualNull, VirtualNull, "2026-01-01 00:00:00+00"},
-		}
+		return [][]string{activity.ArchiverStatsRow(VirtualNull, "2026-01-01 00:00:00+00")}
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_archiver"] = pgStatArchiver
 
