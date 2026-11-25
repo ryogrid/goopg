@@ -1392,6 +1392,17 @@ func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
 	if err := syncSubscriptionRow(o.ctx, sub.OID, sub); err != nil {
 		return fmt.Errorf("pg_subscription heap write: %w", err)
 	}
+	// CreateSubscription with connect = true: fetch_table_list and one
+	// pg_subscription_rel row per published table — 'i' to be copied by a
+	// table sync (copy_data = true) or 'r' (copy_data = false). goopg's
+	// refresh hook does that and runs the initial COPY of each table
+	// (subscriptioncmds.c:730-790). Before M0149-0044a CREATE SUBSCRIPTION
+	// seeded no rows and copied no pre-existing data.
+	if opts.connect && o.ctx.RefreshSubscriptionOnPublisher != nil {
+		if rerr := o.ctx.RefreshSubscriptionOnPublisher(s.Name, s.Conninfo, subDBOid, s.Publications, opts.copyData); rerr != nil {
+			return rerr
+		}
+	}
 	if o.ctx.OnSubscriptionChange != nil {
 		o.ctx.OnSubscriptionChange()
 	}

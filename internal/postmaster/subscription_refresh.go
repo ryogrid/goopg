@@ -201,13 +201,21 @@ func (s *Server) RefreshSubscriptionOnPublisher(subName, conninfo string, dbOid 
 // tablesync workers commit one transaction per table) plus a
 // CopyFromExecutor bound to the local rel with every column in order
 // (the publisher's COPY stream is the full table).
-func (s *Server) refreshOpenWriter(rels map[uint32]*refreshRel) func(ctx context.Context, relOID uint32) (*replication.WriterPair, error) {
-	return func(ctx context.Context, relOID uint32) (*replication.WriterPair, error) {
+func (s *Server) refreshOpenWriter(rels map[uint32]*refreshRel) func(ctx context.Context, relOID uint32, remoteCols []string) (*replication.WriterPair, error) {
+	return func(ctx context.Context, relOID uint32, remoteCols []string) (*replication.WriterPair, error) {
 		rr, ok := rels[relOID]
 		if !ok {
 			return nil, fmt.Errorf("subscription refresh: relation %d is not a fetched published table", relOID)
 		}
 		tbl := rr.tbl
+		// copy_table: COPY local_table (remote columns) FROM the
+		// publisher's stream, so the subscriber's extra columns take their
+		// defaults; a replicated column missing locally is
+		// logicalrep_report_missing_attrs' error. M0149-0044a.
+		colIdx, err := copyColumnIndex(tbl, remoteCols)
+		if err != nil {
+			return nil, err
+		}
 		tx, err := s.cfg.TxnMgr.Begin(transam.IsolationReadCommitted)
 		if err != nil {
 			return nil, err
@@ -229,10 +237,6 @@ func (s *Server) refreshOpenWriter(rels map[uint32]*refreshRel) func(ctx context
 		ectx.Tx = tx
 		ectx.Snap = snap
 		ectx.CurrentDatabaseOid = rr.dbOid
-		colIdx := make([]int, len(tbl.Columns))
-		for i := range colIdx {
-			colIdx[i] = i
-		}
 		from, err := executor.NewCopyFromExecutor(ectx, &optimizer.Copy{
 			Direction:   optimizer.CopyFrom,
 			Table:       tbl,
@@ -268,4 +272,46 @@ type refreshRel struct {
 // quoteIdent mirrors quote_identifier for the publisher-side COPY name.
 func quoteIdent(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// copyColumnIndex maps the publisher's column names onto tbl's columns in
+// the publisher's order (copy_table's attnamelist). Every column when
+// remoteCols is empty. A replicated column the local table lacks is
+// logicalrep_report_missing_attrs' 42P10 error. M0149-0044a.
+func copyColumnIndex(tbl *catalog.Table, remoteCols []string) ([]int, error) {
+	if len(remoteCols) == 0 {
+		idx := make([]int, len(tbl.Columns))
+		for i := range idx {
+			idx[i] = i
+		}
+		return idx, nil
+	}
+	byName := make(map[string]int, len(tbl.Columns))
+	for i, c := range tbl.Columns {
+		byName[c.Name] = i
+	}
+	idx := make([]int, 0, len(remoteCols))
+	var missing []string
+	for _, rc := range remoteCols {
+		i, ok := byName[rc]
+		if !ok {
+			missing = append(missing, `"`+rc+`"`)
+			continue
+		}
+		idx = append(idx, i)
+	}
+	if len(missing) > 0 {
+		schema := tbl.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		noun := "column"
+		if len(missing) > 1 {
+			noun = "columns"
+		}
+		return nil, &executor.ExecError{Code: "42P10", Message: fmt.Sprintf(
+			"logical replication target relation \"%s.%s\" is missing replicated %s: %s",
+			schema, tbl.Name, noun, strings.Join(missing, ", "))}
+	}
+	return idx, nil
 }

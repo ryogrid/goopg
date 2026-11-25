@@ -21,9 +21,11 @@ import (
 // goopg subscriber, and a goopg publisher with a PG 18.3 subscriber.
 //
 // Gated by GOOPG_TAP_008 until it passes (M0149-0044): the goopg publisher
-// with a PG 18.3 subscriber passes; a goopg subscriber's table sync leaves a
-// table with extra local columns empty, and a later replicated UPDATE then
-// installs rows without the local defaults (M0149-0044a).
+// with a PG 18.3 subscriber passes; with a goopg subscriber the copy, apply
+// and extra-column checks pass (M0149-0044a), but ALTER SUBSCRIPTION …
+// REFRESH PUBLICATION is a no-op, so test_tab3 is never synced and the
+// missing-columns error is never logged (M0149-0044b); all-goopg also stalls
+// on the apply worker not resuming after a sync (M0149-0042b).
 func TestPort_Subscription008DiffSchema(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")

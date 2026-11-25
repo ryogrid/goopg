@@ -20,7 +20,9 @@ import (
 // they don't have to spin up real TCP.
 func fakePublisherConn(t *testing.T, rows []string) *ConnPair {
 	t.Helper()
-	pubBytes := pubRespond(t, rows)
+	// fetch_remote_table_info's column query is answered first (one
+	// column, "a"), then the COPY (M0149-0044a).
+	pubBytes := append(columnQueryRespond(t, "a"), pubRespond(t, rows)...)
 	return &ConnPair{
 		Reader: libpq.NewFrameReader(bytes.NewReader(pubBytes)),
 		Writer: libpq.NewFrameWriter(&bytes.Buffer{}),
@@ -85,7 +87,7 @@ func TestRunTableSyncManagerWalksUnsyncedRels(t *testing.T) {
 				fmt.Sprintf("%d\trow", oid),
 			}), nil
 		},
-		OpenWriter: func(_ context.Context, oid uint32) (*WriterPair, error) {
+		OpenWriter: func(_ context.Context, oid uint32, _ []string) (*WriterPair, error) {
 			writerCalls++
 			rec := &recordingLineWriter{}
 			writers[oid] = rec
@@ -165,7 +167,7 @@ func TestRunTableSyncManagerOneFailureDoesNotAbortRest(t *testing.T) {
 			}
 			return fakePublisherConn(t, []string{"x\ty"}), nil
 		},
-		OpenWriter: func(_ context.Context, _ uint32) (*WriterPair, error) {
+		OpenWriter: func(_ context.Context, _ uint32, _ []string) (*WriterPair, error) {
 			return fakeWriterPair(&recordingLineWriter{}), nil
 		},
 	})
@@ -221,7 +223,7 @@ func TestRunTableSyncManagerUnresolvedRelnameSkips(t *testing.T) {
 			connOpened = true
 			return nil, errors.New("should not dial")
 		},
-		OpenWriter: func(_ context.Context, _ uint32) (*WriterPair, error) {
+		OpenWriter: func(_ context.Context, _ uint32, _ []string) (*WriterPair, error) {
 			return fakeWriterPair(&recordingLineWriter{}), nil
 		},
 	})
@@ -269,7 +271,7 @@ func TestRunTableSyncManagerRegistersStatHandle(t *testing.T) {
 		OpenConn: func(_ context.Context, _ uint32) (*ConnPair, error) {
 			return fakePublisherConn(t, []string{"1\trow"}), nil
 		},
-		OpenWriter: func(_ context.Context, _ uint32) (*WriterPair, error) {
+		OpenWriter: func(_ context.Context, _ uint32, _ []string) (*WriterPair, error) {
 			return &WriterPair{Writer: probe, Close: func() error { return nil }}, nil
 		},
 		OpenStat: func(_ context.Context, relOID uint32) (*StatPair, error) {
@@ -359,7 +361,7 @@ func TestRunTableSyncManagerStatClosedOnFailure(t *testing.T) {
 				Close:  func() error { return nil },
 			}, nil
 		},
-		OpenWriter: func(_ context.Context, _ uint32) (*WriterPair, error) {
+		OpenWriter: func(_ context.Context, _ uint32, _ []string) (*WriterPair, error) {
 			return fakeWriterPair(&recordingLineWriter{}), nil
 		},
 		OpenStat: func(_ context.Context, relOID uint32) (*StatPair, error) {
@@ -406,7 +408,7 @@ func TestRunTableSyncManagerNoUnsyncedRelsReturnsEmpty(t *testing.T) {
 		SubName:    "sub1",
 		ResolveRel: func(_ uint32) (string, bool) { t.Fatal("ResolveRel should not be called"); return "", false },
 		OpenConn:   func(_ context.Context, _ uint32) (*ConnPair, error) { t.Fatal("OpenConn should not be called"); return nil, nil },
-		OpenWriter: func(_ context.Context, _ uint32) (*WriterPair, error) { t.Fatal("OpenWriter should not be called"); return nil, nil },
+		OpenWriter: func(_ context.Context, _ uint32, _ []string) (*WriterPair, error) { t.Fatal("OpenWriter should not be called"); return nil, nil },
 	})
 	if err != nil {
 		t.Fatalf("err=%v", err)
@@ -414,4 +416,27 @@ func TestRunTableSyncManagerNoUnsyncedRelsReturnsEmpty(t *testing.T) {
 	if len(results) != 0 {
 		t.Errorf("results=%v want empty", results)
 	}
+}
+
+// columnQueryRespond scripts the publisher's reply to FetchRemoteColumns:
+// one DataRow per column name, CommandComplete, ReadyForQuery.
+func columnQueryRespond(t *testing.T, cols ...string) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	w := libpq.NewFrameWriter(&out)
+	for _, c := range cols {
+		if err := w.WriteDataRow([][]byte{[]byte(c)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.WriteCommandComplete(fmt.Sprintf("SELECT %d", len(cols))); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.WriteReadyForQuery(libpq.TxStatusIdle); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
 }

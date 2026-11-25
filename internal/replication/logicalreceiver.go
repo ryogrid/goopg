@@ -416,16 +416,22 @@ func CheckRemotePublications(ctx context.Context, cfg LogicalReceiverConfig, pub
 // ErrorResponse becomes a *RemoteCommandError; transport failures are
 // ErrPublisherConnect-wrapped.
 func (r *LogicalReceiver) queryRows(cmd string) ([][][]byte, error) {
-	if err := r.w.WriteQuery(cmd); err != nil {
+	return queryRowsOn(r.r, r.w, cmd)
+}
+
+// queryRowsOn runs one simple query on an authenticated connection parked
+// at ReadyForQuery and returns its DataRows, or the publisher's error.
+func queryRowsOn(rd *libpq.FrameReader, wr *libpq.FrameWriter, cmd string) ([][][]byte, error) {
+	if err := wr.WriteQuery(cmd); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, err)
 	}
-	if err := r.w.Flush(); err != nil {
+	if err := wr.Flush(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, err)
 	}
 	var rows [][][]byte
 	var cmdErr *RemoteCommandError
 	for {
-		f, err := r.r.ReadFrame()
+		f, err := rd.ReadFrame()
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, err)
 		}

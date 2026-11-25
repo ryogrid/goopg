@@ -3668,20 +3668,24 @@ func TestPort_PgoutputInteropGoopgToGoopgRefreshData(t *testing.T) {
 				"(SELECT oid FROM pg_subscription WHERE subname = 'g2g_refreshdata_sub')")
 	}
 
-	// ADD p1: t's 5 pre-existing publisher rows reach the subscriber
-	// through the refresh's initial COPY (they predate the ADD, so
-	// streaming alone cannot deliver them), the pg_subscription_rel
-	// row reaches 'r', and the restarted worker keeps streaming the
-	// new list (post-ADD INSERT lands).
+	// CREATE SUBSCRIPTION … WITH (copy_data = false) already seeded t's
+	// pg_subscription_rel row as 'r' with no copy (subscriptioncmds.c
+	// CreateSubscription, M0149-0044a). ADD p1 also publishes t, but
+	// AlterSubscription_refresh only seeds rels that have no row yet, so
+	// t's 5 pre-existing publisher rows are NOT copied; the rel count
+	// stays 1 and the restarted worker keeps streaming the new list
+	// (the post-ADD INSERT lands).
 	psc.Publisher.Exec(t, "CREATE PUBLICATION p1 FOR TABLE t")
 	psc.Subscriber.Exec(t, "ALTER SUBSCRIPTION g2g_refreshdata_sub ADD PUBLICATION p1")
-	psc.WaitForRow(t, "t", "TRUE", 5, 20*time.Second)
 	psc.WaitForScalar(t,
 		"SELECT count(*)::text FROM pg_subscription_rel WHERE srsubid = "+
 			"(SELECT oid FROM pg_subscription WHERE subname = 'g2g_refreshdata_sub')",
 		"1", 20*time.Second)
 	psc.Publisher.Exec(t, "INSERT INTO t VALUES (6,'f')")
-	psc.WaitForRow(t, "t", "TRUE", 6, 20*time.Second)
+	psc.WaitForRow(t, "t", "TRUE", 1, 20*time.Second)
+	if got := psc.Subscriber.QueryScalar(t, "SELECT string_agg(id::text, ',') FROM t"); got != "6" {
+		t.Fatalf("t ids after ADD PUBLICATION p1 + INSERT = %s, want 6 (an existing rel row is not re-copied)", got)
+	}
 
 	// ADD p2 publishes u, which the subscriber LACKS: 42P01. No row is
 	// seeded, no data copied — PG resolves every fetched name BEFORE
@@ -3717,8 +3721,8 @@ func TestPort_PgoutputInteropGoopgToGoopgRefreshData(t *testing.T) {
 		"SELECT count(*)::text FROM pg_subscription_rel WHERE srsubid = "+
 			"(SELECT oid FROM pg_subscription WHERE subname = 'g2g_refreshdata_sub')",
 		"2", 20*time.Second)
-	if got := psc.Subscriber.QueryScalar(t, "SELECT count(*)::text FROM t"); got != "6" {
-		t.Fatalf("t rows after DROP PUBLICATION p1 = %s, want 6 (copied data kept; TRUNCATE ledgered)", got)
+	if got := psc.Subscriber.QueryScalar(t, "SELECT count(*)::text FROM t"); got != "1" {
+		t.Fatalf("t rows after DROP PUBLICATION p1 = %s, want 1 (data kept; TRUNCATE ledgered)", got)
 	}
 
 	// DROP p2: u now belongs to NO remaining publication ({dummy} =

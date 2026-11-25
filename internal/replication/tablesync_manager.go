@@ -91,7 +91,7 @@ type TableSyncManagerConfig struct {
 	// a *executor.CopyFromExecutor opened against the local
 	// table identified by relOID. The manager guarantees Close
 	// is called before moving on.
-	OpenWriter func(ctx context.Context, relOID uint32) (*WriterPair, error)
+	OpenWriter func(ctx context.Context, relOID uint32, remoteCols []string) (*WriterPair, error)
 
 	// Logger receives structured replication-event lines and is
 	// forwarded into every per-rel RunTableSync invocation. nil
@@ -185,16 +185,30 @@ func syncOneRel(ctx context.Context, cfg TableSyncManagerConfig, relOID uint32, 
 		}
 	}()
 
-	writer, err := cfg.OpenWriter(ctx, relOID)
+	// fetch_remote_table_info: the publisher's column list, which both
+	// the COPY and the local column mapping follow. M0149-0044a.
+	remoteCols, err := FetchRemoteColumns(conn.Reader, conn.Writer, relname)
+	if err != nil {
+		res.Err = fmt.Errorf("tablesync_manager: fetch columns of rel %d (%s): %w", relOID, relname, err)
+		return res
+	}
+	writer, err := cfg.OpenWriter(ctx, relOID, remoteCols)
 	if err != nil {
 		res.Err = fmt.Errorf("tablesync_manager: open writer for rel %d (%s): %w", relOID, relname, err)
 		return res
 	}
-	defer func() {
-		if writer.Close != nil {
-			_ = writer.Close()
+	// The writer's Close commits the copied rows; its error is the rel's
+	// error (it used to be dropped, so a COPY that failed to insert left
+	// the rel marked synchronized and empty). M0149-0044a.
+	closed := false
+	closeWriter := func() error {
+		if closed || writer.Close == nil {
+			return nil
 		}
-	}()
+		closed = true
+		return writer.Close()
+	}
+	defer func() { _ = closeWriter() }()
 
 	var statHandle *xlog.Subscriber
 	if cfg.OpenStat != nil {
@@ -218,6 +232,7 @@ func syncOneRel(ctx context.Context, cfg TableSyncManagerConfig, relOID uint32, 
 		SubName: cfg.SubName,
 		RelOID:  relOID,
 		Relname: relname,
+		Columns: remoteCols,
 		From:    writer.Writer,
 		Reader:  conn.Reader,
 		Writer:  conn.Writer,
@@ -227,6 +242,9 @@ func syncOneRel(ctx context.Context, cfg TableSyncManagerConfig, relOID uint32, 
 	res.Rows = rows
 	if err != nil {
 		res.Err = err
+	}
+	if cerr := closeWriter(); cerr != nil && res.Err == nil {
+		res.Err = fmt.Errorf("tablesync_manager: finish copy of rel %d (%s): %w", relOID, relname, cerr)
 	}
 
 	if got, ok := cfg.PubSub.LookupSubscriptionRel(cfg.SubName, relOID); ok {

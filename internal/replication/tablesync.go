@@ -44,6 +44,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -71,6 +72,11 @@ type TableSyncConfig struct {
 	SubName string
 	RelOID  uint32
 	Relname string
+	// Columns are the publisher's replicated column names
+	// (fetch_remote_table_info); copy_table asks for exactly those, so a
+	// subscriber table with extra local columns fills them with its own
+	// defaults. Empty copies every column. M0149-0044a.
+	Columns []string
 	From    LineWriter
 	Reader  *libpq.FrameReader
 	Writer  *libpq.FrameWriter
@@ -134,6 +140,13 @@ func RunTableSync(cfg TableSyncConfig) (int64, error) {
 	// inside still parses; the upstream tablesync uses the same
 	// dotted form.
 	sql := fmt.Sprintf("COPY %s TO STDOUT", cfg.Relname)
+	if len(cfg.Columns) > 0 {
+		quoted := make([]string, len(cfg.Columns))
+		for i, c := range cfg.Columns {
+			quoted[i] = quoteIdentifier(c)
+		}
+		sql = fmt.Sprintf("COPY %s (%s) TO STDOUT", cfg.Relname, strings.Join(quoted, ", "))
+	}
 	if err := cfg.Writer.WriteQuery(sql); err != nil {
 		return 0, fmt.Errorf("tablesync: write Query: %w", err)
 	}
@@ -333,4 +346,29 @@ func errFromErrorResponse(payload []byte, ctx string) error {
 		msg = "publisher returned ErrorResponse"
 	}
 	return fmt.Errorf("%s: [%s] %s", ctx, code, msg)
+}
+
+// quoteIdentifier is quote_identifier: double-quoted, embedded quotes
+// doubled.
+func quoteIdentifier(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// FetchRemoteColumns is fetch_remote_table_info's column query
+// (tablesync.c): the publisher's live, non-generated columns of relname in
+// attnum order, on the table-sync connection. M0149-0044a.
+func FetchRemoteColumns(rd *libpq.FrameReader, wr *libpq.FrameWriter, relname string) ([]string, error) {
+	rows, err := queryRowsOn(rd, wr, "SELECT a.attname FROM pg_catalog.pg_attribute a"+
+		" WHERE a.attnum > 0::pg_catalog.int2 AND NOT a.attisdropped AND a.attgenerated = ''"+
+		" AND a.attrelid = "+quotePublicationLiteral(relname)+"::pg_catalog.regclass ORDER BY a.attnum")
+	if err != nil {
+		return nil, err
+	}
+	cols := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if len(row) > 0 && row[0] != nil {
+			cols = append(cols, string(row[0]))
+		}
+	}
+	return cols, nil
 }

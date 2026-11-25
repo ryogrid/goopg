@@ -683,6 +683,14 @@ func (c *CopyFromExecutor) storeCopyRow(row Row) error {
 		if err := c.fillDefaults(row); err != nil {
 			return err
 		}
+		// An omitted serial or identity column takes its sequence's next
+		// value: in PG its DEFAULT is the nextval() build_column_default
+		// returns, which BeginCopyFrom puts in defexprs like any other.
+		// goopg keeps that nextval out of DefaultExpr
+		// (autoGenerateSerialValues), so COPY t (a, b) left the column NULL
+		// and failed its NOT NULL. Serial and identity columns are NOT NULL,
+		// so this sits inside the needsConstraints gate. M0149-0044a.
+		autoGenerateSerialValues(c.ctx, c.plan.Table.Name, c.cols, row, c.missing)
 	}
 
 	// BEFORE ROW INSERT triggers see the row with its defaults and may

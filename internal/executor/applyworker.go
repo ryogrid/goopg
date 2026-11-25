@@ -308,6 +308,11 @@ func (w *ApplyWorker) applyInsert(m *xlog.DecodedMessage) error {
 	ctx.Catalog = w.cat
 	ctx.TxnMgr = w.txnMgr
 	ctx.Tx = w.currentTx
+	ctx.CurrentDatabaseOid = w.dbOid()
+	// A subscriber-only serial or identity column takes its sequence's
+	// next value, as slot_fill_defaults' nextval() default does in PG
+	// (goopg keeps that nextval out of DefaultExpr). M0149-0044a.
+	autoGenerateSerialValues(ctx, r.local.Name, r.local.Columns, row, missing)
 
 	// ExecSimpleRelationInsert: BEFORE ROW triggers may replace the row
 	// or skip it (RETURN NULL). M0149-0040c.
