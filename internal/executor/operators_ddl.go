@@ -8451,6 +8451,13 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 	// at commit for the deferred-drop path that funnels through here).
 	// M0118-0009 (`stats`, rung 6; design 0118-0128).
 	relStats.dropTable(relOID)
+	// The commit record names the stats entries of the table and its indexes
+	// (heap_drop_with_catalog / index_drop → pgstat_drop_relation), so a
+	// standby drops them when it replays the commit. M0149-0032b.
+	for _, ioid := range idxOIDs {
+		noteRelationStatsDrop(o.ctx, ioid)
+	}
+	noteRelationStatsDrop(o.ctx, relOID)
 	// Dropping a partition left in the incomplete-detach state
 	// (DetachPendingEpoch != 0) also grabs an AccessExclusiveLock on the parent,
 	// because the parent's partition descriptor still references it: upstream
@@ -8623,6 +8630,7 @@ func ApplyDeferredRoutineDrops(ctx *Context, sess *BasicSession) {
 			}
 		}
 		funcStats.dropFunction(d.Routine.OID)
+		noteFunctionStatsDrop(ctx, d.Routine.OID)
 	}
 }
 
@@ -18234,6 +18242,9 @@ func (o *ddlOp) walLogCreateRoutine(r *catalog.Routine) error {
 // removal, CASCADE-dependent drops, and (via ApplyDeferredRoutineDrops)
 // either statement's deferred-at-commit removal.
 func (o *ddlOp) walLogDropRoutine(oid uint32) error {
+	// RemoveFunctionById → pgstat_drop_function: the commit record names the
+	// function's stats entry. M0149-0032b.
+	noteFunctionStatsDrop(o.ctx, oid)
 	// B1.2: journal the drop as a pg_proc heap DELETE (xl_heap_delete) —
 	// replaces the bespoke RecordKindDropFunction record (retired).
 	if o.ctx.Pool == nil {
@@ -18565,6 +18576,7 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		if old := bsess.TakeDeferredRoutineDropMatching(r.Schema, r.Name, r.Signature()); old != nil {
 			_ = rs.DropRoutine(old)
 			funcStats.dropFunction(old.OID)
+			noteFunctionStatsDrop(o.ctx, old.OID)
 		}
 	}
 	created, err := rs.Create(r, s.OrReplace)
@@ -22432,7 +22444,10 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 							// already populated), avoiding the OUT-param signature mismatch a
 							// rebuilt Drop(name, r.ArgTypes, ...) stub would hit (no ArgModes
 							// carried through that call) — see funcArgModes/LookupWithArgModes.
-							_ = rs.DropRoutine(r)
+							if rs.DropRoutine(r) == nil {
+								funcStats.dropFunction(r.OID)
+								noteFunctionStatsDrop(o.ctx, r.OID)
+							}
 						}
 					}
 					sort.Strings(droppedRoutines)
@@ -22488,12 +22503,22 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				// ledger 2026-11-03), and the namespace is unregistered only
 				// after this loop, so failing here would strand the schema.
 				for _, tbl := range tables {
-					if _, ok := o.ctx.Catalog.LookupTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); !ok {
+					t, ok := o.ctx.Catalog.LookupTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+					if !ok {
 						continue
 					}
+					idxs := o.ctx.Catalog.IndexesOnTable(t, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 					if err := o.ctx.Catalog.DropTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 						return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 					}
+					// pgstat_drop_relation for the table and its indexes, as
+					// dropTableByRefImmediate does. M0149-0032b.
+					for _, idx := range idxs {
+						relStats.dropTable(idx.OID)
+						noteRelationStatsDrop(o.ctx, idx.OID)
+					}
+					relStats.dropTable(t.OID)
+					noteRelationStatsDrop(o.ctx, t.OID)
 				}
 				// Emit NOTICE with total cascade count. reportDependentObjects
 				// (dependency.c) reports a single object in the message itself

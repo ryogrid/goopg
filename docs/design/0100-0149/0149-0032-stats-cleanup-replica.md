@@ -49,3 +49,30 @@ teardown in `postmaster/server.go`, is pgstat\_shutdown\_hook's flush. The defer
 open\-transaction rollback has folded its staged counts. PG's rate\-limited idle flush \(pgstat\_report\_stat at
 ReadyForQuery\) is not done yet. Effects: 030's creation checks pass on goopg standbys, regress stats 235 → 234, and
 the isolation stats spec still passes.
+
+## M0149\-0032b — dropped\-stats items in goopg commit and abort records \(landed\)
+
+PG's `pgstat_drop_transactional` / `pgstat_create_transactional` \(pgstat\_xact.c\) queue an `xl_xact_stats_item`
+\{kind, dboid, objid\_lo, objid\_hi\} per dropped or created object. `pgstat_get_transactional_drops` puts the dropped
+ones into the commit record and the created ones into the abort record \(`XACT_XINFO_HAS_DROPPED_STATS`, after the
+relfilelocators chunk and before the invals\). A standby replaying the record drops those stats entries. goopg's
+records had no such chunk, so a PG 18.3 standby of a goopg primary kept the stats of dropped objects.
+
+- `transam` keeps a per\-top\-XID pending list \(`AddPendingStatsDrop`, `PendingStatsDrops(top, commit)`,
+  `pending_stats_drop.go`\), next to the pending relation deletes:
+  - at commit it returns the dropped items, leaving out drops made inside a rolled\-back subtransaction;
+  - at abort it returns the created items;
+  - the list is forgotten when the transaction ends.
+- `xlog.EncodeXactCommitPGWithStatsAt` / `EncodeXactAbortPGWithStatsAt` write the chunk, and `ParseXactRecord` now
+  returns the items as `DroppedStats` \(for M0149\-0032c\). The commit hook in `initdb/open.go` passes them in.
+- The executor's `noteStatsDrop` \(`pgstat_xact.go`\) records items at:
+  - the table drop \(`dropTableByRefImmediate`: the table and its indexes\);
+  - the function drop paths \(`walLogDropRoutine`, the deferred\-at\-commit drops, DROP\-then\-CREATE\);
+  - DROP SCHEMA CASCADE \(its tables, indexes and functions; it now also drops their stats on the primary\);
+  - DROP DATABASE \(the pg\_database row delete transaction, kind database\).
+- Effect: 030's goopg\-primary → PG 18.3 standby pairing passes end to end. The goopg\-standby pairings still need
+  M0149\-0032c.
+- Not done yet \(deferral ledger\):
+  - abort\-record items for created objects \(pgstat\_create\_relation / pgstat\_create\_function\);
+  - items for views, materialized views, sequences, standalone DROP INDEX and TOAST relations;
+  - 2PC prepare / COMMIT PREPARED records.

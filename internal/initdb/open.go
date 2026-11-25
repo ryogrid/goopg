@@ -1464,6 +1464,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			// (XACT_XINFO_HAS_RELFILELOCATORS); their files are removed once
 			// the record is written (transam pending_rel_delete.go).
 			dropped := txnMgr.PendingRelDeletes(xid)
+			// The stats entries of the objects it dropped go in too
+			// (XACT_XINFO_HAS_DROPPED_STATS, pgstat_get_transactional_drops),
+			// so a standby drops them when it replays the commit. M0149-0032b.
+			droppedStats := txnMgr.PendingStatsDrops(xid, true)
 			// The committed subtransactions go into the record
 			// (XACT_XINFO_HAS_SUBXACTS), so replay stamps them committed with
 			// their parent (TransactionIdCommitTree). Without them, catalog
@@ -1489,7 +1493,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 				if twoPhase {
 					payload, perr = xlog.EncodeXactCommitPreparedPGAt(stopTime, xid, commitSubs, dropped, true)
 				} else {
-					payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, true)
+					payload, perr = xlog.EncodeXactCommitPGWithStatsAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, droppedStats, true)
 				}
 				_ = catalog.WithRelCacheInitLock(func() error {
 					if err := catalog.RelcacheInitFileUnlink(abs, catalog.DefaultDBOid); err != nil {
@@ -1510,7 +1514,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			} else if twoPhase {
 				payload, perr = xlog.EncodeXactCommitPreparedPGAt(stopTime, xid, commitSubs, dropped, false)
 			} else {
-				payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, false)
+				payload, perr = xlog.EncodeXactCommitPGWithStatsAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, droppedStats, false)
 			}
 		case transam.XactAbort:
 			// The relations the transaction created go into the abort record;
@@ -1521,7 +1525,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 				finishedSubs = mergeSubxids(prepEntry.Subxacts, txnMgr.SubxidsOf(xid, false))
 				payload, perr = xlog.EncodeXactAbortPreparedPGAt(stopTime, xid, finishedSubs, txnMgr.PendingAbortRelDeletes(xid))
 			} else {
-				payload, perr = xlog.EncodeXactAbortPGWithRelsAt(stopTime, xid, txnMgr.SubxidsOf(xid, false), txnMgr.PendingAbortRelDeletes(xid))
+				payload, perr = xlog.EncodeXactAbortPGWithStatsAt(stopTime, xid, txnMgr.SubxidsOf(xid, false), txnMgr.PendingAbortRelDeletes(xid), txnMgr.PendingStatsDrops(xid, false))
 			}
 		default:
 			return fmt.Errorf("goopg: unknown xact marker %v", kind)

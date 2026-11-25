@@ -120,6 +120,9 @@ type Manager struct {
 	// pendingRelDel holds the relation storage each transaction dropped,
 	// removed only once it commits (pending_rel_delete.go).
 	pendingRelDel pendingRelDeletes
+	// pendingStatsDrop holds the stats entries each transaction's end record
+	// names (pgstat_xact.c pending_drops).
+	pendingStatsDrop pendingStatsDrops
 
 	// catalogXminSource, when installed, returns the smallest catalog_xmin
 	// pinned by any active logical replication slot (0 = nothing pinned).
@@ -925,6 +928,7 @@ func (m *Manager) finish(tx Transaction, kind XactMarker, waitLocalFlush bool) e
 	// CommitTransaction / AbortTransaction run after ProcArrayEndTransaction).
 	if xid != storage.InvalidTransactionID {
 		m.endPendingRelDeletes(xid, kind == XactCommit)
+		m.endPendingStatsDrops(xid)
 	}
 
 	if xid != storage.InvalidTransactionID {

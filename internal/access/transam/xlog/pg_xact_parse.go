@@ -3,6 +3,8 @@ package xlog
 import (
 	"encoding/binary"
 	"fmt"
+
+	"github.com/goopg/goopg/internal/access/transam"
 )
 
 // M0131-S22: decoding the variable-length body of a real PostgreSQL
@@ -66,6 +68,9 @@ type XactParsed struct {
 	// HAS_RELFILELOCATORS chunk), raw as PG wrote them. The WAL summarizer
 	// sets their limit block to 0 (walsummarizer.c SummarizeXactRecord).
 	DroppedRels []XactRelFileLocator
+	// DroppedStats are the cumulative-statistics entries replay drops (the
+	// HAS_DROPPED_STATS chunk, pgstat_execute_transactional_drops).
+	DroppedStats []transam.XactStatsItem
 	// TwophaseXid is the prepared transaction a COMMIT PREPARED / ABORT
 	// PREPARED record finishes (XACT_XINFO_HAS_TWOPHASE, xl_xact_twophase),
 	// or 0. M0149-0012.
@@ -165,6 +170,15 @@ func ParseXactRecord(info uint8, mainData []byte) (XactParsed, error) {
 		data = data[4:]
 		if n < 0 || n > maxParsedSubxacts || len(data) < n*sizeOfXactStatsItem {
 			return out, fmt.Errorf("wal: xact record declares %d dropped stats items but only %d bytes remain", n, len(data))
+		}
+		out.DroppedStats = make([]transam.XactStatsItem, n)
+		for i := 0; i < n; i++ {
+			b := data[i*sizeOfXactStatsItem:]
+			out.DroppedStats[i] = transam.XactStatsItem{
+				Kind:  int32(binary.LittleEndian.Uint32(b[0:4])),
+				DBOid: binary.LittleEndian.Uint32(b[4:8]),
+				ObjID: uint64(binary.LittleEndian.Uint32(b[8:12])) | uint64(binary.LittleEndian.Uint32(b[12:16]))<<32,
+			}
 		}
 		data = data[n*sizeOfXactStatsItem:]
 	}

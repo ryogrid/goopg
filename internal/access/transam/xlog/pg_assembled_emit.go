@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/access/nbtree"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -449,6 +450,17 @@ func TimestampTzNow() int64 {
 // recovery_target_time, pg_waldump and a standby's
 // pg_last_xact_replay_timestamp() read. The un-timed encoders write 0.
 func EncodeXactCommitPGWithRelsAt(xactTime int64, xid storage.TransactionID, subxacts []storage.TransactionID, rels []storage.RelFileNode, hasInvals bool) ([]byte, error) {
+	return EncodeXactCommitPGWithStatsAt(xactTime, xid, subxacts, rels, nil, hasInvals)
+}
+
+// EncodeXactCommitPGWithStatsAt is EncodeXactCommitPGWithRelsAt plus the
+// cumulative-statistics entries of the objects the transaction dropped
+// (pgstat_get_transactional_drops(true)): a non-empty stats adds
+// xinfo{HAS_DROPPED_STATS} + xl_xact_stats_items{nitems, items[]} after the
+// relfilelocators chunk and before the invals (xact.c:5948-5954). A standby
+// replaying the commit drops those entries
+// (xact_redo_commit → pgstat_execute_transactional_drops).
+func EncodeXactCommitPGWithStatsAt(xactTime int64, xid storage.TransactionID, subxacts []storage.TransactionID, rels []storage.RelFileNode, stats []transam.XactStatsItem, hasInvals bool) ([]byte, error) {
 	info := xlogXactCommit
 	var xinfo uint32
 	if hasInvals {
@@ -460,6 +472,9 @@ func EncodeXactCommitPGWithRelsAt(xactTime int64, xid storage.TransactionID, sub
 	if len(rels) > 0 {
 		xinfo |= xactXinfoHasRelfilelocators
 	}
+	if len(stats) > 0 {
+		xinfo |= xactXinfoHasDroppedStats
+	}
 	mainData := binary.LittleEndian.AppendUint64(nil, uint64(xactTime)) // xact_time
 	if xinfo != 0 {
 		info |= xlogXactHasInfo
@@ -467,6 +482,7 @@ func EncodeXactCommitPGWithRelsAt(xactTime int64, xid storage.TransactionID, sub
 	}
 	mainData = appendXactSubxacts(mainData, subxacts)
 	mainData = appendXactRelFileLocators(mainData, rels)
+	mainData = appendXactStatsItems(mainData, stats)
 	if hasInvals {
 		// nmsgs = 0 (goopg carries no message array). The invals chunk is last
 		// of the chunks goopg writes, matching upstream's order.
@@ -484,6 +500,23 @@ func appendXactSubxacts(mainData []byte, subxacts []storage.TransactionID) []byt
 	mainData = binary.LittleEndian.AppendUint32(mainData, uint32(int32(len(subxacts))))
 	for _, sub := range subxacts {
 		mainData = binary.LittleEndian.AppendUint32(mainData, uint32(sub))
+	}
+	return mainData
+}
+
+// appendXactStatsItems appends xl_xact_stats_items{nitems, items[]} when
+// stats is non-empty. Each xl_xact_stats_item is {kind int, dboid Oid,
+// objid_lo uint32, objid_hi uint32}.
+func appendXactStatsItems(mainData []byte, stats []transam.XactStatsItem) []byte {
+	if len(stats) == 0 {
+		return mainData
+	}
+	mainData = binary.LittleEndian.AppendUint32(mainData, uint32(int32(len(stats))))
+	for _, it := range stats {
+		mainData = binary.LittleEndian.AppendUint32(mainData, uint32(it.Kind))
+		mainData = binary.LittleEndian.AppendUint32(mainData, it.DBOid)
+		mainData = binary.LittleEndian.AppendUint32(mainData, uint32(it.ObjID))
+		mainData = binary.LittleEndian.AppendUint32(mainData, uint32(it.ObjID>>32))
 	}
 	return mainData
 }
@@ -537,6 +570,14 @@ func EncodeXactAbortPGWithRels(xid storage.TransactionID, subxacts []storage.Tra
 // EncodeXactAbortPGWithRelsAt is EncodeXactAbortPGWithRels with the record's
 // xact_time (XactLogAbortRecord stores GetCurrentTransactionStopTimestamp).
 func EncodeXactAbortPGWithRelsAt(xactTime int64, xid storage.TransactionID, subxacts []storage.TransactionID, rels []storage.RelFileNode) ([]byte, error) {
+	return EncodeXactAbortPGWithStatsAt(xactTime, xid, subxacts, rels, nil)
+}
+
+// EncodeXactAbortPGWithStatsAt is EncodeXactAbortPGWithRelsAt plus the
+// stats entries of the objects the aborting transaction created
+// (pgstat_get_transactional_drops(false), XactLogAbortRecord's
+// HAS_DROPPED_STATS chunk, xact.c:6101-6107).
+func EncodeXactAbortPGWithStatsAt(xactTime int64, xid storage.TransactionID, subxacts []storage.TransactionID, rels []storage.RelFileNode, stats []transam.XactStatsItem) ([]byte, error) {
 	info := xlogXactAbort
 	var xinfo uint32
 	if len(subxacts) > 0 {
@@ -545,6 +586,9 @@ func EncodeXactAbortPGWithRelsAt(xactTime int64, xid storage.TransactionID, subx
 	if len(rels) > 0 {
 		xinfo |= xactXinfoHasRelfilelocators
 	}
+	if len(stats) > 0 {
+		xinfo |= xactXinfoHasDroppedStats
+	}
 	mainData := binary.LittleEndian.AppendUint64(nil, uint64(xactTime)) // xact_time
 	if xinfo != 0 {
 		info |= xlogXactHasInfo
@@ -552,6 +596,7 @@ func EncodeXactAbortPGWithRelsAt(xactTime int64, xid storage.TransactionID, subx
 	}
 	mainData = appendXactSubxacts(mainData, subxacts)
 	mainData = appendXactRelFileLocators(mainData, rels)
+	mainData = appendXactStatsItems(mainData, stats)
 	return framedAssemble(RmgrXact, info, uint32(xid), mainData, nil)
 }
 

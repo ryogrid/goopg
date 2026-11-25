@@ -1453,6 +1453,9 @@ func (s *Server) syncPgDatabaseHeapRow(newOid uint32, name string, owner, templa
 // (DROP DATABASE, B4.6 Stage 1) from its own short-lived transaction.
 func (s *Server) deletePgDatabaseHeapRow(oid uint32) error {
 	return s.runPgDatabaseHeapTxn(func(ectx *executor.Context) error {
+		// dropdb → pgstat_drop_database: the commit record names the
+		// database's stats entry. M0149-0032b.
+		executor.NoteDatabaseStatsDrop(ectx, oid)
 		return executor.DeletePgDatabaseCatalogRow(ectx, oid)
 	})
 }

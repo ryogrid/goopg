@@ -16696,10 +16696,21 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: none \(found while fixing M0149\-0032e; not on 030's path\)
   - After `CREATE TABLE t2 AS SELECT 1`, `SELECT * FROM t2` and `SELECT f1()` \(SQL, track\_functions = all\), each in its own session, pg\_stat\_have\_stats is t but pg\_stat\_user\_tables shows seq\_scan 0, n\_tup\_ins 0 and pg\_stat\_user\_functions has no row \(PG: 1, 1, 1 call\). Check recordRelScan / recordRelInsert call sites for these paths, and SQL\-function call accounting \(funcStats.record is only in plpgsql\_runtime\).
-- [ ] **M0149-0032b — goopg commit/abort records carry xl\_xact\_stats\_items for dropped objects**
+- [x] **M0149-0032b — goopg commit/abort records carry xl\_xact\_stats\_items for dropped objects**
   Kind: impl
   Parent: M0149-0032
   - PG: AtEOXact\_PgStat / pgstat\_get\_transactional\_drops put XACT\_XINFO\_HAS\_DROPPED\_STATS items \(kind, dboid, objoid\) into the commit record for DROP TABLE / FUNCTION / SCHEMA CASCADE / DATABASE; a PG 18.3 standby of a goopg primary keeps the stats today.
+  - Path\-to\-TAP: 030 \(goopg\-primary\-pg18\-standby "post drop" checks\) ← M0149\-0032b. One link.
+  - 2026\-11\-25 \(done\): transam keeps a per\-top\-XID pending stats\-drop list \(pending\_stats\_drop.go, PendingStatsDrops honours rolled\-back subtransactions\). The commit hook writes the dropped items and the abort hook the created ones through the new EncodeXactCommitPGWithStatsAt / EncodeXactAbortPGWithStatsAt; ParseXactRecord returns them as DroppedStats. The executor's noteStatsDrop records items at:
+    - the table drop \(table \+ indexes\);
+    - the function drop paths;
+    - DROP SCHEMA CASCADE \(which now also drops its objects' stats on the primary\);
+    - DROP DATABASE.
+  - Results: TestPort\_Recovery030 goopg\-primary\-pg18\-standby PASSES end to end; the two goopg\-standby pairings fail only on 0032c. Unit tests TestPendingStatsDrops, TestXactCommitDroppedStatsItems. Regress stats 234 unchanged; isolation stats PASS.
+- [ ] **M0149-0032h — DROP SCHEMA CASCADE removes its tables from the catalog only**
+  Kind: impl
+  Parent: none \(found while fixing M0149\-0032b; not on 030's path\)
+  - execDropCompat's schema branch calls Catalog.DropTable for each table in the schema, without dropTableByRefImmediate's dropRelationStorage, pg\_class / pg\_attribute heap deletes or index removal. Check whether the relation files and catalog heap rows survive a DROP SCHEMA CASCADE \(PG: performDeletion → heap\_drop\_with\_catalog for each\) and route the cascade through the table\-drop path.
 - [ ] **M0149-0032c — a goopg standby drops stats named by replayed commit records**
   Kind: impl
   Parent: M0149-0032
