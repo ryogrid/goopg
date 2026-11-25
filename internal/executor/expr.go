@@ -18225,6 +18225,8 @@ case "pg_char_to_encoding":
 	// switch record. M0149-0076.
 	case "pg_switch_wal":
 		return evalPgSwitchWAL(ctx)
+	case "pg_create_restore_point":
+		return evalPgCreateRestorePoint(x, slot, ctx)
 	case "pg_wal_replay_pause", "pg_wal_replay_resume", "pg_get_wal_replay_pause_state":
 		return evalPgWalReplayPause(x.Name, ctx)
 	case "pg_current_wal_lsn", "pg_current_wal_insert_lsn", "pg_current_wal_flush_lsn":

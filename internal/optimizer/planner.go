@@ -18006,6 +18006,9 @@ func exprType(e Expr) catalog.Type {
 		case "pg_trigger_depth":
 			// pg_trigger_depth() -> int4 (pg_proc.dat oid 3163). M0146-0080.
 			return catalog.Type{Name: "int4"}
+		case "pg_create_restore_point":
+			// pg_create_restore_point(text) -> pg_lsn (pg_proc.dat oid 3098). M0149-0023a.
+			return catalog.Type{Name: "pg_lsn"}
 		case "pg_current_wal_lsn", "pg_current_wal_insert_lsn", "pg_current_wal_flush_lsn":
 			// xlogfuncs.c; pg_proc.dat oids 2849/2852/3330: prorettype pg_lsn.
 			// M0122-0009 S7.

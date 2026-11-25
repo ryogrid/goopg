@@ -16526,6 +16526,27 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/recovery/t/003_recovery_targets.pl` — PITR to name/time/XID/LSN/immediate targets.
   Likely prerequisites \(verify at start\): all `recovery_target*` GUCs + `recovery_target_action`, `pg_create_restore_point` \(`XLOG_RESTORE_POINT`\), conflicting-target FATAL texts, PG `pg_ctl` on goopg data dirs.
+  - 2026\-11\-25: ported as TestPort\_Recovery003RecoveryTargetsFull \(gated GOOPG\_TAP\_003\). Real upstream semantics: standby\_1..7 are standbys \(has\_restoring, standby => 1\), standby\_8 is archive recovery \(standby => 0\). Not\-oks split into children 0023a\-d below.
+- [x] **M0149-0023a — recovery targets by name, time and immediate; pg\_create\_restore\_point; the multiple\-target check**
+  Kind: impl
+  Parent: M0149-0023
+  - Path\-to\-TAP: 003 ← pg\_create\_restore\_point, the recovery\_target / \_name / \_time GUCs, "multiple recovery targets specified" at startup, and archive recovery's "recovery ended before configured recovery target was reached" for a name target \(standby\_8\) ← M0149\-0023.
+  - 2026\-11\-25 \(done\): pg\_create\_restore\_point writes XLOG\_RESTORE\_POINT \(xl\_restore\_point: rp\_time \+ 64\-byte name\), logs "restore point … created at …", returns the record end, with PG's recovery / wal\_level / length errors. GUCs recovery\_target \("immediate"\), recovery\_target\_name \(< 64\), recovery\_target\_time \(now/today/tomorrow/yesterday rejected by the hook; parsed as timestamptz at startup\). checkSingleRecoveryTarget counts all five and runs for every server at startup. Archive recovery stops at a restore point \(always after\), at a transaction end by time \(inclusive: after at = target, before > target; exclusive: before ≥ target\), and after reaching consistency for 'immediate'; StopReason/StopMessage carry PG's texts; the never\-reached FATAL covers them and is logged at FATAL. 003's standby\_8 passes in both goopg pairings.
+- [ ] **M0149-0023b — a goopg standby stops at its recovery target and pauses there \(standby mode\)**
+  Kind: impl
+  Parent: M0149-0023
+  - Path\-to\-TAP: 003 standby\_1..6 \(goopg standbys\) ← the StreamReplayer honours recovery\_target / \_xid / \_time / \_name / \_lsn and pauses \(recovery\_target\_action = pause: "pausing at the end of recovery", reads served, pg\_wal\_replay\_resume\(\) promotes\) ← M0149\-0023.
+  - Today the standby ignores every target; with a PG primary the counts are whatever replay reached when the poll fired \(timing\-dependent passes\). Reuse the archive\-recovery stop logic \(RecoveryStop, RestorePointOf\) and ctx.RecoveryPause.
+- [ ] **M0149-0023c — all\-goopg 003: every standby counts 1005 rows of tab\_int**
+  Kind: impl
+  Parent: M0149-0023
+  - Path\-to\-TAP: 003 all\-goopg ← goopg standbys of a goopg primary whose epoch was bumped by pg\_resetwal \-\-epoch 1 see the right rows ← M0149\-0023.
+  - Not diagnosed. 1000 rows exist at the backup; 1005 suggests a visibility error after replay — first suspect is the epoch bump on the goopg primary \(pg\_current\_xact\_id with epoch 1\).
+- [ ] **M0149-0023d — a PG 18.3 standby of a goopg primary with recovery\_target = 'immediate' never becomes ready**
+  Kind: impl
+  Parent: M0149-0023
+  - Path\-to\-TAP: 003 goopg\-primary\-pg18\-standbys ← PG reaches consistency from the goopg base backup \(and pauses\) ← M0149\-0023.
+  - Not diagnosed: "pgcluster: not ready within 1m30s" with no log tail; read the PG node's log \(possibly the epoch bump again, or the base backup's end\-of\-backup\).
 - [ ] **M0149-0024 — port recovery/t/023_pitr_prepared_xact.pl**
   Kind: impl
   Parent: none

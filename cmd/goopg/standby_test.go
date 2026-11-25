@@ -1341,6 +1341,59 @@ func TestRecoveryStopXidAndSingleTarget(t *testing.T) {
 	}
 }
 
+// TestRecoveryStopNameTimeImmediate pins the name, time and 'immediate'
+// targets: recoveryStop reads them, their check hooks reject what PG's do,
+// a name plus a time is "multiple recovery targets specified", and an
+// emptied name does not count (003's overriding settings). M0149-0023a.
+func TestRecoveryStopNameTimeImmediate(t *testing.T) {
+	r := misc.BuildDefaultRegistry()
+	for _, kv := range [][2]string{
+		{"recovery_target_name", "my_target"},
+		{"recovery_target_name", ""},
+		{"recovery_target_time", "2026-11-25 09:00:00.5+00"},
+	} {
+		if err := r.Set(kv[0], kv[1], misc.SourceConfigFile); err != nil {
+			t.Fatalf("%s = %q: %v", kv[0], kv[1], err)
+		}
+	}
+	if err := checkSingleRecoveryTarget(r); err != nil {
+		t.Errorf("overriding settings: %v", err)
+	}
+	got := recoveryStop(r)
+	want := time.Date(2026, 11, 25, 9, 0, 0, 500000000, time.UTC).UnixMicro() - 946684800*1000000
+	if !got.TimeSet || got.Time != want || got.NameSet {
+		t.Errorf("time target: %+v, want Time %d", got, want)
+	}
+	if err := r.Set("recovery_target_name", "my_target", misc.SourceConfigFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkSingleRecoveryTarget(r); err == nil {
+		t.Error("name and time together: no error")
+	}
+	if err := r.Set("recovery_target", "immediate", misc.SourceConfigFile); err != nil {
+		t.Fatal(err)
+	}
+	if !recoveryStop(r).Immediate {
+		t.Error("recovery_target = 'immediate' not read")
+	}
+	for _, kv := range [][2]string{
+		{"recovery_target", "later"},
+		{"recovery_target_time", "now"},
+		{"recovery_target_name", strings.Repeat("x", 64)},
+	} {
+		if err := r.Set(kv[0], kv[1], misc.SourceConfigFile); err == nil {
+			t.Errorf("%s = %q accepted", kv[0], kv[1])
+		}
+	}
+	r2 := misc.BuildDefaultRegistry()
+	if err := r2.Set("recovery_target_time", "not a time", misc.SourceConfigFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoveryTargetTimeError(r2); err == nil || err.Error() != `invalid value for parameter "recovery_target_time": "not a time"` {
+		t.Errorf("bad time: %v", err)
+	}
+}
+
 // TestStandbyConsistencyPoint pins reachedConsistency for the hot-standby
 // gate: the consistency point is max(minRecoveryPoint, the checkpoint's
 // redo, backupEndPoint) as InitWalRecovery leaves pg_control

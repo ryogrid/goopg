@@ -24,6 +24,7 @@ import (
 
 	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/postmaster"
 	"github.com/goopg/goopg/internal/replication"
@@ -1179,6 +1180,16 @@ func endInterruptedArchiveRecovery(rt *initdb.Runtime, err error, immediate bool
 	if errors.As(err, &fatal) && fatal.Detail != "" {
 		fmt.Fprintf(stderr, "DETAIL: %s\n", fatal.Detail)
 	}
+	// The server log carries it as PG's startup process does: FATAL, with
+	// its DETAIL (M0149-0023a: "recovery ended before configured recovery
+	// target was reached").
+	if errors.As(err, &fatal) {
+		if fatal.Detail != "" {
+			logger.Log(context.Background(), xlog.LogLevelFatal, fatal.Msg, "detail", fatal.Detail)
+		} else {
+			logger.Log(context.Background(), xlog.LogLevelFatal, fatal.Msg)
+		}
+	}
 	return 1
 }
 
@@ -1214,14 +1225,47 @@ func recoveryStop(registry *misc.Registry) xlog.RecoveryStop {
 	if xid, set, ok := misc.ParseRecoveryTargetXid(stringGUC(registry, "recovery_target_xid", "")); set && ok {
 		stop.Xid, stop.XidSet = xid, true
 	}
+	if name := stringGUC(registry, "recovery_target_name", ""); name != "" {
+		stop.Name, stop.NameSet = name, true
+	}
+	if stringGUC(registry, "recovery_target", "") == "immediate" {
+		stop.Immediate = true
+	}
+	if value := stringGUC(registry, "recovery_target_time", ""); value != "" {
+		// validateRecoveryParameters: timestamptz_in in the server's zone.
+		if t, err := executor.ParseTimestamptzText(value, stringGUC(registry, "timezone", "")); err == nil {
+			const pgEpochUnixMicros = 946684800 * 1000000
+			stop.Time, stop.TimeSet = t.UnixMicro()-pgEpochUnixMicros, true
+		}
+	}
 	return stop
+}
+
+// recoveryTargetTimeError is recovery_target_time's parse failure, which
+// PG's check hook reports as the startup FATAL `invalid value for parameter
+// "recovery_target_time"`; nil when the value is empty or parses.
+func recoveryTargetTimeError(registry *misc.Registry) error {
+	value := stringGUC(registry, "recovery_target_time", "")
+	if value == "" {
+		return nil
+	}
+	if _, err := executor.ParseTimestamptzText(value, stringGUC(registry, "timezone", "")); err != nil {
+		return fmt.Errorf(`invalid value for parameter "recovery_target_time": "%s"`, value)
+	}
+	return nil
 }
 
 // checkSingleRecoveryTarget is error_multiple_recovery_targets: at most one
 // recovery target may be set. PG raises it from the target GUCs' assign
 // hooks while the configuration loads, so the server does not start.
 func checkSingleRecoveryTarget(registry *misc.Registry) error {
-	if stringGUC(registry, "recovery_target_lsn", "") != "" && stringGUC(registry, "recovery_target_xid", "") != "" {
+	set := 0
+	for _, name := range []string{"recovery_target", "recovery_target_lsn", "recovery_target_name", "recovery_target_time", "recovery_target_xid"} {
+		if stringGUC(registry, name, "") != "" {
+			set++
+		}
+	}
+	if set > 1 {
 		return &xlog.RestoreFatalError{
 			Msg:    "multiple recovery targets specified",
 			Detail: `At most one of "recovery_target", "recovery_target_lsn", "recovery_target_name", "recovery_target_time", "recovery_target_xid" may be set.`,
@@ -1249,7 +1293,7 @@ func recoveryTargetAction(registry *misc.Registry) string {
 // written position, a PG position) is the earliest point the recovery can
 // stop at.
 func checkRecoveryTargetReached(stop xlog.RecoveryStop, res xlog.ArchiveRecoveryResult, localEnd uint64) error {
-	if !stop.Set && !stop.XidSet {
+	if !stop.Set && !stop.XidSet && !stop.NameSet && !stop.TimeSet && !stop.Immediate {
 		return nil
 	}
 	if !res.ReachedTarget {

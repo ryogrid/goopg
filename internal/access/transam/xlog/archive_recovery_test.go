@@ -2,6 +2,7 @@ package xlog
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -646,5 +647,104 @@ func TestRunArchiveRecoveryStopsAtTargetXid(t *testing.T) {
 	res = run(RecoveryStop{XidSet: true, Xid: 704, Inclusive: true})
 	if res.ReachedTarget || res.EndOfLog != last {
 		t.Errorf("absent xid 704: %+v; want not reached, whole archive replayed", res)
+	}
+}
+
+// TestRunArchiveRecoveryStopsAtNameAndTime pins recovery_target_name (stop
+// after the matching XLOG_RESTORE_POINT — always after, whatever
+// recovery_target_inclusive says; an absent name is never reached) and
+// recovery_target_time (on transaction ends: inclusive stops after one at
+// exactly the target and before a later one, exclusive before one at or past
+// it). M0149-0023a.
+func TestRunArchiveRecoveryStopsAtNameAndTime(t *testing.T) {
+	const segSize = int64(1 << 20)
+	archive := t.TempDir()
+	w, err := NewWriter(Config{WALDir: archive, SegmentSize: segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type rec struct{ start, end uint64 }
+	ends := map[string]rec{}
+	appendRec := func(key string, framed []byte, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, e, err := w.Append(framed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ends[key] = rec{s, e}
+	}
+	base := TimestampTzNow()
+	c1, err1 := EncodeXactCommitPGWithRelsAt(base, storage.TransactionID(800), nil, nil, false)
+	appendRec("c800", c1, err1)
+	rp, errRP := EncodeRestorePointPG("my_target", base+500)
+	appendRec("rp", rp, errRP)
+	c2, err2 := EncodeXactCommitPGWithRelsAt(base+1000, storage.TransactionID(801), nil, nil, false)
+	appendRec("c801", c2, err2)
+	c3, err3 := EncodeXactCommitPGWithRelsAt(base+2000, storage.TransactionID(802), nil, nil, false)
+	appendRec("c802", c3, err3)
+	if err := w.FlushUpTo(w.WrittenLSN()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The commit times as recorded.
+	recs, err := ReadSegmentRecords(archive, 0, segSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	xactTime := map[uint32]int64{}
+	for _, r := range recs {
+		if r.XLog != nil && r.XLog.Header.Rmid == RmgrXact && len(r.XLog.MainData) >= 8 {
+			xactTime[r.XLog.Header.XID] = int64(binary.LittleEndian.Uint64(r.XLog.MainData[:8]))
+		}
+	}
+	if xactTime[801] <= xactTime[800] || xactTime[802] <= xactTime[801] {
+		t.Fatalf("commit times not increasing: %v", xactTime)
+	}
+	run := func(stop RecoveryStop) ArchiveRecoveryResult {
+		dataDir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dataDir, "pg_wal"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+		res, err := RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return "cp " + filepath.Join(archive, "%f") + " %p" }, segSize, TargetTimeline{}, stop)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+
+	res := run(RecoveryStop{NameSet: true, Name: "my_target", Inclusive: false})
+	if !res.ReachedTarget || res.StopKind != StopAtName || !res.StopAfter || res.EndOfLog != ends["rp"].end {
+		t.Errorf("name target: %+v; want stop after the restore point at %X", res, ends["rp"].end)
+	}
+	if got := res.StopReason(); got != `at restore point "my_target"` {
+		t.Errorf("reason %q", got)
+	}
+	if got := res.StopMessage(); !strings.HasPrefix(got, `recovery stopping at restore point "my_target", time `) {
+		t.Errorf("message %q", got)
+	}
+	if res := run(RecoveryStop{NameSet: true, Name: "does_not_exist", Inclusive: true}); res.ReachedTarget {
+		t.Errorf("absent name reached: %+v", res)
+	}
+
+	res = run(RecoveryStop{TimeSet: true, Time: xactTime[801], Inclusive: true})
+	if !res.ReachedTarget || res.StopKind != StopAtTime || !res.StopAfter || res.StopXid != 801 || res.EndOfLog != ends["c801"].end {
+		t.Errorf("inclusive time: %+v; want stop after commit 801", res)
+	}
+	if got := res.StopMessage(); !strings.HasPrefix(got, "recovery stopping after commit of transaction 801, time ") {
+		t.Errorf("message %q", got)
+	}
+	res = run(RecoveryStop{TimeSet: true, Time: xactTime[801], Inclusive: false})
+	if !res.ReachedTarget || res.StopAfter || res.StopXid != 801 || res.EndOfLog >= ends["c801"].start {
+		t.Errorf("exclusive time: %+v; want stop before commit 801", res)
+	}
+	res = run(RecoveryStop{TimeSet: true, Time: xactTime[801] + 1, Inclusive: true})
+	if !res.ReachedTarget || res.StopAfter || res.StopXid != 802 || res.EndOfLog >= ends["c802"].start {
+		t.Errorf("time between commits: %+v; want stop before commit 802", res)
 	}
 }

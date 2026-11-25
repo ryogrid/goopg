@@ -1,6 +1,12 @@
 package executor
 
-import "fmt"
+import (
+	"fmt"
+	"log/slog"
+
+	"github.com/goopg/goopg/internal/access/transam/xlog"
+	"github.com/goopg/goopg/internal/optimizer"
+)
 
 // WAL position functions (xlogfuncs.c): pg_current_wal_lsn reports
 // GetXLogWriteRecPtr (written to the kernel), pg_current_wal_insert_lsn
@@ -149,4 +155,53 @@ func evalPgWalfileName(d Datum, ctx *Context) (Datum, error) {
 func xlogFileName(tli uint32, segno, segSize uint64) string {
 	perID := uint64(0x100000000) / segSize
 	return fmt.Sprintf("%08X%08X%08X", tli, uint32(segno/perID), uint32(segno%perID))
+}
+
+// evalPgCreateRestorePoint implements pg_create_restore_point(text) →
+// pg_lsn (xlogfuncs.c): it writes an XLOG_RESTORE_POINT record carrying the
+// name — a recovery_target_name archive recovery and standbys can stop at —
+// logs "restore point ... created at ...", and returns the record's end.
+// M0149-0023a.
+func evalPgCreateRestorePoint(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
+	if len(x.Args) != 1 {
+		return Datum{}, &ExecError{Code: "42883", Message: "function pg_create_restore_point does not exist"}
+	}
+	v, err := evalExprSlot(x.Args[0], slot, ctx)
+	if err != nil || v.IsNull() {
+		return NullDatum, err // STRICT
+	}
+	if ctx.IsStandby {
+		return Datum{}, &ExecError{
+			Code:    "55000",
+			Message: "recovery is in progress",
+			Hint:    "WAL control functions cannot be executed during recovery.",
+		}
+	}
+	if backupGUC(ctx, "wal_level") == "minimal" {
+		return Datum{}, &ExecError{
+			Code:    "55000",
+			Message: "WAL level not sufficient for creating a restore point",
+			Hint:    `"wal_level" must be set to "replica" or "logical" at server start.`,
+		}
+	}
+	name := v.StringValue()
+	if len(name) > xlog.MaxRestorePointName {
+		return Datum{}, &ExecError{
+			Code:    "22023",
+			Message: fmt.Sprintf("value too long for restore point (maximum %d characters)", xlog.MaxRestorePointName),
+		}
+	}
+	if ctx.WAL == nil {
+		return NewStringDatum(formatPgLSN(0)), nil
+	}
+	rec, err := xlog.EncodeRestorePointPG(name, xlog.TimestampTzNow())
+	if err != nil {
+		return Datum{}, &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	_, end, err := ctx.WAL.Append(rec)
+	if err != nil {
+		return Datum{}, &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	slog.Info(fmt.Sprintf("restore point \"%s\" created at %s", name, formatPgLSN(end)))
+	return NewStringDatum(formatPgLSN(end)), nil
 }

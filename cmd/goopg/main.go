@@ -1065,15 +1065,27 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "goopg start: FATAL: %v\n", err)
 		return 1
 	}
+	// The recovery-target settings are checked when the configuration loads
+	// (their assign hooks; validateRecoveryParameters' timestamptz_in), so a
+	// bad combination stops any server — a standby as much as archive
+	// recovery (M0149-0023a).
+	targetErr := checkSingleRecoveryTarget(registry)
+	if targetErr == nil {
+		targetErr = recoveryTargetTimeError(registry)
+	}
+	if targetErr != nil {
+		if rt != nil && rt.Recovery && !rt.Standby {
+			return endInterruptedArchiveRecovery(rt, targetErr, quit.Requested(), logger, stderr)
+		}
+		reportStartupFatal(targetErr, logger, stderr)
+		return 1
+	}
 	if rt != nil && rt.Recovery && !rt.Standby {
 		logger.Info("archive recovery starting", "restore_command", stringGUC(registry, "restore_command", ""))
 		// restore_command is PGC_SIGHUP: each fetch first processes a
 		// pending reload (ProcessStartupProcInterrupts), then reads it.
 		// ctx is the shutdown request (SIGTERM/SIGINT): it stops recovery
 		// at the next fetch or segment and cancels a running restore_command.
-		if err := checkSingleRecoveryTarget(registry); err != nil {
-			return endInterruptedArchiveRecovery(rt, err, quit.Requested(), logger, stderr)
-		}
 		stop := recoveryStop(registry)
 		// Crash replay in initdb.Open has already applied the local WAL; a
 		// stop point inside it cannot be honoured.
@@ -1949,4 +1961,21 @@ func archiveXactHook(rt *initdb.Runtime) func(xid storage.TransactionID, committ
 			txnMgr.ReplayXactAbort(xid)
 		}
 	}
+}
+
+// reportStartupFatal logs a startup FATAL (with its DETAIL when it has one)
+// to the server log and stderr.
+func reportStartupFatal(err error, logger *slog.Logger, stderr io.Writer) {
+	msg, detail := err.Error(), ""
+	var fatal *xlog.RestoreFatalError
+	if errors.As(err, &fatal) {
+		msg, detail = fatal.Msg, fatal.Detail
+	}
+	if detail != "" {
+		logger.Log(context.Background(), xlog.LogLevelFatal, msg, "detail", detail)
+		fmt.Fprintf(stderr, "goopg start: FATAL:  %s\nDETAIL:  %s\n", msg, detail)
+		return
+	}
+	logger.Log(context.Background(), xlog.LogLevelFatal, msg)
+	fmt.Fprintf(stderr, "goopg start: FATAL:  %s\n", msg)
 }

@@ -1226,3 +1226,10 @@ func parseCopyTimestampZoneSession(s string, zone tsZoneMode, sessionZone string
 	t, _, err := decodeTimestampText(s, zone, dateInput{zone: sessionZone})
 	return t, err
 }
+
+// ParseTimestamptzText is timestamptz_in for a server-side caller with no
+// session: the text is read in zone (the TimeZone setting; "" is UTC) and the
+// instant returned. Used for recovery_target_time (validateRecoveryParameters).
+func ParseTimestamptzText(s, zone string) (time.Time, error) {
+	return parseCopyTimestampZoneSession(s, tsApplyZone, zone)
+}

@@ -167,6 +167,13 @@
 
 # - Archive Recovery -
 
+#recovery_target = ''		# 'immediate' to end recovery as soon as a
+				# consistent state is reached
+				# (change requires restart)
+#recovery_target_name = ''	# the named restore point to which recovery will proceed
+				# (change requires restart)
+#recovery_target_time = ''	# the time stamp up to which recovery will proceed
+				# (change requires restart)
 #recovery_target_xid = ''	# the transaction ID up to which recovery will proceed
 				# (change requires restart)
 #recovery_target_lsn = ''	# the WAL LSN up to which recovery will proceed
