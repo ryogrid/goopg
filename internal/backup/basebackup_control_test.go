@@ -175,13 +175,15 @@ func TestBaseBackupDoesNotMutateLiveControlFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("shipped pg_control does not verify: %v", err)
 	}
-	if cd.MinRecoveryPoint == 0 {
-		t.Error("shipped pg_control has minRecoveryPoint = 0; a restoring standby " +
-			"short-circuits CheckRecoveryConsistency on XLogRecPtrIsInvalid()")
-	}
-	if cd.MinRecoveryPointTLI != 1 {
-		t.Errorf("shipped pg_control minRecoveryPointTLI = %d, want 1 (the live timeline)",
-			cd.MinRecoveryPointTLI)
+	// M0149-0023d: as in the live file basebackup.c sends, the shipped
+	// image carries no minimum recovery point and no backup end. A restoring
+	// server raises minRecoveryPoint to the redo itself (InitWalRecovery)
+	// and, from backup_label's "BACKUP METHOD: streamed", waits for the
+	// XLOG_BACKUP_END record; a pre-set backupEndPoint = redo made it
+	// consistent before replaying anything.
+	if cd.MinRecoveryPoint != 0 || cd.MinRecoveryPointTLI != 0 || cd.BackupEndPoint != 0 || cd.BackupEndRequired {
+		t.Errorf("shipped pg_control: minRecoveryPoint=%X tli=%d backupEndPoint=%X backupEndRequired=%v, want all unset",
+			cd.MinRecoveryPoint, cd.MinRecoveryPointTLI, cd.BackupEndPoint, cd.BackupEndRequired)
 	}
 	if cd.CheckPointCopyThisTLI != 1 {
 		t.Errorf("shipped pg_control checkPointCopy.ThisTimeLineID = %d, want 1",

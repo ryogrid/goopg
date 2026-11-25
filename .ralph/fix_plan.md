@@ -16550,11 +16550,12 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: none \(found while fixing M0149\-0023c\)
   - `VALUES (generate_series(1,3))` and `SELECT … FROM (VALUES (generate_series(1,3))) v` return 1 row on goopg; PG raises "set\-returning functions are not allowed in VALUES" \(0A000\) — the check transformValuesClause applies to every VALUES RTE.
-- [ ] **M0149-0023d — a PG 18.3 standby of a goopg primary with recovery\_target = 'immediate' never becomes ready**
+- [x] **M0149-0023d — a PG 18.3 standby of a goopg primary with recovery\_target = 'immediate' never becomes ready**
   Kind: impl
   Parent: M0149-0023
   - Path\-to\-TAP: 003 goopg\-primary\-pg18\-standbys ← PG reaches consistency from the goopg base backup \(and pauses\) ← M0149\-0023.
   - Not diagnosed: "pgcluster: not ready within 1m30s" with no log tail; read the PG node's log \(possibly the epoch bump again, or the base backup's end\-of\-backup\).
+  - 2026\-11\-25 \(done\): PG's cassert build TRAPped in FinishWalRecovery \(Assert !XLogRecPtrIsInvalid\): "completed backup recovery … end LSN" = the redo, consistency before any record was read, "recovery stopping after reaching consistency" with no last record. Cause: BASE\_BACKUP shipped a pg\_control image with minRecoveryPoint = 1 and backupEndPoint = redo \(a shortcut so standbys became consistent\) and wrote no XLOG\_BACKUP\_END. Now BASE\_BACKUP does do\_pg\_backup\_stop's primary arm after the data files and before fetched WAL — XLOG\_BACKUP\_END \(its end is the stop LSN\), segment switch, backup history file \(.ready\) — and the image leaves minRecoveryPoint / backupEndPoint unset like the live file basebackup.c sends; PG raises minRecoveryPoint itself and waits for XLOG\_BACKUP\_END. Verified on real PG: "completed backup recovery with redo LSN … and end LSN …" at the record, then "pausing at the end of recovery", 1000 rows. Harness: StartExpectExit's PG branch starts its exit deadline after pgcluster.Start returns. 003 goopg\-primary\-pg18\-standbys PASSES.
 - [ ] **M0149-0024 — port recovery/t/023_pitr_prepared_xact.pl**
   Kind: impl
   Parent: none

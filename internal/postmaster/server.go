@@ -576,6 +576,7 @@ func New(cfg Config) *Server {
 			WAL:            cfg.WAL,
 			WALSegmentSize: cfg.WALSegmentSize,
 			Checkpointer:   cfg.Checkpointer,
+			IsStandby:      func() bool { return s.cfg.IsStandby != nil && s.cfg.IsStandby() },
 		}, s.writeQueryError),
 	)
 	for _, rp := range cfg.RecoveredPrepared {

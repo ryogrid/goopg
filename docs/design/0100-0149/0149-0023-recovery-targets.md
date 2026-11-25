@@ -1,6 +1,6 @@
 # 0149-0023 — Port recovery/t/003\_recovery\_targets.pl
 
-Status: in progress. 0023a and 0023c done \(2026\-11\-25\); 0023b and 0023d open. `TestPort_Recovery003RecoveryTargetsFull`
+Status: in progress. 0023a, 0023c and 0023d done \(2026\-11\-25\); 0023b open. The goopg\-primary\-pg18\-standbys pairing passes. `TestPort_Recovery003RecoveryTargetsFull`
 \(`internal/testport/recovery_003_recovery_targets_test.go`\) is gated by `GOOPG_TAP_003`. It has three pairings:
 all\-goopg, a PG 18.3 primary with goopg standbys, and a goopg primary with PG 18.3 standbys.
 
@@ -42,7 +42,19 @@ transformValuesClause refuses it: "set\-returning functions are not allowed in V
 single row holding a set\-returning function, and no DEFAULT, as INSERT … SELECT <row>. It raises the error for
 multi\-row lists. The standalone VALUES form still lacks the check; it is filed as M0149\-0095.
 
+## 0023d — BASE\_BACKUP's end of backup
+
+A PG 18.3 standby of a goopg primary with recovery\_target = 'immediate' never became ready. PG's cassert build
+asserted in FinishWalRecovery: it was consistent before reading any record \("completed backup recovery … end LSN" =
+the redo\), stopped "after reaching consistency", and had no last record. The cause was a shortcut in BASE\_BACKUP:
+its shipped pg\_control carried minRecoveryPoint = 1 and backupEndPoint = redo, and no XLOG\_BACKUP\_END was written.
+BASE\_BACKUP now runs do\_pg\_backup\_stop's primary arm after the data files and before any fetched WAL, as
+perform\_base\_backup does. It writes XLOG\_BACKUP\_END, whose end is the stop LSN, switches segment, and writes the
+backup history file \(.ready\). The shipped image leaves minRecoveryPoint and backupEndPoint unset, like the live
+file basebackup.c sends. The restoring server raises minRecoveryPoint to the redo itself and, from the label's
+"BACKUP METHOD: streamed", waits for XLOG\_BACKUP\_END. A goopg standby's consistency point is unchanged \(the
+redo\).
+
 ## Open
 
 - 0023b: a goopg standby ignores every recovery target; it must stop at the target and pause there.
-- 0023d: a PG standby of the goopg primary with recovery\_target = 'immediate' never becomes ready.

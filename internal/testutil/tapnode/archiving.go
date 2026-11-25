@@ -65,6 +65,10 @@ func (n *Node) StartExpectExit(timeout time.Duration) bool {
 	}
 	n.p.SetStartArgs("--cluster-name=" + n.name)
 	_ = n.p.Start()
+	// pgcluster's Start waits out its whole readiness budget when the
+	// server dies at once (pg_ctl start, like Cluster.pm's run_log, only
+	// reports the failure); the exit wait starts after it.
+	deadline = time.Now().Add(timeout)
 	pid := filepath.Join(n.DataDir(), "postmaster.pid")
 	time.Sleep(200 * time.Millisecond)
 	for time.Now().Before(deadline) {

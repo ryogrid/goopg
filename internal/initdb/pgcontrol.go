@@ -185,16 +185,19 @@ func BackupControlImage(dataDir string, redoLSN, ckptRecordLSN uint64, tli uint3
 		cd.CheckPointCopyThisTLI = tli
 		cd.CheckPointCopyPrevTLI = tli
 		cd.CheckPointCopyFullPageWrites = true
-		// minRecoveryPoint must be non-zero so CheckRecoveryConsistency
-		// doesn't bail out immediately (XLogRecPtrIsInvalid(0) returns true).
-		// Its timeline must be the live one too, or PG FATALs "requested
-		// timeline %u does not contain minimum recovery point"
-		// (xlogrecovery.c:878-886).
-		cd.MinRecoveryPoint = 1
-		cd.MinRecoveryPointTLI = tli
-		// backupEndPoint = redo LSN so ReachedEndOfBackup() is satisfied
-		// after the first WAL record (the checkpoint) has been replayed.
-		cd.BackupEndPoint = lsn0
+		// No minimum recovery point and no backup end, as in the live
+		// pg_control basebackup.c sends: the restoring server raises
+		// minRecoveryPoint to the checkpoint's redo itself (InitWalRecovery,
+		// archive recovery), and backup_label's "BACKUP METHOD: streamed"
+		// makes it wait for the XLOG_BACKUP_END record BASE_BACKUP writes at
+		// stop (backupEndRequired). Pre-setting backupEndPoint = redo made a
+		// standby consistent before replaying anything, which a
+		// recovery_target = 'immediate' standby trips over (M0149-0023d).
+		cd.MinRecoveryPoint = 0
+		cd.MinRecoveryPointTLI = 0
+		cd.BackupEndPoint = 0
+		cd.BackupStartPoint = 0
+		cd.BackupEndRequired = false
 	})
 }
 

@@ -101,6 +101,10 @@ type Config struct {
 	// location patched into the shipped pg_control. nil skips the
 	// checkpoint, matching the v0 in-process default.
 	Checkpointer executor.Checkpointer
+	// IsStandby reports whether the server is in recovery: a backup taken
+	// there writes no XLOG_BACKUP_END record (do_pg_backup_stop's
+	// backup_stopped_in_recovery arm). nil means a primary.
+	IsStandby func() bool
 }
 
 // WriteQueryErrorFunc writes an ErrorResponse plus a trailing ReadyForQuery on
@@ -424,26 +428,50 @@ func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, arg
 	// 0-based redo point (baseLSN0); endptr is the 0-based stop LSN sampled
 	// now (emitBaseBackupTar reads files but writes no WAL, so WrittenLSN
 	// is stable across the call).
-	var walStartSeg, walEndSeg uint64
-	if opts.IncludeWAL {
-		walStartSeg = baseLSN0 / uint64(segSize)
-		endLSN0 := baseLSN0
-		if s.cfg.WAL != nil {
-			if wlsn := s.cfg.WAL.WrittenLSN(); wlsn > 0 {
-				endLSN0 = wlsn - 1
-			}
+	//
+	// do_pg_backup_stop runs after the data files are sent and before the
+	// WAL is (perform_base_backup), so the stop — XLOG_BACKUP_END on a
+	// primary — is inside the fetched range: stopBackup is called once the
+	// files are in the tar, and again (a no-op) before the result sets.
+	// M0149-0023d.
+	var stopLSN uint64
+	stopped := false
+	stopBackup := func() (uint64, error) {
+		if stopped {
+			return stopLSN, nil
 		}
-		if endLSN0 == 0 {
-			walEndSeg = walStartSeg
-		} else {
+		stopped = true
+		stopLSN = startLSN
+		if s.cfg.WAL != nil {
+			stopLSN = s.cfg.WAL.WrittenLSN()
+		}
+		if s.cfg.WAL != nil && redoLSN > 0 && (s.cfg.IsStandby == nil || !s.cfg.IsStandby()) {
+			end, err := s.writeBackupEnd(baseLSN0, ckptLSN0, startTLI, segSize, opts.Label)
+			if err != nil {
+				return 0, err
+			}
+			stopLSN = end
+		}
+		return stopLSN, nil
+	}
+	walStartSeg := baseLSN0 / uint64(segSize)
+	walEnd := func() (uint64, error) {
+		end, err := stopBackup()
+		if err != nil {
+			return 0, err
+		}
+		endLSN0 := baseLSN0
+		if end > 0 {
+			endLSN0 = end - 1
+		}
+		walEndSeg := walStartSeg
+		if endLSN0 != 0 {
 			walEndSeg = (endLSN0 - 1) / uint64(segSize)
 		}
-		if walEndSeg < walStartSeg {
-			walEndSeg = walStartSeg
-		}
+		return max(walEndSeg, walStartSeg), nil
 	}
 
-	entries, err := emitBaseBackupTar(ctx, streamer, s.cfg.DataDir, opts.Label, baseLSN0, ckptLSN0, startTLI, segSize, mck, opts.IncludeWAL, walStartSeg, walEndSeg, pgControlImage)
+	entries, err := emitBaseBackupTar(ctx, streamer, s.cfg.DataDir, opts.Label, baseLSN0, ckptLSN0, startTLI, segSize, mck, opts.IncludeWAL, walStartSeg, walEnd, pgControlImage)
 	if err != nil {
 		if ctx.Err() != nil {
 			return s.writeStreamingError(w, errcodes.QueryCanceled, "canceling statement due to user request")
@@ -487,9 +515,12 @@ func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, arg
 	// The 'm' frame announces the manifest; its bytes then flow through
 	// the same CopyData 'd' framing as the tar. stopLSN is the WAL-range
 	// end the manifest records, so compute it before building.
-	stopLSN := startLSN
-	if s.cfg.WAL != nil {
-		stopLSN = s.cfg.WAL.WrittenLSN()
+	// do_pg_backup_stop on a primary: XLOG_BACKUP_END with the backup's
+	// start point — a restored node is consistent once it replays it
+	// (backupEndRequired, from the label's "BACKUP METHOD: streamed") —
+	// whose end is the stop point. Already done when the WAL was fetched.
+	if _, err := stopBackup(); err != nil {
+		return s.writeStreamingError(w, errcodes.InternalError, fmt.Sprintf("BASE_BACKUP: %v", err))
 	}
 	if wantManifest {
 		sysID, err := initdb.LoadOrCreateSystemID(s.cfg.DataDir)
@@ -815,7 +846,7 @@ type manifestEntry struct {
 // the bytes on disk: BASE_BACKUP patches the checkpoint fields for the backup's
 // consumer only, and must leave the live cluster's control file alone
 // (M0131-S29).
-func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string, startLSN, ckptLSN uint64, tli uint32, segSize int64, mck manifestChecksumKind, includeWAL bool, walStartSeg, walEndSeg uint64, pgControlImage []byte) ([]manifestEntry, error) {
+func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string, startLSN, ckptLSN uint64, tli uint32, segSize int64, mck manifestChecksumKind, includeWAL bool, walStartSeg uint64, walEnd func() (uint64, error), pgControlImage []byte) ([]manifestEntry, error) {
 	tw := tar.NewWriter(out)
 
 	var manifest []manifestEntry
@@ -960,6 +991,10 @@ func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string
 	// including its contiguity sanity check. Appended WAL is intentionally
 	// NOT recorded in the manifest Files[] — PG tracks it via WAL-Ranges.
 	if includeWAL {
+		walEndSeg, err := walEnd()
+		if err != nil {
+			return nil, err
+		}
 		if err := appendWALSegments(tw, dataDir, tli, segSize, walStartSeg, walEndSeg); err != nil {
 			return nil, err
 		}
@@ -1536,4 +1571,36 @@ func tokenizeLegacyOptions(raw string) []string {
 	}
 	flush()
 	return out
+}
+
+// writeBackupEnd is the primary arm of do_pg_backup_stop for BASE_BACKUP: it
+// writes XLOG_BACKUP_END (main data: the backup's start point), switches to a
+// new segment so the backup's last segment can be archived, and writes the
+// backup history file into pg_wal, announced to the archiver. It returns the
+// record's end, the backup's stop point. M0149-0023d.
+func (s *Handler) writeBackupEnd(start0, ckpt0 uint64, tli uint32, segSize int64, label string) (uint64, error) {
+	rec, err := xlog.EncodeBackupEndPG(start0)
+	if err != nil {
+		return 0, err
+	}
+	_, end, err := s.cfg.WAL.Append(rec)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := s.cfg.WAL.SwitchSegment(); err != nil {
+		return 0, err
+	}
+	if err := s.cfg.WAL.FlushUpTo(s.cfg.WAL.WrittenLSN()); err != nil {
+		return 0, err
+	}
+	if label == "" {
+		label = "goopg base backup"
+	}
+	hist := xlog.BackupHistoryFileName(tli, start0, segSize)
+	content := executor.BuildBackupHistory(label, start0, ckpt0, tli, end, s.cfg.WAL.TimelineID(), segSize, time.Now(), time.Now())
+	if err := os.WriteFile(filepath.Join(s.cfg.DataDir, "pg_wal", hist), content, 0o600); err != nil {
+		return 0, fmt.Errorf("could not write file \"%s\": %w", filepath.Join("pg_wal", hist), err)
+	}
+	s.cfg.WAL.Archiver().Notify(hist)
+	return end, nil
 }
