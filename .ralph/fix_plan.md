@@ -16558,11 +16558,12 @@ verify each at HEAD when the task starts.
   - Path\-to\-TAP: 003 goopg\-primary\-pg18\-standbys ← PG reaches consistency from the goopg base backup \(and pauses\) ← M0149\-0023.
   - Not diagnosed: "pgcluster: not ready within 1m30s" with no log tail; read the PG node's log \(possibly the epoch bump again, or the base backup's end\-of\-backup\).
   - 2026\-11\-25 \(done\): PG's cassert build TRAPped in FinishWalRecovery \(Assert !XLogRecPtrIsInvalid\): "completed backup recovery … end LSN" = the redo, consistency before any record was read, "recovery stopping after reaching consistency" with no last record. Cause: BASE\_BACKUP shipped a pg\_control image with minRecoveryPoint = 1 and backupEndPoint = redo \(a shortcut so standbys became consistent\) and wrote no XLOG\_BACKUP\_END. Now BASE\_BACKUP does do\_pg\_backup\_stop's primary arm after the data files and before fetched WAL — XLOG\_BACKUP\_END \(its end is the stop LSN\), segment switch, backup history file \(.ready\) — and the image leaves minRecoveryPoint / backupEndPoint unset like the live file basebackup.c sends; PG raises minRecoveryPoint itself and waits for XLOG\_BACKUP\_END. Verified on real PG: "completed backup recovery with redo LSN … and end LSN …" at the record, then "pausing at the end of recovery", 1000 rows. Harness: StartExpectExit's PG branch starts its exit deadline after pgcluster.Start returns. 003 goopg\-primary\-pg18\-standbys PASSES.
-- [ ] **M0149-0024 — port recovery/t/023_pitr_prepared_xact.pl**
+- [x] **M0149-0024 — port recovery/t/023_pitr_prepared_xact.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/023_pitr_prepared_xact.pl` — PITR with a prepared transaction, then promotion.
   Likely prerequisites \(verify at start\): prepared-xact restore from WAL at a PITR stop point, `recovery_target_action=promote`, end-of-recovery checkpoint keeping `pg_twophase`.
+  - 2026\-11\-25 \(done\): Path\-to\-TAP: 023 goopg\-PITR pairings ← archive recovery keeps the transaction prepared before the restore point \(PrepareRedoAdd, RecoverPreparedTransactions\) ← M0149\-0024. Archive recovery's replay hooks now include Prepare / PreparedFinish \(the standby replayer's two\-phase bookkeeping\), and at the end of archive recovery the prepared transactions replay left open are restored into the promoted server \(restoreReplayedPrepared, shared with standby promotion\). Before: "prepared transaction with identifier "fooinsert" does not exist" after promotion. 023 passes on all three pairings 3 of 3, ungated; inventory row 023 → port.
 - [ ] **M0149-0025 — port recovery/t/004_timeline_switch.pl**
   Kind: impl
   Parent: none

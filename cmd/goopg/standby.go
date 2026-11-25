@@ -28,6 +28,7 @@ import (
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/postmaster"
 	"github.com/goopg/goopg/internal/replication"
+	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/utils/misc"
 )
 
@@ -329,19 +330,7 @@ func (sc *standbyController) Promote(ctx context.Context) error {
 // and is handed to the server so COMMIT/ROLLBACK PREPARED can finish it.
 // M0149-0015b.
 func (sc *standbyController) restorePreparedAtPromotion() {
-	var out []initdb.RecoveredPrepared
-	for _, p := range sc.rt.TxnMgr.PreparedXacts() {
-		tx, err := sc.rt.TxnMgr.RestorePrepared(p)
-		if err != nil {
-			sc.logger.Warn("promote: could not restore prepared transaction", "xid", p.XID, "gid", p.GID, "err", err)
-			continue
-		}
-		st, _ := xlog.ParseTwoPhaseState(p.State)
-		sc.logger.Info("recovering prepared transaction", "xid", p.XID, "gid", p.GID, "subxacts", len(p.Subxacts))
-		out = append(out, initdb.RecoveredPrepared{
-			GID: p.GID, XID: p.XID, Tx: tx, Database: st.Database, Owner: st.Owner, PreparedAt: st.PreparedAt,
-		})
-	}
+	out := restoreReplayedPrepared(sc.rt, sc.logger, nil)
 	if len(out) == 0 {
 		return
 	}
@@ -1535,4 +1524,37 @@ func standbyRecoveryTarget(registry *misc.Registry, logger *slog.Logger, scRef *
 			Resumed: func() { go promote() },
 		})
 	}
+}
+
+// restoreReplayedPrepared is RecoverPreparedTransactions at the end of
+// recovery: every prepared transaction replay registered and saw no
+// COMMIT/ABORT PREPARED for gets a proc slot holding its xid, ready to hand
+// to the server. Transactions already in known (restored at startup from
+// pg_twophase) are skipped. Shared by a standby's promotion and archive
+// recovery (M0149-0015b, M0149-0024).
+func restoreReplayedPrepared(rt *initdb.Runtime, logger *slog.Logger, known []initdb.RecoveredPrepared) []initdb.RecoveredPrepared {
+	if rt == nil || rt.TxnMgr == nil {
+		return nil
+	}
+	have := map[storage.TransactionID]bool{}
+	for _, k := range known {
+		have[k.XID] = true
+	}
+	var out []initdb.RecoveredPrepared
+	for _, p := range rt.TxnMgr.PreparedXacts() {
+		if have[p.XID] {
+			continue
+		}
+		tx, err := rt.TxnMgr.RestorePrepared(p)
+		if err != nil {
+			logger.Warn("could not restore prepared transaction", "xid", p.XID, "gid", p.GID, "err", err)
+			continue
+		}
+		st, _ := xlog.ParseTwoPhaseState(p.State)
+		logger.Info("recovering prepared transaction", "xid", p.XID, "gid", p.GID, "subxacts", len(p.Subxacts))
+		out = append(out, initdb.RecoveredPrepared{
+			GID: p.GID, XID: p.XID, Tx: tx, Database: st.Database, Owner: st.Owner, PreparedAt: st.PreparedAt,
+		})
+	}
+	return out
 }

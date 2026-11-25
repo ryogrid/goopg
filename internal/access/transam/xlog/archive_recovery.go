@@ -145,6 +145,12 @@ func RunArchiveRecovery(mgr *storage.Manager, dataDir, restoreCommand string, se
 // transaction manager rather than in page replay. M0149-0021.
 type ArchiveReplayHooks struct {
 	Xact func(xid storage.TransactionID, committed bool)
+	// Prepare gets each replayed XLOG_XACT_PREPARE's end LSN and state
+	// buffer (xact_redo's PrepareRedoAdd), so the prepared transaction
+	// survives recovery; PreparedFinish gets the xid a COMMIT PREPARED or
+	// ABORT PREPARED ends (PrepareRedoRemove). M0149-0024.
+	Prepare        func(endLSN uint64, state []byte)
+	PreparedFinish func(xid storage.TransactionID)
 }
 
 func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir string, restoreCommand func() string, segmentSize int64, target TargetTimeline, stop RecoveryStop, hooks ...ArchiveReplayHooks) (ArchiveRecoveryResult, error) {
@@ -452,18 +458,31 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 				return res, fmt.Errorf("wal: archive recovery: replay segment %s: %w", FormatSegmentNameTLI(seg, chosen), err)
 			}
 			for _, h := range hooks {
-				if h.Xact == nil {
-					continue
-				}
 				for _, r := range records {
 					if r.EndLSN <= redoLSN {
 						continue // before the redo point: already in pg_xact
 					}
-					if xid, committed, ok := replayedXactInfo(r); ok {
-						for _, sub := range replayedSubxacts(r) {
-							h.Xact(sub, committed)
+					finishesPrepared := false
+					if r.XLog != nil && r.XLog.Header.Rmid == RmgrXact {
+						switch r.XLog.Header.Info & xlogXactOpMask {
+						case xlogXactPrepare:
+							if h.Prepare != nil {
+								h.Prepare(r.EndLSN, append([]byte(nil), r.XLog.MainData...))
+							}
+						case xlogXactCommitPrepared, xlogXactAbortPrepared:
+							finishesPrepared = true
 						}
-						h.Xact(xid, committed)
+					}
+					if xid, committed, ok := replayedXactInfo(r); ok {
+						if h.Xact != nil {
+							for _, sub := range replayedSubxacts(r) {
+								h.Xact(sub, committed)
+							}
+							h.Xact(xid, committed)
+						}
+						if finishesPrepared && h.PreparedFinish != nil {
+							h.PreparedFinish(xid)
+						}
 					}
 				}
 			}

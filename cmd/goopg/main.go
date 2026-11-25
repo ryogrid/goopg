@@ -1096,7 +1096,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		recovered, err := xlog.RunArchiveRecoveryWith(ctx, rt.StorageMgr, rt.DataDir, func() string {
 			startupHup.process(registry, cfg.ConfigPath, *dataDir)
 			return stringGUC(registry, "restore_command", "")
-		}, 0, recoveryTargetTimeline(registry), stop, xlog.ArchiveReplayHooks{Xact: archiveXactHook(rt)})
+		}, 0, recoveryTargetTimeline(registry), stop, archiveReplayHooks(rt, logger))
 		if err == nil {
 			err = checkRecoveryTargetReached(stop, recovered, localEnd)
 		}
@@ -1124,6 +1124,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				return shutdownAtRecoveryTarget(rt, action, logger, stderr)
 			}
 		}
+		// RecoverPreparedTransactions: prepared transactions archive replay
+		// left open survive into the promoted server (M0149-0024).
+		cfg.RecoveredPrepared = append(cfg.RecoveredPrepared, restoreReplayedPrepared(rt, logger, cfg.RecoveredPrepared)...)
 		logger.Info("archive recovery complete; promoting to primary")
 		// Promote: bump TLI, write history, update pg_control,
 		// and remove recovery.signal. Mirrors finalizePromotion
@@ -1947,6 +1950,35 @@ func reportParameters(rt *initdb.Runtime, registry *misc.Registry, logger *slog.
 	}
 	logger.Debug("parameter change WAL-logged", "wal_level", p.WalLevel)
 	return nil
+}
+
+// archiveReplayHooks is archive recovery's xact_redo side: commit/abort
+// stamping (archiveXactHook) and the two-phase bookkeeping the standby's
+// replayer does — a replayed PREPARE leaves a prepared transaction
+// (PrepareRedoAdd) that the promoted server can still commit or roll back,
+// and COMMIT/ABORT PREPARED replay drops it (PrepareRedoRemove). M0149-0024.
+func archiveReplayHooks(rt *initdb.Runtime, logger *slog.Logger) xlog.ArchiveReplayHooks {
+	h := xlog.ArchiveReplayHooks{Xact: archiveXactHook(rt)}
+	if rt == nil || rt.TxnMgr == nil {
+		return h
+	}
+	txnMgr := rt.TxnMgr
+	h.Prepare = func(endLSN uint64, state []byte) {
+		st, err := xlog.ParseTwoPhaseState(state)
+		if err != nil {
+			logger.Warn("archive recovery: unreadable prepare record", "err", err)
+			return
+		}
+		txnMgr.RegisterPrepared(transam.PreparedXact{
+			XID: st.XID, Subxacts: st.Subxacts, GID: st.GID, State: state, PrepareEndLSN: endLSN,
+		})
+	}
+	h.PreparedFinish = func(xid storage.TransactionID) {
+		if txnMgr.TakeTwoPhase(xid) {
+			txnMgr.RemoveTwoPhaseFile(xid)
+		}
+	}
+	return h
 }
 
 // archiveXactHook stamps archive recovery's replayed commits and aborts into

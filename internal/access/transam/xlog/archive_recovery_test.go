@@ -748,3 +748,63 @@ func TestRunArchiveRecoveryStopsAtNameAndTime(t *testing.T) {
 		t.Errorf("time between commits: %+v; want stop before commit 802", res)
 	}
 }
+
+// TestRunArchiveRecoveryPreparedHooks pins archive recovery's two-phase
+// replay: each XLOG_XACT_PREPARE reaches Prepare (PrepareRedoAdd) with its
+// state, and a COMMIT PREPARED reaches PreparedFinish (PrepareRedoRemove)
+// for its xid; an open prepared transaction is the one left. M0149-0024.
+func TestRunArchiveRecoveryPreparedHooks(t *testing.T) {
+	const segSize = int64(1 << 20)
+	archive := t.TempDir()
+	w, err := NewWriter(Config{WALDir: archive, SegmentSize: segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, gx := range []struct {
+		xid storage.TransactionID
+		gid string
+	}{{910, "fooinsert"}, {911, "other"}} {
+		rec, err := EncodeXactPreparePG(gx.xid, EncodeTwoPhaseState(TwoPhaseState{XID: gx.xid, GID: gx.gid}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := w.Append(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fin, err := EncodeXactCommitPreparedPGAt(TimestampTzNow(), storage.TransactionID(911), nil, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Append(fin); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.FlushUpTo(w.WrittenLSN()); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+
+	dataDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dataDir, "pg_wal"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	open := map[storage.TransactionID]string{}
+	hooks := ArchiveReplayHooks{
+		Prepare: func(_ uint64, state []byte) {
+			st, err := ParseTwoPhaseState(state)
+			if err != nil {
+				t.Errorf("prepare state: %v", err)
+				return
+			}
+			open[st.XID] = st.GID
+		},
+		PreparedFinish: func(xid storage.TransactionID) { delete(open, xid) },
+	}
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	if _, err := RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return "cp " + filepath.Join(archive, "%f") + " %p" }, segSize, TargetTimeline{}, RecoveryStop{}, hooks); err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 1 || open[910] != "fooinsert" {
+		t.Errorf("open prepared transactions = %v, want only 910 fooinsert", open)
+	}
+}
