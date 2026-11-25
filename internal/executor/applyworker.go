@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/goopg/goopg/internal/access/transam"
@@ -308,6 +309,17 @@ func (w *ApplyWorker) applyInsert(m *xlog.DecodedMessage) error {
 	ctx.TxnMgr = w.txnMgr
 	ctx.Tx = w.currentTx
 
+	// ExecSimpleRelationInsert: BEFORE ROW triggers may replace the row
+	// or skip it (RETURN NULL). M0149-0040c.
+	trigCtx := w.triggerContext(ctx)
+	row, keep, err := fireTriggers(trigCtx, r.local, "before", "insert", nil, row)
+	if err != nil {
+		return fmt.Errorf("applyworker: BEFORE INSERT trigger on %q: %w", r.local.Name, err)
+	}
+	if !keep {
+		return nil
+	}
+
 	rel := w.cat.RelFileNode(r.local)
 	ptr, err := writeHeapRowReturning(ctx, rel, r.local.Columns, row)
 	if err != nil {
@@ -320,7 +332,41 @@ func (w *ApplyWorker) applyInsert(m *xlog.DecodedMessage) error {
 	// fresh-session visibility gap surfaced in
 	// `TestPubSubClusterSmokePGToGoopgFreshSessionVisibility`.
 	maintainUniqueIndexesForInsert(ctx, r.local, r.local.Columns, row, ptr)
+	if err := queueAfterRowTriggers(trigCtx, r.local, "insert", nil, row, nil); err != nil {
+		return fmt.Errorf("applyworker: AFTER INSERT trigger on %q: %w", r.local.Name, err)
+	}
 	return nil
+}
+
+// triggerContext is the Context the apply worker fires triggers with:
+// the subscriber database's routines resolve, and the session runs with
+// session_replication_role = replica, as the apply worker's does
+// (SetConfigOption in ApplyWorkerMain), so only REPLICA and ALWAYS
+// triggers fire (TriggerEnabled). M0149-0040c.
+func (w *ApplyWorker) triggerContext(ctx *Context) *Context {
+	ctx.CurrentDatabaseOid = w.dbOid()
+	ctx.GetSetting = func(name string) (string, bool) {
+		if strings.EqualFold(name, "session_replication_role") {
+			return "replica", true
+		}
+		return "", false
+	}
+	return ctx
+}
+
+// remoteUpdatedColumns is apply_handle_update's updatedCols: every local
+// column the remote new tuple carries a value for (not an unchanged
+// TOAST cell, not a subscriber-only column). Logical replication ships
+// whole rows, so an UPDATE OF trigger fires for any of them.
+func remoteUpdatedColumns(cols []catalog.Column, unchanged, missing []bool) map[string]bool {
+	out := make(map[string]bool, len(cols))
+	for i, c := range cols {
+		if (i < len(unchanged) && unchanged[i]) || (i < len(missing) && missing[i]) {
+			continue
+		}
+		out[strings.ToLower(c.Name)] = true
+	}
+	return out
 }
 
 func (w *ApplyWorker) applyDelete(m *xlog.DecodedMessage) error {
@@ -345,7 +391,34 @@ func (w *ApplyWorker) applyDelete(m *xlog.DecodedMessage) error {
 	}
 	ctx := w.applyContext()
 	rel := w.cat.RelFileNode(r.local)
-	return applyDeleteByKey(ctx, rel, r.local.Columns, keyRow)
+	// ExecSimpleRelationDelete: BEFORE ROW triggers see the located row
+	// and may skip the delete; AFTER ROW triggers follow it. M0149-0040c.
+	trigCtx := w.triggerContext(ctx)
+	var oldRow Row
+	if tableHasTrigger(r.local, "before", "delete", true) || tableHasTrigger(r.local, "after", "delete", true) {
+		oldRow, err = applyScanFirstMatch(ctx, rel, r.local.Columns, keyRow)
+		if err != nil {
+			return err
+		}
+		if oldRow != nil {
+			_, keep, terr := fireTriggers(trigCtx, r.local, "before", "delete", oldRow, nil)
+			if terr != nil {
+				return fmt.Errorf("applyworker: BEFORE DELETE trigger on %q: %w", r.local.Name, terr)
+			}
+			if !keep {
+				return nil
+			}
+		}
+	}
+	if err := applyDeleteByKey(ctx, rel, r.local.Columns, keyRow); err != nil {
+		return err
+	}
+	if oldRow != nil {
+		if err := queueAfterRowTriggers(trigCtx, r.local, "delete", oldRow, nil, nil); err != nil {
+			return fmt.Errorf("applyworker: AFTER DELETE trigger on %q: %w", r.local.Name, err)
+		}
+	}
+	return nil
 }
 
 func (w *ApplyWorker) applyUpdate(m *xlog.DecodedMessage) error {
@@ -408,7 +481,46 @@ func (w *ApplyWorker) applyUpdate(m *xlog.DecodedMessage) error {
 	}
 	ctx := w.applyContext()
 	rel := w.cat.RelFileNode(r.local)
-	return applyUpdateByKey(ctx, rel, r.local, r.local.Columns, oldKeyRow, newRow, newUnchanged, newMissing)
+	// ExecSimpleRelationUpdate: BEFORE ROW triggers see the located old
+	// row and the new one (its unchanged-TOAST and subscriber-only cells
+	// taken from the old row) and may replace or skip it; AFTER ROW
+	// triggers follow. M0149-0040c.
+	if !tableHasTrigger(r.local, "before", "update", true) && !tableHasTrigger(r.local, "after", "update", true) {
+		return applyUpdateByKey(ctx, rel, r.local, r.local.Columns, oldKeyRow, newRow, newUnchanged, newMissing)
+	}
+	trigCtx := w.triggerContext(ctx)
+	updCols := remoteUpdatedColumns(r.local.Columns, newUnchanged, newMissing)
+	oldRow, err := applyScanFirstMatch(ctx, rel, r.local.Columns, oldKeyRow)
+	if err != nil {
+		return err
+	}
+	if oldRow != nil {
+		for i := range newRow {
+			if i < len(oldRow) && ((i < len(newUnchanged) && newUnchanged[i]) || (i < len(newMissing) && newMissing[i])) {
+				newRow[i] = oldRow[i]
+			}
+		}
+		// The cells are filled: applyUpdateByKey must not overwrite what a
+		// trigger returned for them.
+		newUnchanged, newMissing = nil, nil
+		var keep bool
+		newRow, keep, err = fireTriggersCols(trigCtx, r.local, "before", "update", oldRow, newRow, updCols)
+		if err != nil {
+			return fmt.Errorf("applyworker: BEFORE UPDATE trigger on %q: %w", r.local.Name, err)
+		}
+		if !keep {
+			return nil
+		}
+	}
+	if err := applyUpdateByKey(ctx, rel, r.local, r.local.Columns, oldKeyRow, newRow, newUnchanged, newMissing); err != nil {
+		return err
+	}
+	if oldRow != nil {
+		if err := queueAfterRowTriggers(trigCtx, r.local, "update", oldRow, newRow, updCols); err != nil {
+			return fmt.Errorf("applyworker: AFTER UPDATE trigger on %q: %w", r.local.Name, err)
+		}
+	}
+	return nil
 }
 
 // applyTruncate handles pgoutput 'T' frames. The publisher emits one

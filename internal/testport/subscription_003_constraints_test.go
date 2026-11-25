@@ -17,9 +17,10 @@ import (
 // PG 18.3 publisher with a goopg subscriber, and a goopg publisher with a
 // PG 18.3 subscriber.
 //
-// Gated by GOOPG_TAP_003 until it passes (M0149-0040): a goopg apply worker
-// fires no triggers (M0149-0040c), and a goopg publisher streams synthetic
-// LSNs and lists no logical walsender in pg_stat_replication (M0149-0040b).
+// Gated by GOOPG_TAP_003 until it passes (M0149-0040). The PG 18.3
+// publisher with a goopg subscriber passes (M0149-0040a/c); a goopg
+// publisher streams synthetic LSNs and lists no logical walsender in
+// pg_stat_replication (M0149-0040b).
 func TestPort_Subscription003Constraints(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")

@@ -16806,10 +16806,15 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: M0149-0040
   - 003 with a goopg publisher: pg\_stat\_replication is empty while tap\_sub's slot is active \(plugin column empty; restart\_lsn / confirmed\_flush\_lsn one byte past the target, 0/10E90B1 vs 0/10E90B0\). runLogicalWalsender \(internal/replication/logicalwalsender.go\) never registers in s.cfg.WalSenders, and walsenderPgoutputAdapter numbers its 'w' frames with synthetic byte\-counted LSNs from START\_REPLICATION's position, with keepalive walEnd likewise synthetic. PG: WalSndWriteData sends each message at the decoded record's LSN, WalSndKeepalive sends the flushed WAL end, and the walsender's row shows the subscriber's write/flush/replay from its 'r' replies.
-- [ ] **M0149-0040c — a goopg apply worker fires the table's triggers under session\_replication\_role = replica**
+- [x] **M0149-0040c — a goopg apply worker fires the table's triggers under session\_replication\_role = replica**
   Kind: impl
   Parent: M0149-0040
   - 003 \(PG publisher\): after ALTER TABLE … ENABLE REPLICA TRIGGER filter\_basic\_dml\_trg \(BEFORE INSERT OR UPDATE OF bid, RETURN NULL for id ≥ 10 and for any UPDATE\), applied changes still land: got 3\|1\|10, want 2\|1\|2. applyInsert / applyUpdate / applyDelete \(internal/executor/applyworker.go\) write the heap directly. PG: ExecSimpleRelationInsert/Update/Delete fire the BR/AR row triggers, the apply worker runs with session\_replication\_role = replica \(so REPLICA and ALWAYS triggers fire\), and apply\_handle\_update marks every column the remote tuple carries as updated \(so an UPDATE OF bid trigger fires for UPDATE … SET id\). fireTriggersCols \(operators\_trigger.go\) needs a Context with the routine registry and GetSetting returning replica.
+  - 2026\-11\-26 \(done\): applyInsert / applyUpdate / applyDelete fire the table's row triggers as ExecSimpleRelationInsert / Update / Delete do:
+    - BEFORE ROW may replace the row or skip the change \(RETURN NULL\); AFTER ROW fires after it \(queueAfterRowTriggers, immediately: the worker has no after\-trigger query level\).
+    - The trigger Context \(ApplyWorker.triggerContext\) resolves the subscriber database's routines and reports session\_replication\_role = replica, so only REPLICA and ALWAYS triggers fire.
+    - UPDATE: the located old row feeds OLD and fills NEW's unchanged\-TOAST and subscriber\-only cells; updCols = every column the remote tuple carries \(remoteUpdatedColumns, apply\_handle\_update\), so UPDATE OF bid fires for SET id.
+  - Results: TestPort\_Subscription003Constraints pg18\-publisher\-goopg\-subscriber PASSES end to end. Unit test TestApplyWorkerFiresReplicaTriggers \(replica trigger replaces/skips; origin trigger silent\).
 - [ ] **M0149-0041 — port subscription/t/005_encoding.pl**
   Kind: impl
   Parent: none

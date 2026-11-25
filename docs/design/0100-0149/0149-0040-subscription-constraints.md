@@ -22,9 +22,25 @@ The receiver now does the same. Its `inXact` flag is set between a pgoutput Begi
 commit before reading the next frame, so the applied commit stands in for PG's flushed one \(PG maps remote commit
 ends to local flush positions through `lsn_mapping`\).
 
-## Remaining
+## Landed — M0149\-0040c, triggers in the apply worker
 
-- M0149\-0040c: the apply worker writes the heap directly and fires no triggers. PG's
-  ExecSimpleRelationInsert / Update / Delete fire row triggers under `session_replication_role = replica`.
+The apply worker wrote the heap directly and fired no triggers. PG's ExecSimpleRelationInsert / Update / Delete fire
+the table's row triggers, and the apply worker runs with `session_replication_role = replica`
+\(ApplyWorkerMain → SetConfigOption\), so REPLICA and ALWAYS triggers fire and ORIGIN ones do not.
+
+- `ApplyWorker.triggerContext` gives the apply Context the subscriber database's OID, so the routine registry
+  resolves trigger functions. Its `GetSetting` reports `session_replication_role = replica`, which
+  `triggerModeFires` reads.
+- INSERT: BEFORE ROW triggers may replace the row or skip it \(RETURN NULL\). AFTER ROW triggers fire after the heap
+  write.
+- UPDATE: the located old row is OLD and fills NEW's unchanged\-TOAST and subscriber\-only cells. The updated\-column
+  set is every column the remote tuple carries \(`remoteUpdatedColumns`, apply\_handle\_update's `updatedCols`\), so
+  an `UPDATE OF bid` trigger fires for an UPDATE that only changed `id`, as 003 checks.
+- DELETE: BEFORE ROW triggers see the located row and may skip the delete; AFTER ROW triggers follow it.
+- AFTER ROW triggers fire immediately: the worker opens no after\-trigger query level. PG queues them and fires them
+  at the end of each applied change \(AfterTriggerEndQuery in apply\_handle\_\*\); for a single row the order is the
+  same.
+
+## Remaining
 - M0149\-0040b: the logical walsender numbers its frames with synthetic byte\-counted LSNs and never registers in the
   walsender registry, so a goopg publisher has no `pg_stat_replication` row to wait on.
