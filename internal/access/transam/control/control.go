@@ -336,6 +336,12 @@ type Listener struct {
 	// a subsequent reset/start does not trip the lock-file guard. nil
 	// falls back to the graceful OnStop path. (M0110-0004 / RW-002 b.)
 	OnStopImmediate func() error
+	// PMStatus reports the postmaster.pid status line PostgreSQL keeps
+	// (LOCK_FILE_LINE_PM_STATUS): "starting", "ready" (accepting
+	// connections, including a consistent hot standby) or "standby" (in
+	// recovery with hot_standby = off). PMSTATUS returns it; nil means
+	// "ready". pg_ctl start -w waits for ready or standby.
+	PMStatus func() string
 	// OnReload is invoked when a client sends RELOAD. Should be
 	// fast; v0's only consumer is a no-op.
 	OnReload func() error
@@ -435,6 +441,12 @@ func (l *Listener) handleConn(conn net.Conn) {
 	switch cmd {
 	case "PING":
 		_, _ = conn.Write([]byte("OK\n"))
+	case "PMSTATUS":
+		status := "ready"
+		if l.PMStatus != nil {
+			status = l.PMStatus()
+		}
+		_, _ = conn.Write([]byte(status + "\n"))
 	case "STOP":
 		_, _ = conn.Write([]byte("OK\n"))
 		if l.OnStop != nil {

@@ -384,3 +384,26 @@ func TestUpdateControlFileNextOidRoundTrip(t *testing.T) {
 		t.Errorf("nextOid after no-op update: got %d want 20000 (encode must preserve nextOid)", nx)
 	}
 }
+
+// TestListenerPMStatus pins PMSTATUS: the postmaster.pid status line's
+// value as the server reports it — "starting" while a hot standby has not
+// reached consistency, then "ready". M0149-0021a.
+func TestListenerPMStatus(t *testing.T) {
+	path := filepath.Join(t.TempDir(), SocketName)
+	ln, err := NewListener(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var status atomic.Value
+	status.Store("starting")
+	ln.PMStatus = func() string { return status.Load().(string) }
+	go func() { _ = ln.Serve() }()
+	if reply, err := Send(path, "PMSTATUS", time.Second); err != nil || reply != "starting" {
+		t.Fatalf("PMSTATUS = %q, %v; want starting", reply, err)
+	}
+	status.Store("ready")
+	if reply, err := Send(path, "PMSTATUS", time.Second); err != nil || reply != "ready" {
+		t.Fatalf("PMSTATUS = %q, %v; want ready", reply, err)
+	}
+}

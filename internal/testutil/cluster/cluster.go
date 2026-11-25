@@ -19,6 +19,7 @@ import (
 
 	_ "github.com/lib/pq"
 
+	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/testutil/util"
 )
 
@@ -286,7 +287,7 @@ func (c *Cluster) Start() error {
 	deadline := time.Now().Add(c.startupWait)
 	for time.Now().Before(deadline) {
 		status, _, err := c.Status()
-		if err == nil && status == 0 {
+		if err == nil && status == 0 && c.pmStatus() != "starting" {
 			return nil
 		}
 		select {
@@ -541,6 +542,22 @@ func (c *Cluster) Kill() error {
 	}
 	c.cmd = nil
 	return nil
+}
+
+// pmStatus is pg_ctl start -w's view of postmaster.pid's status line: the
+// server's PMSTATUS reply ("starting" while a hot standby has not reached
+// consistency). Anything unreadable counts as "ready", so a server without
+// the command behaves as before.
+func (c *Cluster) pmStatus() string {
+	pf, err := control.ParsePIDFile(c.dataDir)
+	if err != nil {
+		return "ready"
+	}
+	reply, err := control.Send(pf.SocketPath, "PMSTATUS", 2*time.Second)
+	if err != nil || strings.HasPrefix(reply, "ERR") {
+		return "ready"
+	}
+	return reply
 }
 
 // WaitExit waits up to timeout for the last started server process to exit

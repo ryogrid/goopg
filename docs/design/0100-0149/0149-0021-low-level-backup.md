@@ -1,12 +1,10 @@
 # 0149-0021 — Port recovery/t/042\_low\_level\_backup.pl
 
-Status: reopened \(2026\-11\-25\). The port first restored replica\_success with recovery.signal, but Cluster.pm
-init\_from\_backup's has\_restoring defaults to `standby => 1`. With the faithful standby only the goopg\-primary
-pairing passes; a goopg standby restored from backup\_label never accepts connections \(M0149\-0021a\). The test is
-gated by `GOOPG_TAP_042` again. Everything below landed and stays: it is PG behaviour archive recovery and PG
-restore nodes use. `TestPort_Recovery042LowLevelBackupFull`
-\(`internal/testport/recovery_042_low_level_backup_test.go`\) has three pairings: all\-goopg, a PG 18.3 primary with
-goopg recovery nodes, and a goopg primary with PG 18.3 recovery nodes.
+Status: done \(2026\-11\-25\). `TestPort_Recovery042LowLevelBackupFull`
+\(`internal/testport/recovery_042_low_level_backup_test.go`\) passes on all three pairings, ungated: all\-goopg, a PG
+18.3 primary with goopg recovery nodes, and a goopg primary with PG 18.3 recovery nodes. As in Cluster.pm, the
+node restored with backup\_label is a standby \(init\_from\_backup has\_restoring defaults to `standby => 1`\). An
+earlier version of the port used recovery.signal and was reopened; see "Standby from backup\_label" below.
 
 042 takes a backup with pg\_backup\_start, a file copy and pg\_backup\_stop. It copies pg\_control last, after a
 checkpoint that follows the creation of a `canary` table. Without backup\_label the copy recovers from pg\_control's
@@ -36,10 +34,24 @@ there. The gaps:
 - **Catalog**: relations created after the backup started exist only in the replayed catalog heaps. Archive recovery
   now refreshes every database's catalog after replay \(`RefreshAllCatalogsAfterReplay`\).
 
+## Standby from backup\_label \(M0149\-0021a\)
+
+- **Start position**: at standby start, `startStandbyFromBackupLabel` \(cmd/goopg/standby.go\) reads backup\_label and
+  logs "starting backup recovery with redo LSN …". With an empty pg\_wal it moves the WAL writer to the label's redo
+  segment \(`Writer.StartAt`; pg\_control's checkpoint redo without a label\). The archive feeder and the continuous
+  replayer both start from the writer's position, and they started at 0. The label is then renamed to
+  backup\_label.old.
+- **Readiness**: PG's postmaster writes "ready" into postmaster.pid's status line only when hot standby begins, at
+  consistency \("database system is ready to accept read\-only connections"\). pg\_ctl start \-w waits for it. goopg
+  counted as ready once it listened, so a test's first query could race replay and get "the database system is not
+  yet accepting connections". The control socket now answers `PMSTATUS`: "starting" until a hot standby is
+  consistent, "standby" with hot\_standby = off, else "ready". The test cluster's Start waits past "starting".
+
 Not done:
 
-- M0149\-0021a: backup\_label on the standby path \(startStandby, the archive feeder and stream replayer\), so a
-  standby restored from a low\-level backup with an empty pg\_wal replays from the label and becomes consistent;
+- the standby's consistency point is still pg\_control's checkpoint redo, not the backup end \(XLOG\_BACKUP\_END /
+  backupEndRequired\), so a low\-level backup's standby becomes consistent later than PG's would; goopg's own
+  postmaster.pid has no status line \(PMSTATUS is answered over the control socket\);
 - backup\_label in crash recovery \(no recovery.signal\) and on a standby \(standby.signal\): only archive recovery
   reads it;
 - PG renames backup\_label as recovery starts and copies the label's checkpoint into pg\_control; goopg renames

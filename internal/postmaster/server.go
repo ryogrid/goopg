@@ -825,6 +825,21 @@ func (s *Server) startControlPlane(runCtx context.Context, runCancel context.Can
 		s.StopImmediate("control: immediate stop requested")
 		return nil
 	}
+	// The postmaster's PM status as canAcceptConnections sees it: a
+	// standby is "starting" until hot standby begins (PM_RECOVERY →
+	// PM_HOT_STANDBY at consistency, "database system is ready to accept
+	// read-only connections"), "standby" with hot_standby = off. M0149-0021a.
+	cl.PMStatus = func() string {
+		if s.cfg.IsStandby != nil && s.cfg.IsStandby() {
+			if s.cfg.HotStandbyDisabled {
+				return "standby"
+			}
+			if s.cfg.HotStandbyConsistent != nil && !s.cfg.HotStandbyConsistent() {
+				return "starting"
+			}
+		}
+		return "ready"
+	}
 	cl.OnReload = func() error {
 		s.cfg.Logger.Info("control: reload requested")
 		s.reloadConfig()

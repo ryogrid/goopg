@@ -18,17 +18,10 @@ import (
 // the archive). It runs in three pairings: all-goopg, a PG 18.3 primary with
 // goopg recovery nodes, and a goopg primary with PG 18.3 recovery nodes.
 // As in Cluster.pm, init_from_backup's has_restoring makes the second node a
-// standby (standby => 1 by default).
-//
-// Gated by GOOPG_TAP_042=1 until it passes (M0149-0021a: a goopg standby
-// restored from a backup_label with an empty pg_wal never accepts
-// connections).
+// standby (standby => 1 by default) (M0149-0021, -0021a).
 func TestPort_Recovery042LowLevelBackupFull(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping recovery TAP port in short mode")
-	}
-	if os.Getenv("GOOPG_TAP_042") == "" {
-		t.Skip("042 re-port is not passing yet (M0149-0021a); set GOOPG_TAP_042=1 to run")
 	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)

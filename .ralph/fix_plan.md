@@ -16484,18 +16484,19 @@ verify each at HEAD when the task starts.
   Upstream: `postgres/src/test/recovery/t/024_archive_recovery.pl` — archive recovery refusing WAL generated with `wal_level=minimal`.
   Likely prerequisites \(verify at start\): `XLOG_PARAMETER_CHANGE` record + PG FATAL text, restart with changed `wal_level`.
   - 2026\-11\-25 \(done\): TestPort\_Recovery024ArchiveRecoveryFull passes on all three pairings \(3 of 3 runs\), ungated; inventory row 024 → port. XLogReportParameters at startup, the wal\_level=minimal FATAL, archive recovery replays from the pg\_control redo. Design: docs/design/0100\-0149/0149\-0020\-archive\-recovery\-wal\-level.md.
-- [ ] **M0149-0021 — port recovery/t/042_low_level_backup.pl**
+- [x] **M0149-0021 — port recovery/t/042_low_level_backup.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/042_low_level_backup.pl` — `pg_backup_start`/`pg_backup_stop` backups restored with/without `backup_label`.
   Likely prerequisites \(verify at start\): non-exclusive low-level backup returning PG-exact `backup_label`/`tablespace_map` text, recovery from caller-written `backup_label`, the "missing backup\_label" behaviour.
   - 2026\-11\-25 \(done\): TestPort\_Recovery042LowLevelBackupFull passes on all three pairings \(3 of 3 runs\), ungated; inventory row 042 → port. pg\_backup\_stop\(\) in FROM, XLOG\_BACKUP\_END \+ history file \+ archive wait, archive recovery from backup\_label, replayed commit status and catalog refresh. Design: docs/design/0100\-0149/0149\-0021\-low\-level\-backup.md.
   - 2026\-11\-25 \(REOPENED\): the 042 port closed in d45d3a8b0 used recovery.signal for replica\_success, but Cluster.pm init\_from\_backup has\_restoring defaults to standby => 1. With the faithful standby, goopg\-primary\-pg18\-recovery passes and both goopg\-recovery pairings fail: "the database system is not yet accepting connections". The test is gated again \(GOOPG\_TAP\_042\) and the inventory row is back to failed. The archive\-recovery pieces of d45d3a8b0 \(pg\_backup\_stop in FROM, XLOG\_BACKUP\_END, history file, archive wait, backup\_label in archive recovery, commit stamping and catalog refresh\) stay: they are PG behaviour 042's PG\-restore pairing needs and archive recovery uses.
-- [ ] **M0149-0021a — a goopg standby restored from backup\_label \(empty pg\_wal\) reaches consistency and serves reads**
+- [x] **M0149-0021a — a goopg standby restored from backup\_label \(empty pg\_wal\) reaches consistency and serves reads**
   Kind: impl
   Parent: M0149-0021
   - Path\-to\-TAP: 042 \(goopg recovery pairings\) ← a goopg standby \(standby.signal \+ restore\_command\) starting from backup\_label replays from the label's redo, reaches consistency and accepts read\-only connections ← M0149\-0021.
   - Start: the standby path \(startStandby, runArchiveFeeder, StreamReplayer in cmd/goopg\) ignores backup\_label; the feeder starts at the writer's position \(0 for an empty pg\_wal\); the consistency point comes from pg\_control \(recoveryConsistencyPoint\), whose checkpoint is later than the WAL the label needs.
+  - 2026\-11\-25 \(done\): startStandbyFromBackupLabel reads backup\_label at standby start, logs "starting backup recovery with redo LSN …", moves an empty WAL writer to the redo segment \(Writer.StartAt\) so the archive feeder and the replayer start there, and renames the label to backup\_label.old. Second link: a goopg standby reported itself ready as soon as it listened, so the test's first query raced replay \("not yet accepting connections"\). The control socket now answers PMSTATUS with PG's postmaster.pid status line \("starting" until hot standby begins at consistency, "standby" with hot\_standby = off, else "ready"\), and the test cluster's Start waits past "starting" as pg\_ctl start \-w does. 042 passes on all three pairings 3 of 3, ungated, inventory row 042 → port; recovery TAPs 001–045 and 21 standby E2Es PASS.
 - [x] **M0149-0022 — port recovery/t/045_archive_restartpoint.pl**
   Kind: impl
   Parent: none

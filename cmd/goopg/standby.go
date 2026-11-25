@@ -182,6 +182,12 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 	rplDone := make(chan struct{})
 	sigDone := make(chan struct{})
 
+	// read_backup_label (InitWalRecovery) for a standby: recovery starts at
+	// the label's redo, not pg_control's checkpoint, which a low-level
+	// backup copies last. With an empty pg_wal the writer — and with it the
+	// archive feeder and the replayer — would start at 0 (M0149-0021a).
+	startStandbyFromBackupLabel(rt, logger)
+
 	// M0149-0012: hot-standby snapshots see a primary transaction only once
 	// its replayed commit has stamped the commit log.
 	if rt.TxnMgr != nil {
@@ -1401,4 +1407,40 @@ func startWalReceiverForStandby(rcvCtx context.Context, rcvDone chan struct{}, r
 func removeRecoveryFiles(walDir string) {
 	_ = os.Remove(filepath.Join(walDir, xlog.RecoveryXLogName))
 	_ = os.Remove(filepath.Join(walDir, xlog.RecoveryHistoryName))
+}
+
+// startStandbyFromBackupLabel applies backup_label to a standby's start: it
+// logs "starting backup recovery with redo LSN …", moves an empty WAL writer
+// to the label's redo segment (else pg_control's checkpoint redo segment) so
+// the archive feeder fetches and the replayer reads from there, and renames
+// the label to backup_label.old as StartupXLOG does once recovery has
+// started from it.
+func startStandbyFromBackupLabel(rt *initdb.Runtime, logger *slog.Logger) {
+	if rt == nil || rt.WAL == nil || rt.DataDir == "" {
+		return
+	}
+	label, haveLabel, err := xlog.ReadBackupLabel(rt.DataDir)
+	if err != nil {
+		logger.Warn(err.Error())
+		haveLabel = false
+	}
+	var redo uint64
+	if haveLabel {
+		redo = label.StartLSN
+		logger.Info(label.StartingBackupRecoveryMessage())
+	} else if cd, cerr := control.ReadControlFile(rt.DataDir); cerr == nil && cd != nil {
+		redo = cd.CheckPointCopyRedo
+	}
+	segSize := uint64(rt.WAL.SegmentSize())
+	if rt.WAL.WrittenLSN() == 0 && redo >= segSize {
+		if err := rt.WAL.StartAt(redo / segSize * segSize); err != nil {
+			logger.Warn("standby mode: could not position the WAL writer at the redo segment", "err", err)
+		}
+	}
+	if haveLabel {
+		from, to := filepath.Join(rt.DataDir, xlog.BackupLabelFile), filepath.Join(rt.DataDir, xlog.BackupLabelOld)
+		if err := os.Rename(from, to); err != nil {
+			logger.Warn(fmt.Sprintf("could not rename file \"%s\" to \"%s\": %v", xlog.BackupLabelFile, xlog.BackupLabelOld, err))
+		}
+	}
 }
