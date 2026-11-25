@@ -16644,11 +16644,37 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/recovery/t/031_recovery_conflict.pl` — hot-standby query cancellation on recovery conflicts.
   Likely prerequisites \(verify at start\): buffer-pin/lock/snapshot/tablespace/startup-deadlock/database conflicts with `max_standby_streaming_delay`, PG cancel texts + SQLSTATEs, `pg_stat_database_conflicts`.
+  - 2026\-11\-25 \(skipped as detour, no port written\): Path\-to\-TAP has six independent links — one per conflict type — and none exist in goopg. No PG cancel/log text for buffer pin, snapshot, lock, tablespace, startup deadlock or database conflicts; max\_standby\_streaming\_delay has a single reference; pg\_stat\_database\_conflicts confl\_\* columns exist but nothing counts. The lock conflict needs replayed AccessExclusive locks \(XLOG\_STANDBY\_LOCK\) to conflict with a standby session's ACCESS SHARE lock held across statements, and goopg's lock manager is statement\-scoped \(possible owner\-architecture item\). Filed M0149\-0031a.
+- [ ] **M0149-0031a — hot\-standby recovery conflict resolution \(standby.c ResolveRecoveryConflictWith\*\)**
+  Kind: impl
+  Parent: M0149-0031
+  - One slice per conflict, each with PG's FATAL/ERROR text, SQLSTATE 40001/57P04 and the pg\_stat\_database\_conflicts / pg\_stat\_database.conflicts counters:
+    - buffer pin \(LockBufferForCleanup during replay vs a cursor's pin; "User was holding shared buffer pin for too long."\);
+    - snapshot \(XLOG\_HEAP2\_PRUNE snapshotConflictHorizon vs standby snapshots; "User query might have needed to see row versions that must be removed."\);
+    - lock \(replayed AccessExclusiveLock vs a session lock; "User was holding a relation lock for too long."\);
+    - tablespace \(DROP TABLESPACE replay vs temp files; "User was or might have been using tablespace that must be dropped."\);
+    - startup deadlock \(buffer pin \+ lock wait; "User transaction caused buffer deadlock with recovery."\);
+    - database \(DROP DATABASE replay; "User was connected to a database that must be dropped."\).
+  - Driven by max\_standby\_streaming\_delay / max\_standby\_archive\_delay, deadlock\_timeout and log\_recovery\_conflict\_waits.
 - [ ] **M0149-0032 — port recovery/t/030_stats_cleanup_replica.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/030_stats_cleanup_replica.pl` — standbys drop object stats on replayed drops and keep them across restart.
   Likely prerequisites \(verify at start\): stats-drop items in xact commit/abort records and their replay \(`pgstat_execute_transactional_drops`\), stats on standby.
+  - Path\-to\-TAP: 030 ← \(1\) M0149\-0032a a standby sees functions the primary creates ← \(2\) M0149\-0032b goopg commit records carry the stats\-drop items ← \(3\) M0149\-0032c a goopg standby executes replayed stats drops. 3 links: in scope, work them in order.
+  - 2026\-11\-25 \(progress\): TestPort\_Recovery030StatsCleanupReplica written, gated GOOPG\_TAP\_030. First run: both goopg\-standby pairings stop at `'public.drop_func_test1()'::regprocedure` with "function … does not exist" \(link 1\). With a goopg primary, the PG 18.3 standby keeps the relation, function and database stats after every replayed drop \(link 2\). The initial standby stats creation and the restart checks are not reached yet on the goopg\-standby pairings.
+- [ ] **M0149-0032a — a goopg standby's catalog refresh registers routines created on the primary**
+  Kind: impl
+  Parent: M0149-0032
+  - initdb RefreshCatalogAfterReplay reloads tables, event triggers and sequences, not pg\_proc. Add the routines reload in the committed\-only, only\-new mode \(as reloadSequencesFromHeapMode\). reloadUserRoutinesFromHeapForDB decodes only goopg rows \(Routine JSON in proargdefaults\); a PG 18.3 primary's pg\_proc row needs a decoder from the real columns \(proname, pronamespace, prolang, prorettype, proargtypes, provolatile, prosrc\). A replayed DROP FUNCTION should also unregister the routine.
+- [ ] **M0149-0032b — goopg commit/abort records carry xl\_xact\_stats\_items for dropped objects**
+  Kind: impl
+  Parent: M0149-0032
+  - PG: AtEOXact\_PgStat / pgstat\_get\_transactional\_drops put XACT\_XINFO\_HAS\_DROPPED\_STATS items \(kind, dboid, objoid\) into the commit record for DROP TABLE / FUNCTION / SCHEMA CASCADE / DATABASE; a PG 18.3 standby of a goopg primary keeps the stats today.
+- [ ] **M0149-0032c — a goopg standby drops stats named by replayed commit records**
+  Kind: impl
+  Parent: M0149-0032
+  - pgstat\_execute\_transactional\_drops in xact\_redo\_commit/abort; plus stats kept across a clean standby restart and discarded after an immediate one \(pgstat\_restore\_stats / pgstat\_discard\_stats on crash recovery\).
 - [ ] **M0149-0033 — port recovery/t/048_vacuum_horizon_floor.pl**
   Kind: impl
   Parent: none
