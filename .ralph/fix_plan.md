@@ -16570,11 +16570,12 @@ verify each at HEAD when the task starts.
   Upstream: `postgres/src/test/recovery/t/004_timeline_switch.pl` — cascading standby follows a newly promoted standby.
   Likely prerequisites \(verify at start\): streaming end-of-timeline exchange + `TIMELINE_HISTORY` \(design 0102-0002 — verify vs PG\), `recovery_target_timeline=latest`, `primary_conninfo` reload without restart.
   - 2026\-11\-25 \(done\): ported as TestPort\_Recovery004TimelineSwitchFull; it passed on all three pairings on the first run and 3 of 3 runs with no product change — the cascading\-standby timeline follow, the walreceiver PID staying the same across the jump, and a standby following a primary that was restarted as a standby and promoted with archiving on were already in place \(M0149 timeline work\). Inventory row 004 → port. Observation only: the goopg\-standby pairings take ~38 s against ~11 s with PG 18.3 standbys \(the same assertions pass\).
-- [ ] **M0149-0026 — port recovery/t/025_stuck_on_old_timeline.pl**
+- [x] **M0149-0026 — port recovery/t/025_stuck_on_old_timeline.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/025_stuck_on_old_timeline.pl` — cascading standby without WAL fetches the history file from the archive.
   Likely prerequisites \(verify at start\): archiving of `.history` before segments, `restore_command` history fetch, cascaded walsender on a promoted node.
+  - 2026\-11\-25 \(done\): ported as TestPort\_Recovery025StuckOnOldTimelineFull \(upstream's cp\_history\_files archive\_command, the standby's -Xnone backup via tapnode Backup\(name, options...\)\); it passed on all three pairings 3 of 3 with no product change — the promoted standby's cascade follows it onto TLI 2 with only history files in the primary's archive. Inventory row 025 → port.
 - [ ] **M0149-0027 — port recovery/t/028_pitr_timelines.pl**
   Kind: impl
   Parent: none

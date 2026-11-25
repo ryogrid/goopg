@@ -408,7 +408,7 @@ R-021,recovery-tap,tap,postgres/src/test/recovery/t/021_row_visibility.pl,port,y
 ,recovery-tap,tap,postgres/src/test/recovery/t/022_crash_temp_files.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/023_pitr_prepared_xact.pl,port,yes,-,Ported as TestPort_Recovery023PitrPreparedXactFull in internal/testport/recovery_023_pitr_prepared_xact_test.go (all three pairings: all-goopg; PG 18.3 primary with a goopg PITR node; goopg primary with a PG 18.3 PITR node — M0149-0024),,
 ,recovery-tap,tap,postgres/src/test/recovery/t/024_archive_recovery.pl,port,yes,-,Ported as TestPort_Recovery024ArchiveRecoveryFull in internal/testport/recovery_024_archive_recovery_test.go (all three pairings: all-goopg; PG 18.3 origin with goopg recovery nodes; goopg origin with PG 18.3 recovery nodes — M0149-0020),,
-,recovery-tap,tap,postgres/src/test/recovery/t/025_stuck_on_old_timeline.pl,not-tried,no,-,,,
+,recovery-tap,tap,postgres/src/test/recovery/t/025_stuck_on_old_timeline.pl,port,yes,-,Ported as TestPort_Recovery025StuckOnOldTimelineFull in internal/testport/recovery_025_stuck_on_old_timeline_test.go (all three pairings: all-goopg; PG 18.3 primary with goopg standbys; goopg primary with PG 18.3 standbys — M0149-0026),,
 R-026,recovery-tap,tap,postgres/src/test/recovery/t/026_overwrite_contrecord.pl,port,yes,-,Ported as TestPort_Recovery026OverwriteContrecord in internal/testport/recovery_026_overwrite_contrecord_test.go (M0149-0017): all-goopg and with PG 18.3 as primary or standby,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/027_stream_regress.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/028_pitr_timelines.pl,not-tried,no,-,,,

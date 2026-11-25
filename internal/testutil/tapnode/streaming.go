@@ -16,12 +16,16 @@ import (
 // Backup is Cluster.pm's backup(name): pg_basebackup --no-sync
 // --checkpoint=fast of the running node into a fresh directory, whose path
 // it returns (Cluster.pm keeps it under the node's backup_dir). M0149-0010.
-func (n *Node) Backup(name string) string {
+//
+// backupOptions are extra pg_basebackup arguments (Cluster.pm's
+// backup_options, e.g. -Xnone).
+func (n *Node) Backup(name string, backupOptions ...string) string {
 	n.t.Helper()
 	host, port, user := n.connParams()
 	dst := filepath.Join(n.t.TempDir(), "backup-"+name)
-	cmd := exec.Command(filepath.Join(n.binDir, "pg_basebackup"), "--no-sync",
-		"--pgdata", dst, "--host", host, "--port", port, "--username", user, "--checkpoint", "fast")
+	args := append([]string{"--no-sync",
+		"--pgdata", dst, "--host", host, "--port", port, "--username", user, "--checkpoint", "fast"}, backupOptions...)
+	cmd := exec.Command(filepath.Join(n.binDir, "pg_basebackup"), args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		n.t.Fatalf("tapnode %s: pg_basebackup %s: %v\n%s", n.name, name, err, out)
 	}
