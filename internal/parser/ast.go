@@ -3103,6 +3103,18 @@ type AlterPublicationOwnerStmt struct {
 func (s *AlterPublicationOwnerStmt) Pos() int  { return s.pos }
 func (s *AlterPublicationOwnerStmt) stmtNode() {}
 
+// AlterPublicationRenameStmt — `ALTER PUBLICATION name RENAME TO newname`
+// (RenameStmt with OBJECT_PUBLICATION). Before M0149-0043b it fell through
+// to the compatibility no-op and left the publication's name unchanged.
+type AlterPublicationRenameStmt struct {
+	pos     int
+	Name    string
+	NewName string
+}
+
+func (s *AlterPublicationRenameStmt) Pos() int  { return s.pos }
+func (s *AlterPublicationRenameStmt) stmtNode() {}
+
 // AlterSubscriptionOwnerStmt — `ALTER SUBSCRIPTION name OWNER TO { new_owner |
 // CURRENT_ROLE | CURRENT_USER | SESSION_USER }`. The only ALTER SUBSCRIPTION
 // form goopg models (RENAME TO / SET / SKIP fall through to the generic

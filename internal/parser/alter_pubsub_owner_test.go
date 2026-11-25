@@ -64,7 +64,8 @@ func TestParseAlterSubscriptionOwner(t *testing.T) {
 // rather than erroring or being misrouted into the OWNER TO path.
 func TestParseAlterPublicationOtherFormsStillNoop(t *testing.T) {
 	cases := []string{
-		"ALTER PUBLICATION mypub RENAME TO otherpub",
+		// RENAME TO left this list when it was modelled (M0149-0043b,
+		// TestParseAlterPublicationRename).
 		"ALTER PUBLICATION mypub ADD TABLES IN SCHEMA s",
 		"ALTER SUBSCRIPTION mysub RENAME TO othersub",
 		// SET PUBLICATION p2 left this list when the publication-list
@@ -334,5 +335,20 @@ func TestParseAlterSubscriptionPublications(t *testing.T) {
 	// A missing name_list is a parse error (gram.y name_list is non-empty).
 	if _, err := Parse("ALTER SUBSCRIPTION mysub SET PUBLICATION"); err == nil {
 		t.Error("SET PUBLICATION with no list: parse succeeded, want error")
+	}
+}
+
+// TestParseAlterPublicationRename: ALTER PUBLICATION name RENAME TO newname
+// parses into AlterPublicationRenameStmt (gram.y RenameStmt, OBJECT_PUBLICATION)
+// instead of the compatibility no-op that left the name unchanged
+// (M0149-0043b).
+func TestParseAlterPublicationRename(t *testing.T) {
+	stmts, err := Parse("ALTER PUBLICATION mypub RENAME TO otherpub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, ok := stmts[0].(*AlterPublicationRenameStmt)
+	if !ok || r.Name != "mypub" || r.NewName != "otherpub" {
+		t.Fatalf("stmt = %#v, want AlterPublicationRenameStmt mypub -> otherpub", stmts[0])
 	}
 }

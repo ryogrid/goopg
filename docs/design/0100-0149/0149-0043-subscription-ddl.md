@@ -1,7 +1,6 @@
 # M0149\-0043 — Port subscription/t/007\_ddl.pl
 
-Status: in progress. TestPort\_Subscription007DDL is written with the three\-pairing `tapnode` harness and gated
-\(`GOOPG_TAP_007`\). The PG 18.3 publisher → goopg subscriber pairing passes.
+Status: done. TestPort\_Subscription007DDL is ungated and passes 3 of 3 runs in all three pairings \(M0149\-0043a–b\).
 
 ## Landed — M0149\-0043a, missing\-publication warnings
 
@@ -15,9 +14,17 @@ It runs from CREATE SUBSCRIPTION with connect = true, before the slot is created
 / ADD PUBLICATION with refresh. goopg reported these at NOTICE level from ALTER only. `ddlOp.warnMissingPublications`
 now raises the WARNING, and CREATE SUBSCRIPTION calls `CheckPublicationsOnPublisher` first.
 
-## Remaining — M0149\-0043b
+## Landed — M0149\-0043b, publication renames
 
-A goopg walsender resolves its `publication_names` once, at START\_REPLICATION \(`buildPublicationFilter`\). After the
-test renames `pub_for_tab` away and renames the empty publication to `pub_for_tab`, the stream still carries test1.
-PG's pgoutput reloads its publications by name on every publication invalidation \(publication\_invalidation\_cb →
-LoadPublications\), using the catalog as of the decoded change.
+Two gaps on a goopg publisher:
+
+- **The rename itself.** ALTER PUBLICATION … RENAME TO was a silent no\-op: the legacy DDL parser consumed every
+  unmodelled ALTER PUBLICATION form as a compatibility no\-op. `AlterPublicationRenameStmt` now reaches
+  `PubSub.RenamePublication` \(AlterObjectRename\_internal\). The publication keeps its OID under the new name; a
+  missing publication is 42704, a taken name 42710. The `pg_publication` row is rewritten under the same OID.
+- **The walsender's filter.** A goopg walsender resolved its `publication_names` once, at START\_REPLICATION. PG's
+  pgoutput reloads them by name whenever a publication changes \(publication\_invalidation\_cb → LoadPublications\).
+  `PubSub.PublicationGeneration` now counts every publication change, and `livePublicationFilter` rebuilds the
+  name → tables filter when the counter moves.
+
+The filter is rebuilt against the current registry, not the catalog as of the decoded change \(deferral ledger\).

@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Publication is one CREATE PUBLICATION's catalog row. Mirrors
@@ -137,6 +138,13 @@ type PubSub struct {
 	mu            sync.RWMutex
 	publications  map[string]*Publication
 	subscriptions map[string]*Subscription
+
+	// pubGen counts publication changes (create, drop, rename, table list,
+	// options, owner). A logical walsender re-resolves its
+	// publication_names when it moves, as pgoutput's
+	// publication_invalidation_cb does. M0149-0043b.
+	pubGen atomic.Uint64
+
 	// subRels is the tablesync state-machine store. Keyed by
 	// subscription name → RelOID → SubscriptionRel. The
 	// per-subscription map keeps lookups + iteration cheap and
@@ -223,6 +231,7 @@ func (p *PubSub) CreatePublication(name string, tables []string, opts Publicatio
 // matching pre-DU-002 single-DB behavior. M0119-0004 (DU-002 per-DB
 // publication scoping).
 func (p *PubSub) CreatePublicationAsOwner(name string, tables []string, opts PublicationOptions, owner uint32, dbOid ...uint32) (*Publication, error) {
+	defer p.pubGen.Add(1)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	oid := resolveDBOid(dbOid)
@@ -257,6 +266,7 @@ func (p *PubSub) CreatePublicationAsOwner(name string, tables []string, opts Pub
 // dbOid is variadic (mirrors LookupPublication); omitted defaults to
 // DefaultDBOid. M0119-0004.
 func (p *PubSub) SetPublicationOwner(name string, owner uint32, dbOid ...uint32) error {
+	defer p.pubGen.Add(1)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	oid := resolveDBOid(dbOid)
@@ -273,6 +283,7 @@ func (p *PubSub) SetPublicationOwner(name string, owner uint32, dbOid ...uint32)
 // dbOid is variadic (mirrors LookupPublication); omitted defaults to
 // DefaultDBOid. M0119-0004 (DU-002 per-DB publication scoping).
 func (p *PubSub) DropPublication(name string, dbOid ...uint32) error {
+	defer p.pubGen.Add(1)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	oid := resolveDBOid(dbOid)
@@ -282,6 +293,36 @@ func (p *PubSub) DropPublication(name string, dbOid ...uint32) error {
 	}
 	delete(p.publications, key)
 	return nil
+}
+
+// PublicationGeneration reports the publication change counter.
+func (p *PubSub) PublicationGeneration() uint64 { return p.pubGen.Load() }
+
+// RenamePublication is ALTER PUBLICATION name RENAME TO newname
+// (RenamePublication via AlterObjectRename_internal): the publication keeps
+// its OID, tables and options under the new name. ErrPublicationNotFound
+// when name is missing, ErrPublicationExists when newname is taken in the
+// same database. M0149-0043b.
+func (p *PubSub) RenamePublication(name, newName string, dbOid ...uint32) (*Publication, error) {
+	defer p.pubGen.Add(1)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	oid := resolveDBOid(dbOid)
+	key := pubMapKey(oid, name)
+	pub, ok := p.publications[key]
+	if !ok {
+		return nil, ErrPublicationNotFound
+	}
+	newKey := pubMapKey(oid, newName)
+	if _, taken := p.publications[newKey]; taken && newKey != key {
+		return nil, ErrPublicationExists
+	}
+	delete(p.publications, key)
+	pub.Name = newName
+	p.publications[newKey] = pub
+	cp := *pub
+	cp.Tables = append([]string(nil), pub.Tables...)
+	return &cp, nil
 }
 
 // LookupPublication returns a copy of the named publication, or
@@ -306,6 +347,7 @@ func (p *PubSub) LookupPublication(name string, dbOid ...uint32) (*Publication, 
 // (ALTER PUBLICATION ... ADD / SET / DROP TABLE; the caller computes the new
 // list). It returns the updated publication.
 func (p *PubSub) SetPublicationTables(name string, tables []string, dbOid ...uint32) (*Publication, error) {
+	defer p.pubGen.Add(1)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	pub, ok := p.publications[pubMapKey(resolveDBOid(dbOid), name)]
@@ -322,6 +364,7 @@ func (p *PubSub) SetPublicationTables(name string, tables []string, dbOid ...uin
 // PUBLICATION ... SET ( ... )). AllTables is not changed. It returns the
 // updated publication.
 func (p *PubSub) SetPublicationOptions(name string, opts PublicationOptions, dbOid ...uint32) (*Publication, error) {
+	defer p.pubGen.Add(1)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	pub, ok := p.publications[pubMapKey(resolveDBOid(dbOid), name)]
@@ -363,6 +406,7 @@ func (p *PubSub) PublicationsForDBOid(dbOid uint32) []*Publication {
 // Mirrors catalog.InMemory.CreateCollationDuringRecovery. DU-002
 // restart-persistence follow-up (M0119-0004, loop #67 ledger resume point).
 func (p *PubSub) CreatePublicationDuringRecovery(pub *Publication) {
+	defer p.pubGen.Add(1)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	out := *pub
@@ -379,6 +423,7 @@ func (p *PubSub) CreatePublicationDuringRecovery(pub *Publication) {
 // publication was still present. DU-002 restart-persistence follow-up
 // (M0119-0004, loop #67 ledger resume point).
 func (p *PubSub) DropPublicationDuringRecovery(name string, dbOid ...uint32) {
+	defer p.pubGen.Add(1)
 	_ = p.DropPublication(name, dbOid...)
 }
 
@@ -387,6 +432,7 @@ func (p *PubSub) DropPublicationDuringRecovery(name string, dbOid ...uint32) {
 // DropPublicationDuringRecovery. DU-002 restart-persistence follow-up
 // (M0119-0004, loop #67 ledger resume point).
 func (p *PubSub) SetPublicationOwnerDuringRecovery(name string, owner uint32, dbOid ...uint32) {
+	defer p.pubGen.Add(1)
 	_ = p.SetPublicationOwner(name, owner, dbOid...)
 }
 

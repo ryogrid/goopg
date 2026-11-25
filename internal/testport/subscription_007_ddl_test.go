@@ -1,7 +1,6 @@
 package testport
 
 import (
-	"os"
 	"strings"
 	"testing"
 
@@ -16,17 +15,9 @@ import (
 // subscription receives, for FOR TABLE and FOR ALL TABLES publications. It
 // runs in three pairings: all-goopg, a PG 18.3 publisher with a goopg
 // subscriber, and a goopg publisher with a PG 18.3 subscriber.
-//
-// Gated by GOOPG_TAP_007 until it passes (M0149-0043): the PG 18.3 publisher
-// with a goopg subscriber passes; with a goopg publisher, a running
-// walsender keeps streaming a table whose publication was renamed away
-// (M0149-0043b).
 func TestPort_Subscription007DDL(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")
-	}
-	if os.Getenv("GOOPG_TAP_007") == "" {
-		t.Skip("007 re-port is not passing yet (M0149-0043); set GOOPG_TAP_007=1 to run")
 	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)

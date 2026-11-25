@@ -8828,6 +8828,17 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		name := p.cur().Value
 		p.advance()
+		// ALTER PUBLICATION name RENAME TO newname. M0149-0043b.
+		if pubSubKind == KwPublication && p.acceptIdentKeyword("rename") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			tok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			return &AlterPublicationRenameStmt{pos: t.Pos, Name: name, NewName: identText(tok)}, nil
+		}
 		if p.acceptIdentKeyword("owner") {
 			if _, err := p.expectKeyword(KwTo); err != nil {
 				return nil, err

@@ -202,6 +202,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execDropSubscription(s)
 	case *parser.AlterPublicationOwnerStmt:
 		return nil, o.execAlterPublicationOwner(s)
+	case *parser.AlterPublicationRenameStmt:
+		return nil, o.execAlterPublicationRename(s)
 	case *parser.AlterPublicationTablesStmt:
 		return nil, o.execAlterPublicationTables(s)
 	case *parser.AlterPublicationOptionsStmt:
@@ -1661,6 +1663,30 @@ func (o *ddlOp) execAlterPublicationOwner(s *parser.AlterPublicationOwnerStmt) e
 		if uerr := upsertPublicationCatalogRow(o.ctx, pub); uerr != nil {
 			return fmt.Errorf("pg_publication journal: %w", uerr)
 		}
+	}
+	return nil
+}
+
+// execAlterPublicationRename handles ALTER PUBLICATION name RENAME TO
+// newname (AlterObjectRename_internal for OBJECT_PUBLICATION): 42704 for a
+// missing publication, 42710 when newname is taken, then the pg_publication
+// row is rewritten under the same OID. M0149-0043b.
+func (o *ddlOp) execAlterPublicationRename(s *parser.AlterPublicationRenameStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER PUBLICATION requires PubSub registry in Context"}
+	}
+	pubDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	pub, err := o.ctx.PubSub.RenamePublication(s.Name, s.NewName, pubDBOid)
+	switch {
+	case errors.Is(err, catalog.ErrPublicationNotFound):
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("publication \"%s\" does not exist", s.Name)}
+	case errors.Is(err, catalog.ErrPublicationExists):
+		return &ExecError{Code: "42710", Pos: s.Pos(), Message: fmt.Sprintf("publication \"%s\" already exists", s.NewName)}
+	case err != nil:
+		return err
+	}
+	if uerr := upsertPublicationCatalogRow(o.ctx, pub); uerr != nil {
+		return fmt.Errorf("pg_publication journal: %w", uerr)
 	}
 	return nil
 }

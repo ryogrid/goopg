@@ -924,3 +924,32 @@ func TestAlterSubscriptionPublications(t *testing.T) {
 		wantExecErr(t, runDDL(t, ctx, sql), "42704", `subscription "nosuch" does not exist`)
 	}
 }
+
+// TestAlterPublicationRename pins ALTER PUBLICATION … RENAME TO
+// (M0149-0043b): before it, the statement was a silent no-op. The
+// publication keeps its OID under the new name; a missing publication is
+// 42704 and a taken name 42710.
+func TestAlterPublicationRename(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+	if err := runDDL(t, ctx, "CREATE PUBLICATION pa"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "CREATE PUBLICATION pc"); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := ctx.PubSub.LookupPublication("pa", catalog.DefaultDBOid)
+	if err := runDDL(t, ctx, "ALTER PUBLICATION pa RENAME TO pb"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ctx.PubSub.LookupPublication("pa", catalog.DefaultDBOid); ok {
+		t.Fatal("old name still resolves after RENAME")
+	}
+	after, ok := ctx.PubSub.LookupPublication("pb", catalog.DefaultDBOid)
+	if !ok || after.OID != before.OID {
+		t.Fatalf("renamed publication = %+v, want OID %d under pb", after, before.OID)
+	}
+	wantExecErr(t, runDDL(t, ctx, "ALTER PUBLICATION nope RENAME TO x"), "42704", `publication "nope" does not exist`)
+	wantExecErr(t, runDDL(t, ctx, "ALTER PUBLICATION pb RENAME TO pc"), "42710", `publication "pc" already exists`)
+}

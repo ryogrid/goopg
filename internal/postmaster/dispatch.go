@@ -4231,7 +4231,7 @@ func stmtCommandTag(stmt parser.Stmt) (string, bool) {
 		return "REFRESH MATERIALIZED VIEW", true
 	case *parser.CreatePublicationStmt:
 		return "CREATE PUBLICATION", true
-	case *parser.AlterPublicationOwnerStmt, *parser.AlterPublicationTablesStmt, *parser.AlterPublicationOptionsStmt:
+	case *parser.AlterPublicationOwnerStmt, *parser.AlterPublicationRenameStmt, *parser.AlterPublicationTablesStmt, *parser.AlterPublicationOptionsStmt:
 		return "ALTER PUBLICATION", true
 	case *parser.DropPublicationStmt:
 		return "DROP PUBLICATION", true

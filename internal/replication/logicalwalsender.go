@@ -119,7 +119,7 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 	// snapshot, matching the v0 pre-filter behaviour. See
 	// docs/design/0008-0003-publication-subscription-ddl.md.
 	if pubNames := splitPublicationNames(args.Options["publication_names"]); len(pubNames) > 0 && s.cfg.PubSub != nil {
-		plugin.SetFilter(buildPublicationFilter(s.cfg.PubSub, pubNames, dbOidVar...))
+		plugin.SetFilter(newLivePublicationFilter(s.cfg.PubSub, pubNames, dbOidVar...))
 	}
 
 	// pgoutput's "messages" option (parse_output_parameters,
@@ -617,6 +617,40 @@ func buildPublicationFilter(ps *catalog.PubSub, names []string, dbOid ...uint32)
 		}
 	}
 	return out
+}
+
+// livePublicationFilter re-resolves the stream's publication_names whenever
+// the publication registry changes (create, drop, rename, ALTER PUBLICATION
+// … ADD/SET/DROP TABLE, options): pgoutput's publication_invalidation_cb
+// marks its publications invalid and get_rel_sync_entry reloads them BY
+// NAME, so a publication renamed away stops feeding the stream and one
+// renamed into a subscribed name starts. The filter is consulted from the
+// single decoder goroutine. M0149-0043b.
+type livePublicationFilter struct {
+	ps    *catalog.PubSub
+	names []string
+	dbOid []uint32
+	gen   uint64
+	cur   *publicationFilter
+}
+
+func newLivePublicationFilter(ps *catalog.PubSub, names []string, dbOid ...uint32) *livePublicationFilter {
+	f := &livePublicationFilter{ps: ps, names: names, dbOid: dbOid}
+	f.refresh()
+	return f
+}
+
+func (f *livePublicationFilter) refresh() {
+	f.gen = f.ps.PublicationGeneration()
+	f.cur = buildPublicationFilter(f.ps, f.names, f.dbOid...)
+}
+
+// Allows implements xlog.RelationFilter.
+func (f *livePublicationFilter) Allows(rel *xlog.RelationDef, kind xlog.ChangeKind) bool {
+	if g := f.ps.PublicationGeneration(); g != f.gen {
+		f.refresh()
+	}
+	return f.cur.Allows(rel, kind)
 }
 
 // unionFlags ORs the publish-flag bitsets — a relation gets the

@@ -16873,22 +16873,27 @@ verify each at HEAD when the task starts.
     - It now answers exactly that \(walsenderPgoutputAdapter.endStreaming\), once the decoder and keepalive goroutines have stopped.
     - After the subscriber's CopyDone it sends no further 'w' or 'k' frame \(stopSending, PG's streamingDoneSending\).
   - Results: with a goopg publisher the PG subscriber's table sync completes \(test1 reaches r\). Unit test TestWalsenderPgoutputAdapterEndStreaming; the interop, subscription and pubsubcluster tests pass.
-- [ ] **M0149-0043 — port subscription/t/007_ddl.pl**
+- [x] **M0149-0043 — port subscription/t/007_ddl.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/007_ddl.pl` — subscription DDL behaviour.
   Likely prerequisites \(verify at start\): `ALTER SUBSCRIPTION … SET/ADD PUBLICATION` with missing-publication WARNING texts, DROP SUBSCRIPTION transaction-block rules.
   - Path\-to\-TAP: 007 \(goopg\-subscriber pairings\) ← M0149\-0043a; 007 \(goopg\-publisher pairings\) ← M0149\-0043b. One link each.
   - 2026\-11\-26 \(progress\): TestPort\_Subscription007DDL written \(three pairings\), gated GOOPG\_TAP\_007. First run: both goopg\-subscriber pairings missed the three missing\-publication WARNINGs; both goopg\-publisher pairings replicate the row inserted after the publication rename swap. With 0043a the PG\-publisher pairing passes end to end.
+  - 2026\-11\-26 \(done, closed by M0149\-0043b\): 0043a and 0043b landed; TestPort\_Subscription007DDL is ungated and passes 3/3 in all three pairings; inventory row → port, pass\_required yes.
 - [x] **M0149-0043a — CREATE / ALTER SUBSCRIPTION warn about publications missing on the publisher**
   Kind: impl
   Parent: M0149-0043
   - goopg's ALTER SUBSCRIPTION … ADD/SET PUBLICATION reported missing publications as NOTICE, and CREATE SUBSCRIPTION did not check them at all. PG's check\_publications \(subscriptioncmds.c:446\) raises one WARNING \(ERRCODE\_UNDEFINED\_OBJECT\), singular or plural, from CreateSubscription with connect = true \(:723\) and from AlterSubscription's refresh \(:858\).
   - 2026\-11\-26 \(done\): ddlOp.warnMissingPublications emits that WARNING \(42704\). CREATE SUBSCRIPTION with connect = true runs CheckPublicationsOnPublisher before creating the slot, as PG orders it. TestAlterSubscriptionPublications now pins WARNING, not NOTICE, and covers CREATE.
-- [ ] **M0149-0043b — a goopg walsender follows publication renames while streaming**
+- [x] **M0149-0043b — a goopg walsender follows publication renames while streaming**
   Kind: impl
   Parent: M0149-0043
   - 007 goopg\-publisher pairings: after ALTER PUBLICATION pub\_for\_tab RENAME TO tap\_pub\_tmp; ALTER PUBLICATION pub\_empty RENAME TO pub\_for\_tab; …, the next INSERT into test1 still reaches the subscriber \(got 1\|2, want 1\). PG's pgoutput resolves its publication\_names on every publication invalidation \(publication\_invalidation\_cb → publications\_valid = false → LoadPublications by name in get\_rel\_sync\_entry\), using the catalog as of the decoded change. runLogicalWalsender builds buildPublicationFilter once at START\_REPLICATION from the names \(internal/replication/logicalwalsender.go\).
+  - 2026\-11\-26 \(done\), two halves:
+    - ALTER PUBLICATION … RENAME TO was a silent no\-op: the legacy DDL parser consumed unmodelled ALTER PUBLICATION forms as CompatNoopStmt. New AlterPublicationRenameStmt → PubSub.RenamePublication: same OID, 42704 / 42710; the pg\_publication row is rewritten.
+    - The walsender resolved publication\_names once at START\_REPLICATION. New PubSub.PublicationGeneration counter, bumped by every publication change; livePublicationFilter rebuilds the filter by name when it moves \(pgoutput's publication\_invalidation\_cb → LoadPublications\).
+  - Results: TestPort\_Subscription007DDL ungated, PASS 3/3 in all three pairings. Unit tests TestLivePublicationFilterFollowsRename, TestAlterPublicationRename.
 - [ ] **M0149-0044 — port subscription/t/008_diff_schema.pl**
   Kind: impl
   Parent: none
