@@ -3160,7 +3160,9 @@ func (s *AlterSubscriptionSetStmt) stmtNode() {}
 // AlterSubscription's ALTER_SUBSCRIPTION_{SET,ADD,DROP}_PUBLICATION kinds
 // (gram.y:10873-10901, bare name_list; subscriptioncmds.c:1374-1475).
 // Action is "set", "add" or "drop"; the WITH options carry refresh and
-// copy_data (the arms' supported_opts).
+// copy_data (the arms' supported_opts). Action "refresh" is
+// ALTER_SUBSCRIPTION_REFRESH (REFRESH PUBLICATION [WITH (copy_data)]),
+// with no publication list.
 type AlterSubscriptionPublicationsStmt struct {
 	pos          int
 	Name         string

@@ -156,9 +156,15 @@ func (s *Server) RefreshSubscriptionOnPublisher(subName, conninfo string, dbOid 
 	if mgrErr != nil {
 		syncErrs = append(syncErrs, mgrErr.Error())
 	}
+	// A failed table copy does not fail the command: PG's tablesync
+	// worker runs after the command commits and reports the failure as
+	// an ERROR in the server log (e.g. logicalrep_rel_open's "… is
+	// missing replicated columns"), leaving the rel's row at 'i' / 'd'
+	// for a retry. goopg's sync is synchronous, so it logs the same
+	// ERROR here and leaves the row for the next refresh. M0149-0044b.
 	for _, r := range results {
 		if r.Err != nil {
-			syncErrs = append(syncErrs, fmt.Sprintf("%s: %v", r.Relname, r.Err))
+			s.cfg.Logger.Error(tableSyncErrorMessage(r.Err), "subscription", subName, "relation", r.Relname)
 		}
 	}
 	// Sync-end promotion: a rel whose COPY completed sits at 's' with
@@ -277,7 +283,8 @@ func quoteIdent(s string) string {
 // copyColumnIndex maps the publisher's column names onto tbl's columns in
 // the publisher's order (copy_table's attnamelist). Every column when
 // remoteCols is empty. A replicated column the local table lacks is
-// logicalrep_report_missing_attrs' 42P10 error. M0149-0044a.
+// logicalrep_report_missing_or_gen_attrs' 55000 error
+// (ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE). M0149-0044a.
 func copyColumnIndex(tbl *catalog.Table, remoteCols []string) ([]int, error) {
 	if len(remoteCols) == 0 {
 		idx := make([]int, len(tbl.Columns))
@@ -309,9 +316,20 @@ func copyColumnIndex(tbl *catalog.Table, remoteCols []string) ([]int, error) {
 		if len(missing) > 1 {
 			noun = "columns"
 		}
-		return nil, &executor.ExecError{Code: "42P10", Message: fmt.Sprintf(
+		return nil, &executor.ExecError{Code: "55000", Message: fmt.Sprintf(
 			"logical replication target relation \"%s.%s\" is missing replicated %s: %s",
 			schema, tbl.Name, noun, strings.Join(missing, ", "))}
 	}
 	return idx, nil
+}
+
+// tableSyncErrorMessage is the text a failed table sync logs: the
+// innermost ExecError's message (PG's errmsg) when the failure carries
+// one, else the error text.
+func tableSyncErrorMessage(err error) string {
+	var ee *executor.ExecError
+	if errors.As(err, &ee) {
+		return ee.Message
+	}
+	return err.Error()
 }

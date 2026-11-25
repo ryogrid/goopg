@@ -1839,6 +1839,9 @@ func (o *ddlOp) execAlterSubscriptionPublications(s *parser.AlterSubscriptionPub
 	if !ok {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("subscription %q does not exist", s.Name)}
 	}
+	if s.Action == "refresh" {
+		return o.execAlterSubscriptionRefresh(s, sub, subDBOid)
+	}
 	// parse_subscription_options over the arms' supported_opts. goopg's
 	// WITH clause is a map, so keys are validated in sorted order (the
 	// determinism convention parseAlterSubscriptionSetOptions uses).
@@ -1981,6 +1984,53 @@ func (o *ddlOp) execAlterSubscriptionPublications(s *parser.AlterSubscriptionPub
 	// refresh killed, now dialing with the committed list. The
 	// kill-in-refresh + kick-relaunch split mirrors PG's
 	// kill-during-refresh / wake-after-commit ordering.
+	if o.ctx.OnSubscriptionChange != nil {
+		o.ctx.OnSubscriptionChange()
+	}
+	return nil
+}
+
+// execAlterSubscriptionRefresh is AlterSubscription's
+// ALTER_SUBSCRIPTION_REFRESH arm (subscriptioncmds.c:1476-1512): a
+// disabled subscription is 55000, WITH accepts only copy_data (42601
+// otherwise), PreventInTransactionBlock is 25001, then
+// AlterSubscription_refresh(sub, copy_data, NULL) runs over the
+// subscription's current publications — no check_publications (the
+// validate list is NULL) and no pg_subscription write. Tables new to the
+// publications get pg_subscription_rel rows and their table sync; rows of
+// tables that left them are removed. M0149-0044b.
+func (o *ddlOp) execAlterSubscriptionRefresh(s *parser.AlterSubscriptionPublicationsStmt, sub *catalog.Subscription, subDBOid uint32) error {
+	if !sub.Enabled {
+		return &ExecError{Code: "55000", Pos: s.Pos(),
+			Message: "ALTER SUBSCRIPTION ... REFRESH is not allowed for disabled subscriptions"}
+	}
+	copyData := true
+	names := make([]string, 0, len(s.Options))
+	for k := range s.Options {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if name != "copy_data" {
+			return &ExecError{Code: "42601", Pos: s.Pos(),
+				Message: fmt.Sprintf("unrecognized subscription parameter: %q", name)}
+		}
+		b, berr := defGetSubscriptionBoolean(name, s.Options[name], s.Pos())
+		if berr != nil {
+			return berr
+		}
+		copyData = b
+	}
+	if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+		return &ExecError{Code: "25001", Pos: s.Pos(),
+			Message: "ALTER SUBSCRIPTION ... REFRESH cannot run inside a transaction block"}
+	}
+	if o.ctx.RefreshSubscriptionOnPublisher != nil {
+		if rerr := o.ctx.RefreshSubscriptionOnPublisher(s.Name, sub.Conninfo, subDBOid, sub.Publications, copyData); rerr != nil {
+			return rerr
+		}
+	}
+	// Launcher kick: relaunch the apply worker the refresh stopped.
 	if o.ctx.OnSubscriptionChange != nil {
 		o.ctx.OnSubscriptionChange()
 	}

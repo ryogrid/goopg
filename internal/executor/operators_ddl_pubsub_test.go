@@ -953,3 +953,73 @@ func TestAlterPublicationRename(t *testing.T) {
 	wantExecErr(t, runDDL(t, ctx, "ALTER PUBLICATION nope RENAME TO x"), "42704", `publication "nope" does not exist`)
 	wantExecErr(t, runDDL(t, ctx, "ALTER PUBLICATION pb RENAME TO pc"), "42710", `publication "pc" already exists`)
 }
+
+// TestAlterSubscriptionRefresh pins ALTER_SUBSCRIPTION_REFRESH
+// (subscriptioncmds.c:1476-1512, M0149-0044b): a disabled subscription is
+// 55000, WITH takes only copy_data (42601 otherwise, refresh included),
+// an explicit transaction block is 25001, and the refresh runs over the
+// subscription's CURRENT publication list with the copy_data value —
+// without changing the list. Before M0149-0044b the statement parsed to a
+// compatibility no-op and synced nothing.
+func TestAlterSubscriptionRefresh(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+	create := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("runDDL %q: %v", sql, err)
+		}
+	}
+	create("CREATE SUBSCRIPTION s CONNECTION 'host=remote dbname=app' PUBLICATION p1, p2")
+	create("CREATE SUBSCRIPTION off CONNECTION 'host=remote dbname=app' PUBLICATION p1 WITH (connect = false, enabled = false, create_slot = false, slot_name = NONE)")
+
+	type call struct {
+		sub      string
+		pubs     []string
+		copyData bool
+	}
+	var calls []call
+	ctx.RefreshSubscriptionOnPublisher = func(subName, conninfo string, dbOid uint32, pubs []string, copyData bool) error {
+		calls = append(calls, call{subName, append([]string(nil), pubs...), copyData})
+		return nil
+	}
+
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION off REFRESH PUBLICATION"),
+		"55000", "ALTER SUBSCRIPTION ... REFRESH is not allowed for disabled subscriptions")
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s REFRESH PUBLICATION WITH (refresh = false)"),
+		"42601", "unrecognized subscription parameter: \"refresh\"")
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION nope REFRESH PUBLICATION"),
+		"42704", "subscription \"nope\" does not exist")
+	if len(calls) != 0 {
+		t.Fatalf("refused statements reached the refresh hook: %+v", calls)
+	}
+
+	create("ALTER SUBSCRIPTION s REFRESH PUBLICATION")
+	create("ALTER SUBSCRIPTION s REFRESH PUBLICATION WITH (copy_data = false)")
+	if len(calls) != 2 {
+		t.Fatalf("refresh hook calls = %+v, want 2", calls)
+	}
+	for i, wantCopy := range []bool{true, false} {
+		c := calls[i]
+		if c.sub != "s" || len(c.pubs) != 2 || c.pubs[0] != "p1" || c.pubs[1] != "p2" || c.copyData != wantCopy {
+			t.Errorf("call %d = %+v, want s [p1 p2] copyData=%v", i, c, wantCopy)
+		}
+	}
+	if sub, _ := ctx.PubSub.LookupSubscription("s"); len(sub.Publications) != 2 {
+		t.Errorf("REFRESH changed the publication list: %v", sub.Publications)
+	}
+
+	ctx.Session = NewBasicSession()
+	if err := runTransactionStmt(t, ctx, "BEGIN"); err != nil {
+		t.Fatalf("BEGIN: %v", err)
+	}
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s REFRESH PUBLICATION"),
+		"25001", "ALTER SUBSCRIPTION ... REFRESH cannot run inside a transaction block")
+	if err := runTransactionStmt(t, ctx, "ROLLBACK"); err != nil {
+		t.Fatalf("ROLLBACK: %v", err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("refresh inside a transaction block reached the hook: %+v", calls)
+	}
+}

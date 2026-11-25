@@ -1,6 +1,9 @@
 package parser
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestParseAlterPublicationOwner pins the `ALTER PUBLICATION name OWNER TO
 // {role | CURRENT_USER | SESSION_USER | CURRENT_ROLE}` shape. M0119-0004
@@ -69,8 +72,8 @@ func TestParseAlterPublicationOtherFormsStillNoop(t *testing.T) {
 		"ALTER PUBLICATION mypub ADD TABLES IN SCHEMA s",
 		"ALTER SUBSCRIPTION mysub RENAME TO othersub",
 		// SET PUBLICATION p2 left this list when the publication-list
-		// arms landed (M0122-0014, TestParseAlterSubscriptionPublications).
-		"ALTER SUBSCRIPTION mysub REFRESH PUBLICATION",
+		// arms landed (M0122-0014, TestParseAlterSubscriptionPublications);
+		// REFRESH PUBLICATION left it with M0149-0044b.
 	}
 	for _, sql := range cases {
 		t.Run(sql, func(t *testing.T) {
@@ -236,7 +239,6 @@ func TestParseAlterSubscriptionEscapeHatch(t *testing.T) {
 	// subscription-only arms, stay CompatNoop. (SET PUBLICATION left this
 	// list when the publication-list arms landed — M0122-0014.)
 	for _, sql := range []string{
-		"ALTER SUBSCRIPTION mysub REFRESH PUBLICATION",
 		"ALTER SUBSCRIPTION mysub SKIP (lsn = '0/16B3740')",
 		"ALTER SUBSCRIPTION mysub RENAME TO othersub",
 		"ALTER PUBLICATION mypub ENABLE",
@@ -271,6 +273,9 @@ func TestParseAlterSubscriptionPublications(t *testing.T) {
 		{"ALTER SUBSCRIPTION mysub ADD PUBLICATION p3, p4 WITH (refresh = false)", "add", []string{"p3", "p4"}, "false"},
 		{"ALTER SUBSCRIPTION mysub DROP PUBLICATION p1", "drop", []string{"p1"}, ""},
 		{"ALTER SUBSCRIPTION mysub DROP PUBLICATION p1, p2 WITH (copy_data = false)", "drop", []string{"p1", "p2"}, ""},
+		// ALTER_SUBSCRIPTION_REFRESH: no publication list (M0149-0044b).
+		{"ALTER SUBSCRIPTION mysub REFRESH PUBLICATION", "refresh", nil, ""},
+		{"ALTER SUBSCRIPTION mysub REFRESH PUBLICATION WITH (copy_data = false)", "refresh", nil, ""},
 	}
 	for _, tc := range cases {
 		stmts, err := Parse(tc.sql)
@@ -295,7 +300,7 @@ func TestParseAlterSubscriptionPublications(t *testing.T) {
 		if tc.withOpt != "" && s.Options["refresh"] != tc.withOpt {
 			t.Errorf("%q: Options[refresh]=%q, want %q", tc.sql, s.Options["refresh"], tc.withOpt)
 		}
-		if tc.sql == "ALTER SUBSCRIPTION mysub DROP PUBLICATION p1, p2 WITH (copy_data = false)" && s.Options["copy_data"] != "false" {
+		if strings.HasSuffix(tc.sql, "WITH (copy_data = false)") && s.Options["copy_data"] != "false" {
 			t.Errorf("%q: Options[copy_data]=%q, want false", tc.sql, s.Options["copy_data"])
 		}
 	}

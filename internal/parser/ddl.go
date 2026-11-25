@@ -8905,6 +8905,24 @@ func (p *parser) parseAlter() (Stmt, error) {
 				if pubAction != "" && p.acceptKeyword(KwPublication) {
 					return p.parseAlterSubscriptionPubsTail(t.Pos, name, pubAction)
 				}
+				// ALTER SUBSCRIPTION name REFRESH PUBLICATION [WITH (...)]
+				// — ALTER_SUBSCRIPTION_REFRESH (gram.y:10864); "refresh" is
+				// unreserved and arrives as an ident. Action "refresh"
+				// carries no publication list. M0149-0044b.
+				if pubAction == "" && p.acceptIdentKeyword("refresh") {
+					if _, err := p.expectKeyword(KwPublication); err != nil {
+						return nil, err
+					}
+					stmt := &AlterSubscriptionPublicationsStmt{pos: t.Pos, Name: name, Action: "refresh"}
+					if p.acceptKeyword(KwWith) {
+						opts, err := p.parsePubSubWithList(false)
+						if err != nil {
+							return nil, err
+						}
+						stmt.Options = opts
+					}
+					return stmt, nil
+				}
 			}
 		}
 		// ALTER PUBLICATION name { ADD | SET | DROP } TABLE [ONLY] t [*] [, ...].

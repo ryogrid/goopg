@@ -16909,7 +16909,7 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/subscription/t/008_diff_schema.pl` — subscriber with a different table schema.
   Likely prerequisites \(verify at start\): attribute mapping by name, extra/missing-column errors with PG texts, Relation-message re-send after publisher ALTER.
-  - Path\-to\-TAP: 008 \(goopg\-publisher pairing\) ← M0149\-0040f \(landed\); 008 \(goopg\-subscriber pairings\) ← M0149\-0044a \(landed\) ← M0149\-0044b; all\-goopg also ← M0149\-0042b.
+  - Path\-to\-TAP: 008 \(goopg\-publisher pairing\) ← M0149\-0040f \(landed\); 008 \(goopg\-subscriber pairings\) ← M0149\-0044a, M0149\-0044b \(both landed; PG\-publisher pairing passes\); 008 all\-goopg ← M0149\-0042b \(one link\).
   - 2026\-11\-26 \(progress\): TestPort\_Subscription008DiffSchema written \(three pairings\), gated GOOPG\_TAP\_008. goopg\-publisher\-pg18\-subscriber PASSES since 0040f. Both goopg\-subscriber pairings: after the sync test\_tab is empty \(0\|0\|0\), and the next replicated UPDATE installs 2 rows with NULL c/d/e \(no local DEFAULT / identity\), so the subscriber's own UPDATE then fails "null value in column e".
 - [x] **M0149-0044a — a goopg subscriber's table sync copies into a table with extra local columns**
   Kind: impl
@@ -16920,11 +16920,15 @@ verify each at HEAD when the task starts.
     - CREATE SUBSCRIPTION \(connect\) runs the initial sync: 'i' rows for copy\_data = true, 'r' rows for copy\_data = false.
     - COPY with a column list and the apply worker's INSERT now fill identity and serial columns.
   - Results: 008 checks 1–5 pass with a goopg subscriber. The applyUpdateByKey not\-found upsert was not on the path once the copy worked; filed as M0149\-0044c. TestPort\_PgoutputInteropGoopgToGoopgRefreshData's premise was corrected to PG's behavior: an existing 'r' row is not re\-copied on ADD PUBLICATION. Regress copy2 248→225 and identity 318→312 mismatches \(HEAD worktree A/B\).
-- [ ] **M0149-0044b — ALTER SUBSCRIPTION … REFRESH PUBLICATION is a no-op**
+- [x] **M0149-0044b — ALTER SUBSCRIPTION … REFRESH PUBLICATION is a no-op**
   Kind: impl
   Parent: M0149-0044
   - The legacy parser maps `ALTER SUBSCRIPTION s REFRESH PUBLICATION [WITH \(copy\_data\)]` to CompatNoopStmt, so new published tables are never seeded or copied. 008's test\_tab2 check passes only because apply ignores pg\_subscription\_rel. 008's last check also needs PG's async outcome: the command succeeds and the tablesync worker logs ERROR 42P10 "… is missing replicated columns: "b", "c"". goopg's synchronous refresh would fail the command instead.
   - Path\-to\-TAP: 008 goopg\-subscriber pairings ← 0044b \(link 2 of the 008 chain\).
+  - 2026\-11\-26 \(done\):
+    - `REFRESH PUBLICATION [WITH \(copy\_data\)]` parses to AlterSubscriptionPublicationsStmt with Action "refresh". execAlterSubscriptionRefresh applies 55000 for a disabled subscription, 42601 for any option except copy\_data, and 25001 inside a transaction block, then runs the refresh hook over the current publications.
+    - A failed table copy now logs ERROR with PG's message instead of failing the command \(PG's async tablesync worker outcome\). The missing\-columns errcode is now 55000 \(it was 42P10\).
+  - Results: 008 passes in pg18\-publisher\-goopg\-subscriber and goopg\-publisher\-pg18\-subscriber. all\-goopg still times out on the catch\-up after the test\_tab2 refresh \(slot inactive\), which is M0149\-0042b. Unit test TestAlterSubscriptionRefresh; parser pins updated.
 - [ ] **M0149-0044c — applyUpdateByKey installs a row when the old row is not found**
   Kind: impl
   Parent: M0149-0044
