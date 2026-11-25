@@ -16720,22 +16720,27 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: M0149-0035
   - Shared prerequisite of 006 \(M0149\-0035\) and 010 \(M0149\-0036\). An xlog.OutputPlugin \(internal/access/transam/xlog/decoder.go\) producing contrib/test\_decoding's text \("BEGIN <xid>", "table public.t: INSERT: a\[integer\]:1", "COMMIT <xid>"; include\-xids / skip\-empty\-xacts options\); the four SRFs over a logical slot \(confirmed\_flush advance for get, none for peek\); the walsender accepting test\_decoding for pg\_recvlogical. CREATE EXTENSION is not needed \(test\_decoding is a plugin, loaded by name\).
-- [ ] **M0149-0036 — port recovery/t/010_logical_decoding_timelines.pl**
+- [!] **M0149-0036 — port recovery/t/010_logical_decoding_timelines.pl** — blocked-on M0149-0035a
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/010_logical_decoding_timelines.pl` — logical slots surviving a timeline switch.
   Likely prerequisites \(verify at start\): `pg_replslot` copied by `backup_fs_cold` and loaded at startup, catalog\_xmin via `hot_standby_feedback`, decoding across TLI. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034.
-- [ ] **M0149-0037 — port recovery/t/044_invalidate_inactive_slots.pl**
+- [!] **M0149-0037 — port recovery/t/044_invalidate_inactive_slots.pl** — blocked-on M0149-0037a
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/044_invalidate_inactive_slots.pl` — slot invalidation by `idle_replication_slot_timeout`.
   Likely prerequisites \(verify at start\): checkpoint-time idle invalidation, `invalidation_reason = idle_timeout`, injection point `slot-timeout-inval`, PG log text. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034.
-- [ ] **M0149-0038 — port recovery/t/046_checkpoint_logical_slot.pl**
+  - 2026\-11\-25 \(blocked\): 044 attaches injection points \(slot\-timeout\-inval\) and skips without the extension; filed the shared prerequisite M0149\-0037a. 046 \(M0149\-0038\) and 035 \(M0149\-0039\) need it too; 041 \(M0149\-0034\) also needs a backend kill.
+- [ ] **M0149-0037a — an injection\_points equivalent for goopg \(CREATE EXTENSION injection\_points; attach/wakeup/detach; wait and error modes\)**
+  Kind: impl
+  Parent: M0149-0037
+  - Shared prerequisite of 041 \(M0149\-0034\), 044 \(M0149\-0037\), 046 \(M0149\-0038\) and 035 \(M0149\-0039\). PG: src/test/modules/injection\_points \(injection\_points\_attach\(name, 'wait'\|'error'\|'notice'\), injection\_points\_wakeup, injection\_points\_detach, wait\_event 'injection\_point' in pg\_stat\_activity \(Cluster.pm wait\_for\_event\)\) and the INJECTION\_POINT\(name\) call sites in the server \(create\-restart\-point, slot\-timeout\-inval, checkpoint\-before\-old\-wal\-removal, …\). Each test names its points; goopg needs the same names at the same code positions. The PG side uses tmp/pg183\-inj \(built with \-\-enable\-injection\-points\).
+- [!] **M0149-0038 — port recovery/t/046_checkpoint_logical_slot.pl** — blocked-on M0149-0037a
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/046_checkpoint_logical_slot.pl` — logical slot advanced during a checkpoint keeps a valid `restart_lsn`.
   Likely prerequisites \(verify at start\): injection points in checkpoint/slot code \(`checkpoint-before-old-wal-removal`, etc.\), `restart_lsn` vs WAL removal ordering, standby slot sync paths. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034.
-- [ ] **M0149-0039 — port recovery/t/035_standby_logical_decoding.pl**
+- [!] **M0149-0039 — port recovery/t/035_standby_logical_decoding.pl** — blocked-on M0149-0037a
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/035_standby_logical_decoding.pl` — logical decoding on a standby, conflicts and promotion.
@@ -16936,7 +16941,7 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/subscription/t/029_on_error.pl` — `disable_on_error` and `ALTER SUBSCRIPTION … SKIP`.
   Likely prerequisites \(verify at start\): `disable_on_error`, `subskiplsn` + skip-transaction log texts, interplay with streaming and two-phase.
-- [ ] **M0149-0072 — port recovery/t/040_standby_failover_slots_sync.pl**
+- [!] **M0149-0072 — port recovery/t/040_standby_failover_slots_sync.pl** — blocked-on M0149-0035a
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/040_standby_failover_slots_sync.pl` — failover slots synced to a standby and used after promotion.
@@ -16946,7 +16951,7 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/subscription/t/100_bugs.pl` — historical logical-replication regression cases.
   Likely prerequisites \(verify at start\): triage each bug case at start; file one child per uncovered case.
-- [ ] **M0149-0074 — port recovery/t/027_stream_regress.pl**
+- [!] **M0149-0074 — port recovery/t/027_stream_regress.pl** — blocked-on M0148 regress parity (and M0149-0074a)
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/027_stream_regress.pl` — full regress schedule on a streaming primary; `pg_dumpall` of primary and standby compared.
@@ -16963,6 +16968,11 @@ open until its output matches PostgreSQL 18.3; every missing prerequisite is
 filed and implemented as that suite task's child. Ledger-only parking is not a
 completion path.
 
+  - 2026\-11\-25 \(blocked\): 027's "regression tests pass" assertion runs pg\_regress parallel\_schedule against the primary, so it needs M0148 regress parity, per this entry. It also loads pg\_stat\_statements through shared\_preload\_libraries \(compute\_query\_id = regress, pg\_stat\_statements.max\) and checks its contents. The replication part — the standby replays everything the regress workload writes, and pg\_dumpall / pg\_dump \-\-schema pg\_catalog of primary and standby are identical — is filed as M0149\-0074a.
+- [ ] **M0149-0074a — after the regress schedule on a goopg primary, a goopg standby's pg\_dumpall and pg\_catalog dump equal the primary's**
+  Kind: impl
+  Parent: M0149-0074
+  - Discovery run: tapnode primary \+ streaming standby with a physical slot \(max\_connections 25, max\_prepared\_transactions 10, synchronize\_seqscans off\); run scripts/pg\-regress\-runner.sh's parallel\_schedule against the primary \(regress failures expected until M0148\); `select setval(seqrelid, nextval(seqrelid)) from pg_sequence`; wait for replay; diff `pg_dumpall --no-sync --no-statistics --restrict-key=test` \(primary with \-\-no\-unlogged\-table\-data\). Each differing object is a replay\-fidelity child. Then the same with pg\_dump \-\-schema pg\_catalog after a restart with autovacuum off.
 - [x] **M0148-0001 — aggregates.sql regress coverage closure**.
   Kind: impl
   Parent: none
