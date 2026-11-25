@@ -227,3 +227,29 @@ func TestBeginRecoveryStandbyIsArchiveRecovery(t *testing.T) {
 		t.Fatalf("stampInArchiveRecovery left state %d", got)
 	}
 }
+
+// TestBeginRecoveryDidCrash pins StartupXLOG's didCrash (M0149-0032c): only a
+// state other than DB_SHUTDOWNED and DB_SHUTDOWNED_IN_RECOVERY is a crash, so
+// a standby shut down cleanly in recovery restores its statistics instead of
+// discarding them, although it still replays.
+func TestBeginRecoveryDidCrash(t *testing.T) {
+	for _, c := range []struct {
+		state   uint32
+		crashed bool
+	}{
+		{control.DBStateShutdowned, false},
+		{control.DBStateShutdownedInRecovery, false},
+		{control.DBStateInProduction, true},
+		{control.DBStateInArchiveRecovery, true},
+	} {
+		dir := freshDataDir(t)
+		setState(t, dir, c.state)
+		d, err := beginRecovery(dir, true)
+		if err != nil {
+			t.Fatalf("state=%d: %v", c.state, err)
+		}
+		if d.didCrash != c.crashed {
+			t.Errorf("state=%d: didCrash = %v, want %v", c.state, d.didCrash, c.crashed)
+		}
+	}
+}

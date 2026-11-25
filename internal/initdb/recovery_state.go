@@ -24,6 +24,12 @@ type startupRecoveryDecision struct {
 	// crashRecovery is true when the previous run did not shut down
 	// cleanly, i.e. upstream would have set InRecovery = true.
 	crashRecovery bool
+	// didCrash is StartupXLOG's didCrash: pg_control's state is neither
+	// DB_SHUTDOWNED nor DB_SHUTDOWNED_IN_RECOVERY. Unlike crashRecovery it
+	// leaves a standby that shut down cleanly in recovery uncrashed, so its
+	// cumulative statistics are restored, not discarded (xlog.c: didCrash →
+	// pgstat_discard_stats, else pgstat_restore_stats). M0149-0032c.
+	didCrash bool
 	// redoLSN is pg_control's checkPointCopy.redo (0-based XLogRecPtr), or
 	// 0 when there is no usable control file — see wal.ReplayRecordsFrom
 	// for what 0 means to the replay path.
@@ -94,6 +100,7 @@ func beginRecovery(dataDir string, archiveRecovery bool) (startupRecoveryDecisio
 	}
 	onlineCheckpoint := cd.CheckPointCopyRedo < cd.CheckPoint
 	d.crashRecovery = cd.State != control.DBStateShutdowned || onlineCheckpoint
+	d.didCrash = cd.State != control.DBStateShutdowned && cd.State != control.DBStateShutdownedInRecovery
 	if !d.crashRecovery {
 		return d, nil
 	}

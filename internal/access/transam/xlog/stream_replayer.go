@@ -30,6 +30,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -54,6 +55,10 @@ type StreamReplayer struct {
 	onPreparedFinish func(xid storage.TransactionID)
 	// onCatalogReplay / catalogDBs: the live catalog refresh (M0149-0010a).
 	onCatalogReplay func(dbOid uint32)
+	// onStatsDropReplay: pgstat_execute_transactional_drops (M0149-0032c).
+	onStatsDropReplay func(items []transam.XactStatsItem)
+	// onRelDropReplay: DropRelationFiles' buffer drop (M0149-0032c).
+	onRelDropReplay func(rel storage.RelFileNode)
 	onSeqReplay     func(rel storage.RelFileNode) // M0149-0077a
 	catalogDBs      map[uint32]struct{}
 	// Recovery pause / apply delay (stream_replayer_pause.go). M0149-0013.
@@ -152,8 +157,56 @@ func (sr *StreamReplayer) SetSequenceReplayHook(fn func(rel storage.RelFileNode)
 	sr.onSeqReplay = fn
 }
 
+// SetStatsDropReplayHook installs fn, called with the dropped-stats items
+// (XACT_XINFO_HAS_DROPPED_STATS) of every replayed commit, abort, COMMIT
+// PREPARED or ABORT PREPARED record that carries any: xact_redo_commit /
+// xact_redo_abort → pgstat_execute_transactional_drops. Must be called
+// before Run. M0149-0032c.
+func (sr *StreamReplayer) SetStatsDropReplayHook(fn func(items []transam.XactStatsItem)) {
+	sr.onStatsDropReplay = fn
+}
+
+// SetRelDropReplayHook installs fn, called for every fork of each relation
+// a replayed commit or abort record drops (XACT_XINFO_HAS_RELFILELOCATORS)
+// before its files are removed: DropRelationFiles → smgrdounlinkall drops
+// the relation's buffers (DropRelationsAllBuffers) before unlinking, so a
+// page a hot-standby read dirtied (hint bits) is never written back to a
+// removed — or since reused — relfilenode. Must be called before Run.
+// M0149-0032c.
+func (sr *StreamReplayer) SetRelDropReplayHook(fn func(rel storage.RelFileNode)) {
+	sr.onRelDropReplay = fn
+}
+
 func (sr *StreamReplayer) SetCatalogReplayHook(fn func(dbOid uint32)) {
 	sr.onCatalogReplay = fn
+}
+
+// dropReplayedRelBuffers runs the rel-drop hook for every fork of each
+// relation an RM_XACT commit/abort record lists (the files dropXactRelFiles
+// removes), with the tablespace mapped as dropXactRelFiles maps it.
+func (sr *StreamReplayer) dropReplayedRelBuffers(rec Record) {
+	if sr.onRelDropReplay == nil || rec.XLog == nil || rec.XLog.Header.Rmid != RmgrXact {
+		return
+	}
+	switch rec.XLog.Header.Info & xlogXactOpMask {
+	case xlogXactCommit, xlogXactAbort, xlogXactCommitPrepared, xlogXactAbortPrepared:
+	default:
+		return
+	}
+	parsed, err := ParseXactRecord(rec.XLog.Header.Info, rec.XLog.MainData)
+	if err != nil {
+		return
+	}
+	for _, l := range parsed.DroppedRels {
+		rel := storage.RelFileNode{TblOid: l.SpcOid, DBOid: l.DbOid, RelOid: l.RelNumber}
+		if rel.TblOid == pgDefaultTableSpaceOID || rel.TblOid == pgGlobalTableSpaceOID {
+			rel.TblOid = 0
+		}
+		for fork := storage.ForkNumber(0); fork <= storage.InitFork; fork++ {
+			rel.Fork = fork
+			sr.onRelDropReplay(rel)
+		}
+	}
 }
 
 // noteCatalogBlocks records the databases of the system-catalog relations
@@ -271,6 +324,7 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 		if err := verifyOverwriteContrecord(rec); err != nil {
 			return err
 		}
+		sr.dropReplayedRelBuffers(rec)
 		applied, err := ApplyRecord(sr.mgr, rec)
 		if err != nil {
 			return fmt.Errorf("wal: stream replay record lsn[%d,%d]: %w", rec.StartLSN, rec.EndLSN, err)
@@ -310,6 +364,11 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 			}
 			if finishesPrepared && sr.onPreparedFinish != nil {
 				sr.onPreparedFinish(xid)
+			}
+			if sr.onStatsDropReplay != nil && rec.XLog != nil && rec.XLog.Header.Rmid == RmgrXact {
+				if parsed, err := ParseXactRecord(rec.XLog.Header.Info, rec.XLog.MainData); err == nil && len(parsed.DroppedStats) > 0 {
+					sr.onStatsDropReplay(parsed.DroppedStats)
+				}
 			}
 			if committed && sr.onCatalogReplay != nil && len(sr.catalogDBs) > 0 {
 				for db := range sr.catalogDBs {

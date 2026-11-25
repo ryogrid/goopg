@@ -16664,7 +16664,7 @@ verify each at HEAD when the task starts.
     - startup deadlock \(buffer pin \+ lock wait; "User transaction caused buffer deadlock with recovery."\);
     - database \(DROP DATABASE replay; "User was connected to a database that must be dropped."\).
   - Driven by max\_standby\_streaming\_delay / max\_standby\_archive\_delay, deadlock\_timeout and log\_recovery\_conflict\_waits.
-- [ ] **M0149-0032 — port recovery/t/030_stats_cleanup_replica.pl**
+- [x] **M0149-0032 — port recovery/t/030_stats_cleanup_replica.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/030_stats_cleanup_replica.pl` — standbys drop object stats on replayed drops and keep them across restart.
@@ -16672,6 +16672,7 @@ verify each at HEAD when the task starts.
   - Path\-to\-TAP: 030 ← \(1\) M0149\-0032a a standby sees functions the primary creates ← \(2\) M0149\-0032b goopg commit records carry the stats\-drop items ← \(3\) M0149\-0032c a goopg standby executes replayed stats drops. 3 links: in scope, work them in order.
   - 2026\-11\-25 \(progress\): TestPort\_Recovery030StatsCleanupReplica written, gated GOOPG\_TAP\_030. First run: both goopg\-standby pairings stop at `'public.drop_func_test1()'::regprocedure` with "function … does not exist" \(link 1\). With a goopg primary, the PG 18.3 standby keeps the relation, function and database stats after every replayed drop \(link 2\). The initial standby stats creation and the restart checks are not reached yet on the goopg\-standby pairings.
   - 2026\-11\-25 \(skipped as detour after 0032a\): with 0032a landed, the remaining path is 0032d \+ 0032e \+ 0032b \+ 0032c — 4 links > 3. Resume when those are worked.
+  - 2026\-11\-26 \(done, closed by M0149\-0032c\): all children landed \(0032a–f\); TestPort\_Recovery030StatsCleanupReplica is ungated and passes 3/3 in all three pairings; inventory row → port, pass\_required yes. Open nearby filings: 0032g, 0032h.
 - [x] **M0149-0032a — a goopg standby's catalog refresh registers routines created on the primary**
   Kind: impl
   Parent: M0149-0032
@@ -16711,10 +16712,17 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: none \(found while fixing M0149\-0032b; not on 030's path\)
   - execDropCompat's schema branch calls Catalog.DropTable for each table in the schema, without dropTableByRefImmediate's dropRelationStorage, pg\_class / pg\_attribute heap deletes or index removal. Check whether the relation files and catalog heap rows survive a DROP SCHEMA CASCADE \(PG: performDeletion → heap\_drop\_with\_catalog for each\) and route the cascade through the table\-drop path.
-- [ ] **M0149-0032c — a goopg standby drops stats named by replayed commit records**
+- [x] **M0149-0032c — a goopg standby drops stats named by replayed commit records**
   Kind: impl
   Parent: M0149-0032
   - pgstat\_execute\_transactional\_drops in xact\_redo\_commit/abort; plus stats kept across a clean standby restart and discarded after an immediate one \(pgstat\_restore\_stats / pgstat\_discard\_stats on crash recovery\).
+  - Path\-to\-TAP: 030 \(both goopg\-standby pairings\) ← M0149\-0032c; the restart check also needed ← a clean standby shutdown \(link 2, below\).
+  - 2026\-11\-26 \(done\), four parts:
+    - Replayed drops: StreamReplayer.SetStatsDropReplayHook → executor.ExecuteTransactionalStatsDrops. Relation and function items drop their entry when it belongs to the item's database; a database item drops the database and everything attributed to it \(pgstat\_drop\_database\_and\_contents\).
+    - Restore after a clean standby stop: startup chose discard vs restore by crashRecovery, which counts DB\_SHUTDOWNED\_IN\_RECOVERY as a crash. New startupRecoveryDecision.didCrash is StartupXLOG's rule \(neither DB\_SHUTDOWNED nor DB\_SHUTDOWNED\_IN\_RECOVERY\).
+    - Default\-database attribution: dbStats.noteFlush skipped database OID 0 \(a connection to the default database\), so pgstat.stat wrote those entries under dboid 0 and after a restart pg\_stat\_have\_stats\('relation', 5, …\) missed them. It now maps 0 through catalog.NamespaceDBOid.
+    - Clean standby shutdown \(PG\-primary pairing\): the shutdown restartpoint failed "WriteBlockAIO base/5/16384 blk 0: out of range \(nblocks=0\)", so pg\_control never reached DB\_SHUTDOWNED\_IN\_RECOVERY and the next start discarded the stats. A buffer a hot\-standby read had dirtied outlived the replayed DROP that removed its file. New SetRelDropReplayHook discards a dropped relation's buffers \(Pool.InvalidateRelForTruncate\) before the files go, as DropRelationFiles → smgrdounlinkall → DropRelationsAllBuffers does.
+  - Results: TestPort\_Recovery030StatsCleanupReplica ungated, PASS 3/3 in all three pairings; inventory → port. Unit tests TestExecuteTransactionalStatsDrops, TestNoteFlushDefaultDatabase, TestBeginRecoveryDidCrash, TestDropReplayedRelBuffers. Regress stats 234 unchanged; isolation stats PASS.
 - [ ] **M0149-0033 — port recovery/t/048_vacuum_horizon_floor.pl**
   Kind: impl
   Parent: none

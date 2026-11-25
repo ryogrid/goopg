@@ -28,6 +28,7 @@ import (
 
 	"github.com/goopg/goopg/internal/libpq/auth"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/initdb"
@@ -1326,6 +1327,14 @@ func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Ru
 	// catalogs refreshes the standby's catalog (PG's relcache invalidation),
 	// so relations the primary creates become visible while it streams.
 	sr.SetSequenceReplayHook(rt.RefreshSequenceAfterReplay)
+	// M0149-0032c: a replayed commit/abort's dropped-stats items drop the
+	// standby's stats entries (pgstat_execute_transactional_drops).
+	sr.SetStatsDropReplayHook(executor.ExecuteTransactionalStatsDrops)
+	// M0149-0032c: a replayed DROP discards the relation's buffers before
+	// its files go (DropRelationFiles → DropRelationsAllBuffers).
+	if rt.Pool != nil {
+		sr.SetRelDropReplayHook(rt.Pool.InvalidateRelForTruncate)
+	}
 	sr.SetCatalogReplayHook(func(dbOid uint32) {
 		if err := rt.RefreshCatalogAfterReplay(dbOid); err != nil {
 			logger.Warn("standby replay: catalog refresh failed", "db", dbOid, "err", err)

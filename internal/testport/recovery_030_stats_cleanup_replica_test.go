@@ -1,7 +1,6 @@
 package testport
 
 import (
-	"os"
 	"testing"
 
 	"github.com/goopg/goopg/internal/testutil/tapnode"
@@ -14,17 +13,9 @@ import (
 // clean restart and discards them after an immediate one. It runs in three
 // pairings: all-goopg, a PG 18.3 primary with a goopg standby, and a goopg
 // primary with a PG 18.3 standby.
-//
-// Gated by GOOPG_TAP_030=1 until it passes (M0149-0032). The goopg primary
-// with a PG 18.3 standby passes since goopg commit records carry
-// dropped-stats items (M0149-0032b); goopg standbys do not yet execute
-// replayed stats drops nor keep stats across a clean restart (M0149-0032c).
 func TestPort_Recovery030StatsCleanupReplica(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping recovery TAP port in short mode")
-	}
-	if os.Getenv("GOOPG_TAP_030") == "" {
-		t.Skip("030 re-port is not passing yet (M0149-0032); set GOOPG_TAP_030=1 to run")
 	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)

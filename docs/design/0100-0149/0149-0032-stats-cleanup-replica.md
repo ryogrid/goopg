@@ -1,7 +1,7 @@
 # M0149\-0032 — Port recovery/t/030\_stats\_cleanup\_replica.pl
 
-Status: skipped as a detour after M0149\-0032a landed. TestPort\_Recovery030StatsCleanupReplica is written and gated
-\(`GOOPG_TAP_030`\).
+Status: done. TestPort\_Recovery030StatsCleanupReplica is ungated and passes 3 of 3 runs in all three pairings
+\(M0149\-0032a–f\).
 
 ## Landed — M0149\-0032a, routines on a running standby
 
@@ -76,3 +76,29 @@ records had no such chunk, so a PG 18.3 standby of a goopg primary kept the stat
   - abort\-record items for created objects \(pgstat\_create\_relation / pgstat\_create\_function\);
   - items for views, materialized views, sequences, standalone DROP INDEX and TOAST relations;
   - 2PC prepare / COMMIT PREPARED records.
+
+## M0149\-0032c — replayed stats drops and stats across a standby restart \(landed\)
+
+Four gaps stood between the goopg standbys and 030:
+
+- **Replayed drops.** `StreamReplayer.SetStatsDropReplayHook` passes each replayed commit / abort / COMMIT PREPARED /
+  ABORT PREPARED record's `DroppedStats` to `executor.ExecuteTransactionalStatsDrops`
+  \(pgstat\_execute\_transactional\_drops\).
+  - goopg's relation and function stores key on the OID alone, so an item drops an entry only when that entry belongs
+    to the item's database \(or has no database\).
+  - A database item drops the database entry and every relation and function attributed to it
+    \(pgstat\_drop\_database\_and\_contents\).
+- **Restore after a clean standby stop.** Startup chose discard vs restore of `pg_stat/pgstat.stat` by
+  `crashRecovery`, which also counts DB\_SHUTDOWNED\_IN\_RECOVERY \(a standby that stopped cleanly\) as a crash, because
+  a standby always replays. The new `startupRecoveryDecision.didCrash` is StartupXLOG's own rule: the state is neither
+  DB\_SHUTDOWNED nor DB\_SHUTDOWNED\_IN\_RECOVERY.
+- **Default\-database attribution.** A connection to the default database carries database OID 0
+  \(`catalog.NamespaceDBOid`'s convention\), and `dbStats.noteFlush` skipped 0. Those entries were written to the stats
+  file under dboid 0, so after a restart `pg_stat_have_stats('relation', 5, …)` no longer matched them. noteFlush now
+  maps 0 to the default database.
+- **Clean standby shutdown.** On the PG\-primary pairing the standby's shutdown restartpoint failed: a hot\-standby read
+  had dirtied a buffer \(hint bits\) of a relation whose replayed DROP had removed the file. pg\_control then never
+  reached DB\_SHUTDOWNED\_IN\_RECOVERY, and the next start discarded the stats. PG's DropRelationFiles →
+  smgrdounlinkall drops the relation's buffers before unlinking. `StreamReplayer.SetRelDropReplayHook` now does that:
+  for each relation a replayed commit/abort lists, every fork's buffers are discarded through
+  `Pool.InvalidateRelForTruncate` before `dropXactRelFiles` removes the files.

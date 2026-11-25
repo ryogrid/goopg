@@ -528,9 +528,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 	// M0149-0007: StartupXLOG's pgstat_discard_stats / pgstat_restore_stats
 	// — a crash throws the cumulative statistics away, a clean start loads
-	// pg_stat/pgstat.stat (and removes it).
+	// pg_stat/pgstat.stat (and removes it). The choice is StartupXLOG's
+	// didCrash, under which a standby shut down in recovery did not crash
+	// (M0149-0032c).
 	if abs != "" {
-		if recov.crashRecovery {
+		if recov.didCrash {
 			executor.DiscardPgStatFile(abs)
 		} else {
 			executor.RestorePgStatFile(abs)

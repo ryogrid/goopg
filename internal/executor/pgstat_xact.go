@@ -51,3 +51,73 @@ func noteFunctionStatsDrop(ctx *Context, funcoid uint32) {
 func NoteDatabaseStatsDrop(ctx *Context, dboid uint32) {
 	noteStatsDrop(ctx, transam.PgStatKindDatabase, dboid, 0)
 }
+
+// ExecuteTransactionalStatsDrops is pgstat_execute_transactional_drops
+// (pgstat_xact.c), called by a standby for each replayed commit or abort
+// record that carries dropped-stats items (xact_redo_commit /
+// xact_redo_abort). A relation or function item drops that entry; a database
+// item drops the database's entry and every relation and function entry
+// attributed to it (pgstat_drop_entry → pgstat_drop_database_and_contents).
+// An item for an entry that does not exist is a no-op. M0149-0032c.
+func ExecuteTransactionalStatsDrops(items []transam.XactStatsItem) {
+	for _, it := range items {
+		switch it.Kind {
+		case transam.PgStatKindRelation:
+			if dbStats.forgetObject(true, it.DBOid, uint32(it.ObjID)) {
+				relStats.dropTable(uint32(it.ObjID))
+			}
+		case transam.PgStatKindFunction:
+			if dbStats.forgetObject(false, it.DBOid, uint32(it.ObjID)) {
+				funcStats.dropFunction(uint32(it.ObjID))
+			}
+		case transam.PgStatKindDatabase:
+			rels, funcs := dbStats.dropDatabase(it.DBOid)
+			for _, oid := range rels {
+				relStats.dropTable(oid)
+			}
+			for _, oid := range funcs {
+				funcStats.dropFunction(oid)
+			}
+		}
+	}
+}
+
+// forgetObject removes a dropped relation's (rel) or function's database
+// attribution. The stores key on the OID alone, so it reports whether the
+// entry belongs to dboid (or has no attribution) and may be dropped: an item
+// for another database's object of the same OID leaves this one alone, as
+// PG's (kind, dboid, objid) key does.
+func (m *dbStatsManager) forgetObject(rel bool, dboid, oid uint32) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	attr := m.funcDB
+	if rel {
+		attr = m.relDB
+	}
+	if db, ok := attr[oid]; ok && db != dboid {
+		return false
+	}
+	delete(attr, oid)
+	return true
+}
+
+// dropDatabase removes dboid's database entry and returns the relations and
+// functions attributed to it, whose entries the caller drops.
+func (m *dbStatsManager) dropDatabase(dboid uint32) (rels, funcs []uint32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.databases, dboid)
+	for oid, db := range m.relDB {
+		if db == dboid {
+			rels = append(rels, oid)
+			delete(m.relDB, oid)
+		}
+	}
+	for oid, db := range m.funcDB {
+		if db == dboid {
+			funcs = append(funcs, oid)
+			delete(m.funcDB, oid)
+		}
+	}
+	return rels, funcs
+}

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/utils/activity"
 )
 
@@ -195,9 +196,12 @@ var dbStats = &dbStatsManager{
 // database gets an entry (pgstat_flush_pending_entries reports the database
 // too), and each flushed relation and function is attributed to it.
 func (m *dbStatsManager) noteFlush(dboid uint32, rels, funcs []uint32) {
-	if dboid == 0 {
-		return
-	}
+	// A connection to the default database carries database OID 0
+	// (catalog.NamespaceDBOid's convention). Leaving its objects
+	// unattributed wrote them to pg_stat/pgstat.stat under dboid 0, and
+	// after a restart pg_stat_have_stats('relation', <postgres oid>, …)
+	// no longer found them. M0149-0032c.
+	dboid = catalog.NamespaceDBOid(dboid)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.databases[dboid]; !ok {
