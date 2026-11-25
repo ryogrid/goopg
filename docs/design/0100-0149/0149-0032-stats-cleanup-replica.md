@@ -30,3 +30,12 @@ pg\_namespace rows count, new user schemas are registered, and a registered user
 replayed DROP SCHEMA\) is unregistered \(`catalog.UserSchemasInDB` lists a database's user schemas\). Doing schemas
 first lets a relation the primary created in a new schema resolve its namespace when the table reload registers it.
 Next on 030's path: M0149\-0032f \(databases created on the primary are not connectable on the standby\).
+
+## M0149\-0032f — databases on a running standby \(landed\)
+
+pg\_database is a shared catalog \(global/1262, DBOid 0\), and the replayer's catalog\-change tracking skipped DBOid 0,
+so a replayed CREATE DATABASE never refreshed anything. `noteCatalogBlocks` now marks key 0 for a global/1262 block.
+`RefreshCatalogAfterReplay(0)` then runs `reloadDatabasesFromHeapMode(replay)`: committed rows only, new databases
+registered, and databases whose row is gone unregistered. This also closed M0149\-0033b: 048's "pg\_stat\_wal\_receiver
+is empty" was a refused connection to a database created after the backup. 048's PG\-primary → goopg\-standby pairing
+now passes end to end.

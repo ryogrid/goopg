@@ -1487,6 +1487,15 @@ func reloadUserTablespacesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, 
 // path B4.1-B4.5 use. Dropped databases carry xmax and are skipped by the
 // liveness filter.
 func reloadDatabasesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	return reloadDatabasesFromHeapMode(mgr, cat, clog, false)
+}
+
+// reloadDatabasesFromHeapMode is reloadDatabasesFromHeap; with replay set it is
+// a running standby's refresh after a replayed pg_database change
+// (M0149-0032f): only committed rows count, databases the primary created are
+// registered, and a registered user database whose row is gone (a replayed
+// DROP DATABASE) is unregistered.
+func reloadDatabasesFromHeapMode(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, replay bool) error {
 	if cat == nil {
 		return nil
 	}
@@ -1510,21 +1519,30 @@ func reloadDatabasesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 				name:      d[1].StringValue(),
 				owner:     uint32(d[2].Int),
 				connLimit: int32(d[catalog.PgDatabaseDatConnLimitOrdinal].Int),
-			}, false, nil
+			}, replay, nil
 		})
 	if err != nil {
 		return err
 	}
+	live := map[string]bool{}
 	for _, r := range rows {
 		db := r.(dbRow)
 		if db.oid < catalog.FirstUserOID || db.name == "" {
 			continue // bootstrap databases are registered at construction
 		}
+		live[db.name] = true
 		cat.RegisterDatabaseDuringRecovery(db.name, db.owner, db.oid)
 		// M0122-0006: restore datconnlimit from the heap row so a
 		// restart preserves the value set by UPDATE pg_database SET
 		// datconnlimit.
 		cat.SetDatabaseConnLimit(db.name, db.connLimit)
+	}
+	if replay {
+		for _, name := range cat.ListDatabases() {
+			if cat.DatabaseOid(name) >= catalog.FirstUserOID && !live[name] {
+				cat.UnregisterDatabaseDuringRecovery(name)
+			}
+		}
 	}
 	return nil
 }
@@ -3954,6 +3972,11 @@ func (r *Runtime) RefreshCatalogAfterReplay(dbOid uint32) error {
 	var clog *transam.CLog
 	if r.TxnMgr != nil {
 		clog = r.TxnMgr.CLog()
+	}
+	// A replayed pg_database change (shared, key 0) refreshes the database
+	// list: CREATE DATABASE / DROP DATABASE on the primary (M0149-0032f).
+	if dbOid == 0 {
+		return reloadDatabasesFromHeapMode(r.StorageMgr, cat, clog, true)
 	}
 	heapDB := storage.StorageDBOid(dbOid)
 	// Schemas first: a relation the primary created in a new schema

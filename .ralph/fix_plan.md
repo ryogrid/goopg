@@ -16682,10 +16682,11 @@ verify each at HEAD when the task starts.
   Parent: M0149-0032
   - 030 "schema creation": after a replayed CREATE SCHEMA drop\_schema\_test1 \+ CREATE TABLE in it, `'drop_schema_test1.drop_tab_test1'::regclass` fails on goopg standbys \(both pairings\). RefreshCatalogAfterReplay has no pg\_namespace reload \(ReloadUserDatabaseSchemasFromHeap exists for startup\).
   - 2026\-11\-25 \(done\): RefreshCatalogAfterReplay now first runs reloadUserSchemasFromHeapForDBMode\(replay\): committed rows only, new schemas registered, and a user schema whose pg\_namespace row is gone \(replayed DROP SCHEMA\) unregistered via the new catalog.UserSchemasInDB. Running it before the table reload lets a table in a new schema resolve its namespace. 030's "schema creation" step now resolves `'drop_schema_test1.drop_tab_test1'::regclass` on both goopg\-standby pairings and fails only on stats \(0032e\). Unit test TestUserSchemasInDB.
-- [ ] **M0149-0032f — a goopg standby accepts connections to a database the primary created after the base backup**
+- [x] **M0149-0032f — a goopg standby accepts connections to a database the primary created after the base backup**
   Kind: impl
   Parent: M0149-0032
   - 030 "createdb": after a replayed CREATE DATABASE test, `psql -d test` on the goopg standby fails to connect \(both goopg\-standby pairings\). The standby's catalog does not learn databases from replayed pg\_database \(a shared catalog\) — check RefreshCatalogAfterReplay's dbOid 0 / global path and the database list.
+  - 2026\-11\-25 \(done\): pg\_database is shared, so its blocks have DBOid 0 and StreamReplayer.noteCatalogBlocks skipped them. A replayed CREATE/DROP DATABASE refreshed nothing, and the standby rejected connections to the new database. Now a global/1262 block marks key 0, and RefreshCatalogAfterReplay\(0\) runs reloadDatabasesFromHeapMode\(replay\): committed rows only, new databases registered, vanished ones unregistered. Unit test TestNoteCatalogBlocksSharedPgDatabase. 030's createdb step connects; both goopg\-standby pairings now fail only on standby stats \(0032e\).
 - [ ] **M0149-0032e — queries on a goopg hot standby create relation and function stats**
   Kind: impl
   Parent: M0149-0032
@@ -16705,10 +16706,11 @@ verify each at HEAD when the task starts.
   Likely prerequisites \(verify at start\): `hot_standby_feedback` xmin on the walsender slot, `GlobalVisState`/OldestXmin floor in VACUUM, walreceiver reconnect mid-VACUUM. `pg_backend_pid()` is used only at SQL level here \(fine\); never `kill()` it — on goopg it is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID.
   - Path\-to\-TAP: 048 ← \(1\) io\_combine\_limit GUC \(landed\) ← \(2\) M0149\-0033b pg\_stat\_wal\_receiver from a non\-default database on a goopg standby ← \(3\) M0149\-0033c VACUUM \(FREEZE\) waits for a cleanup lock with wait\_event BufferPin while a cursor pins the page ← \(4\) M0149\-0033d live pg\_stat\_progress\_vacuum.index\_vacuum\_count ← \(5\) the GlobalVisState / OldestXmin horizon floor with hot\_standby\_feedback.
   - 2026\-11\-25 \(skipped as detour, 5 links\): io\_combine\_limit / io\_max\_combine\_limit registered \(goopg refused to start on 048's conf: "unknown parameter io\_combine\_limit"\). TestPort\_Recovery048VacuumHorizonFloor written, gated GOOPG\_TAP\_048. First run: both goopg\-standby pairings time out on `SELECT EXISTS (SELECT * FROM pg_stat_wal_receiver)` in test\_db; the goopg\-primary pairing times out waiting for the VACUUM's BufferPin wait.
-- [ ] **M0149-0033b — pg\_stat\_wal\_receiver is empty when queried from a non\-default database on a goopg standby**
+- [x] **M0149-0033b — pg\_stat\_wal\_receiver is empty when queried from a non\-default database on a goopg standby**
   Kind: impl
   Parent: M0149-0033
   - 048 polls `SELECT EXISTS (SELECT * FROM pg_stat_wal_receiver)` connected to test\_db \(a database created on the primary after the backup\); it never turns t on goopg standbys although streaming works. PG: the view is cluster\-wide \(pg\_stat\_get\_wal\_receiver\).
+  - 2026\-11\-25 \(done by M0149\-0032f\): the poll failed because the standby refused connections to test\_db, a database created on the primary after the backup, not because pg\_stat\_wal\_receiver was empty. With 0032f, 048's pg18\-primary\-goopg\-standby pairing PASSES end to end; the goopg\-primary pairings still need 0033c \(VACUUM BufferPin wait\).
 - [ ] **M0149-0033c — VACUUM \(FREEZE\) waits for a cleanup lock on a pinned page and reports wait\_event BufferPin**
   Kind: impl
   Parent: M0149-0033

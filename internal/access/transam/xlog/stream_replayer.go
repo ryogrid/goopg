@@ -163,6 +163,15 @@ func (sr *StreamReplayer) noteCatalogBlocks(rec Record) {
 		return
 	}
 	for _, b := range rec.XLog.Blocks {
+		// The shared pg_database (global/1262) refreshes the database
+		// list: key 0 (M0149-0032f).
+		if b.Rel.RelOid == 1262 && b.Rel.DBOid == 0 {
+			if sr.catalogDBs == nil {
+				sr.catalogDBs = make(map[uint32]struct{})
+			}
+			sr.catalogDBs[0] = struct{}{}
+			continue
+		}
 		if b.Rel.RelOid != 0 && b.Rel.RelOid < 16384 && b.Rel.DBOid != 0 {
 			if sr.catalogDBs == nil {
 				sr.catalogDBs = make(map[uint32]struct{})
