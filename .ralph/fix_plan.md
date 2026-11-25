@@ -16795,6 +16795,21 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/subscription/t/003_constraints.pl` — FKs and triggers on the subscriber.
   Likely prerequisites \(verify at start\): existing ports drive pgoutput in-process; verify the libpq apply path \(`internal/executor/applyworker.go`, `internal/postmaster/subscription_refresh.go`\) covers the test; `session_replication_role=replica` trigger rules, `ENABLE REPLICA/ALWAYS TRIGGER`. Overlap: M0122-0014 \(logical replication / decoding / subscription, open\) — reference it with `Prerequisite: M0122-0014` where its scope covers a gap.
+  - Path\-to\-TAP: 003 \(PG publisher → goopg subscriber\) ← M0149\-0040a \(catch\-up\) and ← M0149\-0040c \(replica triggers\); 003 \(goopg publisher pairings\) ← M0149\-0040b. Each chain is one link.
+  - 2026\-11\-26 \(progress\): TestPort\_Subscription003Constraints written \(tapnode, three pairings\), gated GOOPG\_TAP\_003. First run: every pairing timed out at the first wait\_for\_catchup. With 0040a, the PG\-publisher pairing catches up and passes the TOAST insert and FK\-ignored checks; its three trigger checks fail \(0040c\).
+- [x] **M0149-0040a — a goopg subscriber's status replies follow send\_feedback**
+  Kind: impl
+  Parent: M0149-0040
+  - 003's wait\_for\_catchup on a PG publisher never passed: goopg's logical receiver reported write = flush = apply = its last applied commit LSN, so on a quiet publisher the reply never reached pg\_current\_wal\_lsn\(\) and replay\_lsn stayed empty.
+  - 2026\-11\-26 \(done\): LogicalReceiver now tracks last\_received \(a 'w' frame's start and walEnd, a keepalive's walEnd\) and whether a transaction is in progress \(Begin seen, Commit not yet\). The 'r' reply carries write = last received; flush and apply = last received when idle, the last applied commit otherwise \(worker.c send\_feedback / get\_flush\_position\). A keepalive that moved nothing sends no reply unless one is requested. Unit test TestLogicalReceiverFeedbackPositions; the pgoutput interop, replication and pubsubcluster tests pass.
+- [ ] **M0149-0040b — a goopg publisher streams real WAL LSNs and lists logical walsenders in pg\_stat\_replication**
+  Kind: impl
+  Parent: M0149-0040
+  - 003 with a goopg publisher: pg\_stat\_replication is empty while tap\_sub's slot is active \(plugin column empty; restart\_lsn / confirmed\_flush\_lsn one byte past the target, 0/10E90B1 vs 0/10E90B0\). runLogicalWalsender \(internal/replication/logicalwalsender.go\) never registers in s.cfg.WalSenders, and walsenderPgoutputAdapter numbers its 'w' frames with synthetic byte\-counted LSNs from START\_REPLICATION's position, with keepalive walEnd likewise synthetic. PG: WalSndWriteData sends each message at the decoded record's LSN, WalSndKeepalive sends the flushed WAL end, and the walsender's row shows the subscriber's write/flush/replay from its 'r' replies.
+- [ ] **M0149-0040c — a goopg apply worker fires the table's triggers under session\_replication\_role = replica**
+  Kind: impl
+  Parent: M0149-0040
+  - 003 \(PG publisher\): after ALTER TABLE … ENABLE REPLICA TRIGGER filter\_basic\_dml\_trg \(BEFORE INSERT OR UPDATE OF bid, RETURN NULL for id ≥ 10 and for any UPDATE\), applied changes still land: got 3\|1\|10, want 2\|1\|2. applyInsert / applyUpdate / applyDelete \(internal/executor/applyworker.go\) write the heap directly. PG: ExecSimpleRelationInsert/Update/Delete fire the BR/AR row triggers, the apply worker runs with session\_replication\_role = replica \(so REPLICA and ALWAYS triggers fire\), and apply\_handle\_update marks every column the remote tuple carries as updated \(so an UPDATE OF bid trigger fires for UPDATE … SET id\). fireTriggersCols \(operators\_trigger.go\) needs a Context with the routine registry and GetSetting returning replica.
 - [ ] **M0149-0041 — port subscription/t/005_encoding.pl**
   Kind: impl
   Parent: none

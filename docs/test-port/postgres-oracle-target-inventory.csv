@@ -434,7 +434,7 @@ R-047,recovery-tap,tap,postgres/src/test/recovery/t/047_checkpoint_physical_slot
 ,recovery-tap,tap,postgres/src/test/recovery/t/048_vacuum_horizon_floor.pl,failed,no,-,Port in progress as TestPort_Recovery048VacuumHorizonFloor (internal/testport/recovery_048_vacuum_horizon_floor_test.go; gated GOOPG_TAP_048): blocked on M0149-0033b/c/d and the horizon floor,,
 S-001,subscription-tap,tap,postgres/src/test/subscription/t/001_rep_changes.pl,port,yes,-,Ported as TestPort_Subscription001RepChanges in internal/testport/subscription_port_test.go,,
 ,subscription-tap,tap,postgres/src/test/subscription/t/002_types.pl,not-tried,no,-,,,
-,subscription-tap,tap,postgres/src/test/subscription/t/003_constraints.pl,not-tried,no,-,,,
+,subscription-tap,tap,postgres/src/test/subscription/t/003_constraints.pl,failed,no,-,Port in progress as TestPort_Subscription003Constraints (internal/testport/subscription_003_constraints_test.go; gated GOOPG_TAP_003): the PG-publisher pairing catches up and passes the TOAST and FK checks but the goopg apply worker fires no replica triggers (M0149-0040c); goopg publishers stream synthetic LSNs and list no logical walsender in pg_stat_replication (M0149-0040b),,
 S-004,subscription-tap,tap,postgres/src/test/subscription/t/004_sync.pl,port,yes,-,Ported as TestPort_Subscription004Sync in internal/testport/subscription_port_test.go,,
 ,subscription-tap,tap,postgres/src/test/subscription/t/005_encoding.pl,not-tried,no,-,,,
 ,subscription-tap,tap,postgres/src/test/subscription/t/006_rewrite.pl,not-tried,no,-,,,

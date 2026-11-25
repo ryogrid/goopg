@@ -136,6 +136,17 @@ type LogicalReceiver struct {
 	// status frame to advance the publisher slot's
 	// confirmed_flush_lsn.
 	applyLSN atomic.Uint64
+	// lastReceived is LogicalRepApplyLoop's last_received: the highest
+	// position a 'w' frame (its start and the sender's walEnd) or a
+	// 'k' keepalive (walEnd) reported. inXact is set between a
+	// pgoutput Begin and its Commit — get_flush_position's
+	// have_pending_txes. sendStatus reports from both (send_feedback).
+	// lastSent* hold the positions of the last reply, so a keepalive
+	// that moved nothing does not trigger one. M0149-0040a.
+	lastReceived  atomic.Uint64
+	inXact        atomic.Bool
+	lastSentWrite atomic.Uint64
+	lastSentFlush atomic.Uint64
 
 	// mu guards the per-iteration connection state and the
 	// terminal-close flag.
@@ -776,6 +787,8 @@ func (r *LogicalReceiver) handleCopyData(payload []byte) error {
 	switch kind {
 	case libpq.ReplMsgWALData:
 		m := parsed.(*libpq.WALDataMessage)
+		r.noteReceived(m.StartLSN)
+		r.noteReceived(m.EndLSN)
 		if len(m.WALBytes) == 0 {
 			return nil
 		}
@@ -785,6 +798,12 @@ func (r *LogicalReceiver) handleCopyData(payload []byte) error {
 		decoded, err := xlog.DecodeMessage(m.WALBytes)
 		if err != nil {
 			return fmt.Errorf("logicalreceiver: pgoutput decode: %w", err)
+		}
+		switch decoded.Kind {
+		case 'B':
+			r.inXact.Store(true)
+		case 'C':
+			defer r.inXact.Store(false)
 		}
 		commitLSN, err := r.cfg.Apply.ApplyMessage(decoded)
 		if err != nil {
@@ -823,19 +842,69 @@ func (r *LogicalReceiver) handleCopyData(payload []byte) error {
 		}
 	case libpq.ReplMsgKeepalive:
 		ka := parsed.(*libpq.KeepaliveMessage)
-		if ka.ReplyRequested {
+		r.noteReceived(ka.WALEnd)
+		// send_feedback(last_received, reply_requested, false): a
+		// requested reply is forced; otherwise one goes out only when
+		// the reported positions moved.
+		if ka.ReplyRequested || r.statusMoved() {
 			return r.sendStatus()
 		}
 	}
 	return nil
 }
 
-func (r *LogicalReceiver) sendStatus() error {
+// noteReceived raises lastReceived to lsn.
+func (r *LogicalReceiver) noteReceived(lsn uint64) {
+	for {
+		cur := r.lastReceived.Load()
+		if lsn <= cur || r.lastReceived.CompareAndSwap(cur, lsn) {
+			return
+		}
+	}
+}
+
+// feedbackPositions is send_feedback's position choice (worker.c):
+// write is the last received position; flush and apply are the last
+// applied commit while a transaction is in progress
+// (have_pending_txes), and the last received position otherwise —
+// everything received has then been applied, so an idle subscriber
+// confirms up to the publisher's keepalive walEnd. goopg applies each
+// commit before reading the next frame, so the applied commit is also
+// its flushed position. No position goes backwards.
+func (r *LogicalReceiver) feedbackPositions() (write, flush uint64) {
 	apply := r.applyLSN.Load()
-	// Report flush_lsn = applyLSN so the publisher's SyncRep wait
-	// queue (M0102-0005 primitive, wired in M0103-0005) can
-	// release waiters once the subscriber confirms apply.
-	frame := libpq.EncodeStandbyStatusUpdate(apply, apply, apply, time.Now().UTC(), false)
+	write = r.lastReceived.Load()
+	if write < apply {
+		write = apply
+	}
+	flush = apply
+	if !r.inXact.Load() {
+		flush = write
+	}
+	if w := r.lastSentWrite.Load(); write < w {
+		write = w
+	}
+	if f := r.lastSentFlush.Load(); flush < f {
+		flush = f
+	}
+	return write, flush
+}
+
+// statusMoved reports whether a reply now would carry new positions.
+func (r *LogicalReceiver) statusMoved() bool {
+	write, flush := r.feedbackPositions()
+	return write != r.lastSentWrite.Load() || flush != r.lastSentFlush.Load()
+}
+
+func (r *LogicalReceiver) sendStatus() error {
+	// 'r' carries write = last received, flush and apply = the
+	// confirmed position (send_feedback). flush_lsn drives the
+	// publisher's SyncRep wait queue (M0102-0005 / M0103-0005) and the
+	// slot's confirmed_flush_lsn. M0149-0040a.
+	write, flush := r.feedbackPositions()
+	r.lastSentWrite.Store(write)
+	r.lastSentFlush.Store(flush)
+	frame := libpq.EncodeStandbyStatusUpdate(write, flush, flush, time.Now().UTC(), false)
 	r.mu.Lock()
 	w := r.w
 	r.mu.Unlock()
