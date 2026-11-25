@@ -884,8 +884,16 @@ func adoptRestoredWAL(rt *initdb.Runtime, startOfLog, endOfLog uint64, timelines
 		}
 		return nil
 	}
-	for _, sp := range timelines {
+	for i, sp := range timelines {
 		if sp.TLI <= rt.WAL.TimelineID() || sp.Begin >= endOfLog {
+			continue
+		}
+		// A timeline whose child forked off before it began owns no WAL:
+		// a PITR that stopped short of its target timeline's own switch
+		// point writes that point-in-history as the child's switch point,
+		// and tliOfPointInHistory never lands on the empty span between
+		// (M0149-0027, 028_pitr_timelines).
+		if i+1 < len(timelines) && timelines[i+1].Begin <= sp.Begin {
 			continue
 		}
 		if sp.Begin < rt.WAL.WrittenLSN() {

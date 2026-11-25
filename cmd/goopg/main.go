@@ -1128,6 +1128,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		// left open survive into the promoted server (M0149-0024).
 		cfg.RecoveredPrepared = append(cfg.RecoveredPrepared, restoreReplayedPrepared(rt, logger, cfg.RecoveredPrepared)...)
 		logger.Info("archive recovery complete; promoting to primary")
+		// The promotion's history file and the new timeline's segments are
+		// archived (M0149-0027).
+		attachWALArchiver(rt, registry, logger)
 		// Promote: bump TLI, write history, update pg_control,
 		// and remove recovery.signal. Mirrors finalizePromotion
 		// in standby.go but without the standby controller.
@@ -1182,15 +1185,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// history files become .ready, and archive_command copies them out.
 	// With archive_mode = on it waits out recovery (M0149-0018a).
 	if rt != nil && rt.WAL != nil && rt.DataDir != "" {
-		walArchiver = xlog.NewArchiver(xlog.ArchiverConfig{
-			DataDir:    rt.DataDir,
-			WALDir:     walDirFor(rt),
-			Mode:       func() string { return stringGUC(registry, "archive_mode", "off") },
-			Command:    func() string { return stringGUC(registry, "archive_command", "") },
-			InRecovery: func() bool { return rt.Standby },
-			Logger:     logger,
-		})
-		rt.WAL.SetArchiver(walArchiver)
+		attachWALArchiver(rt, registry, logger)
 		archCtx, archCancel := context.WithCancel(ctx)
 		archDone := make(chan struct{})
 		go func() {
@@ -1218,6 +1213,15 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		// restartpoint in Close, after its replay has stopped.
 		cfg.ShutdownCheckpoint = func() {
 			if !rt.Standby {
+				// ShutdownXLOG: with archiving active the last segment is
+				// rotated first, so all the remaining records are archived;
+				// the shutdown checkpoint goes to the next segment
+				// (RequestXLogSwitch, M0149-0027).
+				if walArchiver.Enabled() && rt.WAL != nil {
+					if _, err := rt.WAL.SwitchSegment(); err != nil {
+						logger.Warn("shutdown: could not switch WAL segment for archiving", "err", err)
+					}
+				}
 				rt.ShutdownCheckpoint()
 			}
 		}
@@ -1373,6 +1377,40 @@ func boolGUC(registry *misc.Registry, name string, fallback bool) bool {
 // stringGUC reads a string-shaped GUC by name, returning fallback
 // when the registry is nil, the variable isn't registered, or its
 // Display value is empty.
+// attachWALArchiver constructs the WAL archiver and attaches it to the WAL
+// writer, once. Start-time archive recovery attaches it before its
+// promotion, so the new timeline's history file and the segments the new
+// timeline completes get their .ready (XLogArchiveNotify writes the status
+// file whether or not the archiver process runs yet); runStart starts it.
+func attachWALArchiver(rt *initdb.Runtime, registry *misc.Registry, logger *slog.Logger) {
+	if walArchiver != nil || rt == nil || rt.WAL == nil || rt.DataDir == "" {
+		return
+	}
+	walArchiver = xlog.NewArchiver(xlog.ArchiverConfig{
+		DataDir:    rt.DataDir,
+		WALDir:     walDirFor(rt),
+		Mode:       func() string { return stringGUC(registry, "archive_mode", "off") },
+		Command:    func() string { return stringGUC(registry, "archive_command", "") },
+		InRecovery: func() bool { return rt.Standby },
+		Logger:     logger,
+		// A pg_stat_activity row (backend_type archiver) while the
+		// archiver runs, as for the WAL summarizer's slot.
+		OnStart: func() {
+			if rt.Activity != nil {
+				rt.Activity.RegisterBackground(activity.ArchiverIdx, &activity.Backend{
+					PID: "archiver-0", BackendType: "archiver", State: "active",
+				})
+			}
+		},
+		OnStop: func() {
+			if rt.Activity != nil {
+				rt.Activity.ReleaseBackground(activity.ArchiverIdx, "archiver-0")
+			}
+		},
+	})
+	rt.WAL.SetArchiver(walArchiver)
+}
+
 func stringGUC(registry *misc.Registry, name string, fallback string) string {
 	if registry == nil {
 		return fallback

@@ -91,6 +91,24 @@ Not done:
   - restored history files are not kept in pg\_wal for cascading standbys \(restoreTimeLineHistoryFiles\) on the
     standby path.
 
+## M0149\-0027 — the archiver process across start\-time archive recovery \(028\_pitr\_timelines\)
+
+- The archiver holds a pg\_stat\_activity slot \(`activity.ArchiverIdx`, backend\_type `archiver`\) from the first pass
+  where archiving is allowed — archive\_mode = on outside recovery, or always \(PgArchStartupAllowed\) — until shutdown.
+  `ArchiverConfig.OnStart` / `OnStop` bracket it; a promotion's history\-file notification wakes the archiver, which then
+  starts.
+- `attachWALArchiver` \(cmd/goopg\) constructs the archiver and attaches it to the WAL writer once. Start\-time archive
+  recovery calls it before its promotion, so the new timeline's history file and the segments the new timeline
+  completes get their .ready. XLogArchiveNotify writes the status file whether or not the archiver process runs yet.
+  Before this, the notification went to a nil archiver and was dropped.
+- ShutdownXLOG: a primary with archive\_mode on or always rotates the last segment \(`Writer.SwitchSegment`,
+  RequestXLogSwitch\) before the shutdown checkpoint, so every record but the checkpoint is archived.
+- `adoptRestoredWAL` skips an empty timeline span. A PITR that stops on timeline 1 before the target timeline 2 forked
+  writes "2 <EndOfLog>" with EndOfLog below the 1→2 switch point, as PG's writeTimeLineHistory\(newTLI,
+  recoveryTargetTLI, EndOfLog\) does. tliOfPointInHistory never lands on timeline 2 there, so the restored WAL goes
+  straight from timeline 1 to 3.
+- Not done: promotion does not archive the old timeline's last segment as `.partial` \(M0149\-0096\).
+
 ## Open \(children in fix\_plan\)
 
 None.

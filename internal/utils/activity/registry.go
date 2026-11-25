@@ -28,7 +28,10 @@ const (
 	// WalSummarizerIdx is the WAL summarizer's slot, held while it runs
 	// (summarize_wal on). M0122-0009.
 	WalSummarizerIdx = 4
-	// Indices 5–15 available for future workers.
+	// ArchiverIdx is the WAL archiver's slot, held while archiving is
+	// allowed (archive_mode = on outside recovery, or always). M0149-0027.
+	ArchiverIdx = 5
+	// Indices 6–15 available for future workers.
 )
 
 // activitySlot is a 64-byte cache-line-aligned per-backend state block.

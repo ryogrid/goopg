@@ -75,10 +75,12 @@ func runStuckOnOldTimeline(t *testing.T, repo string, nodePrimary *tapnode.Node,
 	backupName := "my_backup"
 	bkp := nodePrimary.Backup(backupName)
 
-	// Create streaming standby linking to primary (has_streaming,
-	// has_archiving).
+	// Create streaming standby linking to primary (has_streaming). Cluster.pm's
+	// has_archiving only creates the archive directory: the standby keeps the
+	// primary's archive_command (cp_history_files into the primary's archive)
+	// from the base backup, so after promotion its 00000002.history lands
+	// there — the one file the cascade can restore.
 	nodeStandby := fromBackup("standby", bkp, nodePrimary)
-	nodeStandby.EnableArchiving()
 	nodeStandby.Start()
 
 	// Take backup of standby, use -Xnone so that pg_wal is empty.

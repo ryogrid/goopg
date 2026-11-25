@@ -16552,6 +16552,10 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: none \(found while fixing M0149\-0023c\)
   - `VALUES (generate_series(1,3))` and `SELECT … FROM (VALUES (generate_series(1,3))) v` return 1 row on goopg; PG raises "set\-returning functions are not allowed in VALUES" \(0A000\) — the check transformValuesClause applies to every VALUES RTE.
+- [ ] **M0149-0096 — promotion does not archive the old timeline's last segment as .partial**
+  Kind: impl
+  Parent: none \(found while porting M0149\-0027\)
+  - PG's CleanupAfterArchiveRecovery renames the last, partly\-filled segment of the old timeline to `<seg>.partial` and XLogArchiveNotify\-s it when archiving is active \(028's comment lists `000000010000000000000003.partial` in the archive\); goopg's standby and archive\-recovery promotions leave the segment under its full name with no .partial. 028 does not depend on it.
 - [x] **M0149-0023d — a PG 18.3 standby of a goopg primary with recovery\_target = 'immediate' never becomes ready**
   Kind: impl
   Parent: M0149-0023
@@ -16576,11 +16580,13 @@ verify each at HEAD when the task starts.
   Upstream: `postgres/src/test/recovery/t/025_stuck_on_old_timeline.pl` — cascading standby without WAL fetches the history file from the archive.
   Likely prerequisites \(verify at start\): archiving of `.history` before segments, `restore_command` history fetch, cascaded walsender on a promoted node.
   - 2026\-11\-25 \(done\): ported as TestPort\_Recovery025StuckOnOldTimelineFull \(upstream's cp\_history\_files archive\_command, the standby's -Xnone backup via tapnode Backup\(name, options...\)\); it passed on all three pairings 3 of 3 with no product change — the promoted standby's cascade follows it onto TLI 2 with only history files in the primary's archive. Inventory row 025 → port.
-- [ ] **M0149-0027 — port recovery/t/028_pitr_timelines.pl**
+- [x] **M0149-0027 — port recovery/t/028_pitr_timelines.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/028_pitr_timelines.pl` — PITR whose target lies in a higher-TLI segment.
   Likely prerequisites \(verify at start\): `XLogFileReadAnyTLI` / `expectedTLEs` segment selection, old-TLI `.partial` segment handling.
+  - Path\-to\-TAP \(3 links, all on 028's goopg\-PITR pairings\): \(1\) the "wait for the archiver" poll needs a pg\_stat\_activity row with backend\_type 'archiver'; \(2\) node\_pitr2 needs node\_pitr's 00000003.history in the archive — start\-time archive recovery promoted before the archiver existed, so XLogArchiveNotify was dropped; \(3\) it needs node\_pitr's timeline\-3 segment — PG's ShutdownXLOG rotates the last segment when archiving is active.
+  - 2026\-11\-25 \(done\): ported as TestPort\_Recovery028PitrTimelinesFull. Fixes: the archiver holds a pg\_stat\_activity slot \(ArchiverIdx, backend\_type archiver\) from when archiving is allowed until shutdown \(ArchiverConfig OnStart/OnStop\); attachWALArchiver constructs and attaches it before the start\-time archive\-recovery promotion, so the history file and the new timeline's segments get .ready; the primary's shutdown switches WAL segment first when archive\_mode is on/always \(RequestXLogSwitch in ShutdownXLOG\); adoptRestoredWAL skips an empty timeline span — node\_pitr stopped at 'rp' on TLI 1 before TLI 2's fork and, like PG, writes "2 <EndOfLog>" with EndOfLog below the 1→2 switch point. Passes 3 of 3 on all three pairings, ungated; the archiving ports 002/003/004/020/023/024/025/042/045 still pass. The 025 port no longer gives its standby its own archive\_command \(Cluster.pm has\_archiving only creates the directory\). Inventory row 028 → port. Nearby: M0149\-0096 \(.partial\) filed.
 - [ ] **M0149-0028 — port recovery/t/043_no_contrecord_switch.pl**
   Kind: impl
   Parent: none

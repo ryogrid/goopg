@@ -54,6 +54,12 @@ type ArchiverConfig struct {
 	// (XLogArchivingActive vs XLogArchivingAlways).
 	InRecovery func() bool
 	Logger     *slog.Logger
+	// OnStart and OnStop bracket the span in which PG's postmaster would
+	// have the archiver process running (PgArchStartupAllowed: archive_mode
+	// = on outside recovery, or always): the server shows it as a
+	// pg_stat_activity row with backend_type 'archiver' meanwhile.
+	OnStart func()
+	OnStop  func()
 }
 
 // Archiver is the pgarch process.
@@ -158,7 +164,17 @@ func (a *Archiver) Wakeup() {
 func (a *Archiver) Run(ctx context.Context) {
 	t := time.NewTicker(pgarchTimeout)
 	defer t.Stop()
+	running := false
 	for {
+		// The archiver "process" starts once archiving is allowed — at
+		// startup, or when a promotion's history-file notification wakes
+		// it — and keeps running until shutdown.
+		if !running && a.active() {
+			running = true
+			if a.cfg.OnStart != nil {
+				a.cfg.OnStart()
+			}
+		}
 		a.copyLoop(ctx)
 		select {
 		case <-ctx.Done():
@@ -166,6 +182,9 @@ func (a *Archiver) Run(ctx context.Context) {
 			// shell_archive_shutdown: the shell archive module's shutdown
 			// callback (elog DEBUG1).
 			a.cfg.Logger.Debug("archiver process shutting down")
+			if running && a.cfg.OnStop != nil {
+				a.cfg.OnStop()
+			}
 			return
 		case <-a.wake:
 		case <-t.C:

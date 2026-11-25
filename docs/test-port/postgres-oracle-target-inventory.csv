@@ -411,7 +411,7 @@ R-021,recovery-tap,tap,postgres/src/test/recovery/t/021_row_visibility.pl,port,y
 ,recovery-tap,tap,postgres/src/test/recovery/t/025_stuck_on_old_timeline.pl,port,yes,-,Ported as TestPort_Recovery025StuckOnOldTimelineFull in internal/testport/recovery_025_stuck_on_old_timeline_test.go (all three pairings: all-goopg; PG 18.3 primary with goopg standbys; goopg primary with PG 18.3 standbys — M0149-0026),,
 R-026,recovery-tap,tap,postgres/src/test/recovery/t/026_overwrite_contrecord.pl,port,yes,-,Ported as TestPort_Recovery026OverwriteContrecord in internal/testport/recovery_026_overwrite_contrecord_test.go (M0149-0017): all-goopg and with PG 18.3 as primary or standby,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/027_stream_regress.pl,not-tried,no,-,,,
-,recovery-tap,tap,postgres/src/test/recovery/t/028_pitr_timelines.pl,not-tried,no,-,,,
+,recovery-tap,tap,postgres/src/test/recovery/t/028_pitr_timelines.pl,port,yes,-,Ported as TestPort_Recovery028PitrTimelinesFull in internal/testport/recovery_028_pitr_timelines_test.go (all three pairings: all-goopg; PG 18.3 primary with goopg standby/PITR nodes; goopg primary with PG 18.3 standby/PITR nodes — M0149-0027),,
 R-029,recovery-tap,tap,postgres/src/test/recovery/t/029_stats_restart.pl,port,yes,-,Ported as TestPort_Recovery029StatsRestart in internal/testport/recovery_029_stats_restart_test.go: all-goopg (44/44) and a PG 18.3 cold start on the cleanly stopped goopg directory that loads goopg's pg_stat/pgstat.stat (M0149-0007),,
 ,recovery-tap,tap,postgres/src/test/recovery/t/030_stats_cleanup_replica.pl,not-tried,no,-,,,
 ,recovery-tap,tap,postgres/src/test/recovery/t/031_recovery_conflict.pl,not-tried,no,-,,,

@@ -4,7 +4,9 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestArchiverOrderAndPlaceholders pins pgarch_readyXlog's order (timeline
@@ -92,5 +94,50 @@ func TestArchiverCopyLoop(t *testing.T) {
 	mode = "off"
 	if a.segmentRemovable(wal, seg2) != true || a.Enabled() {
 		t.Fatal("archive_mode = off still archives")
+	}
+}
+
+// TestArchiverRunStartsOnceAllowed pins the archiver "process" lifetime the
+// pg_stat_activity row follows (PgArchStartupAllowed): with archive_mode =
+// on it does not start during recovery, starts once a wakeup finds the
+// server out of recovery, and stops at shutdown (M0149-0027).
+func TestArchiverRunStartsOnceAllowed(t *testing.T) {
+	data := t.TempDir()
+	wal := filepath.Join(data, "pg_wal")
+	if err := os.MkdirAll(wal, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var inRecovery atomic.Bool
+	inRecovery.Store(true)
+	started, stopped := make(chan struct{}, 2), make(chan struct{}, 2)
+	a := NewArchiver(ArchiverConfig{
+		DataDir: data, WALDir: wal,
+		Mode:       func() string { return "on" },
+		Command:    func() string { return "true" },
+		InRecovery: inRecovery.Load,
+		OnStart:    func() { started <- struct{}{} },
+		OnStop:     func() { stopped <- struct{}{} },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); a.Run(ctx) }()
+	a.Wakeup()
+	select {
+	case <-started:
+		t.Fatal("archiver started during recovery with archive_mode = on")
+	case <-time.After(200 * time.Millisecond):
+	}
+	inRecovery.Store(false)
+	a.Wakeup()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("archiver did not start after recovery ended")
+	}
+	a.Wakeup()
+	cancel()
+	<-done
+	if len(started) != 0 || len(stopped) != 1 {
+		t.Fatalf("starts after the first = %d, stops = %d; want 0, 1", len(started), len(stopped))
 	}
 }
