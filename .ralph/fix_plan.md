@@ -16840,11 +16840,34 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/subscription/t/005_encoding.pl` — publisher and subscriber databases in different encodings.
   Likely prerequisites \(verify at start\): non-UTF8 database encodings \(LATIN1\), `client_encoding` conversion in the apply connection.
+  - Path\-to\-TAP: 005 \(goopg\-subscriber pairings\) ← M0149\-0041a LATIN1 databases ← \(1\) pg\_database.encoding / server\_encoding honored at runtime ← \(2\) text stored and compared in the database encoding ← \(3\) client↔server encoding conversion ← \(4\) the apply worker converts incoming UTF8 to the local encoding. More than 3 links.
+  - 2026\-11\-26 \(skipped as detour\): TestPort\_Subscription005Encoding written \(three pairings\), gated GOOPG\_TAP\_005. goopg init \-\-encoding=LATIN1 exits 0 but the running server reports server\_encoding UTF8 and every database UTF8, so a goopg subscriber stores the value as UTF8 and the LATIN1 literal does not match \(0041a\). The goopg\-publisher pairing needs 0041b \(landed\) and 0042a.
+- [ ] **M0149-0041d — TestPort\_PgoutputInteropPGToGoopgPgbenchKillAsync fails its row\-loss bound inside the batch run**
+  Kind: test
+  Parent: none \(nearby, seen while gating M0149\-0040d/0041b; not on any TAP path\)
+  - In `go test -p 1 -run 'TestPort_PgoutputInterop|TestPort_Subscription|TestPubSubCluster'` it failed on 3 of 4 runs since 2026\-11\-26 \("async DoD lower bound: count\(\*\)=407 < 489 … too many rows lost"\) and passes every time alone \(6 s\). The PG publisher and goopg subscriber paths it uses were not changed by those loops. Check whether a preceding test's leftover server or slot load shortens the window \(timing\-based kill\), or whether asyncLossBound is too tight.
+- [ ] **M0149-0041a — a goopg database uses the encoding goopg init \-E / CREATE DATABASE ENCODING names**
+  Kind: impl
+  Parent: M0149-0041
+  - goopg init \-\-locale=C \-\-encoding=LATIN1 writes the encoding but the server reports server\_encoding = UTF8 and pg\_database.encoding = UTF8 for postgres/template0/template1. PG stores text in the database encoding, converts between client\_encoding and it \(pg\_do\_encoding\_conversion\), validates literals in it, and the apply worker's connection asks the publisher for the subscriber's encoding \(client\_encoding = GetDatabaseEncodingName\(\)\). Owner\-architecture: every text path assumes UTF8.
+- [x] **M0149-0041b — a FOR ALL TABLES publication covers publishable user tables only**
+  Kind: impl
+  Parent: M0149-0041
+  - A goopg FOR ALL TABLES publication listed pg\_catalog.pg\_type, pg\_attribute, pg\_largeobject and pg\_largeobject\_metadata in pg\_publication\_tables and pg\_get\_publication\_tables, across every database. A PG subscriber then tried to sync them and never finished \(005, 006: pg\_subscription\_rel stuck in 'd' on four catalogs\).
+  - 2026\-11\-26 \(done\): new catalog.IsPublishableTable \(is\_publishable\_class\) — permanent ordinary tables with OID ≥ FirstNormalObjectId outside pg\_catalog / information\_schema / pg\_toast; not views, matviews, foreign tables, sequences, virtual relations. pg\_get\_publication\_tables and the pg\_publication\_tables view apply it, limited to the publication's database. Unit test TestIsPublishableTable. 005/006 with a goopg publisher now list only test1.
 - [ ] **M0149-0042 — port subscription/t/006_rewrite.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/006_rewrite.pl` — decoding across a heap rewrite.
   Likely prerequisites \(verify at start\): decoding DML after a table rewrite \(new relfilenode, `RelidByRelfilenumber`, rewrite mappings\).
+  - Path\-to\-TAP: 006 \(goopg\-publisher pairings\) ← M0149\-0041b \(landed\) ← M0149\-0042a table sync from a goopg publisher \(step 1 pg\_get\_replica\_identity\_index landed; step 2 the post\-copy catch\-up stall open\). 3 links.
+  - 2026\-11\-26 \(progress\): TestPort\_Subscription006Rewrite written \(three pairings\), gated GOOPG\_TAP\_006. pg18\-publisher\-goopg\-subscriber PASSES. goopg\-publisher\-pg18\-subscriber: test1 reaches 'f' and stops. all\-goopg: the initial sync passes but the slot goes inactive \(pg\_stat\_replication empty\) and the first catch\-up times out.
+- [ ] **M0149-0042a — a subscriber's table sync from a goopg publisher completes**
+  Kind: impl
+  Parent: M0149-0042
+  - PG subscriber: fetch\_remote\_table\_info failed with "function pg\_get\_replica\_identity\_index does not exist". 2026\-11\-26 \(step 1 done\): evalPgGetReplicaIdentityIndex \(RelationGetReplicaIndex: the primary key under DEFAULT, the USING INDEX index, NULL under FULL / NOTHING / no key; return type regclass\). Unit test TestPgGetReplicaIdentityIndex.
+  - Open: the PG table\-sync worker then copies test1 and sets 'f', but never reports finishing \(no error logged\) — check the goopg walsender for the tablesync slot \(CREATE\_REPLICATION\_SLOT … LOGICAL pgoutput \(SNAPSHOT 'use'\) inside the copy transaction, then START\_REPLICATION from it\) and what keepalive / sentPtr the sync worker sees against the apply worker's relstate\_lsn \(process\_syncing\_tables\_for\_sync\). all\-goopg: after the goopg subscriber's sync, the slot is inactive — check the goopg apply worker's restart after tablesync.
+
 - [ ] **M0149-0043 — port subscription/t/007_ddl.pl**
   Kind: impl
   Parent: none

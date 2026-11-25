@@ -18349,6 +18349,15 @@ case "pg_char_to_encoding":
 			return NullDatum, err
 		}
 		return toRegTypmod(v.StringValue(), ctx), nil
+	case "pg_get_replica_identity_index":
+		if len(x.Args) != 1 {
+			return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: "function pg_get_replica_identity_index requires 1 argument"}
+		}
+		v, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		return evalPgGetReplicaIdentityIndex(v, ctx), nil
 	case "to_regclass", "to_regtype", "to_regrole", "to_regcollation", "to_regproc", "to_regprocedure", "to_regnamespace", "to_regoper", "to_regoperator":
 		// to_reg*(text): the type's input function with a soft error context
 		// — NULL instead of an error, for a missing object and (PG 16+) for

@@ -17871,6 +17871,8 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "bool"} // M0149-0001h / h1 / h1a
 		case "to_regtypemod":
 			return catalog.Type{Name: "int4"} // M0149-0001h1a13
+		case "pg_get_replica_identity_index":
+			return catalog.Type{Name: "regclass"} // M0149-0041c
 		case "regproc", "regprocedure", "regclass", "regtype", "regnamespace", "regrole", "regcollation", "regoper", "regoperator":
 			// a one-argument call named after a type is that cast
 			return catalog.Type{Name: strings.TrimPrefix(strings.ToLower(x.Name), "pg_catalog.")}

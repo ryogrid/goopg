@@ -173,7 +173,14 @@ func publicationTablesForCtx(ctx *Context, pub *catalog.Publication) []*catalog.
 	}
 	if pub.AllTables {
 		if in, ok := ctx.Catalog.(*catalog.InMemory); ok {
-			out := in.AllTables()
+			// GetAllTablesPublicationRelations: the current database's
+			// publishable tables only (is_publishable_class). M0149-0041b.
+			var out []*catalog.Table
+			for _, t := range in.AllTables(catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
+				if catalog.IsPublishableTable(t) {
+					out = append(out, t)
+				}
+			}
 			sort.Slice(out, func(i, j int) bool {
 				if out[i].Schema != out[j].Schema {
 					return out[i].Schema < out[j].Schema

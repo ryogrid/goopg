@@ -523,8 +523,12 @@ func registerPublicationViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
 		out := make([][]string, 0)
 		for _, pub := range ps.Publications() {
 			if pub.AllTables {
-				for _, t := range cat.AllTables() {
-					out = append(out, pubTableRow(pub.Name, t.Schema, t.Name))
+				// Only publishable tables (is_publishable_class), of the
+				// publication's own database. M0149-0041b.
+				for _, t := range cat.AllTables(pub.DBOid) {
+					if catalog.IsPublishableTable(t) {
+						out = append(out, pubTableRow(pub.Name, t.Schema, t.Name))
+					}
 				}
 				continue
 			}
