@@ -22,3 +22,11 @@ Status: skipped as a detour after M0149\-0032a landed. TestPort\_Recovery030Stat
 - M0149\-0032e: queries on a goopg standby create no relation/function stats.
 - M0149\-0032b: goopg commit records carry no dropped\-stats items.
 - M0149\-0032c: goopg standbys do not execute replayed stats drops.
+
+## M0149\-0032d — schemas on a running standby \(landed\)
+
+`RefreshCatalogAfterReplay` runs `reloadUserSchemasFromHeapForDBMode(replay)` before the table reload. Only committed
+pg\_namespace rows count, new user schemas are registered, and a registered user schema whose row is gone \(a
+replayed DROP SCHEMA\) is unregistered \(`catalog.UserSchemasInDB` lists a database's user schemas\). Doing schemas
+first lets a relation the primary created in a new schema resolve its namespace when the table reload registers it.
+Next on 030's path: M0149\-0032f \(databases created on the primary are not connectable on the standby\).

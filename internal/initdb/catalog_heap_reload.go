@@ -264,6 +264,14 @@ func ReloadUserDatabaseSchemasFromHeap(mgr *storage.Manager, cat *catalog.InMemo
 // each live user schema in that database's own schema set — pg_namespace is
 // per-database, at runtime and across a restart alike (M0119-0006).
 func reloadUserSchemasFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
+	return reloadUserSchemasFromHeapForDBMode(mgr, cat, clog, heapDBOid, false)
+}
+
+// reloadUserSchemasFromHeapForDBMode is reloadUserSchemasFromHeapForDB; with
+// replay set it is a running standby's catalog refresh (M0149-0032d): only
+// committed rows count, and a registered user schema of the database whose
+// row is gone (a replayed DROP SCHEMA) is unregistered.
+func reloadUserSchemasFromHeapForDBMode(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32, replay bool) error {
 	type nsRow struct {
 		oid   uint32
 		name  string
@@ -284,22 +292,31 @@ func reloadUserSchemasFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory,
 				name:  decoded[1].StringValue(),
 				owner: uint32(decoded[2].Int),
 				tid:   tid,
-			}, false, nil
+			}, replay, nil
 		})
 	if err != nil {
 		return err
 	}
 	nsDB := catalog.NamespaceDBOid(heapDBOid)
+	live := map[string]bool{}
 	for _, r := range rows {
 		ns := r.(nsRow)
 		if ns.oid < catalog.FirstUserOID || ns.name == "" {
 			continue
 		}
+		live[strings.ToLower(ns.name)] = true
 		cat.RegisterSchemaDuringRecovery(ns.name, ns.oid, nsDB)
 		if ns.owner != 0 {
 			cat.SetSchemaOwnerDuringRecovery(ns.name, ns.owner, nsDB)
 		}
 		cat.SetSchemaHeapTID(ns.name, catalog.SchemaHeapTID{Block: uint32(ns.tid.Block), Offset: ns.tid.Offset}, nsDB)
+	}
+	if replay {
+		for name, oid := range cat.UserSchemasInDB(nsDB) {
+			if oid >= catalog.FirstUserOID && !live[name] {
+				cat.UnregisterSchemaDuringRecovery(name, nsDB)
+			}
+		}
 	}
 	return nil
 }
@@ -3939,6 +3956,12 @@ func (r *Runtime) RefreshCatalogAfterReplay(dbOid uint32) error {
 		clog = r.TxnMgr.CLog()
 	}
 	heapDB := storage.StorageDBOid(dbOid)
+	// Schemas first: a relation the primary created in a new schema
+	// resolves its namespace when the table reload registers it
+	// (M0149-0032d).
+	if err := reloadUserSchemasFromHeapForDBMode(r.StorageMgr, cat, clog, heapDB, true); err != nil {
+		return err
+	}
 	if heapDB == storage.StorageDBOid(cat.DBOID()) {
 		if err := loadUserTablesFromHeapForDBMode(r.StorageMgr, cat, clog, cat.DBOID(), 0, true); err != nil {
 			return err

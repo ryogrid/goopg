@@ -16677,10 +16677,15 @@ verify each at HEAD when the task starts.
   Parent: M0149-0032
   - initdb RefreshCatalogAfterReplay reloads tables, event triggers and sequences, not pg\_proc. Add the routines reload in the committed\-only, only\-new mode \(as reloadSequencesFromHeapMode\). reloadUserRoutinesFromHeapForDB decodes only goopg rows \(Routine JSON in proargdefaults\); a PG 18.3 primary's pg\_proc row needs a decoder from the real columns \(proname, pronamespace, prolang, prorettype, proargtypes, provolatile, prosrc\). A replayed DROP FUNCTION should also unregister the routine.
   - 2026\-11\-25 \(done\): RefreshCatalogAfterReplay runs reloadUserRoutinesFromHeapForDBMode\(replay\): committed rows only, new routines registered, a registered user routine whose row is gone is dropped. pgProcRowRoutine decodes a PG 18.3 primary's pg\_proc row \(name, namespace, language, types by OID, volatility, strictness, kind, prosrc\); parseOIDVector reads proargtypes' raw oidvector image \(the text parser had turned it into garbage\). Both goopg\-standby pairings now resolve `'public.drop_func_test1()'::regprocedure`. Unit test TestParseOIDVector.
-- [ ] **M0149-0032d — a goopg standby registers schemas the primary creates**
+- [x] **M0149-0032d — a goopg standby registers schemas the primary creates**
   Kind: impl
   Parent: M0149-0032
   - 030 "schema creation": after a replayed CREATE SCHEMA drop\_schema\_test1 \+ CREATE TABLE in it, `'drop_schema_test1.drop_tab_test1'::regclass` fails on goopg standbys \(both pairings\). RefreshCatalogAfterReplay has no pg\_namespace reload \(ReloadUserDatabaseSchemasFromHeap exists for startup\).
+  - 2026\-11\-25 \(done\): RefreshCatalogAfterReplay now first runs reloadUserSchemasFromHeapForDBMode\(replay\): committed rows only, new schemas registered, and a user schema whose pg\_namespace row is gone \(replayed DROP SCHEMA\) unregistered via the new catalog.UserSchemasInDB. Running it before the table reload lets a table in a new schema resolve its namespace. 030's "schema creation" step now resolves `'drop_schema_test1.drop_tab_test1'::regclass` on both goopg\-standby pairings and fails only on stats \(0032e\). Unit test TestUserSchemasInDB.
+- [ ] **M0149-0032f — a goopg standby accepts connections to a database the primary created after the base backup**
+  Kind: impl
+  Parent: M0149-0032
+  - 030 "createdb": after a replayed CREATE DATABASE test, `psql -d test` on the goopg standby fails to connect \(both goopg\-standby pairings\). The standby's catalog does not learn databases from replayed pg\_database \(a shared catalog\) — check RefreshCatalogAfterReplay's dbOid 0 / global path and the database list.
 - [ ] **M0149-0032e — queries on a goopg hot standby create relation and function stats**
   Kind: impl
   Parent: M0149-0032

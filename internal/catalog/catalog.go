@@ -14528,6 +14528,20 @@ func (c *InMemory) CopyUserSchemas(src, dst uint32) []string {
 	return names
 }
 
+// UserSchemasInDB returns the user schemas registered in dbOid's database
+// (name -> oid; bootstrap schemas excluded). A running standby's catalog
+// refresh compares it with the replayed pg_namespace heap. M0149-0032d.
+func (c *InMemory) UserSchemasInDB(dbOid uint32) map[string]uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	n := c.ns(NamespaceDBOid(dbOid))
+	out := make(map[string]uint32, len(n.schemas))
+	for name, oid := range n.schemas {
+		out[name] = oid
+	}
+	return out
+}
+
 // UnregisterSchema removes a schema from dbOid's database (DefaultDBOid when
 // omitted). Called from DROP SCHEMA. A bootstrap schema (DROP SCHEMA public)
 // is removed from the shared set, as before — see the M0119-0006 ledger row.
