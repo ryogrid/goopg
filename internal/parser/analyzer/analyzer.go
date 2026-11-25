@@ -639,6 +639,40 @@ func analyzeInsert(s *parser.InsertStmt, cat catalog.Catalog) error {
 	if len(s.Rows) == 0 {
 		return analyzeError(s.Pos(), "42601", "INSERT requires at least one row")
 	}
+	// transformInsertStmt (analyze.c): a single VALUES row is transformed as
+	// a target list, so a set-returning function in it expands to rows as
+	// in a SELECT list (ProjectSet) — `INSERT INTO t VALUES
+	// (generate_series(1, 3))` inserts three. goopg plans that row as
+	// INSERT … SELECT <row>. A multi-row VALUES list is a VALUES RTE, where
+	// set-returning functions are not allowed. A row with DEFAULT stays a
+	// VALUES row (SetToDefault has no SELECT-list form here). M0149-0023c.
+	if len(s.Rows) == 1 {
+		row := s.Rows[0]
+		hasSRF, hasDefault := false, false
+		for _, e := range row {
+			if _, ok := e.(*parser.DefaultMarker); ok {
+				hasDefault = true
+			} else if exprHasSRF(e, cat) {
+				hasSRF = true
+			}
+		}
+		if hasSRF && !hasDefault {
+			sel := parser.NewSelectStmt(s.Pos())
+			for _, e := range row {
+				sel.Targets = append(sel.Targets, parser.NewResTarget(e.Pos(), "", e))
+			}
+			s.Select, s.Rows = sel, nil
+			return analyzeSelectWithParent(s.Select, cat, cteCtx)
+		}
+	} else {
+		for _, row := range s.Rows {
+			for _, e := range row {
+				if exprHasSRF(e, cat) {
+					return analyzeError(e.Pos(), "0A000", "set-returning functions are not allowed in VALUES")
+				}
+			}
+		}
+	}
 
 	targetCols, err := resolveInsertTargetColumns(tbl, cat, s)
 	if err != nil {

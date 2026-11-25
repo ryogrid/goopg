@@ -16537,11 +16537,19 @@ verify each at HEAD when the task starts.
   Parent: M0149-0023
   - Path\-to\-TAP: 003 standby\_1..6 \(goopg standbys\) ← the StreamReplayer honours recovery\_target / \_xid / \_time / \_name / \_lsn and pauses \(recovery\_target\_action = pause: "pausing at the end of recovery", reads served, pg\_wal\_replay\_resume\(\) promotes\) ← M0149\-0023.
   - Today the standby ignores every target; with a PG primary the counts are whatever replay reached when the poll fired \(timing\-dependent passes\). Reuse the archive\-recovery stop logic \(RecoveryStop, RestorePointOf\) and ctx.RecoveryPause.
-- [ ] **M0149-0023c — all\-goopg 003: every standby counts 1005 rows of tab\_int**
+- [x] **M0149-0023c — all\-goopg 003: every standby counts 1005 rows of tab\_int**
   Kind: impl
   Parent: M0149-0023
-  - Path\-to\-TAP: 003 all\-goopg ← goopg standbys of a goopg primary whose epoch was bumped by pg\_resetwal \-\-epoch 1 see the right rows ← M0149\-0023.
-  - Not diagnosed. 1000 rows exist at the backup; 1005 suggests a visibility error after replay — first suspect is the epoch bump on the goopg primary \(pg\_current\_xact\_id with epoch 1\).
+  - Path\-to\-TAP: 003 all\-goopg ← `INSERT INTO tab_int VALUES (generate_series(1001,2000))` inserts 1000 rows on the goopg primary ← M0149\-0023.
+  - 2026\-11\-25 \(done\): not the standby and not the epoch — the goopg primary inserted ONE row per `VALUES (generate_series(…))`, so five inserts gave 1005. transformInsertStmt treats a single VALUES row as a target list \(SRFs expand, in lockstep, NULL\-padded\); a multi\-row VALUES list is a VALUES RTE \("set\-returning functions are not allowed in VALUES", 0A000, caret at the SRF\). analyzeInsert now plans a single SRF row as INSERT … SELECT <row> and raises the error for multi\-row lists; output identical to PG 18.3 on the probe set. Regress: insert 249→240, tsrf 181→179, psql 297→297, vacuum 64→64 \(psql measured alone: run after insert it shows insert's leftover mlparted tables\). 003 all\-goopg now fails only on the standby\-mode target stops \(0023b\).
+- [ ] **M0149-0094 — pg\_current\_xact\_id\(\) ignores the xid epoch**
+  Kind: impl
+  Parent: none \(found while diagnosing M0149\-0023c; not a 003 assertion — recovery\_target\_xid truncates to 32 bits\)
+  - After `pg_resetwal --epoch 1`, PG's pg\_current\_xact\_id\(\) returns epoch<<32 \| xid \(4294968049 for xid 753\); goopg returns 753. pg\_control's nextXid epoch \(FullTransactionId\) is not carried into xid8 values.
+- [ ] **M0149-0095 — a standalone VALUES with a set\-returning function returns one row instead of erroring**
+  Kind: impl
+  Parent: none \(found while fixing M0149\-0023c\)
+  - `VALUES (generate_series(1,3))` and `SELECT … FROM (VALUES (generate_series(1,3))) v` return 1 row on goopg; PG raises "set\-returning functions are not allowed in VALUES" \(0A000\) — the check transformValuesClause applies to every VALUES RTE.
 - [ ] **M0149-0023d — a PG 18.3 standby of a goopg primary with recovery\_target = 'immediate' never becomes ready**
   Kind: impl
   Parent: M0149-0023

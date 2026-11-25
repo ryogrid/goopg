@@ -1,6 +1,6 @@
 # 0149-0023 — Port recovery/t/003\_recovery\_targets.pl
 
-Status: in progress. 0023a done \(2026\-11\-25\); 0023b–d open. `TestPort_Recovery003RecoveryTargetsFull`
+Status: in progress. 0023a and 0023c done \(2026\-11\-25\); 0023b and 0023d open. `TestPort_Recovery003RecoveryTargetsFull`
 \(`internal/testport/recovery_003_recovery_targets_test.go`\) is gated by `GOOPG_TAP_003`. It has three pairings:
 all\-goopg, a PG 18.3 primary with goopg standbys, and a goopg primary with PG 18.3 standbys.
 
@@ -32,8 +32,17 @@ are refused at startup. Archive recovery \(`standby => 0`\) to a restore point t
   that was never reached is the FATAL "recovery ended before configured recovery target was reached". That FATAL
   is now logged at FATAL in the server log, not only on stderr.
 
+## 0023c — SRF in a single INSERT VALUES row
+
+The all\-goopg standbys counted 1005 rows, but the fault was on the primary.
+`INSERT INTO tab_int VALUES (generate_series(1001,2000))` inserted one row.
+transformInsertStmt treats a single VALUES row as a target list, so a set\-returning function there expands to rows
+\(in lockstep, NULL\-padded, as in a SELECT list\). A multi\-row VALUES list is a VALUES RTE, where
+transformValuesClause refuses it: "set\-returning functions are not allowed in VALUES". `analyzeInsert` now plans a
+single row holding a set\-returning function, and no DEFAULT, as INSERT … SELECT <row>. It raises the error for
+multi\-row lists. The standalone VALUES form still lacks the check; it is filed as M0149\-0095.
+
 ## Open
 
 - 0023b: a goopg standby ignores every recovery target; it must stop at the target and pause there.
-- 0023c: all\-goopg standbys count 1005 rows; the epoch bump is the first suspect.
 - 0023d: a PG standby of the goopg primary with recovery\_target = 'immediate' never becomes ready.
