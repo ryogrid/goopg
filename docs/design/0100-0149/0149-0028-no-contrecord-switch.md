@@ -1,7 +1,6 @@
 # M0149\-0028 — Port recovery/t/043\_no\_contrecord\_switch.pl
 
-Status: in progress \(two of three pairings pass; the PG 18.3 primary with goopg standbys pairing is blocked on
-M0149\-0028a\).
+Status: done — TestPort\_Recovery043NoContrecordSwitch passes on all three pairings \(M0149\-0028, M0149\-0028a\).
 
 ## What the test needs
 
@@ -34,12 +33,14 @@ Path\-to\-TAP: 043 ← \(1\) an invalid record is the end of the available WAL o
 - The promotion's end of log was already correct: standby1 promotes at the start of the torn record \(the end of the
   last valid record\).
 
+- M0149\-0028a: the catalog heap loader \(initdb `loadUserTablesFromHeapForDBMode`\) decodes pg\_class rows with
+  `DecodePGClassPhysicalRow` first. A PG primary's first table has oid 16384 \(0x00004000\). The goopg logical
+  decoder read that leading 0x00 as its "not null" flag and returned garbage without an error, so the table never
+  reached a goopg standby's catalog, at replay or at restart. `deleteCatalogRowsForOID` and the pg\_attribute pass
+  already decoded physical\-first.
+
 ## Not done
 
-- M0149\-0028a: with a PG 18.3 primary, a table created after the base backup and replayed from the archive is missing
-  from the goopg standby's catalog. `pg_class` has no row, even after a restart; the xid is below the standby's
-  snapshot xmin; the commit is below the replay point \(pg\_waldump\). It reproduces without the zeroed page and with
-  a fast stop, and on HEAD before this work.
 - A standby with both `primary_conninfo` and `restore_command` still uses only the walreceiver. PG alternates the
   archive and streaming sources on failure \(WaitForWALToBecomeAvailable\); goopg switches only from archive to
   streaming, once.

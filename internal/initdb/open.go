@@ -3967,14 +3967,23 @@ func loadUserTablesFromHeapForDBMode(mgr *storage.Manager, cat *catalog.InMemory
 	// Pass 1: collect user table rows from pg_class.
 	classRows, err := scanCatalogHeapRows(mgr, classRel, clog, "pg_class",
 		func(ht storage.HeapTuple, _ storage.ItemPointer) (any, bool, error) {
-			physicalRow := false
-			row, err := catalog.DecodePGClassRow(ht.Data)
+			// The PG-physical decoder first, as deleteCatalogRowsForOID
+			// does: the goopg logical decoder reads a PG-physical row
+			// whose oid has a 0x00 low byte (16384, the first user oid)
+			// as its null-flag prefix and returns garbage without an
+			// error, so a table a PG primary created vanished from a
+			// goopg standby's catalog (M0149-0028a, the pg_attribute
+			// twin is M0149-0010b).
+			physicalRow := true
+			row, err := catalog.DecodePGClassPhysicalRow(ht.Data)
 			if err != nil {
-				row, err = catalog.DecodePGClassPhysicalRow(ht.Data)
+				physicalRow = false
+				row, err = catalog.DecodePGClassRow(ht.Data)
 				if err != nil {
 					return nil, false, err
 				}
-				physicalRow = true
+			}
+			if physicalRow {
 				// DecodePGClassPhysicalRow only covers the fixed-offset
 				// prefix; reloptions (attnum 33) is a varlena column past
 				// it, so re-decode the full PG18-canonical row with the

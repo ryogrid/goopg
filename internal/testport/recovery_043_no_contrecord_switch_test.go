@@ -21,18 +21,10 @@ import (
 // follow the new timeline from that boundary — no continuation record is
 // expected there — and replay what the promoted standby writes. It runs in
 // three pairings: all-goopg, a PG 18.3 primary with goopg standbys, and a
-// goopg primary with PG 18.3 standbys.
-//
-// Gated by GOOPG_TAP_043=1 until it passes (M0149-0028): the PG 18.3
-// primary with goopg standbys pairing still fails — a table the PG primary
-// creates after the backup is missing from the goopg standby's catalog
-// (M0149-0028a).
+// goopg primary with PG 18.3 standbys (M0149-0028).
 func TestPort_Recovery043NoContrecordSwitch(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping recovery TAP port in short mode")
-	}
-	if os.Getenv("GOOPG_TAP_043") == "" {
-		t.Skip("043 re-port is not passing yet (M0149-0028a); set GOOPG_TAP_043=1 to run")
 	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)

@@ -2619,3 +2619,39 @@ func TestUserPGTypeRowSupportProcs(t *testing.T) {
 		t.Errorf("domain over int4 typanalyze = %d", got)
 	}
 }
+
+// TestPGClassPhysicalRowOID16384NeedsPhysicalDecoderFirst pins why the
+// startup catalog loader (initdb loadUserTablesFromHeapForDBMode) and
+// deleteCatalogRowsForOID try DecodePGClassPhysicalRow before the goopg
+// logical decoder (M0149-0028a): a PG18-canonical pg_class row whose oid has
+// a 0x00 low byte — 16384, the first user oid, which a PG 18.3 primary gives
+// its first table — starts with the byte the logical decoder reads as a
+// "not null" flag, so that decoder does not reliably reject it. The physical
+// decoder must read the oid and name exactly.
+func TestPGClassPhysicalRowOID16384NeedsPhysicalDecoderFirst(t *testing.T) {
+	tbl := &catalog.Table{
+		Schema: "public",
+		Name:   "t",
+		OID:    16384,
+		Columns: []catalog.Column{
+			{Name: "?column?", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+		},
+	}
+	body, err := EncodeRowPG(pgClassColumnsPG18(), buildUserPGClassRow(nil, tbl))
+	if err != nil {
+		t.Fatalf("EncodeRowPG: %v", err)
+	}
+	if body[0] != 0 {
+		t.Fatalf("oid 16384's first byte = %#x, want 0x00 (the null-flag collision)", body[0])
+	}
+	row, err := catalog.DecodePGClassPhysicalRow(body)
+	if err != nil {
+		t.Fatalf("DecodePGClassPhysicalRow: %v", err)
+	}
+	if row.OID != 16384 || row.RelName != "t" || row.RelKind != "r" {
+		t.Fatalf("physical decode = oid %d name %q kind %q, want 16384 t r", row.OID, row.RelName, row.RelKind)
+	}
+	if lrow, lerr := catalog.DecodePGClassRow(body); lerr == nil && lrow.OID == 16384 && lrow.RelName == "t" {
+		t.Logf("logical decoder happens to read this row correctly; the physical-first order still applies")
+	}
+}
