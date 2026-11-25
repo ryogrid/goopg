@@ -322,11 +322,31 @@ func RenderTextStyled(elemName string, payload []byte, st OutputStyle) (string, 
 			elemName, size, align, varlena = "text", -1, 4, true
 		}
 	}
+	// dataoffset (relative to the varlena header, which payload omits) is
+	// nonzero when the array carries a null bitmap right after lbound[0]:
+	// bit i clear = element i is NULL and has no data (ARR_NULLBITMAP).
+	// M0149-0046a.
 	elemData := payload[20:]
+	var nullBitmap []byte
+	if dataOffset := int(binary.LittleEndian.Uint32(payload[4:8])); dataOffset > 0 {
+		nb := (n + 7) / 8
+		if dataOffset-4 > len(payload) || 20+nb > len(payload) {
+			return "", fmt.Errorf("pgarray: dataoffset %d out of range for a %d-byte array", dataOffset, len(payload)+4)
+		}
+		nullBitmap = payload[20 : 20+nb]
+		elemData = payload[dataOffset-4:]
+	}
 	var sb strings.Builder
 	sb.WriteByte('{')
 	off := 0
 	for i := 0; i < n; i++ {
+		if nullBitmap != nil && nullBitmap[i/8]&(1<<(i%8)) == 0 {
+			if i > 0 {
+				sb.WriteByte(ElemDelim(elemName))
+			}
+			sb.WriteString("NULL")
+			continue
+		}
 		off += alignPad(off, align)
 		s, adv, err := DecodeElemStyled(elemName, elemData[min(off, len(elemData)):], varlena, size, st)
 		if err != nil {

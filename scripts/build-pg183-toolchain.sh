@@ -3,7 +3,8 @@
 # tmp/pg183-inj: the same source as postgres/ (git archive of the submodule
 # HEAD), configured as local_install is (--enable-cassert --enable-tap-tests)
 # plus --enable-injection-points, with the contrib and test modules recovery
-# TAP tests load (pg_prewarm, test_decoding, injection_points).
+# TAP tests load (pg_prewarm, test_decoding, injection_points), plus the
+# hstore contrib type subscription/t/002_types.pl creates (M0149-0046).
 #
 # postgres/ and postgres/local_install are the read-only oracle and are never
 # touched: the source is extracted to tmp/pg183-src and installed to its own
@@ -16,10 +17,10 @@ cd "$(dirname "$0")/.."
 ROOT=$PWD
 SRC=$ROOT/tmp/pg183-src
 PREFIX=$ROOT/tmp/pg183-inj
-MODULES="contrib/pg_prewarm contrib/test_decoding src/test/modules/injection_points"
+MODULES="contrib/pg_prewarm contrib/test_decoding contrib/hstore src/test/modules/injection_points"
 if [[ "${1:-}" != "--force" && -x $PREFIX/bin/postgres ]]; then
 	missing=0
-	for ext in pg_prewarm test_decoding injection_points; do
+	for ext in pg_prewarm test_decoding hstore injection_points; do
 		[[ -e $PREFIX/share/postgresql/extension/$ext.control || $ext == test_decoding ]] || missing=1
 	done
 	[[ -e $PREFIX/lib/postgresql/test_decoding.so ]] || missing=1

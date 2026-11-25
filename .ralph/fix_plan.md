@@ -16952,6 +16952,33 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/subscription/t/002_types.pl` — arrays, composites, enums, domains, ranges over logical replication.
   Likely prerequisites \(verify at start\): pgoutput Type \(`Y`\) messages, text I/O of every listed type on both sides, range/multirange, domain constraints at apply.
+  - Path\-to\-TAP: 002 \(goopg\-node pairings\) ← 0046a…f; each blocker is one link \(the DDL / DML of 002 fails on any goopg node\).
+  - 2026\-11\-26 \(progress\): TestPort\_Subscription002Types written and gated by GOOPG\_TAP\_002, with the SQL and expected output extracted verbatim from the .pl. It passes PG↔PG, which checks the port. PG nodes use tapnode.NewPGModules; scripts/build\-pg183\-toolchain.sh installs contrib/hstore.
+- [x] **M0149-0046a — NULL array elements**
+  Kind: impl
+  Parent: M0149-0046
+  - 2026\-11\-26 \(done\): the encoder writes PG's null bitmap and dataoffset \(MAXALIGN\(24 \+ ceil\(n/8\)\)\); only the unquoted NULL token is NULL. array.RenderTextStyled reads the bitmap back, and a subscript of a NULL element returns SQL NULL. Unit test TestArrayCodecNullElements.
+  - Movement: regress arrays 1134→760 mismatched lines; 002's array and enum tables now match PG on a goopg node.
+- [ ] **M0149-0046b — btree keys on composite types**
+  Kind: impl
+  Parent: M0149-0046
+  - 002 DDL: `CREATE TABLE tst_comps \(a tst_comp_basic_t PRIMARY KEY, …\)` fails with "btree v0 only supports int4 / numeric keys, got "tst\_comp\_basic\_t"", as do tst\_comp\_enum\_array, tst\_comp\_enum\_what and tst\_comp\_mix\_array. PG compares them with btrecordcmp \(record\_cmp\).
+- [ ] **M0149-0046c — composite fields coerced to their column types**
+  Kind: impl
+  Parent: M0149-0046
+  - `INSERT … ROW\(1.0, 'a', 1\)` into a \(float8, text, int\) composite prints `\(1.0,a,1\)` \(PG: `\(1,a,1\)`\). An array field keeps its input spelling: `\(1.0,"\{a, b, c\}",1\)` \(PG: `\(1,"\{a,b,c\}",1\)`\). PG runs each field through its type's input/cast \(ExecEvalRow → coercion, record\_in\).
+- [ ] **M0149-0046d — range input canonicalised**
+  Kind: impl
+  Parent: M0149-0046
+  - int4range `'\[1, 10\]'` is stored as written \(`\[1, 10\]`\); PG range\_in \+ int4range\_canonical gives `\[1,11\)`. The same applies to int8range elements of an int8range\[\].
+- [ ] **M0149-0046e — range output follows the session TimeZone**
+  Kind: impl
+  Parent: M0149-0046
+  - tstzrange bounds print at \+00 under `SET timezone = '\+2'` \(PG range\_out → timestamptz\_out in the session zone\).
+- [ ] **M0149-0046f — hstore extension**
+  Kind: impl
+  Parent: M0149-0046
+  - `CREATE EXTENSION hstore` fails with "extension "hstore" is not available". 002 needs the type, its I/O, equality for UPDATE/DELETE by key, and its pgoutput text form.
 - [ ] **M0149-0047 — port subscription/t/010_truncate.pl**
   Kind: impl
   Parent: none

@@ -69,18 +69,44 @@ func encodeArrayValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]by
 		// still round-trips (the executor never type-checks element contents).
 		oid, align, varlena = 25, 4, true
 	}
-	elems := parseTextArrayDelim(d.StringValue(), array.ElemDelim(t.Name))
+	parsed := parseTextArrayElemsDelim(d.StringValue(), array.ElemDelim(t.Name))
+	elems := make([]string, len(parsed))
+	isNull := make([]bool, len(parsed))
+	for i, pe := range parsed {
+		elems[i] = pe.Text
+		// ReadArrayStr: only the unquoted, unescaped token NULL (any case)
+		// is a NULL element; "NULL" quoted is the four-letter string.
+		isNull[i] = !pe.Quoted && strings.EqualFold(pe.Text, "NULL")
+	}
 	if len(elems) == 0 {
 		return emptyArrayTypeBytes(oid), nil
 	}
-	var body []byte
-	for _, e := range elems {
-		if e == "NULL" {
-			return nil, &ExecError{Code: "0A000",
-				Message: "NULL array elements are not supported"}
+	// A NULL element sets no bit in the null bitmap and takes no data
+	// (array_in / construct_md_array). The bitmap follows lbound[0] and
+	// dataoffset is ARR_OVERHEAD_WITHNULLS = MAXALIGN(24 + ceil(n/8));
+	// an array without NULLs keeps dataoffset 0 and no bitmap.
+	// M0149-0046a.
+	hasNulls := false
+	for _, n := range isNull {
+		if n {
+			hasNulls = true
+			break
 		}
-		// Align this element relative to the body start (== absolute offset 24,
-		// which is MAXALIGN'd, so body-relative alignment matches PG).
+	}
+	var bitmap []byte
+	if hasNulls {
+		bitmap = make([]byte, (len(elems)+7)/8)
+	}
+	var body []byte
+	for i, e := range elems {
+		if isNull[i] {
+			continue
+		}
+		if hasNulls {
+			bitmap[i/8] |= 1 << (i % 8)
+		}
+		// Align this element relative to the body start (MAXALIGN'd in
+		// both layouts, so body-relative alignment matches PG).
 		if pad := alignPad(len(body), align); pad > 0 {
 			body = append(body, make([]byte, pad)...)
 		}
@@ -102,15 +128,23 @@ func encodeArrayValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]by
 	if pad := alignPad(len(body), align); pad > 0 {
 		body = append(body, make([]byte, pad)...)
 	}
-	total := arrayHeaderSize + len(body)
+	dataStart := arrayHeaderSize
+	dataOffset := 0
+	if hasNulls {
+		dataStart = arrayHeaderSize + len(bitmap)
+		dataStart += alignPad(dataStart, 8) // MAXALIGN
+		dataOffset = dataStart
+	}
+	total := dataStart + len(body)
 	buf := make([]byte, total)
 	binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
-	binary.LittleEndian.PutUint32(buf[4:8], 1)                  // ndim
-	binary.LittleEndian.PutUint32(buf[8:12], 0)                 // dataoffset (no nulls)
-	binary.LittleEndian.PutUint32(buf[12:16], oid)              // elemtype
+	binary.LittleEndian.PutUint32(buf[4:8], 1)                    // ndim
+	binary.LittleEndian.PutUint32(buf[8:12], uint32(dataOffset))  // dataoffset (0 = no nulls)
+	binary.LittleEndian.PutUint32(buf[12:16], oid)                // elemtype
 	binary.LittleEndian.PutUint32(buf[16:20], uint32(len(elems))) // dims[0]
-	binary.LittleEndian.PutUint32(buf[20:24], 1)               // lbound[0]
-	copy(buf[arrayHeaderSize:], body)
+	binary.LittleEndian.PutUint32(buf[20:24], 1)                  // lbound[0]
+	copy(buf[arrayHeaderSize:], bitmap)
+	copy(buf[dataStart:], body)
 	return buf, nil
 }
 

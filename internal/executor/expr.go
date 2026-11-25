@@ -12812,11 +12812,17 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				}
 				return NewStringDatum(string(runes[n])), nil
 			}
-			elems := parseTextArray(sv)
-			if n < 1 || int(n) > len(elems) {
+			pelems := parseTextArrayElems(sv)
+			if n < 1 || int(n) > len(pelems) {
 				return NullDatum, nil
 			}
-			elem := elems[n-1]
+			elem := pelems[n-1].Text
+			// A NULL element subscripts to SQL NULL (array_ref /
+			// array_get_element reads the null bitmap); only the unquoted
+			// NULL token is one. M0149-0046a.
+			if !pelems[n-1].Quoted && strings.EqualFold(elem, "NULL") {
+				return NullDatum, nil
+			}
 			// The planner stamped the element type onto ReturnType (its exprType
 			// array_subscript arm). Re-type the element text through that type's
 			// own input path so the subscript yields the element type's Datum
