@@ -16552,6 +16552,10 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: none \(found while fixing M0149\-0023c\)
   - `VALUES (generate_series(1,3))` and `SELECT … FROM (VALUES (generate_series(1,3))) v` return 1 row on goopg; PG raises "set\-returning functions are not allowed in VALUES" \(0A000\) — the check transformValuesClause applies to every VALUES RTE.
+- [ ] **M0149-0097 — 018\_wal\_optimize now fails earlier: duplicate key in the ins\_trunc case**
+  Kind: impl
+  Parent: none \(found while porting M0149\-0028\)
+  - TestPort\_Recovery018WalOptimize minimal and replica fail at "BEGIN; CREATE TABLE ins\_trunc \(id serial PRIMARY KEY …\); INSERT …; TRUNCATE ins\_trunc; INSERT …" with "Key \(id\)=\(1\) already exists" — reproduced on HEAD 91bd9e77b before the M0149\-0028 changes. The inventory row records 40/42 with only check\_orphan\_relfilenodes failing, so the TRUNCATE\-in\-transaction case regressed since 2bd12fdbe.
 - [ ] **M0149-0096 — promotion does not archive the old timeline's last segment as .partial**
   Kind: impl
   Parent: none \(found while porting M0149\-0027\)
@@ -16592,6 +16596,13 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/recovery/t/043_no_contrecord_switch.pl` — incomplete record at a segment boundary across a timeline switch.
   Likely prerequisites \(verify at start\): contrecord handling at TLI switch on promotion, streaming from the promoted node.
+  - Path\-to\-TAP: 043 ← \(1\) a goopg standby treats a record continuing onto an invalid page as the end of the available WAL, logging PG's "invalid magic number 0000 … offset N" \(the test waits for it\) ← \(2\) an archive\-only standby switches to streaming when a reload sets primary\_conninfo ← \(3\) M0149\-0028a \(pg18\-primary pairing only\).
+  - 2026\-11\-25 \(progress\): \(1\) and \(2\) landed — continuation page header validation in RecordIterator \(PG's XLogReaderValidatePageHeader messages\), SetEndOfWALAtInvalidRecord for standby replay \(log once, wait\), runArchiveThenStream \+ Writer.RewindTo \(stream from the segment start, RequestXLogStreaming\). TestPort\_Recovery043NoContrecordSwitch \(gated GOOPG\_TAP\_043\) passes all\-goopg 3/3 and goopg\-primary\-pg18\-standbys 3/3; pg18\-primary\-goopg\-standbys fails on \(3\). All other recovery/basebackup ports pass \(018 fails identically on HEAD — M0149\-0097\). Design: docs/design/0100\-0149/0149\-0028\-no\-contrecord\-switch.md.
+- [ ] **M0149-0028a — a table a PG 18.3 primary creates after the base backup is missing from a goopg standby that restores it from the archive**
+  Kind: impl
+  Parent: M0149-0028
+  - Path\-to\-TAP: 043 pg18\-primary\-goopg\-standbys ← standby1 sees table t \(CREATE TABLE t AS SELECT 0 right after the backup\) before and after promotion.
+  - Findings: pg\_class has no row for t on the goopg standby, also after a restart; t's xmin 752 is below the standby snapshot \(754:754:\); its COMMIT \(0/3018918, inval msgs\) is below the replay point 0/3018B10 \(pg\_waldump of the archive\). Reproduces without the zeroed page, with a fast primary stop, and on HEAD 91bd9e77b. Differences from 002 \(which passes with a PG primary\): the standby starts after all the WAL is archived and replays it within milliseconds of startup. Also: `SELECT pg_current_snapshot()` on that standby says the function does not exist, though goopg has it — the standby may resolve against a catalog that is not the replayed one. Next: check which catalog the standby loads for db 5 and whether RefreshCatalogAfterReplay runs for this commit \(log in the hook\).
 - [ ] **M0149-0029 — port recovery/t/032_relfilenode_reuse.pl**
   Kind: impl
   Parent: none

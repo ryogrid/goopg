@@ -80,6 +80,28 @@ type RecordIterator struct {
 	// flush LSN this way (walsummarizer.c reads up to GetFlushRecPtr), so a
 	// summary never covers WAL a crash could still rewrite.
 	readLimit func() uint64
+	// endOfWALAtInvalid makes an invalid record — a continuation page whose
+	// header fails validation, or a record whose CRC does not match — the
+	// end of the WAL available for now, as recovery's ReadRecord treats it:
+	// the reason is logged once (emode_for_corrupt_record: LOG) and Next
+	// waits for new WAL instead of failing (M0149-0028). Standby replay sets
+	// it; lastInvalidPos is where the reason was last logged.
+	endOfWALAtInvalid bool
+	lastInvalidPos    int64
+}
+
+// invalidPageHeaderError is XLogReaderValidatePageHeader's failure for a
+// page a record continues onto; Msg is PostgreSQL's text.
+type invalidPageHeaderError struct{ Msg string }
+
+func (e *invalidPageHeaderError) Error() string { return e.Msg }
+
+// SetEndOfWALAtInvalidRecord makes an invalid record the end of the WAL
+// available for now instead of an error (recovery's ReadRecord). Call
+// before the first Next.
+func (it *RecordIterator) SetEndOfWALAtInvalidRecord() {
+	it.endOfWALAtInvalid = true
+	it.lastInvalidPos = -1
 }
 
 // SetReadLimit bounds Next by limit() (an LSN in WrittenLSN's convention,
@@ -223,6 +245,24 @@ func (it *RecordIterator) Next(ctx context.Context) (Record, error) {
 				it.overwrittenRecPtr = uint64(it.pos)
 				it.pos = ow.page
 				continue
+			}
+			if err != nil && it.endOfWALAtInvalid {
+				var bad *invalidPageHeaderError
+				if errors.As(err, &bad) || errors.Is(err, ErrCorruptRecord) {
+					if it.pos != it.lastInvalidPos {
+						at := fmt.Sprintf("%X/%X", uint32(uint64(it.pos)>>32), uint32(uint64(it.pos)))
+						msg := "incorrect resource manager data checksum in record at " + at
+						if bad != nil {
+							msg = bad.Msg
+						}
+						slog.Info(msg)
+						it.lastInvalidPos = it.pos
+					}
+					if err := it.parkUntilWake(ctx, true); err != nil {
+						return Record{}, err
+					}
+					continue
+				}
 			}
 			if err != nil {
 				if errors.Is(err, ErrLSNNotWritten) {
@@ -544,6 +584,15 @@ func (it *RecordIterator) readRecordBytesAt(pos int64, n int) ([]byte, int, erro
 		cur := pos + int64(advance)
 		if cur%XLOGBlockSize == 0 {
 			hsize := pageHeaderSizeAt(cur, it.segSize)
+			// XLogReaderValidatePageHeader on each page the record
+			// continues onto, once its header has been written.
+			if cur > pos {
+				if hdr, err := it.readBytesAt(cur, SizeOfXLogShortPHD); err == nil {
+					if msg := it.validateContPageHeader(hdr, uint64(cur)); msg != "" {
+						return nil, 0, &invalidPageHeaderError{Msg: msg}
+					}
+				}
+			}
 			advance += hsize
 			continue
 		}
@@ -560,6 +609,35 @@ func (it *RecordIterator) readRecordBytesAt(pos int64, n int) ([]byte, int, erro
 		advance += want
 	}
 	return out, advance, nil
+}
+
+// validateContPageHeader is XLogReaderValidatePageHeader's magic, info-bits
+// and pageaddr checks for a page at PG LSN page, returning PostgreSQL's
+// message or "" when the header is valid.
+func (it *RecordIterator) validateContPageHeader(hdr []byte, page uint64) string {
+	if len(hdr) < SizeOfXLogShortPHD {
+		return ""
+	}
+	magic := binary.LittleEndian.Uint16(hdr[0:2])
+	info := binary.LittleEndian.Uint16(hdr[2:4])
+	pageAddr := binary.LittleEndian.Uint64(hdr[8:16])
+	segSize := it.segSize
+	tli := it.segFileTLI
+	if tli == 0 && it.writer != nil {
+		tli = it.writer.TimelineID()
+	}
+	fname := XLogFileName(tli, page/uint64(segSize), segSize)
+	segOff := page % uint64(segSize)
+	lsn := func(v uint64) string { return fmt.Sprintf("%X/%X", uint32(v>>32), uint32(v)) }
+	switch {
+	case magic != XLOGPageMagic:
+		return fmt.Sprintf("invalid magic number %04X in WAL segment %s, LSN %s, offset %d", magic, fname, lsn(page), segOff)
+	case info&^0x000F != 0:
+		return fmt.Sprintf("invalid info bits %04X in WAL segment %s, LSN %s, offset %d", info, fname, lsn(page), segOff)
+	case pageAddr != page:
+		return fmt.Sprintf("unexpected pageaddr %s in WAL segment %s, LSN %s, offset %d", lsn(pageAddr), fname, lsn(page), segOff)
+	}
+	return ""
 }
 
 // readBytesAt fetches `n` bytes starting at byte offset `pos` in the

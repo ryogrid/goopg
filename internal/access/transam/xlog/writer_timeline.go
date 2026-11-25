@@ -62,35 +62,8 @@ func (w *Writer) SwitchTimeline(newTLI uint32, endOfLog, prevRecPtr uint64) erro
 	// Resume insertion at endOfLog. The tracker, the WAL buffer, the
 	// sender ring and the published watermark all restart there; with no
 	// insertion in flight none of them holds a byte past it that matters.
-	if endOfLog < uint64(s.writePos) {
-		s.writePos = int64(endOfLog)
-		s.memRing.ResetToPos(int64(endOfLog))
-	}
-	s.writeLSN = endOfLog
-	s.drainedLSN = min(s.drainedLSN, endOfLog)
-	s.flushedLSN = min(s.flushedLSN, endOfLog)
-	if s.writeLSNMirror != nil {
-		s.writeLSNMirror.Store(endOfLog)
-	}
-	if s.drainedLSNMirror != nil {
-		s.drainedLSNMirror.Store(s.drainedLSN)
-	}
-	if s.flushedLSNMirror != nil {
-		s.flushedLSNMirror.Store(s.flushedLSN)
-	}
-	if s.walBuf != nil {
-		s.walBuf.reset(int64(endOfLog))
-	}
-	s.prevRecPtr = prevRecPtr
-	s.core.resetPosition(endOfLog, prevRecPtr)
-	s.core.resetPublished(int64(endOfLog))
-
 	// Every open segment file is named for the old timeline.
-	for segNo, f := range s.files {
-		_ = f.Close()
-		delete(s.files, segNo)
-	}
-	clear(s.dirty)
+	s.resetInsertPosition(endOfLog, prevRecPtr)
 
 	segSize := uint64(s.cfg.SegmentSize)
 	endSeg := endOfLog / segSize
@@ -108,6 +81,72 @@ func (w *Writer) SwitchTimeline(newTLI uint32, endOfLog, prevRecPtr uint64) erro
 	}
 	s.tli.Store(newTLI)
 	return syncDir(s.cfg.WALDir)
+}
+
+// resetInsertPosition moves insertion back to pos: the tracker, the WAL
+// buffer, the sender ring and the published watermarks restart there, and
+// the open segment files are closed. The caller holds writeMu and appendMu
+// with nothing appending.
+func (s *state) resetInsertPosition(pos, prevRecPtr uint64) {
+	if pos < uint64(s.writePos) {
+		s.writePos = int64(pos)
+		s.memRing.ResetToPos(int64(pos))
+	}
+	s.writeLSN = pos
+	s.drainedLSN = min(s.drainedLSN, pos)
+	s.flushedLSN = min(s.flushedLSN, pos)
+	if s.writeLSNMirror != nil {
+		s.writeLSNMirror.Store(pos)
+	}
+	if s.drainedLSNMirror != nil {
+		s.drainedLSNMirror.Store(s.drainedLSN)
+	}
+	if s.flushedLSNMirror != nil {
+		s.flushedLSNMirror.Store(s.flushedLSN)
+	}
+	if s.walBuf != nil {
+		s.walBuf.reset(int64(pos))
+	}
+	s.prevRecPtr = prevRecPtr
+	s.core.resetPosition(pos, prevRecPtr)
+	s.core.resetPublished(int64(pos))
+	for segNo, f := range s.files {
+		_ = f.Close()
+		delete(s.files, segNo)
+	}
+	clear(s.dirty)
+}
+
+// RewindTo moves a standby's WAL insertion back to segStart, a segment
+// boundary on the current timeline, so a walreceiver started there
+// re-receives the segment over what was restored. It is
+// RequestXLogStreaming's start point: streaming begins at the start of the
+// segment holding the record recovery could not read, and the walreceiver
+// overwrites pg_wal from there (M0149-0028). The restored bytes before the
+// invalid record are the same WAL, so the replayer, parked past segStart,
+// re-reads nothing it already applied. Precondition: nothing appends
+// concurrently (the archive feeder has stopped, no walreceiver yet).
+func (w *Writer) RewindTo(segStart uint64) error {
+	s := w.stateRef
+	if s == nil {
+		return ErrClosed
+	}
+	if segStart%uint64(s.cfg.SegmentSize) != 0 {
+		return fmt.Errorf("wal: rewind: %X is not a segment boundary", segStart)
+	}
+	if segStart >= w.WrittenLSN() {
+		return nil
+	}
+	if err := w.FlushUpTo(w.WrittenLSN()); err != nil {
+		return fmt.Errorf("wal: rewind: flush: %w", err)
+	}
+	s.eagerWG.Wait()
+	s.writeMu.lock()
+	defer s.writeMu.release()
+	s.appendMu.Lock()
+	defer s.appendMu.Unlock()
+	s.resetInsertPosition(segStart, 0)
+	return nil
 }
 
 // InsertPosition returns where the next record goes and the 0-based start

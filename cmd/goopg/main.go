@@ -1331,6 +1331,9 @@ func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Ru
 			return
 		}
 		defer func() { _ = iter.Close() }()
+		// ReadRecord: an invalid record is where the available WAL ends
+		// for now; the standby waits for more (M0149-0028).
+		iter.SetEndOfWALAtInvalidRecord()
 		logger.Info("standby mode: starting continuous WAL replay",
 			"start_lsn", iterStartLSN)
 		if err := sr.Run(ctx, iter); err != nil {

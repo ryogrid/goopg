@@ -221,7 +221,7 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 	// Without primary_conninfo, a standby with restore_command takes its
 	// WAL from the archive instead (M0149-0018b).
 	if stringGUC(registry, "primary_conninfo", "") == "" && stringGUC(registry, "restore_command", "") != "" {
-		go runArchiveFeeder(rcvCtx, rcvDone, rt, registry, logger)
+		go runArchiveThenStream(rcvCtx, rcvDone, rt, registry, logger, replayer, systemID, rcvWALDir)
 	} else {
 		startWalReceiverForStandby(rcvCtx, rcvDone, rt, registry, logger, replayer, systemID, rcvWALDir)
 	}
@@ -1445,6 +1445,47 @@ func startWalReceiverForStandby(rcvCtx context.Context, rcvDone chan struct{}, r
 			}
 		},
 	})
+}
+
+// runArchiveThenStream feeds a standby without primary_conninfo from the
+// archive until a reload sets primary_conninfo (PGC_SIGHUP), then switches
+// to streaming, as WaitForWALToBecomeAvailable does: the walreceiver starts
+// at the segment holding the next record replay needs
+// (RequestXLogStreaming rounds the start down to the segment), on the
+// current timeline, and re-receives that segment over what the archive
+// supplied — past an invalid record the archive copy is not the WAL the
+// upstream has (043_no_contrecord_switch, M0149-0028). done closes once
+// both the feeder and any walreceiver have exited.
+func runArchiveThenStream(ctx context.Context, done chan struct{}, rt *initdb.Runtime, registry *misc.Registry, logger *slog.Logger, replayer *xlog.StreamReplayer, systemID uint64, rcvWALDir string) {
+	defer close(done)
+	feedCtx, feedCancel := context.WithCancel(ctx)
+	defer feedCancel()
+	feedDone := make(chan struct{})
+	go runArchiveFeeder(feedCtx, feedDone, rt, registry, logger)
+	tick := time.NewTicker(200 * time.Millisecond)
+	defer tick.Stop()
+	for stringGUC(registry, "primary_conninfo", "") == "" {
+		select {
+		case <-ctx.Done():
+			<-feedDone
+			return
+		case <-feedDone:
+			return // a FATAL restore failure
+		case <-tick.C:
+		}
+	}
+	feedCancel()
+	<-feedDone
+	if rt.WAL != nil && replayer != nil {
+		segSize := uint64(rt.WAL.SegmentSize())
+		next := replayer.ApplyLSN()
+		if err := rt.WAL.RewindTo(next - next%segSize); err != nil {
+			logger.Warn("standby mode: could not rewind WAL to the streaming start point", "err", err)
+		}
+	}
+	rcvDone := make(chan struct{})
+	startWalReceiverForStandby(ctx, rcvDone, rt, registry, logger, replayer, systemID, rcvWALDir)
+	<-rcvDone
 }
 
 // removeRecoveryFiles drops pg_wal/RECOVERYXLOG and RECOVERYHISTORY, as
