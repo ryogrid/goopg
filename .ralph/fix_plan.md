@@ -16704,16 +16704,22 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: M0149-0033
   - pgstat\_progress\_update\_param\(PROGRESS\_VACUUM\_NUM\_INDEX\_VACUUMS\) per index pass; with maintenance\_work\_mem = 64 the dead\-item store fills and forces several passes \(TidStore limit\).
-- [ ] **M0149-0034 — port recovery/t/041_checkpoint_at_promote.pl**
+- [!] **M0149-0034 — port recovery/t/041_checkpoint_at_promote.pl** — blocked-on owner: architecture \(backend kill\)
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/041_checkpoint_at_promote.pl` — restartpoint racing a promotion; WAL removal stays correct.
   Likely prerequisites \(verify at start\): `injection_points` extension equivalent \(`injection_points_attach/wakeup/detach`, wait mode, PG point names\) — first test to need it; restartpoint/promotion race. Never `kill()` a goopg "backend pid" — `pg_backend_pid()` is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID; a backend-kill step that needs per-backend OS processes goes to `[!] blocked-on owner: architecture`. PG side: first task needing `injection_points` — file the one-time child "build the PG 18.3 test-module toolchain" first: `mkdir -p tmp/pg183-src && git -C postgres archive HEAD | tar -x -C tmp/pg183-src`; in `tmp/pg183-src` run `./configure --enable-cassert --enable-tap-tests --enable-injection-points --prefix=$PWD/../pg183-inj`, `make`, `make install`, `make -C contrib/test_decoding install`, `make -C src/test/modules/injection_points install`. Do not reuse the `--prefix` from `pg_config --configure` \(it is `postgres/local_install`\); never touch `./postgres` or `postgres/local_install` \(milestone C3\). If M0149-0034 is ever `[!]`, re-parent the toolchain child to M0149-0035 \(a held root holds its children\).
-- [ ] **M0149-0035 — port recovery/t/006_logical_decoding.pl**
+  - 2026\-11\-25 \(blocked\): after the restartpoint completes, 041 runs `SELECT pg_backend_pid()` on the promoted standby and `pg_ctl kill KILL <pid>` to crash one backend, then expects restart\_after\_crash and the WAL needed for crash recovery to survive. goopg backends are goroutines and pg\_backend\_pid\(\) is synthetic, so per this entry's own rule the backend\-kill step is `blocked-on owner: architecture`. It also needs a goopg injection\_points equivalent \(create\-restart\-point wait/wakeup\). The PG 18.3 test\-module toolchain child is already done: scripts/build\-pg183\-toolchain.sh builds tmp/pg183\-inj with injection\_points, test\_decoding and pg\_prewarm \(M0149\-0029\). M0149\-0035 and later use it.
+- [!] **M0149-0035 — port recovery/t/006_logical_decoding.pl** — blocked-on M0149-0035a
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/006_logical_decoding.pl` — logical decoding via SQL and `pg_recvlogical`.
   Likely prerequisites \(verify at start\): `test_decoding` output plugin \(absent today\), `pg_logical_slot_get/peek_changes`, PG 18.3 `pg_recvlogical` against goopg, slot persistence/`pg_replslot` format, drop-database-with-slot errors. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034.
+  - 2026\-11\-25 \(skipped as detour, no port written\): goopg has no test\_decoding plugin; pg\_logical\_slot\_get/peek\_changes exist only as catalog rows \(no executor implementation\); the walsender rejects every plugin but pgoutput \(internal/replication/walsender.go:397\). Path\-to\-TAP ≥ 4 links: plugin, SQL decoding SRFs, pg\_recvlogical through the walsender, slot behaviours. Filed the shared prerequisite M0149\-0035a, which also gates M0149\-0036 \(010 creates test\_decoding slots\).
+- [ ] **M0149-0035a — test\_decoding output plugin and SQL logical decoding \(pg\_logical\_slot\_get/peek\_\[binary\_\]changes\)**
+  Kind: impl
+  Parent: M0149-0035
+  - Shared prerequisite of 006 \(M0149\-0035\) and 010 \(M0149\-0036\). An xlog.OutputPlugin \(internal/access/transam/xlog/decoder.go\) producing contrib/test\_decoding's text \("BEGIN <xid>", "table public.t: INSERT: a\[integer\]:1", "COMMIT <xid>"; include\-xids / skip\-empty\-xacts options\); the four SRFs over a logical slot \(confirmed\_flush advance for get, none for peek\); the walsender accepting test\_decoding for pg\_recvlogical. CREATE EXTENSION is not needed \(test\_decoding is a plugin, loaded by name\).
 - [ ] **M0149-0036 — port recovery/t/010_logical_decoding_timelines.pl**
   Kind: impl
   Parent: none
