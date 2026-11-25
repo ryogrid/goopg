@@ -256,12 +256,19 @@ func (p *PgOutput) Change(c Change) error {
 	return fmt.Errorf("pgoutput: unknown change kind %d", c.Kind)
 }
 
-// relationIsPublishable is is_publishable_class's relation half for a
-// decoded change: a user relation (OID >= FirstNormalObjectId) outside
-// pg_catalog, information_schema and pg_toast. It also covers
+// relationIsPublishable is is_publishable_class for a decoded change: a
+// user relation (OID >= FirstNormalObjectId) outside pg_catalog,
+// information_schema and pg_toast whose relkind / persistence is
+// publishable (RelationDef.NotPublishable). It also covers
 // RelationIsLogicallyLogged's !IsCatalogRelation (catalog OIDs are below
 // FirstUnpinnedObjectId, hence below FirstNormalObjectId).
 func relationIsPublishable(rel *RelationDef) bool {
+	if rel.NotPublishable {
+		// A materialized view (or another non-table relkind): its heap
+		// writes decode, but pgoutput never publishes them
+		// (is_publishable_class, bug #15044). M0149-0045.
+		return false
+	}
 	switch strings.ToLower(rel.Schema) {
 	case "pg_catalog", "information_schema", "pg_toast":
 		return false

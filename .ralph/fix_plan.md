@@ -16939,11 +16939,14 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: M0149-0044
   - Nearby defect, filed, not worked. PG's apply\_handle\_update skips the change and logs "logical replication did not find row to be updated in replication target relation …" \(update\_missing conflict, LOG\). goopg inserts the new tuple without local defaults.
-- [ ] **M0149-0045 — port subscription/t/009_matviews.pl**
+- [x] **M0149-0045 — port subscription/t/009_matviews.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/009_matviews.pl` — materialized views are not replicated.
   Likely prerequisites \(verify at start\): decoding skips matview refresh / transient heaps.
+  - 2026\-11\-26 \(done\): TestPort\_Subscription009Matviews passes 3/3 in all three pairings.
+    - The first pass was luck. A probe showed that REFRESH MATERIALIZED VIEW on a goopg publisher streamed the matview's rows, and a goopg subscriber's apply worker then failed \("INSERT for relation public.testmv1 has no local table"\) and lost later changes.
+    - RelationDef.NotPublishable = !catalog.IsPublishableTable\(t\); relationIsPublishable skips it \(is\_publishable\_class\). Unit test TestPgOutputSkipsMaterializedView.
 - [ ] **M0149-0046 — port subscription/t/002_types.pl**
   Kind: impl
   Parent: none

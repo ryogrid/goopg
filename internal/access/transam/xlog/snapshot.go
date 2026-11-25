@@ -47,6 +47,12 @@ type RelationDef struct {
 	// ReplIdent is pg_class.relreplident ('d', 'f', 'i', 'n'), which the
 	// Relation message carries (logicalrep_write_rel).
 	ReplIdent byte
+	// NotPublishable marks a relation is_publishable_class rejects — a
+	// materialized view, view, sequence, foreign, temporary or unlogged
+	// table — whose heap writes logical decoding still sees (a REFRESH
+	// MATERIALIZED VIEW rewrites the matview's heap, bug #15044). The
+	// zero value is publishable. M0149-0045.
+	NotPublishable bool
 }
 
 // ColumnDef mirrors `catalog.Column` but lives in the snapshot
@@ -121,6 +127,9 @@ func relationDefFor(c *catalog.InMemory, t *catalog.Table, dbOid ...uint32) *Rel
 		OID:       t.OID,
 		Columns:   make([]ColumnDef, len(t.Columns)),
 		ReplIdent: catalog.ReplIdentOrDefault(t.ReplicaIdentity)[0],
+		// is_publishable_class (the sibling the publication table
+		// lists use, M0149-0041b).
+		NotPublishable: !catalog.IsPublishableTable(t),
 	}
 	ident := identityColumns(c, t, def.ReplIdent, dbOid...)
 	for i, col := range t.Columns {

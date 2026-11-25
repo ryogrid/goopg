@@ -707,3 +707,33 @@ func TestPgOutputSkipsCatalogRelations(t *testing.T) {
 		t.Errorf("catalog change emitted %x, want nothing", buf.Bytes())
 	}
 }
+
+// TestPgOutputSkipsMaterializedView pins is_publishable_class for a
+// decoded matview change (bug #15044, 009_matviews.pl): REFRESH
+// MATERIALIZED VIEW rewrites the matview's heap, and with FOR ALL TABLES
+// (no filter) the goopg walsender streamed those rows, so a subscriber
+// without the relation failed every apply and stopped. The matview's
+// RelationDef is NotPublishable and its changes emit nothing (M0149-0045).
+func TestPgOutputSkipsMaterializedView(t *testing.T) {
+	c := catalog.NewInMemory()
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "testmv1"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl.IsMatView = true
+	snap, rel := BuildCatalogSnapshot(c, nil), c.RelFileNode(tbl)
+	if def, ok := snap.Lookup(rel); !ok || !def.NotPublishable {
+		t.Fatalf("matview RelationDef = %+v (ok=%v), want NotPublishable", def, ok)
+	}
+	var buf bytes.Buffer
+	po := NewPgOutput(snap, &buf)
+	if err := po.Change(Change{Kind: ChangeInsert, Rel: rel,
+		NewTuple: wrapAsHeapTuple(t, encodeBodyV0([]any{1}, []string{"int4"}), 1)}); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("matview change emitted %x, want nothing", buf.Bytes())
+	}
+}
