@@ -871,20 +871,34 @@ func TestAlterSubscriptionPublications(t *testing.T) {
 	wantPubs("s", "p1", "q1")
 	// Missing publications: singular and plural WARNING shapes
 	// (errmsg_plural, :493-501), statement lands.
+	// They are WARNINGs with ERRCODE_UNDEFINED_OBJECT (M0149-0043a; they
+	// were NOTICEs before).
+	wantWarning := func(label, msg string) {
+		t.Helper()
+		w := ctx.TakeWarningsWithHint()
+		if len(w) != 1 || w[0].Code != "42704" || w[0].Message != msg {
+			t.Fatalf("%s warnings = %+v, want one 42704 %q", label, w, msg)
+		}
+		if n := ctx.TakeNotices(); len(n) != 0 {
+			t.Fatalf("%s left notices %v", label, n)
+		}
+	}
 	hookMissing = []string{"p9"}
 	create("ALTER SUBSCRIPTION s ADD PUBLICATION p9")
-	notices := ctx.TakeNotices()
-	if len(notices) != 1 || notices[0] != `publication "p9" does not exist on the publisher` {
-		t.Fatalf("singular missing notices = %v", notices)
-	}
+	wantWarning("singular missing", `publication "p9" does not exist on the publisher`)
 	wantPubs("s", "p1", "q1", "p9")
 	hookMissing = []string{"p9", "p10"}
 	create("ALTER SUBSCRIPTION s SET PUBLICATION p9, p10")
-	notices = ctx.TakeNotices()
-	if len(notices) != 1 || notices[0] != `publications "p9", "p10" do not exist on the publisher` {
-		t.Fatalf("plural missing notices = %v", notices)
-	}
+	wantWarning("plural missing", `publications "p9", "p10" do not exist on the publisher`)
 	wantPubs("s", "p9", "p10")
+	// CREATE SUBSCRIPTION with connect = true runs the same check
+	// (subscriptioncmds.c:723) and still creates the subscription.
+	hookMissing = []string{"gone"}
+	create("CREATE SUBSCRIPTION s_create CONNECTION 'host=remote dbname=postgres' PUBLICATION p1, gone WITH (create_slot = false, enabled = false)")
+	wantWarning("create missing", `publication "gone" does not exist on the publisher`)
+	if hookName != "s_create" || len(hookPubs) != 2 {
+		t.Fatalf("CREATE check call = %q %v, want s_create [p1 gone]", hookName, hookPubs)
+	}
 	// A hook error maps to PG's message+SQLSTATE and aborts before the
 	// list write (PG updates the tuple only after the refresh succeeds).
 	hookMissing = nil

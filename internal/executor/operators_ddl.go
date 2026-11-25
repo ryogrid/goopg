@@ -1366,6 +1366,16 @@ func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
 	// worker's START_REPLICATION finds no slot and exits on every retry.
 	// It runs before the registry insert: PG's catalog row rolls back with
 	// a failed CREATE SUBSCRIPTION, goopg's registry insert does not.
+	// CreateSubscription with connect = true: check_publications on the
+	// publisher first (subscriptioncmds.c:723), a WARNING per missing
+	// publication, before the slot is created. M0149-0043a.
+	if opts.connect && o.ctx.CheckPublicationsOnPublisher != nil {
+		missing, cerr := o.ctx.CheckPublicationsOnPublisher(s.Name, s.Conninfo, s.Publications)
+		if cerr != nil {
+			return cerr
+		}
+		o.warnMissingPublications(missing)
+	}
 	if opts.connect && opts.createSlot && o.ctx.CreateSubscriptionSlot != nil {
 		if err := o.ctx.CreateSubscriptionSlot(s.Name, s.Conninfo, slotName); err != nil {
 			return err
@@ -1521,6 +1531,24 @@ func (o *ddlOp) execAlterPublicationOptions(s *parser.AlterPublicationOptionsStm
 // (OpenTableList filters duplicates). Membership is journalled as
 // pg_publication_rel rows — written for added tables, xmax-stamped for dropped
 // ones — which the startup reload rebuilds the registry from.
+// warnMissingPublications is check_publications' report
+// (subscriptioncmds.c:493-501): one WARNING (ERRCODE_UNDEFINED_OBJECT)
+// naming every publication missing on the publisher, singular or plural.
+func (o *ddlOp) warnMissingPublications(missing []string) {
+	if len(missing) == 0 {
+		return
+	}
+	quoted := make([]string, len(missing))
+	for i, m := range missing {
+		quoted[i] = `"` + m + `"`
+	}
+	msg := fmt.Sprintf("publication %s does not exist on the publisher", quoted[0])
+	if len(missing) > 1 {
+		msg = fmt.Sprintf("publications %s do not exist on the publisher", strings.Join(quoted, ", "))
+	}
+	o.ctx.AddWarningWithHint("42704", msg, "")
+}
+
 func (o *ddlOp) execAlterPublicationTables(s *parser.AlterPublicationTablesStmt) error {
 	if o.ctx.PubSub == nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER PUBLICATION requires PubSub registry in Context"}
@@ -1884,15 +1912,7 @@ func (o *ddlOp) execAlterSubscriptionPublications(s *parser.AlterSubscriptionPub
 		if cerr != nil {
 			return cerr
 		}
-		if len(missing) == 1 {
-			o.ctx.AddNotice(fmt.Sprintf("publication %q does not exist on the publisher", missing[0]))
-		} else if len(missing) > 1 {
-			quoted := make([]string, len(missing))
-			for i, m := range missing {
-				quoted[i] = `"` + m + `"`
-			}
-			o.ctx.AddNotice(fmt.Sprintf("publications %s do not exist on the publisher", strings.Join(quoted, ", ")))
-		}
+		o.warnMissingPublications(missing)
 	}
 
 	// AlterSubscription_refresh's data half (subscriptioncmds.c:820-880)
