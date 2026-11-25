@@ -26,6 +26,9 @@
 package xlog
 
 import (
+	"strings"
+	"sync"
+
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/nodes"
 	"github.com/goopg/goopg/internal/access/transam"
@@ -69,7 +72,15 @@ type ColumnDef struct {
 // classifier already extracts that, and `RelOid` is the
 // stable identifier across schema renames.
 type CatalogSnapshot struct {
+	// mu guards rels: Current replaces a relation's definition when the
+	// live catalog's shape moved on (M0149-0042b).
+	mu   sync.RWMutex
 	rels map[uint32]*RelationDef
+	// live / dbOid are the catalog the snapshot was built from, which
+	// Current consults for schema changes made after the build. nil
+	// live (tests, no catalog) keeps the snapshot frozen.
+	live  *catalog.InMemory
+	dbOid []uint32
 	// RegOut renders a reg* column value's 4-byte OID as its NAME (PG's text-mode
 	// pgoutput serializes a reg* value through its typoutput — regclassout etc. —
 	// via OidOutputFunctionCall, proto.c:848; the numeric OID is BINARY mode's
@@ -93,30 +104,36 @@ func BuildCatalogSnapshot(c *catalog.InMemory, regOut func(string, uint32) strin
 		return &CatalogSnapshot{rels: map[uint32]*RelationDef{}}
 	}
 	tables := c.AllTables(dbOid...)
-	out := &CatalogSnapshot{rels: make(map[uint32]*RelationDef, len(tables))}
+	out := &CatalogSnapshot{rels: make(map[uint32]*RelationDef, len(tables)), live: c, dbOid: dbOid}
 	out.RegOut = regOut
 	for _, t := range tables {
-		def := &RelationDef{
-			Schema:    t.Schema,
-			Name:      t.Name,
-			OID:       t.OID,
-			Columns:   make([]ColumnDef, len(t.Columns)),
-			ReplIdent: catalog.ReplIdentOrDefault(t.ReplicaIdentity)[0],
-		}
-		ident := identityColumns(c, t, def.ReplIdent, dbOid...)
-		for i, col := range t.Columns {
-			def.Columns[i] = ColumnDef{
-				Name:      col.Name,
-				Type:      col.Type,
-				NotNull:   col.NotNull,
-				Ordinal:   col.Ordinal,
-				Typmod:    nodes.ColumnTypmod(col.Type.Name, col.Type.Args),
-				ReplIdent: ident == nil || ident[col.Name],
-			}
-		}
-		out.rels[t.OID] = def
+		out.rels[t.OID] = relationDefFor(c, t, dbOid...)
 	}
 	return out
+}
+
+// relationDefFor builds t's RelationDef: the columns in order with their
+// types and typmods, and the replica identity flags.
+func relationDefFor(c *catalog.InMemory, t *catalog.Table, dbOid ...uint32) *RelationDef {
+	def := &RelationDef{
+		Schema:    t.Schema,
+		Name:      t.Name,
+		OID:       t.OID,
+		Columns:   make([]ColumnDef, len(t.Columns)),
+		ReplIdent: catalog.ReplIdentOrDefault(t.ReplicaIdentity)[0],
+	}
+	ident := identityColumns(c, t, def.ReplIdent, dbOid...)
+	for i, col := range t.Columns {
+		def.Columns[i] = ColumnDef{
+			Name:      col.Name,
+			Type:      col.Type,
+			NotNull:   col.NotNull,
+			Ordinal:   col.Ordinal,
+			Typmod:    nodes.ColumnTypmod(col.Type.Name, col.Type.Args),
+			ReplIdent: ident == nil || ident[col.Name],
+		}
+	}
+	return def
 }
 
 // identityColumns is the column set logicalrep_write_attrs flags as replica
@@ -155,8 +172,66 @@ func (s *CatalogSnapshot) Lookup(rel storage.RelFileNode) (*RelationDef, bool) {
 	if s == nil {
 		return nil, false
 	}
+	s.mu.RLock()
 	def, ok := s.rels[rel.RelOid]
+	s.mu.RUnlock()
 	return def, ok
+}
+
+// Current is Lookup plus pgoutput's relation-invalidation path
+// (rel_sync_cache_relation_cb clears schema_sent, so the next change
+// re-sends the Relation message): when the live catalog's definition of a
+// relation in the snapshot no longer matches the captured one — a column
+// added, dropped, renamed or retyped, the table renamed, the replica
+// identity changed — the snapshot takes the live definition and changed
+// reports it, so the caller re-sends the Relation message. A relation
+// created after the build is resolved from the live catalog too (a FOR
+// ALL TABLES publication publishes it, and the walsender used to skip its
+// changes until the subscriber reconnected).
+//
+// PG decodes each change against the catalog as of that change (a
+// historic snapshot); goopg uses the catalog as of decoding, so a change
+// decoded after a later DDL already carries the new shape (ledgered).
+// M0149-0042b.
+func (s *CatalogSnapshot) Current(rel storage.RelFileNode) (def *RelationDef, changed, ok bool) {
+	def, ok = s.Lookup(rel)
+	// System catalogs are never published (relationIsPublishable), so
+	// skip the live lookup for them: an ALTER TABLE writes several
+	// catalog rows per statement.
+	if s.live == nil || rel.RelOid < catalog.FirstNormalObjectId {
+		return def, false, ok
+	}
+	t, found := s.live.LookupTableByOID(rel.RelOid, s.dbOid...)
+	if !found {
+		return def, false, ok
+	}
+	if ok && relationDefMatches(def, t) {
+		return def, false, true
+	}
+	fresh := relationDefFor(s.live, t, s.dbOid...)
+	s.mu.Lock()
+	s.rels[rel.RelOid] = fresh
+	s.mu.Unlock()
+	return fresh, true, true
+}
+
+// relationDefMatches is the cheap per-change check that def still
+// describes t: the names, the replica identity and every column's name,
+// type, array-ness and NOT NULL. A typmod-only change (varchar(10) →
+// varchar(20)) is not detected.
+func relationDefMatches(def *RelationDef, t *catalog.Table) bool {
+	if def.Name != t.Name || def.Schema != t.Schema || len(def.Columns) != len(t.Columns) ||
+		def.ReplIdent != catalog.ReplIdentOrDefault(t.ReplicaIdentity)[0] {
+		return false
+	}
+	for i, col := range t.Columns {
+		dc := def.Columns[i]
+		if dc.Name != col.Name || dc.NotNull != col.NotNull || dc.Type.IsArray != col.Type.IsArray ||
+			!strings.EqualFold(dc.Type.Name, col.Type.Name) {
+			return false
+		}
+	}
+	return true
 }
 
 // Len reports the number of tables captured. Used by tests and

@@ -1,7 +1,6 @@
 package testport
 
 import (
-	"os"
 	"strings"
 	"testing"
 
@@ -16,16 +15,13 @@ import (
 // publisher with a goopg subscriber, and a goopg publisher with a PG 18.3
 // subscriber.
 //
-// Gated by GOOPG_TAP_006 until it passes (M0149-0042, skipped as a detour):
-// both pairings with a PG 18.3 node pass (M0149-0042a, M0149-0040f);
-// all-goopg: after the table sync the goopg subscriber's apply worker does
-// not resume streaming (slot inactive, M0149-0042b).
+// Passes 3/3 in all three pairings since M0149-0042b: a goopg walsender
+// skips system-catalog changes (the ALTER TABLE's pg_type rows used to
+// kill it) and re-sends the Relation message after the table's schema
+// changes, so the added column replicates.
 func TestPort_Subscription006Rewrite(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")
-	}
-	if os.Getenv("GOOPG_TAP_006") == "" {
-		t.Skip("006 re-port is not passing yet (M0149-0042); set GOOPG_TAP_006=1 to run")
 	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)

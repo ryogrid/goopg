@@ -209,11 +209,27 @@ func (p *PgOutput) LogicalMessage(_ storage.TransactionID, lsn uint64, transacti
 // they were created after slot creation and are out of v0's
 // scope.
 func (p *PgOutput) Change(c Change) error {
-	rel, ok := p.snap.Lookup(c.Rel)
+	rel, changed, ok := p.snap.Current(c.Rel)
+	if changed {
+		// The relation's schema changed since its Relation message
+		// went out: send it again before this change (pgoutput's
+		// schema_sent = false after an invalidation). M0149-0042b.
+		delete(p.emittedRel, rel.OID)
+	}
 	if !ok {
 		// Future loop: surface this as an error once schema
 		// changes are honoured. For now skip silently — the
 		// classifier already filtered everything actionable.
+		return nil
+	}
+	if !relationIsPublishable(rel) {
+		// System catalogs never reach the output plugin: reorderbuffer.c
+		// skips a change whose relation is not RelationIsLogicallyLogged
+		// (IsCatalogRelation), and pgoutput_change returns early for a
+		// relation that is not is_publishable_relation. A FOR ALL TABLES
+		// filter would otherwise admit catalog rows — e.g. the pg_type /
+		// pg_class rows an ALTER TABLE writes — and encoding them killed
+		// the walsender. M0149-0042b.
 		return nil
 	}
 	if p.filter != nil && !p.filter.Allows(rel, c.Kind) {
@@ -238,6 +254,19 @@ func (p *PgOutput) Change(c Change) error {
 		return p.writeUpdate(rel, c.OldTuple, c.NewTuple)
 	}
 	return fmt.Errorf("pgoutput: unknown change kind %d", c.Kind)
+}
+
+// relationIsPublishable is is_publishable_class's relation half for a
+// decoded change: a user relation (OID >= FirstNormalObjectId) outside
+// pg_catalog, information_schema and pg_toast. It also covers
+// RelationIsLogicallyLogged's !IsCatalogRelation (catalog OIDs are below
+// FirstUnpinnedObjectId, hence below FirstNormalObjectId).
+func relationIsPublishable(rel *RelationDef) bool {
+	switch strings.ToLower(rel.Schema) {
+	case "pg_catalog", "information_schema", "pg_toast":
+		return false
+	}
+	return rel.OID >= catalog.FirstNormalObjectId
 }
 
 // relationNamespace is logicalrep_write_namespace: pg_catalog is written as

@@ -16860,7 +16860,7 @@ verify each at HEAD when the task starts.
   Parent: M0149-0041
   - A goopg FOR ALL TABLES publication listed pg\_catalog.pg\_type, pg\_attribute, pg\_largeobject and pg\_largeobject\_metadata in pg\_publication\_tables and pg\_get\_publication\_tables, across every database. A PG subscriber then tried to sync them and never finished \(005, 006: pg\_subscription\_rel stuck in 'd' on four catalogs\).
   - 2026\-11\-26 \(done\): new catalog.IsPublishableTable \(is\_publishable\_class\) — permanent ordinary tables with OID ≥ FirstNormalObjectId outside pg\_catalog / information\_schema / pg\_toast; not views, matviews, foreign tables, sequences, virtual relations. pg\_get\_publication\_tables and the pg\_publication\_tables view apply it, limited to the publication's database. Unit test TestIsPublishableTable. 005/006 with a goopg publisher now list only test1.
-- [ ] **M0149-0042 — port subscription/t/006_rewrite.pl**
+- [x] **M0149-0042 — port subscription/t/006_rewrite.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/006_rewrite.pl` — decoding across a heap rewrite.
@@ -16869,10 +16869,15 @@ verify each at HEAD when the task starts.
   - 2026\-11\-26 \(progress\): TestPort\_Subscription006Rewrite written \(three pairings\), gated GOOPG\_TAP\_006. pg18\-publisher\-goopg\-subscriber PASSES. goopg\-publisher\-pg18\-subscriber: test1 reaches 'f' and stops. all\-goopg: the initial sync passes but the slot goes inactive \(pg\_stat\_replication empty\) and the first catch\-up times out.
   - 2026\-11\-26 \(skipped as detour, 4 links\): 0041b, 0042a step 1 \(pg\_get\_replica\_identity\_index\) and 0042a step 2 \(end\-of\-streaming reply\) landed; the goopg\-publisher pairings now fail at the post\-ALTER catch\-up because the reconnecting apply worker reads its slot from one byte past the record end \("wal: invalid record header: padding bytes nonzero"\) — M0149\-0040f, a 4th link. 0040f is now a proven blocker of 006 and of every reconnect after a table sync.
   - 2026\-11\-26 \(update\): with 0040f, 006's goopg\-publisher → PG pairing passes. all\-goopg: after the goopg subscriber's table sync, its apply worker never resumes streaming \(publisher slot inactive, pg\_stat\_replication empty\) — filed M0149\-0042b.
-- [ ] **M0149-0042b — a goopg subscriber's apply worker resumes streaming after its table sync**
+  - 2026\-11\-26 \(done, closed by M0149\-0042b\): TestPort\_Subscription006Rewrite ungated, 3/3 in all three pairings; inventory 006 → port.
+- [x] **M0149-0042b — a goopg subscriber's apply worker resumes streaming after its table sync**
   Kind: impl
   Parent: M0149-0042
   - 006 all\-goopg: the initial sync of test1 completes, then the publisher shows mysub's slot inactive and no walsender; the first catch\-up times out. Check the goopg apply launcher / worker restart after tablesync \(internal/postmaster/subscription\_refresh.go\) and what START\_REPLICATION it sends.
+  - 2026\-11\-26 \(done\): the title's diagnosis was wrong. The goopg publisher's walsender died: an ALTER TABLE writes pg\_type rows, FOR ALL TABLES admitted them, and pgoutput failed to encode them \("pglz: truncated compressed varlena"\). Every reconnect died on the same record, so the slot showed inactive.
+    - PgOutput.Change skips non\-publishable relations \(relationIsPublishable: OID < FirstNormalObjectId, pg\_catalog / information\_schema / pg\_toast\), as reorderbuffer.c RelationIsLogicallyLogged and pgoutput\_change is\_publishable\_relation do.
+    - CatalogSnapshot.Current re\-reads a relation from the live catalog on a shape change and pgoutput re\-sends the Relation message \(schema\_sent reset\). Relations created after START\_REPLICATION are resolved live too; 008's goopg\-publisher pairing had relied on the crash\-reconnect to see test\_tab2.
+  - Results: 006 and 008 ungated, 3/3 in all three pairings. Unit tests TestPgOutputResendsRelationAfterSchemaChange, TestPgOutputSkipsCatalogRelations.
 - [x] **M0149-0042a — a subscriber's table sync from a goopg publisher completes**
   Kind: impl
   Parent: M0149-0042
@@ -16904,13 +16909,14 @@ verify each at HEAD when the task starts.
     - ALTER PUBLICATION … RENAME TO was a silent no\-op: the legacy DDL parser consumed unmodelled ALTER PUBLICATION forms as CompatNoopStmt. New AlterPublicationRenameStmt → PubSub.RenamePublication: same OID, 42704 / 42710; the pg\_publication row is rewritten.
     - The walsender resolved publication\_names once at START\_REPLICATION. New PubSub.PublicationGeneration counter, bumped by every publication change; livePublicationFilter rebuilds the filter by name when it moves \(pgoutput's publication\_invalidation\_cb → LoadPublications\).
   - Results: TestPort\_Subscription007DDL ungated, PASS 3/3 in all three pairings. Unit tests TestLivePublicationFilterFollowsRename, TestAlterPublicationRename.
-- [ ] **M0149-0044 — port subscription/t/008_diff_schema.pl**
+- [x] **M0149-0044 — port subscription/t/008_diff_schema.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/008_diff_schema.pl` — subscriber with a different table schema.
   Likely prerequisites \(verify at start\): attribute mapping by name, extra/missing-column errors with PG texts, Relation-message re-send after publisher ALTER.
   - Path\-to\-TAP: 008 \(goopg\-publisher pairing\) ← M0149\-0040f \(landed\); 008 \(goopg\-subscriber pairings\) ← M0149\-0044a, M0149\-0044b \(both landed; PG\-publisher pairing passes\); 008 all\-goopg ← M0149\-0042b \(one link\).
   - 2026\-11\-26 \(progress\): TestPort\_Subscription008DiffSchema written \(three pairings\), gated GOOPG\_TAP\_008. goopg\-publisher\-pg18\-subscriber PASSES since 0040f. Both goopg\-subscriber pairings: after the sync test\_tab is empty \(0\|0\|0\), and the next replicated UPDATE installs 2 rows with NULL c/d/e \(no local DEFAULT / identity\), so the subscriber's own UPDATE then fails "null value in column e".
+  - 2026\-11\-26 \(done, closed by M0149\-0042b\): TestPort\_Subscription008DiffSchema ungated, 3/3 in all three pairings; inventory 008 → port.
 - [x] **M0149-0044a — a goopg subscriber's table sync copies into a table with extra local columns**
   Kind: impl
   Parent: M0149-0044

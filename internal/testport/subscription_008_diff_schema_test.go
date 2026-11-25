@@ -1,7 +1,6 @@
 package testport
 
 import (
-	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -20,16 +19,11 @@ import (
 // columns". It runs in three pairings: all-goopg, a PG 18.3 publisher with a
 // goopg subscriber, and a goopg publisher with a PG 18.3 subscriber.
 //
-// Gated by GOOPG_TAP_008 until it passes (M0149-0044): both pairings with a
-// PG 18.3 node pass (M0149-0040f, M0149-0044a, M0149-0044b); all-goopg
-// stalls after the test_tab2 REFRESH because the goopg subscriber's apply
-// worker does not resume streaming (slot inactive, M0149-0042b).
+// Passes 3/3 in all three pairings (M0149-0040f, M0149-0044a, M0149-0044b,
+// M0149-0042b).
 func TestPort_Subscription008DiffSchema(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")
-	}
-	if os.Getenv("GOOPG_TAP_008") == "" {
-		t.Skip("008 re-port is not passing yet (M0149-0044); set GOOPG_TAP_008=1 to run")
 	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)

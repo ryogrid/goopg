@@ -1,7 +1,8 @@
 # M0149\-0041 / 0042 — subscription/t/005\_encoding.pl and 006\_rewrite.pl
 
-Status: 005 and 006 skipped as detours. Both ports are written with the three\-pairing `tapnode` harness of
-M0149\-0040 and gated \(`GOOPG_TAP_005`, `GOOPG_TAP_006`\). `waitForSubscriptionSync` is Cluster.pm's
+Status: 006 done; 005 skipped as a detour. Both ports use the three\-pairing `tapnode` harness of M0149\-0040.
+TestPort\_Subscription006Rewrite is ungated and passes 3 of 3 runs in all three pairings \(M0149\-0040f,
+M0149\-0042a–b\). 005 stays gated \(`GOOPG_TAP_005`\). `waitForSubscriptionSync` is Cluster.pm's
 `wait_for_subscription_sync`: every `pg_subscription_rel` row is 'r' or 's', then `wait_for_catchup`.
 
 ## 005 — non\-UTF8 databases \(detour\)
@@ -61,8 +62,38 @@ goopg's logical walsender just returned on the subscriber's CopyDone, so the syn
 The physical walsender's reply to a CopyDone \(CopyDone, one CommandComplete "START\_STREAMING"\) is not this
 sequence \(deferral ledger\).
 
+## Landed — a goopg walsender across ALTER TABLE \(M0149\-0042b\)
+
+All\-goopg, the stall after `ALTER TABLE test1 ADD c int NOT NULL DEFAULT 0` had two causes on the goopg publisher.
+
+- **Catalog changes reached pgoutput.** The ALTER TABLE writes pg\_type and pg\_class rows. A FOR ALL TABLES filter
+  admits every relation, so `PgOutput.Change` tried to encode the pg\_type tuple. It failed \("pglz: truncated
+  compressed varlena"\), the walsender died, and every reconnect died on the same record. PG never shows catalog
+  changes to the output plugin: reorderbuffer.c skips relations that are not RelationIsLogicallyLogged
+  \(IsCatalogRelation\), and pgoutput\_change returns early for relations that are not is\_publishable\_relation.
+  `relationIsPublishable` now skips relations below FirstNormalObjectId and those in pg\_catalog,
+  information\_schema and pg\_toast.
+- **A frozen schema.** The walsender's `CatalogSnapshot` was built once at START\_REPLICATION, so the row inserted
+  after ADD COLUMN went out with the old two\-column Relation message and the subscriber stored NULL. PG's pgoutput
+  re\-sends the Relation message after a relcache invalidation \(rel\_sync\_cache\_relation\_cb → schema\_sent =
+  false\). `CatalogSnapshot.Current` compares the captured definition with the live catalog on every change. On a
+  different shape it takes the live definition and pgoutput re\-sends the Relation message. A relation created
+  after START\_REPLICATION is also resolved from the live catalog, so a FOR ALL TABLES stream publishes it, as PG
+  does.
+
+Before this, that second case only worked because the walsender crashed on the CREATE TABLE's catalog rows and the
+reconnect rebuilt the snapshot. Without the crash, 008's goopg\-publisher pairing lost test\_tab2's insert until
+the live lookup was added.
+
+Deviations \(deferral ledger\):
+
+- **Decode\-time schema.** goopg decodes each change against the catalog as of decoding, not PG's historic
+  snapshot as of the change. A change decoded after a later DDL already carries the new shape.
+- **Typmod\-only changes** are not detected.
+- **Per\-change cost.** The live check is a linear scan by OID, once per user\-table change.
+
 ## Remaining
 
-With a goopg publisher, the apply worker reconnects after the table sync and fails with "padding bytes nonzero". The
+Historical, resolved by M0149\-0040f: with a goopg publisher, the apply worker reconnects after the table sync and fails with "padding bytes nonzero". The
 slot's confirmed position is one byte past the record end \(M0149\-0040f\), so the decoder starts mid\-record. That
 is a 4th link for 006, which is therefore skipped as a detour; 0040f is filed as a proven blocker.

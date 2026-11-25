@@ -1,8 +1,7 @@
 # M0149\-0044 — Port subscription/t/008\_diff\_schema.pl
 
-Status: in progress. TestPort\_Subscription008DiffSchema is gated by GOOPG\_TAP\_008. Both pairings with a PG 18.3
-node pass \(M0149\-0040f, M0149\-0044a, M0149\-0044b\). All\-goopg stalls after a refresh because the goopg
-subscriber's apply worker does not resume streaming \(M0149\-0042b\).
+Status: done. TestPort\_Subscription008DiffSchema is ungated and passes 3 of 3 runs in all three pairings
+\(M0149\-0040f, M0149\-0044a, M0149\-0044b, and M0149\-0042b for all\-goopg — see the 0149\-0041 doc\).
 
 ## Landed — M0149\-0044a, table sync into a table with extra local columns
 

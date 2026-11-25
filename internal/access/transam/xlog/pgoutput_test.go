@@ -614,3 +614,96 @@ func TestPgOutputRelationMessageFields(t *testing.T) {
 		t.Error("pg_catalog must be written empty and other namespaces by name")
 	}
 }
+
+// TestPgOutputResendsRelationAfterSchemaChange pins pgoutput's
+// relation-invalidation path (rel_sync_cache_relation_cb → schema_sent =
+// false): after ALTER TABLE ADD COLUMN on the publisher, the next change
+// re-sends the Relation message with the new column, and the change is
+// encoded with the new shape. The frozen START_REPLICATION snapshot used
+// to keep the old two-column shape, so the subscriber stored NULL in the
+// added column (006_rewrite.pl, M0149-0042b).
+func TestPgOutputResendsRelationAfterSchemaChange(t *testing.T) {
+	c := catalog.NewInMemory()
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "test1"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+		{Name: "b", Type: catalog.Type{Name: "text"}, Ordinal: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, rel := BuildCatalogSnapshot(c, nil), c.RelFileNode(tbl)
+	var buf bytes.Buffer
+	po := NewPgOutput(snap, &buf)
+	if err := po.Change(Change{Kind: ChangeInsert, Rel: rel,
+		NewTuple: wrapAsHeapTuple(t, encodeBodyV0([]any{1, "one"}, []string{"int4", "text"}), 2)}); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Bytes()[0] != 'R' {
+		t.Fatalf("first change: first byte %q, want R", buf.Bytes()[0])
+	}
+
+	if _, err := c.AddColumn(tbl, catalog.Column{Name: "c", Type: catalog.Type{Name: "int4"}}); err != nil {
+		t.Fatal(err)
+	}
+	buf.Reset()
+	if err := po.Change(Change{Kind: ChangeInsert, Rel: rel,
+		NewTuple: wrapAsHeapTuple(t, encodeBodyV0([]any{3, "three", 33}, []string{"int4", "text", "int4"}), 3)}); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.Bytes()
+	if out[0] != 'R' {
+		t.Fatalf("change after ADD COLUMN: first byte %q, want R (Relation re-sent)", out[0])
+	}
+	// R | oid(4) | nspname\0 | relname\0 | replident(1) | natts(2)
+	i := 5
+	i += bytes.IndexByte(out[i:], 0) + 1
+	i += bytes.IndexByte(out[i:], 0) + 1
+	i++
+	if natts := binary.BigEndian.Uint16(out[i:]); natts != 3 {
+		t.Fatalf("re-sent Relation natts = %d, want 3", natts)
+	}
+	if !bytes.Contains(out, []byte("33")) {
+		t.Errorf("insert after ADD COLUMN does not carry c = 33: %q", out)
+	}
+
+	// No schema change: no third Relation message.
+	buf.Reset()
+	if err := po.Change(Change{Kind: ChangeInsert, Rel: rel,
+		NewTuple: wrapAsHeapTuple(t, encodeBodyV0([]any{4, "four", 44}, []string{"int4", "text", "int4"}), 3)}); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Bytes()[0] != 'I' {
+		t.Errorf("unchanged relation: first byte %q, want I", buf.Bytes()[0])
+	}
+}
+
+// TestPgOutputSkipsCatalogRelations pins RelationIsLogicallyLogged /
+// is_publishable_relation for the decoded stream: a change to a system
+// catalog row (pg_type, written by ALTER TABLE) emits nothing, even with
+// no publication filter (FOR ALL TABLES). Encoding the pg_type row used to
+// fail and kill the walsender (M0149-0042b).
+func TestPgOutputSkipsCatalogRelations(t *testing.T) {
+	for _, def := range []*RelationDef{
+		{Schema: "pg_catalog", Name: "pg_type", OID: 1247},
+		{Schema: "information_schema", Name: "sql_features", OID: 13000},
+		{Schema: "public", Name: "low_oid", OID: 12000},
+	} {
+		if relationIsPublishable(def) {
+			t.Errorf("relationIsPublishable(%s.%s oid %d) = true, want false", def.Schema, def.Name, def.OID)
+		}
+	}
+	if !relationIsPublishable(&RelationDef{Schema: "", Name: "t", OID: catalog.FirstNormalObjectId}) {
+		t.Error("relationIsPublishable(user table at FirstNormalObjectId) = false, want true")
+	}
+
+	snap := &CatalogSnapshot{rels: map[uint32]*RelationDef{1247: {Schema: "pg_catalog", Name: "pg_type", OID: 1247,
+		Columns: []ColumnDef{{Name: "typname", Type: catalog.Type{Name: "name"}}}}}}
+	var buf bytes.Buffer
+	po := NewPgOutput(snap, &buf)
+	if err := po.Change(Change{Kind: ChangeInsert, Rel: storage.RelFileNode{RelOid: 1247}, NewTuple: []byte{0xff}}); err != nil {
+		t.Fatalf("catalog change: %v (want skipped)", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("catalog change emitted %x, want nothing", buf.Bytes())
+	}
+}
