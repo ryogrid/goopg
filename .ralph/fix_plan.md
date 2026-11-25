@@ -16690,6 +16690,20 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/recovery/t/048_vacuum_horizon_floor.pl` — VACUUM removes all tuples dead before OldestXmin while the standby feedback horizon moves.
   Likely prerequisites \(verify at start\): `hot_standby_feedback` xmin on the walsender slot, `GlobalVisState`/OldestXmin floor in VACUUM, walreceiver reconnect mid-VACUUM. `pg_backend_pid()` is used only at SQL level here \(fine\); never `kill()` it — on goopg it is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID.
+  - Path\-to\-TAP: 048 ← \(1\) io\_combine\_limit GUC \(landed\) ← \(2\) M0149\-0033b pg\_stat\_wal\_receiver from a non\-default database on a goopg standby ← \(3\) M0149\-0033c VACUUM \(FREEZE\) waits for a cleanup lock with wait\_event BufferPin while a cursor pins the page ← \(4\) M0149\-0033d live pg\_stat\_progress\_vacuum.index\_vacuum\_count ← \(5\) the GlobalVisState / OldestXmin horizon floor with hot\_standby\_feedback.
+  - 2026\-11\-25 \(skipped as detour, 5 links\): io\_combine\_limit / io\_max\_combine\_limit registered \(goopg refused to start on 048's conf: "unknown parameter io\_combine\_limit"\). TestPort\_Recovery048VacuumHorizonFloor written, gated GOOPG\_TAP\_048. First run: both goopg\-standby pairings time out on `SELECT EXISTS (SELECT * FROM pg_stat_wal_receiver)` in test\_db; the goopg\-primary pairing times out waiting for the VACUUM's BufferPin wait.
+- [ ] **M0149-0033b — pg\_stat\_wal\_receiver is empty when queried from a non\-default database on a goopg standby**
+  Kind: impl
+  Parent: M0149-0033
+  - 048 polls `SELECT EXISTS (SELECT * FROM pg_stat_wal_receiver)` connected to test\_db \(a database created on the primary after the backup\); it never turns t on goopg standbys although streaming works. PG: the view is cluster\-wide \(pg\_stat\_get\_wal\_receiver\).
+- [ ] **M0149-0033c — VACUUM \(FREEZE\) waits for a cleanup lock on a pinned page and reports wait\_event BufferPin**
+  Kind: impl
+  Parent: M0149-0033
+  - 048: a cursor in an open transaction \(FETCH of a seq scan\) keeps the first heap page pinned; VACUUM \(FREEZE\) must wait in LockBufferForCleanup with pg\_stat\_activity.wait\_event = 'BufferPin' and resume when the cursor moves on. Check whether goopg cursors hold the scan's pin between FETCHes at all.
+- [ ] **M0149-0033d — pg\_stat\_progress\_vacuum reports live index\_vacuum\_count**
+  Kind: impl
+  Parent: M0149-0033
+  - pgstat\_progress\_update\_param\(PROGRESS\_VACUUM\_NUM\_INDEX\_VACUUMS\) per index pass; with maintenance\_work\_mem = 64 the dead\-item store fills and forces several passes \(TidStore limit\).
 - [ ] **M0149-0034 — port recovery/t/041_checkpoint_at_promote.pl**
   Kind: impl
   Parent: none

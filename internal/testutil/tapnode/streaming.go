@@ -49,6 +49,10 @@ func (n *Node) BackupFsCold(name string) string {
 
 // connstr is Cluster.pm's connstr: the libpq string a standby's
 // primary_conninfo points at.
+// ConnStr is Cluster.pm's connstr(): the libpq connection string a
+// standby's primary_conninfo uses to reach this node.
+func (n *Node) ConnStr() string { return n.connstr() }
+
 func (n *Node) connstr() string {
 	host, port, user := n.connParams()
 	return fmt.Sprintf("port=%s host=%s user=%s dbname=postgres", port, host, user)

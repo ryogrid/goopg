@@ -104,6 +104,9 @@
 
 #max_worker_processes = 8               # 0-262143
                                         # (change requires restart)
+#io_max_combine_limit = 128kB		# usually 1-128 blocks (depends on OS)
+					# (change requires restart)
+#io_combine_limit = 128kB		# usually 1-128 blocks (depends on OS)
 #io_method = worker                     # sync | worker | io_uring
                                         # (change requires restart)
 #io_workers = 3                         # 1-1024 worker goroutines for io_method=worker

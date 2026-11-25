@@ -788,6 +788,26 @@ func BuildDefaultRegistry() *Registry {
 		Context:     ContextPostmaster,
 		Scope:       ScopeServer,
 	}))
+	// io_max_combine_limit / io_combine_limit (guc_tables.c, GUC_UNIT_BLOCKS):
+	// the largest read or write the read stream combines, default
+	// DEFAULT_IO_COMBINE_LIMIT = 128kB / BLCKSZ = 16 blocks, range 1 to
+	// MAX_IO_COMBINE_LIMIT = PG_IOV_MAX (128 on Linux). io_combine_limit is
+	// clamped to io_max_combine_limit upstream (assign_io_combine_limit).
+	// Declared for configuration parity; goopg's reads do not combine by
+	// these yet (048_vacuum_horizon_floor sets io_combine_limit = 1;
+	// M0149-0033).
+	r.MustRegister(NewVariable(Variable{
+		Name: "io_max_combine_limit", Type: TypeInt, Unit: UnitBlocks, BootVal: "128kB",
+		MinVal: 1, MaxVal: 128,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "io_combine_limit", Type: TypeInt, Unit: UnitBlocks, BootVal: "128kB",
+		MinVal: 1, MaxVal: 128,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
 	// io_workers is the goroutine count for `io_method=worker`.
 	// Upstream's default is 3; we mirror it.
 	r.MustRegister(NewVariable(Variable{
