@@ -429,53 +429,12 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 		if stop.Set || stop.XidSet || stop.NameSet || stop.TimeSet || stop.Immediate {
 			for i, r := range records {
 				readRecPtr := r.StartLSN - 1 // 1-based internal start -> PG ReadRecPtr
-				hit, after := false, stop.Inclusive
-				// The transaction end this record is, if any: its xid,
-				// commit or abort, and xact_time (getRecordTimestamp).
-				isXactEnd, isCommit, xactTime := false, false, int64(0)
-				if r.XLog != nil && r.XLog.Header.Rmid == RmgrXact {
-					op := r.XLog.Header.Info & xlogXactOpMask
-					if op == xlogXactCommit || op == xlogXactAbort {
-						isXactEnd, isCommit = true, op == xlogXactCommit
-						if len(r.XLog.MainData) >= 8 {
-							xactTime = int64(binary.LittleEndian.Uint64(r.XLog.MainData[:8]))
-						}
-					}
-				}
-				switch {
-				case stop.Set && readRecPtr >= stop.LSN:
-					hit = true
-					res.StopKind = StopAtLSN
-					res.StopLSN = readRecPtr
-				case stop.XidSet && isXactEnd && r.XLog.Header.XID == stop.Xid:
-					hit = true
-					res.StopKind = StopAtXid
-				case stop.TimeSet && isXactEnd && xactTime >= stop.Time:
-					// recoveryStopsBefore: inclusive stops before a later
-					// transaction end, exclusive before one at or past the
-					// target; recoveryStopsAfter (inclusive): after one at
-					// exactly the target.
-					hit = true
-					res.StopKind = StopAtTime
-					after = stop.Inclusive && xactTime == stop.Time
-				case stop.NameSet:
-					if name, rpTime, ok := RestorePointOf(r); ok && name == stop.Name {
-						// recoveryStopsAfter: always after the restore point.
-						hit, after = true, true
-						res.StopKind = StopAtName
-						res.StopName, res.StopXactTime = name, rpTime
-					}
-				case stop.Immediate && r.EndLSN >= consistentAt:
-					// recoveryStopsAfter once reachedConsistency.
-					hit, after = true, true
-					res.StopKind = StopAtImmediate
-				}
+				ev, hit := EvaluateRecoveryStop(stop, r, r.EndLSN >= consistentAt)
 				if !hit {
 					continue
 				}
-				if res.StopKind == StopAtXid || res.StopKind == StopAtTime {
-					res.StopXid, res.StopIsCommit, res.StopXactTime = r.XLog.Header.XID, isCommit, xactTime
-				}
+				after := ev.After
+				ev.fill(&res)
 				stopped = true
 				res.ReachedTarget, res.StopAfter = true, after
 				res.StopPoint = readRecPtr
@@ -648,4 +607,88 @@ func ReadSegmentRecords(walDir string, segNo uint64, segmentSize int64) ([]Recor
 func pgTimestampTzString(ts int64) string {
 	const pgEpochUnixMicros = 946684800 * 1000000
 	return time.UnixMicro(ts + pgEpochUnixMicros).Format("2006-01-02 15:04:05.999999-07")
+}
+
+// StopEval is one record's recovery-target verdict: which target it reaches,
+// whether recovery stops after applying it (else before), and what
+// StopMessage / StopReason report.
+type StopEval struct {
+	Kind     StopKind
+	After    bool
+	LSN      uint64 // the record's PG ReadRecPtr (LSN targets)
+	Xid      uint32
+	IsCommit bool
+	Time     int64 // xact_time, or the restore point's time
+	Name     string
+}
+
+func (ev StopEval) fill(res *ArchiveRecoveryResult) {
+	res.StopKind = ev.Kind
+	switch ev.Kind {
+	case StopAtLSN:
+		res.StopLSN = ev.LSN
+	case StopAtXid, StopAtTime:
+		res.StopXid, res.StopIsCommit, res.StopXactTime = ev.Xid, ev.IsCommit, ev.Time
+	case StopAtName:
+		res.StopName, res.StopXactTime = ev.Name, ev.Time
+	}
+}
+
+// Result is the ArchiveRecoveryResult view of a reached target, for its
+// StopMessage and StopReason texts.
+func (ev StopEval) Result() ArchiveRecoveryResult {
+	res := ArchiveRecoveryResult{ReachedTarget: true, StopAfter: ev.After}
+	ev.fill(&res)
+	return res
+}
+
+// EvaluateRecoveryStop is recoveryStopsBefore and recoveryStopsAfter for one
+// record (xlogrecovery.c), shared by archive recovery and a standby's
+// continuous replay:
+//   - an LSN target stops at the first record whose ReadRecPtr reaches it,
+//     after it when recovery_target_inclusive, else before;
+//   - an xid target at that transaction's COMMIT or ABORT, likewise;
+//   - a time target at a transaction end: inclusive stops after one at
+//     exactly the target and before a later one, exclusive before one at or
+//     past it;
+//   - a name target after the matching XLOG_RESTORE_POINT;
+//   - 'immediate' after the record that makes recovery consistent.
+//
+// consistent reports whether recovery is consistent once r is applied.
+func EvaluateRecoveryStop(stop RecoveryStop, r Record, consistent bool) (StopEval, bool) {
+	readRecPtr := r.StartLSN - 1 // 1-based internal start -> PG ReadRecPtr
+	isXactEnd, isCommit, xactTime := false, false, int64(0)
+	if r.XLog != nil && r.XLog.Header.Rmid == RmgrXact {
+		op := r.XLog.Header.Info & xlogXactOpMask
+		if op == xlogXactCommit || op == xlogXactAbort {
+			isXactEnd, isCommit = true, op == xlogXactCommit
+			if len(r.XLog.MainData) >= 8 {
+				xactTime = int64(binary.LittleEndian.Uint64(r.XLog.MainData[:8]))
+			}
+		}
+	}
+	ev := StopEval{After: stop.Inclusive}
+	switch {
+	case stop.Set && readRecPtr >= stop.LSN:
+		ev.Kind, ev.LSN = StopAtLSN, readRecPtr
+	case stop.XidSet && isXactEnd && r.XLog.Header.XID == stop.Xid:
+		ev.Kind = StopAtXid
+	case stop.TimeSet && isXactEnd && xactTime >= stop.Time:
+		ev.Kind = StopAtTime
+		ev.After = stop.Inclusive && xactTime == stop.Time
+	case stop.NameSet:
+		name, rpTime, ok := RestorePointOf(r)
+		if !ok || name != stop.Name {
+			return ev, false
+		}
+		ev.Kind, ev.After, ev.Name, ev.Time = StopAtName, true, name, rpTime
+	case stop.Immediate && consistent:
+		ev.Kind, ev.After = StopAtImmediate, true
+	default:
+		return ev, false
+	}
+	if ev.Kind == StopAtXid || ev.Kind == StopAtTime {
+		ev.Xid, ev.IsCommit, ev.Time = r.XLog.Header.XID, isCommit, xactTime
+	}
+	return ev, true
 }

@@ -1259,7 +1259,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 // would compound the corruption. The goroutine also exits when the
 // supplied context is cancelled (clean shutdown) or the writer
 // closes (process tear-down).
-func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Runtime, logger *slog.Logger) *xlog.StreamReplayer {
+// opts configure the replayer before its goroutine starts (a recovery
+// target must be in place before the first record).
+func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Runtime, logger *slog.Logger, opts ...func(*xlog.StreamReplayer)) *xlog.StreamReplayer {
 	// WrittenLSN() is the LSN of the last byte already written. The
 	// iterator's startLSN argument is the LSN of the next record's
 	// first byte (= writer's "tail" position). Anchoring at WrittenLSN
@@ -1311,6 +1313,9 @@ func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Ru
 			logger.Warn("standby replay: catalog refresh failed", "db", dbOid, "err", err)
 		}
 	})
+	for _, o := range opts {
+		o(sr)
+	}
 	go func() {
 		defer close(done)
 		iter, err := xlog.NewRecordIterator(rt.WAL, walDir, 0, iterStartLSN)

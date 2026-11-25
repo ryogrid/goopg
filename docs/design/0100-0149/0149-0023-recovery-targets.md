@@ -1,7 +1,7 @@
 # 0149-0023 — Port recovery/t/003\_recovery\_targets.pl
 
-Status: in progress. 0023a, 0023c and 0023d done \(2026\-11\-25\); 0023b open. The goopg\-primary\-pg18\-standbys pairing passes. `TestPort_Recovery003RecoveryTargetsFull`
-\(`internal/testport/recovery_003_recovery_targets_test.go`\) is gated by `GOOPG_TAP_003`. It has three pairings:
+Status: done \(2026\-11\-25\). `TestPort_Recovery003RecoveryTargetsFull`
+\(`internal/testport/recovery_003_recovery_targets_test.go`\) passes on all three pairings and is ungated:
 all\-goopg, a PG 18.3 primary with goopg standbys, and a goopg primary with PG 18.3 standbys.
 
 003 bumps the primary's xid epoch with pg\_resetwal, takes a backup, and writes five batches of rows. The batches
@@ -55,6 +55,22 @@ file basebackup.c sends. The restoring server raises minRecoveryPoint to the red
 "BACKUP METHOD: streamed", waits for XLOG\_BACKUP\_END. A goopg standby's consistency point is unchanged \(the
 redo\).
 
-## Open
+## 0023b — recovery targets on a standby
 
-- 0023b: a goopg standby ignores every recovery target; it must stop at the target and pause there.
+The per\-record decision is one function, `EvaluateRecoveryStop` \(recoveryStopsBefore and recoveryStopsAfter\),
+shared by archive recovery and the standby's continuous replay. The standby's StreamReplayer takes a
+`ReplayTarget` before it starts. It stops before a record or after it as the target says; 'immediate' stops after
+the record that makes the standby consistent. It logs PG's "recovery stopping …" line, and then acts on
+recovery\_target\_action:
+
+- pause: it waits at the end of recovery with "pausing at the end of recovery" and HINT "Execute
+  pg\_wal\_replay\_resume\(\) to promote.". Hot\-standby reads are served and pg\_get\_wal\_replay\_pause\_state
+  reports paused. pg\_wal\_replay\_resume\(\) ends recovery and promotes.
+- promote: it promotes at once.
+- shutdown: it stops the server; this goes through the immediate\-shutdown path, not PG's clean shutdown.
+
+Not done:
+
+- pause at the target during start\-time archive recovery \(M0149\-0022b\);
+- the standby's 'shutdown' action is an immediate shutdown;
+- time targets ignore COMMIT PREPARED / ABORT PREPARED.

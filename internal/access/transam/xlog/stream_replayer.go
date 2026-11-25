@@ -60,6 +60,9 @@ type StreamReplayer struct {
 	applyDelay       atomic.Pointer[func() time.Duration]
 	pauseState       atomic.Int32
 	promoteTriggered atomic.Bool
+	// target is the recovery target (stream_replayer_target.go), set before
+	// Run. M0149-0023b.
+	target *ReplayTarget
 
 	mu       sync.Mutex
 	applyLSN uint64
@@ -251,6 +254,11 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 		sr.recoveryPausesHere(ctx)
 		sr.recoveryApplyDelay(ctx, rec)
 		sr.recoveryPausesHere(ctx)
+		// recoveryStopsBefore: the target ends replay before this record.
+		if ev, stop := sr.targetBefore(rec); stop {
+			sr.reachTarget(ctx, ev)
+			return nil
+		}
 		if err := verifyOverwriteContrecord(rec); err != nil {
 			return err
 		}
@@ -336,6 +344,11 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 			sr.lastStart = rec.StartLSN
 		}
 		sr.mu.Unlock()
+		// recoveryStopsAfter: the target ends replay after this record.
+		if ev, stop := sr.targetAfter(rec); stop {
+			sr.reachTarget(ctx, ev)
+			return nil
+		}
 	}
 }
 

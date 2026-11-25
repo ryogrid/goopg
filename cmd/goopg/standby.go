@@ -194,7 +194,10 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 	if rt.TxnMgr != nil {
 		rt.TxnMgr.SetInRecovery(true)
 	}
-	replayer := startStandbyReplayer(rplCtx, rplDone, rt, logger)
+	// M0149-0023b: a recovery target stops continuous replay there, and
+	// recovery_target_action decides what follows (PerformWalRecovery).
+	var scRef atomic.Pointer[standbyController]
+	replayer := startStandbyReplayer(rplCtx, rplDone, rt, logger, standbyRecoveryTarget(registry, logger, &scRef))
 	// M0149-0013: recovery_min_apply_delay (SIGHUP; re-read per commit).
 	replayer.SetApplyDelay(func() time.Duration {
 		return time.Duration(intGUC(registry, "recovery_min_apply_delay", 0)) * time.Millisecond
@@ -237,6 +240,7 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 		walLevel:           walLevelEnum(stringGUC(registry, "wal_level", "replica")),
 	}
 	sc.consistentAt, sc.neverConsistent = recoveryConsistencyPoint(rt.DataDir)
+	scRef.Store(sc)
 	// Clear any stale promote signal file left by a previous run before
 	// starting the watcher. Upstream's xlogrecovery.c initialises
 	// the trigger state in StartupXLOG before the replay loop ever
@@ -1486,5 +1490,49 @@ func startStandbyFromBackupLabel(rt *initdb.Runtime, logger *slog.Logger) {
 		if err := os.Rename(from, to); err != nil {
 			logger.Warn(fmt.Sprintf("could not rename file \"%s\" to \"%s\": %v", xlog.BackupLabelFile, xlog.BackupLabelOld, err))
 		}
+	}
+}
+
+// standbyRecoveryTarget installs the standby's recovery target on its
+// replayer: when replay reaches it, the stop is logged as PG logs it
+// ("recovery stopping …"), and recovery_target_action decides what follows —
+// pause waits at the end of recovery ("pausing at the end of recovery",
+// promoting on pg_wal_replay_resume), promote promotes, shutdown stops the
+// server. No target means no option. M0149-0023b.
+func standbyRecoveryTarget(registry *misc.Registry, logger *slog.Logger, scRef *atomic.Pointer[standbyController]) func(*xlog.StreamReplayer) {
+	stop := recoveryStop(registry)
+	if !stop.Set && !stop.XidSet && !stop.NameSet && !stop.TimeSet && !stop.Immediate {
+		return func(*xlog.StreamReplayer) {}
+	}
+	promote := func() {
+		if sc := scRef.Load(); sc != nil {
+			if err := sc.Promote(context.Background()); err != nil {
+				logger.Warn("promotion at recovery target failed", "err", err)
+			}
+		}
+	}
+	return func(sr *xlog.StreamReplayer) {
+		sr.SetRecoveryTarget(xlog.ReplayTarget{
+			Stop: stop,
+			Consistent: func() bool {
+				sc := scRef.Load()
+				return sc != nil && sc.Consistent()
+			},
+			Reached: func(ev xlog.StopEval) bool {
+				logger.Info(ev.Result().StopMessage())
+				switch recoveryTargetAction(registry) {
+				case "pause":
+					logger.Info("pausing at the end of recovery", "hint", "Execute pg_wal_replay_resume() to promote.")
+					return true
+				case "promote":
+					go promote()
+				default: // shutdown
+					logger.Info("shutdown at recovery target")
+					fatalShutdown()
+				}
+				return false
+			},
+			Resumed: func() { go promote() },
+		})
 	}
 }

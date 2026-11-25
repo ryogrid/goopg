@@ -2,7 +2,6 @@ package testport
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -21,15 +20,10 @@ import (
 // are allowed, two different targets are "multiple recovery targets
 // specified", and archive recovery that ends before its target is a FATAL.
 // It runs in three pairings: all-goopg, a PG 18.3 primary with goopg
-// standbys, and a goopg primary with PG 18.3 standbys.
-//
-// Gated by GOOPG_TAP_003=1 until it passes (M0149-0023).
+// standbys, and a goopg primary with PG 18.3 standbys (M0149-0023).
 func TestPort_Recovery003RecoveryTargetsFull(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping recovery TAP port in short mode")
-	}
-	if os.Getenv("GOOPG_TAP_003") == "" {
-		t.Skip("003 re-port is not passing yet (M0149-0023); set GOOPG_TAP_003=1 to run")
 	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)

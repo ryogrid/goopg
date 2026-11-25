@@ -16521,7 +16521,7 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: none \(found while porting 045; not a 045 assertion\)
   - After a failed pg\_basebackup against a goopg primary, its `pg_basebackup_<pid>` slot \(CREATE\_REPLICATION\_SLOT … TEMPORARY\) was still listed after a restart with temporary = f. PG drops temporary slots at session end and never persists them \(ReplicationSlotCleanup, RS\_TEMPORARY\). goopg's per\-start backend PIDs then make the next pg\_basebackup's slot name collide: "replication slot already exists".
-- [ ] **M0149-0023 — port recovery/t/003_recovery_targets.pl**
+- [x] **M0149-0023 — port recovery/t/003_recovery_targets.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/003_recovery_targets.pl` — PITR to name/time/XID/LSN/immediate targets.
@@ -16532,11 +16532,13 @@ verify each at HEAD when the task starts.
   Parent: M0149-0023
   - Path\-to\-TAP: 003 ← pg\_create\_restore\_point, the recovery\_target / \_name / \_time GUCs, "multiple recovery targets specified" at startup, and archive recovery's "recovery ended before configured recovery target was reached" for a name target \(standby\_8\) ← M0149\-0023.
   - 2026\-11\-25 \(done\): pg\_create\_restore\_point writes XLOG\_RESTORE\_POINT \(xl\_restore\_point: rp\_time \+ 64\-byte name\), logs "restore point … created at …", returns the record end, with PG's recovery / wal\_level / length errors. GUCs recovery\_target \("immediate"\), recovery\_target\_name \(< 64\), recovery\_target\_time \(now/today/tomorrow/yesterday rejected by the hook; parsed as timestamptz at startup\). checkSingleRecoveryTarget counts all five and runs for every server at startup. Archive recovery stops at a restore point \(always after\), at a transaction end by time \(inclusive: after at = target, before > target; exclusive: before ≥ target\), and after reaching consistency for 'immediate'; StopReason/StopMessage carry PG's texts; the never\-reached FATAL covers them and is logged at FATAL. 003's standby\_8 passes in both goopg pairings.
-- [ ] **M0149-0023b — a goopg standby stops at its recovery target and pauses there \(standby mode\)**
+- [x] **M0149-0023b — a goopg standby stops at its recovery target and pauses there \(standby mode\)**
   Kind: impl
   Parent: M0149-0023
   - Path\-to\-TAP: 003 standby\_1..6 \(goopg standbys\) ← the StreamReplayer honours recovery\_target / \_xid / \_time / \_name / \_lsn and pauses \(recovery\_target\_action = pause: "pausing at the end of recovery", reads served, pg\_wal\_replay\_resume\(\) promotes\) ← M0149\-0023.
   - Today the standby ignores every target; with a PG primary the counts are whatever replay reached when the poll fired \(timing\-dependent passes\). Reuse the archive\-recovery stop logic \(RecoveryStop, RestorePointOf\) and ctx.RecoveryPause.
+  - 2026\-11\-25 \(done\): the per\-record stop decision is one function, EvaluateRecoveryStop \(recoveryStopsBefore/After\), shared by archive recovery and the StreamReplayer. The standby's replayer takes a ReplayTarget before it starts: it stops before a record or after it as the target says \('immediate' after the record that makes the standby consistent\), logs PG's "recovery stopping …", and for recovery\_target\_action = pause waits at the end of recovery \("pausing at the end of recovery", HINT "Execute pg\_wal\_replay\_resume\(\) to promote."; pg\_get\_wal\_replay\_pause\_state = paused, reads served\). pg\_wal\_replay\_resume\(\) then promotes; 'promote' promotes at once. 003 passes on all three pairings 3 of 3, ungated; inventory row 003 → port. M0149\-0023 closed.
+  - Same loop: TestE2E\_PGStandbyFullCycle failed 3 of 5 runs after the end\-of\-backup switch \(0023d\): it read row 2 right after pg\_stat\_replication said streaming, and replay landed ~100 ms later \(probe: replay 0/2000000 → 0/2000140\). The test now polls for the row \(30 s\), as upstream's wait\_for\_catchup would; 6 of 6 runs pass. Not the documented walreceiver start\-mismatch flake \(the row always arrived\).
 - [x] **M0149-0023c — all\-goopg 003: every standby counts 1005 rows of tab\_int**
   Kind: impl
   Parent: M0149-0023
