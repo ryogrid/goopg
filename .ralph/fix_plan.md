@@ -16564,11 +16564,12 @@ verify each at HEAD when the task starts.
   Upstream: `postgres/src/test/recovery/t/023_pitr_prepared_xact.pl` — PITR with a prepared transaction, then promotion.
   Likely prerequisites \(verify at start\): prepared-xact restore from WAL at a PITR stop point, `recovery_target_action=promote`, end-of-recovery checkpoint keeping `pg_twophase`.
   - 2026\-11\-25 \(done\): Path\-to\-TAP: 023 goopg\-PITR pairings ← archive recovery keeps the transaction prepared before the restore point \(PrepareRedoAdd, RecoverPreparedTransactions\) ← M0149\-0024. Archive recovery's replay hooks now include Prepare / PreparedFinish \(the standby replayer's two\-phase bookkeeping\), and at the end of archive recovery the prepared transactions replay left open are restored into the promoted server \(restoreReplayedPrepared, shared with standby promotion\). Before: "prepared transaction with identifier "fooinsert" does not exist" after promotion. 023 passes on all three pairings 3 of 3, ungated; inventory row 023 → port.
-- [ ] **M0149-0025 — port recovery/t/004_timeline_switch.pl**
+- [x] **M0149-0025 — port recovery/t/004_timeline_switch.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/recovery/t/004_timeline_switch.pl` — cascading standby follows a newly promoted standby.
   Likely prerequisites \(verify at start\): streaming end-of-timeline exchange + `TIMELINE_HISTORY` \(design 0102-0002 — verify vs PG\), `recovery_target_timeline=latest`, `primary_conninfo` reload without restart.
+  - 2026\-11\-25 \(done\): ported as TestPort\_Recovery004TimelineSwitchFull; it passed on all three pairings on the first run and 3 of 3 runs with no product change — the cascading\-standby timeline follow, the walreceiver PID staying the same across the jump, and a standby following a primary that was restarted as a standby and promoted with archiving on were already in place \(M0149 timeline work\). Inventory row 004 → port. Observation only: the goopg\-standby pairings take ~38 s against ~11 s with PG 18.3 standbys \(the same assertions pass\).
 - [ ] **M0149-0026 — port recovery/t/025_stuck_on_old_timeline.pl**
   Kind: impl
   Parent: none
