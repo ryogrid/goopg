@@ -14,8 +14,8 @@ func TestFSMSaveLoadRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 
 	src := NewFSM()
-	relA := RelFileNode{DBOid: 1, RelOid: 16402, Fork: MainFork}
-	relB := RelFileNode{DBOid: 1, RelOid: 16405, Fork: MainFork}
+	relA := RelFileNode{DBOid: 16384, RelOid: 16402, Fork: MainFork}
+	relB := RelFileNode{DBOid: 16384, RelOid: 16405, Fork: MainFork}
 	src.RecordFreeSpace(relA, 0, 7000)
 	src.RecordFreeSpace(relA, 1, 0)
 	src.RecordFreeSpace(relA, 2, 4096)
@@ -54,7 +54,7 @@ func TestFSMLoadMissingFileIsNoOp(t *testing.T) {
 func TestFSMLoadRejectsCorruptFork(t *testing.T) {
 	dir := t.TempDir()
 	// Write a corrupt _fsm file that is not a multiple of BlockSize.
-	dbDir := filepath.Join(dir, "base", "1")
+	dbDir := filepath.Join(dir, "base", "16384")
 	if err := os.MkdirAll(dbDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -76,8 +76,8 @@ func TestFSMSaveDeterministicOrdering(t *testing.T) {
 
 	src := NewFSM()
 	for _, rel := range []RelFileNode{
-		{DBOid: 1, RelOid: 16405, Fork: MainFork},
-		{DBOid: 1, RelOid: 16402, Fork: MainFork},
+		{DBOid: 16384, RelOid: 16405, Fork: MainFork},
+		{DBOid: 16384, RelOid: 16402, Fork: MainFork},
 		{DBOid: 5, RelOid: 99, Fork: MainFork},
 	} {
 		src.RecordFreeSpace(rel, 1, 1234)
@@ -91,8 +91,8 @@ func TestFSMSaveDeterministicOrdering(t *testing.T) {
 
 	// Compare the fork files — same state should produce identical files.
 	for _, rel := range []RelFileNode{
-		{DBOid: 1, RelOid: 16405, Fork: FSMFork},
-		{DBOid: 1, RelOid: 16402, Fork: FSMFork},
+		{DBOid: 16384, RelOid: 16405, Fork: FSMFork},
+		{DBOid: 16384, RelOid: 16402, Fork: FSMFork},
 		{DBOid: 5, RelOid: 99, Fork: FSMFork},
 	} {
 		pathA := RelForkPath(dirA, rel)

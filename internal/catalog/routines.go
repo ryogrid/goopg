@@ -219,6 +219,20 @@ type routineStore struct {
 	byName  map[string][]string // schema.name → list of overload keys
 	nextOID uint32
 
+	// allocOID / advanceOID, when set, route routine OIDs through the owning
+	// catalog's single OID counter (InMemory.nextOID), as PG's ProcedureCreate
+	// takes pg_proc OIDs from the same GetNewObjectId counter that pg_class
+	// and pg_type use (catalog.c GetNewOidWithIndex). M0148-0001j4: a separate
+	// counter put every routine above every relation/type, so dependency
+	// lists sorted by OID (findDependentObjects' object_address_comparator)
+	// printed a function before the domain or table created before it. They
+	// are never called with mu held: the catalog takes its own lock first
+	// and then this one (DropDatabase → DropAllInDB), so the reverse order
+	// would deadlock. A registry without them (NewRoutines in isolation)
+	// keeps its own counter from FirstRoutineOID.
+	allocOID   func() uint32
+	advanceOID func(uint32)
+
 	// heapTIDs maps routine OID → the routine's LIVE pg_proc heap-row TID
 	// (B1.2 TID-carrying cache, doc 02a §3.3): seeded by CREATE's heap
 	// INSERT and by the startup reload, refreshed by every ALTER's heap
@@ -306,6 +320,15 @@ func NewRoutines() *Routines {
 	}}
 }
 
+// shareOIDCounter makes the registry draw routine OIDs from alloc and report
+// recovered ones to advance — the owning catalog's single OID counter.
+func (rs *Routines) shareOIDCounter(alloc func() uint32, advance func(uint32)) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.allocOID = alloc
+	rs.advanceOID = advance
+}
+
 // routineDBPrefix folds dbOid into a registry key, mirroring domainKey's
 // "<dbOid>\x00" prefix convention (M0119-0004 DU-002 follow-up).
 func routineDBPrefix(dbOid uint32) string {
@@ -343,9 +366,31 @@ func (rs *Routines) Create(r *Routine, orReplace bool) (*Routine, error) {
 		clone.DBOid = rs.dbFor(nil)
 	}
 	signature := clone.Signature()
-	rs.mu.Lock()
-	defer rs.mu.Unlock()
 	k := routineKey(clone.DBOid, schema, clone.Name, signature)
+	// Take a fresh OID from the shared counter before locking the registry
+	// (see allocOID), but only when the signature is not registered yet: a
+	// CREATE OR REPLACE keeps its OID and a duplicate CREATE fails, and
+	// neither consumes one in PG. A concurrent CREATE of the same signature
+	// can still win the race; the OID drawn here is then simply unused, as
+	// an aborted CREATE's would be.
+	var freshOID uint32
+	for {
+		rs.mu.RLock()
+		_, exists := rs.byKey[k]
+		alloc := rs.allocOID
+		rs.mu.RUnlock()
+		if !exists && alloc != nil && freshOID == 0 {
+			freshOID = alloc()
+		}
+		rs.mu.Lock()
+		if _, exists = rs.byKey[k]; exists || alloc == nil || freshOID != 0 {
+			break
+		}
+		// The signature disappeared between the peek and the lock (a
+		// concurrent DROP): draw an OID outside the lock and retry.
+		rs.mu.Unlock()
+	}
+	defer rs.mu.Unlock()
 	if existing, ok := rs.byKey[k]; ok {
 		if !orReplace {
 			return nil, fmt.Errorf("%w: %s%s", ErrRoutineExists, clone.QualifiedName(), signature)
@@ -365,8 +410,12 @@ func (rs *Routines) Create(r *Routine, orReplace bool) (*Routine, error) {
 		rs.byKey[k] = &clone
 		return &clone, nil
 	}
-	clone.OID = rs.nextOID
-	rs.nextOID++
+	if freshOID != 0 {
+		clone.OID = freshOID
+	} else {
+		clone.OID = rs.nextOID
+		rs.nextOID++
+	}
 	rs.byKey[k] = &clone
 	nk := nameKey(clone.DBOid, schema, clone.Name)
 	rs.byName[nk] = append(rs.byName[nk], k)
@@ -387,6 +436,19 @@ func (rs *Routines) Create(r *Routine, orReplace bool) (*Routine, error) {
 // registry. DU-002 restart-persistence follow-up (M0119-0004, loop #71
 // ledger resume point).
 func (rs *Routines) CreateDuringRecovery(r *Routine) *Routine {
+	stored := rs.createDuringRecoveryLocked(r)
+	// Keep the shared catalog counter past the recovered OID too, outside
+	// the registry lock (see allocOID).
+	rs.mu.RLock()
+	advance := rs.advanceOID
+	rs.mu.RUnlock()
+	if advance != nil {
+		advance(stored.OID)
+	}
+	return stored
+}
+
+func (rs *Routines) createDuringRecoveryLocked(r *Routine) *Routine {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	schema := r.Schema

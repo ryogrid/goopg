@@ -321,6 +321,13 @@ func (c *CLog) InitializeAsCommitted(highXID storage.TransactionID) error {
 // the upstream cluster's nextXid BEFORE this sweep runs so the upstream
 // range is already Committed.
 func (c *CLog) MarkUnknownAsAborted(highXID storage.TransactionID) error {
+	return c.MarkUnknownAsAbortedExcept(highXID, nil)
+}
+
+// MarkUnknownAsAbortedExcept is MarkUnknownAsAborted leaving alone every xid
+// keep reports true for — a prepared transaction restored at startup and its
+// subtransactions, which are still in progress (M0149-0015a).
+func (c *CLog) MarkUnknownAsAbortedExcept(highXID storage.TransactionID, keep func(storage.TransactionID) bool) error {
 	if highXID == 0 {
 		return nil
 	}
@@ -353,6 +360,9 @@ func (c *CLog) MarkUnknownAsAborted(highXID storage.TransactionID) error {
 			return err
 		}
 		if st == TxnStatusUnknown {
+			if keep != nil && keep(xid) {
+				continue
+			}
 			if _, err := p.setStatus(xid, TxnStatusAborted); err != nil {
 				return err
 			}

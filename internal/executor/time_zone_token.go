@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // Trailing-field classification for TIME / TIMETZ text input.
@@ -128,19 +130,15 @@ func classifyZoneToken(tok string) (kind zoneTokenKind, offsetSecs int) {
 		return zoneTokenOffset, -off
 	}
 
-	// A zone name proper. pg_tzset() is case-insensitive; Go's loader is not,
-	// so try the spelling as written before the lowercased one.
-	for _, name := range []string{tok, strings.ToLower(tok)} {
-		loc, err := time.LoadLocation(name)
-		if err != nil {
-			continue
-		}
-		if off, fixed := fixedZoneOffset(loc); fixed {
-			return zoneTokenOffset, off
-		}
-		return zoneTokenNamedNeedsDate, 0
+	// A zone name proper, found as pg_tzset() finds it, in any case.
+	loc, ok := misc.ZoneByName(tok)
+	if !ok {
+		return zoneTokenNotRecognised, 0
 	}
-	return zoneTokenNotRecognised, 0
+	if off, fixed := fixedZoneOffset(loc); fixed {
+		return zoneTokenOffset, off
+	}
+	return zoneTokenNamedNeedsDate, 0
 }
 
 // pgDateTimeKeywords is the set of wholly-alphabetic tokens in upstream's

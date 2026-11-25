@@ -141,8 +141,17 @@ func TestE2E_PGStandbyFullCycle(t *testing.T) {
 		"SELECT val FROM public.s10_t WHERE id = 1"); got != "basebackup" {
 		t.Fatalf("standby row id=1 = %q, want basebackup", got)
 	}
-	if got := pgScalar(t, standby,
-		"SELECT val FROM public.s10_t WHERE id = 2"); got != "post-backup" {
+	// "streaming" says nothing about replay: wait for the post-backup row
+	// as upstream's wait_for_catchup / poll_query_until would, instead of
+	// racing replay (it lands ~100 ms later once the stream starts at the
+	// segment after the backup's XLOG_BACKUP_END switch; M0149-0023d).
+	var got string
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		if got, _ = pgScalarMaybe(standby, "SELECT val FROM public.s10_t WHERE id = 2"); got == "post-backup" {
+			break
+		}
+	}
+	if got != "post-backup" {
 		t.Fatalf("standby row id=2 = %q, want post-backup", got)
 	}
 

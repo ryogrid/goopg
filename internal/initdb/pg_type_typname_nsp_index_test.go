@@ -101,6 +101,15 @@ func TestBootstrapPgTypeTypnameNspIndexWritesPopulatedBtree(t *testing.T) {
 				wantNsp = 13273
 				seenInfoSchema[name] = true
 			}
+			// M0149-0001g slice 18: captured rowtypes (and their arrays)
+			// carry their own namespace; a name can exist in two (pg_catalog's
+			// array "_pg_user_mappings" and information_schema's view of that
+			// name), so accept any captured (name, namespace) pair.
+			for _, r := range pgTypeRowtypeRows() {
+				if r.Name == name && r.Nsp == nsp {
+					wantNsp = nsp
+				}
+			}
 			if nsp != wantNsp {
 				t.Fatalf("leaf %d slot %d (%q): nsp = %d, want %d", blk, i, name, nsp, wantNsp)
 			}

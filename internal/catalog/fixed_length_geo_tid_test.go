@@ -1,0 +1,109 @@
+package catalog
+
+import (
+	"bufio"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// TestFixedLengthGeoTidMatchesPostgresBKI pins M0149-0001k: in a cluster with
+// the fixed_length_geometric_tid capability, PhysicalTypeIsVarlena and
+// PhysicalTypeAlign answer PostgreSQL 18.3's pg_type typlen / typalign for
+// point, lseg, box, line, circle and tid (postgres.bki), so a PG node deforms
+// goopg-written rows at the same offsets. Without the capability the six stay
+// varlena at 'i' — the format older clusters wrote, and the
+// knownAlignGaps entries of TestPhysicalTypeAlignMatchesPostgresBKI.
+func TestFixedLengthGeoTidMatchesPostgresBKI(t *testing.T) {
+	f, err := os.Open(filepath.Join("..", "..", "postgres", "src", "include", "catalog", "postgres.bki"))
+	if err != nil {
+		t.Skipf("PG oracle postgres.bki not available: %v", err)
+	}
+	defer f.Close()
+	want := map[string][2]int{} // typlen, align bytes
+	bytes := map[string]int{"c": 1, "s": 2, "i": 4, "d": 8}
+	in := false
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		l := sc.Text()
+		switch {
+		case strings.HasPrefix(l, "create pg_type "):
+			in = true
+		case l == "close pg_type":
+			in = false
+		case in && strings.HasPrefix(l, "insert ( "):
+			fl := strings.Fields(strings.TrimPrefix(l, "insert ( "))
+			if isFixedGeoTidName(fl[1]) {
+				n, _ := strconv.Atoi(fl[4])
+				want[fl[1]] = [2]int{n, bytes[fl[22]]}
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(want) != 6 {
+		t.Fatalf("found %d of the 6 pg_type rows", len(want))
+	}
+	defer SetFixedLengthGeoTid(FixedLengthGeoTid())
+	for _, on := range []bool{true, false} {
+		SetFixedLengthGeoTid(on)
+		for name, w := range want {
+			typ := Type{Name: name}
+			gotVarlena, gotAlign := PhysicalTypeIsVarlena(typ), PhysicalTypeAlignName(typ)
+			if on && (gotVarlena || gotAlign != w[1] || w[0] <= 0) {
+				t.Errorf("capable cluster: %s varlena=%v align=%d, PG typlen %d typalign %d", name, gotVarlena, gotAlign, w[0], w[1])
+			}
+			if !on && (!gotVarlena || gotAlign != 4) {
+				t.Errorf("legacy cluster: %s varlena=%v align=%d, want the varlena 'i' format", name, gotVarlena, gotAlign)
+			}
+		}
+	}
+}
+
+// TestFixedLengthMoney pins the money capability's catalog answers: Cash is
+// typlen 8, typalign 'd' (pg_type.dat OID 790) when the cluster has
+// fixed_length_money, varlena at 'i' otherwise. M0149-0001k1.
+func TestFixedLengthMoney(t *testing.T) {
+	defer SetFixedLengthMoney(FixedLengthMoney())
+	SetFixedLengthMoney(true)
+	if PhysicalTypeIsVarlena(Type{Name: "money"}) || PhysicalTypeAlignName(Type{Name: "money"}) != 8 {
+		t.Error("capable cluster: money must be fixed-length at 'd'")
+	}
+	SetFixedLengthMoney(false)
+	if !PhysicalTypeIsVarlena(Type{Name: "money"}) || PhysicalTypeAlignName(Type{Name: "money"}) != 4 {
+		t.Error("legacy cluster: money must stay varlena at 'i'")
+	}
+}
+
+// TestFixedLengthAclItem pins the aclitem capability's catalog answers:
+// AclItem is typlen 16, typalign 'd' (pg_type.dat OID 1033) with
+// fixed_length_aclitem, varlena at 'i' otherwise. M0149-0001k2.
+func TestFixedLengthAclItem(t *testing.T) {
+	defer SetFixedLengthAclItem(FixedLengthAclItem())
+	SetFixedLengthAclItem(true)
+	if PhysicalTypeIsVarlena(Type{Name: "aclitem"}) || PhysicalTypeAlignName(Type{Name: "aclitem"}) != 8 {
+		t.Error("capable cluster: aclitem must be fixed-length at 'd'")
+	}
+	SetFixedLengthAclItem(false)
+	if !PhysicalTypeIsVarlena(Type{Name: "aclitem"}) || PhysicalTypeAlignName(Type{Name: "aclitem"}) != 4 {
+		t.Error("legacy cluster: aclitem must stay varlena at 'i'")
+	}
+}
+
+// TestDefaultBtreeOpclassForIndexableTypes pins the pg_index.indclass
+// default-opclass mapping for the types goopg can btree-index whose indclass
+// used to be 0 (a PG node then rejects every query on the table with "bogus
+// pg_index tuple"). OIDs per a PG 18.3 initdb. M0149-0001k5.
+func TestDefaultBtreeOpclassForIndexableTypes(t *testing.T) {
+	c := NewInMemory()
+	for typ, want := range map[string]uint32{
+		"money": 10047, "time": 10038, "timetz": 10041, "cidr": 10015, "regclass": 1981, "int4": 1978,
+	} {
+		if got := c.ResolveIndexColumnOpclassOID("", typ, 403); got != want {
+			t.Errorf("default btree opclass for %s = %d, want %d", typ, got, want)
+		}
+	}
+}

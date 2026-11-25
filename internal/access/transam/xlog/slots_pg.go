@@ -92,7 +92,7 @@ func marshalSlotBinary(slot *Slot) []byte {
 	putNameData(buf[slotOffName:], slot.Name)
 	binary.LittleEndian.PutUint32(buf[slotOffDatabase:], slot.DatabaseOID)
 	// slotdata.persistency = RS_PERSISTENT = 0 (already zero)
-	// slotdata.xmin = 0 (already zero)
+	binary.LittleEndian.PutUint32(buf[slotOffXmin:], uint32(slot.Xmin))
 	binary.LittleEndian.PutUint32(buf[slotOffCatalogXmin:], uint32(slot.CatalogXmin))
 	binary.LittleEndian.PutUint64(buf[slotOffRestartLSN:], slot.RestartLSN)
 	if slot.Invalidated {
@@ -150,6 +150,7 @@ func unmarshalSlotBinary(data []byte, dirName string) (*Slot, error) {
 		name = dirName
 	}
 	dbOID := binary.LittleEndian.Uint32(data[slotOffDatabase:])
+	xmin := binary.LittleEndian.Uint32(data[slotOffXmin:])
 	catalogXmin := binary.LittleEndian.Uint32(data[slotOffCatalogXmin:])
 	restartLSN := binary.LittleEndian.Uint64(data[slotOffRestartLSN:])
 	invalidatedVal := binary.LittleEndian.Uint32(data[slotOffInvalidated:])
@@ -178,6 +179,7 @@ func unmarshalSlotBinary(data []byte, dirName string) (*Slot, error) {
 		Database:          dbName,
 		DatabaseOID:       dbOID,
 		CatalogXmin:       uint64(catalogXmin),
+		Xmin:              uint64(xmin),
 	}, nil
 }
 

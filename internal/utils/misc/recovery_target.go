@@ -161,3 +161,38 @@ func checkRecoveryTargetXid(value string) error {
 	}
 	return nil
 }
+
+// checkRecoveryTarget is check_recovery_target: "" or "immediate".
+func checkRecoveryTarget(value string) error {
+	if value != "" && value != "immediate" {
+		return &ValidationError{
+			Msg:    `invalid value for parameter "recovery_target": "` + value + `"`,
+			Detail: `The only allowed value is "immediate".`,
+		}
+	}
+	return nil
+}
+
+// checkRecoveryTargetName is check_recovery_target_name: shorter than
+// MAXFNAMELEN.
+func checkRecoveryTargetName(value string) error {
+	if len(value) >= 64 {
+		return &ValidationError{
+			Msg:    `invalid value for parameter "recovery_target_name": "` + value + `"`,
+			Detail: `"recovery_target_name" is too long (maximum 63 characters).`,
+		}
+	}
+	return nil
+}
+
+// checkRecoveryTargetTime is the part of check_recovery_target_time that
+// needs no datetime parser: the special inputs now, today, tomorrow and
+// yesterday are rejected. The value itself is parsed as timestamptz when
+// recovery starts (validateRecoveryParameters' timestamptz_in).
+func checkRecoveryTargetTime(value string) error {
+	switch value {
+	case "now", "today", "tomorrow", "yesterday":
+		return &ValidationError{Msg: `invalid value for parameter "recovery_target_time": "` + value + `"`}
+	}
+	return nil
+}

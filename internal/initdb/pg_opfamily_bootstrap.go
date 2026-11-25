@@ -52,8 +52,8 @@ func pgOpfamilyInitialEntries() []pgOpfamilyEntry {
 		amHash      uint32 = 405
 		amGist      uint32 = 783
 		amGin       uint32 = 2742
-		amBrin      uint32 = 4000
-		amSpgist    uint32 = 3580
+		amBrin      uint32 = 3580 // BRIN_AM_OID; was swapped with spgist before M0149-0001g slice 7
+		amSpgist    uint32 = 4000 // SPGIST_AM_OID
 	)
 	return []pgOpfamilyEntry{
 		{397, amBtree, "array_ops", nsPGCatalog, ownerSuper},          // btree/array_ops

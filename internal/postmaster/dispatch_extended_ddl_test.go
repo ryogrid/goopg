@@ -118,9 +118,9 @@ func TestExtendedProtocolDatabaseAndRoleDDL(t *testing.T) {
 	if tag != "ALTER DATABASE" {
 		t.Fatalf("ALTER DATABASE SET: CommandComplete tag=%q, want %q", tag, "ALTER DATABASE")
 	}
-	dbEntries := im.DatabaseConfigEntries(catalog.FirstUserOID)
+	dbEntries := im.DatabaseConfigEntries(catalog.PostgresDBOid)
 	if len(dbEntries) != 1 || dbEntries[0] != "work_mem=77MB" {
-		t.Fatalf("DatabaseConfigEntries(FirstUserOID) = %v, want [work_mem=77MB]", dbEntries)
+		t.Fatalf("DatabaseConfigEntries(PostgresDBOid) = %v, want [work_mem=77MB]", dbEntries)
 	}
 
 	frames = extendedExec(t, conn, "dr", "DROP ROLE extddl_role")

@@ -232,3 +232,72 @@ func writeConstraintIndexFile(dataDir string, oid uint32, file []byte) error {
 	}
 	return nil
 }
+
+// bootstrapPgConstraintConnameNspIndex writes pg_constraint_conname_nsp_index
+// (OID 2664, btree(conname name_ops, connamespace oid_ops), non-unique) over the
+// bootstrapped constraint rows. M0149-0001g: PG's ChooseConstraintName /
+// ConstraintNameIsUsed scan it for every PRIMARY KEY, UNIQUE and CHECK it
+// creates; without it a PG 18.3 node failed "could not open relation with OID
+// 2664" on CREATE TABLE … PRIMARY KEY over a goopg directory.
+func bootstrapPgConstraintConnameNspIndex(dataDir string, tids map[uint32]heapTID) error {
+	entries := pgConstraintInitialEntries()
+	type indexed struct {
+		name  string
+		block uint32
+		off   uint16
+	}
+	items := make([]indexed, 0, len(entries))
+	for _, e := range entries {
+		tid, ok := tids[e.OID]
+		if !ok {
+			return fmt.Errorf("pg_constraint_conname_nsp_index: no heap TID for constraint OID %d", e.OID)
+		}
+		items = append(items, indexed{name: e.ConName, block: tid.Block, off: tid.Offset})
+	}
+	// connamespace is information_schema (13273) for every bootstrap row.
+	sort.Slice(items, func(i, j int) bool { return items[i].name < items[j].name })
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleNameOidKey(it.block, it.off, it.name, 13273)
+	}
+	file, err := pgBuildBtreeBulkLoadSized(tuples, 80 /* name+oid tuple size */, 2)
+	if err != nil {
+		return fmt.Errorf("pg_constraint_conname_nsp_index bulk-load: %w", err)
+	}
+	return writeConstraintIndexFile(dataDir, 2664, file)
+}
+
+// bootstrapPgConstraintConparentidIndex writes pg_constraint_conparentid_index
+// (OID 2579, btree(conparentid oid_ops)). Every bootstrap row has conparentid 0.
+// M0149-0001g.
+func bootstrapPgConstraintConparentidIndex(dataDir string, tids map[uint32]heapTID) error {
+	entries := pgConstraintInitialEntries()
+	type indexed struct {
+		block uint32
+		off   uint16
+	}
+	items := make([]indexed, 0, len(entries))
+	for _, e := range entries {
+		tid, ok := tids[e.OID]
+		if !ok {
+			return fmt.Errorf("pg_constraint_conparentid_index: no heap TID for constraint OID %d", e.OID)
+		}
+		items = append(items, indexed{block: tid.Block, off: tid.Offset})
+	}
+	// Equal keys: heap TID order, as nbtree's heapkeyspace sorts duplicates.
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].block != items[j].block {
+			return items[i].block < items[j].block
+		}
+		return items[i].off < items[j].off
+	})
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidKey(it.block, it.off, 0)
+	}
+	file, err := pgBuildBtreeBulkLoad(tuples, 1)
+	if err != nil {
+		return fmt.Errorf("pg_constraint_conparentid_index bulk-load: %w", err)
+	}
+	return writeConstraintIndexFile(dataDir, 2579, file)
+}

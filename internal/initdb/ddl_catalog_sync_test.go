@@ -148,7 +148,9 @@ func scanPGAttributeByRelID(t *testing.T, rt *Runtime, relOID uint32) []catalog.
 					continue
 				}
 			}
-			if row.AttRelID == relOID {
+			// User columns only: the six system attributes (attnum < 0) every
+			// table carries since M0149-0001e are not what these tests count.
+			if row.AttRelID == relOID && row.AttNum > 0 {
 				out = append(out, row)
 			}
 		}

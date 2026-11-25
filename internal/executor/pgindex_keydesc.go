@@ -58,7 +58,9 @@ func pgIndexComparatorForOID(oid uint32) nbtree.PGAttrComparator {
 		return nbtree.PGCompareInt2
 	case catalog.OIDInt4, catalog.OIDDate:
 		return nbtree.PGCompareInt4
-	case catalog.OIDInt8, catalog.OIDTime, catalog.OIDTimestamp, catalog.OIDTimestampTZ:
+	case catalog.OIDInt8, catalog.OIDTime, catalog.OIDTimestamp, catalog.OIDTimestampTZ,
+		// cash_cmp: the int64 Cash count, ordered as int8. M0149-0001k5.
+		catalog.OIDMoney:
 		return nbtree.PGCompareInt8
 	case catalog.OIDOID:
 		return nbtree.PGCompareOID
@@ -93,7 +95,7 @@ func pgIndexIntWidthForOID(oid uint32, typLen int16) uint8 {
 		w = 2
 	case catalog.OIDInt4, catalog.OIDDate:
 		w = 4
-	case catalog.OIDInt8, catalog.OIDTime, catalog.OIDTimestamp, catalog.OIDTimestampTZ:
+	case catalog.OIDInt8, catalog.OIDTime, catalog.OIDTimestamp, catalog.OIDTimestampTZ, catalog.OIDMoney:
 		w = 8
 	}
 	if int16(w) != typLen {
@@ -169,6 +171,13 @@ func pgIndexKeyTypeOID(col *catalog.Column) (uint32, bool) {
 		return catalog.OIDTimestamp, true
 	case "timestamptz", "timestamp with time zone":
 		return catalog.OIDTimestampTZ, true
+	case "money":
+		// Only where the heap image IS the 8-byte Cash (fixed_length_money);
+		// an older cluster's varlena text would mis-order under cash_cmp.
+		// M0149-0001k5.
+		if catalog.FixedLengthMoney() {
+			return catalog.OIDMoney, true
+		}
 	}
 	return 0, false
 }

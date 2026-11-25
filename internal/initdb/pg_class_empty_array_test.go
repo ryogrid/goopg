@@ -10,8 +10,9 @@ import (
 
 // TestPgClassRelaclReloptionsEncodedAsBinaryArrayType pins the
 // bootstrap pg_class encoding for M0106-0010: relacl and reloptions
-// must be emitted as 16-byte PG-native ArrayType blobs (not text
-// varlena "{}"), so that vanilla PG's deconstruct_array does not
+// must be emitted as PG-native ArrayType blobs (not text varlena "{}");
+// relacl carries PG initdb's ACL since M0149-0001g slice 12. Vanilla PG's
+// deconstruct_array must not
 // trip the ARR_ELEMTYPE assertion when a backend reads cached
 // pg_class tuples.
 //
@@ -47,11 +48,18 @@ func TestPgClassRelaclReloptionsEncodedAsBinaryArrayType(t *testing.T) {
 	if relaclIdx < 0 || reloptionsIdx < 0 {
 		t.Fatalf("relacl/reloptions not found in pgClassColDefs")
 	}
-	relaclOff, reloptionsOff := offsetsForVarlenaColumns(t, cols, relaclIdx, reloptionsIdx)
+	relaclOff, _ := offsetsForVarlenaColumns(t, cols, relaclIdx, reloptionsIdx)
 
-	if got := payload[relaclOff:][:16]; !isEmptyArrayType(got, 1033) {
-		t.Fatalf("relacl @offset %d: not a valid empty aclitem[] ArrayType: % x", relaclOff, got)
+	// M0149-0001g slice 12: pg_class's relacl is PG initdb's
+	// {B=arwdDxtm/B,=r/B} — a ONE-dimensional aclitem array (PG's check_acl
+	// rejects the ndim-0 empty array goopg used to write) with two items.
+	le := binary.LittleEndian
+	relacl := payload[relaclOff:]
+	relaclLen := int(le.Uint32(relacl[0:4]) >> 2)
+	if nd, et, n := le.Uint32(relacl[4:8]), le.Uint32(relacl[12:16]), le.Uint32(relacl[16:20]); nd != 1 || et != 1033 || n != 2 || relaclLen != 24+2*16 {
+		t.Fatalf("relacl @offset %d: ndim=%d elemtype=%d items=%d len=%d, want a 1-D aclitem[] of 2 items (len 56)", relaclOff, nd, et, n, relaclLen)
 	}
+	reloptionsOff := alignTo(relaclOff+relaclLen, 4)
 	if got := payload[reloptionsOff:][:16]; !isEmptyArrayType(got, 25) {
 		t.Fatalf("reloptions @offset %d: not a valid empty text[] ArrayType: % x", reloptionsOff, got)
 	}

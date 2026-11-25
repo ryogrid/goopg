@@ -121,28 +121,51 @@ func ParseDateStyleValue(s string) (style, order string) {
 // depend on that invariant). Unrecognized style falls back to ISO, matching
 // ParseDateStyleValue's own default.
 func FormatDate(t time.Time, style, order string) string {
-	t, era := eraDisplay(t)
+	y, era := eraYear(t)
+	_, mo, d := t.Date()
 	switch style {
 	case "SQL":
 		if order == "DMY" {
-			return t.Format("02/01/2006") + era
+			return numericDate(d, int(mo), y, '/') + era
 		}
-		return t.Format("01/02/2006") + era
+		return numericDate(int(mo), d, y, '/') + era
 	case "Postgres":
 		if order == "DMY" {
-			return t.Format("02-01-2006") + era
+			return numericDate(d, int(mo), y, '-') + era
 		}
-		return t.Format("01-02-2006") + era
+		return numericDate(int(mo), d, y, '-') + era
 	case "German":
-		return t.Format("02.01.2006") + era
+		return numericDate(d, int(mo), y, '.') + era
 	default:
 		// review/260831 UT-9: ISO is the default DateStyle and therefore the
-		// shape almost every result row is rendered in, so it does not go
-		// through time.Format (which builds its own buffer and then a string)
-		// plus a concatenation. isoDate writes the digits into a stack buffer
-		// and allocates exactly the returned string.
-		return isoDate(t, era)
+		// shape almost every result row is rendered in; isoDate writes the digits
+		// into a stack buffer and allocates exactly the returned string.
+		return isoDate(y, int(mo), d, era)
 	}
+}
+
+// numericDate renders "AA<sep>BB<sep>YYYY".
+func numericDate(a, b, year int, sep byte) string {
+	var buf [32]byte
+	out := appendPad2(buf[:0], a)
+	out = append(out, sep)
+	out = appendPad2(out, b)
+	out = append(out, sep)
+	out = appendYear4(out, year)
+	return string(out)
+}
+
+// clockText renders " HH:MM:SS".
+func clockText(t time.Time) string {
+	hh, mi, ss := t.Clock()
+	var buf [16]byte
+	out := append(buf[:0], ' ')
+	out = appendPad2(out, hh)
+	out = append(out, ':')
+	out = appendPad2(out, mi)
+	out = append(out, ':')
+	out = appendPad2(out, ss)
+	return string(out)
 }
 
 // appendPad2 appends v as at least two digits ("07", "42", "123"), the way
@@ -177,21 +200,20 @@ func appendYear4(dst []byte, y int) []byte {
 }
 
 // isoDate renders "YYYY-MM-DD" + era.
-func isoDate(t time.Time, era string) string {
-	y, mo, d := t.Date()
+func isoDate(y, mo, d int, era string) string {
 	var b [32]byte
 	buf := appendYear4(b[:0], y)
 	buf = append(buf, '-')
-	buf = appendPad2(buf, int(mo))
+	buf = appendPad2(buf, mo)
 	buf = append(buf, '-')
 	buf = appendPad2(buf, d)
 	buf = append(buf, era...)
 	return string(buf)
 }
 
-// isoTimestamp renders "YYYY-MM-DD HH:MM:SS" + frac.
-func isoTimestamp(t time.Time, frac string) string {
-	y, mo, d := t.Date()
+// isoTimestamp renders "YYYY-MM-DD HH:MM:SS" + frac for the display year y.
+func isoTimestamp(t time.Time, y int, frac string) string {
+	_, mo, d := t.Date()
 	hh, mi, ss := t.Clock()
 	var b [48]byte
 	buf := appendYear4(b[:0], y)
@@ -209,29 +231,24 @@ func isoTimestamp(t time.Time, frac string) string {
 	return string(buf)
 }
 
-// eraDisplay converts a stored (astronomical) instant into the pair every
-// EncodeDateOnly/EncodeDateTime style needs: a time whose YEAR field holds the
-// digits PostgreSQL prints, and the trailing era marker.
+// eraYear gives the year digits PostgreSQL prints for t and the trailing era
+// marker. Instants count years astronomically, as PG's date2j/j2date do: 1 BC is
+// year 0 and 2 BC is year -1, printed as `-(year - 1)` with " BC" appended after
+// everything else, including the time of day and the zone (datetime.c).
 //
-// goopg stores dates the way PG's date2j/j2date count them — 1 BC is year 0,
-// 2 BC is year -1 — so a BC date must not be handed to Go's layout formatter
-// as-is: `t.Format("2006-01-02")` renders year -2019 as "-2019-01-01", where
-// upstream prints "2020-01-01 BC" (datetime.c: the year digits are
-// `-(tm_year - 1)` for tm_year <= 0 and " BC" is appended after everything
-// else, including the time of day and the zone offset).
-//
-// Only the year field is rewritten, never the instant, so callers that also
-// print a WEEKDAY (the Postgres style's "Mon") must take it from the original
-// time — 1 January 2020 BC is a Thursday and 1 January 2020 AD is not.
-func eraDisplay(t time.Time) (time.Time, string) {
+// Only the digits change. Month, day and clock come from t itself: rebuilding a
+// time with the display year would turn a BC leap day into March 1, since the
+// display year is not the leap year.
+func eraYear(t time.Time) (int, string) {
 	y := t.Year()
 	if y > 0 {
-		return t, ""
+		return y, ""
 	}
-	return time.Date(-(y - 1), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(),
-		t.Nanosecond(), t.Location()), " BC"
+	return -(y - 1), " BC"
 }
 
+// EraYear exports eraYear for the type-agnostic Datum renderers.
+func EraYear(t time.Time) (int, string) { return eraYear(t) }
 
 // fracSecondsSuffix renders t's sub-second component as a leading-dot suffix
 // (e.g. ".5", ".000123"), trimmed of trailing zeros, or "" when there is no
@@ -282,25 +299,27 @@ func FormatTimestamp(t time.Time, style, order string) string {
 // FormatTimestampTZ splices the encoded zone between them.
 func formatTimestampBody(t time.Time, style, order string) (body, era string) {
 	frac := fracSecondsSuffix(t)
-	// The Postgres style prints a weekday, which belongs to the stored instant,
-	// so it keeps formatting from t; every other style embeds only the year and
-	// formats from the era-adjusted copy.
-	disp, era := eraDisplay(t)
+	y, era := eraYear(t)
+	_, moName, d := t.Date()
+	mo := int(moName)
 	switch style {
 	case "SQL":
 		if order == "DMY" {
-			return disp.Format("02/01/2006 15:04:05") + frac, era
+			return numericDate(d, mo, y, '/') + clockText(t) + frac, era
 		}
-		return disp.Format("01/02/2006 15:04:05") + frac, era
+		return numericDate(mo, d, y, '/') + clockText(t) + frac, era
 	case "Postgres":
+		// The weekday and month name belong to the stored date.
+		var year [16]byte
+		suffix := frac + " " + string(appendYear4(year[:0], y))
 		if order == "DMY" {
-			return t.Format("Mon 02 Jan 15:04:05") + frac + disp.Format(" 2006"), era
+			return t.Format("Mon 02 Jan 15:04:05") + suffix, era
 		}
-		return t.Format("Mon Jan 02 15:04:05") + frac + disp.Format(" 2006"), era
+		return t.Format("Mon Jan 02 15:04:05") + suffix, era
 	case "German":
-		return disp.Format("02.01.2006 15:04:05") + frac, era
+		return numericDate(d, mo, y, '.') + clockText(t) + frac, era
 	default:
 		// review/260831 UT-9: the ISO default, see isoDate.
-		return isoTimestamp(disp, frac), era
+		return isoTimestamp(t, y, frac), era
 	}
 }

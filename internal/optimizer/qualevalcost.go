@@ -1,6 +1,7 @@
 package optimizer
 
 import (
+	"math"
 	"sort"
 
 	"github.com/goopg/goopg/internal/executor/hashsize"
@@ -251,8 +252,26 @@ func indexClausesEvalOps(clauses []indexPathClause) float64 {
 	for _, c := range clauses {
 		_, p := qualEvalOps(c.local)
 		ops += p
+		// M0148-0001c3a4 (i): the column quals merged into an array are
+		// index quals too, not qpquals.
+		for _, q := range c.saopColQuals {
+			_, p := qualEvalOps(q.local)
+			ops += p
+		}
 	}
 	return ops
+}
+
+// indexQualCount is list_length(indexQuals) over clauses: one per clause,
+// plus each column qual merged into a ScalarArrayOp (M0148-0001c3a4 (i)) —
+// genericcostestimate's qual_op_cost charges every index qual on every
+// index tuple.
+func indexQualCount(clauses []indexPathClause) float64 {
+	n := len(clauses)
+	for _, c := range clauses {
+		n += len(c.saopColQuals)
+	}
+	return float64(n)
 }
 
 // pgBootCPUOperatorCost is cpu_operator_cost's boot value (guc_tables.c),
@@ -374,4 +393,18 @@ func inSubPlanHashed(x *InExpr) bool {
 	maxAlign := func(n int) int { return (n + 7) &^ 7 }
 	size := pc.PlanRows * float64(maxAlign(pc.PlanWidth)+maxAlign(23))
 	return size <= float64(hashsize.HashMemLimit(0, 0))
+}
+
+// saopDescents is btcostestimate's num_sa_scans for one ScalarArrayOp
+// clause: the product of every array's length (selfuncs.c: `num_sa_scans *=
+// alength` per ScalarArrayOpExpr index qual, when alength > 1), including
+// the further arrays merged into it as column quals (M0148-0001c3a4 (i)).
+func saopDescents(c indexPathClause) float64 {
+	n := math.Max(float64(len(c.saop)), 1)
+	for _, q := range c.saopColQuals {
+		if l := float64(len(q.array)); l > 1 {
+			n *= l
+		}
+	}
+	return n
 }

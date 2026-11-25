@@ -281,6 +281,7 @@ func nodeOwnExprs(n Node) []Expr {
 			exprs = append(exprs, t.Key)
 		}
 		exprs = append(exprs, t.Keys...)
+		exprs = append(exprs, t.SAOPKeys...)
 		if t.LowKey != nil {
 			exprs = append(exprs, t.LowKey)
 		}
@@ -398,6 +399,9 @@ func nodeOwnExprs(n Node) []Expr {
 		}
 		if t.Step != nil {
 			exprs = append(exprs, t.Step)
+		}
+		if t.Zone != nil {
+			exprs = append(exprs, t.Zone)
 		}
 	case *GenerateSubscripts:
 		if t.ArrExpr != nil {

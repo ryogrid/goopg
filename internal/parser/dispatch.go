@@ -387,7 +387,8 @@ var routedCreatePairs = map[string]map[string]bool{
 		"view": true, // P5.13
 		"materialized": true, // P5.14 (SET SCHEMA only, see alterMatviewRouted)
 		"event": true, // P7.2 — ALTER EVENT TRIGGER
-		"system": true}, // M0122-0008 — ALTER SYSTEM
+		"system": true, // M0122-0008 — ALTER SYSTEM
+		"large": true}, // M0149-0001h1a — ALTER LARGE OBJECT … OWNER TO (legacy rejected every form)
 	"drop": {"table": true, "index": true, "view": true, "materialized": true, // P5.1
 		"function": true, "procedure": true, "routine": true, // P5.2
 		"type": true, "domain": true, // P5.5
@@ -483,7 +484,7 @@ var commentKinds = map[string]bool{
 	"view": true, "sequence": true, "materialized": true, "type": true,
 	"domain": true, "collation": true, "access": true, "server": true,
 	"foreign": true, "extension": true, "cast": true, "function": true,
-	"schema": true,
+	"schema": true, "large": true,
 }
 
 func commentRouted(frag []Token) bool {

@@ -47,7 +47,7 @@ func TestReadBlocksMatchesReadBlock(t *testing.T) {
 	mgr := NewManager(ManagerConfig{DataDir: dir, ChecksumsEnabled: true})
 	defer mgr.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 700, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 700, Fork: MainFork}
 	const n = 9
 	extendN(t, mgr, rel, n)
 
@@ -92,7 +92,7 @@ func TestReadBlocksMatchesReadBlock(t *testing.T) {
 // corrupt page that still parses produces wrong rows silently.
 func TestReadBlocksVerifiesChecksums(t *testing.T) {
 	dir := t.TempDir()
-	rel := RelFileNode{DBOid: 1, RelOid: 701, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 701, Fork: MainFork}
 
 	mgrCk := NewManager(ManagerConfig{DataDir: dir, ChecksumsEnabled: true})
 	extendN(t, mgrCk, rel, 4)
@@ -138,7 +138,7 @@ func TestReadBlocksShortRunAtEOF(t *testing.T) {
 	mgr := NewManager(ManagerConfig{DataDir: dir, ChecksumsEnabled: true})
 	defer mgr.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 702, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 702, Fork: MainFork}
 	extendN(t, mgr, rel, 3)
 
 	full, err := mgr.ReadBlocks(rel, 1, blockBufs(5))
@@ -160,7 +160,7 @@ func TestReadBlocksRejectsBadArgs(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
-	rel := RelFileNode{DBOid: 1, RelOid: 703, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 703, Fork: MainFork}
 	extendN(t, mgr, rel, 2)
 
 	if n, err := mgr.ReadBlocks(rel, 0, nil); n != 0 || err != nil {
@@ -187,7 +187,7 @@ func TestReadBlocksLatchesEveryBlockInTheRun(t *testing.T) {
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 704, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 704, Fork: MainFork}
 	extendN(t, mgr, rel, 4)
 
 	f, err := mgr.relFile(rel)
@@ -262,7 +262,7 @@ func TestReadBlocksIssuesOneSyscallPerRun(t *testing.T) {
 	mgr := NewManager(ManagerConfig{DataDir: dir, ChecksumsEnabled: true})
 	defer mgr.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 707, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 707, Fork: MainFork}
 	const n = DefaultIOCombineLimit // 16
 	extendN(t, mgr, rel, n)
 

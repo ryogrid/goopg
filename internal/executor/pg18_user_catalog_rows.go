@@ -482,11 +482,13 @@ func collationNameToOID(name string) uint32 {
 // ASSERTS relam == InvalidOid for RELKIND_SEQUENCE (relcache.c:1841; it
 // installs the heap AM routine itself) and views have no storage at all.
 func relamFor(relkind string) int64 {
+	// RELKIND_HAS_TABLE_AM: only tables, TOAST tables and matviews carry
+	// the heap AM. M0149-0001h1a16.
 	switch relkind {
-	case "S", "v":
-		return 0
-	default:
+	case "r", "t", "m":
 		return pgHeapAccessMethodOID
+	default:
+		return 0
 	}
 }
 
@@ -522,6 +524,14 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table, dbOid ...uint3
 		relfilenode = int64(tbl.OID)
 	}
 	isPartition := tbl.PartitionParentOID != 0
+	if !isPartition {
+		// ATTACH PARTITION registers the link without setting
+		// PartitionParentOID (catalog sibling: partitionParentsLocked).
+		// M0149-0001h1a29.
+		if im, ok := cat.(*catalog.InMemory); ok {
+			_, isPartition = im.PartitionParentOf(tbl.OID)
+		}
+	}
 	// relpersistence: 'u' for UNLOGGED tables, 't' for TEMP, 'p' for
 	// permanent. pg_dump keys `CREATE UNLOGGED TABLE` off relpersistence ==
 	// RELPERSISTENCE_UNLOGGED, so hardcoding 'p' silently demoted an UNLOGGED
@@ -572,13 +582,14 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table, dbOid ...uint3
 	// that `_bt_checkpage` rejects: the flag would only have converted a silent
 	// gap into `index "…" contains corrupted page at block 0` (blocker #12).
 	// See pgClassRelhasindex for why it is not simply `len(indexes) > 0`.
+	frozenXID, frozenMXID := PGClassFrozenIDs(relkind)
 	return Row{
 		NewIntDatum(int64(tbl.OID)), // oid
 		NewStringDatum(tbl.Name),    // relname (name)
 		NewIntDatum(int64(namespaceOIDForSchema(cat, tbl.Schema, dbOid...))), // relnamespace
-		NewIntDatum(0),                                  // reltype (no composite type seeded yet)
+		NewIntDatum(int64(tbl.RowTypeOID)),              // reltype (the relation's rowtype; 0 for a sequence, M0149-0001h1a34)
 		NewIntDatum(int64(tbl.OfTypeOID)),               // reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
-		NewIntDatum(bootstrapSuperuserOID),              // relowner
+		NewIntDatum(tableOwnerOID(cat, tbl)),            // relowner (M0149-0001h1a26)
 		NewIntDatum(relamFor(relkind)),                  // relam (0 for sequences/views — relcache.c:1841 asserts it)
 		NewIntDatum(relfilenode),                        // relfilenode
 		NewIntDatum(int64(tbl.Tablespace)),              // reltablespace (0 = default; explicit CREATE TABLE ... TABLESPACE otherwise, M0122-0007)
@@ -602,9 +613,9 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table, dbOid ...uint3
 		NewStringDatum(replIdent),                       // relreplident ('d' default; FULL/NOTHING via ALTER, DU-002 slice 305)
 		NewBoolDatum(isPartition),                       // relispartition
 		NewIntDatum(0),                                  // relrewrite
-		NewIntDatum(minFrozenXID),                       // relfrozenxid
-		NewIntDatum(minFrozenMXID),                      // relminmxid
-		NewStringDatum("{}"),                            // relacl (encoded as empty aclitem[] ArrayType)
+		NewIntDatum(frozenXID),                          // relfrozenxid (valid only for r/t/m — PGClassFrozenIDs)
+		NewIntDatum(frozenMXID),                         // relminmxid
+		userRelACLDatum(cat, tbl.OID, relkind),          // relacl: NULL (acldefault) until a GRANT, then the materialized ACL
 		reloptionsDatum,                                 // reloptions (fillfactor/autovacuum_*/security_*/check_option, or NULL)
 		NewStringDatum(relpartbound),                    // relpartbound (FOR VALUES … for partition children)
 	}
@@ -710,9 +721,9 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index, dbOid 
 		NewIntDatum(int64(namespaceOIDForSchema(cat, idx.Schema, dbOid...))),
 		NewIntDatum(0),                        // reltype
 		NewIntDatum(0),                        // reloftype
-		NewIntDatum(bootstrapSuperuserOID),    // relowner
+		NewIntDatum(indexOwnerOID(cat, idx)),  // relowner (the table owner's, M0149-0001h1a28)
 		NewIntDatum(indexRelamOID(idx)),       // relam
-		NewIntDatum(int64(idx.OID)),           // relfilenode
+		NewIntDatum(int64(catalogRelfilenodeForIndex(idx))), // relfilenode (0 for a partitioned index)
 		NewIntDatum(int64(idx.Tablespace)),    // reltablespace (0 = default; explicit CREATE/ALTER INDEX ... TABLESPACE otherwise, M0122-0007)
 		NewIntDatum(0),                        // relpages
 		NewIntDatum(0),                        // reltuples
@@ -722,7 +733,7 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index, dbOid 
 		NewBoolDatum(false),                   // relhasindex (indexes never have indexes themselves)
 		NewBoolDatum(false),                   // relisshared
 		NewStringDatum(indexPersistence(idx)), // relpersistence (follows the owning table)
-		NewStringDatum("i"),                   // relkind
+		NewStringDatum(catalog.IndexRelkind(idx)), // relkind ('I' on a partitioned table, M0149-0001h1a26)
 		NewIntDatum(natts),                    // relnatts
 		NewIntDatum(0),                        // relchecks
 		NewBoolDatum(false),                   // relhasrules
@@ -732,11 +743,11 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index, dbOid 
 		NewBoolDatum(false),                   // relforcerowsecurity
 		NewBoolDatum(true),                    // relispopulated
 		NewStringDatum("n"),                   // relreplident
-		NewBoolDatum(false),                   // relispartition
+		NewBoolDatum(idx.PartitionParentOID != 0), // relispartition (M0149-0001h1a29)
 		NewIntDatum(0),                        // relrewrite
-		NewIntDatum(minFrozenXID),             // relfrozenxid
-		NewIntDatum(minFrozenMXID),            // relminmxid
-		NewStringDatum("{}"),                  // relacl
+		NewIntDatum(0),                        // relfrozenxid (InvalidTransactionId: indexes have no table AM)
+		NewIntDatum(0),                        // relminmxid
+		NullDatum,                             // relacl: indexes have none (PG stores NULL)
 		idxReloptionsDatum,                    // reloptions (fillfactor/fastupdate/… or NULL)
 		NewStringDatum(""),                    // relpartbound
 	}
@@ -1142,6 +1153,71 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 	}
 }
 
+// relKindHasSystemAttributes reports whether PG gives a relation of tbl's
+// relkind the six system attributes: every kind except views and composite
+// types (heap_create_with_catalog → AddNewAttributeTuples is skipped only for
+// RELKIND_VIEW and RELKIND_COMPOSITE_TYPE).
+func relKindHasSystemAttributes(tbl *catalog.Table) bool {
+	return relkindByteForTable(tbl) != 'v'
+}
+
+// buildUserPGSystemAttributeRows returns the six system-attribute pg_attribute
+// rows heap_create_with_catalog writes for every table-like relation
+// (AddNewAttributeTuples over SysAtt[], postgres/src/backend/catalog/heap.c):
+// ctid, xmin, cmin, xmax, cmax, tableoid at attnum -1 … -6. Without them a
+// PG 18.3 node reading a goopg directory answers `SELECT ctid FROM t` with
+// "column \"ctid\" does not exist" (M0149-0001e). Values checked against a
+// scratch PG 18.3 initdb: attstorage 'p', attnotnull true, attislocal true,
+// attcollation 0, every nullable trailing column NULL.
+func buildUserPGSystemAttributeRows(relOID uint32) []Row {
+	sys := []struct {
+		num   int64
+		name  string
+		typ   int64
+		len   int64
+		byval bool
+		align string
+	}{
+		{-1, "ctid", 27, 6, false, "s"},
+		{-2, "xmin", 28, 4, true, "i"},
+		{-3, "cmin", 29, 4, true, "i"},
+		{-4, "xmax", 28, 4, true, "i"},
+		{-5, "cmax", 29, 4, true, "i"},
+		{-6, "tableoid", 26, 4, true, "i"},
+	}
+	rows := make([]Row, 0, len(sys))
+	for _, a := range sys {
+		rows = append(rows, Row{
+			NewIntDatum(int64(relOID)), // attrelid
+			NewStringDatum(a.name),     // attname
+			NewIntDatum(a.typ),         // atttypid
+			NewIntDatum(a.len),         // attlen
+			NewIntDatum(a.num),         // attnum
+			NewIntDatum(-1),            // atttypmod
+			NewIntDatum(0),             // attndims
+			NewBoolDatum(a.byval),      // attbyval
+			NewStringDatum(a.align),    // attalign
+			NewStringDatum("p"),        // attstorage
+			NewStringDatum(""),         // attcompression
+			NewBoolDatum(true),         // attnotnull
+			NewBoolDatum(false),        // atthasdef
+			NewBoolDatum(false),        // atthasmissing
+			NewStringDatum(""),         // attidentity
+			NewStringDatum(""),         // attgenerated
+			NewBoolDatum(false),        // attisdropped
+			NewBoolDatum(true),         // attislocal
+			NewIntDatum(0),             // attinhcount
+			NewIntDatum(0),             // attcollation
+			NullDatum,                  // attstattarget
+			NullDatum,                  // attacl
+			NullDatum,                  // attoptions
+			NullDatum,                  // attfdwoptions
+			NullDatum,                  // attmissingval
+		})
+	}
+	return rows
+}
+
 // setPGAttributeCol overwrites one column of a pg_attribute row by NAME rather
 // than by literal slice index, so the index-attribute overrides below survive
 // any future reordering of pgAttributeColumnsPG18 / buildUserPGAttributeRow.
@@ -1176,7 +1252,7 @@ func setPGAttributeCol(row Row, name string, d Datum) {
 // attacl/attoptions/attfdwoptions/attmissingval/attstattarget NULL — because
 // an index attribute carries none of the heap column's constraints.
 //
-// An EXPRESSION key column (Columns[i] == "") is named `pg_expression_<attnum>`
+// An EXPRESSION key column (Columns[i] == "") is named by FigureIndexColname (ChooseIndexColumnNames)
 // exactly as upstream does, but its type is emitted as the parent column-less
 // `text` fallback: goopg has no expression type resolver reachable from here.
 // That divergence is ledgered, not silently absorbed.
@@ -1188,18 +1264,23 @@ func buildUserPGAttributeRowsForIndex(cat catalog.Catalog, idx *catalog.Index) (
 	names = append(names, idx.Columns...)
 	names = append(names, idx.IncludeColumns...)
 
+	// ConstructTupleDescriptor names every index attribute from
+	// ChooseIndexColumnNames over all key and INCLUDE columns: a plain
+	// column's name, an expression's FigureIndexColname ("expr" when it has
+	// none), each conflict suffixed 1, 2, … (`(abs(a), abs(b))` is abs, abs1).
+	chosen := pgDeduplicateColNames(append(indexNameColumnsPtr(idx.Columns, idx.ColExprs), idx.IncludeColumns...))
+
 	rows := make([]Row, 0, len(names))
 	attnames := make([]string, 0, len(names))
 	for i, colName := range names {
 		attnum := int16(i + 1)
-		attname := colName
+		attname := chosen[i]
 		var src catalog.Column
 		if col, ok := cat.LookupColumn(idx.Table, colName); ok && colName != "" {
 			src = *col
 		} else {
 			// Expression key column (or a column that vanished from the
-			// parent): upstream names it pg_expression_<attnum>.
-			attname = fmt.Sprintf("pg_expression_%d", attnum)
+			// parent): no heap column to copy from.
 			src = catalog.Column{Name: attname, Type: catalog.Type{Name: "text"}}
 		}
 		row := buildUserPGAttributeRow(cat, idx.Table, src)
@@ -1224,6 +1305,14 @@ func buildUserPGAttributeRowsForIndex(cat catalog.Catalog, idx *catalog.Index) (
 	}
 	return rows, attnames
 }
+
+// TypeLengthForOID is pg_type.typlen for a built-in type; an OID it does not
+// know is reported as variable-length (-1). RowDescription carries it.
+func TypeLengthForOID(oid uint32) int16 { return userTypeAttrsForOID(oid).TypLen }
+
+// AttTypmodForOID is the atttypmod of a column of the built-in type oid declared
+// with args, or -1 when the declaration has no modifier.
+func AttTypmodForOID(oid uint32, args []int64) int32 { return int32(pgAttTypmod(oid, args)) }
 
 // pgAttTypmod computes the PG-canonical pg_attribute.atttypmod from a column's
 // declared type arguments (e.g. the (10,2) in numeric(10,2)). It mirrors the
@@ -1588,6 +1677,14 @@ const (
 // for one column of a user table. MCV values are stored in slot 1
 // (stakind1=1), histogram in slot 2 (stakind2=2), remaining slots empty.
 func buildUserPGStatisticRow(tableOID uint32, attNum int16, stats catalog.ColumnStats) Row {
+	return buildUserPGStatisticRowTyped(tableOID, attNum, catalog.Type{}, stats)
+}
+
+// buildUserPGStatisticRowTyped is buildUserPGStatisticRow with the column's
+// type: its stavalues slots are anyarrays of that type (pgStatValuesBytes),
+// readable by a PG node, where the zero Type keeps the legacy text-element
+// blob. M0149-0001j.
+func buildUserPGStatisticRowTyped(tableOID uint32, attNum int16, colType catalog.Type, stats catalog.ColumnStats) Row {
 	// float4 columns (stanullfrac, stadistinct) are encoded as varlena text
 	// by EncodeRowPG's "float4" branch; pass KindString.
 	nullFracStr := strconv.FormatFloat(stats.NullFrac, 'g', -1, 32)
@@ -1623,11 +1720,11 @@ func buildUserPGStatisticRow(tableOID uint32, attNum int16, stats catalog.Column
 			vals[i] = e.Value
 		}
 		stanumbers1 = NewBytesDatum(pgFloat4ArrayBytes(freqs))
-		stavalues1 = NewBytesDatum(pgTextArrayBytes(vals))
+		stavalues1 = NewBytesDatum(pgStatValuesBytes(colType, vals))
 	}
 	if len(stats.Histogram) > 0 {
 		stakind2 = statisticKindHistogram
-		stavalues2 = NewBytesDatum(pgTextArrayBytes(stats.Histogram))
+		stavalues2 = NewBytesDatum(pgStatValuesBytes(colType, stats.Histogram))
 	}
 	// Correlation rides in slot 3, as a one-element stanumbers array — PG's
 	// layout for STATISTIC_KIND_CORRELATION, which carries no stavalues.
@@ -1771,6 +1868,14 @@ func pgSingletonArrayElement(blob []byte, t catalog.Type) (Datum, bool) {
 // pgTextArrayBytes builds a PG text[] (OID 25) ArrayType blob from a slice of strings.
 // Each element is a varlena with 4-byte header (total_size << 2) followed by UTF-8 bytes.
 func pgTextArrayBytes(strs []string) []byte {
+	if len(strs) == 0 {
+		// construct_empty_array: ndim 0, no dims — the 16-byte
+		// ARR_OVERHEAD_NONULLS(0) header.
+		buf := make([]byte, 16)
+		binary.LittleEndian.PutUint32(buf[0:4], 16<<2)
+		binary.LittleEndian.PutUint32(buf[12:16], 25)
+		return buf
+	}
 	const hdrSize = 24
 	totalData := 0
 	for _, s := range strs {
@@ -1781,6 +1886,11 @@ func pgTextArrayBytes(strs []string) []byte {
 	total := hdrSize + totalData
 	buf := make([]byte, 0, total)
 	hdr := make([]byte, hdrSize)
+	// ndim = 1: without it PG reads the array as empty ({}) — a goopg
+	// primary's proargnames / reloptions / proconfig were invisible to a PG
+	// standby, which then refused the function ("proargnames must have the
+	// same number of elements as the function has arguments"). M0149-0015e.
+	binary.LittleEndian.PutUint32(hdr[4:8], 1)
 	binary.LittleEndian.PutUint32(hdr[12:16], 25) // text OID
 	binary.LittleEndian.PutUint32(hdr[16:20], uint32(len(strs)))
 	binary.LittleEndian.PutUint32(hdr[20:24], 1) // lbound=1
@@ -1903,7 +2013,7 @@ func buildUserPGTypeRowForEnumArray(et *catalog.EnumType) Row {
 		NewBoolDatum(true),                             // typisdefined
 		NewStringDatum(","),                            // typdelim
 		NewIntDatum(0),                                 // typrelid
-		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(6179),                              // typsubscript: array_subscript_handler
 		NewIntDatum(int64(et.OID)),                     // typelem = the enum element type
 		NewIntDatum(0),                                 // typarray
 		NewIntDatum(750),                               // typinput (array_in/out/recv/send; B2.1c)
@@ -1912,7 +2022,7 @@ func buildUserPGTypeRowForEnumArray(et *catalog.EnumType) Row {
 		NewIntDatum(2401),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
-		NewIntDatum(0),                                 // typanalyze
+		NewIntDatum(3816),                              // typanalyze: array_typanalyze
 		NewStringDatum("i"),                            // typalign = 'i' (matches 4-byte enum element)
 		NewStringDatum("x"),                            // typstorage = 'x' (extended)
 		NewBoolDatum(false),                            // typnotnull
@@ -1970,6 +2080,28 @@ func buildUserPGTypeRowForComposite(ct *catalog.CompositeType) Row {
 	}
 }
 
+// buildUserPGTypeRowForRelation is the pg_type row heap_create_with_catalog's
+// AddNewRelationType writes for a relation's rowtype: typtype 'c', typrelid =
+// the relation, record_in/out/recv/send, in the relation's namespace and
+// owned by its owner. M0149-0001h1a34.
+func buildUserPGTypeRowForRelation(cat catalog.Catalog, tbl *catalog.Table, dbOid ...uint32) Row {
+	ct := &catalog.CompositeType{Name: tbl.Name, OID: tbl.RowTypeOID, ArrayOID: tbl.RowTypeOID - 1, RelOID: tbl.OID}
+	row := buildUserPGTypeRowForComposite(ct)
+	row[2] = NewIntDatum(int64(namespaceOIDForSchema(cat, tbl.Schema, dbOid...)))
+	row[3] = NewIntDatum(tableOwnerOID(cat, tbl))
+	return row
+}
+
+// buildUserPGTypeRowForRelationArray is the `_name` array type of a
+// relation's rowtype (AssignTypeArrayOid's OID, typelem = the rowtype).
+func buildUserPGTypeRowForRelationArray(cat catalog.Catalog, tbl *catalog.Table, dbOid ...uint32) Row {
+	ct := &catalog.CompositeType{Name: tbl.Name, OID: tbl.RowTypeOID, ArrayOID: tbl.RowTypeOID - 1, RelOID: tbl.OID}
+	row := buildUserPGTypeRowForCompositeArray(ct)
+	row[2] = NewIntDatum(int64(namespaceOIDForSchema(cat, tbl.Schema, dbOid...)))
+	row[3] = NewIntDatum(tableOwnerOID(cat, tbl))
+	return row
+}
+
 // buildUserPGTypeRowForCompositeArray builds the pg_type row for the
 // auto-generated `_name` array type of a composite type (typtype='b',
 // typcategory='A'), mirroring buildUserPGTypeRowForEnumArray. DU-002 slice 242.
@@ -1987,7 +2119,7 @@ func buildUserPGTypeRowForCompositeArray(ct *catalog.CompositeType) Row {
 		NewBoolDatum(true),                             // typisdefined
 		NewStringDatum(","),                            // typdelim
 		NewIntDatum(0),                                 // typrelid
-		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(6179),                              // typsubscript: array_subscript_handler
 		NewIntDatum(int64(ct.OID)),                     // typelem = the composite element type
 		NewIntDatum(0),                                 // typarray
 		NewIntDatum(750),                               // typinput (array_in/out/recv/send; B2.1c)
@@ -1996,7 +2128,7 @@ func buildUserPGTypeRowForCompositeArray(ct *catalog.CompositeType) Row {
 		NewIntDatum(2401),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
-		NewIntDatum(0),                                 // typanalyze
+		NewIntDatum(3816),                              // typanalyze: array_typanalyze
 		NewStringDatum("d"),                            // typalign = 'd' (matches composite element)
 		NewStringDatum("x"),                            // typstorage = 'x' (extended)
 		NewBoolDatum(false),                            // typnotnull
@@ -2104,7 +2236,7 @@ func buildUserPGClassRowForComposite(cat catalog.Catalog, ct *catalog.CompositeT
 		NewIntDatum(0),                                 // relrewrite
 		NewIntDatum(0),                                 // relfrozenxid (InvalidTransactionId — no storage)
 		NewIntDatum(0),                                 // relminmxid
-		NewStringDatum("{}"),                           // relacl
+		NullDatum,                                      // relacl: NULL, as PG stores for a composite type's relation
 		NewStringDatum("{}"),                           // reloptions
 		NewStringDatum(""),                             // relpartbound
 	}
@@ -2438,7 +2570,7 @@ func buildUserPGTypeRowForDomain(d *catalog.Domain) Row {
 		NewBoolDatum(true),                             // typisdefined
 		NewStringDatum(","),                            // typdelim
 		NewIntDatum(0),                                 // typrelid
-		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(domainTypsubscript(d.Base)),        // typsubscript: the base type's (DefineDomain)
 		NewIntDatum(0),                                 // typelem
 		NewIntDatum(int64(d.ArrayOID)),                 // typarray (auto-generated `_name` array type, slice 251)
 		NewIntDatum(domIn),                             // typinput (base type's — DefineDomain copies them; B2.1b)
@@ -2447,7 +2579,7 @@ func buildUserPGTypeRowForDomain(d *catalog.Domain) Row {
 		NewIntDatum(domSend),                           // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
-		NewIntDatum(0),                                 // typanalyze
+		NewIntDatum(domainTypanalyze(baseOID, d.Base)), // typanalyze: the base type's (DefineDomain)
 		NewStringDatum(string(attrs.TypAlign)),         // typalign (inherit base)
 		NewStringDatum(string(attrs.TypStorage)),       // typstorage (inherit base)
 		NewBoolDatum(d.NotNull),                        // typnotnull (declared NOT NULL)
@@ -2493,7 +2625,7 @@ func buildUserPGTypeRowForDomainArray(d *catalog.Domain) Row {
 		NewBoolDatum(true),                             // typisdefined
 		NewStringDatum(","),                            // typdelim
 		NewIntDatum(0),                                 // typrelid
-		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(6179),                              // typsubscript: array_subscript_handler
 		NewIntDatum(int64(d.OID)),                      // typelem = the domain element type
 		NewIntDatum(0),                                 // typarray
 		NewIntDatum(750),                               // typinput (array_in/out/recv/send; B2.1c)
@@ -2502,7 +2634,7 @@ func buildUserPGTypeRowForDomainArray(d *catalog.Domain) Row {
 		NewIntDatum(2401),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
-		NewIntDatum(0),                                 // typanalyze
+		NewIntDatum(3816),                              // typanalyze: array_typanalyze
 		NewStringDatum(string(typalign)),               // typalign (matches base element alignment)
 		NewStringDatum("x"),                            // typstorage = 'x' (extended)
 		NewBoolDatum(false),                            // typnotnull
@@ -2552,7 +2684,7 @@ func buildUserPGTypeRowForRange(rt *catalog.RangeType) Row {
 		NewIntDatum(3837),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
-		NewIntDatum(0),                                 // typanalyze
+		NewIntDatum(3916),                              // typanalyze: range_typanalyze
 		NewStringDatum(string(align)),                  // typalign
 		NewStringDatum("x"),                            // typstorage = 'x' (extended)
 		NewBoolDatum(false),                            // typnotnull
@@ -2600,7 +2732,7 @@ func buildUserPGTypeRowForMultirange(rt *catalog.RangeType) Row {
 		NewIntDatum(4234),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
-		NewIntDatum(0),                                 // typanalyze
+		NewIntDatum(4242),                              // typanalyze: multirange_typanalyze
 		NewStringDatum(string(align)),                  // typalign
 		NewStringDatum("x"),                            // typstorage = 'x' (extended)
 		NewBoolDatum(false),                            // typnotnull
@@ -2638,7 +2770,7 @@ func buildUserPGTypeRowForRangeArray(rt *catalog.RangeType) Row {
 		NewBoolDatum(true),                             // typisdefined
 		NewStringDatum(","),                            // typdelim
 		NewIntDatum(0),                                 // typrelid
-		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(6179),                              // typsubscript: array_subscript_handler
 		NewIntDatum(int64(rt.OID)),                     // typelem = the range element type
 		NewIntDatum(0),                                 // typarray
 		NewIntDatum(750),                               // typinput (array_in/out/recv/send; B2.1c)
@@ -2647,7 +2779,7 @@ func buildUserPGTypeRowForRangeArray(rt *catalog.RangeType) Row {
 		NewIntDatum(2401),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
-		NewIntDatum(0),                                 // typanalyze
+		NewIntDatum(3816),                              // typanalyze: array_typanalyze
 		NewStringDatum(string(align)),                  // typalign (matches the range element's alignment)
 		NewStringDatum("x"),                            // typstorage = 'x' (extended)
 		NewBoolDatum(false),                            // typnotnull
@@ -2684,7 +2816,7 @@ func buildUserPGTypeRowForMultirangeArray(rt *catalog.RangeType) Row {
 		NewBoolDatum(true),                             // typisdefined
 		NewStringDatum(","),                            // typdelim
 		NewIntDatum(0),                                 // typrelid
-		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(6179),                              // typsubscript: array_subscript_handler
 		NewIntDatum(int64(rt.MultirangeOID)),           // typelem = the multirange element type
 		NewIntDatum(0),                                 // typarray
 		NewIntDatum(750),                               // typinput (array_in/out/recv/send; B2.1c)
@@ -2693,7 +2825,7 @@ func buildUserPGTypeRowForMultirangeArray(rt *catalog.RangeType) Row {
 		NewIntDatum(2401),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
-		NewIntDatum(0),                                 // typanalyze
+		NewIntDatum(3816),                              // typanalyze: array_typanalyze
 		NewStringDatum(string(align)),                  // typalign (matches the multirange element's alignment)
 		NewStringDatum("x"),                            // typstorage = 'x' (extended)
 		NewBoolDatum(false),                            // typnotnull
@@ -2834,4 +2966,109 @@ func buildUserPGAggregateRow(ctx *Context, agg *catalog.UserAggregate) Row {
 		initCond,       // agginitval
 		NullDatum,      // aggminitval
 	}
+}
+
+// PGClassFrozenIDs returns the pg_class relfrozenxid / relminmxid a new
+// relation of relkind starts with. PostgreSQL sets them only for relkinds with
+// a table access method — RELKIND_HAS_TABLE_AM (pg_class.h): 'r', 't', 'm' —
+// through table_relation_set_new_filelocator (heap_create, catalog/heap.c);
+// every other relkind (indexes, sequences, views, composite types, foreign and
+// partitioned tables/indexes) keeps InvalidTransactionId / InvalidMultiXactId.
+// A valid value on a storage-less relation trips PG's
+// Assert(!TransactionIdIsValid(relfrozenxid)) when autovacuum or VACUUM
+// recomputes datfrozenxid (vac_update_datfrozenxid, commands/vacuum.c) on a
+// goopg directory (M0149-0001g slice 5).
+func PGClassFrozenIDs(relkind string) (int64, int64) {
+	switch relkind {
+	case "r", "t", "m":
+		return minFrozenXID, minFrozenMXID
+	}
+	return 0, 0
+}
+
+// userRelACLDatum is pg_class.relacl for a user relation: NULL while no
+// privilege has been granted away (PG's acldefault), otherwise the ACL goopg's
+// store materializes, as a PG-native aclitem[]. Never the empty array: an
+// explicit empty ACL denies even the owner on a PG node (M0149-0001g slice 12).
+func userRelACLDatum(cat catalog.Catalog, relOID uint32, relkind string) Datum {
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		return NullDatum
+	}
+	txt := im.RelaclText(relOID)
+	if relkind == "S" {
+		txt = im.SequenceRelaclText(relOID)
+	}
+	if txt == "" {
+		return NullDatum
+	}
+	blob, err := encodeAclItemArrayText(txt, func(roleName string) uint32 {
+		if roid, ok := im.RoleOID(roleName); ok {
+			return roid
+		}
+		return 0
+	})
+	if err != nil {
+		return NullDatum
+	}
+	return NewBytesDatum(blob)
+}
+
+// domainTypanalyze is the typanalyze DefineDomain copies from the base type
+// (typecmds.c: analyzeProcedure = baseType->typanalyze): array_typanalyze for
+// an array base, range_typanalyze / multirange_typanalyze for the built-in
+// range and multirange types, ts_typanalyze for tsvector, 0 otherwise.
+// M0149-0001h1a15.
+func domainTypanalyze(baseOID uint32, base catalog.Type) int64 {
+	if base.IsArray {
+		return 3816
+	}
+	switch baseOID {
+	case 3904, 3906, 3908, 3910, 3912, 3926:
+		return 3916
+	case 4451, 4532, 4533, 4534, 4535, 4536:
+		return 4242
+	case 3614:
+		return 3688
+	}
+	return 0
+}
+
+// domainTypsubscript is the typsubscript DefineDomain copies from the base
+// type (subscriptProcedure = baseType->typsubscript): array_subscript_handler
+// for an array base. M0149-0001h1a15.
+func domainTypsubscript(base catalog.Type) int64 {
+	if base.IsArray {
+		return 6179
+	}
+	return 0
+}
+
+// tableOwnerOID is pg_class.relowner for tbl: the creating role (SET ROLE
+// counts — heap_create_with_catalog's ownerId = GetUserId()) or ALTER ...
+// OWNER TO's target, the bootstrap superuser when unset. Sibling of the
+// catalog's virtual pg_class row. M0149-0001h1a26.
+func tableOwnerOID(cat catalog.Catalog, tbl *catalog.Table) int64 {
+	if tbl.Owner != "" && cat != nil {
+		if oid, ok := cat.RoleOID(tbl.Owner); ok {
+			return int64(oid)
+		}
+	}
+	return bootstrapSuperuserOID
+}
+
+// catalogRelfilenodeForIndex is relfilenode for an index's pg_class row: 0
+// for a partitioned index (no storage), the index OID otherwise.
+func catalogRelfilenodeForIndex(idx *catalog.Index) uint32 {
+	n, _ := strconv.ParseUint(catalog.RelfilenodeForRelkind(catalog.IndexRelkind(idx), idx.OID), 10, 32)
+	return uint32(n)
+}
+
+// indexOwnerOID is an index's pg_class.relowner: its table's owner
+// (index_create). M0149-0001h1a28.
+func indexOwnerOID(cat catalog.Catalog, idx *catalog.Index) int64 {
+	if idx != nil && idx.Table != nil {
+		return tableOwnerOID(cat, idx.Table)
+	}
+	return bootstrapSuperuserOID
 }

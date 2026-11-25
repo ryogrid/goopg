@@ -32,6 +32,10 @@ type Context struct {
 
 	// Params holds bind values for $1, $2, ... — Params[i-1] is $i.
 	Params []Datum
+	// PreparedLiterals, when set, is the TimeZone and DateStyle of the
+	// PREPARE whose statement is being executed: PG reads its literals at
+	// PREPARE, so planning at EXECUTE must read them the same way.
+	PreparedLiterals *PreparedLiteralSettings
 	// Now is the wall-clock value `current_timestamp` and friends
 	// resolve to. Captured once at statement start so retries see
 	// consistent values, matching upstream.
@@ -608,6 +612,9 @@ type Context struct {
 	// This matches PostgreSQL's behavior where NOTICE messages arrive before
 	// any blocking point. M0100-0005.
 	NoticeFlush func(string)
+	// NoticeFieldsFlush is NoticeFlush for a NOTICE with its own SQLSTATE,
+	// DETAIL and HINT fields (AddNoticeFields).
+	NoticeFieldsFlush func(code, msg, detail, hint string)
 
 	// Warnings accumulates WARNING-severity messages emitted during statement
 	// execution (e.g. "you don't own a lock of type ExclusiveLock" from
@@ -771,6 +778,12 @@ type Context struct {
 	// which the functions return as NULL (xlogfuncs.c).
 	RecoveryLSNs func() (receive, replay uint64)
 
+	// RecoveryPause, when non-nil, is the standby's replay pause control for
+	// pg_wal_replay_pause / pg_wal_replay_resume ("pause", "resume") and
+	// pg_get_wal_replay_pause_state ("state"), returning the pause state text
+	// or a non-empty refusal (promotion triggered). M0149-0013.
+	RecoveryPause func(action string) (state string, promoteTriggered bool)
+
 	// MaterializedCTEs holds rows from data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE
 	// with RETURNING). Populated by cteDMLPrefixOp before the outer query runs.
 	// Key is the lowercase CTE name; value is the materialized RETURNING rows.
@@ -876,8 +889,8 @@ type Context struct {
 	// CurrentDatabaseOid is the REAL, physical pg_database.oid resolved for
 	// CurrentDatabase via catalog.(*InMemory).ResolveDatabaseOid — the same
 	// oid that keys on-disk storage/ACLs, NOT pg_database's displayed oid
-	// column (which shows "postgres" as a legacy 16384 placeholder for
-	// compat, see ResolveDatabaseOid's doc comment). Zero if CurrentDatabase
+	// column (the two differ only for template1, see ResolveDatabaseOid's
+	// doc comment). Zero if CurrentDatabase
 	// is empty or unresolvable (embedded/test contexts, or a database name
 	// the catalog doesn't recognize). This is plumbing only today — no
 	// lookup site yet keys off it, since catalog.InMemory's table/index
@@ -1363,6 +1376,25 @@ func (c *Context) AddNotice(msg string) {
 		return
 	}
 	c.Notices = append(c.Notices, msg)
+}
+
+// AddNoticeFields delivers a NOTICE carrying its own SQLSTATE, DETAIL and
+// HINT (RAISE NOTICE ... USING). It goes through NoticeFieldsFlush inline,
+// like AddNotice, so it keeps its place among plain notices; with no
+// flusher wired it falls back to the buffered queues.
+func (c *Context) AddNoticeFields(code, msg, detail, hint string) {
+	if code == "" && detail == "" && hint == "" {
+		c.AddNotice(msg)
+		return
+	}
+	if c.NoticeFieldsFlush != nil {
+		if code == "" {
+			code = "00000"
+		}
+		c.NoticeFieldsFlush(code, msg, detail, hint)
+		return
+	}
+	c.AddNoticeWithDetail(msg, detail)
 }
 
 // TakeNotices returns and clears the accumulated notices.
@@ -2166,4 +2198,13 @@ func sessionTempOwner(ctx *Context) string {
 		}
 	}
 	return ""
+}
+
+// PreparedLiteralSettings is the TimeZone and DateStyle a prepared statement
+// was parsed under.
+type PreparedLiteralSettings struct {
+	TimeZone  string
+	DateStyle string
+	// TimezoneAbbreviations is timezone_abbreviations at PREPARE (M0149-0001h1a82).
+	TimezoneAbbreviations string
 }

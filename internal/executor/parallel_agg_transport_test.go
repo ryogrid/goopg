@@ -205,7 +205,7 @@ func TestAggRuntimeSerialization(t *testing.T) {
 			return st
 		}()},
 		{"var_pop-numeric", "var_pop", func() aggRuntime {
-			st := aggRuntime{hasValue: true, numericExact: true, count: 2}
+			st := aggRuntime{hasValue: true, numericExact: true, count: 2, numericScale: 3}
 			st.numericSx = big.NewRat(7, 2)
 			st.numericSxx = big.NewRat(99, 8)
 			return st
@@ -257,7 +257,7 @@ func aggRuntimeStateEqual(name string, a, b aggRuntime) bool {
 		return a.hasValue == b.hasValue && a.intResult == b.intResult && a.strResult == b.strResult
 	case "var_pop", "var_samp", "variance", "stddev_pop", "stddev_samp", "stddev":
 		if a.hasValue != b.hasValue || a.intExact != b.intExact || a.numericExact != b.numericExact ||
-			a.count != b.count || a.floatSx != b.floatSx {
+			a.count != b.count || a.floatSx != b.floatSx || a.numericScale != b.numericScale {
 			return false
 		}
 		if !(math.IsNaN(a.floatM2) && math.IsNaN(b.floatM2)) && a.floatM2 != b.floatM2 {

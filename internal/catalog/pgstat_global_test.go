@@ -148,12 +148,12 @@ func TestPGStatDatabaseViewRegistered(t *testing.T) {
 		}
 	}
 	// The three bootstrap databases must appear with their canonical display
-	// oids (template1→1, template0→4, postgres→16384 placeholder).
+	// oids (template1→1, template0→4, postgres→5).
 	byName := map[string]string{}
 	for _, row := range rows[1:] {
 		byName[row[1]] = row[0]
 	}
-	for name, wantOid := range map[string]string{"template1": "1", "template0": "4", "postgres": "16384"} {
+	for name, wantOid := range map[string]string{"template1": "1", "template0": "4", "postgres": "5"} {
 		if got := byName[name]; got != wantOid {
 			t.Errorf("pg_stat_database: datid for %q = %q, want %q", name, got, wantOid)
 		}
@@ -237,7 +237,7 @@ func TestPGStatDatabaseConflictsViewRegistered(t *testing.T) {
 	for _, row := range rows {
 		byName[row[1]] = row[0]
 	}
-	for name, wantOid := range map[string]string{"template1": "1", "template0": "4", "postgres": "16384"} {
+	for name, wantOid := range map[string]string{"template1": "1", "template0": "4", "postgres": "5"} {
 		if got := byName[name]; got != wantOid {
 			t.Errorf("pg_stat_database_conflicts: datid for %q = %q, want %q", name, got, wantOid)
 		}

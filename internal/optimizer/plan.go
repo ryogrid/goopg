@@ -133,6 +133,8 @@ func (*CTIDExpr) exprNode()  {}
 type StringConst struct {
 	pos   int
 	Value string
+	// BitString: a B'...' / X'...' literal, typed bit (M0149-0001h1a1).
+	BitString bool
 }
 
 func (e *StringConst) Pos() int { return e.pos }
@@ -551,6 +553,71 @@ type unnestParam struct {
 
 // ParamRef passes through a bind-parameter placeholder. The executor
 // supplies values at execute time.
+// IndexNullTest is the kind of a NullTest index qual (IndexScan.LeadingNullTest).
+type IndexNullTest uint8
+
+const (
+	// IndexNullTestNone: no NullTest index qual.
+	IndexNullTestNone IndexNullTest = iota
+	// IndexNullTestIsNull: `col IS NULL` (SK_SEARCHNULL).
+	IndexNullTestIsNull
+	// IndexNullTestIsNotNull: `col IS NOT NULL` (SK_SEARCHNOTNULL).
+	IndexNullTestIsNotNull
+)
+
+// ExtraIndexNullTest is a further `col IS [NOT] NULL` index qual on the
+// column a scan's LeadingNullTest is on, in restriction-list order. PG takes
+// every NullTest on the column as an index clause (match_clause_to_indexcol)
+// and prints each in Index Cond — `((a IS NULL) AND (a IS NULL))` — leaving
+// _bt_preprocess_keys to merge duplicates and to find `IS NULL AND IS NOT
+// NULL` contradictory, which makes the scan empty (M0148-0001c3a2).
+// AfterBounds places it after the column's range bounds, as
+// NullTestAfterBounds does the leading one.
+type ExtraIndexNullTest struct {
+	Kind        IndexNullTest
+	AfterBounds bool
+}
+
+// IndexCondItem is one index clause on a scan's range column — its lower
+// bound, its upper bound, or the next of its NullTests (LeadingNullTest, then
+// ExtraNullTests). IndexCondOrder lists them in restriction-list order, the
+// order PG keeps one index column's clauses in (match_clauses_to_index walks
+// baserestrictinfo) and prints in Index Cond: `((a < 50) AND (a > 10))`
+// (M0148-0001c3a2). Empty means the legacy order: NullTests not after the
+// bounds, the lower bound, the upper bound, the rest.
+type IndexCondItem uint8
+
+const (
+	IndexCondLow IndexCondItem = iota + 1
+	IndexCondHigh
+	IndexCondNullTest
+	// IndexCondExtraBound is the next of the scan's ExtraBounds.
+	IndexCondExtraBound
+	// IndexCondRowCompare is the scan's RowCompare.
+	IndexCondRowCompare
+)
+
+// ExtraIndexBound is a further bound on a range scan's column that the
+// probe's LowKey/HighKey already implies — PG prints every bound in Index
+// Cond (`((unique1 < 3) AND (unique1 < '-1'::bigint))`) and
+// _bt_preprocess_keys keeps the tightest (M0148-0001c3a6 (i)). Display only.
+type ExtraIndexBound struct {
+	Op  parser.OpCode
+	Key Expr
+}
+
+// NullTestsContradict reports whether a scan's NullTest index quals ask for
+// both a NULL and a non-NULL key on their column — the qual
+// _bt_preprocess_keys proves unsatisfiable, so the probe matches nothing.
+func NullTestsContradict(lead IndexNullTest, extras []ExtraIndexNullTest) bool {
+	for _, x := range extras {
+		if x.Kind != lead {
+			return true
+		}
+	}
+	return false
+}
+
 type ParamRef struct {
 	pos    int
 	Number int
@@ -592,6 +659,11 @@ type BinaryOp struct {
 	Left       Expr
 	Right      Expr
 	ResultType string // non-empty for arithmetic with typed result (e.g., "int2")
+	// Nested marks an AND / OR the planner built after PG's flattening, as
+	// group_similar_or_args builds a sub-OR of similar arms (indxpath.c):
+	// it stays ONE argument of the enclosing same-kind clause, so EXPLAIN
+	// prints `((a = 1) OR ((b = 3) OR (b = 7)))` (M0148-0001c3a2).
+	Nested bool
 }
 
 // LikeEscapePattern is the optimizer-side mirror of parser.LikeEscapePattern.
@@ -704,6 +776,15 @@ type FuncCall struct {
 	Distinct   bool
 	Variadic   bool   // true when args were expanded from VARIADIC array syntax
 	ReturnType string // return type for user-defined functions; empty for unknown
+	// Operator is the SQL operator symbol when the call implements one
+	// (moneyArithCall rewrites `m * 2` to cash_mul_int4): the target-list
+	// column is then "?column?" and EXPLAIN renders the infix form, as PG's
+	// OpExpr would. Empty for an ordinary function call. M0149-0001k1.
+	Operator string
+	// SQLName is the function's SQL name when Name is the resolved variant
+	// of an overloaded builtin (bit_length(bit) → bitlength): the column
+	// label and EXPLAIN print it, as PG prints proname. M0149-0001h1a1.
+	SQLName string
 	// ArgWidth is the resolved overload width for width-sensitive builtins
 	// such as to_hex; empty means default int4.
 	ArgWidth string
@@ -926,22 +1007,41 @@ type IndexScan struct {
 	// performs one point descent per element and unions the tids
 	// (B-14/P2-09a). Exactly one probe shape is ever set on a node
 	// (Key, Keys, LowKey/HighKey, or SAOPKeys); the executor checks SAOPKeys
-	// first. A node carrying SAOPKeys is never promoted to IndexOnlyScan
+	// first. With RangePrefix set the array binds Columns[len(RangePrefix)]
+	// behind that equality prefix, and LowKey/HighKey (if any) bound the
+	// column after the array (M0148-0001c3a4 (b)/(c)); the elements descend
+	// sorted and de-duplicated in index order. A node carrying SAOPKeys is never promoted to IndexOnlyScan
 	// (tryPromoteIndexOnlyScan declines: the IOS operator has no
 	// multi-descent) and DML falls back to its SeqScan+predicate path
 	// (updateViaIndex requires Key; indexScanPredicate rebuilds the IN
 	// qual for the fallback).
 	SAOPKeys []Expr
+	// SAOPOp is the array's operator: OpUnknown for `= ANY`, or an
+	// inequality (`col < ANY (…)`) — one range up to the extreme element
+	// (_bt_find_extreme_element, M0148-0001c3a4 (a)); LowKey/HighKey are
+	// then unset.
+	SAOPOp parser.OpCode
+	// SAOPColQuals are further constant quals on the array's own column
+	// (M0148-0001c3a4 (i)), which _bt_preprocess_keys merges into the array:
+	// another `= ANY` keeps the intersection, a bound keeps the elements it
+	// admits.
+	SAOPColQuals []SAOPColQual
+	// TrailingSAOP mirrors IndexOnlyScan.TrailingSAOP (M0148-0001c3a4 (i)):
+	// an `= ANY` array on the second index column behind a leading-column
+	// range (LowKey/HighKey), checked against each entry's key before its
+	// heap fetch.
+	TrailingSAOP *TrailingSAOP
+
 	LowKey  Expr // inclusive lower bound for range scan; nil = no lower bound
 	HighKey Expr // inclusive upper bound for range scan; nil = no upper bound
 	// RangePrefix, when non-empty, is an EQUALITY prefix for index columns
 	// [0, len(RangePrefix)) and moves LowKey/HighKey onto column
 	// len(RangePrefix) — PG's `a = 1 AND b > 5` probe on `(a, b)`
-	// (build_index_paths binds a range behind an equality prefix). Only ever
-	// set together with LowKey and/or HighKey, never with Key/Keys/SAOPKeys;
-	// the one producer (restriction paths, M0145-0029 slice 2b) keeps the
-	// range conjunct as a Filter recheck. A consumer that reinterprets
-	// LowKey/HighKey as leading-column bounds must refuse a node with it set.
+	// (build_index_paths binds a range behind an equality prefix). Set
+	// together with LowKey and/or HighKey, or with SAOPKeys (the array then
+	// binds column len(RangePrefix), M0148-0001c3a4 (b)); never with
+	// Key/Keys. A consumer that reinterprets LowKey/HighKey or SAOPKeys as
+	// leading-column quals must refuse a node with it set.
 	RangePrefix []Expr
 	// LowOp / HighOp preserve the ORIGINAL comparison operator in its canonical
 	// col-op-key form (see tryRangeIndexScan / flipRangeOp) for the low/high
@@ -951,6 +1051,41 @@ type IndexScan struct {
 	// bound (M0134-0001 S4 class 8) so the redundant Filter can be dropped.
 	LowOp  parser.OpCode
 	HighOp parser.OpCode
+	// LeadingNullTest is a `col IS [NOT] NULL` index qual on the range column
+	// — the leading key column, or Columns[len(RangePrefix)] behind an
+	// equality prefix (M0148-0001c3a) — PG's match_clause_to_indexcol takes a NullTest
+	// as an index clause when the AM has amsearchnulls (btree), and
+	// _bt_preprocess_keys turns it into an SK_SEARCHNULL / SK_SEARCHNOTNULL
+	// scan key that bounds the descent at the column's NULL group. It
+	// combines with LowKey/HighKey on the same column (`x IS NOT NULL AND
+	// x < 5`) and RangePrefix, never with Key/Keys/SAOPKeys/SkipPrefix.
+	LeadingNullTest IndexNullTest
+	// NullTestAfterBounds: the NullTest followed the range bounds in the
+	// relation's restriction list, so `Index Cond` prints it after them
+	// (PG lists one column's index clauses in baserestrictinfo order).
+	NullTestAfterBounds bool
+	// ExtraNullTests are the column's further NullTest index quals
+	// (ExtraIndexNullTest, M0148-0001c3a2).
+	ExtraNullTests []ExtraIndexNullTest
+	// ExtraBounds are the range column's further bounds, implied by
+	// LowKey/HighKey and printed in Index Cond (ExtraIndexBound).
+	ExtraBounds []ExtraIndexBound
+	// RowCompare is a row comparison over the index's leading columns
+	// (M0148-0001c3a12): LowKey (RowCompareLow) or HighKey holds its lossy
+	// bound on the leading column, the scan checks the comparison on each
+	// entry, and Index Cond prints it whole.
+	RowCompare    *BinaryOp
+	RowCompareLow bool
+	// IndexCondOrder is the range column's clauses in restriction-list
+	// order (IndexCondItem).
+	IndexCondOrder []IndexCondItem
+	// Backward walks the index from its high end down — PG's
+	// BackwardScanDirection IndexScan (`Index Scan Backward`), the rows in
+	// the reverse of the index order (M0148-0001c3a3). The probe's bounds
+	// are the forward scan's; nbtree.ReverseScanCursor walks them right to
+	// left. Never set together with SAOPKeys or SkipPrefix, nor on a
+	// parallel-aware scan (not yet supported; the executor refuses them).
+	Backward bool
 	// Cond is a residual filter evaluated per HEAP TUPLE the probe returns —
 	// PostgreSQL's `Filter:` line on an Index Scan node, which sits alongside
 	// `Index Cond:` rather than in a separate node. Its ColumnRefs are in the
@@ -1156,6 +1291,32 @@ type Materialize struct {
 func (n *Materialize) Pos() int       { return n.pos }
 func (n *Materialize) Output() Schema { return n.Child.Output() }
 
+// SAOPColQual is one further qual on a ScalarArrayOp probe's column: a
+// comparison `col Op Key`, or (Array set) `col = ANY (Array)`. Keys and
+// elements are planner constants only (restrictionKeyUsable over
+// isConstExpr), so expression walkers need not visit them. BeforeArray
+// prints it ahead of the probe's own array in Index Cond (restriction-list
+// order).
+type SAOPColQual struct {
+	Op          parser.OpCode
+	Key         Expr
+	Array       []Expr
+	BeforeArray bool
+	// ArrayText is a cross-type array literal as EXPLAIN prints its Const
+	// (`'{33,44}'::bigint[]` on an int4 column, M0148-0001c3a6 (i)); Array
+	// then holds only the elements inside the column type's range, the
+	// ones the scan can probe. "" for the column's own type.
+	ArrayText string
+}
+
+// TrailingSAOP is IndexOnlyScan.TrailingSAOP: the array's elements and the
+// further quals on its column (SAOPColQual). Elements and keys are planner
+// constants only, so expression walkers need not visit them.
+type TrailingSAOP struct {
+	Elems    []Expr
+	ColQuals []SAOPColQual
+}
+
 // IndexOnlyScan is a covered index scan (M0046-0004): all projected columns
 // come from the B-tree index key, so no heap fetch is needed when the
 // visibility map reports ALL_VISIBLE for the target page.
@@ -1188,7 +1349,24 @@ type IndexOnlyScan struct {
 	// (one Expr per Index.Columns entry, in declared order). When set,
 	// takes priority over Key. Carries the M0054-0006 composite probe
 	// across IOS promotion so multi-column equality stays index-only.
-	Keys    []Expr
+	Keys []Expr
+	// SAOPKeys mirrors IndexScan.SAOPKeys: a ScalarArrayOp probe on the
+	// LEADING column, one element per descent, with LowKey/HighKey (if set)
+	// bounding the second column (M0148-0001c3a4 (h)). Never set with
+	// Key/Keys/SkipPrefix. The elements descend sorted and de-duplicated
+	// (saopWindows, shared with indexScanOp).
+	SAOPKeys []Expr
+	// SAOPOp / SAOPColQuals mirror IndexScan's fields of the same names.
+	SAOPOp       parser.OpCode
+	SAOPColQuals []SAOPColQual
+	// TrailingSAOP is an `= ANY` array on the index's second column behind
+	// a leading-column range (LowKey/HighKey), M0148-0001c3a4 (i): PG's
+	// `((thousand < 2) AND (tenthous = ANY (…)))`. The range scan checks
+	// each entry against it before any heap fetch, as nbtree applies a
+	// non-leading array key; the output stays in index order. Its column is
+	// always one of Covered.
+	TrailingSAOP *TrailingSAOP
+
 	LowKey  Expr
 	HighKey Expr
 	// LowOp / HighOp mirror IndexScan's fields of the same name: the bound's
@@ -1207,6 +1385,16 @@ type IndexOnlyScan struct {
 	// first SkipPrefix key columns are enumerated by the executor.
 	SkipPrefix int
 	Covered []catalog.Column
+	// LeadingNullTest / NullTestAfterBounds mirror IndexScan's fields of
+	// the same name (M0148-0001c3a): a `col IS [NOT] NULL` index qual on the
+	// leading key column, executed as SK_SEARCHNULL / SK_SEARCHNOTNULL bounds.
+	LeadingNullTest     IndexNullTest
+	NullTestAfterBounds bool
+	ExtraNullTests      []ExtraIndexNullTest
+	ExtraBounds         []ExtraIndexBound
+	RowCompare          *BinaryOp
+	RowCompareLow       bool
+	IndexCondOrder      []IndexCondItem
 	// Cond is an additional filter evaluated per index row (S6 min/max
 	// rewrite: the `col IS NOT NULL` qual). IndexOnlyScan's primary probe
 	// (Key/Keys/LowKey/HighKey) is equality/range-shaped; this general
@@ -1360,6 +1548,10 @@ type Join struct {
 	// predicate lists the merge pairs first, so fillJoinHashKeys keeps this
 	// prefix and the rest stay residual — `Join Filter:` as in PG.
 	MergeKeyCount int
+	// MergeKeyDesc marks the merge keys (HashKeys[:MergeKeyCount]) compared
+	// descending; nil is all ascending. M0148-0001c3a3 slice 4 — PG's
+	// mergestrategies (BTGreaterStrategyNumber for a DESC merge).
+	MergeKeyDesc []bool
 	BuildLeft bool // hash join: build on left input instead of right
 	// ParallelHash marks PG's `parallel_hash = true` hash join
 	// (try_partial_hashjoin_path, joinpath.c:1290-1297): the build side is a
@@ -2402,6 +2594,7 @@ type GenerateSeries struct {
 	Start  Expr
 	Stop   Expr
 	Step   Expr // nil means step=1
+	Zone   Expr // generate_series(timestamptz, timestamptz, interval, text); else nil
 	// Alias is the FROM-clause alias; defaults to the function name when
 	// not specified. Consumed by the EXPLAIN Function Scan label.
 	Alias  string
@@ -2465,6 +2658,13 @@ type FromUnnest struct {
 	// specified. Consumed by the EXPLAIN Function Scan label.
 	Alias    string
 	schema   Schema
+	// FuncName and FuncArgs name the SQL function when the scan stands in for
+	// one: FROM string_to_table(s, d) is unnest(string_to_array(s, d)) — the
+	// same rows from text_to_table — and EXPLAIN prints `Function Scan on
+	// string_to_table` with its own arguments. Empty for a plain unnest.
+	// M0149-0001h1a78f.
+	FuncName string
+	FuncArgs []Expr
 }
 
 func (n *FromUnnest) Pos() int       { return n.pos }
@@ -2532,6 +2732,9 @@ type SrfCol struct {
 	Start  Expr // generate_series start arg
 	Stop   Expr // generate_series stop arg
 	Step   Expr // generate_series step arg (nil → step 1)
+	Zone   Expr // generate_series time zone arg, or nil
+	// Type is the series' type, from generateSeriesType.
+	Type string
 	// Wrapped marks an SRF that feeds an enclosing scalar expression (e.g.
 	// `generate_series(1,n) % 4`). When true the executor writes the raw
 	// per-step SRF value into the eval row at ColIdx (a temp slot beyond the
@@ -2547,6 +2750,10 @@ type UnnestCol struct {
 	CastType string // cast each element to this type (e.g. "int4"), empty=no cast. M0097-0035.
 	// Wrapped: see SrfCol.Wrapped. M0118-0008.
 	Wrapped bool
+	// FuncName is the SQL function the unnest stands in for: string_to_table
+	// is unnest(string_to_array(...)), and EXPLAIN prints it under its own
+	// name with ArrExpr's arguments. "" for a plain unnest. M0149-0001h1a78f.
+	FuncName string
 	// ExplicitCast marks a CastType the SQL wrote over the unnest that
 	// changes the element type (`unnest(a)::integer` over text[]) — PG
 	// evaluates it in a Result above the ProjectSet. A CastType inferred
@@ -2566,6 +2773,8 @@ type RegexpMatchesCol struct {
 	StringExpr  Expr // the subject string argument
 	PatternExpr Expr // the regex pattern argument
 	FlagsExpr   Expr // optional flags argument; nil when not given
+	// Wrapped: see SrfCol.Wrapped. M0149-0001h1a78.
+	Wrapped bool
 }
 
 // SrfWrapper applies an enclosing scalar expression to a set-returning function
@@ -2588,6 +2797,8 @@ type UserSrfCol struct {
 	FuncPos int    // source position for error reporting
 	Args    []Expr // resolved argument expressions
 	Routine *catalog.Routine
+	// Wrapped: see SrfCol.Wrapped. M0149-0001h1a78.
+	Wrapped bool
 }
 
 type ProjectSet struct {
@@ -3347,6 +3558,9 @@ type SetOp struct {
 	// left-deep UNION ALL chain can reach that link's SETOP rel
 	// (setopbranchrel.go).
 	setOpBranchTag
+	// searchedTree: a partitionwise join's Append (M0148-0001c3a9) can be
+	// the root the PG-shaped search returns (searchedtree.go).
+	searchedTree
 	pos   int
 	Left  Node
 	Right Node
@@ -3404,6 +3618,15 @@ type SetOp struct {
 	// node nameless, as every other construction site does.
 	RTID          int32
 	AppendRelName string
+	// partScheme is the partitioned parent's scheme and PartitionDesc-ordered
+	// partitions when this chain is a one-level partitioned table's
+	// appendrel (M0148-0001c3a9 slice 2, partscheme.go); nil otherwise.
+	partScheme *partScheme
+	// PartitionwiseParents, on the Append of a partitionwise join's child
+	// joins, are the two partitioned appendrels the join replaced — PG's
+	// Append apprelids, the parent RTEs EXPLAIN names before the children
+	// and deparses the Append's columns with (M0148-0001c3a9).
+	PartitionwiseParents []*SetOp
 	// Op is the set-operation kind (UNION / INTERSECT / EXCEPT).
 	// The zero value (parser.SetOpUnion) keeps the implicit
 	// partition/inheritance UNION ALL construction sites working
@@ -3677,6 +3900,33 @@ type BitmapIndexScan struct {
 	HighKey Expr
 	LowOp   parser.OpCode
 	HighOp  parser.OpCode
+	// LeadingNullTest / NullTestAfterBounds: a `col IS [NOT] NULL` index qual
+	// (M0148-0001c3a1) on Columns[len(Keys)] — the column after the equality
+	// Keys, or the leading column beside LowKey/HighKey — executed through
+	// the same SK_SEARCHNULL / SK_SEARCHNOTNULL bounds as IndexScan's.
+	LeadingNullTest     IndexNullTest
+	NullTestAfterBounds bool
+	ExtraNullTests      []ExtraIndexNullTest
+	RowCompare          *BinaryOp // M0148-0001c3a12, as IndexScan.RowCompare
+	RowCompareLow       bool
+	IndexCondOrder      []IndexCondItem
+	// SAOPKeys is a ScalarArrayOp equality index qual (`col = ANY (…)`,
+	// match_saopclause_to_indexcol / match_orclause_to_indexcol) on
+	// Columns[len(Keys)], behind the equality Keys: one probe per element,
+	// all into the one TID bitmap (M0148-0001c3a2). Never set together with
+	// Key, LowKey/HighKey or LeadingNullTest.
+	// SkipPrefix, when non-zero, moves LowKey/HighKey onto
+	// Index.Columns[SkipPrefix]: PG 18's skip scan with a range on a later
+	// column and nothing bound before it (M0148-0001c3a4 (j)). The executor
+	// reads the whole index and checks each entry's key column.
+	SkipPrefix int
+	SAOPKeys []Expr
+	// SAOPOp is the array's operator: OpUnknown for `= ANY`, or an
+	// inequality (`col < ANY (…)`, M0148-0001c3a4 (a)) probed as the range of
+	// the extreme element. Shared with IndexScan / IndexOnlyScan.SAOPOp.
+	SAOPOp parser.OpCode
+	// SAOPColQuals mirrors IndexScan.SAOPColQuals (M0148-0001c3a4 (i)).
+	SAOPColQuals []SAOPColQual
 	// Pred is the full index condition (for recheck). When Key/Keys
 	// cover only a prefix, Pred holds the remaining index quals.
 	Pred   []Expr
@@ -3777,3 +4027,19 @@ type BitmapOr struct {
 
 func (n *BitmapOr) Pos() int       { return n.pos }
 func (n *BitmapOr) Output() Schema { return n.schema }
+
+// BuiltinSRFScan is the FROM-clause plan node for a built-in table function
+// evaluated by a per-function callback in the executor: the arguments are
+// evaluated once per scan (against the lateral outer row when correlated)
+// and the callback returns every row. Func is the function's lower-case
+// name, which also labels EXPLAIN's "Function Scan on <func>". Used for
+// genfile.c's pg_ls_dir and pg_stat_file (M0149-0016c).
+type BuiltinSRFScan struct {
+	pos    int
+	Func   string
+	Args   []Expr
+	schema Schema
+}
+
+func (n *BuiltinSRFScan) Pos() int       { return n.pos }
+func (n *BuiltinSRFScan) Output() Schema { return n.schema }

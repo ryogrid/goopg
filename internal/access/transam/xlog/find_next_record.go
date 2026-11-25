@@ -23,7 +23,7 @@ import (
 // or the page is an all-zero preallocated page.
 func FindNextRecord(walDir string, tli uint32, segSize int64, lsn uint64) (rec uint64, ok bool, err error) {
 	if segSize <= 0 {
-		segSize = DefaultSegmentSize
+		segSize = WALSegmentSize()
 	}
 	if lsn%XLOGBlockSize != 0 {
 		return 0, false, fmt.Errorf("wal: FindNextRecord: %X/%X is not page-aligned", uint32(lsn>>32), uint32(lsn))

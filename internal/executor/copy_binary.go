@@ -3,14 +3,15 @@ package executor
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"math/big"
 	"strings"
-	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/utils/adt/fixedgeo"
 )
 
 // COPY BINARY format (PostgreSQL wire protocol):
@@ -163,6 +164,24 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		return nil, err
 	}
 	switch strings.ToLower(t.Name) {
+	case "point", "lseg", "box", "line", "circle", "tid":
+		// point_send / lseg_send / box_send / line_send / circle_send /
+		// tidsend (geo_ops.c, tid.c): the struct fields big-endian. Before
+		// this arm the default shipped the canonical TEXT. M0149-0001k4.
+		s, err := coerceTextLikeDatum(t, d)
+		if err != nil {
+			return nil, err
+		}
+		return fixedgeo.Send(strings.ToLower(t.Name), s)
+	case "money":
+		// cash_send (cash.c): pq_sendint64 of the Cash count. M0149-0001k4.
+		c, err := moneyCents(d)
+		if err != nil {
+			return nil, err
+		}
+		b := make([]byte, 8)
+		binary.BigEndian.PutUint64(b, uint64(c))
+		return b, nil
 	case "int2", "smallint", "smallserial", "serial2":
 		// M0119-0006 (52nd slice): before this arm `int2` fell through to the
 		// default's KindInt escape and shipped EIGHT big-endian bytes where
@@ -317,7 +336,7 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 			binary.BigEndian.PutUint64(b, uint64(sentinel))
 			return b, nil
 		}
-		return encodeTimestampBinary(d.TimeValue().UTC()), nil
+		return encodeTimestampBinary(d.Int), nil
 	case "time", "time without time zone":
 		// M0119-0006 (51st slice): before this arm `time` fell through to the
 		// default and shipped Datum.Format()'s TEXT under FORMAT binary — a
@@ -361,10 +380,8 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 			binary.BigEndian.PutUint32(b, uint32(sentinel))
 			return b, nil
 		}
-		epoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
-		days := int32(d.TimeValue().UTC().Truncate(24*time.Hour).Sub(epoch).Hours() / 24)
 		b := make([]byte, 4)
-		binary.BigEndian.PutUint32(b, uint32(days))
+		binary.BigEndian.PutUint32(b, uint32(pgDaysOfDatum(d)))
 		return b, nil
 	case "interval":
 		// M0119-0006 (55th slice): before this arm an `interval` column fell
@@ -470,6 +487,24 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		return Datum{}, err
 	}
 	switch strings.ToLower(t.Name) {
+	case "point", "lseg", "box", "line", "circle", "tid":
+		// Twin of the send arm: point_recv … tidrecv, with box_recv's corner
+		// reordering and circle_recv / line_recv's rejections. M0149-0001k4.
+		s, err := fixedgeo.Recv(strings.ToLower(t.Name), payload)
+		if err != nil {
+			var re *fixedgeo.RecvError
+			if errors.As(err, &re) {
+				return Datum{}, &ExecError{Code: "22P02", Message: re.Msg}
+			}
+			return Datum{}, err
+		}
+		return NewStringDatum(s), nil
+	case "money":
+		// cash_recv: pq_getmsgint64. M0149-0001k4.
+		if len(payload) != 8 {
+			return Datum{}, fmt.Errorf("money: expected 8 bytes, got %d", len(payload))
+		}
+		return moneyDatum(int64(binary.BigEndian.Uint64(payload))), nil
 	case "int2", "smallint", "smallserial", "serial2":
 		// Decode twin of the "int2" encode arm. Upstream int2recv (int.c:87) is
 		// pq_getmsgint(buf, sizeof(int16)); the length is enforced because the
@@ -560,26 +595,15 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 			return Datum{}, fmt.Errorf("timestamp: expected 8 bytes, got %d", len(payload))
 		}
 		usec := int64(binary.BigEndian.Uint64(payload))
-		// Decode twin of the encode intercept: timestamp_recv accepts
-		// DT_NOEND / DT_NOBEGIN unchanged, and the epoch arithmetic below
-		// would overflow on them. (review/260831-2 EC-7)
-		switch usec {
-		case math.MaxInt64:
-			return NewTimestampInfinity(true), nil
-		case math.MinInt64:
-			return NewTimestampInfinity(false), nil
+		// The wire value is the carrier, DT_NOEND / DT_NOBEGIN included
+		// (timestamp_recv accepts them unchanged; review/260831-2 EC-7). The
+		// column type picks the subtype tag, as the heap decode does, so a value
+		// from binary COPY renders like the same value from INSERT in every
+		// type-agnostic path. M0119-0006 (41st slice), Hard-won Rule #2.
+		if usec != math.MaxInt64 && usec != math.MinInt64 && !validTimestampCarrier(usec) {
+			return Datum{}, &ExecError{Code: "22008", Message: "timestamp out of range"}
 		}
-		ts := pgEpoch.Add(time.Duration(usec) * time.Microsecond)
-		// M0119-0006 (41st slice): the column type is in reach here, so this
-		// decoder owes the same subtype tag the heap decode already applies
-		// (decodePhysicalPGValueMctx, codec.go) — otherwise a value that entered through
-		// binary COPY renders differently from the identical value that entered
-		// through INSERT, in every type-agnostic path (Datum.Format(),
-		// CAST-to-text, string concat, FK-violation DETAIL). Hard-won Rule #2.
-		if isTimestampTZTypeName(t.Name) {
-			return NewTimestampTZDatum(ts), nil
-		}
-		return NewTimeDatum(ts), nil
+		return newTimestampDatumFromPGMicros(usec, isTimestampTZTypeName(t.Name)), nil
 	case "time", "time without time zone":
 		// Decode twin of the "time" arm in datumToCopyBinary. Upstream time_recv
 		// range-checks the received TimeADT against [0, USECS_PER_DAY] — the
@@ -595,7 +619,7 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		if micros < 0 || micros > usecsPerDay {
 			return Datum{}, &ExecError{Code: "22008", Message: "time out of range"}
 		}
-		return roundTimeDatumToPrecision(NewTimeDatum(pgTimeFromMicros(micros)), timeColumnPrecision(t)), nil
+		return roundTimeDatumToPrecision(NewTimeOfDayDatum(pgTimeFromMicros(micros)), timeColumnPrecision(t)), nil
 	case "timetz", "time with time zone":
 		// Decode twin of the "timetz" encode arm; upstream timetz_recv reads the
 		// TimeADT then the int32 zone and applies the same TZDISP_LIMIT sanity
@@ -619,16 +643,13 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 			return Datum{}, fmt.Errorf("date: expected 4 bytes, got %d", len(payload))
 		}
 		days := int32(binary.BigEndian.Uint32(payload))
-		// Decode twin of the encode intercept: date_recv accepts
-		// DATEVAL_NOEND / DATEVAL_NOBEGIN unchanged. (review/260831-2 EC-7)
-		switch days {
-		case math.MaxInt32:
-			return NewDateInfinity(true), nil
-		case math.MinInt32:
-			return NewDateInfinity(false), nil
+		// date_recv accepts DATEVAL_NOEND / DATEVAL_NOBEGIN unchanged.
+		// (review/260831-2 EC-7)
+		d, ok := newDateDatumFromPGDays(days)
+		if !ok {
+			return Datum{}, &ExecError{Code: "22008", Message: "date out of range"}
 		}
-		d := pgEpoch.AddDate(0, 0, int(days))
-		return NewDateDatum(d), nil
+		return d, nil
 	case "interval":
 		// Decode twin of the "interval" encode arm. Upstream interval_recv
 		// (timestamp.c:997) is pq_getmsgint64(time) + pq_getmsgint(day) +
@@ -683,8 +704,7 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 	}
 }
 
-func encodeTimestampBinary(t time.Time) []byte {
-	usec := t.Sub(pgEpoch).Microseconds()
+func encodeTimestampBinary(usec int64) []byte {
 	b := make([]byte, 8)
 	binary.BigEndian.PutUint64(b, uint64(usec))
 	return b

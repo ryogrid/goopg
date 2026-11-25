@@ -309,6 +309,15 @@ func TestRestrictionSAOPIndexScanOnJointreePipeline(t *testing.T) {
 		t.Fatalf("%s: a second-column bound belongs exactly to the composite index (LowKey=%v)", scan.Index.Name, scan.LowKey)
 	}
 	f := findFilterOver(node, scan)
+	if scan.LowKey != nil {
+		// M0148-0001c3a4 (c): on the composite the bound is an exact index
+		// qual (each element's descent bounded by indexRangeBounds), so
+		// nothing is left to filter — PG prints no Filter either.
+		if f != nil {
+			t.Fatalf("i_flag > 1 is an exact index qual on %s; want no Filter, got %v", scan.Index.Name, f.Predicate)
+		}
+		return
+	}
 	if f == nil {
 		t.Fatal("i_flag > 1 is not an index qual; want it kept as a Filter over the scan")
 	}
@@ -337,9 +346,12 @@ func TestRestrictionSAOPIndexScanOnJointreePipeline(t *testing.T) {
 
 // Slice 2b: behind an equality prefix, range bounds on the NEXT index column
 // become IndexScan.RangePrefix + LowKey/HighKey (PG's
-// `Index Cond: ((i_item_sk = 2) AND (i_flag > 5))`). The prefix equality is
-// dropped from the Filter; the bound stays there as a recheck (an open bound
-// runs to the prefix's padded upper bound, past NULLs in the bounded column).
+// `Index Cond: ((i_item_sk = 2) AND (i_flag > 5))`). Both the prefix equality
+// and the bound leave the Filter: the probe bounds through indexRangeBounds,
+// whose open end stops at the column's NULL group (M0148-0001c3a2 — the
+// bound used to stay as a Filter recheck, from before that NULL stop).
+// Planned with bitmap scans off: this pins the index producer, and the
+// bitmap producer takes the same bounds since M0148-0001c3a2.
 func TestRestrictionPrefixRangeIndexScanOnJointreePipeline(t *testing.T) {
 
 	c := catalog.NewInMemory()
@@ -356,7 +368,9 @@ func TestRestrictionPrefixRangeIndexScanOnJointreePipeline(t *testing.T) {
 	}
 	tbl.Stats = &catalog.TableStats{RowCount: 100000, Pages: 10000, Analyzed: true}
 
-	node, err := Plan(parseOne(t, "SELECT c FROM pr WHERE a = 7 AND b > 90"), c)
+	ps := DefaultPlannerSettings()
+	ps.EnableBitmapScan = false
+	node, err := PlanWithSettings(parseOne(t, "SELECT c FROM pr WHERE a = 7 AND b > 90"), c, ps)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -369,12 +383,8 @@ func TestRestrictionPrefixRangeIndexScanOnJointreePipeline(t *testing.T) {
 		t.Fatalf("want RangePrefix=[7] + LowKey > 90, got prefix=%d lo=%v/%v hi=%v key=%v keys=%d",
 			len(scan.RangePrefix), scan.LowKey, scan.LowOp, scan.HighKey, scan.Key, len(scan.Keys))
 	}
-	f := findFilterOver(node, scan)
-	if f == nil {
-		t.Fatal("the range bound must stay as a Filter recheck")
-	}
-	if bin, ok := f.Predicate.(*BinaryOp); !ok || bin.Op != parser.OpGt {
-		t.Fatalf("want the Filter to be exactly b > 90 (the prefix equality dropped), got %T", f.Predicate)
+	if f := findFilterOver(node, scan); f != nil {
+		t.Fatalf("both quals are exact index quals; want no Filter, got %T", f.Predicate)
 	}
 }
 
@@ -394,14 +404,15 @@ func TestMatchBitmapIndexQualsIsGapless(t *testing.T) {
 		}
 	}
 	eqFlag := &BinaryOp{Op: parser.OpEq, Left: &ColumnRef{Index: 2, Name: "i_flag"}, Right: &IntegerConst{Value: 7}}
-	if got, _ := matchBitmapIndexQuals(composite, tbl, []Expr{eqFlag}, &scanIdentity{}); len(got) != 0 {
+	if got, _ := matchBitmapIndexQuals(nil, composite, tbl, []Expr{eqFlag}, &scanIdentity{}); len(got) != 0 {
 		t.Fatalf("i_flag = 7 alone binds no prefix of (i_item_sk, i_flag); got %d clauses", len(got))
 	}
 }
 
 // SAOP + range: `a IN (7, 8) AND b > 90` on (a, b) plans one IndexScan with
 // SAOPKeys on a and the bound on b (PG `Index Cond: ((a = ANY (...)) AND
-// (b > 90))`); the bound stays in the Filter as a recheck, the IN does not.
+// (b > 90))`). Since M0148-0001c3a4 (c) the bound is an exact index qual,
+// so no Filter remains, as in PG.
 func TestRestrictionSAOPPlusRangeOnJointreePipeline(t *testing.T) {
 
 	c := prTestCatalog(t, []string{"a", "b"}, true)
@@ -413,12 +424,8 @@ func TestRestrictionSAOPPlusRangeOnJointreePipeline(t *testing.T) {
 	if scan == nil || len(scan.SAOPKeys) != 2 || scan.LowKey == nil || scan.LowOp != parser.OpGt || scan.HighKey != nil {
 		t.Fatalf("want SAOPKeys=[7 8] + LowKey > 90, got %+v", scan)
 	}
-	f := findFilterOver(node, scan)
-	if f == nil {
-		t.Fatal("the bound must stay as a Filter recheck")
-	}
-	if _, isIn := f.Predicate.(*InExpr); isIn {
-		t.Fatal("the IN is applied by the descents; it must not stay in the Filter")
+	if f := findFilterOver(node, scan); f != nil {
+		t.Fatalf("both quals are index quals; want no Filter, got %v", f.Predicate)
 	}
 }
 
@@ -429,7 +436,16 @@ func TestRestrictionProbeDeclinesUnboundNullableKeyColumn(t *testing.T) {
 
 	for _, cNotNull := range []bool{false, true} {
 		c := prTestCatalog(t, []string{"a", "b", "c"}, cNotNull)
-		node, err := Plan(parseOne(t, "SELECT c FROM pr WHERE a = 7 AND b > 90"), c)
+		// The bitmap producer applies the same NULL-key rule
+		// (indexUnboundKeysNotNull); with c nullable it must decline too.
+		if node, err := Plan(parseOne(t, "SELECT c FROM pr WHERE a = 7 AND b > 90"), c); err != nil {
+			t.Fatalf("Plan: %v", err)
+		} else if !cNotNull && planHasBitmapIndexScan(node) {
+			t.Fatal("c nullable: a bitmap probe binding (a, b) would miss (7, 95, NULL)")
+		}
+		ps := DefaultPlannerSettings()
+		ps.EnableBitmapScan = false
+		node, err := PlanWithSettings(parseOne(t, "SELECT c FROM pr WHERE a = 7 AND b > 90"), c, ps)
 		if err != nil {
 			t.Fatalf("Plan: %v", err)
 		}
@@ -461,4 +477,30 @@ func prTestCatalog(t *testing.T, idxCols []string, cNotNull bool) *catalog.InMem
 	}
 	tbl.Stats = &catalog.TableStats{RowCount: 100000, Pages: 10000, Analyzed: true}
 	return c
+}
+
+// planHasBitmapIndexScan reports whether a Bitmap Index Scan sits under n
+// (through the wrappers findFilterOver walks, and a bitmap heap scan).
+func planHasBitmapIndexScan(n Node) bool {
+	for n != nil {
+		switch v := n.(type) {
+		case *BitmapIndexScan:
+			return true
+		case *BitmapHeapScan:
+			n = v.Outer
+		case *BitmapAnd, *BitmapOr:
+			return true
+		case *Filter:
+			n = v.Child
+		case *Project:
+			n = v.Child
+		case *Sort:
+			n = v.Child
+		case *Limit:
+			n = v.Child
+		default:
+			return false
+		}
+	}
+	return false
 }

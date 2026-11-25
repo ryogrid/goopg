@@ -163,6 +163,7 @@ func TestReadAllSkipsShortSegmentTailGap(t *testing.T) {
 // necessarily zero — it can hold a previous write cycle's bytes (the measured
 // production failure had 0xff there). Those must not be decoded either.
 func TestReadAllSkipsShortSegmentTailGapWithStaleBytes(t *testing.T) {
+	withCrossSegmentPad(t) // the pre-M0149-0017d pad layout older WAL still has
 	const gapLen = int64(8)
 	walDir, payloads := writeWALWithShortSegmentTailGap(t, gapLen, 1<<20)
 

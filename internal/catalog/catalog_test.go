@@ -170,23 +170,22 @@ func TestPgCatalogBootstrapViews(t *testing.T) {
 	// (pg_dump.c:10548), so pg_roles must expose oid as its first
 	// column carrying the postgres superuser's OID 10.
 	roles, _ := c.LookupTable(parser.ObjectName{Name: "pg_roles"})
-	if roles.Columns[0].Name != "oid" || roles.Columns[0].Type.Name != "oid" {
-		t.Errorf("pg_roles col0=%+v want {oid oid}", roles.Columns[0])
-	}
-	if roles.Columns[1].Name != "rolname" {
-		t.Errorf("pg_roles col1=%s want rolname", roles.Columns[1].Name)
+	// system_views.sql order: rolname first, oid last (column 12); pg_dump
+	// selects `oid, rolname` by name.
+	if roles.Columns[0].Name != "rolname" || roles.Columns[12].Name != "oid" || roles.Columns[12].Type.Name != "oid" {
+		t.Errorf("pg_roles col0=%+v col12=%+v want rolname / {oid oid}", roles.Columns[0], roles.Columns[12])
 	}
 	rrows := roles.VirtualRows()
 	// 1 bootstrap superuser + PG18's 16 built-in "pg_*" predefined roles
 	// (M0119-0004-ACLHEAP: pg_authid/pg_roles predefined-role rows).
-	if len(rrows) != 17 || rrows[0][0] != "10" || rrows[0][1] != "postgres" {
-		t.Errorf("pg_roles rows=%v want 17 (10,postgres,t,t first)", rrows)
+	if len(rrows) != 17 || rrows[0][12] != "10" || rrows[0][0] != "postgres" || rrows[0][1] != "t" {
+		t.Errorf("pg_roles rows=%v want 17 (postgres superuser oid 10 first)", rrows)
 	}
 	foundPredefined := false
 	for _, r := range rrows {
-		if r[1] == "pg_read_all_data" {
+		if r[0] == "pg_read_all_data" {
 			foundPredefined = true
-			if r[2] != "f" || r[3] != "f" {
+			if r[1] != "f" || r[5] != "f" {
 				t.Errorf("pg_roles pg_read_all_data row=%v want rolsuper=f rolcanlogin=f", r)
 			}
 		}
@@ -763,36 +762,20 @@ func TestVerboseIntervalOffset(t *testing.T) {
 // `select * from pg_timezone_abbrevs where abbrev = 'LMT'` must return the
 // verbose-interval offset and a "f" is_dst (not "false"/"-07:52:58").
 func TestPgTimezoneAbbrevsLMTRow(t *testing.T) {
-	c := NewInMemory()
-	for _, name := range []string{"pg_timezone_abbrevs", "pg_timezone_names"} {
-		tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: name})
-		if !ok || tbl.VirtualRows == nil {
-			t.Fatalf("%s virtual table not registered", name)
+	// sysviews.sql runs under America/Los_Angeles, whose local mean time
+	// reaches pg_timezone_abbrevs through pg_timezone_abbrevs_zone.
+	var found bool
+	for _, row := range TimezoneAbbrevRows("America/Los_Angeles") {
+		if row[0] != "LMT" {
+			continue
 		}
-		var found bool
-		for _, row := range tbl.VirtualRows() {
-			// abbrev is col 0 for abbrevs, col 1 for names.
-			abbrevIdx := 0
-			isDstIdx := len(row) - 1
-			offIdx := isDstIdx - 1
-			if row[abbrevIdx] != "LMT" && row[len(row)-3] != "LMT" {
-				continue
-			}
-			// Locate the LMT row regardless of table shape.
-			if !(row[0] == "LMT" || (len(row) >= 3 && row[len(row)-3] == "LMT")) {
-				continue
-			}
-			found = true
-			if row[offIdx] != "@ 7 hours 52 mins 58 secs ago" {
-				t.Errorf("%s LMT utc_offset = %q, want verbose interval", name, row[offIdx])
-			}
-			if row[isDstIdx] != "f" {
-				t.Errorf("%s LMT is_dst = %q, want \"f\"", name, row[isDstIdx])
-			}
+		found = true
+		if row[1] != "@ 7 hours 52 mins 58 secs ago" || row[2] != "f" {
+			t.Errorf("LMT row = %q", row)
 		}
-		if !found {
-			t.Errorf("%s: no LMT row found", name)
-		}
+	}
+	if !found {
+		t.Error("pg_timezone_abbrevs: no LMT row for America/Los_Angeles")
 	}
 }
 
@@ -1081,16 +1064,20 @@ func TestPgLanguageBuiltinRows(t *testing.T) {
 	if len(rows) != 4 {
 		t.Fatalf("pg_language returned %d rows; want exactly 4 (internal/c/sql/plpgsql)", len(rows))
 	}
-	// oid -> expected (lanname, lanpltrusted, laninline)
+	// oid -> expected (lanname, lanispl, lanpltrusted, laninline): PG 18.3
+	// initdb's rows (M0149-0001g slice 29). plpgsql is a procedural language
+	// (lanispl t); pg_dump still skips it because it is a member of the
+	// built-in plpgsql extension (oid below FirstNormalObjectId).
 	want := map[string]struct {
 		name      string
+		ispl      string
 		pltrusted string
 		inline    string
 	}{
-		"12":    {"internal", "f", "0"},
-		"13":    {"c", "f", "0"},
-		"14":    {"sql", "t", "2511"},
-		"13627": {"plpgsql", "t", "0"},
+		"12":    {"internal", "f", "f", "0"},
+		"13":    {"c", "f", "f", "0"},
+		"14":    {"sql", "f", "t", "0"},
+		"13627": {"plpgsql", "t", "t", "13625"},
 	}
 	for _, row := range rows {
 		oid := row[colIdx["oid"]]
@@ -1102,9 +1089,8 @@ func TestPgLanguageBuiltinRows(t *testing.T) {
 		if got := row[colIdx["lanname"]]; got != w.name {
 			t.Errorf("oid %s lanname = %q; want %q", oid, got, w.name)
 		}
-		// lanispl MUST be "f" for every built-in so getProcLangs returns 0 rows.
-		if got := row[colIdx["lanispl"]]; got != "f" {
-			t.Errorf("oid %s lanispl = %q; want f (built-ins must never be dumped)", oid, got)
+		if got := row[colIdx["lanispl"]]; got != w.ispl {
+			t.Errorf("oid %s lanispl = %q; want %q", oid, got, w.ispl)
 		}
 		if got := row[colIdx["lanpltrusted"]]; got != w.pltrusted {
 			t.Errorf("oid %s lanpltrusted = %q; want %q", oid, got, w.pltrusted)

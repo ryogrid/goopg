@@ -89,7 +89,7 @@ func ActualVariableEndpointProbe(pool *storage.Pool, txn *transam.Manager, vm *s
 				}
 			}
 			// The key aliases the pinned leaf: render it before returning.
-			value, found = formatDatumDateStyle(datums[0], nil), true
+			value, found = statValueText(datums[0], keyCols[0].Type, nil), true
 			return false, nil
 		}
 		if last {

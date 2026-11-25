@@ -36,7 +36,7 @@ func TestCrashRecoveryReplaysWALAfterUncleanShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rel := storage.RelFileNode{DBOid: 1, RelOid: 9200, Fork: storage.MainFork}
+	rel := storage.RelFileNode{DBOid: 5, RelOid: 9200, Fork: storage.MainFork}
 
 	// Phase 1: build a populated tree.
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 16})
@@ -128,7 +128,7 @@ func TestCrashRecoveryReplaysChecksummedClusterCleanly(t *testing.T) {
 		t.Fatalf("data_checksum_version = %d, want 1 (checksums not enabled)", ctrl.DataChecksumVersion)
 	}
 
-	rel := storage.RelFileNode{DBOid: 1, RelOid: 9200, Fork: storage.MainFork}
+	rel := storage.RelFileNode{DBOid: 5, RelOid: 9200, Fork: storage.MainFork}
 
 	// Phase 1: build a multi-page tree on the checksum-enabled Manager. Every
 	// WriteBlock here flows through checksummedForWrite, so the runtime pages
@@ -199,7 +199,8 @@ func TestCrashRecoveryReplaysChecksummedClusterCleanly(t *testing.T) {
 	if err := rt2.Pool.FlushAll(); err != nil {
 		t.Fatalf("FlushAll before on-disk verify: %v", err)
 	}
-	btreePath := filepath.Join(dir, "base", "1", "9200")
+	// DBOid 1 is stored at base/5 (storage.StorageDBOid, M0149-0001a1 S1).
+	btreePath := filepath.Join(dir, "base", "5", "9200")
 	if fi, err := os.Stat(btreePath); err != nil {
 		t.Fatalf("stat recovered btree file %q: %v", btreePath, err)
 	} else if fi.Size() <= storage.BlockSize {

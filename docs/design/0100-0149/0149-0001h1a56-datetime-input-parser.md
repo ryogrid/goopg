@@ -1,0 +1,69 @@
+# M0149\-0001h1a56 — date and timestamp input parser
+
+## Problem
+
+Date and timestamp input went through a list of Go layouts with a set of normalising steps around
+it. It read ISO spellings and little else: `Feb 10 17:32:01 1997 PST`, `19970210 173201` and
+`1997/02/10` failed, DateStyle was ignored, and zone names and abbreviations were not read.
+
+## What PG does
+
+`date_in`, `timestamp_in` and `timestamptz_in` share `ParseDateTime` and `DecodeDateTime`
+\(`datetime.c`\). The first splits the text into typed fields, and the second works through them with a
+bit mask of what has been seen, so most field orders are accepted.
+
+## Design
+
+`internal/utils/adt/datetime/decode.go` ports `ParseDateTime`, `DecodeDateTime`, `DecodeDate`,
+`ValidateDate`, `DecodeTime`, `DecodeNumber`, `DecodeNumberField`, `DecodeTimezone` and the token table.
+`zone_abbrevs_gen.go` is generated from `postgres/src/timezone/tznames/Default`.
+
+The session reaches the decoder through `DecodeEnv`: the DateStyle field order, the statement
+time, the session zone, and two functions from `misc` for zone lookup and `DetermineTimeZoneOffset`.
+An abbreviation is looked up in the session zone first and then in the table, as in PG. A zone's
+abbreviations come from walking its periods with `Time.ZoneBounds`, cached per location.
+
+In `copy_text.go`, `decodeTimestampText` and `decodeDateText` turn the fields into a value and replace the
+layout table, the proxy\-year fallbacks and the verbose\-format fallback. Literals, casts, COPY and row
+encoding all use them.
+
+`Decoded.UsedSession` is set when the zone or DateStyle decided the result. A literal's value is then not
+cached on the plan node, because the same plan can run under another setting.
+
+With the parser in place the planner types every untyped literal opposite a timestamp, so a bad one raises
+PG's input error. `dateTimeInputError` also gives PG's codes for a bad zone, an out\-of\-range displacement, and
+a month or day overflow, which carries the DateStyle hint.
+
+## Error position of typed literals \(M0149\-0001h1a55\)
+
+PG reports a bad `date 'x'` at the string \(`makeStringConstCast`\). The adapter's `TYPEDLIT` token keeps the
+type name's position, which raw source spans start from, and carries the string's position in `ival`. The
+grammar builds the literal from that, and the multi\-word forms use the `SCONST` position.
+
+## Verification
+
+About 2,000 inputs were run as `date`, `timestamp` and `timestamptz` under the three field orders on goopg and
+PG 18.3. Results and errors match, apart from dates after 294276 AD \(M0149\-0001h1a54\).
+
+## Not covered
+
+- `time` and `timetz` input still use their own parser, not `DecodeTimeOnly`, and `timezone_abbreviations` is
+  always the `Default` set \(M0149\-0001h1a70\).
+- Typed literals PG accepts but goopg's grammar does not, such as `uuid 'x'` and `timestamp(3) 'x'`, are
+  M0149\-0001h1a71.
+
+## Time and timetz input \(M0149\-0001h1a70\)
+
+`DecodeTimeOnlyInput` \(`internal/utils/adt/datetime/timeonly.go`\) ports `DecodeTimeOnly` onto the same
+decoder, and `parseTimeString`, `parseTimeTZString` and the time and timetz casts and typed literals all go
+through it \(`decodeTimeOnlyText`\). As in `time_in`, zone fields parse for `time` too and are dropped.
+
+- `now` reads the clock in the session zone; `allballs` and `z` are midnight UTC.
+- Without a zone field, timetz takes the session offset at the input's date or today's.
+- A named zone needs a full date unless the zone has only ever had one offset \(`pg_get_timezone_offset`\).
+
+A timetz offset can have seconds \(`+05:30:15`, LMT zones\). The minutes still live in `Datum.Scale`; the
+exact seconds now ride in `Datum.Hi`, which `TimeTZOffsetSecs` reads, and the wire output prints them.
+
+Not covered: the `timezone_abbreviations` setting; input always uses the Default set \(M0149\-0001h1a82\).
+

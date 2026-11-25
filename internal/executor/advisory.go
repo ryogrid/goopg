@@ -368,6 +368,9 @@ func ReleaseAdvisoryTransactionLocks(identity any) {
 	if id := advisoryPointerID(identity); id != 0 {
 		globalAdvisoryMgr.releaseAllXact(id)
 	}
+	// Large-object descriptors are transaction-scoped too
+	// (AtEOXact_LargeObject). M0149-0001h1a.
+	ReleaseLargeObjectDescriptors(identity)
 }
 
 // ReleaseAllAdvisoryLocks releases EVERY advisory lock held by the given stable
@@ -378,6 +381,7 @@ func ReleaseAdvisoryTransactionLocks(identity any) {
 // would otherwise persist for the lifetime of the server process and block
 // every future acquirer of the same key. M0118-0003.
 func ReleaseAllAdvisoryLocks(identity any) {
+	ReleaseLargeObjectDescriptors(identity)
 	if id := advisoryPointerID(identity); id != 0 {
 		globalAdvisoryMgr.releaseAll(id)
 	}
@@ -409,7 +413,7 @@ func (m *advisoryManager) PgLockRows() [][]string {
 		}
 		rows = append(rows, []string{
 			"advisory", // locktype
-			"16384",    // database
+			fmt.Sprintf("%d", catalog.PostgresDBOid), // database (postgres, M0149-0001a1 S2)
 			"",         // relation
 			"",         // page
 			"",         // tuple

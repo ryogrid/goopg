@@ -39,7 +39,7 @@ func TestTruncateRelationMissingNoCreate(t *testing.T) {
 	m := NewManager(ManagerConfig{DataDir: dir})
 	defer func() { _ = m.Close() }()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 90001}
+	rel := RelFileNode{DBOid: 16384, RelOid: 90001}
 	path := relFilePath(m, rel)
 
 	if err := m.TruncateRelation(rel); err != nil {
@@ -55,7 +55,7 @@ func TestTruncateRelationToMissingNoCreate(t *testing.T) {
 	m := NewManager(ManagerConfig{DataDir: dir})
 	defer func() { _ = m.Close() }()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 90002}
+	rel := RelFileNode{DBOid: 16384, RelOid: 90002}
 	path := relFilePath(m, rel)
 
 	if err := m.TruncateRelationTo(rel, 0); err != nil {
@@ -88,7 +88,7 @@ func TestTruncateRelationExistingStillTruncates(t *testing.T) {
 	m := NewManager(ManagerConfig{DataDir: dir})
 	defer func() { _ = m.Close() }()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 90004}
+	rel := RelFileNode{DBOid: 16384, RelOid: 90004}
 	buf := make([]byte, BlockSize)
 	for i := range buf {
 		buf[i] = 0xAB

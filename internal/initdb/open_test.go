@@ -515,7 +515,7 @@ func TestPGAttributeSQLSurfaceForUserTable(t *testing.T) {
 					continue
 				}
 			}
-			if row.AttRelID == tbl.OID {
+			if row.AttRelID == tbl.OID && row.AttNum > 0 { // user columns; system attributes since M0149-0001e
 				colsByName[row.AttName] = row
 			}
 		}

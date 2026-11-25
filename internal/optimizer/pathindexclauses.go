@@ -134,6 +134,34 @@ type indexPathClause struct {
 	// element, lowered onto IndexScan.SAOPKeys. `key` is nil and `op` is
 	// equality when set.
 	saop []Expr
+	// saopOp is the array's operator: OpUnknown for `= ANY`, or an
+	// inequality (`col < ANY (…)`, M0148-0001c3a4 (a)).
+	saopOp parser.OpCode
+	// saopColQuals are further constant quals on the array's own column,
+	// merged into the array (M0148-0001c3a4 (i)); each carries its conjunct
+	// in local so createPlan drops it from the Filter.
+	saopColQuals []saopColQual
+	// nullTest marks a `indexcol IS [NOT] NULL` index qual (M0148-0001c3a,
+	// restrictionLeadingNullTest): `key` is nil, `op` equality, `local` the
+	// NullTest conjunct. createRangeIndexScanPlan lowers it onto
+	// IndexScan.LeadingNullTest.
+	nullTest IndexNullTest
+	// trailingQuals marks the plain comparisons on index column 1 behind a
+	// leading range or NullTest (M0148-0001c3a5 (a)): PG 18 makes every
+	// qual on a later index column an index qual — `((a > 0) AND (b = 5))`.
+	// The first comparison sits in op/key/local, the rest in saopColQuals;
+	// saop stays empty. Lowered onto TrailingSAOP with no Elems.
+	trailingQuals bool
+	// redundantBound marks a range bound the clause list's tighter bound of
+	// the same direction implies (restrictionRangeOnColumnLocal): an index
+	// clause PG prints, not a probe bound (ExtraIndexBound).
+	redundantBound bool
+	// rowCompare marks the leading-column bound derived from a row
+	// comparison `(c0, c1, …) op (v0, v1, …)` over the index's leading
+	// columns (match_rowcompare_to_indexcol, M0148-0001c3a12): op / key are
+	// the lossy bound on c0, local the comparison, which the scan checks
+	// exactly per entry (IndexScan.RowCompare).
+	rowCompare bool
 }
 
 // indexPathClauses is `build_index_paths`' `index_clauses` accumulation

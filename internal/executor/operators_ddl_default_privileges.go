@@ -52,15 +52,6 @@ func (o *ddlOp) execAlterDefaultPrivileges(s *parser.AlterDefaultPrivilegesStmt)
 	if err := checkGrantOptionToPublic(s.Revoke, s.WithGrantOption, s.Grantees); err != nil {
 		return err
 	}
-	// goopg has no pg_largeobject subsystem at all (no lo_create/lo_open/
-	// loread/lowrite/..., no heap-backed pg_largeobject(_metadata) storage —
-	// a separate, materially larger Effort-L feature per the deferral
-	// ledger), so a LARGE OBJECTS default is accepted syntactically (the
-	// parser already validated the grammar) but never materialized: there
-	// is no object kind here for a resulting row to describe.
-	if s.ObjType == "largeobject" {
-		return nil
-	}
 	var privs []string
 	for _, p := range s.Privileges {
 		privs = append(privs, catalog.DefaultACLNormalizePriv(objType, p)...)
@@ -76,8 +67,14 @@ func (o *ddlOp) execAlterDefaultPrivileges(s *parser.AlterDefaultPrivilegesStmt)
 	if err != nil {
 		return err
 	}
+	bs, _ := o.ctx.Session.(*BasicSession)
 	for _, roleOID := range roleOIDs {
 		for _, schemaOID := range schemaOIDs {
+			if bs != nil && bs.TracksDDLUndo() {
+				// SetDefaultACL's pg_default_acl write rolls back with the
+				// transaction; the in-memory entry is snapshotted first.
+				bs.RecordCatalogUndo(im.SnapshotACLEntry(im.DefaultACLOID(roleOID, schemaOID, objType)))
+			}
 			if s.Revoke {
 				// A REVOKE against a triple with no materialized row (never
 				// granted, or already back at its implicit default) is a

@@ -54,6 +54,8 @@ type SenderState struct {
 	// BackendStart is the wall-clock instant the walsender registered
 	// (i.e. began serving the standby).
 	BackendStart time.Time
+	// SyncSlot is the walsender's SyncRep slot (walsnd_index), or -1.
+	SyncSlot int
 }
 
 // Senders is the process-wide registry of active walsenders.
@@ -144,6 +146,23 @@ type Sender struct {
 	writeLSN  atomic.Uint64
 	flushLSN  atomic.Uint64
 	replayLSN atomic.Uint64
+
+	syncStandby atomic.Pointer[SyncRepStandby]
+}
+
+// FlushLSN is the standby's last reported flush position.
+func (se *Sender) FlushLSN() uint64 { return se.flushLSN.Load() }
+
+// SetSyncStandby attaches the walsender's SyncRep slot, so status replies
+// feed it and pg_stat_replication reads its sync_priority/sync_state.
+func (se *Sender) SetSyncStandby(h *SyncRepStandby) { se.syncStandby.Store(h) }
+
+// SyncStandby is the attached SyncRep slot, or nil (also for a nil Sender).
+func (se *Sender) SyncStandby() *SyncRepStandby {
+	if se == nil {
+		return nil
+	}
+	return se.syncStandby.Load()
 }
 
 // SetSentLSN advances the "bytes shipped" counter. Walsender calls
@@ -194,6 +213,7 @@ func (se *Sender) snapshot() SenderState {
 		WriteLSN:        se.writeLSN.Load(),
 		FlushLSN:        se.flushLSN.Load(),
 		ReplayLSN:       se.replayLSN.Load(),
+		SyncSlot:        se.syncStandby.Load().Slot(),
 	}
 }
 

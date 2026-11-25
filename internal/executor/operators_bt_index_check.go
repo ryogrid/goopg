@@ -98,6 +98,12 @@ func evalBtIndexCheck(x *optimizer.FuncCall, slot SlotView, ctx *Context, parent
 				// of erroring.
 				return NullDatum, nil
 			}
+			if catalog.IsCapturedSystemRelation(uint32(argVal.Int)) {
+				// A captured system index pg_class lists (M0149-0001h1a35)
+				// with no goopg index behind it — sibling of the
+				// verify_heapam case: no entries, no findings.
+				return NullDatum, nil
+			}
 		}
 		return NullDatum, &ExecError{Code: "42P01", Pos: x.Pos(),
 			Message: "could not open relation: relation does not exist"}

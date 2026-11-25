@@ -120,6 +120,17 @@ type PlannerSettings struct {
 	// C-19h.
 	EnableGatherMerge bool
 
+	// TimeZone and DateStyle are the session's GUCs. A date/time literal is
+	// read when the statement is planned, as PG reads it at parse time, so
+	// they are planner inputs (canonicalizeDateTimeLiterals). "" means the
+	// built-in default.
+	TimeZone  string
+	DateStyle string
+	// TimezoneAbbreviations is the timezone_abbreviations GUC: which
+	// abbreviation set a literal's zone abbreviation is read from
+	// (M0149-0001h1a82). "" means Default.
+	TimezoneAbbreviations string
+
 	// EnableHashAgg / EnablePresortedAggregate / Geqo / GeqoThreshold are the
 	// remaining P2-02c bridges. Same defect as EnableMemoize below: each
 	// reached the planner through a registry.OnChange bridge writing a
@@ -153,6 +164,20 @@ type PlannerSettings struct {
 	// other session on the server. It is a per-statement planner input like any
 	// other and now travels with the rest.
 	EnableMemoize bool
+
+	// EnablePartitionwiseJoin is `enable_partitionwise_join`: whether the
+	// search builds partition-by-partition joins (try_partitionwise_join,
+	// M0148-0001c3a9). goopg's GUC default is on (owner-gated, see GUC
+	// defaults); PG's is off.
+	EnablePartitionwiseJoin bool
+
+	// KeepAppendRelsWhole is set by the planner (never by a GUC) for a
+	// row-locking SELECT and for UPDATE / DELETE / MERGE: their EPQ recheck
+	// reads a restriction kept above the appendrel's scan chain
+	// (planTakesRowMarksOrModifies), so no path may move it into a member —
+	// neither a partitionwise join nor a per-member child scan
+	// (M0148-0001c3a9 / c3a10).
+	KeepAppendRelsWhole bool
 
 	// HashMemMultiplier is `hash_mem_multiplier`. A hash build's budget is
 	// `work_mem * hash_mem_multiplier` (get_hash_memory_limit,
@@ -252,6 +277,9 @@ type PlannerSettings struct {
 func DefaultPlannerSettings() PlannerSettings {
 	cp := defaultCostParams()
 	return PlannerSettings{
+		TimeZone:  "UTC",      // TimeZone BootVal (internal/utils/misc/defaults.go)
+		DateStyle: "ISO, MDY", // DateStyle BootVal
+		TimezoneAbbreviations: "Default", // timezone_abbreviations BootVal
 		EnableHashJoin:  true,
 		EnableMergeJoin: true,
 		EnableNestLoop:  true,
@@ -264,6 +292,7 @@ func DefaultPlannerSettings() PlannerSettings {
 		EnableBitmapScan: true,
 		EnableGatherMerge: true,
 		EnableMemoize:   true,
+		EnablePartitionwiseJoin: true,
 		EnableMaterial:  true,
 
 		EnableHashAgg:            HashAggEnabled(),
@@ -331,6 +360,8 @@ func (ps PlannerSettings) costParams() costParams {
 		enableBitmapScan: ps.EnableBitmapScan,
 		enableGatherMerge: ps.EnableGatherMerge,
 		enableMemoize:   ps.EnableMemoize,
+		enablePartitionwiseJoin: ps.EnablePartitionwiseJoin && !ps.KeepAppendRelsWhole,
+		keepAppendRelsWhole:     ps.KeepAppendRelsWhole,
 		enableMaterial:  ps.EnableMaterial,
 		geqo:            ps.Geqo,
 		geqoThreshold:   ps.GeqoThreshold,

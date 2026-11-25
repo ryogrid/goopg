@@ -808,12 +808,12 @@ func assertParallelAwareJoinIsRunnable(p *Path, j *Join) {
 //   - a parameterised merge path is undischargeable for the same reason the hash
 //     one is — `calc_non_nestloop_required_outer` (:1071) propagates rather than
 //     binds — and `tryMergeJoinPath` already refuses to build one;
-//   - a result ordering that is not ascending/nulls-last is a LIE about the
-//     emitted node. goopg's merge comparator is fixed ascending with NULL-keyed
-//     rows last (`mergeSortedSource.less`, join_merge_stream.go:280), so a path
-//     claiming a descending ordering — which only P5.4c-ii's ordered index paths
-//     can produce — would have a merge one level up skip a sort it still needs.
-//     Ledgered against that slice.
+//   - a result ordering the operator does not emit is a LIE about the node.
+//     goopg's merge comparator takes each key's direction from the path
+//     (`Path.MergeDesc`, M0148-0001c3a3 slice 4) but files NULL-keyed rows
+//     after every real key (`mergeSortedSource.less`), so a NULLS FIRST
+//     result is refused for a join that emits NULL-keyed outer rows — a merge
+//     one level up would skip a sort it still needs.
 func createMergeJoinPlan(p *Path) (Node, outputLayout) {
 	if len(p.Children) != 2 {
 		panic(fmt.Sprintf("createPlan: PathMergeJoin with %d children, want exactly 2", len(p.Children)))
@@ -825,9 +825,16 @@ func createMergeJoinPlan(p *Path) (Node, outputLayout) {
 		panic(fmt.Sprintf("createPlan: parameterised PathMergeJoin over relset %#08x; a merge join propagates a parameter rather than binding it",
 			uint32(p.Rel.Relids)))
 	}
+	if len(p.MergeDesc) > len(p.HashKeys) {
+		panic(fmt.Sprintf("createPlan: PathMergeJoin carries %d merge directions for %d merge clauses", len(p.MergeDesc), len(p.HashKeys)))
+	}
 	for i, pk := range p.Pathkeys {
-		if !pk.SortAsc || pk.NullsFirst {
-			panic(fmt.Sprintf("createPlan: PathMergeJoin result pathkey %d is %s; goopg's merge operator emits ascending, nulls last, so this ordering would not be delivered",
+		// M0148-0001c3a3 slice 4: the merge compares each key in its path
+		// direction (MergeDesc), so a descending result is delivered; what
+		// it cannot deliver is NULLS FIRST when NULL-keyed outer rows are
+		// emitted — it files them after every real key.
+		if pk.NullsFirst && !mergeNullsFirstDeliverable(p.Jointype) {
+			panic(fmt.Sprintf("createPlan: PathMergeJoin result pathkey %d is %s; goopg's merge operator emits NULL-keyed outer rows last, so this ordering would not be delivered",
 				i, describePathKeyOrder(pk)))
 		}
 	}
@@ -859,6 +866,8 @@ func createMergeJoinPlan(p *Path) (Node, outputLayout) {
 		schema:    in.publishedSchema(jt),
 		// The path's mergeclauses — its other equalities are joinqual.
 		MergeKeyCount: len(pairs),
+		// M0148-0001c3a3 slice 4: their compare directions.
+		MergeKeyDesc: append([]bool(nil), p.MergeDesc...),
 	}
 	assertPartialMergeJoinIsRunnable(p, j)
 	return j, in.publishedLayout(jt)
@@ -896,15 +905,10 @@ func assertPartialMergeJoinIsRunnable(p *Path, j *Join) {
 // path the side's node is built from; `restoreMergeSort` puts the Sort back on
 // once that node is narrowed. See `createMergeJoinPlan`'s doc.
 //
-// The one thing checked is that the sort is not asking for something the join
-// will not deliver: goopg's merge comparator is
-// ascending, NULL-keyed rows last. A descending `PathSort` under a merge join
-// means the producer expected the sort to survive — it would not — and the
-// resulting stream would be ordered the other way with nothing to notice.
-//
-// `sortPathFor` is the only `PathSort` producer today and it builds its keys from
-// `mergeKeyGroups`, which are ascending/nulls-last by construction, so this
-// refusal is unreachable now and is a guard for P5.4c-ii's ordered inputs.
+// A descending sort key is the merge's own direction: `mergeInnerSortKeys`
+// copies it from the outer pathkey and `Path.MergeDesc` makes the operator
+// compare that key the same way (M0148-0001c3a3 slice 4), so the restored
+// Sort's order is the order the operator merges in.
 func absorbMergeSort(child *Path, side string) *Path {
 	if child == nil || child.Kind != PathSort {
 		return child
@@ -912,12 +916,10 @@ func absorbMergeSort(child *Path, side string) *Path {
 	if len(child.Children) != 1 || child.Children[0] == nil {
 		panic(fmt.Sprintf("createPlan: PathMergeJoin %s child is a PathSort with %d children, want exactly 1", side, len(child.Children)))
 	}
-	for i, pk := range child.Pathkeys {
-		if !pk.SortAsc || pk.NullsFirst {
-			panic(fmt.Sprintf("createPlan: PathMergeJoin %s sort key %d is %s, but the merge operator re-sorts ascending, nulls last; the requested ordering would be discarded",
-				side, i, describePathKeyOrder(pk)))
-		}
-	}
+	// M0148-0001c3a3 slice 4: a descending sort key is the merge's own
+	// direction (Path.MergeDesc, mergeInnerSortKeys copies it from the
+	// outer pathkey), so the sort is consumed, not discarded; the operator
+	// still files NULL-keyed rows itself.
 	return child.Children[0]
 }
 

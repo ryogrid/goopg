@@ -18,7 +18,7 @@ func refISOTimestamp(t time.Time, frac string) string {
 
 // TestISOFastPathsMatchTimeFormat pins review/260831 UT-9: the hand-rolled ISO
 // renderers must agree with time.Format on every value, including BC years
-// (where eraDisplay has already mapped the year), years past 9999, and every
+// (where eraYear supplies the display year), years past 9999, and every
 // fractional-second shape.
 func TestISOFastPathsMatchTimeFormat(t *testing.T) {
 	rng := rand.New(rand.NewSource(20260831))
@@ -36,12 +36,12 @@ func TestISOFastPathsMatchTimeFormat(t *testing.T) {
 	}
 	for _, tc := range cases {
 		for _, era := range []string{"", " BC"} {
-			if got, want := isoDate(tc, era), refISODate(tc, era); got != want {
+			if got, want := isoDate(tc.Year(), int(tc.Month()), tc.Day(), era), refISODate(tc, era); got != want {
 				t.Fatalf("isoDate(%v, %q) = %q, time.Format says %q", tc, era, got, want)
 			}
 		}
 		frac := fracSecondsSuffix(tc)
-		if got, want := isoTimestamp(tc, frac), refISOTimestamp(tc, frac); got != want {
+		if got, want := isoTimestamp(tc, tc.Year(), frac), refISOTimestamp(tc, frac); got != want {
 			t.Fatalf("isoTimestamp(%v) = %q, time.Format says %q", tc, got, want)
 		}
 	}

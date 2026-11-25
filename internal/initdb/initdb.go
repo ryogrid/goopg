@@ -207,7 +207,10 @@ const goopgFeaturesFile = "global/pg_goopg_features"
 
 func defaultGoopgFeatures() []byte {
 	return []byte(catalog.NullKeyedIndexEntriesFeature + "\n" + storage.HeapLinePointerLifecycleFeature + "\n" +
-		storage.VMWALLoggedFeature + "\n" + clogCompleteHistoryFeature + "\n")
+		storage.VMWALLoggedFeature + "\n" + clogCompleteHistoryFeature + "\n" +
+		PostgresCatalogsAtBase5Feature + "\n" + Template1AtBase1Feature + "\n" +
+		catalog.FixedLengthGeoTidFeature + "\n" + catalog.FixedLengthMoneyFeature + "\n" +
+		catalog.FixedLengthAclItemFeature + "\n")
 }
 
 // clogCompleteHistoryFeature says this binary's initdb created the cluster:
@@ -365,6 +368,11 @@ type Options struct {
 	// (possibly commented) assignment in place, or appends a new line.
 	ExtraGUC []GUCSetting
 
+	// WALSegSizeMB is initdb --wal-segsize: the WAL segment size in MB, a
+	// power of two between 1 and 1024. 0 means the default (16). It is
+	// recorded in pg_control's xlog_seg_size and sizes every segment.
+	WALSegSizeMB int
+
 	// AuthMethodHost and AuthMethodLocal select the authentication
 	// methods written into pg_hba.conf for host and local connections,
 	// mirroring upstream initdb's -A/--auth (sets both), --auth-host, and
@@ -487,7 +495,7 @@ func CreatePerDatabaseScaffolding(dataDir string, dbOID uint32) error {
 	// their OIDs — a documented goopg deviation.) The three system databases
 	// are populated by initdb itself and skip this.
 	switch dbOID {
-	case catalog.DefaultDBOid, template0DbOid, catalog.PostgresDBOid:
+	case template0DbOid, catalog.PostgresDBOid:
 		return nil
 	}
 	return copyBootstrapCatalogImage(dataDir, dbOID)
@@ -570,23 +578,40 @@ func copyBootstrapCatalogImage(dataDir string, dbOID uint32) error {
 //
 // This runs BEFORE stampClusterChecksums, so a `-k` cluster checksums the
 // refreshed pages rather than the stale ones, and before the trailing fsync.
+//
+// M0149-0001a: template1 (base/1) gets the same finished image. PostgreSQL's
+// initdb bootstraps template1 in full — every catalog file plus its
+// pg_filenode.map (bootstrap.c, relmapper.c write_relmap_file) — and a PG
+// node reads template1 from base/1 the moment it starts on the directory.
+// goopg's bootstrappers wrote only part of base/1 (138 files, no
+// pg_filenode.map); the rest arrived at the first `goopg start` through
+// CreatePerDatabaseScaffolding, so a freshly initialised directory was not
+// openable by PG as template1.
 func refreshTemplate0Image(dataDir string) error {
 	srcDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(catalog.PostgresDBOid), 10))
-	dstDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(template0DbOid), 10))
 	entries, err := os.ReadDir(srcDir)
 	if err != nil {
 		return fmt.Errorf("read postgres image: %w", err)
 	}
-	for _, e := range entries {
-		if e.IsDir() || e.Name() == "PG_VERSION" {
-			continue
+	for _, db := range []struct {
+		oid  uint32
+		name string
+	}{{template0DbOid, "template0"}, {catalog.Template1NamespaceDBOid, "template1"}} {
+		dstDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(db.oid), 10))
+		if err := os.MkdirAll(dstDir, 0o700); err != nil {
+			return fmt.Errorf("create %s image dir: %w", db.name, err)
 		}
-		data, err := os.ReadFile(filepath.Join(srcDir, e.Name()))
-		if err != nil {
-			return fmt.Errorf("read postgres %s: %w", e.Name(), err)
-		}
-		if err := os.WriteFile(filepath.Join(dstDir, e.Name()), data, 0o600); err != nil {
-			return fmt.Errorf("write template0 %s: %w", e.Name(), err)
+		for _, e := range entries {
+			if e.IsDir() || e.Name() == "PG_VERSION" {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(srcDir, e.Name()))
+			if err != nil {
+				return fmt.Errorf("read postgres %s: %w", e.Name(), err)
+			}
+			if err := os.WriteFile(filepath.Join(dstDir, e.Name()), data, 0o600); err != nil {
+				return fmt.Errorf("write %s %s: %w", db.name, e.Name(), err)
+			}
 		}
 	}
 	return nil
@@ -879,6 +904,24 @@ func Init(opts Options) error {
 	if err != nil {
 		return fmt.Errorf("goopg init: resolve %q: %w", opts.DataDir, err)
 	}
+	// --wal-segsize (initdb.c): validated before anything is written; the
+	// bootstrap WAL, pg_control and the WAL-size GUCs follow it.
+	// The process-wide size is set either way, so an in-process caller
+	// never inherits an earlier Init's.
+	if opts.WALSegSizeMB == 0 {
+		xlog.SetWALSegmentSize(xlog.DefaultSegmentSize)
+	} else {
+		if !xlog.IsValidWalSegSize(int64(opts.WALSegSizeMB) << 20) {
+			return fmt.Errorf("argument of %s must be a power of two between 1 and 1024", "--wal-segsize")
+		}
+		xlog.SetWALSegmentSize(int64(opts.WALSegSizeMB) << 20)
+		// setup_config: min_wal_size / max_wal_size depend on the segment
+		// size (DEFAULT_MIN_WAL_SEGS, DEFAULT_MAX_WAL_SEGS).
+		opts.ExtraGUC = append([]GUCSetting{
+			{Name: "min_wal_size", Value: prettyWALSize(opts.WALSegSizeMB, 5)},
+			{Name: "max_wal_size", Value: prettyWALSize(opts.WALSegSizeMB, 64)},
+		}, opts.ExtraGUC...)
+	}
 	// Validate the sync method up front (mirrors parse_sync_method, which
 	// initdb runs during option parsing) so both the sync-only and full-init
 	// paths reject a bad value before touching the filesystem.
@@ -1073,6 +1116,11 @@ func Init(opts Options) error {
 	if err := bootstrapPgAuthidIndexes(abs, pgAuthidEntries); err != nil {
 		return fmt.Errorf("goopg init: pg_authid indexes: %w", err)
 	}
+	// M0149-0001g slice 10: the three predefined-role memberships a PG initdb
+	// grants to pg_monitor (system_functions.sql), with their four indexes.
+	if err := bootstrapPgAuthMembers(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_auth_members: %w", err)
+	}
 	// M0106-0010 batched-12: overwrite the empty placeholder at global/1213
 	// with two pg_tablespace rows (pg_default OID 1663, pg_global OID 1664)
 	// and populate the oid-index (global/2697) and spcname-index (global/2698)
@@ -1222,6 +1270,9 @@ func Init(opts Options) error {
 	if err := bootstrapPgAmopFamStratIndex(abs, pgAmopTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_amop_fam_strat_index: %w", err)
 	}
+	if err := bootstrapPgAmopOidIndex(abs, pgAmopTIDs); err != nil { // M0149-0001g slice 4
+		return fmt.Errorf("goopg init: pg_amop_oid_index: %w", err)
+	}
 	if err := bootstrapPgAmopOprFamIndex(abs, pgAmopTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_amop_opr_fam_index: %w", err)
 	}
@@ -1237,6 +1288,9 @@ func Init(opts Options) error {
 	// the cmp/sortsupport/equalimage rows. Without this the next FATAL
 	// during standby boot is "missing support function 1 for attribute
 	// 1 of index pg_authid_rolname_index".
+	if err := bootstrapPgAmprocOidIndex(abs, pgAmprocTIDs); err != nil { // M0149-0001g slice 4
+		return fmt.Errorf("goopg init: pg_amproc_oid_index: %w", err)
+	}
 	if err := bootstrapPgAmprocFamProcIndex(abs, pgAmprocTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_amproc_fam_proc_index: %w", err)
 	}
@@ -1387,6 +1441,9 @@ func Init(opts Options) error {
 	// loading the SHARED critical indexes — can find pg_class rows
 	// via pg_class_oid_index. Without this the next FATAL during
 	// standby boot is "could not open critical system index 2671".
+	if err := bootstrapPgClassTblspcRelfilenodeIndex(abs, pgClassTIDs); err != nil { // M0149-0001g slice 4
+		return fmt.Errorf("goopg init: pg_class_tblspc_relfilenode_index: %w", err)
+	}
 	if err := bootstrapPgClassOidIndex(abs, pgClassTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_class_oid_index: %w", err)
 	}
@@ -1405,6 +1462,12 @@ func Init(opts Options) error {
 	// missing N attribute(s) for relation OID …".
 	if err := bootstrapPgAttributeRelidAttnumIndex(abs, pgAttrTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_attribute_relid_attnum_index: %w", err)
+	}
+	// M0149-0001g: pg_attribute_relid_attnam_index (2658) was left an empty
+	// placeholder — zero leaf tuples over ~2800 heap rows — which a PG 18.3
+	// node's planner and ATTNAME syscache trust once relhasindex is true.
+	if err := bootstrapPgAttributeRelidAttnamIndex(abs, pgAttrTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_attribute_relid_attnam_index: %w", err)
 	}
 	// M0106-0010 step 3dm phase B: seed pg_rewrite heap + leaf indices.
 	// Step 3dl seeded pg_stat_wal_receiver into pg_class with
@@ -1458,6 +1521,13 @@ func Init(opts Options) error {
 	if err := bootstrapPgConstraintRelidTypidNameIndex(abs, pgConstraintTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_constraint_relid_typid_name_index: %w", err)
 	}
+	// M0149-0001g: the two pg_constraint indexes the image lacked.
+	if err := bootstrapPgConstraintConnameNspIndex(abs, pgConstraintTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_constraint_conname_nsp_index: %w", err)
+	}
+	if err := bootstrapPgConstraintConparentidIndex(abs, pgConstraintTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_constraint_conparentid_index: %w", err)
+	}
 	// M0106-0010 step 3w: write an empty heap page for every mapped local
 	// catalog that lacks a dedicated bootstrapper (pg_aggregate=2600,
 	// pg_type=1247, pg_namespace=2615, …). Without these files PG's
@@ -1466,6 +1536,29 @@ func Init(opts Options) error {
 	// PANIC loop.
 	if err := bootstrapMappedLocalCatalogHeaps(abs); err != nil {
 		return fmt.Errorf("goopg init: mapped local catalog heaps: %w", err)
+	}
+	// M0149-0001g slice 19: built-in object descriptions (after the empty
+	// placeholder heaps above, which would otherwise overwrite 2609).
+	if err := bootstrapPgDescription(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_description: %w", err)
+	}
+	// M0149-0001g slice 20: postgres.bki's text-search rows (parser,
+	// templates, simple dictionary/configuration and its map) with indexes.
+	if err := bootstrapPgTS(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_ts_*: %w", err)
+	}
+	// M0149-0001g slice 22: setup_privileges()' pg_init_privs rows + index 3395.
+	if err := bootstrapPgInitPrivs(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_init_privs: %w", err)
+	}
+	// M0149-0001g slice 29: CREATE EXTENSION plpgsql's pg_extension row (its
+	// handlers and language row join the seeds above).
+	if err := bootstrapPgPlpgsql(abs); err != nil {
+		return fmt.Errorf("goopg init: plpgsql: %w", err)
+	}
+	// M0149-0001g slice 31: every pg_depend row of a PG 18.3 initdb.
+	if err := bootstrapPgDepend(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_depend: %w", err)
 	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
@@ -1480,6 +1573,11 @@ func Init(opts Options) error {
 	}
 	// M0106: generate PG-compatible relcache init files so PG backends
 	// can start from a goopg backup without PANIC on critical indexes.
+	// M0149-0001g slice 25: relpages / reltuples / relallvisible measured from
+	// the catalog files just written (PG's initdb ends with VACUUM FREEZE).
+	if err := stampPgClassRelStats(abs); err != nil {
+		return fmt.Errorf("goopg init: %w", err)
+	}
 	if err := bootstrapRelcacheInitFiles(abs); err != nil {
 		return fmt.Errorf("goopg init: relcache init files: %w", err)
 	}
@@ -1527,6 +1625,12 @@ func Init(opts Options) error {
 	// the mapped-local-catalog heaps — is final, and before the trailing fsync
 	// so the checksummed bytes are flushed durably. A version-0 cluster (the
 	// default) skips this entirely and is byte-identical to before.
+	// M0149-0007: initdb's standalone backend leaves pg_stat/pgstat.stat
+	// behind with the IO it did — the bootstrap WAL segment's write — which
+	// the first server start loads into pg_stat_io.
+	if err := executor.WriteInitStatsFile(abs, xlog.WALSegmentSize(), time.Now()); err != nil {
+		return fmt.Errorf("goopg init: statistics file: %w", err)
+	}
 	if opts.DataChecksums {
 		if err := stampClusterChecksums(abs); err != nil {
 			return fmt.Errorf("goopg init: data-page checksums: %w", err)
@@ -1594,7 +1698,8 @@ func bootstrapSharedCatalogPlaceholders(dataDir string) error {
 		1262, // pg_database
 		1213, // pg_tablespace
 		1214, // pg_shdepend
-		3592, // pg_shdescription
+		2396, // pg_shdescription (M0149-0001c; was mislabeled 3592)
+		3592, // pg_shseclabel
 		6000, // pg_replication_origin
 		6100, // pg_subscription
 		6243, // pg_parameter_acl
@@ -1666,6 +1771,9 @@ func bootstrapSharedCatalogPlaceholders(dataDir string) error {
 //	2753 pg_opfamily        (bootstrapPgOpfamilyTuples)
 //	3456 pg_collation       (bootstrapPgCollationTuples)
 //	3541 pg_range           (bootstrapPgRangeTuples)
+// M0149-0006: the stale entries (2614, 3765, 3768, 6003, 6101, 6137, 9400 —
+// no PG 18 catalog has these OIDs; 3764 is pg_ts_template, kept once) are
+// gone: each was a file under base/<db> that no pg_class row names.
 func mappedLocalCatalogPlaceholderOIDs() []uint32 {
 	return []uint32{
 		826,  // pg_default_acl (M0106-0010 step 3ak)
@@ -1674,11 +1782,9 @@ func mappedLocalCatalogPlaceholderOIDs() []uint32 {
 		2609, // pg_description
 		2611, // pg_inherits
 		2613, // pg_largeobject
-		2614, // pg_largeobject_metadata (MISLABEL — 2614 is no catalog in PG18;
-		//	  the real LargeObjectMetadataRelationId is 2995, below. Kept because
-		//	  removing a laid-down file is not this slice's business.)
 		2619, // pg_statistic
 		2620, // pg_trigger
+		3394, // pg_init_privs (M0149-0001g slice 3)
 		2995, // pg_largeobject_metadata (M0131-S9.3f — base catalog of the
 		//	  pg_seclabels view's "large object" branch; 3596 below is the
 		//	  other half. Both heaps stay empty.)
@@ -1687,15 +1793,10 @@ func mappedLocalCatalogPlaceholderOIDs() []uint32 {
 		3501, // pg_enum (M0106-0010 step 3an)
 		3596, // pg_seclabel
 		3602, // pg_ts_config (M0106-0010 step 3ck)
-		3764, // pg_ts_config (stale — true pg_ts_config OID is 3602)
 		3603, // pg_ts_config_map (M0106-0010 step 3cj)
-		3765, // pg_ts_config_map (stale — true pg_ts_config_map OID is 3603)
 		3600, // pg_ts_dict (M0106-0010 step 3cm)
-		3766, // pg_ts_template_tmplname_index — overwritten with btree root below
 		3601, // pg_ts_parser (M0106-0010 step 3cn)
-		3767, // pg_ts_template_oid_index — overwritten with btree root below
 		3764, // pg_ts_template (M0106-0010 step 3co)
-		3768, // pg_ts_template (stale — true pg_ts_template OID is 3764)
 		3466, // pg_event_trigger (M0106-0010 step 3ar)
 		3079, // pg_extension (M0106-0010 step 3aw)
 		2328, // pg_foreign_data_wrapper (M0106-0010 step 3bb)
@@ -1709,12 +1810,13 @@ func mappedLocalCatalogPlaceholderOIDs() []uint32 {
 		2224, // pg_sequence (M0106-0010 step 3cb)
 		3429, // pg_statistic_ext_data (M0106-0010 step 3cc)
 		3576, // pg_transform (M0106-0010 step 3ci)
-		6003, // pg_publication (stale — no upstream catalog at OID 6003)
-		6101, // pg_publication_rel
 		6102, // pg_subscription_rel
-		6137, // pg_transform (stale — true pg_transform OID is 3576)
-		6245, // pg_statistic_ext_data
-		9400, // pg_db_role_setting
+		// M0149-0001g slice 6: never list an index OID here — this runs after
+		// bootstrapPostgresDatabase and would overwrite its btree page with a
+		// heap page. 3766/3767 (pg_ts_template indexes) were listed and PG
+		// failed _bt_checkpage on them; 6245 is the SHARED pg_parameter_acl
+		// TOAST index (global/), not a local catalog.
+		// (TestMappedLocalCatalogPlaceholdersAreNotIndexes)
 	}
 }
 
@@ -1812,8 +1914,8 @@ func bootstrapPostgresRole(dataDir, superuser string) ([]pgAuthidEntry, error) {
 // pre-encoded rolpassword verifier for the bootstrap superuser (OID 10),
 // supplied by --pwfile (upstream initdb's setup_auth ALTER USER … PASSWORD).
 // An empty rolpassword leaves the row's password empty (the no-password
-// default). The verifier is a non-NULL text value, so the bootstrap row keeps
-// HEAP_HASNULL clear and its t_hoff is unchanged.
+// default). rolvaliduntil is always NULL, so the row carries a null bitmap,
+// as PG's does.
 func bootstrapPostgresRoleWithPassword(dataDir, superuser, rolpassword string) ([]pgAuthidEntry, error) {
 	// pg_authid columns (postgres/src/include/catalog/pg_authid.h)
 	cols := []catalog.Column{
@@ -1830,29 +1932,32 @@ func bootstrapPostgresRoleWithPassword(dataDir, superuser, rolpassword string) (
 		{Name: "rolpassword", Type: catalog.Type{Name: "text"}, Ordinal: 10},
 		{Name: "rolvaliduntil", Type: catalog.Type{Name: "timestamptz"}, Ordinal: 11},
 	}
-	// Bootstrap superuser row (OID 10) and optional OS-user row (OID 16384).
-	// rolpassword/rolvaliduntil are written as empty-string/epoch for the
-	// bootstrap rows to keep HEAP_HASNULL clear (no null bitmap, t_hoff=24).
-	// The OID-10 superuser carries the --pwfile verifier (when supplied);
-	// it remains a non-NULL text value, so HEAP_HASNULL stays clear.
+	// Bootstrap superuser row (OID 10) and optional OS-user row (OID 16384),
+	// shaped like PG's: pg_authid.dat gives BOOTSTRAP_SUPERUSERID every
+	// privilege (rolcreatedb included) and leaves rolpassword and
+	// rolvaliduntil NULL, so the tuple carries a null bitmap. The OID-10
+	// superuser carries the --pwfile verifier when one is supplied (initdb's
+	// setup_auth ALTER USER ... PASSWORD); rolvaliduntil stays NULL. Writing
+	// an epoch rolvaliduntil here made psql's \du print "Password valid
+	// until 1970-01-01" for the superuser.
 	buildBootstrapRow := func(oid int64, rolname string) executor.Row {
-		pw := ""
-		if oid == 10 {
-			pw = rolpassword
+		pw := executor.NullDatum
+		if oid == 10 && rolpassword != "" {
+			pw = executor.NewStringDatum(rolpassword)
 		}
 		return executor.Row{
-			executor.NewIntDatum(oid),                    // oid
-			executor.NewStringDatum(rolname),             // rolname
-			executor.NewBoolDatum(true),                  // rolsuper
-			executor.NewBoolDatum(true),                  // rolinherit
-			executor.NewBoolDatum(true),                  // rolcreaterole
-			executor.NewBoolDatum(false),                 // rolcreatedb
-			executor.NewBoolDatum(true),                  // rolcanlogin
-			executor.NewBoolDatum(true),                  // rolreplication
-			executor.NewBoolDatum(true),                  // rolbypassrls
-			executor.NewIntDatum(-1),                     // rolconnlimit
-			executor.NewStringDatum(pw),                  // rolpassword (verifier or empty, not null)
-			executor.NewTimeDatum(time.Unix(0, 0).UTC()), // rolvaliduntil (epoch, not null)
+			executor.NewIntDatum(oid),        // oid
+			executor.NewStringDatum(rolname), // rolname
+			executor.NewBoolDatum(true),      // rolsuper
+			executor.NewBoolDatum(true),      // rolinherit
+			executor.NewBoolDatum(true),      // rolcreaterole
+			executor.NewBoolDatum(true),      // rolcreatedb
+			executor.NewBoolDatum(true),      // rolcanlogin
+			executor.NewBoolDatum(true),      // rolreplication
+			executor.NewBoolDatum(true),      // rolbypassrls
+			executor.NewIntDatum(-1),         // rolconnlimit
+			pw,                               // rolpassword (verifier or NULL)
+			executor.NullDatum,               // rolvaliduntil (NULL)
 		}
 	}
 	// Predefined-role rows: rolsuper=false, rolinherit=true, all other
@@ -1917,13 +2022,15 @@ func bootstrapPostgresRoleWithPassword(dataDir, superuser, rolpassword string) (
 	}
 	entries := make([]pgAuthidEntry, 0, len(seeds)+len(predefined))
 
-	// Bootstrap rows (no null bitmap, xmin=1).
+	// Bootstrap rows (null bitmap for the NULL rolpassword / rolvaliduntil,
+	// xmin=1).
 	for _, s := range seeds {
-		payload, err := executor.EncodeRowPG(cols, buildBootstrapRow(s.oid, s.rolname))
+		row := buildBootstrapRow(s.oid, s.rolname)
+		payload, err := executor.EncodeRowPG(cols, row)
 		if err != nil {
 			return nil, fmt.Errorf("encode %s role: %w", s.rolname, err)
 		}
-		tuple := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload)
+		tuple := storage.NewHeapTupleWithNulls(storage.TransactionID(1), storage.InvalidTransactionID, executor.NullBitmapPG(row), payload)
 		tuple.Header.SetNatts(len(cols))
 		slot, err := storage.PageAddHeapTuple(page, tuple)
 		if err != nil {
@@ -2032,7 +2139,7 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 			datlocaleDatum,                                   // datlocale (NULL for libc)
 			executor.NullDatum,                               // daticurules
 			executor.NullDatum,                               // datcollversion
-			executor.NullDatum,                               // datacl
+			templateDatacl(name),                             // datacl
 		}
 	}
 	writeRow := func(page storage.Page, row executor.Row) error {
@@ -2152,71 +2259,11 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 			return err
 		}
 	}
-	// Local pg_filenode.map with critical local catalog entries.
-	// All standard PG local catalogs (OID == filenumber by default).
-	localRelMap := makeRelMapFile([][2]uint32{
-		{826, 826},   // pg_default_acl (M0106-0010 step 3ak)
-		{1247, 1247}, // pg_type
-		{1249, 1249}, // pg_attribute
-		{1255, 1255}, // pg_proc
-		{1259, 1259}, // pg_class
-		{2600, 2600}, // pg_aggregate
-		{2601, 2601}, // pg_am
-		{2602, 2602}, // pg_amop
-		{2603, 2603}, // pg_amproc
-		{2604, 2604}, // pg_attrdef
-		{2605, 2605}, // pg_cast
-		{2606, 2606}, // pg_constraint
-		{2607, 2607}, // pg_conversion
-		{2608, 2608}, // pg_depend
-		{2609, 2609}, // pg_description
-		{2610, 2610}, // pg_index
-		{2611, 2611}, // pg_inherits
-		{2612, 2612}, // pg_language
-		{2613, 2613}, // pg_largeobject
-		{2614, 2614}, // pg_largeobject_metadata
-		// {2615, 2615}: dedicated bootstrapper (bootstrapPgNamespaceTuples)
-		{2616, 2616}, // pg_opclass
-		{2617, 2617}, // pg_operator
-		// {2618, 2618}: dedicated bootstrapper (bootstrapPgRewriteTuples)
-		{2619, 2619}, // pg_statistic
-		{2620, 2620}, // pg_trigger
-		{3381, 3381}, // pg_statistic_ext
-		{3501, 3501}, // pg_enum (M0106-0010 step 3an)
-		{3596, 3596}, // pg_seclabel
-		{3602, 3602}, // pg_ts_config (M0106-0010 step 3ck) — authoritative OID per pg_ts_config.h:30
-		{3764, 3764}, // pg_ts_config (stale — true pg_ts_config OID is 3602, mapped above)
-		{3603, 3603}, // pg_ts_config_map (M0106-0010 step 3cj) — authoritative OID per pg_ts_config_map.h:30
-		{3765, 3765}, // pg_ts_config_map (stale — true pg_ts_config_map OID is 3603, mapped above)
-		{3600, 3600}, // pg_ts_dict (M0106-0010 step 3cm) — authoritative OID per pg_ts_dict.h:29
-		{3766, 3766}, // pg_ts_template_tmplname_index (M0106-0010 step 3co) — authoritative OID per pg_ts_template.h:48
-		{3601, 3601}, // pg_ts_parser (M0106-0010 step 3cn) — authoritative OID per pg_ts_parser.h:29
-		{3767, 3767}, // pg_ts_template_oid_index (M0106-0010 step 3co) — authoritative OID per pg_ts_template.h:49
-		{3764, 3764}, // pg_ts_template (M0106-0010 step 3co) — authoritative OID per pg_ts_template.h:29
-		{3768, 3768}, // pg_ts_template (stale — true pg_ts_template OID is 3764, mapped above; 3768 has no upstream catalog assignment)
-		{3466, 3466}, // pg_event_trigger (M0106-0010 step 3ar)
-		{3079, 3079}, // pg_extension (M0106-0010 step 3aw)
-		{2328, 2328}, // pg_foreign_data_wrapper (M0106-0010 step 3bb)
-		{1417, 1417}, // pg_foreign_server (M0106-0010 step 3be)
-		{1418, 1418}, // pg_user_mapping (M0106-0010 step 3cp) — authoritative OID per pg_user_mapping.h:28
-		{3118, 3118}, // pg_foreign_table (M0106-0010 step 3bh)
-		{2753, 2753}, // pg_opfamily (M0106-0010 step 3bm)
-		{3350, 3350}, // pg_partitioned_table (M0106-0010 step 3bs)
-		{6104, 6104}, // pg_publication (M0106-0010 step 3bu)
-		{6237, 6237}, // pg_publication_namespace (M0106-0010 step 3bx)
-		{6106, 6106}, // pg_publication_rel (M0106-0010 step 3by)
-		{3541, 3541}, // pg_range (M0106-0010 step 3bz)
-		{2224, 2224}, // pg_sequence (M0106-0010 step 3cb)
-		{3429, 3429}, // pg_statistic_ext_data (M0106-0010 step 3cc)
-		{3576, 3576}, // pg_transform (M0106-0010 step 3ci) — authoritative OID per pg_transform.h
-		{6003, 6003}, // pg_publication (stale comment — OID 6003 has no upstream catalog assignment)
-		{6101, 6101}, // pg_publication_rel
-		{6102, 6102}, // pg_subscription_rel (stale comment was "pg_sequence" — true pg_sequence OID is 2224, mapped above)
-		{6137, 6137}, // pg_transform (stale — true pg_transform OID is 3576, mapped above)
-		{6239, 6239}, // pg_authid (shared but also local copy sometimes)
-		{6245, 6245}, // pg_statistic_ext_data
-		{9400, 9400}, // pg_db_role_setting (shared but may need local mapping)
-	})
+	// Local pg_filenode.map: exactly PG 18.3's 17 local mapped relations
+	// (pgLocalRelMapOIDs, M0149-0001g slice 27). It used to list ~60
+	// non-mapped catalogs plus stale OIDs; harmless while every pg_class row
+	// carried relfilenode = oid, wrong once mapped rows carry 0.
+	localRelMap := makeRelMapFile(identityRelMap(pgLocalRelMapOIDs))
 	if err := os.WriteFile(filepath.Join(dbDir, "pg_filenode.map"), localRelMap, 0o600); err != nil {
 		return err
 	}
@@ -2224,6 +2271,18 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 	// files don't exist (load_critical_index in relcache.c).
 	btreePage = makeBtreeRootPage()
 	perDBIndexOIDs := []uint32{
+		// M0149-0001g: indexes over catalogs that are empty at initdb
+		// (pg_depend, pg_inherits, pg_description); goopg maintains them
+		// at runtime (sys_catalog_index_generic.go).
+		2673, 2674, // pg_depend_depender_index, pg_depend_reference_index
+		2187,       // pg_inherits_parent_index
+		2675,       // pg_description_o_c_o_index
+		2699, 2702, // pg_trigger_tgconstraint_index, pg_trigger_oid_index (slice 3)
+		2996,       // pg_largeobject_metadata_oid_index (slice 3)
+		2683,       // pg_largeobject_loid_pn_index (slice 30)
+		3257, 3258, // pg_policy_oid_index, pg_policy_polrelid_polname_index (slice 3)
+		3597,       // pg_seclabel_object_index (slice 3)
+		3395,       // pg_init_privs_o_c_o_index (slice 3)
 		// Local critical indexes
 		827,  // pg_default_acl_role_nsp_obj_index (Step 3al)
 		828,  // pg_default_acl_oid_index (Step 3am)
@@ -2302,6 +2361,13 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		175,  // pg_user_mapping_user_server_index (Step 3cp)
 	}
 	for _, oid := range perDBIndexOIDs {
+		// A shared catalog's index lives only in global/ (written below):
+		// a copy under base/<db> is a file no pg_class row of that
+		// database names (018_wal_optimize check_orphan_relfilenodes).
+		// M0149-0006.
+		if isSharedRelOID(oid) {
+			continue
+		}
 		if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
 		}
@@ -2321,6 +2387,9 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		6001, // pg_replication_origin_roiident_index (Step 3ca)
 		6002, // pg_replication_origin_roname_index (Step 3ca)
 		2965, // pg_db_role_setting_databaseid_rol_index (Step 3cu)
+		1232, // pg_shdepend_depender_index (M0149-0001c)
+		1233, // pg_shdepend_reference_index (M0149-0001c)
+		2397, // pg_shdescription_o_c_index (M0149-0001c)
 		// Also copy all local critical indexes to global/
 		827,  // pg_default_acl_role_nsp_obj_index (Step 3al)
 		828,  // pg_default_acl_oid_index (Step 3am)
@@ -2427,6 +2496,9 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		return err
 	}
 	for _, oid := range perDBIndexOIDs {
+		if isSharedRelOID(oid) {
+			continue
+		}
 		if err := os.WriteFile(filepath.Join(tmpl0Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
 		}
@@ -2442,22 +2514,21 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 //
 // Returns a map[oid]heapTID so the Step 3m caller can build the matching
 // pg_class_oid_index btree over the same heap-row locations.
-func bootstrapPgClassTuples(dataDir string) (map[uint32]heapTID, error) {
-	cols := pgClassColDefs()
+// pgClassBootstrapRels is the bootstrapped pg_class row set, in heap order.
+func pgClassBootstrapRels() []nailedRel {
 	allRels := append([]nailedRel{}, nailedSharedRels...)
 	allRels = append(allRels, nailedLocalRels...)
-	// M0131-S20.1: the TOAST pair rides in the pg_class heap but NOT in
-	// nailedLocalRels — see nailedToastRels for why (no pg_type row, no
-	// pg_internal.init entry).
 	allRels = append(allRels, nailedToastRels()...)
-	// M0133-S3: the four information_schema data tables carry pg_class rows
-	// (relkind 'r', relnamespace 13273) but are NOT nailed — they ride the heap
-	// here, and their pg_type composite rows via their RelType, but never
-	// pg_internal.init (see informationSchemaDataTableRels).
 	allRels = append(allRels, informationSchemaDataTableRels()...)
-	// M0133-S4: the information_schema VIEWS (relkind 'v', relnamespace 13273)
-	// likewise ride the pg_class heap but never pg_internal.init.
 	allRels = append(allRels, informationSchemaViewSeedRels()...)
+	return allRels
+}
+
+func bootstrapPgClassTuples(dataDir string) (map[uint32]heapTID, error) {
+	cols := pgClassColDefs()
+	// M0131-S20.1 TOAST pairs, M0133-S3/S4 information_schema tables and
+	// views ride the pg_class heap too (see pgClassBootstrapRels).
+	allRels := pgClassBootstrapRels()
 	tids, err := writeMultiPageHeap(dataDir, "1259", cols, allRels, func(rel nailedRel) executor.Row {
 		return pgClassRow(rel)
 	})
@@ -2485,26 +2556,8 @@ type pgAttrTIDKey struct {
 // metadata from disk. Returns a map from (attrelid, attnum) → heapTID so
 // callers can build composite-key btree index tuples that point at each row.
 func bootstrapPgAttributeTuples(dataDir string) (map[pgAttrTIDKey]heapTID, error) {
-	attrCols := pgAttrColDefs()
-	allRels := append([]nailedRel{}, nailedSharedRels...)
-	allRels = append(allRels, nailedLocalRels...)
-	allRels = append(allRels, nailedToastRels()...) // M0131-S20.1
-	allRels = append(allRels, informationSchemaDataTableRels()...) // M0133-S3
-	allRels = append(allRels, informationSchemaViewSeedRels()...) // M0133-S4
-	type rowKey struct {
-		AttRelID uint32
-		AttNum   int16
-	}
-	var rows []executor.Row
-	keys := make([]rowKey, 0)
-	for _, rel := range allRels {
-		attrs := pgAttrEntriesForRel(rel)
-		for _, a := range attrs {
-			rows = append(rows, pgAttributeRow(rel.OID, a))
-			keys = append(keys, rowKey{AttRelID: rel.OID, AttNum: a.Num})
-		}
-	}
-	tids, err := writeMultiPageHeapRows(dataDir, "1249", attrCols, rows)
+	rows, keys := pgAttrBootstrapHeapRows()
+	tids, err := writeMultiPageHeapRows(dataDir, "1249", pgAttrColDefs(), rows)
 	if err != nil {
 		return nil, err
 	}
@@ -2513,9 +2566,52 @@ func bootstrapPgAttributeTuples(dataDir string) (map[pgAttrTIDKey]heapTID, error
 	}
 	out := make(map[pgAttrTIDKey]heapTID, len(tids))
 	for i, k := range keys {
-		out[pgAttrTIDKey{AttRelID: k.AttRelID, AttNum: k.AttNum}] = tids[i]
+		out[k] = tids[i]
 	}
 	return out, nil
+}
+
+// pgAttrBootstrapHeapRows is the single source of the bootstrapped pg_attribute
+// rows, in heap order, with their (attrelid, attnum) keys. The heap writer and
+// the two pg_attribute index builders (2659 by attnum, 2658 by attname) all
+// derive from it, so they cannot disagree.
+func pgAttrBootstrapHeapRows() ([]executor.Row, []pgAttrTIDKey) {
+	allRels := append([]nailedRel{}, nailedSharedRels...)
+	allRels = append(allRels, nailedLocalRels...)
+	allRels = append(allRels, nailedToastRels()...)               // M0131-S20.1
+	allRels = append(allRels, informationSchemaDataTableRels()...) // M0133-S3
+	allRels = append(allRels, informationSchemaViewSeedRels()...)  // M0133-S4
+	var rows []executor.Row
+	var keys []pgAttrTIDKey
+	for _, rel := range allRels {
+		attrs := pgAttrEntriesForRel(rel)
+		for _, a := range attrs {
+			rows = append(rows, pgAttributeRow(rel.OID, a))
+			keys = append(keys, pgAttrTIDKey{AttRelID: rel.OID, AttNum: a.Num})
+		}
+		// M0149-0001e: every table-like relation also carries the six system
+		// attributes (heap.c AddNewAttributeTuples over SysAtt[]); without them
+		// a PG 18.3 node answers `SELECT ctid FROM pg_database` with
+		// "column \"ctid\" does not exist".
+		if rel.RelKind == 'r' || rel.RelKind == 't' {
+			for _, row := range pgSystemAttributeRows(rel.OID) {
+				rows = append(rows, row)
+				keys = append(keys, pgAttrTIDKey{AttRelID: rel.OID, AttNum: int16(row[4].Int)})
+			}
+		}
+	}
+	return rows, keys
+}
+
+// pgAttributeBootstrapNames maps each bootstrapped (attrelid, attnum) to its
+// attname, for pg_attribute_relid_attnam_index (2658).
+func pgAttributeBootstrapNames() map[pgAttrTIDKey]string {
+	rows, keys := pgAttrBootstrapHeapRows()
+	out := make(map[pgAttrTIDKey]string, len(keys))
+	for i, k := range keys {
+		out[k] = rows[i][1].StringValue()
+	}
+	return out
 }
 
 // pgAmColDefs returns pg_am column descriptors matching PG18's
@@ -2577,8 +2673,12 @@ func bootstrapPgAmTuples(dataDir string) error {
 	for _, e := range entries {
 		rows = append(rows, pgAmRow(e))
 	}
-	_, err := writeMultiPageHeapRows(dataDir, "2601", cols, rows)
-	return err
+	tids, err := writeMultiPageHeapRows(dataDir, "2601", cols, rows)
+	if err != nil {
+		return err
+	}
+	// M0149-0001g slice 4: pg_am_oid_index 2652 / pg_am_name_index 2651.
+	return bootstrapPgAmIndexes(dataDir, tids)
 }
 
 // pgNamespaceColDefs returns PG18's 4-column FormData_pg_namespace layout.
@@ -2596,6 +2696,9 @@ type pgNamespaceEntry struct {
 	OID      uint32
 	NspName  string
 	NspOwner uint32
+	// NspACL is the aclitemout text a PG 18.3 initdb leaves in nspacl, with
+	// "B" standing for the bootstrap superuser (OID 10); "" means NULL.
+	NspACL string
 }
 
 // pgNamespaceInitialEntries returns the four namespaces a PG18 initdb produces:
@@ -2608,20 +2711,45 @@ type pgNamespaceEntry struct {
 // without its types.
 func pgNamespaceInitialEntries() []pgNamespaceEntry {
 	return []pgNamespaceEntry{
-		{OID: 11, NspName: "pg_catalog", NspOwner: 10},
+		// pg_catalog / public: postgres.bki inserts NULL, then initdb's
+		// setup_privileges runs GRANT USAGE ON SCHEMA pg_catalog, public TO
+		// PUBLIC (initdb.c). public is owned by pg_database_owner (6171) per
+		// pg_namespace.dat. information_schema.sql grants USAGE to PUBLIC.
+		// pg_toast keeps NULL. Values measured on a PG 18.3 initdb
+		// (M0149-0001g slice 11).
+		{OID: 11, NspName: "pg_catalog", NspOwner: 10, NspACL: "{B=UC/B,=U/B}"},
 		{OID: 99, NspName: "pg_toast", NspOwner: 10},
-		{OID: 2200, NspName: "public", NspOwner: 10},
-		{OID: 13273, NspName: "information_schema", NspOwner: 10},
+		{OID: 2200, NspName: "public", NspOwner: 6171, NspACL: "{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}"},
+		{OID: 13273, NspName: "information_schema", NspOwner: 10, NspACL: "{B=UC/B,=U/B}"},
 	}
 }
 
-func pgNamespaceRow(e pgNamespaceEntry) executor.Row {
+func pgNamespaceRow(e pgNamespaceEntry) (executor.Row, error) {
+	// nspacl: NULL (acldefault) or the initdb ACL. Never the empty array "{}":
+	// on a PG node an explicit empty ACL grants nothing — not even USAGE to
+	// the owner (aclmask only implies the owner's grant options).
+	acl := executor.NullDatum
+	if e.NspACL != "" {
+		blob, err := executor.EncodeAclItemArrayText(e.NspACL, func(role string) uint32 {
+			switch role {
+			case "B":
+				return 10 // BOOTSTRAP_SUPERUSERID
+			case "pg_database_owner":
+				return 6171 // ROLE_PG_DATABASE_OWNER
+			}
+			return 0
+		})
+		if err != nil {
+			return nil, fmt.Errorf("pg_namespace %s nspacl: %w", e.NspName, err)
+		}
+		acl = executor.NewBytesDatum(blob)
+	}
 	return executor.Row{
 		executor.NewIntDatum(int64(e.OID)),      // oid
 		executor.NewStringDatum(e.NspName),      // nspname
 		executor.NewIntDatum(int64(e.NspOwner)), // nspowner
-		executor.NewStringDatum("{}"),           // nspacl (empty aclitem[])
-	}
+		acl,                                     // nspacl
+	}, nil
 }
 
 // bootstrapPgNamespaceTuples writes pg_catalog(11)/pg_toast(99)/public(2200)/
@@ -2636,7 +2764,11 @@ func bootstrapPgNamespaceTuples(dataDir string) (map[uint32]heapTID, error) {
 	entries := pgNamespaceInitialEntries()
 	rows := make([]executor.Row, 0, len(entries))
 	for _, e := range entries {
-		rows = append(rows, pgNamespaceRow(e))
+		row, err := pgNamespaceRow(e)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, row)
 	}
 	tids, err := writeMultiPageHeapRows(dataDir, "2615", cols, rows)
 	if err != nil {
@@ -2909,6 +3041,7 @@ type pgProcEntry struct {
 	Rows      int64  // prorows. 0 → 0.
 	Support   uint32 // prosupport regproc OID. 0 → 0 (none).
 	SqlBody   string // prosqlbody blob name (prosrc='' for these); "" → NULL.
+	Bin       string // probin for a C-language function outside pg_proc.dat; "" → NULL.
 }
 
 // pgProcColDefs returns the 30-column PG18 FormData_pg_proc layout.
@@ -2964,7 +3097,9 @@ func pgProcColDefs() []catalog.Column {
 // list of 32 entries (7 AM handlers + 24 I/O regprocs + 1 SRF) that was
 // maintained prior to M0106-0010 batched-14.
 func pgProcInitialEntries() []pgProcEntry {
-	return append(pgProcAllEntries(), informationSchemaHelperProcs()...)
+	// pgTSSnowballProcs: the dict_snowball C functions initdb's
+	// snowball_create.sql creates (M0149-0001g slice 21).
+	return append(append(append(pgProcAllEntries(), informationSchemaHelperProcs()...), pgTSSnowballProcs...), pgPlpgsqlProcs...) // + plpgsql handlers (slice 29)
 }
 
 // pgProcRow materialises one pgProcEntry as the 30-column row that
@@ -2993,6 +3128,24 @@ func pgProcRow(e pgProcEntry) executor.Row {
 	kind := e.Kind
 	if kind == 0 {
 		kind = derivePgProcKind(e.HandlerName)
+	}
+	cost := e.Cost
+	if cost == 0 {
+		cost = 1
+	}
+	rows, variadic, support := e.Rows, uint32(0), e.Support
+	secDef, leakProof, strict, retSet := false, false, !e.NotStrict, e.RetSet
+	probin := executor.NullDatum
+	// M0149-0001g slice 15: a built-in's scalar attributes are PostgreSQL's
+	// own (pg_proc.dat via pgProcBKIAttrsByOID) — the seed defaulted most of
+	// them (VOLATILE, leakproof false, cost 1, no support function).
+	if bk, ok := pgProcBKIAttrsByOID[e.OID]; ok {
+		cost, rows, variadic, support = bk.Cost, bk.Rows, bk.Variadic, bk.Support
+		kind, secDef, leakProof, strict, retSet = bk.Kind, bk.SecDef, bk.LeakProof, bk.Strict, bk.RetSet
+		vol, parallel = bk.Volatile, bk.Parallel
+		if bk.Bin != "" {
+			probin = executor.NewStringDatum(bk.Bin)
+		}
 	}
 	// Step 3dk: emit OUT-arg metadata as binary ArrayType blobs when
 	// supplied. NewBytesDatum lands a KindBytes datum that codec.go's
@@ -3042,6 +3195,36 @@ func pgProcRow(e pgProcEntry) executor.Row {
 	if e.SqlBody != "" {
 		sqlBody = executor.NewStringDatum(nailedProcSqlBody(e.SqlBody))
 	}
+	lang := int64(12) // INTERNALlanguageId
+	if e.Lang != 0 {
+		lang = int64(e.Lang)
+	}
+	prosrc := e.HandlerName
+	if e.Bin != "" {
+		probin = executor.NewStringDatum(e.Bin)
+	}
+	// M0149-0001g slice 16: functions initdb's system_functions.sql re-creates
+	// carry the state it leaves — argument defaults and names, a prosqlbody
+	// node tree with prosrc empty for SQL-standard bodies, and the declared
+	// cost/strictness/volatility/parallel/language (pgProcInitdbOverrides).
+	if ov, ok := pgProcInitdbOverrides[e.OID]; ok {
+		prosrc, lang = ov.Src, int64(ov.Lang)
+		cost, rows, strict, vol, parallel = ov.Cost, ov.Rows, ov.Strict, ov.Volatile, ov.Parallel
+		sqlBody = executor.NullDatum
+		// pglzVarlenaDatum: a node tree over the TOAST threshold is stored as
+		// PG's inline pglz-compressed varlena, as toast_compress_datum would
+		// (ts_debug's prosqlbody is 19 KB raw).
+		if ov.SqlBody != "" {
+			sqlBody = pglzVarlenaDatum(ov.SqlBody)
+		}
+		nargDefaults, argDefaultsDatum = ov.NArgDefaults, executor.NullDatum
+		if ov.ArgDefaults != "" {
+			argDefaultsDatum = pglzVarlenaDatum(ov.ArgDefaults)
+		}
+		if ov.ArgNames != nil {
+			argNames = executor.NewBytesDatum(textArrayBytes(ov.ArgNames))
+		}
+	}
 	return executor.Row{
 		executor.NewIntDatum(int64(e.OID)), // 1  oid
 		executor.NewStringDatum(e.Name),    // 2  proname
@@ -3052,26 +3235,16 @@ func pgProcRow(e pgProcEntry) executor.Row {
 			return 11
 		}()),
 		executor.NewIntDatum(10), // 4  proowner = BOOTSTRAP_SUPERUSERID
-		executor.NewIntDatum(func() int64 { // 5  prolang
-			if e.Lang != 0 {
-				return int64(e.Lang)
-			}
-			return 12 // INTERNALlanguageId
-		}()),
-		executor.NewIntDatum(func() int64 { // 6  procost (float4)
-			if e.Cost != 0 {
-				return e.Cost
-			}
-			return 1
-		}()),
-		executor.NewIntDatum(e.Rows), // 7  prorows (float4)
-		executor.NewIntDatum(0),      // 8  provariadic = 0
-		executor.NewIntDatum(int64(e.Support)), // 9  prosupport (regproc OID)
+		executor.NewIntDatum(lang), // 5  prolang
+		executor.NewIntDatum(cost),              // 6  procost (float4)
+		executor.NewIntDatum(rows),              // 7  prorows (float4)
+		executor.NewIntDatum(int64(variadic)),   // 8  provariadic
+		executor.NewIntDatum(int64(support)),    // 9  prosupport (regproc OID)
 		executor.NewStringDatum(string(kind)),            // 10 prokind
-		executor.NewBoolDatum(false),                     // 11 prosecdef
-		executor.NewBoolDatum(false),                     // 12 proleakproof
-		executor.NewBoolDatum(!e.NotStrict),              // 13 proisstrict
-		executor.NewBoolDatum(e.RetSet),                  // 14 proretset
+		executor.NewBoolDatum(secDef),                    // 11 prosecdef
+		executor.NewBoolDatum(leakProof),                 // 12 proleakproof
+		executor.NewBoolDatum(strict),                    // 13 proisstrict
+		executor.NewBoolDatum(retSet),                    // 14 proretset
 		executor.NewStringDatum(string(vol)),             // 15 provolatile
 		executor.NewStringDatum(string(parallel)),        // 16 proparallel
 		executor.NewIntDatum(int64(len(argTypes))),       // 17 pronargs
@@ -3083,11 +3256,11 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		argNames,                               // 23 proargnames
 		argDefaultsDatum,                       // 24 proargdefaults (pg_node_tree)
 		executor.NullDatum,                     // 25 protrftypes
-		executor.NewStringDatum(e.HandlerName), // 26 prosrc — fmgr internal lookup key
-		executor.NullDatum,                     // 27 probin
+		executor.NewStringDatum(prosrc),        // 26 prosrc — fmgr lookup key, or the initdb SQL text (empty for prosqlbody)
+		probin,                                 // 27 probin
 		sqlBody,                                // 28 prosqlbody (NULL ⇒ PG executes prosrc)
 		executor.NullDatum,                     // 29 proconfig (NULL ⇒ no fmgr_security_definer)
-		executor.NullDatum,                     // 30 proacl (NULL ⇒ owner + PUBLIC EXECUTE default)
+		pgProcBootstrapACL(e.OID),              // 30 proacl: PG initdb's REVOKE/GRANT result, else NULL (owner + PUBLIC EXECUTE)
 	}
 }
 
@@ -3181,128 +3354,131 @@ func pgOpclassInitialEntries() []pgOpclassEntry {
 		amHash      uint32 = 405
 		amGist      uint32 = 783
 		amGin       uint32 = 2742
-		amBrin      uint32 = 4000
-		amSpgist    uint32 = 3580
+		amBrin      uint32 = 3580 // BRIN_AM_OID (pg_am.dat); was swapped with spgist before M0149-0001g slice 7
+		amSpgist    uint32 = 4000 // SPGIST_AM_OID
 	)
-	// Entries with explicit OIDs from pg_opclass_d.h / pg_opclass.dat.
-	// Entries without explicit OIDs in pg_opclass.dat use synthetic OIDs
-	// starting at 9000, assigned in dat-file order.
+	// OIDs are PostgreSQL 18.3's: the explicit ones from pg_opclass.dat and,
+	// for the rest, the ones genbki assigns from 10000 in dat-file order
+	// (postgres/src/include/catalog/postgres.bki). pg_index.indclass and
+	// every OID-keyed lookup on a PG node depend on them — goopg's former
+	// synthetic 9000-series / 1984-1987 OIDs made PG fail "could not find
+	// tuple for opclass 10012" (M0149-0001g slice 7).
 	return []pgOpclassEntry{
 		// btree/array_ops
-		{OID: 9000, Method: amBtree, Name: "array_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 397, IntType: 2277, Default: true, KeyType: 0},
+		{OID: 10000, Method: amBtree, Name: "array_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 397, IntType: 2277, Default: true, KeyType: 0},
 		// hash/array_ops
-		{OID: 9001, Method: amHash, Name: "array_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 627, IntType: 2277, Default: true, KeyType: 0},
+		{OID: 10001, Method: amHash, Name: "array_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 627, IntType: 2277, Default: true, KeyType: 0},
 		// btree/bit_ops
-		{OID: 9002, Method: amBtree, Name: "bit_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 423, IntType: 1560, Default: true, KeyType: 0},
-		// btree/bool_ops — synthetic OID 1984 (no explicit OID in dat; pinned for nailed-index indclass)
-		{OID: 1984, Method: amBtree, Name: "bool_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 424, IntType: 16, Default: true, KeyType: 0},
+		{OID: 10002, Method: amBtree, Name: "bit_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 423, IntType: 1560, Default: true, KeyType: 0},
+		// btree/bool_ops
+		{OID: 10003, Method: amBtree, Name: "bool_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 424, IntType: 16, Default: true, KeyType: 0},
 		// btree/bpchar_ops
-		{OID: 9003, Method: amBtree, Name: "bpchar_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 426, IntType: 1042, Default: true, KeyType: 0},
+		{OID: 10004, Method: amBtree, Name: "bpchar_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 426, IntType: 1042, Default: true, KeyType: 0},
 		// hash/bpchar_ops
-		{OID: 9004, Method: amHash, Name: "bpchar_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 427, IntType: 1042, Default: true, KeyType: 0},
+		{OID: 10005, Method: amHash, Name: "bpchar_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 427, IntType: 1042, Default: true, KeyType: 0},
 		// btree/bytea_ops
-		{OID: 9005, Method: amBtree, Name: "bytea_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 428, IntType: 17, Default: true, KeyType: 0},
-		// btree/char_ops — synthetic OID 1985 (no explicit OID in dat; pinned for nailed-index indclass)
-		{OID: 1985, Method: amBtree, Name: "char_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 429, IntType: 18, Default: true, KeyType: 0},
+		{OID: 10006, Method: amBtree, Name: "bytea_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 428, IntType: 17, Default: true, KeyType: 0},
+		// btree/char_ops
+		{OID: 10007, Method: amBtree, Name: "char_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 429, IntType: 18, Default: true, KeyType: 0},
 		// hash/char_ops
-		{OID: 9006, Method: amHash, Name: "char_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 431, IntType: 18, Default: true, KeyType: 0},
+		{OID: 10008, Method: amHash, Name: "char_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 431, IntType: 18, Default: true, KeyType: 0},
 		// btree/cidr_ops (default=false: inet_ops is the default for inet)
-		{OID: 9007, Method: amBtree, Name: "cidr_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1974, IntType: 869, Default: false, KeyType: 0},
+		{OID: 10009, Method: amBtree, Name: "cidr_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1974, IntType: 869, Default: false, KeyType: 0},
 		// hash/cidr_ops
-		{OID: 9008, Method: amHash, Name: "cidr_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1975, IntType: 869, Default: false, KeyType: 0},
+		{OID: 10010, Method: amHash, Name: "cidr_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1975, IntType: 869, Default: false, KeyType: 0},
 		// btree/date_ops — OID 3122 = DATE_BTREE_OPS_OID
 		{OID: 3122, Method: amBtree, Name: "date_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 434, IntType: 1082, Default: true, KeyType: 0},
 		// hash/date_ops
-		{OID: 9009, Method: amHash, Name: "date_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 435, IntType: 1082, Default: true, KeyType: 0},
+		{OID: 10011, Method: amHash, Name: "date_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 435, IntType: 1082, Default: true, KeyType: 0},
 		// btree/float4_ops
-		{OID: 9010, Method: amBtree, Name: "float4_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1970, IntType: 700, Default: true, KeyType: 0},
+		{OID: 10012, Method: amBtree, Name: "float4_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1970, IntType: 700, Default: true, KeyType: 0},
 		// hash/float4_ops
-		{OID: 9011, Method: amHash, Name: "float4_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1971, IntType: 700, Default: true, KeyType: 0},
+		{OID: 10013, Method: amHash, Name: "float4_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1971, IntType: 700, Default: true, KeyType: 0},
 		// btree/float8_ops — OID 3123 = FLOAT8_BTREE_OPS_OID
 		{OID: 3123, Method: amBtree, Name: "float8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1970, IntType: 701, Default: true, KeyType: 0},
 		// hash/float8_ops
-		{OID: 9012, Method: amHash, Name: "float8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1971, IntType: 701, Default: true, KeyType: 0},
+		{OID: 10014, Method: amHash, Name: "float8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1971, IntType: 701, Default: true, KeyType: 0},
 		// btree/inet_ops
-		{OID: 9013, Method: amBtree, Name: "inet_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1974, IntType: 869, Default: true, KeyType: 0},
+		{OID: 10015, Method: amBtree, Name: "inet_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1974, IntType: 869, Default: true, KeyType: 0},
 		// hash/inet_ops
-		{OID: 9014, Method: amHash, Name: "inet_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1975, IntType: 869, Default: true, KeyType: 0},
+		{OID: 10016, Method: amHash, Name: "inet_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1975, IntType: 869, Default: true, KeyType: 0},
 		// gist/inet_ops (default=false: spgist is the default for inet gist)
-		{OID: 9015, Method: amGist, Name: "inet_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3550, IntType: 869, Default: false, KeyType: 0},
+		{OID: 10017, Method: amGist, Name: "inet_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3550, IntType: 869, Default: false, KeyType: 0},
 		// spgist/inet_ops
-		{OID: 9016, Method: amSpgist, Name: "inet_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3794, IntType: 869, Default: true, KeyType: 0},
+		{OID: 10018, Method: amSpgist, Name: "inet_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3794, IntType: 869, Default: true, KeyType: 0},
 		// btree/int2_ops — OID 1979 = INT2_BTREE_OPS_OID
 		{OID: 1979, Method: amBtree, Name: "int2_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1976, IntType: 21, Default: true, KeyType: 0},
 		// hash/int2_ops
-		{OID: 9017, Method: amHash, Name: "int2_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1977, IntType: 21, Default: true, KeyType: 0},
+		{OID: 10019, Method: amHash, Name: "int2_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1977, IntType: 21, Default: true, KeyType: 0},
 		// btree/int4_ops — OID 1978 = INT4_BTREE_OPS_OID
 		{OID: 1978, Method: amBtree, Name: "int4_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1976, IntType: 23, Default: true, KeyType: 0},
 		// hash/int4_ops
-		{OID: 9018, Method: amHash, Name: "int4_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1977, IntType: 23, Default: true, KeyType: 0},
+		{OID: 10020, Method: amHash, Name: "int4_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1977, IntType: 23, Default: true, KeyType: 0},
 		// btree/int8_ops — OID 3124 = INT8_BTREE_OPS_OID
 		{OID: 3124, Method: amBtree, Name: "int8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1976, IntType: 20, Default: true, KeyType: 0},
 		// hash/int8_ops
-		{OID: 9019, Method: amHash, Name: "int8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1977, IntType: 20, Default: true, KeyType: 0},
+		{OID: 10021, Method: amHash, Name: "int8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1977, IntType: 20, Default: true, KeyType: 0},
 		// btree/interval_ops
-		{OID: 9020, Method: amBtree, Name: "interval_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1982, IntType: 1186, Default: true, KeyType: 0},
+		{OID: 10022, Method: amBtree, Name: "interval_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1982, IntType: 1186, Default: true, KeyType: 0},
 		// hash/interval_ops
-		{OID: 9021, Method: amHash, Name: "interval_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1983, IntType: 1186, Default: true, KeyType: 0},
+		{OID: 10023, Method: amHash, Name: "interval_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1983, IntType: 1186, Default: true, KeyType: 0},
 		// btree/macaddr_ops
-		{OID: 9022, Method: amBtree, Name: "macaddr_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1984, IntType: 829, Default: true, KeyType: 0},
+		{OID: 10024, Method: amBtree, Name: "macaddr_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1984, IntType: 829, Default: true, KeyType: 0},
 		// hash/macaddr_ops
-		{OID: 9023, Method: amHash, Name: "macaddr_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1985, IntType: 829, Default: true, KeyType: 0},
+		{OID: 10025, Method: amHash, Name: "macaddr_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1985, IntType: 829, Default: true, KeyType: 0},
 		// btree/macaddr8_ops
-		{OID: 9024, Method: amBtree, Name: "macaddr8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3371, IntType: 774, Default: true, KeyType: 0},
+		{OID: 10026, Method: amBtree, Name: "macaddr8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3371, IntType: 774, Default: true, KeyType: 0},
 		// hash/macaddr8_ops
-		{OID: 9025, Method: amHash, Name: "macaddr8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3372, IntType: 774, Default: true, KeyType: 0},
-		// btree/name_ops — synthetic OID 1986 (no explicit OID; pinned for nailed-index indclass)
+		{OID: 10027, Method: amHash, Name: "macaddr8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3372, IntType: 774, Default: true, KeyType: 0},
+		// btree/name_ops
 		// name_ops keys are stored as cstring (2275) for index space — see pg_opclass.dat comment.
-		{OID: 1986, Method: amBtree, Name: "name_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1994, IntType: 19, Default: true, KeyType: 2275},
+		{OID: 10028, Method: amBtree, Name: "name_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1994, IntType: 19, Default: true, KeyType: 2275},
 		// hash/name_ops
-		{OID: 9026, Method: amHash, Name: "name_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1995, IntType: 19, Default: true, KeyType: 0},
+		{OID: 10029, Method: amHash, Name: "name_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1995, IntType: 19, Default: true, KeyType: 0},
 		// btree/numeric_ops — OID 3125 = NUMERIC_BTREE_OPS_OID
 		{OID: 3125, Method: amBtree, Name: "numeric_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1988, IntType: 1700, Default: true, KeyType: 0},
 		// hash/numeric_ops
-		{OID: 9027, Method: amHash, Name: "numeric_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1998, IntType: 1700, Default: true, KeyType: 0},
+		{OID: 10030, Method: amHash, Name: "numeric_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1998, IntType: 1700, Default: true, KeyType: 0},
 		// btree/oid_ops — OID 1981 = OID_BTREE_OPS_OID
 		{OID: 1981, Method: amBtree, Name: "oid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1989, IntType: 26, Default: true, KeyType: 0},
 		// hash/oid_ops
-		{OID: 9028, Method: amHash, Name: "oid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1990, IntType: 26, Default: true, KeyType: 0},
-		// btree/oidvector_ops — synthetic OID 1987 (pinned for nailed-index indclass)
-		{OID: 1987, Method: amBtree, Name: "oidvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1991, IntType: 30, Default: true, KeyType: 0},
+		{OID: 10031, Method: amHash, Name: "oid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1990, IntType: 26, Default: true, KeyType: 0},
+		// btree/oidvector_ops
+		{OID: 10032, Method: amBtree, Name: "oidvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1991, IntType: 30, Default: true, KeyType: 0},
 		// hash/oidvector_ops
-		{OID: 9029, Method: amHash, Name: "oidvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1992, IntType: 30, Default: true, KeyType: 0},
+		{OID: 10033, Method: amHash, Name: "oidvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1992, IntType: 30, Default: true, KeyType: 0},
 		// btree/record_ops
-		{OID: 9030, Method: amBtree, Name: "record_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2994, IntType: 2249, Default: true, KeyType: 0},
+		{OID: 10034, Method: amBtree, Name: "record_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2994, IntType: 2249, Default: true, KeyType: 0},
 		// hash/record_ops
-		{OID: 9031, Method: amHash, Name: "record_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 6194, IntType: 2249, Default: true, KeyType: 0},
+		{OID: 10035, Method: amHash, Name: "record_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 6194, IntType: 2249, Default: true, KeyType: 0},
 		// btree/record_image_ops (default=false: record_ops is the default)
-		{OID: 9032, Method: amBtree, Name: "record_image_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3194, IntType: 2249, Default: false, KeyType: 0},
+		{OID: 10036, Method: amBtree, Name: "record_image_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3194, IntType: 2249, Default: false, KeyType: 0},
 		// btree/text_ops — OID 3126 = TEXT_BTREE_OPS_OID
 		{OID: 3126, Method: amBtree, Name: "text_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1994, IntType: 25, Default: true, KeyType: 0},
 		// hash/text_ops
-		{OID: 9033, Method: amHash, Name: "text_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1995, IntType: 25, Default: true, KeyType: 0},
+		{OID: 10037, Method: amHash, Name: "text_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1995, IntType: 25, Default: true, KeyType: 0},
 		// btree/time_ops
-		{OID: 9034, Method: amBtree, Name: "time_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1996, IntType: 1083, Default: true, KeyType: 0},
+		{OID: 10038, Method: amBtree, Name: "time_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1996, IntType: 1083, Default: true, KeyType: 0},
 		// hash/time_ops
-		{OID: 9035, Method: amHash, Name: "time_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1997, IntType: 1083, Default: true, KeyType: 0},
+		{OID: 10039, Method: amHash, Name: "time_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1997, IntType: 1083, Default: true, KeyType: 0},
 		// btree/timestamptz_ops — OID 3127 = TIMESTAMPTZ_BTREE_OPS_OID
 		{OID: 3127, Method: amBtree, Name: "timestamptz_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 434, IntType: 1184, Default: true, KeyType: 0},
 		// hash/timestamptz_ops
-		{OID: 9036, Method: amHash, Name: "timestamptz_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1999, IntType: 1184, Default: true, KeyType: 0},
+		{OID: 10040, Method: amHash, Name: "timestamptz_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1999, IntType: 1184, Default: true, KeyType: 0},
 		// btree/timetz_ops
-		{OID: 9037, Method: amBtree, Name: "timetz_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2000, IntType: 1266, Default: true, KeyType: 0},
+		{OID: 10041, Method: amBtree, Name: "timetz_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2000, IntType: 1266, Default: true, KeyType: 0},
 		// hash/timetz_ops
-		{OID: 9038, Method: amHash, Name: "timetz_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2001, IntType: 1266, Default: true, KeyType: 0},
+		{OID: 10042, Method: amHash, Name: "timetz_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2001, IntType: 1266, Default: true, KeyType: 0},
 		// btree/varbit_ops
-		{OID: 9039, Method: amBtree, Name: "varbit_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2002, IntType: 1562, Default: true, KeyType: 0},
+		{OID: 10043, Method: amBtree, Name: "varbit_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2002, IntType: 1562, Default: true, KeyType: 0},
 		// btree/varchar_ops (default=false: text_ops is the default for varchar=25)
-		{OID: 9040, Method: amBtree, Name: "varchar_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1994, IntType: 25, Default: false, KeyType: 0},
+		{OID: 10044, Method: amBtree, Name: "varchar_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1994, IntType: 25, Default: false, KeyType: 0},
 		// hash/varchar_ops
-		{OID: 9041, Method: amHash, Name: "varchar_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1995, IntType: 25, Default: false, KeyType: 0},
+		{OID: 10045, Method: amHash, Name: "varchar_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1995, IntType: 25, Default: false, KeyType: 0},
 		// btree/timestamp_ops — OID 3128 = TIMESTAMP_BTREE_OPS_OID
 		{OID: 3128, Method: amBtree, Name: "timestamp_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 434, IntType: 1114, Default: true, KeyType: 0},
 		// hash/timestamp_ops
-		{OID: 9042, Method: amHash, Name: "timestamp_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2040, IntType: 1114, Default: true, KeyType: 0},
+		{OID: 10046, Method: amHash, Name: "timestamp_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2040, IntType: 1114, Default: true, KeyType: 0},
 		// btree/text_pattern_ops — OID 4217 = TEXT_BTREE_PATTERN_OPS_OID
 		{OID: 4217, Method: amBtree, Name: "text_pattern_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2095, IntType: 25, Default: false, KeyType: 0},
 		// btree/varchar_pattern_ops — OID 4218 = VARCHAR_BTREE_PATTERN_OPS_OID
@@ -3310,239 +3486,239 @@ func pgOpclassInitialEntries() []pgOpclassEntry {
 		// btree/bpchar_pattern_ops — OID 4219 = BPCHAR_BTREE_PATTERN_OPS_OID
 		{OID: 4219, Method: amBtree, Name: "bpchar_pattern_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2097, IntType: 1042, Default: false, KeyType: 0},
 		// btree/money_ops
-		{OID: 9043, Method: amBtree, Name: "money_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2099, IntType: 790, Default: true, KeyType: 0},
+		{OID: 10047, Method: amBtree, Name: "money_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2099, IntType: 790, Default: true, KeyType: 0},
 		// hash/bool_ops
-		{OID: 9044, Method: amHash, Name: "bool_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2222, IntType: 16, Default: true, KeyType: 0},
+		{OID: 10048, Method: amHash, Name: "bool_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2222, IntType: 16, Default: true, KeyType: 0},
 		// hash/bytea_ops
-		{OID: 9045, Method: amHash, Name: "bytea_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2223, IntType: 17, Default: true, KeyType: 0},
+		{OID: 10049, Method: amHash, Name: "bytea_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2223, IntType: 17, Default: true, KeyType: 0},
 		// btree/tid_ops
-		{OID: 9046, Method: amBtree, Name: "tid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2789, IntType: 27, Default: true, KeyType: 0},
+		{OID: 10050, Method: amBtree, Name: "tid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2789, IntType: 27, Default: true, KeyType: 0},
 		// hash/xid_ops
-		{OID: 9047, Method: amHash, Name: "xid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2225, IntType: 28, Default: true, KeyType: 0},
+		{OID: 10051, Method: amHash, Name: "xid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2225, IntType: 28, Default: true, KeyType: 0},
 		// hash/xid8_ops
-		{OID: 9048, Method: amHash, Name: "xid8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 5032, IntType: 5069, Default: true, KeyType: 0},
+		{OID: 10052, Method: amHash, Name: "xid8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 5032, IntType: 5069, Default: true, KeyType: 0},
 		// btree/xid8_ops
-		{OID: 9049, Method: amBtree, Name: "xid8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 5067, IntType: 5069, Default: true, KeyType: 0},
+		{OID: 10053, Method: amBtree, Name: "xid8_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 5067, IntType: 5069, Default: true, KeyType: 0},
 		// hash/cid_ops
-		{OID: 9050, Method: amHash, Name: "cid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2226, IntType: 29, Default: true, KeyType: 0},
+		{OID: 10054, Method: amHash, Name: "cid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2226, IntType: 29, Default: true, KeyType: 0},
 		// hash/tid_ops
-		{OID: 9051, Method: amHash, Name: "tid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2227, IntType: 27, Default: true, KeyType: 0},
+		{OID: 10055, Method: amHash, Name: "tid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2227, IntType: 27, Default: true, KeyType: 0},
 		// hash/text_pattern_ops
-		{OID: 9052, Method: amHash, Name: "text_pattern_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2229, IntType: 25, Default: false, KeyType: 0},
+		{OID: 10056, Method: amHash, Name: "text_pattern_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2229, IntType: 25, Default: false, KeyType: 0},
 		// hash/varchar_pattern_ops
-		{OID: 9053, Method: amHash, Name: "varchar_pattern_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2229, IntType: 25, Default: false, KeyType: 0},
+		{OID: 10057, Method: amHash, Name: "varchar_pattern_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2229, IntType: 25, Default: false, KeyType: 0},
 		// hash/bpchar_pattern_ops
-		{OID: 9054, Method: amHash, Name: "bpchar_pattern_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2231, IntType: 1042, Default: false, KeyType: 0},
+		{OID: 10058, Method: amHash, Name: "bpchar_pattern_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2231, IntType: 1042, Default: false, KeyType: 0},
 		// hash/aclitem_ops
-		{OID: 9055, Method: amHash, Name: "aclitem_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2235, IntType: 1033, Default: true, KeyType: 0},
+		{OID: 10059, Method: amHash, Name: "aclitem_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2235, IntType: 1033, Default: true, KeyType: 0},
 		// gist/box_ops
-		{OID: 9056, Method: amGist, Name: "box_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2593, IntType: 603, Default: true, KeyType: 0},
+		{OID: 10060, Method: amGist, Name: "box_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2593, IntType: 603, Default: true, KeyType: 0},
 		// gist/point_ops (opckeytype=box 603)
-		{OID: 9057, Method: amGist, Name: "point_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1029, IntType: 600, Default: true, KeyType: 603},
+		{OID: 10061, Method: amGist, Name: "point_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 1029, IntType: 600, Default: true, KeyType: 603},
 		// gist/poly_ops (opckeytype=box 603)
-		{OID: 9058, Method: amGist, Name: "poly_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2594, IntType: 604, Default: true, KeyType: 603},
+		{OID: 10062, Method: amGist, Name: "poly_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2594, IntType: 604, Default: true, KeyType: 603},
 		// gist/circle_ops (opckeytype=box 603)
-		{OID: 9059, Method: amGist, Name: "circle_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2595, IntType: 718, Default: true, KeyType: 603},
+		{OID: 10063, Method: amGist, Name: "circle_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2595, IntType: 718, Default: true, KeyType: 603},
 		// gin/array_ops (opckeytype=anyelement 2283)
-		{OID: 9060, Method: amGin, Name: "array_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2745, IntType: 2277, Default: true, KeyType: 2283},
+		{OID: 10064, Method: amGin, Name: "array_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2745, IntType: 2277, Default: true, KeyType: 2283},
 		// btree/uuid_ops
-		{OID: 9061, Method: amBtree, Name: "uuid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2968, IntType: 2950, Default: true, KeyType: 0},
+		{OID: 10065, Method: amBtree, Name: "uuid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2968, IntType: 2950, Default: true, KeyType: 0},
 		// hash/uuid_ops
-		{OID: 9062, Method: amHash, Name: "uuid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2969, IntType: 2950, Default: true, KeyType: 0},
+		{OID: 10066, Method: amHash, Name: "uuid_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 2969, IntType: 2950, Default: true, KeyType: 0},
 		// btree/pg_lsn_ops
-		{OID: 9063, Method: amBtree, Name: "pg_lsn_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3253, IntType: 3220, Default: true, KeyType: 0},
+		{OID: 10067, Method: amBtree, Name: "pg_lsn_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3253, IntType: 3220, Default: true, KeyType: 0},
 		// hash/pg_lsn_ops
-		{OID: 9064, Method: amHash, Name: "pg_lsn_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3254, IntType: 3220, Default: true, KeyType: 0},
+		{OID: 10068, Method: amHash, Name: "pg_lsn_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3254, IntType: 3220, Default: true, KeyType: 0},
 		// btree/enum_ops (opcintype=anyenum 3500)
-		{OID: 9065, Method: amBtree, Name: "enum_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3522, IntType: 3500, Default: true, KeyType: 0},
+		{OID: 10069, Method: amBtree, Name: "enum_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3522, IntType: 3500, Default: true, KeyType: 0},
 		// hash/enum_ops
-		{OID: 9066, Method: amHash, Name: "enum_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3523, IntType: 3500, Default: true, KeyType: 0},
+		{OID: 10070, Method: amHash, Name: "enum_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3523, IntType: 3500, Default: true, KeyType: 0},
 		// btree/tsvector_ops
-		{OID: 9067, Method: amBtree, Name: "tsvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3626, IntType: 3614, Default: true, KeyType: 0},
+		{OID: 10071, Method: amBtree, Name: "tsvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3626, IntType: 3614, Default: true, KeyType: 0},
 		// gist/tsvector_ops (opckeytype=gtsvector 3642)
-		{OID: 9068, Method: amGist, Name: "tsvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3655, IntType: 3614, Default: true, KeyType: 3642},
+		{OID: 10072, Method: amGist, Name: "tsvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3655, IntType: 3614, Default: true, KeyType: 3642},
 		// gin/tsvector_ops (opckeytype=text 25)
-		{OID: 9069, Method: amGin, Name: "tsvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3659, IntType: 3614, Default: true, KeyType: 25},
+		{OID: 10073, Method: amGin, Name: "tsvector_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3659, IntType: 3614, Default: true, KeyType: 25},
 		// btree/tsquery_ops (opcintype=tsquery 3615)
-		{OID: 9070, Method: amBtree, Name: "tsquery_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3683, IntType: 3615, Default: true, KeyType: 0},
+		{OID: 10074, Method: amBtree, Name: "tsquery_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3683, IntType: 3615, Default: true, KeyType: 0},
 		// gist/tsquery_ops (opckeytype=int8 20)
-		{OID: 9071, Method: amGist, Name: "tsquery_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3702, IntType: 3615, Default: true, KeyType: 20},
+		{OID: 10075, Method: amGist, Name: "tsquery_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3702, IntType: 3615, Default: true, KeyType: 20},
 		// btree/range_ops (opcintype=anyrange 3831)
-		{OID: 9072, Method: amBtree, Name: "range_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3901, IntType: 3831, Default: true, KeyType: 0},
+		{OID: 10076, Method: amBtree, Name: "range_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3901, IntType: 3831, Default: true, KeyType: 0},
 		// hash/range_ops
-		{OID: 9073, Method: amHash, Name: "range_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3903, IntType: 3831, Default: true, KeyType: 0},
+		{OID: 10077, Method: amHash, Name: "range_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3903, IntType: 3831, Default: true, KeyType: 0},
 		// gist/range_ops
-		{OID: 9074, Method: amGist, Name: "range_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3919, IntType: 3831, Default: true, KeyType: 0},
+		{OID: 10078, Method: amGist, Name: "range_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3919, IntType: 3831, Default: true, KeyType: 0},
 		// spgist/range_ops
-		{OID: 9075, Method: amSpgist, Name: "range_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3474, IntType: 3831, Default: true, KeyType: 0},
+		{OID: 10079, Method: amSpgist, Name: "range_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 3474, IntType: 3831, Default: true, KeyType: 0},
 		// btree/multirange_ops (opcintype=anymultirange 4537)
-		{OID: 9076, Method: amBtree, Name: "multirange_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4199, IntType: 4537, Default: true, KeyType: 0},
+		{OID: 10080, Method: amBtree, Name: "multirange_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4199, IntType: 4537, Default: true, KeyType: 0},
 		// hash/multirange_ops
-		{OID: 9077, Method: amHash, Name: "multirange_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4225, IntType: 4537, Default: true, KeyType: 0},
+		{OID: 10081, Method: amHash, Name: "multirange_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4225, IntType: 4537, Default: true, KeyType: 0},
 		// gist/multirange_ops (opckeytype=anyrange 3831)
-		{OID: 9078, Method: amGist, Name: "multirange_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 6158, IntType: 4537, Default: true, KeyType: 3831},
+		{OID: 10082, Method: amGist, Name: "multirange_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 6158, IntType: 4537, Default: true, KeyType: 3831},
 		// spgist/box_ops
-		{OID: 9079, Method: amSpgist, Name: "box_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 5000, IntType: 603, Default: true, KeyType: 0},
+		{OID: 10083, Method: amSpgist, Name: "box_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 5000, IntType: 603, Default: true, KeyType: 0},
 		// spgist/quad_point_ops
-		{OID: 9080, Method: amSpgist, Name: "quad_point_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4015, IntType: 600, Default: true, KeyType: 0},
+		{OID: 10084, Method: amSpgist, Name: "quad_point_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4015, IntType: 600, Default: true, KeyType: 0},
 		// spgist/kd_point_ops (default=false: quad_point_ops is default)
-		{OID: 9081, Method: amSpgist, Name: "kd_point_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4016, IntType: 600, Default: false, KeyType: 0},
+		{OID: 10085, Method: amSpgist, Name: "kd_point_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4016, IntType: 600, Default: false, KeyType: 0},
 		// spgist/text_ops
-		{OID: 9082, Method: amSpgist, Name: "text_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4017, IntType: 25, Default: true, KeyType: 0},
+		{OID: 10086, Method: amSpgist, Name: "text_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4017, IntType: 25, Default: true, KeyType: 0},
 		// spgist/poly_ops (opckeytype=box 603)
-		{OID: 9083, Method: amSpgist, Name: "poly_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 5008, IntType: 604, Default: true, KeyType: 603},
+		{OID: 10087, Method: amSpgist, Name: "poly_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 5008, IntType: 604, Default: true, KeyType: 603},
 		// btree/jsonb_ops (opcintype=jsonb 3802)
-		{OID: 9084, Method: amBtree, Name: "jsonb_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4033, IntType: 3802, Default: true, KeyType: 0},
+		{OID: 10088, Method: amBtree, Name: "jsonb_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4033, IntType: 3802, Default: true, KeyType: 0},
 		// hash/jsonb_ops
-		{OID: 9085, Method: amHash, Name: "jsonb_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4034, IntType: 3802, Default: true, KeyType: 0},
+		{OID: 10089, Method: amHash, Name: "jsonb_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4034, IntType: 3802, Default: true, KeyType: 0},
 		// gin/jsonb_ops (opckeytype=text 25)
-		{OID: 9086, Method: amGin, Name: "jsonb_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4036, IntType: 3802, Default: true, KeyType: 25},
+		{OID: 10090, Method: amGin, Name: "jsonb_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4036, IntType: 3802, Default: true, KeyType: 25},
 		// gin/jsonb_path_ops (default=false; opckeytype=int4 23)
-		{OID: 9087, Method: amGin, Name: "jsonb_path_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4037, IntType: 3802, Default: false, KeyType: 23},
+		{OID: 10091, Method: amGin, Name: "jsonb_path_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4037, IntType: 3802, Default: false, KeyType: 23},
 		// brin/bytea_minmax_ops
-		{OID: 9088, Method: amBrin, Name: "bytea_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4064, IntType: 17, Default: true, KeyType: 17},
+		{OID: 10092, Method: amBrin, Name: "bytea_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4064, IntType: 17, Default: true, KeyType: 17},
 		// brin/bytea_bloom_ops
-		{OID: 9089, Method: amBrin, Name: "bytea_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4578, IntType: 17, Default: false, KeyType: 17},
+		{OID: 10093, Method: amBrin, Name: "bytea_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4578, IntType: 17, Default: false, KeyType: 17},
 		// brin/char_minmax_ops
-		{OID: 9090, Method: amBrin, Name: "char_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4062, IntType: 18, Default: true, KeyType: 18},
+		{OID: 10094, Method: amBrin, Name: "char_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4062, IntType: 18, Default: true, KeyType: 18},
 		// brin/char_bloom_ops
-		{OID: 9091, Method: amBrin, Name: "char_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4577, IntType: 18, Default: false, KeyType: 18},
+		{OID: 10095, Method: amBrin, Name: "char_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4577, IntType: 18, Default: false, KeyType: 18},
 		// brin/name_minmax_ops
-		{OID: 9092, Method: amBrin, Name: "name_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4065, IntType: 19, Default: true, KeyType: 19},
+		{OID: 10096, Method: amBrin, Name: "name_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4065, IntType: 19, Default: true, KeyType: 19},
 		// brin/name_bloom_ops
-		{OID: 9093, Method: amBrin, Name: "name_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4579, IntType: 19, Default: false, KeyType: 19},
+		{OID: 10097, Method: amBrin, Name: "name_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4579, IntType: 19, Default: false, KeyType: 19},
 		// brin/int8_minmax_ops
-		{OID: 9094, Method: amBrin, Name: "int8_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4054, IntType: 20, Default: true, KeyType: 20},
+		{OID: 10098, Method: amBrin, Name: "int8_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4054, IntType: 20, Default: true, KeyType: 20},
 		// brin/int8_minmax_multi_ops
-		{OID: 9095, Method: amBrin, Name: "int8_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4602, IntType: 20, Default: false, KeyType: 20},
+		{OID: 10099, Method: amBrin, Name: "int8_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4602, IntType: 20, Default: false, KeyType: 20},
 		// brin/int8_bloom_ops
-		{OID: 9096, Method: amBrin, Name: "int8_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4572, IntType: 20, Default: false, KeyType: 20},
+		{OID: 10100, Method: amBrin, Name: "int8_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4572, IntType: 20, Default: false, KeyType: 20},
 		// brin/int2_minmax_ops
-		{OID: 9097, Method: amBrin, Name: "int2_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4054, IntType: 21, Default: true, KeyType: 21},
+		{OID: 10101, Method: amBrin, Name: "int2_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4054, IntType: 21, Default: true, KeyType: 21},
 		// brin/int2_minmax_multi_ops
-		{OID: 9098, Method: amBrin, Name: "int2_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4602, IntType: 21, Default: false, KeyType: 21},
+		{OID: 10102, Method: amBrin, Name: "int2_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4602, IntType: 21, Default: false, KeyType: 21},
 		// brin/int2_bloom_ops
-		{OID: 9099, Method: amBrin, Name: "int2_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4572, IntType: 21, Default: false, KeyType: 21},
+		{OID: 10103, Method: amBrin, Name: "int2_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4572, IntType: 21, Default: false, KeyType: 21},
 		// brin/int4_minmax_ops
-		{OID: 9100, Method: amBrin, Name: "int4_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4054, IntType: 23, Default: true, KeyType: 23},
+		{OID: 10104, Method: amBrin, Name: "int4_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4054, IntType: 23, Default: true, KeyType: 23},
 		// brin/int4_minmax_multi_ops
-		{OID: 9101, Method: amBrin, Name: "int4_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4602, IntType: 23, Default: false, KeyType: 23},
+		{OID: 10105, Method: amBrin, Name: "int4_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4602, IntType: 23, Default: false, KeyType: 23},
 		// brin/int4_bloom_ops
-		{OID: 9102, Method: amBrin, Name: "int4_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4572, IntType: 23, Default: false, KeyType: 23},
+		{OID: 10106, Method: amBrin, Name: "int4_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4572, IntType: 23, Default: false, KeyType: 23},
 		// brin/text_minmax_ops
-		{OID: 9103, Method: amBrin, Name: "text_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4056, IntType: 25, Default: true, KeyType: 25},
+		{OID: 10107, Method: amBrin, Name: "text_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4056, IntType: 25, Default: true, KeyType: 25},
 		// brin/text_bloom_ops
-		{OID: 9104, Method: amBrin, Name: "text_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4573, IntType: 25, Default: false, KeyType: 25},
+		{OID: 10108, Method: amBrin, Name: "text_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4573, IntType: 25, Default: false, KeyType: 25},
 		// brin/oid_minmax_ops
-		{OID: 9105, Method: amBrin, Name: "oid_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4068, IntType: 26, Default: true, KeyType: 26},
+		{OID: 10109, Method: amBrin, Name: "oid_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4068, IntType: 26, Default: true, KeyType: 26},
 		// brin/oid_minmax_multi_ops
-		{OID: 9106, Method: amBrin, Name: "oid_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4606, IntType: 26, Default: false, KeyType: 26},
+		{OID: 10110, Method: amBrin, Name: "oid_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4606, IntType: 26, Default: false, KeyType: 26},
 		// brin/oid_bloom_ops
-		{OID: 9107, Method: amBrin, Name: "oid_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4580, IntType: 26, Default: false, KeyType: 26},
+		{OID: 10111, Method: amBrin, Name: "oid_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4580, IntType: 26, Default: false, KeyType: 26},
 		// brin/tid_minmax_ops
-		{OID: 9108, Method: amBrin, Name: "tid_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4069, IntType: 27, Default: true, KeyType: 27},
+		{OID: 10112, Method: amBrin, Name: "tid_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4069, IntType: 27, Default: true, KeyType: 27},
 		// brin/tid_bloom_ops
-		{OID: 9109, Method: amBrin, Name: "tid_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4581, IntType: 27, Default: false, KeyType: 27},
+		{OID: 10113, Method: amBrin, Name: "tid_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4581, IntType: 27, Default: false, KeyType: 27},
 		// brin/tid_minmax_multi_ops
-		{OID: 9110, Method: amBrin, Name: "tid_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4607, IntType: 27, Default: false, KeyType: 27},
+		{OID: 10114, Method: amBrin, Name: "tid_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4607, IntType: 27, Default: false, KeyType: 27},
 		// brin/float4_minmax_ops
-		{OID: 9111, Method: amBrin, Name: "float4_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4070, IntType: 700, Default: true, KeyType: 700},
+		{OID: 10115, Method: amBrin, Name: "float4_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4070, IntType: 700, Default: true, KeyType: 700},
 		// brin/float4_minmax_multi_ops
-		{OID: 9112, Method: amBrin, Name: "float4_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4608, IntType: 700, Default: false, KeyType: 700},
+		{OID: 10116, Method: amBrin, Name: "float4_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4608, IntType: 700, Default: false, KeyType: 700},
 		// brin/float4_bloom_ops
-		{OID: 9113, Method: amBrin, Name: "float4_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4582, IntType: 700, Default: false, KeyType: 700},
+		{OID: 10117, Method: amBrin, Name: "float4_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4582, IntType: 700, Default: false, KeyType: 700},
 		// brin/float8_minmax_ops
-		{OID: 9114, Method: amBrin, Name: "float8_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4070, IntType: 701, Default: true, KeyType: 701},
+		{OID: 10118, Method: amBrin, Name: "float8_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4070, IntType: 701, Default: true, KeyType: 701},
 		// brin/float8_minmax_multi_ops
-		{OID: 9115, Method: amBrin, Name: "float8_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4608, IntType: 701, Default: false, KeyType: 701},
+		{OID: 10119, Method: amBrin, Name: "float8_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4608, IntType: 701, Default: false, KeyType: 701},
 		// brin/float8_bloom_ops
-		{OID: 9116, Method: amBrin, Name: "float8_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4582, IntType: 701, Default: false, KeyType: 701},
+		{OID: 10120, Method: amBrin, Name: "float8_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4582, IntType: 701, Default: false, KeyType: 701},
 		// brin/macaddr_minmax_ops
-		{OID: 9117, Method: amBrin, Name: "macaddr_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4074, IntType: 829, Default: true, KeyType: 829},
+		{OID: 10121, Method: amBrin, Name: "macaddr_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4074, IntType: 829, Default: true, KeyType: 829},
 		// brin/macaddr_minmax_multi_ops
-		{OID: 9118, Method: amBrin, Name: "macaddr_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4609, IntType: 829, Default: false, KeyType: 829},
+		{OID: 10122, Method: amBrin, Name: "macaddr_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4609, IntType: 829, Default: false, KeyType: 829},
 		// brin/macaddr_bloom_ops
-		{OID: 9119, Method: amBrin, Name: "macaddr_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4583, IntType: 829, Default: false, KeyType: 829},
+		{OID: 10123, Method: amBrin, Name: "macaddr_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4583, IntType: 829, Default: false, KeyType: 829},
 		// brin/macaddr8_minmax_ops
-		{OID: 9120, Method: amBrin, Name: "macaddr8_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4109, IntType: 774, Default: true, KeyType: 774},
+		{OID: 10124, Method: amBrin, Name: "macaddr8_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4109, IntType: 774, Default: true, KeyType: 774},
 		// brin/macaddr8_minmax_multi_ops
-		{OID: 9121, Method: amBrin, Name: "macaddr8_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4610, IntType: 774, Default: false, KeyType: 774},
+		{OID: 10125, Method: amBrin, Name: "macaddr8_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4610, IntType: 774, Default: false, KeyType: 774},
 		// brin/macaddr8_bloom_ops
-		{OID: 9122, Method: amBrin, Name: "macaddr8_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4584, IntType: 774, Default: false, KeyType: 774},
+		{OID: 10126, Method: amBrin, Name: "macaddr8_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4584, IntType: 774, Default: false, KeyType: 774},
 		// brin/inet_minmax_ops (default=false: inet_inclusion_ops is default for inet brin)
-		{OID: 9123, Method: amBrin, Name: "inet_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4075, IntType: 869, Default: false, KeyType: 869},
+		{OID: 10127, Method: amBrin, Name: "inet_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4075, IntType: 869, Default: false, KeyType: 869},
 		// brin/inet_minmax_multi_ops
-		{OID: 9124, Method: amBrin, Name: "inet_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4611, IntType: 869, Default: false, KeyType: 869},
+		{OID: 10128, Method: amBrin, Name: "inet_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4611, IntType: 869, Default: false, KeyType: 869},
 		// brin/inet_bloom_ops
-		{OID: 9125, Method: amBrin, Name: "inet_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4585, IntType: 869, Default: false, KeyType: 869},
+		{OID: 10129, Method: amBrin, Name: "inet_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4585, IntType: 869, Default: false, KeyType: 869},
 		// brin/inet_inclusion_ops
-		{OID: 9126, Method: amBrin, Name: "inet_inclusion_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4102, IntType: 869, Default: true, KeyType: 869},
+		{OID: 10130, Method: amBrin, Name: "inet_inclusion_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4102, IntType: 869, Default: true, KeyType: 869},
 		// brin/bpchar_minmax_ops
-		{OID: 9127, Method: amBrin, Name: "bpchar_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4076, IntType: 1042, Default: true, KeyType: 1042},
+		{OID: 10131, Method: amBrin, Name: "bpchar_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4076, IntType: 1042, Default: true, KeyType: 1042},
 		// brin/bpchar_bloom_ops
-		{OID: 9128, Method: amBrin, Name: "bpchar_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4586, IntType: 1042, Default: false, KeyType: 1042},
+		{OID: 10132, Method: amBrin, Name: "bpchar_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4586, IntType: 1042, Default: false, KeyType: 1042},
 		// brin/time_minmax_ops
-		{OID: 9129, Method: amBrin, Name: "time_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4077, IntType: 1083, Default: true, KeyType: 1083},
+		{OID: 10133, Method: amBrin, Name: "time_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4077, IntType: 1083, Default: true, KeyType: 1083},
 		// brin/time_minmax_multi_ops
-		{OID: 9130, Method: amBrin, Name: "time_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4612, IntType: 1083, Default: false, KeyType: 1083},
+		{OID: 10134, Method: amBrin, Name: "time_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4612, IntType: 1083, Default: false, KeyType: 1083},
 		// brin/time_bloom_ops
-		{OID: 9131, Method: amBrin, Name: "time_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4587, IntType: 1083, Default: false, KeyType: 1083},
+		{OID: 10135, Method: amBrin, Name: "time_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4587, IntType: 1083, Default: false, KeyType: 1083},
 		// brin/date_minmax_ops
-		{OID: 9132, Method: amBrin, Name: "date_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4059, IntType: 1082, Default: true, KeyType: 1082},
+		{OID: 10136, Method: amBrin, Name: "date_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4059, IntType: 1082, Default: true, KeyType: 1082},
 		// brin/date_minmax_multi_ops
-		{OID: 9133, Method: amBrin, Name: "date_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4605, IntType: 1082, Default: false, KeyType: 1082},
+		{OID: 10137, Method: amBrin, Name: "date_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4605, IntType: 1082, Default: false, KeyType: 1082},
 		// brin/date_bloom_ops
-		{OID: 9134, Method: amBrin, Name: "date_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4576, IntType: 1082, Default: false, KeyType: 1082},
+		{OID: 10138, Method: amBrin, Name: "date_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4576, IntType: 1082, Default: false, KeyType: 1082},
 		// brin/timestamp_minmax_ops
-		{OID: 9135, Method: amBrin, Name: "timestamp_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4059, IntType: 1114, Default: true, KeyType: 1114},
+		{OID: 10139, Method: amBrin, Name: "timestamp_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4059, IntType: 1114, Default: true, KeyType: 1114},
 		// brin/timestamp_minmax_multi_ops
-		{OID: 9136, Method: amBrin, Name: "timestamp_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4605, IntType: 1114, Default: false, KeyType: 1114},
+		{OID: 10140, Method: amBrin, Name: "timestamp_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4605, IntType: 1114, Default: false, KeyType: 1114},
 		// brin/timestamp_bloom_ops
-		{OID: 9137, Method: amBrin, Name: "timestamp_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4576, IntType: 1114, Default: false, KeyType: 1114},
+		{OID: 10141, Method: amBrin, Name: "timestamp_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4576, IntType: 1114, Default: false, KeyType: 1114},
 		// brin/timestamptz_minmax_ops
-		{OID: 9138, Method: amBrin, Name: "timestamptz_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4059, IntType: 1184, Default: true, KeyType: 1184},
+		{OID: 10142, Method: amBrin, Name: "timestamptz_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4059, IntType: 1184, Default: true, KeyType: 1184},
 		// brin/timestamptz_minmax_multi_ops
-		{OID: 9139, Method: amBrin, Name: "timestamptz_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4605, IntType: 1184, Default: false, KeyType: 1184},
+		{OID: 10143, Method: amBrin, Name: "timestamptz_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4605, IntType: 1184, Default: false, KeyType: 1184},
 		// brin/timestamptz_bloom_ops
-		{OID: 9140, Method: amBrin, Name: "timestamptz_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4576, IntType: 1184, Default: false, KeyType: 1184},
+		{OID: 10144, Method: amBrin, Name: "timestamptz_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4576, IntType: 1184, Default: false, KeyType: 1184},
 		// brin/interval_minmax_ops
-		{OID: 9141, Method: amBrin, Name: "interval_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4078, IntType: 1186, Default: true, KeyType: 1186},
+		{OID: 10145, Method: amBrin, Name: "interval_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4078, IntType: 1186, Default: true, KeyType: 1186},
 		// brin/interval_minmax_multi_ops
-		{OID: 9142, Method: amBrin, Name: "interval_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4613, IntType: 1186, Default: false, KeyType: 1186},
+		{OID: 10146, Method: amBrin, Name: "interval_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4613, IntType: 1186, Default: false, KeyType: 1186},
 		// brin/interval_bloom_ops
-		{OID: 9143, Method: amBrin, Name: "interval_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4588, IntType: 1186, Default: false, KeyType: 1186},
+		{OID: 10147, Method: amBrin, Name: "interval_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4588, IntType: 1186, Default: false, KeyType: 1186},
 		// brin/timetz_minmax_ops
-		{OID: 9144, Method: amBrin, Name: "timetz_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4058, IntType: 1266, Default: true, KeyType: 1266},
+		{OID: 10148, Method: amBrin, Name: "timetz_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4058, IntType: 1266, Default: true, KeyType: 1266},
 		// brin/timetz_minmax_multi_ops
-		{OID: 9145, Method: amBrin, Name: "timetz_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4604, IntType: 1266, Default: false, KeyType: 1266},
+		{OID: 10149, Method: amBrin, Name: "timetz_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4604, IntType: 1266, Default: false, KeyType: 1266},
 		// brin/timetz_bloom_ops
-		{OID: 9146, Method: amBrin, Name: "timetz_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4575, IntType: 1266, Default: false, KeyType: 1266},
+		{OID: 10150, Method: amBrin, Name: "timetz_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4575, IntType: 1266, Default: false, KeyType: 1266},
 		// brin/bit_minmax_ops
-		{OID: 9147, Method: amBrin, Name: "bit_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4079, IntType: 1560, Default: true, KeyType: 1560},
+		{OID: 10151, Method: amBrin, Name: "bit_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4079, IntType: 1560, Default: true, KeyType: 1560},
 		// brin/varbit_minmax_ops
-		{OID: 9148, Method: amBrin, Name: "varbit_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4080, IntType: 1562, Default: true, KeyType: 1562},
+		{OID: 10152, Method: amBrin, Name: "varbit_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4080, IntType: 1562, Default: true, KeyType: 1562},
 		// brin/numeric_minmax_ops
-		{OID: 9149, Method: amBrin, Name: "numeric_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4055, IntType: 1700, Default: true, KeyType: 1700},
+		{OID: 10153, Method: amBrin, Name: "numeric_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4055, IntType: 1700, Default: true, KeyType: 1700},
 		// brin/numeric_minmax_multi_ops
-		{OID: 9150, Method: amBrin, Name: "numeric_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4603, IntType: 1700, Default: false, KeyType: 1700},
+		{OID: 10154, Method: amBrin, Name: "numeric_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4603, IntType: 1700, Default: false, KeyType: 1700},
 		// brin/numeric_bloom_ops
-		{OID: 9151, Method: amBrin, Name: "numeric_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4574, IntType: 1700, Default: false, KeyType: 1700},
+		{OID: 10155, Method: amBrin, Name: "numeric_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4574, IntType: 1700, Default: false, KeyType: 1700},
 		// brin/uuid_minmax_ops
-		{OID: 9152, Method: amBrin, Name: "uuid_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4081, IntType: 2950, Default: true, KeyType: 2950},
+		{OID: 10156, Method: amBrin, Name: "uuid_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4081, IntType: 2950, Default: true, KeyType: 2950},
 		// brin/uuid_minmax_multi_ops
-		{OID: 9153, Method: amBrin, Name: "uuid_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4614, IntType: 2950, Default: false, KeyType: 2950},
+		{OID: 10157, Method: amBrin, Name: "uuid_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4614, IntType: 2950, Default: false, KeyType: 2950},
 		// brin/uuid_bloom_ops
-		{OID: 9154, Method: amBrin, Name: "uuid_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4589, IntType: 2950, Default: false, KeyType: 2950},
+		{OID: 10158, Method: amBrin, Name: "uuid_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4589, IntType: 2950, Default: false, KeyType: 2950},
 		// brin/range_inclusion_ops (opcintype=anyrange 3831)
-		{OID: 9155, Method: amBrin, Name: "range_inclusion_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4103, IntType: 3831, Default: true, KeyType: 3831},
+		{OID: 10159, Method: amBrin, Name: "range_inclusion_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4103, IntType: 3831, Default: true, KeyType: 3831},
 		// brin/pg_lsn_minmax_ops
-		{OID: 9156, Method: amBrin, Name: "pg_lsn_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4082, IntType: 3220, Default: true, KeyType: 3220},
+		{OID: 10160, Method: amBrin, Name: "pg_lsn_minmax_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4082, IntType: 3220, Default: true, KeyType: 3220},
 		// brin/pg_lsn_minmax_multi_ops
-		{OID: 9157, Method: amBrin, Name: "pg_lsn_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4615, IntType: 3220, Default: false, KeyType: 3220},
+		{OID: 10161, Method: amBrin, Name: "pg_lsn_minmax_multi_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4615, IntType: 3220, Default: false, KeyType: 3220},
 		// brin/pg_lsn_bloom_ops
-		{OID: 9158, Method: amBrin, Name: "pg_lsn_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4590, IntType: 3220, Default: false, KeyType: 3220},
+		{OID: 10162, Method: amBrin, Name: "pg_lsn_bloom_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4590, IntType: 3220, Default: false, KeyType: 3220},
 		// brin/box_inclusion_ops
-		{OID: 9159, Method: amBrin, Name: "box_inclusion_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4104, IntType: 603, Default: true, KeyType: 603},
+		{OID: 10163, Method: amBrin, Name: "box_inclusion_ops", Namespace: nsPGCatalog, Owner: ownerSuper, Family: 4104, IntType: 603, Default: true, KeyType: 603},
 	}
 }
 
@@ -3640,8 +3816,8 @@ func pgAmopInitialEntries() []pgAmopEntry {
 		purposeSearch byte = 's'
 		purposeOrder  byte = 'o'
 	)
-	// Synthetic OIDs: PG assigns these at initdb time; we pin contiguous
-	// ranges starting from baseOID so pg_amop_oid_index can be heap-rebuilt.
+	// Provisional OIDs, replaced with PostgreSQL's genbki OIDs (from
+	// pgAmopOIDByKey) before return.
 	const baseOID uint32 = 7000
 	out := make([]pgAmopEntry, 0, 945)
 	// addPair emits 5 strategy rows (1..5) for one (family, left, right, am) triple.
@@ -4702,7 +4878,22 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	// Total non-btree amOp calls: 660
 	// Grand total: 945 rows (= 945 pg_amop entries)
 
+	// The rows above are emitted in goopg's own order; PostgreSQL's OIDs follow
+	// pg_amop.dat's order (genbki, from 10000). Give each row its PG OID by
+	// natural key (M0149-0001g slice 8, TestPgAmopMatchesPostgresBKI).
+	for i := range out {
+		e := &out[i]
+		if oid, ok := pgAmopOIDByKey[pgAmopKey{e.Family, e.LeftType, e.RightType, e.Strategy}]; ok {
+			e.OID = oid
+		}
+	}
 	return out
+}
+
+// pgAmopKey is pg_amop's natural key — the pg_amop_fam_strat_index columns.
+type pgAmopKey struct {
+	Family, LeftType, RightType uint32
+	Strategy                    int16
 }
 
 // pgAmopRow encodes one pg_amop row. Field order mirrors
@@ -4889,16 +5080,29 @@ type pgIndexEntry struct {
 // index initialisation walks both critical-local AND critical-shared
 // lists against the current database's pg_index, so shared-catalog
 // index rows must be present in every per-database pg_index too.
+// bootstrapRelHasIndexSet holds every relation with at least one bootstrap
+// pg_index row (see pgClassRow's relhasindex).
+var bootstrapRelHasIndexSet = func() map[uint32]bool {
+	m := make(map[uint32]bool)
+	for _, e := range pgIndexInitialEntries() {
+		m[e.IndRelid] = true
+	}
+	return m
+}()
+
+// bootstrapRelHasIndex reports whether initdb bootstraps an index on oid.
+func bootstrapRelHasIndex(oid uint32) bool { return bootstrapRelHasIndexSet[oid] }
+
 func pgIndexInitialEntries() []pgIndexEntry {
 	const (
 		oidOps       uint32 = 1981
 		int2Ops      uint32 = 1979
 		int4Ops      uint32 = 1978
-		nameOps      uint32 = 1986
+		nameOps      uint32 = 10028
 		textOps      uint32 = 3126
-		charOps      uint32 = 1985
-		oidvectorOps uint32 = 1987
-		boolOps      uint32 = 1984
+		charOps      uint32 = 10007
+		oidvectorOps uint32 = 10032
+		boolOps      uint32 = 10003
 		float4Ops    uint32 = 10012 // btree float4_ops (postgres.bki: am=403 / btree)
 		cCollation   uint32 = 950   // C_COLLATION_OID — name/text use C in catalogs
 	)
@@ -5138,6 +5342,20 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		entry(13460, 13459, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_13456_index
 		entry(13465, 13464, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_13461_index
 		entry(13470, 13469, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_13466_index
+		// M0149-0001c: the shared catalogs' TOAST indexes (same UNIQUE PRIMARY
+		// (chunk_id oid_ops, chunk_seq int4_ops) shape) and pg_shdepend /
+		// pg_shdescription's own indexes (pg_shdepend.h, pg_shdescription.h;
+		// indclass checked against a PG 18.3 initdb).
+		entry(4178, 4177, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_1262_index
+		entry(2967, 2966, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_2964_index
+		entry(4061, 4060, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_3592_index
+		entry(2847, 2846, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_2396_index
+		entry(4184, 4183, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_6100_index
+		entry(4186, 4185, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_1213_index
+		entry(6245, 6244, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_6243_index
+		entry(1232, 1214, []int16{1, 2, 3, 4}, []uint32{oidOps, oidOps, oidOps, int4Ops}, []uint32{0, 0, 0, 0}, false, false), // pg_shdepend_depender_index
+		entry(1233, 1214, []int16{5, 6}, []uint32{oidOps, oidOps}, []uint32{0, 0}, false, false),                               // pg_shdepend_reference_index
+		entry(2397, 2396, []int16{1, 2}, []uint32{oidOps, oidOps}, []uint32{0, 0}, true, true),                                 // pg_shdescription_o_c_index
 		entry(13475, 13474, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_13471_index
 		// pg_trigger columns (PG18, pg_trigger.h): 1=oid, 2=tgrelid,
 		// 3=tgparentid, 4=tgname. Index = btree(tgrelid, tgname).
@@ -5162,6 +5380,35 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		entry(2656, 2604, []int16{2, 3}, []uint32{oidOps, int2Ops}, []uint32{0, 0}, true, false), // pg_attrdef_adrelid_adnum_index (UNIQUE, not PKEY)
 		entry(2657, 2604, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                 // pg_attrdef_oid_index (UNIQUE PRIMARY)
 		entry(2680, 2611, []int16{1, 3}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true),                          // pg_inherits_relid_seqno_index
+		// M0149-0001g: the six indexes the bootstrap image lacked (keys and
+		// uniqueness checked against a PG 18.3 initdb).
+		entry(2187, 2611, []int16{2}, []uint32{oidOps}, []uint32{0}, false, false),                                                   // pg_inherits_parent_index
+		entry(2673, 2608, []int16{1, 2, 3}, []uint32{oidOps, oidOps, int4Ops}, []uint32{0, 0, 0}, false, false),                      // pg_depend_depender_index
+		entry(2674, 2608, []int16{4, 5, 6}, []uint32{oidOps, oidOps, int4Ops}, []uint32{0, 0, 0}, false, false),                      // pg_depend_reference_index
+		entry(2675, 2609, []int16{1, 2, 3}, []uint32{oidOps, oidOps, int4Ops}, []uint32{0, 0, 0}, true, true),                        // pg_description_o_c_o_index
+		entry(2664, 2606, []int16{2, 3}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, false, false),                           // pg_constraint_conname_nsp_index
+		entry(2579, 2606, []int16{12}, []uint32{oidOps}, []uint32{0}, false, false),                                                  // pg_constraint_conparentid_index
+		// M0149-0001g slice 3: indexes over catalogs that are empty at initdb
+		// and that goopg does not write at runtime (pg_trigger, pg_policy,
+		// pg_largeobject_metadata, pg_seclabel). PG's FK trigger creation
+		// opens 2702 and every DROP probes 3597 (DeleteSecurityLabel).
+		entry(2699, 2620, []int16{11}, []uint32{oidOps}, []uint32{0}, false, false),                                                  // pg_trigger_tgconstraint_index
+		entry(2702, 2620, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                                     // pg_trigger_oid_index
+		entry(2996, 2995, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                                     // pg_largeobject_metadata_oid_index
+		// M0149-0001g slice 30: pg_largeobject_loid_pn_index, UNIQUE PRIMARY
+		// btree(loid oid_ops, pageno int4_ops) (pg_largeobject.h).
+		entry(2683, 2613, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_largeobject_loid_pn_index
+		entry(3257, 3256, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                                     // pg_policy_oid_index
+		entry(3258, 3256, []int16{3, 2}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false),                            // pg_policy_polrelid_polname_index
+		entry(3597, 3596, []int16{1, 2, 3, 4}, []uint32{oidOps, oidOps, int4Ops, textOps}, []uint32{0, 0, 0, cCollation}, true, true), // pg_seclabel_object_index
+		entry(3395, 3394, []int16{1, 2, 3}, []uint32{oidOps, oidOps, int4Ops}, []uint32{0, 0, 0}, true, true),                        // pg_init_privs_o_c_o_index
+		// M0149-0001g slice 4: indexes over catalogs with bootstrap rows, built
+		// from those rows (btree_index_bootstrap.go).
+		entry(2651, 2601, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false),                                        // pg_am_name_index
+		entry(2652, 2601, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                                   // pg_am_oid_index
+		entry(2756, 2602, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                                   // pg_amop_oid_index
+		entry(2757, 2603, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                                   // pg_amproc_oid_index
+		entry(3455, 1259, []int16{9, 8}, []uint32{oidOps, oidOps}, []uint32{0, 0}, false, false),                                   // pg_class_tblspc_relfilenode_index
 		// pg_namespace columns (PG18, pg_namespace.h): 1=oid, 2=nspname,
 		// 3=nspowner, 4=nspacl. PG18 indexing.h:
 		//   NamespaceNameIndexId = 2684 = pg_namespace_nspname_index
@@ -6011,6 +6258,27 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// both oid_ops with no collation.
 		entry(175, 1418, []int16{2, 3}, []uint32{oidOps, oidOps}, []uint32{0, 0}, true, false), // pg_user_mapping_user_server_index
 	}
+	// M0149-0001g slice 26: every DECLARE_TOAST pair not listed above gets the
+	// same UNIQUE PRIMARY (chunk_id oid_ops, chunk_seq int4_ops) index row —
+	// create_toast_table's shape, checked against a PG 18.3 initdb.
+	listed := make(map[uint32]bool, len(shared)+len(local))
+	for _, e := range shared {
+		listed[e.IndexRelid] = true
+	}
+	for _, e := range local {
+		listed[e.IndexRelid] = true
+	}
+	for _, p := range nailedToastPairs() {
+		if listed[p.ToastIdx] {
+			continue
+		}
+		e := entry(p.ToastIdx, p.ToastRel, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true)
+		if p.Shared {
+			shared = append(shared, e)
+		} else {
+			local = append(local, e)
+		}
+	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
 	out = append(out, local...)
@@ -6140,10 +6408,8 @@ func pgClassColDefs() []catalog.Column {
 
 // pgClassRow builds a 14-col pg_class tuple matching pgClassColDefs order.
 func pgClassRow(rel nailedRel) executor.Row {
-	relType := rel.RelType
-	if relType == 0 && !isNailedToastRel(rel) {
-		relType = rel.OID
-	}
+	frozenXID, frozenMXID := executor.PGClassFrozenIDs(string(rune(rel.RelKind)))
+	relType := pgClassRelType(rel)
 	relAm := int64(0)
 	// M0131-S20.1: relkind 't' (TOAST) is heap-AM storage exactly like 'r'.
 	if rel.RelKind == 'r' || rel.RelKind == 't' {
@@ -6158,6 +6424,9 @@ func pgClassRow(rel nailedRel) executor.Row {
 	// that PG's relcache fetches the view's ON-SELECT rewrite rule from
 	// pg_rewrite when the view is opened.
 	relFilenode := int64(rel.OID)
+	if isMappedCatalogOID(rel.OID) {
+		relFilenode = 0 // mapped: pg_filenode.map holds the file number (slice 27)
+	}
 	relHasRules := false
 	if rel.RelKind == 'v' {
 		relFilenode = 0
@@ -6212,12 +6481,21 @@ func pgClassRow(rel nailedRel) executor.Row {
 		executor.NewIntDatum(0),                            // 104: relallvisible
 		executor.NewIntDatum(0), // 108: relallfrozen
 		// 112: reltoastrelid — 2838 on pg_rewrite (DECLARE_TOAST), 0 elsewhere.
-		// 116: relhasindex — true on a TOAST heap, whose (chunk_id, chunk_seq)
-		// btree is the only way PG reaches a chunk. Every other nailed heap
-		// keeps the historical false (goopg's index rows live in pg_index and
-		// PG re-derives them; changing that is out of this slice's scope).
+		// 116: relhasindex — true exactly when the relation has an index, as
+		// PG maintains it (index.c index_update_stats). It is not cosmetic: PG
+		// does not re-derive it. ExecOpenIndices (execIndexing.c) and
+		// RelationGetIndexList (relcache.c) return no indexes when it is false,
+		// so with the historical false every catalog row a PG 18.3 node wrote on
+		// a goopg directory skipped index maintenance — a database PG created
+		// was then invisible to the pg_database_datname_index lookup that
+		// connection start uses (M0149-0001d). Derived from the bootstrap
+		// pg_index entries; a TOAST heap is indexed by construction.
+		//
+		// Local catalogs followed in M0149-0001g once every bootstrap index was
+		// complete — pg_attribute_relid_attnam_index (2658) had been an empty
+		// placeholder, which PG's planner would have trusted.
 		executor.NewIntDatum(int64(pgClassReltoastrelidFor(rel.OID))),
-		executor.NewBoolDatum(isNailedToastRelOID(rel.OID)), // 116: relhasindex
+		executor.NewBoolDatum(isNailedToastRelOID(rel.OID) || bootstrapRelHasIndex(rel.OID)), // 116: relhasindex
 		executor.NewBoolDatum(rel.IsShared),                // 117: relisshared
 		executor.NewStringDatum("p"),                       // 118: relpersistence
 		executor.NewStringDatum(string(rune(rel.RelKind))), // 119: relkind
@@ -6232,9 +6510,9 @@ func pgClassRow(rel nailedRel) executor.Row {
 		executor.NewStringDatum("n"),                       // 130: relreplident
 		executor.NewBoolDatum(false),                       // 131: relispartition
 		executor.NewIntDatum(0),                            // 132: relrewrite
-		executor.NewIntDatum(3),                            // 136: relfrozenxid
-		executor.NewIntDatum(1),                            // 140: relminmxid
-		executor.NewStringDatum("{}"),                      // relacl (empty aclitem[])
+		executor.NewIntDatum(frozenXID),                    // 136: relfrozenxid (r/t only — executor.PGClassFrozenIDs)
+		executor.NewIntDatum(frozenMXID),                   // 140: relminmxid
+		pgClassBootstrapRelACL(rel),                        // relacl: PG initdb's ACL, or NULL (M0149-0001g slice 12)
 		executor.NewStringDatum("{}"),                      // reloptions (empty text[])
 		executor.NewStringDatum(""),                        // relpartbound (empty pg_node_tree)
 	}
@@ -6358,22 +6636,75 @@ func nailedAttrsFromColDefs(cols []catalog.Column) []nailedAttr {
 }
 
 // pgAttributeRow builds one pg_attribute tuple.
+// pgSystemAttributes is PostgreSQL's SysAtt[] (postgres/src/backend/catalog/
+// heap.c): attnum, name, type, length, byval, align — the values a PG 18.3
+// initdb stores for every table-like relation (checked against a scratch
+// initdb's pg_attribute WHERE attnum < 0).
+var pgSystemAttributes = []struct {
+	num   int16
+	name  string
+	typ   uint32
+	len   int16
+	byval bool
+	align string
+}{
+	{-1, "ctid", 27, 6, false, "s"},
+	{-2, "xmin", 28, 4, true, "i"},
+	{-3, "cmin", 29, 4, true, "i"},
+	{-4, "xmax", 28, 4, true, "i"},
+	{-5, "cmax", 29, 4, true, "i"},
+	{-6, "tableoid", 26, 4, true, "i"},
+}
+
+// pgSystemAttributeRows renders the six system attributes of relOID as
+// pg_attribute rows: attstorage 'p', attnotnull true, attislocal true,
+// attcollation 0, attstattarget NULL — PG's own values. byval / align are set
+// from SysAtt[] directly rather than through pgTypeByVal / pgTypeAlignChar.
+func pgSystemAttributeRows(relOID uint32) []executor.Row {
+	rows := make([]executor.Row, 0, len(pgSystemAttributes))
+	for _, sa := range pgSystemAttributes {
+		row := pgAttributeRow(relOID, nailedAttr{Name: sa.name, TypeOID: sa.typ, Num: sa.num, Len: sa.len, NotNull: true})
+		row[7] = executor.NewBoolDatum(sa.byval)  // attbyval
+		row[8] = executor.NewStringDatum(sa.align) // attalign
+		row[9] = executor.NewStringDatum("p")      // attstorage
+		rows = append(rows, row)
+	}
+	return rows
+}
+
 func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
+	typmod, ndims := int64(-1), int64(0)
+	byval, align := pgTypeByVal(a.TypeOID), pgTypeAlignChar(a.TypeOID)
+	// attstorage: type-derived, except on a TOAST relation's own columns,
+	// which upstream pins to 'p' (M0131-S20.1).
+	storage, notNull, collation := pgAttrStorageChar(relOID, a.TypeOID), a.NotNull, a.Collation
+	acl := executor.NullDatum
+	// M0149-0001g slice 17: a system-relation column carries the metadata a
+	// PG 18.3 initdb leaves (pgAttributeInitdbMeta) — attcollation 950 on
+	// name / sql_identifier columns, 100 on text ones, array attndims, the
+	// attalign/attbyval of the declared type, index columns attnotnull false,
+	// and the column GRANTs initdb issues. Only when goopg writes the same
+	// atttypid; attlen stays goopg's, which TestPgAttributeMetaMatchesCodec
+	// pins against the physical layout.
+	if m, ok := pgAttributeInitdbMetaFor(relOID, a.Name, a.TypeOID); ok {
+		typmod, ndims = int64(m.TypMod), int64(m.NDims)
+		byval, align = m.ByVal, string(rune(m.Align))
+		storage, notNull, collation = string(rune(m.Storage)), m.NotNull, m.Collation
+		acl = pgAttributeACLDatum(m, a.Name)
+	}
 	return executor.Row{
 		executor.NewIntDatum(int64(relOID)),
 		executor.NewStringDatum(a.Name),
 		executor.NewIntDatum(int64(a.TypeOID)),
 		executor.NewIntDatum(int64(a.Len)),
 		executor.NewIntDatum(int64(a.Num)),
-		executor.NewIntDatum(-1), // atttypmod
-		executor.NewIntDatum(0),  // attndims
-		executor.NewBoolDatum(pgTypeByVal(a.TypeOID)),
-		executor.NewStringDatum(pgTypeAlignChar(a.TypeOID)),
-		// attstorage: type-derived, except on a TOAST relation's own columns,
-		// which upstream pins to 'p' (M0131-S20.1).
-		executor.NewStringDatum(pgAttrStorageChar(relOID, a.TypeOID)),
+		executor.NewIntDatum(typmod), // atttypmod
+		executor.NewIntDatum(ndims),  // attndims
+		executor.NewBoolDatum(byval),
+		executor.NewStringDatum(align),
+		executor.NewStringDatum(storage),
 		executor.NewStringDatum(""), // attcompression
-		executor.NewBoolDatum(a.NotNull),
+		executor.NewBoolDatum(notNull),
 		executor.NewBoolDatum(false), // atthasdef
 		executor.NewBoolDatum(false), // atthasmissing
 		executor.NewStringDatum(""),  // attidentity
@@ -6381,7 +6712,7 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 		executor.NewBoolDatum(false), // attisdropped
 		executor.NewBoolDatum(true),  // attislocal
 		executor.NewIntDatum(0),      // attinhcount
-		executor.NewIntDatum(int64(a.Collation)), // attcollation (M0133-S3: C collation on non-nailed info_schema columns)
+		executor.NewIntDatum(int64(collation)), // attcollation (initdb's value; M0133-S3 C collation on info_schema columns otherwise)
 		executor.NullDatum,           // attstattarget (PG18 BKI_FORCE_NULL default)
 		// Step 3u: Emit NULL (not empty-text varlena) for the four nullable
 		// trailing varlena/array columns. Previously NewStringDatum("") wrote
@@ -6392,7 +6723,7 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 		// RelationInitIndexAccessInfo on the very index whose error message
 		// is being formatted → ERRORDATA_STACK_SIZE PANIC. PG18's default
 		// for an unconfigured catalog row is SQL NULL on all four columns.
-		executor.NullDatum, // attacl
+		acl,                // attacl (initdb column GRANTs, else NULL)
 		executor.NullDatum, // attoptions
 		executor.NullDatum, // attfdwoptions
 		executor.NullDatum, // attmissingval
@@ -6451,55 +6782,19 @@ type pgAuthidEntry struct {
 // input rels) so callers that need to build a covering btree index over the
 // same rows can stamp the correct ItemPointer into each IndexTuple.
 func writeMultiPageHeap(dataDir, relFile string, cols []catalog.Column, rels []nailedRel, rowFn func(nailedRel) executor.Row) ([]heapTID, error) {
-	var pages [][]byte
-	page := make(storage.Page, storage.BlockSize)
-	if err := storage.InitPage(page); err != nil {
-		return nil, err
-	}
-	tids := make([]heapTID, len(rels))
-	// review/260831 IN-8: the column set does not change between rows, so the
-	// varlena scan is a loop invariant.
-	varWidth := hasVarWidthCol(cols)
+	// Delegates to writeMultiPageHeapRows so NULL columns get a real null
+	// bitmap (HEAP_HASNULL). The former private loop built every tuple with
+	// storage.NewHeapTuple: a NULL datum was dropped from the payload but not
+	// marked NULL, so PG read the following column at the NULL's offset —
+	// harmless while every bootstrap pg_class column was non-NULL, fatal once
+	// relacl became NULL (PG asserted in build_reloptions; M0149-0001g slice 12).
+	rows := make([]executor.Row, len(rels))
 	for i, rel := range rels {
-		row := rowFn(rel)
-		payload, err := executor.EncodeRowPG(cols, row)
-		if err != nil {
-			return nil, fmt.Errorf("encode %s row for %s: %w", relFile, rel.RelName, err)
-		}
-		tuple := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload)
-		tuple.Header.SetNatts(len(cols))
-		if varWidth {
-			tuple.Header.Infomask |= storage.HeapHasVarWidth
-		}
-		off, err := storage.PageAddHeapTuple(page, tuple)
-		if err != nil {
-			pages = append(pages, page)
-			page = make(storage.Page, storage.BlockSize)
-			if err := storage.InitPage(page); err != nil {
-				return nil, err
-			}
-			off, err = storage.PageAddHeapTuple(page, tuple)
-			if err != nil {
-				return nil, fmt.Errorf("add %s tuple for %s on fresh page: %w", relFile, rel.RelName, err)
-			}
-		}
-		tids[i] = heapTID{Block: uint32(len(pages)), Offset: off}
+		rows[i] = rowFn(rel)
 	}
-	pages = append(pages, page)
-	raw := make([]byte, 0, storage.BlockSize*len(pages))
-	for _, p := range pages {
-		raw = append(raw, p...)
-	}
-	b1 := filepath.Join(dataDir, "base", "1")
-	if err := os.WriteFile(filepath.Join(b1, relFile), raw, 0o600); err != nil {
-		return nil, err
-	}
-	b5 := filepath.Join(dataDir, "base", "5")
-	if err := os.MkdirAll(b5, 0o700); err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(filepath.Join(b5, relFile), raw, 0o600); err != nil {
-		return nil, err
+	tids, err := writeMultiPageHeapRows(dataDir, relFile, cols, rows)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", relFile, err)
 	}
 	return tids, nil
 }
@@ -6523,10 +6818,45 @@ func writeMultiPageHeapRows(dataDir, relFile string, cols []catalog.Column, rows
 // VARATT_IS_EXTERNAL (postgres/src/backend/access/common/heaptuple.c:343); it
 // is what tells heap_delete/heap_update that the tuple owns toast chunks.
 func writeMultiPageHeapRowsExternal(dataDir, relFile string, cols []catalog.Column, rows []executor.Row, external []bool) ([]heapTID, error) {
+	raw, tids, err := buildMultiPageHeapFile(relFile, cols, rows, external)
+	if err != nil {
+		return nil, err
+	}
+	b1 := filepath.Join(dataDir, "base", "1")
+	if err := os.WriteFile(filepath.Join(b1, relFile), raw, 0o600); err != nil {
+		return nil, err
+	}
+	b5 := filepath.Join(dataDir, "base", "5")
+	if err := os.MkdirAll(b5, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(filepath.Join(b5, relFile), raw, 0o600); err != nil {
+		return nil, err
+	}
+	return tids, nil
+}
+
+// writeSharedHeapRows is writeMultiPageHeapRows for a SHARED catalog: the one
+// copy lives in global/ (M0149-0001g slice 10, pg_auth_members).
+func writeSharedHeapRows(dataDir, relFile string, cols []catalog.Column, rows []executor.Row) ([]heapTID, error) {
+	raw, tids, err := buildMultiPageHeapFile(relFile, cols, rows, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "global", relFile), raw, 0o600); err != nil {
+		return nil, err
+	}
+	return tids, nil
+}
+
+// buildMultiPageHeapFile encodes rows as PG heap tuples (xmin 1, frozen by
+// FrozenTransactionId semantics at bootstrap) over as many 8 KiB pages as
+// needed, returning the file image and each row's TID.
+func buildMultiPageHeapFile(relFile string, cols []catalog.Column, rows []executor.Row, external []bool) ([]byte, []heapTID, error) {
 	var pages [][]byte
 	page := make(storage.Page, storage.BlockSize)
 	if err := storage.InitPage(page); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	tids := make([]heapTID, 0, len(rows))
 	// review/260831 IN-8: loop invariant, see writeMultiPageHeap.
@@ -6534,7 +6864,7 @@ func writeMultiPageHeapRowsExternal(dataDir, relFile string, cols []catalog.Colu
 	for i, row := range rows {
 		payload, err := executor.EncodeRowPG(cols, row)
 		if err != nil {
-			return nil, fmt.Errorf("encode %s row: %w", relFile, err)
+			return nil, nil, fmt.Errorf("encode %s row: %w", relFile, err)
 		}
 		bitmap := executor.NullBitmapPG(row)
 		var tuple storage.HeapTuple
@@ -6555,11 +6885,11 @@ func writeMultiPageHeapRowsExternal(dataDir, relFile string, cols []catalog.Colu
 			pages = append(pages, page)
 			page = make(storage.Page, storage.BlockSize)
 			if err := storage.InitPage(page); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			off, err = storage.PageAddHeapTuple(page, tuple)
 			if err != nil {
-				return nil, fmt.Errorf("add %s tuple on fresh page: %w", relFile, err)
+				return nil, nil, fmt.Errorf("add %s tuple on fresh page: %w", relFile, err)
 			}
 		}
 		tids = append(tids, heapTID{Block: uint32(len(pages)), Offset: off})
@@ -6569,18 +6899,7 @@ func writeMultiPageHeapRowsExternal(dataDir, relFile string, cols []catalog.Colu
 	for _, p := range pages {
 		raw = append(raw, p...)
 	}
-	b1 := filepath.Join(dataDir, "base", "1")
-	if err := os.WriteFile(filepath.Join(b1, relFile), raw, 0o600); err != nil {
-		return nil, err
-	}
-	b5 := filepath.Join(dataDir, "base", "5")
-	if err := os.MkdirAll(b5, 0o700); err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(filepath.Join(b5, relFile), raw, 0o600); err != nil {
-		return nil, err
-	}
-	return tids, nil
+	return raw, tids, nil
 }
 
 // pgCatalogTypeOID maps a goopg type name → PG type OID.
@@ -6596,8 +6915,12 @@ func pgCatalogTypeOID(t string) uint32 {
 		return 20
 	case "int2":
 		return 21
-	case "int4", "oid", "xid":
+	case "int4":
 		return 23
+	case "oid":
+		return 26 // OIDOID — was folded into int4 before M0149-0001g slice 9
+	case "xid":
+		return 28 // XIDOID
 	case "text":
 		return 25
 	case "pg_node_tree":
@@ -6664,6 +6987,11 @@ func pgTypeByVal(oid uint32) bool {
 		// 64-bit). pg_subscription_rel.srsublsn and pg_subscription.subskiplsn
 		// both depend on this.
 		return true
+	case 28, 1184, 1114, 1082, 1083, 29, 5069:
+		// xid, timestamptz, timestamp, date, time, cid, xid8: by-value in
+		// pg_type.dat (8-byte ones via FLOAT8PASSBYVAL on 64-bit). Found by
+		// TestPgAttributeMetaMatchesCodec (M0149-0001g slice 17).
+		return true
 	}
 	return false
 }
@@ -6682,9 +7010,20 @@ func pgTypeAlignChar(oid uint32) string {
 		return "c"
 	case 21:
 		return "s"
-	case 23, 26, 700, 194, 1009, 1034, 24, 325, 269, 30, 22, 1002, 1028, 3361, 3402, 5017:
+	case 23, 26, 700, 194, 1009, 24, 325, 269, 30, 22, 1002, 1028, 3361, 3402, 5017:
 		return "i"
 	case 20, 701, 10028, 3220,
+		// timestamptz (1184), timestamp (1114), interval (1186), time (1083),
+		// timetz (1266), xid8 (5069): typalign 'd' in pg_type.dat, and the
+		// codec (catalog.PhysicalTypeAlign) already pads them to 8 — the
+		// pg_attribute side said 'i' (pg_authid.rolvaliduntil). M0149-0001g
+		// slice 17, TestPgAttributeMetaMatchesCodec.
+		1184, 1114, 1186, 1083, 1266, 5069,
+		// _aclitem (1034) is typalign 'd' (aclitem carries a 64-bit AclMode
+		// since PG 16). It had been grouped with the 'i' varlenas; harmless
+		// while every ACL column was NULL or sat on an 8-byte boundary, fatal
+		// for the first non-NULL proacl (M0149-0001g slice 13).
+		1034,
 		// anyarray (2277) is typalign='d', not 'i'
 		// (postgres/src/include/catalog/pg_type.dat:573). It had been grouped
 		// with the 'i' varlenas above, which under-declared the alignment of
@@ -6855,17 +7194,9 @@ func makeRelMapFile(mappings [][2]uint32) []byte {
 }
 
 func defaultRelMapFile() []byte {
-	return makeRelMapFile([][2]uint32{
-		{1262, 1262}, // pg_database
-		{1260, 1260}, // pg_authid
-		{1261, 1261}, // pg_auth_members
-		{1213, 1213}, // pg_tablespace
-		{1214, 1214}, // pg_shdepend
-		{3592, 3592}, // pg_shdescription
-		{6000, 6000}, // pg_replication_origin
-		{6100, 6100}, // pg_subscription
-		{6243, 6243}, // pg_parameter_acl
-	})
+	// PG 18.3's 46 shared mapped relations (pgGlobalRelMapOIDs, M0149-0001g
+	// slice 27); it used to hold 9.
+	return makeRelMapFile(identityRelMap(pgGlobalRelMapOIDs))
 }
 
 func defaultPgIdentConf() []byte {
@@ -6881,4 +7212,64 @@ func defaultPgIdentConf() []byte {
 // buildPgHBAConf(host, local) when an explicit auth method is requested.
 func defaultPgHBAConf() []byte {
 	return buildPgHBAConf("trust", "trust")
+}
+
+// pgClassRelType is pg_class.reltype for a bootstrap relation: the composite
+// rowtype a PG 18.3 initdb gives it (pgClassRowtypeOIDs, M0149-0001g slice
+// 18) — before that, most catalogs carried the placeholder 83 (pg_class's own
+// rowtype) and views their own relation OID. Falls back to the historical
+// value for a relation PG has no captured rowtype for. Shared by the heap row
+// and the relcache init file so the two agree.
+func pgClassRelType(rel nailedRel) uint32 {
+	if oid, ok := pgClassRowtypeOIDs()[rel.OID]; ok {
+		return oid
+	}
+	if rel.RelKind == 'i' || rel.RelKind == 'I' {
+		return 0 // indexes have no rowtype (heap.c: only relkinds with a tuple descriptor of their own get one)
+	}
+	relType := rel.RelType
+	if relType == 0 && !isNailedToastRel(rel) {
+		relType = rel.OID
+	}
+	return relType
+}
+
+// templateDatacl is pg_database.datacl after initdb's
+// "REVOKE CREATE,TEMPORARY ON DATABASE template1 / template0 FROM public"
+// (initdb.c setup_privileges): PUBLIC keeps CONNECT only, and the owner entry
+// is materialised — {=c/postgres,postgres=CTc/postgres}. Every other database
+// keeps a NULL datacl (acldefault). Without it a PG node and goopg's
+// has_database_privilege saw PUBLIC holding TEMP on the templates, and \l+
+// showed no access privileges for them. M0149-0001h.
+func templateDatacl(name string) executor.Datum {
+	if name != "template0" && name != "template1" {
+		return executor.NullDatum
+	}
+	blob, err := executor.EncodeAclItemArrayText("{=c/postgres,postgres=CTc/postgres}", func(string) uint32 { return 10 })
+	if err != nil {
+		return executor.NullDatum
+	}
+	return executor.NewBytesDatum(blob)
+}
+
+// isSharedRelOID reports whether oid is one of PG 18.3's shared catalogs or
+// their indexes / TOAST relations (pg_class.relisshared), whose files live
+// only in global/.
+func isSharedRelOID(oid uint32) bool {
+	for _, o := range pgGlobalRelMapOIDs {
+		if o == oid {
+			return true
+		}
+	}
+	return false
+}
+
+// prettyWALSize is initdb's pretty_wal_size: segments × segment size in MB,
+// as "<n>GB" when a whole number of GB, else "<n>MB".
+func prettyWALSize(segSizeMB, segments int) string {
+	sz := segSizeMB * segments
+	if sz%1024 == 0 {
+		return fmt.Sprintf("%dGB", sz/1024)
+	}
+	return fmt.Sprintf("%dMB", sz)
 }

@@ -8,7 +8,7 @@ import (
 // round-trip correctly.
 func TestFSMBasic(t *testing.T) {
 	fsm := NewFSM()
-	rel := RelFileNode{DBOid: 1, RelOid: 42, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 42, Fork: MainFork}
 
 	// No entry yet → not found.
 	if _, ok := fsm.GetPageWithFreeSpace(rel, 100); ok {
@@ -52,7 +52,7 @@ func TestFSMBasic(t *testing.T) {
 // relation so stale pages are never returned after TRUNCATE / DROP TABLE.
 func TestFSMDropRelation(t *testing.T) {
 	fsm := NewFSM()
-	rel := RelFileNode{DBOid: 1, RelOid: 99, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 99, Fork: MainFork}
 	fsm.RecordFreeSpace(rel, 0, 8000)
 	fsm.DropRelation(rel)
 	if _, ok := fsm.GetPageWithFreeSpace(rel, 100); ok {
@@ -64,7 +64,7 @@ func TestFSMDropRelation(t *testing.T) {
 // free space directly from a page's header.
 func TestFSMRecordFreeSpaceForPage(t *testing.T) {
 	fsm := NewFSM()
-	rel := RelFileNode{DBOid: 1, RelOid: 7, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 7, Fork: MainFork}
 
 	page := make(Page, BlockSize)
 	if err := InitPage(page); err != nil {
@@ -84,7 +84,7 @@ func TestFSMRecordFreeSpaceForPage(t *testing.T) {
 // TestFSMNilSafe verifies that a nil FSM silently no-ops on all methods.
 func TestFSMNilSafe(t *testing.T) {
 	var fsm *FSM
-	rel := RelFileNode{DBOid: 1, RelOid: 1}
+	rel := RelFileNode{DBOid: 16384, RelOid: 1}
 	fsm.RecordFreeSpace(rel, 0, 1000) // must not panic
 	if _, ok := fsm.GetPageWithFreeSpace(rel, 100); ok {
 		t.Fatal("nil FSM should never return a page")
@@ -98,7 +98,7 @@ func TestFSMNilSafe(t *testing.T) {
 // meet the minFreeBytes floor. (M0107-0007 slice C foundation.)
 func TestFSMGetCandidatesBasic(t *testing.T) {
 	fsm := NewFSM()
-	rel := RelFileNode{DBOid: 1, RelOid: 42, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 42, Fork: MainFork}
 
 	fsm.RecordFreeSpace(rel, 0, 4000)
 	fsm.RecordFreeSpace(rel, 1, 200)
@@ -136,7 +136,7 @@ func TestFSMGetCandidatesBasic(t *testing.T) {
 // wins among equal free-space estimates).
 func TestFSMGetCandidatesEdgeCases(t *testing.T) {
 	var nilFSM *FSM
-	rel := RelFileNode{DBOid: 1, RelOid: 1}
+	rel := RelFileNode{DBOid: 16384, RelOid: 1}
 	if got := nilFSM.GetCandidates(rel, 100, 4); got != nil {
 		t.Fatalf("nil FSM should return nil, got %v", got)
 	}
@@ -161,7 +161,7 @@ func TestFSMGetCandidatesEdgeCases(t *testing.T) {
 	}
 
 	// Tie-breaking: equal free-space estimates → ascending block number.
-	rel2 := RelFileNode{DBOid: 1, RelOid: 2}
+	rel2 := RelFileNode{DBOid: 16384, RelOid: 2}
 	fsm.RecordFreeSpace(rel2, 0, 3000)
 	fsm.RecordFreeSpace(rel2, 1, 3000)
 	fsm.RecordFreeSpace(rel2, 2, 3000)
@@ -180,7 +180,7 @@ func TestFSMGetCandidatesEdgeCases(t *testing.T) {
 // values when the kept set is constrained to 4.
 func TestFSMGetCandidatesLargeRelation(t *testing.T) {
 	fsm := NewFSM()
-	rel := RelFileNode{DBOid: 1, RelOid: 99}
+	rel := RelFileNode{DBOid: 16384, RelOid: 99}
 
 	// Deterministic pseudo-random distribution: block i gets free-space
 	// (i * 37) % 8000. Block 217 yields the maximum (8029 % 8000 = 29
@@ -227,7 +227,7 @@ func TestFSMGetCandidatesLargeRelation(t *testing.T) {
 // RLock and a concurrent writer should not observe any side effects.
 func TestFSMGetCandidatesDoesNotMutateState(t *testing.T) {
 	fsm := NewFSM()
-	rel := RelFileNode{DBOid: 1, RelOid: 7}
+	rel := RelFileNode{DBOid: 16384, RelOid: 7}
 	fsm.RecordFreeSpace(rel, 0, 4000)
 	fsm.RecordFreeSpace(rel, 1, 6000)
 

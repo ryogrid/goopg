@@ -1191,6 +1191,12 @@ func boundExprToSQLLiteral(e parser.Expr) string {
 		}
 	case *parser.StringConst:
 		return "'" + strings.ReplaceAll(v.Value, "'", "''") + "'"
+	case *parser.BooleanConst:
+		// PG's relpartbound prints a boolean bound bare: IN (true).
+		if v.Value {
+			return "true"
+		}
+		return "false"
 	case *parser.PartitionRangeBoundKeyword:
 		// Unbounded edge: cannot be expressed as a comparable SQL literal.
 		return ""

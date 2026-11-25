@@ -278,6 +278,28 @@ func ZoneLocation(zone string) *time.Location {
 	return sessionLocation(zone)
 }
 
+// ZoneByName is pg_tzset: the zone for a name in any letter case, or a POSIX TZ
+// specification.
+func ZoneByName(name string) (*time.Location, bool) {
+	canonical, ok := zoneName(name)
+	if !ok {
+		return nil, false
+	}
+	return sessionLocation(canonical), true
+}
+
+// WallClockWestOffset is DetermineTimeZoneOffset: the seconds west of UTC that a
+// wall clock, given as UTC-tagged fields, has in loc.
+func WallClockWestOffset(wall time.Time, loc *time.Location) int {
+	return int(resolveLocalWallClock(wall, loc).Unix() - wall.Unix())
+}
+
+// CanonicalZoneName is pg_tzset's name resolution: the tz database spelling of a
+// zone name in any case, or the upper-cased form of a POSIX specification.
+func CanonicalZoneName(name string) (string, bool) {
+	return zoneName(name)
+}
+
 // posixLocation builds the zone a POSIX TZ string describes. Go's time
 // package already implements POSIX TZ rules for the footer of a TZif file,
 // so the location is a TZif v2 image with a single standard-time type, no

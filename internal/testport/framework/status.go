@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -22,6 +23,14 @@ type StatusRow struct {
 	PassRequired string
 	DeferredTo   string
 	Rationale    string
+	// MismatchLines / ExpectedLines come from the OPTIONAL columns
+	// `mismatch_lines` / `expected_lines` (blank when absent). They are set
+	// only on `regress-sql` rows: mismatch = expected-side `-` lines of the
+	// unified diff between the normalised expected .out and goopg's output;
+	// expected = line count of the normalised expected .out. Maintained by
+	// cmd/regress-mismatch-update.
+	MismatchLines string
+	ExpectedLines string
 }
 
 // validStatus is the unified status vocabulary. `pass`/`failed`/`not-tried`
@@ -95,6 +104,12 @@ func LoadStatusCSV(path string) ([]StatusRow, error) {
 			DeferredTo:   val("deferred_to"),
 			Rationale:    val("rationale"),
 		}
+		if _, ok := idx["mismatch_lines"]; ok {
+			row.MismatchLines = val("mismatch_lines")
+		}
+		if _, ok := idx["expected_lines"]; ok {
+			row.ExpectedLines = val("expected_lines")
+		}
 		if row.ItemPath == "" {
 			return nil, fmt.Errorf("csv %q row %d: item_path is empty", path, rowNum)
 		}
@@ -143,6 +158,36 @@ func ValidateStatusRows(rows []StatusRow) error {
 		if r.Status == "port" && !testFuncRe.MatchString(r.Rationale) {
 			return fmt.Errorf("row %d (%s): port rationale must name a TestPort_*/TestE2E_* func", rowNum, label)
 		}
+		if err := validateMismatchCounts(r); err != nil {
+			return fmt.Errorf("row %d (%s): %w", rowNum, label, err)
+		}
+	}
+	return nil
+}
+
+// validateMismatchCounts checks the optional mismatch_lines/expected_lines
+// pair: each blank or a non-negative integer, set both-or-neither, only on
+// `regress-sql` rows, and mismatch <= expected.
+func validateMismatchCounts(r StatusRow) error {
+	if r.MismatchLines == "" && r.ExpectedLines == "" {
+		return nil
+	}
+	if r.SuiteID != "regress-sql" {
+		return fmt.Errorf("mismatch_lines/expected_lines set on non-regress-sql row (suite_id %q)", r.SuiteID)
+	}
+	if r.MismatchLines == "" || r.ExpectedLines == "" {
+		return fmt.Errorf("mismatch_lines and expected_lines must be set together (got %q/%q)", r.MismatchLines, r.ExpectedLines)
+	}
+	m, err := strconv.Atoi(r.MismatchLines)
+	if err != nil || m < 0 {
+		return fmt.Errorf("mismatch_lines %q is not a non-negative integer", r.MismatchLines)
+	}
+	e, err := strconv.Atoi(r.ExpectedLines)
+	if err != nil || e < 0 {
+		return fmt.Errorf("expected_lines %q is not a non-negative integer", r.ExpectedLines)
+	}
+	if m > e {
+		return fmt.Errorf("mismatch_lines %d exceeds expected_lines %d", m, e)
 	}
 	return nil
 }

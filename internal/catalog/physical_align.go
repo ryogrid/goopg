@@ -16,10 +16,35 @@ import "strings"
 // wire. Both callers now share this function so the two paths cannot drift
 // again (review/260831-2, new finding XL-5).
 func PhysicalTypeAlign(t Type, tname string) int {
-	// All array columns store a varlena ArrayType blob → PG 'i' (4-byte) align.
-	// M0118-0002.
+	// An array column stores a varlena ArrayType blob whose typalign is its
+	// element's: 'd' (8) for an 8-aligned element type, else 'i' (4) — e.g.
+	// _int8, _float8, _timestamptz, _interval are typalign 'd' in pg_type.dat.
+	// It had been 4 for every array (M0118-0002), which a hosted PG mis-reads
+	// whenever the pad byte lands off an 8-byte boundary. M0149-0001g slice 14
+	// (TestPhysicalTypeAlignMatchesPostgresBKI).
 	if t.IsArray {
+		if PhysicalTypeAlign(Type{Name: tname}, tname) == 8 || doubleAlignedArrayElem[tname] {
+			return 8
+		}
 		return 4
+	}
+	if doubleAlignedVarlena[tname] {
+		return 8
+	}
+	// point/lseg/box/line/circle are typalign 'd' and tid 's' once stored in
+	// PG's fixed-length form; a cluster without the capability keeps the
+	// varlena 'i' default below. M0149-0001k.
+	if tname == "aclitem" && FixedLengthAclItem() {
+		return 8 // AclItem: typlen 16, typalign 'd'. M0149-0001k2.
+	}
+	if tname == "money" && FixedLengthMoney() {
+		return 8 // Cash: typlen 8, typalign 'd'. M0149-0001k1.
+	}
+	if isFixedGeoTidName(tname) && FixedLengthGeoTid() {
+		if tname == "tid" {
+			return 2
+		}
+		return 8
 	}
 	switch tname {
 	case "bool", "boolean":
@@ -49,8 +74,17 @@ func PhysicalTypeAlign(t Type, tname string) int {
 		// exceed a Datum but carry no field wider than a byte. M0119-0006.
 		"uuid":
 		return 1 // PG 'c' alignment (fixed-size, 1-byte aligned)
-	case "aclitem[]", "_aclitem", "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "char[]", "_char", "float4[]", "_float4", "pg_node_tree", "oidvector", "int2vector":
+	case "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "char[]", "_char", "float4[]", "_float4", "pg_node_tree", "oidvector", "int2vector":
 		return 4 // PG 'i' alignment for varlena ArrayType / pg_node_tree / oidvector / int2vector
+	case "aclitem[]", "_aclitem":
+		// _aclitem (OID 1034) is typalign 'd' since PG 16 made AclMode 64-bit
+		// (pg_type.dat: aclitem typalign 'd'). 4-byte padding left a zero byte
+		// that a hosted PG's att_align_pointer took as alignment padding and
+		// skipped to the next 8-byte boundary, landing inside the array header:
+		// reading a non-NULL proacl asserted in slot_deform_heap_tuple
+		// (execTuples.c). Sibling of initdb.pgTypeAlignChar(1034).
+		// M0149-0001g slice 13.
+		return 8
 	case "anyarray":
 		// anyarray (OID 2277) is typalign='d' — 8 bytes, NOT the 'i' every
 		// other varlena array uses (postgres/src/include/catalog/pg_type.dat:573).
@@ -112,6 +146,17 @@ func PhysicalTypeIsVarlena(t Type) bool {
 		"float8", "double precision", "double",
 		"xid", "xid8":
 		return false
+	case "point", "lseg", "box", "line", "circle", "tid":
+		// Fixed-length only in a cluster with the fixed_length_geometric_tid
+		// capability (fixed_length_geo_tid.go). M0149-0001k.
+		return !FixedLengthGeoTid()
+	case "money":
+		// 8-byte Cash only with the fixed_length_money capability. M0149-0001k1.
+		return !FixedLengthMoney()
+	case "aclitem":
+		// 16-byte AclItem only with the fixed_length_aclitem capability.
+		// M0149-0001k2.
+		return !FixedLengthAclItem()
 	default:
 		return true
 	}
@@ -152,4 +197,24 @@ func alignPhysical(off, align int) int {
 // hold the lowercased type name.
 func PhysicalTypeAlignName(t Type) int {
 	return PhysicalTypeAlign(t, strings.ToLower(t.Name))
+}
+
+// doubleAlignedVarlena lists the varlena types (typlen -1) pg_type.dat declares
+// typalign 'd', besides anyarray/_aclitem above: ranges and multiranges over
+// 8-byte subtypes, the geometric path/polygon, and the snapshot types. Their
+// arrays are 'd' too. M0149-0001g slice 14.
+var doubleAlignedVarlena = map[string]bool{
+	"int8range": true, "tsrange": true, "tstzrange": true,
+	"int8multirange": true, "tsmultirange": true, "tstzmultirange": true,
+	"path": true, "polygon": true,
+	"pg_snapshot": true, "txid_snapshot": true,
+}
+
+// doubleAlignedArrayElem lists fixed-length typalign-'d' element types whose
+// scalar goopg does not yet store in PG's fixed-length form (so the scalar's
+// alignment is left alone — see the oracle test's knownScalarGaps) but whose
+// ARRAY form is a 'd' varlena in pg_type.dat.
+var doubleAlignedArrayElem = map[string]bool{
+	"point": true, "box": true, "lseg": true, "line": true, "circle": true,
+	"money": true, "aclitem": true,
 }

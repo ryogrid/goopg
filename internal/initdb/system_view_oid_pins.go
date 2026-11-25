@@ -33,6 +33,8 @@
 
 package initdb
 
+import "github.com/goopg/goopg/internal/catalog"
+
 // The oracle this table was captured from. A guard test compares this
 // against the PG version the tree pins (config.PGVersionString /
 // catalog-version constant); a mismatch is a hard failure whose fix is to
@@ -434,4 +436,24 @@ func pinnedSystemViewOIDs() map[uint32]string {
 		out[p.RuleOID] = "information_schema." + p.ViewName + "._RETURN"
 	}
 	return out
+}
+
+// Virtual pg_catalog views registered without an OID take their pinned OID
+// (catalog.builtinCatalogRelOID), never a user-range one (M0149-0077f).
+func init() {
+	catalog.SystemRelOIDResolver = func(schema, name string) uint32 {
+		switch schema {
+		case "pg_catalog":
+			if p, ok := systemViewOIDPinByName(name); ok {
+				return p.ViewOID
+			}
+		case "information_schema":
+			for _, p := range informationSchemaViewOIDPins() {
+				if p.ViewName == name {
+					return p.ViewOID
+				}
+			}
+		}
+		return 0
+	}
 }

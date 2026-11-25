@@ -39,7 +39,8 @@ func TestEncodeHeapPruneOptPGRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatalf("decoded record missing block 0")
 	}
-	if block.Rel != rel || block.Block != 7 {
+	// WAL names the canonical database OID (storage.StorageDBOid).
+	if block.Rel != rel.Canonical() || block.Block != 7 {
 		t.Fatalf("block ref rel/blk = %+v/%d", block.Rel, block.Block)
 	}
 

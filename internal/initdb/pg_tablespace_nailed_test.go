@@ -108,7 +108,7 @@ func TestNailedSharedRelsContainsPgTablespaceIndexes(t *testing.T) {
 func TestPgTablespaceIndexInitialEntries(t *testing.T) {
 	const (
 		oidOpsID   uint32 = 1981
-		nameOpsID  uint32 = 1986
+		nameOpsID  uint32 = 10028
 		cCollation uint32 = 950
 	)
 	type want struct {

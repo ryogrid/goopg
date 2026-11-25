@@ -17,6 +17,11 @@ type Record struct {
 	EndLSN   uint64
 	Payload  []byte
 	XLog     *XLogDecodedRecord
+	// OverwrittenRecPtr is xlogreader.c's overwrittenRecPtr: set on the
+	// first record read after the reader dropped a partial record (whose
+	// 0-based start this is) at an XLP_FIRST_IS_OVERWRITE_CONTRECORD page.
+	// Replay of the XLOG_OVERWRITE_CONTRECORD there verifies it.
+	OverwrittenRecPtr uint64
 }
 
 // readAllUncached decodes every record found under walDir across ordered
@@ -60,7 +65,7 @@ func readAllUncached(walDir string, segmentSize int64) ([]Record, error) {
 		segmentSize = detectSegmentSizeAt(walDir, firstSegNo)
 	}
 	if segmentSize <= 0 {
-		segmentSize = DefaultSegmentSize
+		segmentSize = WALSegmentSize()
 	}
 
 	stream, err := readStreamFrom(walDir, segmentSize, firstSegNo)
@@ -101,6 +106,7 @@ func readAllUncached(walDir string, segmentSize int64) ([]Record, error) {
 // LSN-as-byte-offset semantics.
 func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record, error) {
 	var records []Record
+	var overwritten uint64 // M0149-0017b: start of a dropped partial record
 	off := 0
 
 	// M0131-S19: every page header this walk crosses is validated against the
@@ -240,6 +246,17 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		if isZeroXLogRecordHeader(header) {
 			break
 		}
+		// M0149-0017b: a continuation replaced by XLOG_OVERWRITE_CONTRECORD
+		// drops the partial record; reading restarts at the flagged page
+		// (xlogreader.c), and the next record carries its start. Checked on
+		// the raw xl_tot_len, before header validation.
+		// pos is relative to the stream start; the page addresses and the
+		// dropped record's LSN are absolute (baseOffset is segment-aligned).
+		if next, ok := overwritePageWithin(stream, off, int64(baseOffset)+pos, int(binary.LittleEndian.Uint32(header[0:4])), segSize); ok {
+			overwritten = baseOffset + uint64(off)
+			off = next
+			continue
+		}
 		h, err := DecodeXLogRecordHeader(header)
 		if err != nil {
 			// M0088-0001: see ReadAll. Page-aware path uses
@@ -314,10 +331,26 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		}
 		start := baseOffset + uint64(off) + 1
 		end := baseOffset + uint64(off) + uint64(consumed)
-		records = append(records, Record{StartLSN: start, EndLSN: end, Payload: decoded.Payload, XLog: decoded.XLog})
+		records = append(records, Record{StartLSN: start, EndLSN: end, Payload: decoded.Payload, XLog: decoded.XLog, OverwrittenRecPtr: overwritten})
+		overwritten = 0
 		off += consumed
+		// An XLOG_SWITCH record ends its segment: the next record starts at
+		// the next segment boundary (XLogDecodeNextRecord, xlogreader.c).
+		// baseOffset is a whole multiple of segSize, so the boundary is
+		// stream-relative too. M0149-0076.
+		if isXLogSwitchHeader(h) && segSize > 0 {
+			if rem := int64(off) % segSize; rem != 0 {
+				off += int(segSize - rem)
+			}
+		}
 	}
 	return records, early
+}
+
+// isXLogSwitchHeader reports whether h is an RM_XLOG_ID / XLOG_SWITCH record
+// header.
+func isXLogSwitchHeader(h XLogRecord) bool {
+	return h.Rmid == RmgrXLog && h.Info&0xF0 == xlogXLogSwitch
 }
 
 // (afterCorruptIsZeroTail was removed in A9 with the legacy ReadAll walk; the

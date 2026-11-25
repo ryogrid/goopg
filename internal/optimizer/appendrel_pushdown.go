@@ -109,27 +109,37 @@ func appendRelMembers(top *SetOp) ([]appendRelMember, bool) {
 		if s, ok := n.(*SetOp); ok && (s == top || (s.All && s.RTID == 0 && s.AppendRelName == "")) {
 			return visit(s.Left) && visit(s.Right)
 		}
-		var path []*Project
-		cur := n
-		for len(path) < 2 {
-			p, ok := cur.(*Project)
-			if !ok {
-				break
-			}
-			path = append(path, p)
-			cur = p.Child
-		}
-		scan, ok := cur.(*SeqScan)
-		if !ok || len(path) == 0 {
+		m, ok := appendRelMemberOf(n)
+		if !ok {
 			return false
 		}
-		out = append(out, appendRelMember{attach: path[len(path)-1], scan: scan, path: path})
+		out = append(out, m)
 		return true
 	}
 	if !visit(top) {
 		return nil, false
 	}
 	return out, true
+}
+
+// appendRelMemberOf resolves one member root
+// `Project(tableoid) [→ Project(remap)] → SeqScan`.
+func appendRelMemberOf(n Node) (appendRelMember, bool) {
+	var path []*Project
+	cur := n
+	for len(path) < 2 {
+		p, ok := cur.(*Project)
+		if !ok {
+			break
+		}
+		path = append(path, p)
+		cur = p.Child
+	}
+	scan, ok := cur.(*SeqScan)
+	if !ok || len(path) == 0 {
+		return appendRelMember{}, false
+	}
+	return appendRelMember{attach: path[len(path)-1], scan: scan, path: path}, true
 }
 
 // pushFilterIntoAppendRelMembers moves every translatable conjunct of f
@@ -142,11 +152,17 @@ func pushFilterIntoAppendRelMembers(f *Filter, top *SetOp) {
 	if !ok || len(members) == 0 {
 		return
 	}
+	pushFilterIntoMembers(f, top.Output(), members)
+}
+
+// pushFilterIntoMembers is pushFilterIntoAppendRelMembers over an explicit
+// member list whose roots emit out (the appendrel's output layout).
+func pushFilterIntoMembers(f *Filter, out Schema, members []appendRelMember) {
 	conjuncts := splitAnd(f.Predicate)
 	perMember := make([][]Expr, len(members))
 	var kept []Expr
 	for _, c := range conjuncts {
-		if !appendRelConjunctPushable(c, top.Output()) {
+		if !appendRelConjunctPushable(c, out) {
 			kept = append(kept, c)
 			continue
 		}

@@ -2,6 +2,7 @@ package executor
 
 import (
 	"container/heap"
+	"fmt"
 	"io"
 	"os"
 	"sort"
@@ -85,6 +86,11 @@ func (o *valuesOp) Open(ctx *Context) error {
 	o.idx = 0
 	if o.plan != nil && o.plan.VirtualSource != nil {
 		tbl := o.plan.VirtualSource
+		// A virtual catalog PG revokes from PUBLIC (pg_authid) is checked
+		// like a heap scan of it would be.
+		if isPublicRevokedCatalog(tbl) && !dmlPrivilegePermitted(ctx, tbl, "SELECT") {
+			return &ExecError{Code: "42501", Pos: o.plan.Pos(), Message: fmt.Sprintf("permission denied for table %s", tbl.Name)}
+		}
 		// pg_prepared_statements is session-specific: use the per-connection
 		// lister when available rather than the static empty VirtualRows.
 		if tbl.Name == "pg_prepared_statements" && ctx != nil && ctx.PrepStmtsRows != nil {
@@ -106,6 +112,9 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// database-scoped lister so an extension installed in one database
 			// is invisible in another. M0110-0003 (AC-002 gap #7c).
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.ExtensionRows())
+		} else if tbl.Name == "pg_timezone_abbrevs" && tbl.Schema == "pg_catalog" && ctx != nil {
+			// pg_timezone_abbrevs_zone reads the session's TimeZone.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, catalog.TimezoneAbbrevRows(timeZoneFromCtx(ctx), abbrevSetFromCtx(ctx)))
 		} else if tbl.Name == "pg_stat_slru" && ctx != nil {
 			// pg_stat_slru reports live cumulative SLRU statistics (notify
 			// blks_zeroed) honouring the session's stats_fetch_consistency, which

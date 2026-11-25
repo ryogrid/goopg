@@ -140,3 +140,36 @@ Steps 3cw / 3cx / 3cz if it's missing.
   `TestPgTypeRowEmbedsCanonicalIORegprocOIDs` regression pin.
 - `docs/design/0106-0010-step3da-pg-type-io-regproc-oids.md` (this
   file) + index update in `docs/design/README.md`.
+
+## Follow-up: typmodin / typmodout / typanalyze (M0149-0001h1a15)
+
+Step 3da filled the four I/O regprocs. The other regproc columns stayed 0:
+
+- `typmodin` and `typmodout` (20 rows);
+- `typanalyze` (105 rows).
+
+Some non-regproc columns also differed from PG:
+
+- `typcollation` for pg\_node\_tree, pg\_ndistinct, pg\_dependencies,
+  pg\_mcv\_list and the two BRIN summary types;
+- record's `typarray`;
+- the information\_schema `time_stamp` domain's `typdefault`.
+
+These are not hand-written. `scripts/gen-pg-type-support-procs.py` captures
+them from a throwaway PG 18.3 initdb into
+`internal/initdb/pg_type_support_generated.go`, a table keyed by OID.
+`pgTypeRow` reads that table. After the change, every column of every
+pg\_type row with OID < 16384 is identical to the PG 18.3 oracle.
+
+User types follow the same genbki / `TypeCreate` rules
+(`pg18_user_catalog_rows.go`):
+
+| type | typanalyze | typsubscript |
+|---|---|---|
+| any array type | array\_typanalyze | array\_subscript\_handler |
+| range | range\_typanalyze | 0 |
+| multirange | multirange\_typanalyze | 0 |
+| enum, composite | 0 | 0 |
+| domain | the base type's (`DefineDomain`) | the base type's |
+
+Regress type\_sanity 82→62 and create\_type 115→112.

@@ -300,8 +300,14 @@ type SelectIntoStmt struct {
 func (s *SelectIntoStmt) Pos() int          { return s.pos }
 func (s *SelectIntoStmt) plpgsqlStmtNode() {}
 
+// SQLStateConditionPrefix marks an ExceptionHandler condition written as
+// `SQLSTATE 'xxxxx'`; the five-character code follows the prefix. Any other
+// condition is a condition name (plerrcodes.h) or OTHERS.
+const SQLStateConditionPrefix = "sqlstate:"
+
 // ExceptionHandler is one WHEN clause in an EXCEPTION block.
-// Conditions are SQLSTATE codes or condition names. M0097-0012.
+// Conditions are condition names, OTHERS, or SQLStateConditionPrefix+code.
+// M0097-0012.
 type ExceptionHandler struct {
 	Conditions []string
 	Body       []Stmt
@@ -338,8 +344,20 @@ func (e *ExecuteStmt) plpgsqlStmtNode() {}
 type RaiseStmt struct {
 	pos           int
 	Level         string // "notice", "warning", "error"
-	Msg           string // static message text (format substitution deferred)
+	Msg           string // format string and its arguments (raw text), "" when absent
 	ConditionName string // set when RAISE condition_name (not a level keyword)
+	SQLState      string // set when RAISE SQLSTATE 'xxxxx'
+	// Options are the USING clause's `name = expr` items in source order
+	// (pl_gram.y raise_using); Name is upper-case.
+	Options []RaiseOption
+	// ReRaise marks a bare `RAISE;` (re-throw the error being handled).
+	ReRaise bool
+}
+
+// RaiseOption is one `USING name = expr` item of a RAISE statement.
+type RaiseOption struct {
+	Name string // MESSAGE, DETAIL, HINT, ERRCODE, COLUMN, CONSTRAINT, DATATYPE, TABLE, SCHEMA
+	Expr string // expression source text
 }
 
 func (r *RaiseStmt) Pos() int          { return r.pos }

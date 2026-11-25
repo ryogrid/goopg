@@ -35,8 +35,11 @@ func TestEstimateIndexGeometryReadsFileInCatalogDatabase(t *testing.T) {
 	if pages, _, _ := estimateIndexGeometry(c, idx, tbl, 18000); pages != 52 {
 		t.Errorf("with the catalog: %v index pages, want the real 52", pages)
 	}
-	if pages, _, _ := estimateIndexGeometry(nil, idx, tbl, 18000); pages == 52 {
-		t.Errorf("without the catalog the default-database lookup found the file; the case no longer reproduces")
+	// Since M0149-0001a1 S3 the postgres namespace key is its storage OID
+	// (5), so the default-database lookup finds the file as well; before S3 it
+	// looked under base/1 and missed.
+	if pages, _, _ := estimateIndexGeometry(nil, idx, tbl, 18000); pages != 52 {
+		t.Errorf("without the catalog: %v index pages, want 52 (namespace = storage since S3)", pages)
 	}
 }
 
@@ -82,7 +85,8 @@ func TestUpperSplitWorkersSizeOnCatalogDatabase(t *testing.T) {
 	if withCat != want || withCat == 0 {
 		t.Errorf("with the catalog: %d workers, want %d (index-only scan sized on its 30000-page index)", withCat, want)
 	}
-	if without == withCat {
-		t.Errorf("without the catalog the count is also %d; the default-database miss no longer reproduces", without)
+	// Namespace = storage since M0149-0001a1 S3: both lookups size the index.
+	if without != withCat {
+		t.Errorf("without the catalog: %d workers, want %d (namespace = storage since S3)", without, withCat)
 	}
 }

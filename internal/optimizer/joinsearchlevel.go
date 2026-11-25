@@ -717,5 +717,10 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 	if err := s.builder.addPaths(joinrel, rel2, rel1, clauses, sjinfo); err != nil {
 		return nil, err
 	}
+	// try_partitionwise_join (joinrels.c), after the whole-rel paths, as
+	// populate_joinrel_with_paths does (M0148-0001c3a9).
+	if err := s.tryPartitionwiseJoin(joinrel, rel1, rel2, clauses, sjinfo); err != nil {
+		return nil, err
+	}
 	return joinrel, nil
 }

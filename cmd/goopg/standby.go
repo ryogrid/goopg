@@ -24,9 +24,11 @@ import (
 
 	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/postmaster"
 	"github.com/goopg/goopg/internal/replication"
+	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/utils/misc"
 )
 
@@ -48,7 +50,7 @@ const drainPollInterval = 10 * time.Millisecond
 const drainTimeout = 5 * time.Second
 
 // promoteSignalPollInterval is how often the standby checks for the
-// presence of `<datadir>/promote.signal`. 250 ms matches PG's
+// presence of `<datadir>/promote`. 250 ms matches PG's
 // `min_recovery_apply_delay` granularity; faster is wasted poll
 // traffic on idle standbys, slower makes M0102 E2E tests sluggish.
 const promoteSignalPollInterval = 250 * time.Millisecond
@@ -63,6 +65,9 @@ type standbyController struct {
 	// recoveryEndCommand reads recovery_end_command (PGC_SIGHUP) at
 	// promotion time; nil reads as empty (M0122-0013).
 	recoveryEndCommand func() string
+	// restoreCommand reads restore_command (PGC_SIGHUP): promotion probes
+	// the archive for timelines a sibling already took (M0149-0018c).
+	restoreCommand func() string
 
 	receiverCancel context.CancelFunc
 	receiverDone   chan struct{}
@@ -80,7 +85,7 @@ type standbyController struct {
 	neverConsistent bool
 	consistent      atomic.Bool
 
-	// signalCancel cancels the promote.signal poller goroutine.
+	// signalCancel cancels the promote signal file poller goroutine.
 	// Close cancels it explicitly; a successful Promote also
 	// returns from the watcher loop on its own.
 	signalCancel context.CancelFunc
@@ -96,6 +101,11 @@ type standbyController struct {
 	promoting  atomic.Bool
 	promoteErr atomic.Pointer[error]
 	promoted   atomic.Bool
+	// promoteTriggered: Promote was called (PromoteIsTriggered). M0149-0013.
+	promoteTriggered atomic.Bool
+	// onRecoveredPrepared hands the prepared transactions restored at
+	// promotion to the running server (Server.AddRecoveredPrepared).
+	onRecoveredPrepared atomic.Pointer[func([]initdb.RecoveredPrepared)]
 
 	// lastReceived is the highest WAL position a walreceiver reported. PG's
 	// pg_last_wal_receive_lsn keeps answering WalRcv->flushedUpto after the
@@ -174,7 +184,25 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 	rplDone := make(chan struct{})
 	sigDone := make(chan struct{})
 
-	replayer := startStandbyReplayer(rplCtx, rplDone, rt, logger)
+	// read_backup_label (InitWalRecovery) for a standby: recovery starts at
+	// the label's redo, not pg_control's checkpoint, which a low-level
+	// backup copies last. With an empty pg_wal the writer — and with it the
+	// archive feeder and the replayer — would start at 0 (M0149-0021a).
+	startStandbyFromBackupLabel(rt, logger)
+
+	// M0149-0012: hot-standby snapshots see a primary transaction only once
+	// its replayed commit has stamped the commit log.
+	if rt.TxnMgr != nil {
+		rt.TxnMgr.SetInRecovery(true)
+	}
+	// M0149-0023b: a recovery target stops continuous replay there, and
+	// recovery_target_action decides what follows (PerformWalRecovery).
+	var scRef atomic.Pointer[standbyController]
+	replayer := startStandbyReplayer(rplCtx, rplDone, rt, logger, standbyRecoveryTarget(registry, logger, &scRef))
+	// M0149-0013: recovery_min_apply_delay (SIGHUP; re-read per commit).
+	replayer.SetApplyDelay(func() time.Duration {
+		return time.Duration(intGUC(registry, "recovery_min_apply_delay", 0)) * time.Millisecond
+	})
 	// Recovery flushes become restartpoints: the checkpointer adopts the
 	// last checkpoint record replay applied into pg_control
 	// (CreateRestartPoint), so a restarted standby replays from there.
@@ -190,28 +218,19 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 		systemID, _ = initdb.LoadOrCreateSystemID(rt.DataDir)
 		rcvWALDir = walDirFor(rt)
 	}
-	replication.StartWalReceiver(rcvCtx, rcvDone, replication.WalReceiverLauncherConfig{
-		WAL:          rt.WAL,
-		Receivers:    rt.WalReceivers,
-		Registry:     registry,
-		Logger:       logger,
-		ApplyLSNFunc: standbyApplyLSNFunc(replayer),
-		SystemID:     systemID,
-		WALDir:       rcvWALDir,
-		OnEndOfTimeline: func(eot *replication.EndOfTimeline) {
-			if rcvWALDir == "" {
-				return
-			}
-			if _, err := followUpstreamTimeline(rt.WAL, rcvWALDir, rt.DataDir, recoveryTargetTimeline(registry), logger); err != nil {
-				logger.Warn("standby: could not follow the upstream's timeline switch", "err", err)
-			}
-		},
-	})
+	// Without primary_conninfo, a standby with restore_command takes its
+	// WAL from the archive instead (M0149-0018b).
+	if stringGUC(registry, "primary_conninfo", "") == "" && stringGUC(registry, "restore_command", "") != "" {
+		go runArchiveFeeder(rcvCtx, rcvDone, rt, registry, logger)
+	} else {
+		startWalReceiverForStandby(rcvCtx, rcvDone, rt, registry, logger, replayer, systemID, rcvWALDir)
+	}
 
 	sc := &standbyController{
 		rt:                 rt,
 		logger:             logger,
 		recoveryEndCommand: func() string { return stringGUC(registry, "recovery_end_command", "") },
+		restoreCommand:     func() string { return stringGUC(registry, "restore_command", "") },
 		receiverCancel:     rcvCancel,
 		receiverDone:       rcvDone,
 		replayerCancel:     rplCancel,
@@ -222,7 +241,8 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 		walLevel:           walLevelEnum(stringGUC(registry, "wal_level", "replica")),
 	}
 	sc.consistentAt, sc.neverConsistent = recoveryConsistencyPoint(rt.DataDir)
-	// Clear any stale promote.signal left by a previous run before
+	scRef.Store(sc)
+	// Clear any stale promote signal file left by a previous run before
 	// starting the watcher. Upstream's xlogrecovery.c initialises
 	// the trigger state in StartupXLOG before the replay loop ever
 	// calls CheckForStandbyTrigger; a residual file would otherwise
@@ -231,7 +251,7 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 	if rt.DataDir != "" {
 		path := filepath.Join(rt.DataDir, initdb.PromoteSignalFile)
 		if err := os.Remove(path); err == nil {
-			logger.Warn("removed stale promote.signal at standby startup",
+			logger.Warn("removed stale promote signal file at standby startup",
 				"path", path)
 		}
 	}
@@ -270,6 +290,12 @@ func standbyApplyLSNFunc(replayer *xlog.StreamReplayer) func() uint64 {
 // runs the sequence again (steps 1-2 are idempotent — the receiver
 // context stays cancelled and its done channel stays closed).
 func (sc *standbyController) Promote(ctx context.Context) error {
+	// CheckForStandbyTrigger: a promotion ends a replay pause and an apply
+	// delay (recoveryPausesHere, recoveryApplyDelay). M0149-0013.
+	sc.promoteTriggered.Store(true)
+	if sc.replayer != nil {
+		sc.replayer.TriggerPromote()
+	}
 	if sc.promoted.Load() {
 		return nil
 	}
@@ -280,7 +306,7 @@ func (sc *standbyController) Promote(ctx context.Context) error {
 	// a promote that returned an error (drain timeout, cancelled
 	// context) leaves the node a standby, and the operator must be
 	// able to try again. Leaving the flag set wedged every later
-	// PROMOTE — control socket and promote.signal alike — behind a
+	// PROMOTE — control socket and promote signal file alike — behind a
 	// misleading "already in progress" (review/260831-2 CM-1).
 	defer sc.promoting.Store(false)
 	// A promote may have completed between the two loads above.
@@ -291,8 +317,26 @@ func (sc *standbyController) Promote(ctx context.Context) error {
 	sc.promoteErr.Store(&err)
 	if err == nil {
 		sc.promoted.Store(true)
+		if sc.rt != nil && sc.rt.TxnMgr != nil {
+			sc.rt.TxnMgr.SetInRecovery(false)
+		}
 	}
 	return err
+}
+
+// restorePreparedAtPromotion is RecoverPreparedTransactions at the end of
+// recovery: every prepared transaction the standby replayed and has not seen
+// finished gets a dedicated proc slot holding its xid (and its subxacts),
+// and is handed to the server so COMMIT/ROLLBACK PREPARED can finish it.
+// M0149-0015b.
+func (sc *standbyController) restorePreparedAtPromotion() {
+	out := restoreReplayedPrepared(sc.rt, sc.logger, nil)
+	if len(out) == 0 {
+		return
+	}
+	if fn := sc.onRecoveredPrepared.Load(); fn != nil {
+		(*fn)(out)
+	}
 }
 
 func (sc *standbyController) runPromote(ctx context.Context) error {
@@ -390,12 +434,39 @@ func (sc *standbyController) finalizePromotion() error {
 		if err != nil {
 			return fmt.Errorf("promote: load timeline_id: %w", err)
 		}
+		// The timeline being promoted from is the one replay is on
+		// (StartupXLOG's recoveryTargetTLI). A standby that streamed onto
+		// its primary's newer timeline is on that one even when
+		// timeline_id was not rewritten, and the new history must chain
+		// through it (M0149-0015).
+		if sc.rt.WAL != nil && sc.rt.WAL.TimelineID() > oldTLI {
+			oldTLI = sc.rt.WAL.TimelineID()
+		}
 		walDir := walDirFor(sc.rt)
+		// A standby restarted after it had streamed onto a newer timeline
+		// replays that timeline's segments from pg_wal while timeline_id and
+		// the writer still name the older one; recovery is on the newer
+		// timeline (expectedTLEs, recovery_target_timeline = latest), and the
+		// new history must descend from it (M0149-0016).
+		if sc.rt.WAL != nil {
+			endLSN, _ := sc.endOfLog()
+			oldTLI = xlog.ReplayTimelineAt(walDir, endLSN, sc.rt.WAL.SegmentSize(), oldTLI)
+		}
 		// StartupXLOG: newTLI = findNewestTimeLine(recoveryTargetTLI) + 1.
 		// The walreceiver fetches the primary's history files, so a
 		// timeline the primary (or a sibling standby) already used is
 		// skipped instead of reused.
-		newTLI := xlog.FindNewestTimeline(walDir, oldTLI) + 1
+		// A standby restoring from the archive probes it too
+		// (existsTimeLineHistory under ArchiveRecoveryRequested): a
+		// sibling that promoted first has archived <tli>.history.
+		newestTLI := xlog.FindNewestTimeline(walDir, oldTLI)
+		if sc.restoreCommand != nil && sc.rt.WAL != nil {
+			if rc := sc.restoreCommand(); rc != "" {
+				newestTLI = max(newestTLI, xlog.FindNewestTimelineArchive(context.Background(), walDir, rc,
+					lastRestartPointFileName(sc.rt, sc.rt.WAL.SegmentSize()), oldTLI))
+			}
+		}
+		newTLI := newestTLI + 1
 
 		// The switch point is the end of the last record replay
 		// applied: received bytes past it are a partial record, which
@@ -436,12 +507,20 @@ func (sc *standbyController) finalizePromotion() error {
 		sc.logger.Info("promote: timeline bumped",
 			"old_tli", oldTLI, "new_tli", newTLI, "switch_lsn", endLSN,
 			"history_file", filepath.Join(walDir, xlog.TimelineHistoryFileName(newTLI)))
+		// writeTimeLineHistory: XLogArchiveNotify(histfname) — the new
+		// timeline's history file is archived too (M0149-0018a).
+		walArchiver.Notify(xlog.TimelineHistoryFileName(newTLI))
 	}
 
 	if err := initdb.RemoveStandbySignal(sc.rt.DataDir); err != nil {
 		return fmt.Errorf("promote: remove standby.signal: %w", err)
 	}
 	sc.rt.Standby = false
+	// exitArchiveRecovery: the files archive recovery restored into are
+	// removed once it ends.
+	removeRecoveryFiles(walDirFor(sc.rt))
+	// Out of recovery: with archive_mode = on the archiver starts now.
+	walArchiver.Wakeup()
 	// Recovery-mode checkpoints intentionally avoid creating local WAL. Once
 	// promotion completes this runtime owns its timeline again, so restore the
 	// normal checkpoint path before accepting primary writes.
@@ -460,6 +539,15 @@ func (sc *standbyController) finalizePromotion() error {
 	}
 	if err := runRecoveryEndCommand(sc.rt, endCmd, sc.logger); err != nil {
 		return fmt.Errorf("promote: %w", err)
+	}
+	// RecoverPreparedTransactions runs before StartupXLOG ends recovery:
+	// the prepared transactions replay kept are back in progress, and
+	// finishable, before pg_control says DB_IN_PRODUCTION — which is when
+	// pg_ctl promote returns — and before recovery snapshots end, after
+	// which an xid with no clog status below a snapshot's xmin would read as
+	// committed. M0149-0015b.
+	if sc.rt.TxnMgr != nil {
+		sc.restorePreparedAtPromotion()
 	}
 	// Recovery is over: pg_control leaves DB_IN_ARCHIVE_RECOVERY for
 	// DB_IN_PRODUCTION, as the end of StartupXLOG stamps it after promotion
@@ -527,7 +615,7 @@ func (sc *standbyController) Close() {
 	}
 }
 
-// promoteSignalWatcher polls for `<DataDir>/promote.signal` at
+// promoteSignalWatcher polls for `<DataDir>/promote` at
 // promoteSignalPollInterval and triggers Promote(ctx) when the file
 // appears. Mirrors upstream's `CheckForStandbyTrigger` in
 // `postgres/src/backend/access/transam/xlogrecovery.c`, which checks
@@ -563,13 +651,13 @@ func (sc *standbyController) promoteSignalWatcher(ctx context.Context) {
 			// do not block the Promote call — if removal fails the
 			// next loop iteration will re-fire.
 			if rmErr := os.Remove(path); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-				sc.logger.Warn("promote.signal removal failed",
+				sc.logger.Warn("promote signal file removal failed",
 					"path", path, "err", rmErr)
 			}
-			sc.logger.Info("promote.signal detected; triggering Promote",
+			sc.logger.Info("promote signal file detected; triggering Promote",
 				"path", path)
 			if err := sc.Promote(ctx); err != nil {
-				sc.logger.Error("promote.signal triggered Promote failed",
+				sc.logger.Error("promote signal file triggered Promote failed",
 					"err", err)
 			}
 			return
@@ -749,12 +837,19 @@ func appendEndOfRecoveryRecord(rt *initdb.Runtime, oldTLI, newTLI uint32, walLev
 // append up to the timeline's begin, switch the writer onto it there, go on.
 // The switch zero-fills the new timeline's copy of the segment past its
 // begin (copySegmentPrefix), so those restored bytes are read before it.
-func adoptRestoredWAL(rt *initdb.Runtime, endOfLog uint64, timelines []xlog.TimelineSpan) error {
+func adoptRestoredWAL(rt *initdb.Runtime, startOfLog, endOfLog uint64, timelines []xlog.TimelineSpan) error {
 	if rt.WAL == nil || endOfLog <= rt.WAL.WrittenLSN() {
 		return nil
 	}
 	walDir := walDirFor(rt)
 	segSize := uint64(rt.WAL.SegmentSize())
+	// An empty pg_wal (a low-level backup's): the WAL begins at the first
+	// restored segment, the backup's redo segment, not at 0.
+	if rt.WAL.WrittenLSN() == 0 && startOfLog >= segSize {
+		if err := rt.WAL.StartAt(startOfLog / segSize * segSize); err != nil {
+			return fmt.Errorf("adopt restored WAL: %w", err)
+		}
+	}
 	readRestored := func(a, b uint64) ([]byte, error) {
 		segNo, off := a/segSize, a%segSize
 		name, ok, err := xlog.NewestSegmentPath(walDir, segNo)
@@ -789,8 +884,16 @@ func adoptRestoredWAL(rt *initdb.Runtime, endOfLog uint64, timelines []xlog.Time
 		}
 		return nil
 	}
-	for _, sp := range timelines {
+	for i, sp := range timelines {
 		if sp.TLI <= rt.WAL.TimelineID() || sp.Begin >= endOfLog {
+			continue
+		}
+		// A timeline whose child forked off before it began owns no WAL:
+		// a PITR that stopped short of its target timeline's own switch
+		// point writes that point-in-history as the child's switch point,
+		// and tliOfPointInHistory never lands on the empty span between
+		// (M0149-0027, 028_pitr_timelines).
+		if i+1 < len(timelines) && timelines[i+1].Begin <= sp.Begin {
 			continue
 		}
 		if sp.Begin < rt.WAL.WrittenLSN() {
@@ -885,7 +988,7 @@ func promoteAfterRecovery(rt *initdb.Runtime, end archiveRecoveryEnd, logger *sl
 		_, prevRecPtr = rt.WAL.InsertPosition()
 	}
 	if rec.EndOfLog > endLSN {
-		if err := adoptRestoredWAL(rt, rec.EndOfLog, rec.Timelines); err != nil {
+		if err := adoptRestoredWAL(rt, rec.StartOfLog, rec.EndOfLog, rec.Timelines); err != nil {
 			return fmt.Errorf("promote after recovery: %w", err)
 		}
 		endLSN, prevRecPtr = rec.EndOfLog, rec.LastStart-1
@@ -947,6 +1050,7 @@ func promoteAfterRecovery(rt *initdb.Runtime, end archiveRecoveryEnd, logger *sl
 	if err := initdb.RemoveRecoverySignal(rt.DataDir); err != nil {
 		return fmt.Errorf("promote after recovery: remove recovery.signal: %w", err)
 	}
+	walArchiver.Notify(xlog.TimelineHistoryFileName(newTLI))
 	logger.Info("archive recovery promotion complete",
 		"old_tli", oldTLI, "new_tli", newTLI, "switch_lsn", endLSN,
 		"history_file", filepath.Join(walDir, xlog.TimelineHistoryFileName(newTLI)))
@@ -1000,18 +1104,20 @@ func runRecoveryEndCommand(rt *initdb.Runtime, command string, logger *slog.Logg
 	if cd == nil {
 		return fmt.Errorf("recovery_end_command: pg_control missing")
 	}
-	segSize := xlog.DefaultSegmentSize
+	segSize := xlog.WALSegmentSize()
 	if rt.WAL != nil && rt.WAL.SegmentSize() > 0 {
 		segSize = rt.WAL.SegmentSize()
 	}
-	anySignal, err := xlog.ExecuteRecoveryCommand(command, "recovery_end_command", cd.CheckPointCopyRedo, cd.CheckPointCopyThisTLI, segSize)
+	anySignal, err := xlog.ExecuteRecoveryCommandIn(rt.DataDir, command, "recovery_end_command", cd.CheckPointCopyRedo, cd.CheckPointCopyThisTLI, segSize)
 	if err == nil {
 		return nil
 	}
 	if anySignal {
 		return err
 	}
-	logger.Warn("recovery_end_command failed", "err", err)
+	// ExecuteRecoveryCommand's WARNING (xlogarchive.c): the message is PG's
+	// `recovery_end_command "<command>": <wait_result_to_str>`.
+	logger.Warn(err.Error())
 	return nil
 }
 
@@ -1062,10 +1168,28 @@ func endInterruptedArchiveRecovery(rt *initdb.Runtime, err error, immediate bool
 		logger.Info("database system is shut down")
 		return 0
 	}
+	var recFatal *xlog.RecoveryFatalError
+	if errors.As(err, &recFatal) {
+		// ereport(FATAL) during archive recovery (xlog_redo): PG's message,
+		// detail and hint (M0149-0020).
+		logger.Log(context.Background(), xlog.LogLevelFatal, recFatal.Msg, "detail", recFatal.Detail, "hint", recFatal.Hint)
+		fmt.Fprintf(stderr, "goopg start: FATAL:  %s\nDETAIL:  %s\nHINT:  %s\n", recFatal.Msg, recFatal.Detail, recFatal.Hint)
+		return 1
+	}
 	fmt.Fprintf(stderr, "goopg start: FATAL: %v\n", err)
 	var fatal *xlog.RestoreFatalError
 	if errors.As(err, &fatal) && fatal.Detail != "" {
 		fmt.Fprintf(stderr, "DETAIL: %s\n", fatal.Detail)
+	}
+	// The server log carries it as PG's startup process does: FATAL, with
+	// its DETAIL (M0149-0023a: "recovery ended before configured recovery
+	// target was reached").
+	if errors.As(err, &fatal) {
+		if fatal.Detail != "" {
+			logger.Log(context.Background(), xlog.LogLevelFatal, fatal.Msg, "detail", fatal.Detail)
+		} else {
+			logger.Log(context.Background(), xlog.LogLevelFatal, fatal.Msg)
+		}
 	}
 	return 1
 }
@@ -1102,14 +1226,47 @@ func recoveryStop(registry *misc.Registry) xlog.RecoveryStop {
 	if xid, set, ok := misc.ParseRecoveryTargetXid(stringGUC(registry, "recovery_target_xid", "")); set && ok {
 		stop.Xid, stop.XidSet = xid, true
 	}
+	if name := stringGUC(registry, "recovery_target_name", ""); name != "" {
+		stop.Name, stop.NameSet = name, true
+	}
+	if stringGUC(registry, "recovery_target", "") == "immediate" {
+		stop.Immediate = true
+	}
+	if value := stringGUC(registry, "recovery_target_time", ""); value != "" {
+		// validateRecoveryParameters: timestamptz_in in the server's zone.
+		if t, err := executor.ParseTimestamptzText(value, stringGUC(registry, "timezone", "")); err == nil {
+			const pgEpochUnixMicros = 946684800 * 1000000
+			stop.Time, stop.TimeSet = t.UnixMicro()-pgEpochUnixMicros, true
+		}
+	}
 	return stop
+}
+
+// recoveryTargetTimeError is recovery_target_time's parse failure, which
+// PG's check hook reports as the startup FATAL `invalid value for parameter
+// "recovery_target_time"`; nil when the value is empty or parses.
+func recoveryTargetTimeError(registry *misc.Registry) error {
+	value := stringGUC(registry, "recovery_target_time", "")
+	if value == "" {
+		return nil
+	}
+	if _, err := executor.ParseTimestamptzText(value, stringGUC(registry, "timezone", "")); err != nil {
+		return fmt.Errorf(`invalid value for parameter "recovery_target_time": "%s"`, value)
+	}
+	return nil
 }
 
 // checkSingleRecoveryTarget is error_multiple_recovery_targets: at most one
 // recovery target may be set. PG raises it from the target GUCs' assign
 // hooks while the configuration loads, so the server does not start.
 func checkSingleRecoveryTarget(registry *misc.Registry) error {
-	if stringGUC(registry, "recovery_target_lsn", "") != "" && stringGUC(registry, "recovery_target_xid", "") != "" {
+	set := 0
+	for _, name := range []string{"recovery_target", "recovery_target_lsn", "recovery_target_name", "recovery_target_time", "recovery_target_xid"} {
+		if stringGUC(registry, name, "") != "" {
+			set++
+		}
+	}
+	if set > 1 {
 		return &xlog.RestoreFatalError{
 			Msg:    "multiple recovery targets specified",
 			Detail: `At most one of "recovery_target", "recovery_target_lsn", "recovery_target_name", "recovery_target_time", "recovery_target_xid" may be set.`,
@@ -1137,7 +1294,7 @@ func recoveryTargetAction(registry *misc.Registry) string {
 // written position, a PG position) is the earliest point the recovery can
 // stop at.
 func checkRecoveryTargetReached(stop xlog.RecoveryStop, res xlog.ArchiveRecoveryResult, localEnd uint64) error {
-	if !stop.Set && !stop.XidSet {
+	if !stop.Set && !stop.XidSet && !stop.NameSet && !stop.TimeSet && !stop.Immediate {
 		return nil
 	}
 	if !res.ReachedTarget {
@@ -1238,4 +1395,174 @@ func endInterruptedCrashRecovery(dataDir string, immediate bool, logger *slog.Lo
 	}
 	logger.Info("database system is shut down")
 	return 0
+}
+
+// recoveryPause serves pg_wal_replay_pause / pg_wal_replay_resume /
+// pg_get_wal_replay_pause_state (xlogfuncs.c) from the stream replayer's
+// pause state. M0149-0013.
+func (sc *standbyController) recoveryPause(action string) (string, bool) {
+	if sc.replayer == nil {
+		return "not paused", false
+	}
+	if sc.promoted.Load() || sc.promoteTriggered.Load() {
+		return sc.replayer.PauseState(), true
+	}
+	switch action {
+	case "pause":
+		sc.replayer.RequestPause()
+	case "resume":
+		sc.replayer.Resume()
+	}
+	return sc.replayer.PauseState(), false
+}
+
+// startWalReceiverForStandby starts the streaming walreceiver (the
+// XLOG_FROM_STREAM source).
+func startWalReceiverForStandby(rcvCtx context.Context, rcvDone chan struct{}, rt *initdb.Runtime, registry *misc.Registry, logger *slog.Logger, replayer *xlog.StreamReplayer, systemID uint64, rcvWALDir string) {
+	replication.StartWalReceiver(rcvCtx, rcvDone, replication.WalReceiverLauncherConfig{
+		WAL:          rt.WAL,
+		Receivers:    rt.WalReceivers,
+		Registry:     registry,
+		Logger:       logger,
+		ApplyLSNFunc: standbyApplyLSNFunc(replayer),
+		// M0149-0077i: hot_standby_feedback (SIGHUP, read per message) and
+		// GetReplicationHorizons for the 'h' message.
+		HSFeedbackFunc: func() (bool, uint32, uint32) {
+			if rt.TxnMgr == nil {
+				return false, 0, 0
+			}
+			xmin, catalogXmin := rt.TxnMgr.ReplicationHorizons()
+			return boolGUC(registry, "hot_standby_feedback", false), uint32(xmin), uint32(catalogXmin)
+		},
+		SystemID: systemID,
+		WALDir:   rcvWALDir,
+		OnEndOfTimeline: func(eot *replication.EndOfTimeline) {
+			if rcvWALDir == "" {
+				return
+			}
+			if _, err := followUpstreamTimeline(rt.WAL, rcvWALDir, rt.DataDir, recoveryTargetTimeline(registry), logger); err != nil {
+				logger.Warn("standby: could not follow the upstream's timeline switch", "err", err)
+			}
+		},
+	})
+}
+
+// removeRecoveryFiles drops pg_wal/RECOVERYXLOG and RECOVERYHISTORY, as
+// exitArchiveRecovery does at the end of archive recovery (M0149-0018c).
+func removeRecoveryFiles(walDir string) {
+	_ = os.Remove(filepath.Join(walDir, xlog.RecoveryXLogName))
+	_ = os.Remove(filepath.Join(walDir, xlog.RecoveryHistoryName))
+}
+
+// startStandbyFromBackupLabel applies backup_label to a standby's start: it
+// logs "starting backup recovery with redo LSN …", moves an empty WAL writer
+// to the label's redo segment (else pg_control's checkpoint redo segment) so
+// the archive feeder fetches and the replayer reads from there, and renames
+// the label to backup_label.old as StartupXLOG does once recovery has
+// started from it.
+func startStandbyFromBackupLabel(rt *initdb.Runtime, logger *slog.Logger) {
+	if rt == nil || rt.WAL == nil || rt.DataDir == "" {
+		return
+	}
+	label, haveLabel, err := xlog.ReadBackupLabel(rt.DataDir)
+	if err != nil {
+		logger.Warn(err.Error())
+		haveLabel = false
+	}
+	var redo uint64
+	if haveLabel {
+		redo = label.StartLSN
+		logger.Info(label.StartingBackupRecoveryMessage())
+	} else if cd, cerr := control.ReadControlFile(rt.DataDir); cerr == nil && cd != nil {
+		redo = cd.CheckPointCopyRedo
+	}
+	segSize := uint64(rt.WAL.SegmentSize())
+	if rt.WAL.WrittenLSN() == 0 && redo >= segSize {
+		if err := rt.WAL.StartAt(redo / segSize * segSize); err != nil {
+			logger.Warn("standby mode: could not position the WAL writer at the redo segment", "err", err)
+		}
+	}
+	if haveLabel {
+		from, to := filepath.Join(rt.DataDir, xlog.BackupLabelFile), filepath.Join(rt.DataDir, xlog.BackupLabelOld)
+		if err := os.Rename(from, to); err != nil {
+			logger.Warn(fmt.Sprintf("could not rename file \"%s\" to \"%s\": %v", xlog.BackupLabelFile, xlog.BackupLabelOld, err))
+		}
+	}
+}
+
+// standbyRecoveryTarget installs the standby's recovery target on its
+// replayer: when replay reaches it, the stop is logged as PG logs it
+// ("recovery stopping …"), and recovery_target_action decides what follows —
+// pause waits at the end of recovery ("pausing at the end of recovery",
+// promoting on pg_wal_replay_resume), promote promotes, shutdown stops the
+// server. No target means no option. M0149-0023b.
+func standbyRecoveryTarget(registry *misc.Registry, logger *slog.Logger, scRef *atomic.Pointer[standbyController]) func(*xlog.StreamReplayer) {
+	stop := recoveryStop(registry)
+	if !stop.Set && !stop.XidSet && !stop.NameSet && !stop.TimeSet && !stop.Immediate {
+		return func(*xlog.StreamReplayer) {}
+	}
+	promote := func() {
+		if sc := scRef.Load(); sc != nil {
+			if err := sc.Promote(context.Background()); err != nil {
+				logger.Warn("promotion at recovery target failed", "err", err)
+			}
+		}
+	}
+	return func(sr *xlog.StreamReplayer) {
+		sr.SetRecoveryTarget(xlog.ReplayTarget{
+			Stop: stop,
+			Consistent: func() bool {
+				sc := scRef.Load()
+				return sc != nil && sc.Consistent()
+			},
+			Reached: func(ev xlog.StopEval) bool {
+				logger.Info(ev.Result().StopMessage())
+				switch recoveryTargetAction(registry) {
+				case "pause":
+					logger.Info("pausing at the end of recovery", "hint", "Execute pg_wal_replay_resume() to promote.")
+					return true
+				case "promote":
+					go promote()
+				default: // shutdown
+					logger.Info("shutdown at recovery target")
+					fatalShutdown()
+				}
+				return false
+			},
+			Resumed: func() { go promote() },
+		})
+	}
+}
+
+// restoreReplayedPrepared is RecoverPreparedTransactions at the end of
+// recovery: every prepared transaction replay registered and saw no
+// COMMIT/ABORT PREPARED for gets a proc slot holding its xid, ready to hand
+// to the server. Transactions already in known (restored at startup from
+// pg_twophase) are skipped. Shared by a standby's promotion and archive
+// recovery (M0149-0015b, M0149-0024).
+func restoreReplayedPrepared(rt *initdb.Runtime, logger *slog.Logger, known []initdb.RecoveredPrepared) []initdb.RecoveredPrepared {
+	if rt == nil || rt.TxnMgr == nil {
+		return nil
+	}
+	have := map[storage.TransactionID]bool{}
+	for _, k := range known {
+		have[k.XID] = true
+	}
+	var out []initdb.RecoveredPrepared
+	for _, p := range rt.TxnMgr.PreparedXacts() {
+		if have[p.XID] {
+			continue
+		}
+		tx, err := rt.TxnMgr.RestorePrepared(p)
+		if err != nil {
+			logger.Warn("could not restore prepared transaction", "xid", p.XID, "gid", p.GID, "err", err)
+			continue
+		}
+		st, _ := xlog.ParseTwoPhaseState(p.State)
+		logger.Info("recovering prepared transaction", "xid", p.XID, "gid", p.GID, "subxacts", len(p.Subxacts))
+		out = append(out, initdb.RecoveredPrepared{
+			GID: p.GID, XID: p.XID, Tx: tx, Database: st.Database, Owner: st.Owner, PreparedAt: st.PreparedAt,
+		})
+	}
+	return out
 }

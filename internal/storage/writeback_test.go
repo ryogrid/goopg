@@ -28,8 +28,8 @@ func TestPoolBackendWritebackTriggersAtThreshold(t *testing.T) {
 
 	pool.SetBackendFlushAfter(2)
 
-	hotRel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
-	coldRel := RelFileNode{DBOid: 1, RelOid: 2, Fork: MainFork}
+	hotRel := RelFileNode{DBOid: 16384, RelOid: 1, Fork: MainFork}
+	coldRel := RelFileNode{DBOid: 16384, RelOid: 2, Fork: MainFork}
 
 	seedPage := make(Page, BlockSize)
 	if err := InitPage(seedPage); err != nil {
@@ -86,7 +86,7 @@ func TestPoolBackendWritebackOverrideTakesPrecedence(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = pool.Close(); _ = mgr.Close() })
 
-		rel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
+		rel := RelFileNode{DBOid: 16384, RelOid: 1, Fork: MainFork}
 		seedPage := make(Page, BlockSize)
 		if err := InitPage(seedPage); err != nil {
 			t.Fatal(err)
@@ -110,7 +110,7 @@ func TestPoolBackendWritebackOverrideTakesPrecedence(t *testing.T) {
 		// Evict everything by pinning a second, disjoint relation's worth of
 		// cold pages through the same small pool (mirrors
 		// TestPoolBackendWritebackTriggersAtThreshold's hot/cold setup).
-		coldRel := RelFileNode{DBOid: 1, RelOid: 99, Fork: MainFork}
+		coldRel := RelFileNode{DBOid: 16384, RelOid: 99, Fork: MainFork}
 		seedPage := make(Page, BlockSize)
 		_ = InitPage(seedPage)
 		mgr := pool.mgr
@@ -176,7 +176,7 @@ func TestPoolBgwriterWritebackTriggersAtThreshold(t *testing.T) {
 
 	pool.SetBgwriterFlushAfter(2)
 
-	rel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 1, Fork: MainFork}
 	seedPage := make(Page, BlockSize)
 	if err := InitPage(seedPage); err != nil {
 		t.Fatal(err)
@@ -220,7 +220,7 @@ func TestPoolCheckpointerWritebackTriggersAtThreshold(t *testing.T) {
 
 	pool.SetCheckpointFlushAfter(2)
 
-	rel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 1, Fork: MainFork}
 	seedPage := make(Page, BlockSize)
 	if err := InitPage(seedPage); err != nil {
 		t.Fatal(err)
@@ -286,7 +286,7 @@ func TestPoolBgwriterAndCheckpointerWrittenCountsAreTracked(t *testing.T) {
 		}
 	}
 
-	bgRel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
+	bgRel := RelFileNode{DBOid: 16384, RelOid: 1, Fork: MainFork}
 	dirtyRel(bgRel)
 	if n := pool.WriteDirtyPages(dirtyPages); n != dirtyPages {
 		t.Fatalf("WriteDirtyPages wrote %d, want %d", n, dirtyPages)
@@ -298,7 +298,7 @@ func TestPoolBgwriterAndCheckpointerWrittenCountsAreTracked(t *testing.T) {
 		t.Errorf("CheckpointWrittenCount() = %d before any checkpointer flush, want 0", got)
 	}
 
-	cpRel := RelFileNode{DBOid: 1, RelOid: 2, Fork: MainFork}
+	cpRel := RelFileNode{DBOid: 16384, RelOid: 2, Fork: MainFork}
 	dirtyRel(cpRel)
 	if err := pool.FlushAllPaced(nil); err != nil {
 		t.Fatal(err)
@@ -320,7 +320,7 @@ func TestSyncFileRangeHintOnRealFile(t *testing.T) {
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer func() { _ = mgr.Close() }()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 1, Fork: MainFork}
 	seedPage := make(Page, BlockSize)
 	if err := InitPage(seedPage); err != nil {
 		t.Fatal(err)

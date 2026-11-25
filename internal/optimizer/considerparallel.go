@@ -223,7 +223,7 @@ func relConsiderParallel(leaf Node, tbl *catalog.Table, cat catalog.Catalog) boo
 			return false
 		}
 		if !exprsParallelSafe(cat, x.Key, x.LowKey, x.HighKey) ||
-			!exprListParallelSafe(cat, x.Keys) {
+			!exprListParallelSafe(cat, x.Keys) || !exprListParallelSafe(cat, x.SAOPKeys) {
 			return false
 		}
 	case *BitmapHeapScan:

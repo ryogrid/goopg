@@ -39,9 +39,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goopg/goopg/internal/libpq"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
@@ -106,6 +108,12 @@ type WalReceiverConfig struct {
 	// behaviour.
 	ApplyLSNFunc func() uint64
 
+	// HSFeedbackFunc, when non-nil, reports hot_standby_feedback (read per
+	// call, so a reload takes effect) and the standby's replication
+	// horizons (GetReplicationHorizons). The receiver sends them upstream
+	// in an 'h' message with each status update. M0149-0077i.
+	HSFeedbackFunc func() (on bool, xmin, catalogXmin uint32)
+
 	// SSLMode is the libpq sslmode requested in primary_conninfo.
 	// Empty is treated as libpq's "prefer" default. goopg has no TLS
 	// implementation, so "disable"/"allow"/"prefer" all connect in
@@ -158,6 +166,11 @@ type WalReceiver struct {
 	// (in which case all the SetReceivedLSN / MarkMessageReceived
 	// calls become no-ops via the nil-check helpers below).
 	monHandle *xlog.Receiver
+
+	// primaryHasStandbyXmin is walreceiver.c's primary_has_standby_xmin:
+	// the last 'h' message carried a valid horizon, so turning
+	// hot_standby_feedback off must still send one message clearing it.
+	primaryHasStandbyXmin bool
 
 	// primaryTLI is the primary's timeline IDENTIFY_SYSTEM reported.
 	primaryTLI uint32
@@ -594,6 +607,12 @@ func (r *WalReceiver) startStreaming() error {
 func (r *WalReceiver) Run(ctx context.Context) error {
 	statusTicker := time.NewTicker(r.cfg.StatusInterval)
 	defer statusTicker.Stop()
+	// WalReceiverMain sends hot standby feedback right after streaming
+	// starts (XLogWalRcvSendHSFeedback(true)), then with each reply.
+	if err := r.sendHSFeedback(); err != nil {
+		_ = r.Close()
+		return err
+	}
 
 	frames := make(chan libpq.Frame, 4)
 	errCh := make(chan error, 1)
@@ -650,6 +669,10 @@ func (r *WalReceiver) Run(ctx context.Context) error {
 			}
 		case <-statusTicker.C:
 			if err := r.sendStatus(); err != nil {
+				_ = r.Close()
+				return err
+			}
+			if err := r.sendHSFeedback(); err != nil {
 				_ = r.Close()
 				return err
 			}
@@ -731,6 +754,8 @@ func (r *WalReceiver) handleCopyData(payload []byte) error {
 		if err != nil {
 			return fmt.Errorf("walreceiver: append local WAL: %w", err)
 		}
+		// XLogWalRcvWrite's pg_stat_io accounting (IOOP_WRITE on wal). M0149-0077d.
+		executor.CountWALReceiverWrite(len(data))
 		r.mu.Lock()
 		if end > r.applyLSN {
 			r.applyLSN = end
@@ -785,6 +810,33 @@ func (r *WalReceiver) sendStatus() error {
 	return r.w.Flush()
 }
 
+// sendHSFeedback is XLogWalRcvSendHSFeedback: with hot_standby_feedback on
+// it reports the standby's xmin and catalog_xmin upstream; once it is turned
+// off, one message with both invalid clears the upstream's copy, and after
+// that nothing is sent. goopg xids carry no epoch (32-bit, no wraparound
+// yet), so both epochs are 0.
+func (r *WalReceiver) sendHSFeedback() error {
+	if r.cfg.HSFeedbackFunc == nil {
+		return nil
+	}
+	on, xmin, catalogXmin := r.cfg.HSFeedbackFunc()
+	if !on {
+		if !r.primaryHasStandbyXmin {
+			return nil
+		}
+		xmin, catalogXmin = 0, 0
+	}
+	frame := libpq.EncodeHotStandbyFeedback(time.Now().UTC(), xmin, 0, catalogXmin, 0)
+	if err := r.w.WriteCopyData(frame); err != nil {
+		return err
+	}
+	if err := r.w.Flush(); err != nil {
+		return err
+	}
+	r.primaryHasStandbyXmin = xmin != 0 || catalogXmin != 0
+	return nil
+}
+
 // ApplyLSN returns the last LSN successfully appended to the local
 // WAL. Useful for tests that need to observe the receiver's
 // progress.
@@ -826,7 +878,7 @@ func (r *WalReceiver) Close() error {
 // prefix up to written is trimmed on receipt (handleCopyData).
 func streamingStartLSN(written uint64, segSize int64) uint64 {
 	if segSize <= 0 {
-		segSize = xlog.DefaultSegmentSize
+		segSize = xlog.WALSegmentSize()
 	}
 	return written - written%uint64(segSize)
 }
@@ -869,6 +921,9 @@ type WalReceiverLauncherConfig struct {
 	// standby status updates report real replay progress.
 	ApplyLSNFunc func() uint64
 
+	// HSFeedbackFunc is forwarded to WalReceiverConfig.HSFeedbackFunc.
+	HSFeedbackFunc func() (on bool, xmin, catalogXmin uint32)
+
 	// SystemID and WALDir are forwarded to WalReceiverConfig: the
 	// standby's pg_control identifier IDENTIFY_SYSTEM must match, and the
 	// pg_wal fetched history files land in.
@@ -907,30 +962,12 @@ func StartWalReceiver(ctx context.Context, done chan struct{}, cfg WalReceiverLa
 		logger = slog.Default()
 	}
 	registry := cfg.Registry
-	conninfo := ""
-	slotName := ""
-	statusInterval := 10 * time.Second
-	if registry != nil {
-		if v, ok := registry.Get("primary_conninfo"); ok {
-			conninfo = v.Display()
-		}
-		if v, ok := registry.Get("primary_slot_name"); ok {
-			slotName = v.Display()
-		}
-		if v, ok := registry.Get("wal_receiver_status_interval"); ok {
-			if secs, err := strconv.Atoi(v.Display()); err == nil && secs > 0 {
-				statusInterval = time.Duration(secs) * time.Second
-			}
-		}
-	}
+	conninfo, slotName, statusInterval := readWalReceiverGUCs(registry)
 	addr, appName, user, sslmode := parsePrimaryConninfoFull(conninfo)
 	if addr == "" {
 		logger.Info("standby mode: primary_conninfo empty or missing host:port; walreceiver not started")
 		close(done)
 		return
-	}
-	if user == "" {
-		user = "postgres"
 	}
 	logger.Info("standby mode: starting walreceiver",
 		"primary", addr, "slot", slotName, "status_interval", statusInterval)
@@ -943,8 +980,31 @@ func StartWalReceiver(ctx context.Context, done chan struct{}, cfg WalReceiverLa
 			if ctx.Err() != nil {
 				return
 			}
+			// primary_conninfo and primary_slot_name are PGC_SIGHUP: every
+			// connection uses their current values, and a reload that
+			// changes either restarts the walreceiver (StartupRereadConfig
+			// sets pendingWalRcvRestart). M0149-0077i.
+			conninfo, slotName, statusInterval = readWalReceiverGUCs(registry)
+			addr, appName, user, sslmode = parsePrimaryConninfoFull(conninfo)
+			if appName == "" {
+				appName = fallbackApplicationName(registry)
+			}
+			if user == "" {
+				user = "postgres"
+			}
+			if addr == "" {
+				// Emptied by a reload: wait for a usable conninfo.
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(baseBackoff):
+				}
+				continue
+			}
+			runCtx, runCancel := context.WithCancel(ctx)
+			restarted := watchWalReceiverGUCs(runCtx, runCancel, registry, conninfo, slotName, logger)
 			startLSN := streamingStartLSN(cfg.WAL.WrittenLSN(), cfg.WAL.SegmentSize())
-			rec, err := DialWalReceiver(ctx, WalReceiverConfig{
+			rec, err := DialWalReceiver(runCtx, WalReceiverConfig{
 				PrimaryAddr:     addr,
 				User:            user,
 				SlotName:        slotName,
@@ -956,18 +1016,24 @@ func StartWalReceiver(ctx context.Context, done chan struct{}, cfg WalReceiverLa
 				Conninfo:        conninfo,
 				ApplicationName: appName,
 				ApplyLSNFunc:    cfg.ApplyLSNFunc,
+				HSFeedbackFunc:  cfg.HSFeedbackFunc,
 				SSLMode:         sslmode,
 				SystemID:        cfg.SystemID,
 				WALDir:          cfg.WALDir,
 			})
 			var eot *EndOfTimeline
 			if errors.As(err, &eot) {
+				runCancel()
 				if !followEndOfTimeline(ctx, cfg, logger, eot) {
 					return
 				}
 				continue
 			}
 			if err != nil {
+				runCancel()
+				if restarted.Load() {
+					continue
+				}
 				logger.Warn("walreceiver dial failed; will retry",
 					"event", xlog.EventWalreceiverDialFailed,
 					"primary", addr, "err", err, "backoff", backoff)
@@ -989,11 +1055,16 @@ func StartWalReceiver(ctx context.Context, done chan struct{}, cfg WalReceiverLa
 				"event", xlog.EventWalreceiverConnected,
 				"primary", addr, "slot", slotName,
 				"start_lsn", startLSN, "written_lsn", cfg.WAL.WrittenLSN())
-			runErr := rec.Run(ctx)
+			runErr := rec.Run(runCtx)
 			lastApplied := rec.ApplyLSN()
 			_ = rec.Close()
+			runCancel()
 			if ctx.Err() != nil {
 				return
+			}
+			if restarted.Load() {
+				backoff = baseBackoff
+				continue
 			}
 			if errors.As(runErr, &eot) {
 				if !followEndOfTimeline(ctx, cfg, logger, eot) {
@@ -1012,6 +1083,62 @@ func StartWalReceiver(ctx context.Context, done chan struct{}, cfg WalReceiverLa
 			}
 		}
 	}()
+}
+
+// readWalReceiverGUCs reads primary_conninfo, primary_slot_name and
+// wal_receiver_status_interval (default 10s; 0 keeps the default ticker).
+func readWalReceiverGUCs(registry *misc.Registry) (conninfo, slotName string, statusInterval time.Duration) {
+	statusInterval = 10 * time.Second
+	if registry == nil {
+		return "", "", statusInterval
+	}
+	if v, ok := registry.Get("primary_conninfo"); ok {
+		conninfo = v.Display()
+	}
+	if v, ok := registry.Get("primary_slot_name"); ok {
+		slotName = v.Display()
+	}
+	if v, ok := registry.Get("wal_receiver_status_interval"); ok {
+		if secs, err := strconv.Atoi(v.Display()); err == nil && secs > 0 {
+			statusInterval = time.Duration(secs) * time.Second
+		}
+	}
+	return conninfo, slotName, statusInterval
+}
+
+// walReceiverGUCPoll is how often a connected walreceiver checks whether a
+// reload changed primary_conninfo or primary_slot_name.
+const walReceiverGUCPoll = 200 * time.Millisecond
+
+// watchWalReceiverGUCs cancels the current connection (cancel) once a reload
+// changes primary_conninfo or primary_slot_name from the values it was
+// opened with, and reports that through the returned flag. It stops when
+// ctx ends.
+func watchWalReceiverGUCs(ctx context.Context, cancel context.CancelFunc, registry *misc.Registry, conninfo, slotName string, logger *slog.Logger) *atomic.Bool {
+	restarted := &atomic.Bool{}
+	if registry == nil {
+		return restarted
+	}
+	go func() {
+		t := time.NewTicker(walReceiverGUCPoll)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			c, sl, _ := readWalReceiverGUCs(registry)
+			if c != conninfo || sl != slotName {
+				logger.Info("walreceiver restarting: primary_conninfo or primary_slot_name changed",
+					"slot", sl)
+				restarted.Store(true)
+				cancel()
+				return
+			}
+		}
+	}()
+	return restarted
 }
 
 // followEndOfTimeline hands an ended timeline to cfg.OnEndOfTimeline and,
@@ -1046,6 +1173,19 @@ func followEndOfTimeline(ctx context.Context, cfg WalReceiverLauncherConfig, log
 func parsePrimaryConninfo(conninfo string) string {
 	addr, _, _, _ := parsePrimaryConninfoFull(conninfo)
 	return addr
+}
+
+// fallbackApplicationName is libpqwalreceiver's fallback_application_name:
+// cluster_name when set, else "walreceiver". It applies when
+// primary_conninfo names no application_name, so the primary sees the
+// standby under that name (pg_stat_replication, synchronous_standby_names).
+func fallbackApplicationName(registry *misc.Registry) string {
+	if registry != nil {
+		if v, ok := registry.Get("cluster_name"); ok && v.Display() != "" {
+			return v.Display()
+		}
+	}
+	return "walreceiver"
 }
 
 // parsePrimaryConninfoFull extracts host:port, application_name, user

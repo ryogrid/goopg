@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser/analyzer"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -214,41 +215,6 @@ func regprocedureNamePart(s string) string {
 	return s
 }
 
-// regoperatorNameAndArgs splits a `'name(left,right)'::regoperator` input
-// into its operator symbol and two argument-type spellings, mirroring
-// parseNameAndArgTypes' 2-arg case for regoperatorin (postgres/src/backend/
-// utils/adt/regproc.c:639-676) — unlike regprocedureNamePart's deliberate
-// name-only leniency, the operator's (left,right) pair is REQUIRED here to
-// disambiguate an overloaded symbol (alter_operator.sql declares both
-// `=== (boolean, boolean)` and `=== (boolean, real)`; resolving by name alone
-// would pick the wrong one). `NONE` denotes a missing operand of a unary
-// operator (leftType=="" / rightType==""), matching format_operator's own
-// output spelling. ok=false for anything not shaped like `name(a,b)` — a bare
-// name (no parens) or a single-argument list falls through to the caller's
-// existing numeric-OID/unresolved handling, matching regoperatorin's
-// "missing argument" case loosely (goopg does not special-case that error
-// message). M0134-0089.
-func regoperatorNameAndArgs(s string) (name, leftType, rightType string, ok bool) {
-	open := strings.IndexByte(s, '(')
-	if open < 0 || !strings.HasSuffix(s, ")") {
-		return "", "", "", false
-	}
-	argsPart := s[open+1 : len(s)-1]
-	parts := strings.Split(argsPart, ",")
-	if len(parts) != 2 {
-		return "", "", "", false
-	}
-	leftType = strings.TrimSpace(parts[0])
-	rightType = strings.TrimSpace(parts[1])
-	if strings.EqualFold(leftType, "NONE") {
-		leftType = ""
-	}
-	if strings.EqualFold(rightType, "NONE") {
-		rightType = ""
-	}
-	return strings.TrimSpace(s[:open]), leftType, rightType, true
-}
-
 // schemaExistsForReg reports whether a schema name is registered, so the reg*
 // input functions can raise PG's 3F000 for a qualifier that names nothing. A
 // catalog that is not the in-memory one cannot be asked, and answers "yes" so
@@ -267,6 +233,17 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 		return v, nil
 	}
 	name := strings.TrimSpace(v.StringValue())
+	// regoperin / regoperatorin take digits as an OID but no "-" shorthand
+	// (parseNumericOid). M0149-0001h1a14.
+	if lt := strings.ToLower(typeName); lt == "regoper" || lt == "regoperator" {
+		if ctx == nil || ctx.Catalog == nil {
+			return v, nil
+		}
+		if lt == "regoper" {
+			return regoperIn(name, ctx, pos)
+		}
+		return regoperatorIn(name, ctx, pos)
+	}
 	// parseDashOrOid first, for every reg* type — upstream reg*in (regproc.c)
 	// runs it before ANY name resolution: a literal "-" is OID 0 (InvalidOid)
 	// and a pure-digit string is a numeric OID via oidin (IsOidString), never a
@@ -316,12 +293,23 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 			schema, rel = segs[0], segs[1]
 		}
 		objName := parser.ObjectName{Schema: schema, Name: rel}
-		if tbl, found := ctx.Catalog.LookupTable(objName, connDBOid); found && tbl != nil {
+		// An unqualified name walks the session's search_path
+		// (RangeVarGetRelid), not just the bare-name default. M0149-0001h1a30.
+		if tbl, found := lookupTableOnSearchPath(ctx, objName, connDBOid); found && tbl != nil {
 			return NewIntDatum(int64(tbl.OID)), nil
 		}
 		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 			if idx, found := im.LookupIndex(objName, connDBOid); found && idx != nil {
 				return NewIntDatum(int64(idx.OID)), nil
+			}
+			// An unqualified index name walks search_path too
+			// (RangeVarGetRelid covers every relkind). M0149-0001h1a30.
+			if schema == "" {
+				for _, sc := range searchPathSchemas(ctx) {
+					if idx, found := im.LookupIndex(parser.ObjectName{Schema: sc, Name: rel}, connDBOid); found && idx != nil {
+						return NewIntDatum(int64(idx.OID)), nil
+					}
+				}
 			}
 		}
 		// Miss message uses the STRIPPED parsed name — regclassin's
@@ -335,6 +323,28 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 		// text's OID and the 42704 miss-path below would be dead. The established
 		// idiom (castKeyTypeName, pgTypeofOIDForName) treats the fallback as a
 		// miss unless the name really is `text`.
+		//
+		// parseTypeString accepts a type modifier and ignores it for regtypein
+		// (`'varchar(32)'::regtype` is character varying); drop a trailing
+		// parenthesised clause, keeping what follows it (`timestamp(4) with
+		// time zone`). M0149-0001h1a13.
+		if open := strings.IndexByte(name, '('); open > 0 && !strings.ContainsRune(name[:open], '"') {
+			if close := strings.IndexByte(name[open:], ')'); close > 0 {
+				name = strings.TrimSpace(strings.TrimSpace(name[:open]) + " " + strings.TrimSpace(name[open+close+1:]))
+			}
+		}
+		// parseTypeString parses a full SQL type name: the multi-word
+		// spellings (double precision, timestamp with time zone[]) are
+		// pg_catalog types. M0149-0001h1a32.
+		if oid, ok := regtypeMultiWordBuiltin(name); ok {
+			return NewIntDatum(int64(oid)), nil
+		}
+		// A quoted keyword typname names the pg_catalog type format_type
+		// prints quoted: '"char"' is char (18), unlike bare char (bpchar);
+		// '"char"[]' its array. M0149-0001h1a32.
+		if oid, ok := regtypeQuotedBuiltin(name); ok {
+			return NewIntDatum(int64(oid)), nil
+		}
 		schema, typeName, nameOK := splitRegQualifiedName(name)
 		if !nameOK {
 			return NullDatum, &ExecError{Code: "42602", Pos: pos, Message: "invalid name syntax"}
@@ -366,8 +376,32 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 			(oid != catalog.OIDText || strings.EqualFold(typeName, "text")) {
 			return NewIntDatum(int64(oid)), nil
 		}
+		// Every other pg_catalog type by its format_type spelling (cstring,
+		// anyelement, int4range — TypeNameToOID knows only a subset).
+		// M0149-0001h1a22.
+		if builtinVisible {
+			if oid, ok := catalog.BuiltinTypeOIDByFormatName(strings.ToLower(typeName)); ok {
+				return NewIntDatum(int64(oid)), nil
+			}
+			// A typname: "_aclitem" (aclitem[]), a quoted keyword "any".
+			// M0149-0001h1a32.
+			if oid, ok := catalog.BuiltinTypnameOID(typeName); ok {
+				return NewIntDatum(int64(oid)), nil
+			}
+		}
+		// The information_schema domains (sql_identifier, cardinal_number…)
+		// answer to their schema, or bare when it is on search_path.
+		// M0149-0001h1a85a.
+		if oid, ok := catalog.InformationSchemaTypeOID(typeName); ok &&
+			(strings.EqualFold(schema, "information_schema") || schema == "" && informationSchemaOnPath(ctx)) {
+			return NewIntDatum(int64(oid)), nil
+		}
 		if !strings.EqualFold(schema, "pg_catalog") {
-			if oid, ok := userTypeOIDForName(ctx.Catalog, typeName); ok {
+			if oid, ok := userTypeOIDForName(ctx.Catalog, typeName); ok &&
+				userTypeOnPath(ctx, oid, schema) {
+				return NewIntDatum(int64(oid)), nil
+			}
+			if oid, ok := relationRowtypeForName(ctx, schema, typeName); ok {
 				return NewIntDatum(int64(oid)), nil
 			}
 		}
@@ -384,6 +418,13 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 		// :279) — so the message below uses `raw`, not the parsed form.
 		raw := name
 		if strings.EqualFold(typeName, "regprocedure") {
+			// parseNameAndArgTypes' syntax errors (22P02: a missing paren, an
+			// empty or unbalanced type name) come before any lookup.
+			if _, _, _, perr := regParseNameAndArgTypes(raw, false, ctx, pos); perr != nil {
+				if ee, ok := perr.(*ExecError); ok && ee.Code == "22P02" {
+					return NullDatum, ee
+				}
+			}
 			name = regprocedureNamePart(name)
 		}
 		schema, fn, nameOK := splitRegQualifiedName(name)
@@ -399,14 +440,50 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 		// above. Builtins resolve through the global pg_proc index below, which
 		// is not dbOid-scoped (pg_catalog is implicitly visible everywhere).
 		connDBOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
+		// The user routine is found through search_path and, for
+		// regprocedure, by its argument types (M0149-0001h1a32).
 		if rs := routineRegistry(ctx); rs != nil {
-			candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: fn}, connDBOid)
-			if len(candidates) > 0 {
-				return NewIntDatum(int64(candidates[0].OID)), nil
+			oid, found, err := resolveUserRoutineOnPath(rs, schema, fn, raw,
+				strings.EqualFold(typeName, "regprocedure"), ctx, connDBOid, pos)
+			if err != nil {
+				return NullDatum, err
+			}
+			if found {
+				return NewIntDatum(int64(oid)), nil
+			}
+		}
+		// regprocedurein matches the exact signature before any name-only
+		// shortcut: LookupBuiltinProc answers one overload per name, so
+		// 'exp(double precision)' must not resolve to exp(numeric)
+		// (FunctionIsVisible's round trip relies on it). M0149-0001h1a32.
+		if strings.EqualFold(typeName, "regprocedure") &&
+			(schema == "" || strings.EqualFold(schema, "pg_catalog")) {
+			if args, ok := regprocedureArgTypes(raw, ctx); ok {
+				if oid, found := builtinProcByArgs(fn, args); found {
+					return NewIntDatum(int64(oid)), nil
+				}
 			}
 		}
 		if bp, found := catalog.LookupBuiltinProc(fn); found {
 			return NewIntDatum(int64(bp.OID)), nil
+		}
+		// The full pg_proc.dat seed (M0149-0001h1a13): regprocedurein matches
+		// the exact signature (LookupFuncWithArgs over the parsed arg types);
+		// regprocin needs a unique name (42725 "more than one function named").
+		if schema == "" || strings.EqualFold(schema, "pg_catalog") {
+			if strings.EqualFold(typeName, "regprocedure") {
+				if args, ok := regprocedureArgTypes(raw, ctx); ok {
+					if oid, found := catalog.LookupProcForNode(strings.ToLower(fn), args); found {
+						return NewIntDatum(int64(oid)), nil
+					}
+				}
+			} else if oid, found := catalog.LookupBuiltinProcByProname(fn); found {
+				if len(catalog.BuiltinProcSignatures(fn)) > 1 {
+					return NullDatum, &ExecError{Code: "42725", Pos: pos,
+						Message: fmt.Sprintf("more than one function named %q", raw)}
+				}
+				return NewIntDatum(int64(oid)), nil
+			}
 		}
 		// CREATE AGGREGATE routines never land in the Routines() registry
 		// (they live in their own userAggregates map — see
@@ -440,6 +517,21 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 		}
 		return NullDatum, &ExecError{Code: "42704", Pos: pos,
 			Message: fmt.Sprintf("role %q does not exist", roleName)}
+	case "regnamespace":
+		// regnamespacein (regproc.c): a single identifier, then
+		// get_namespace_oid(name, false) — 3F000 "schema \"%s\" does not exist"
+		// with the parsed (case-folded or quoted) name. M0149-0001h1a13.
+		segs, nameOK := splitRegIdentifiers(name)
+		if !nameOK || len(segs) != 1 {
+			return NullDatum, &ExecError{Code: "42602", Pos: pos, Message: "invalid name syntax"}
+		}
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			if oid := im.SchemaOID(segs[0], catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)); oid != 0 {
+				return NewIntDatum(int64(oid)), nil
+			}
+		}
+		return NullDatum, &ExecError{Code: "3F000", Pos: pos,
+			Message: fmt.Sprintf("schema \"%s\" does not exist", segs[0])}
 	case "regcollation":
 		// regcollationin (regproc.c:1026): possibly schema-qualified; a bare
 		// name resolves builtin-then-user through the search path
@@ -459,6 +551,10 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 				if uc := im.FindCollation(coll, schema, ctx.CurrentDatabaseOid); uc != nil {
 					oid = uc.OID
 				}
+			}
+			// The seeded collations live in pg_catalog.
+			if oid == 0 && strings.EqualFold(schema, "pg_catalog") {
+				oid, _ = catalog.BuiltinCollationOIDByName(coll)
 			}
 		} else if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 			oid = im.CollationOIDByName(coll)
@@ -564,6 +660,17 @@ func RegOutArgVisible(typeName string, oid uint32, cat catalog.Catalog, qualify 
 	return regOutShared(typeName, oid, cat, func(s string) bool { return qualify }, argVisible, dbOid...)
 }
 
+// RegOutVisible renders a reg* OID with regclassout / regprocout /
+// regprocedureout's PER-OBJECT rule: the name is schema-qualified iff its
+// schema is not visible on the session's search_path, and a regprocedure
+// argument type likewise. The SELECT and COPY TO paths use it whenever they
+// hold the session predicate; RegOutArgVisible's single qualify flag (all
+// names qualified once "public" is off the path) remains for callers
+// without one. M0149-0001h1a32.
+func RegOutVisible(typeName string, oid uint32, cat catalog.Catalog, visible func(schema string) bool, dbOid ...uint32) string {
+	return regOutShared(typeName, oid, cat, func(s string) bool { return !visible(s) }, visible, dbOid...)
+}
+
 // RegOutRenderer returns a closure over RegOut bound to a fixed catalog and
 // qualification flag, so a caller that has no catalog/qualify at hand (the
 // logical-replication pgoutput decoder in internal/wal) can still render a reg*
@@ -617,6 +724,12 @@ func RegOutRendererVisible(cat catalog.Catalog, visible func(schema string) bool
 // arglist, the base-RegOut behavior). dbOid scopes the database-local relation
 // lookups (see RegOut).
 func regOutShared(typeName string, oid uint32, cat catalog.Catalog, qualify func(schema string) bool, argVisible func(schema string) bool, dbOid ...uint32) string {
+	switch strings.ToLower(typeName) {
+	case "regoper":
+		return regoperOut(oid, &Context{Catalog: cat})
+	case "regoperator":
+		return regoperatorOut(oid, &Context{Catalog: cat})
+	}
 	if oid == 0 {
 		return "-"
 	}
@@ -649,9 +762,12 @@ func regOutShared(typeName string, oid uint32, cat catalog.Catalog, qualify func
 		}
 	case "regproc":
 		if name, ok := catalog.RegprocName(oid); ok {
-			// A builtin proc lives in pg_catalog, which the search path always
-			// searches implicitly, so it is never schema-qualified — only the
-			// name is quote_identifier'd, as regprocout does for every name.
+			// regprocout qualifies unless regprocin would find exactly this
+			// function: an overloaded builtin name (jsonb_delete) renders as
+			// pg_catalog.jsonb_delete, a unique one bare. M0149-0001h1a19.
+			if len(catalog.BuiltinProcSignatures(name)) > 1 {
+				return "pg_catalog." + pgQuoteIdent(name)
+			}
 			return pgQuoteIdent(name)
 		}
 		if cat != nil {
@@ -698,6 +814,14 @@ func regOutShared(typeName string, oid uint32, cat catalog.Catalog, qualify func
 		}
 	case "regtype":
 		return RegtypeName(cat, oid, qualify)
+	case "regnamespace":
+		// regnamespaceout (regproc.c): quote_identifier(schema name), the
+		// OID itself for a dangling one. M0149-0001h1a13.
+		if hasIM {
+			if n := im.SchemaNameForOID(oid); n != "" {
+				return pgQuoteIdent(n)
+			}
+		}
 	case "regrole":
 		if hasIM {
 			// regroleout (regproc.c:1609) quote_identifiers the REAL role name
@@ -792,6 +916,16 @@ func regprocedureArglist(argTypes []catalog.RegprocArg, visible func(schema stri
 		if a.Schema == "" || a.Schema == "pg_catalog" {
 			name = catalog.ArgTypeDisplayAlias(base)
 		}
+		// A pg_proc.dat typname renders as format_type_be prints it: an
+		// "_elem" array typname is "elem[]", a keyword typname quotes
+		// ("any"). M0149-0001h1a32.
+		if a.Schema == "pg_catalog" && !isArray && name == base {
+			if oid, ok := catalog.BuiltinTypnameOID(base); ok {
+				if f, ok := catalog.BuiltinFormatTypeName(oid); ok {
+					name = f
+				}
+			}
+		}
 		if a.Schema != "" && a.Schema != "pg_catalog" && visible != nil && !visible(a.Schema) {
 			name = quoteQualifiedIdentifier(a.Schema, name)
 		}
@@ -831,8 +965,115 @@ func splitArraySuffix(name string) (base string, isArray bool) {
 // slice).
 func isRegIdentifierTypeName(name string) bool {
 	switch strings.ToLower(name) {
-	case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation":
+	case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation",
+		"regnamespace", "regoper", "regoperator":
 		return true
+	}
+	return false
+}
+
+// regprocedureArgTypes parses the "(type, ...)" part of a regprocedure input
+// and resolves each argument through regtypein; ok is false when the list is
+// absent or a type does not resolve.
+func regprocedureArgTypes(s string, ctx *Context) ([]uint32, bool) {
+	open := strings.IndexByte(s, '(')
+	if open < 0 || !strings.HasSuffix(strings.TrimSpace(s), ")") {
+		return nil, false
+	}
+	inner := strings.TrimSpace(strings.TrimSpace(s)[open+1 : len(strings.TrimSpace(s))-1])
+	if inner == "" {
+		return []uint32{}, true
+	}
+	var out []uint32
+	for _, a := range splitTopLevelCommas(inner) {
+		d, err := regIdentifierInput(NewStringDatum(strings.TrimSpace(a)), "regtype", ctx, 0)
+		if err != nil || d.Kind != KindInt {
+			return nil, false
+		}
+		out = append(out, uint32(d.Int))
+	}
+	return out, true
+}
+
+// lookupTableOnSearchPath is RangeVarGetRelid for executor-time lookups: an
+// unqualified name is resolved through the session's search_path (temp and
+// pg_catalog first, then the listed schemas), via the same
+// catalog.SearchPathCatalog the planner uses. A qualified name, or a context
+// without a catalog, falls back to the plain lookup. M0149-0001h1a30.
+func lookupTableOnSearchPath(ctx *Context, name parser.ObjectName, dbOid uint32) (*catalog.Table, bool) {
+	if ctx == nil || ctx.Catalog == nil {
+		return nil, false
+	}
+	if name.Schema != "" {
+		return ctx.Catalog.LookupTable(name, dbOid)
+	}
+	wrapped := catalog.WithSearchPath(ctx.Catalog, func() []string { return searchPathSchemas(ctx) })
+	return wrapped.LookupTable(name, dbOid)
+}
+
+func init() {
+	// typenameType for the analyzer's typed-literal check: the regtype input
+	// resolver, which knows built-in, user, array and qualified names.
+	// M0149-0001h1a85.
+	//
+	// The check only refuses a name that is no type at all: it has no
+	// session, so it cannot apply search_path, and an unqualified user type
+	// of that name in any schema is accepted (the cast itself resolves it).
+	// Array spellings check their element type; float and dec are the SQL
+	// aliases gram.y rewrites. M0149-0001h1a85a.
+	analyzer.TypeNameExists = func(cat catalog.Catalog, schema, name string) bool {
+		for strings.HasSuffix(name, "[]") {
+			name = strings.TrimSuffix(name, "[]")
+		}
+		if name == "" {
+			return true
+		}
+		if schema == "" {
+			switch strings.ToLower(name) {
+			case "float", "dec":
+				return true
+			}
+		}
+		full := quoteRegIdentPart(name)
+		if schema != "" {
+			full = quoteRegIdentPart(schema) + "." + full
+		}
+		if d, err := regIdentifierInput(NewStringDatum(full), "regtype", &Context{Catalog: cat}, 0); err == nil && d.Kind == KindInt {
+			return true
+		}
+		if schema == "" {
+			if _, ok := userTypeOIDForName(cat, name); ok {
+				return true
+			}
+			if _, ok := cat.LookupTable(parser.ObjectName{Name: name}); ok {
+				return true // a table's row type
+			}
+		}
+		return false
+	}
+}
+
+// quoteRegIdentPart double-quotes a name part that is not a plain lower-case
+// identifier, so regtype input reads it as written.
+func quoteRegIdentPart(s string) string {
+	for _, c := range s {
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_') {
+			return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+		}
+	}
+	return s
+}
+
+// informationSchemaOnPath reports whether the session's search_path names
+// information_schema.
+func informationSchemaOnPath(ctx *Context) bool {
+	if ctx == nil {
+		return false
+	}
+	for _, sch := range searchPathSchemas(ctx) {
+		if strings.EqualFold(sch, "information_schema") {
+			return true
+		}
 	}
 	return false
 }

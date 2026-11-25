@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strings"
+
+	"github.com/goopg/goopg/internal/utils/adt/aclitem"
 )
 
 // codec_aclitem.go — PG-native `aclitem[]` (_aclitem, OID 1034) binary codec.
@@ -98,53 +100,14 @@ func aclModeFromPrivLetters(privs string) (uint64, error) {
 // the aclitemout privilege string, emitting each set privilege letter in
 // canonical order, with a trailing '*' when the matching grant-option bit is
 // also set.
-func aclModeToPrivLetters(mode uint64) string {
-	privBits := mode & 0xFFFFFFFF
-	goptBits := (mode >> aclGrantOptionShift) & 0xFFFFFFFF
-	var sb strings.Builder
-	for i := 0; i < len(aclRightsChars); i++ {
-		bit := uint64(1) << uint(i)
-		if privBits&bit != 0 {
-			sb.WriteByte(aclRightsChars[i])
-			if goptBits&bit != 0 {
-				sb.WriteByte('*')
-			}
-		}
-	}
-	return sb.String()
-}
+func aclModeToPrivLetters(mode uint64) string { return aclitem.PrivLetters(mode) }
 
 // aclPutid renders a role name as aclitemout does (PG's putid, acl.c): a name
 // composed solely of lowercase letters, digits and '_' is emitted bare;
 // otherwise it is wrapped in double quotes with embedded '"' doubled. The empty
 // grantee (a grant to PUBLIC) is emitted bare (as the empty string), matching
 // aclitemout's PUBLIC rendering.
-func aclPutid(name string) string {
-	if name == "" {
-		return ""
-	}
-	safe := true
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		if !(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') && c != '_' {
-			safe = false
-			break
-		}
-	}
-	if safe {
-		return name
-	}
-	var sb strings.Builder
-	sb.WriteByte('"')
-	for i := 0; i < len(name); i++ {
-		if name[i] == '"' {
-			sb.WriteByte('"')
-		}
-		sb.WriteByte(name[i])
-	}
-	sb.WriteByte('"')
-	return sb.String()
-}
+func aclPutid(name string) string { return aclitem.Putid(name) }
 
 // splitTopLevelAclItems splits the comma-separated body of an aclitem array
 // (the text between the outer braces) into individual aclitem strings,
@@ -269,7 +232,7 @@ func encodeAclItemArrayText(aclText string, resolveOID func(roleName string) uin
 	body = strings.TrimSuffix(body, "}")
 	items := splitTopLevelAclItems(body)
 	if len(items) == 0 {
-		return emptyArrayTypeBytes(aclItemElemTypeOID), nil
+		return emptyACLBytes(), nil
 	}
 
 	elems := make([]byte, 0, len(items)*aclItemSize)
@@ -368,4 +331,25 @@ func DecodeACLItemArray(blob []byte, resolveName func(oid uint32) string) ([]ACL
 		})
 	}
 	return items, nil
+}
+
+// EncodeAclItemArrayText is encodeAclItemArrayText for callers outside the
+// executor (initdb's bootstrap catalog rows, M0149-0001g slice 11).
+func EncodeAclItemArrayText(aclText string, resolveOID func(roleName string) uint32) ([]byte, error) {
+	return encodeAclItemArrayText(aclText, resolveOID)
+}
+
+// emptyACLBytes is PostgreSQL's empty ACL, allocacl(0) (utils/adt/acl.c): a
+// ONE-dimensional aclitem array with dims[0] = 0. It is not the generic empty
+// array (ndim 0) — check_acl rejects that with "ACL arrays must be
+// one-dimensional", so a PG node reading such a column fails every privilege
+// check on the object (M0149-0001g slice 12). An empty ACL grants nothing; an
+// object that never had a GRANT carries NULL (acldefault) instead.
+func emptyACLBytes() []byte {
+	buf := make([]byte, arrayHeaderSize)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(arrayHeaderSize)<<2) // varlena header
+	binary.LittleEndian.PutUint32(buf[4:8], 1)                          // ndim
+	binary.LittleEndian.PutUint32(buf[12:16], aclItemElemTypeOID)       // elemtype
+	binary.LittleEndian.PutUint32(buf[20:24], 1)                        // lbound[0]; dims[0] stays 0
+	return buf
 }

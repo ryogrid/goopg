@@ -87,7 +87,7 @@ func TestCommentRoutingIsNarrow(t *testing.T) {
 	}
 	for _, q := range []string{
 		"COMMENT ON DATABASE d IS 'x'",
-		"COMMENT ON LARGE OBJECT 1 IS 'x'",
+		"COMMENT ON OPERATOR + (int4, int4) IS 'x'",
 		"COMMENT ON ROLE r IS 'x'",
 	} {
 		if routed(q) {
@@ -97,6 +97,7 @@ func TestCommentRoutingIsNarrow(t *testing.T) {
 	for _, q := range []string{
 		"COMMENT ON TABLE t IS 'x'",
 		"COMMENT ON MATERIALIZED VIEW mv IS 'x'",
+		"COMMENT ON LARGE OBJECT 1 IS 'x'", // M0149-0001h1a
 	} {
 		if !routed(q) {
 			t.Errorf("%q not routed, but it is fully covered", q)

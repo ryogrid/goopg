@@ -211,7 +211,7 @@
 %type <stmt>	create_event_trigger_stmt alter_event_trigger_stmt create_access_method_stmt
 %type <str>	am_type
 %type <strs>	evtrig_when evtrig_filter_list evtrig_sconst_list
-%type <stmt>	explainable_stmt merge_stmt copy_stmt alter_system_stmt alter_index_stmt alter_view_stmt listen_stmt notify_stmt unlisten_stmt alter_matview_stmt alter_sequence_stmt alter_type_stmt alter_domain_stmt drop_misc_stmt drop_database_stmt create_extension_stmt alter_schema_stmt create_policy_stmt create_trigger_stmt drop_trigger_stmt comment_stmt alter_function_stmt create_type_stmt drop_type_stmt create_domain_stmt drop_domain_stmt create_sequence_stmt do_stmt create_function_stmt drop_function_stmt call_stmt savepoint_stmt checkpoint_stmt discard_stmt deallocate_stmt prepare_stmt execute_stmt close_stmt declare_stmt fetch_stmt analyze_stmt vacuum_stmt reindex_stmt cluster_stmt lock_stmt tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt drop_view_stmt create_matview_stmt
+%type <stmt>	explainable_stmt merge_stmt copy_stmt alter_system_stmt alter_index_stmt alter_view_stmt listen_stmt notify_stmt unlisten_stmt alter_matview_stmt alter_sequence_stmt alter_type_stmt alter_domain_stmt drop_misc_stmt drop_database_stmt create_extension_stmt alter_schema_stmt alter_large_object_stmt create_policy_stmt create_trigger_stmt drop_trigger_stmt comment_stmt alter_function_stmt create_type_stmt drop_type_stmt create_domain_stmt drop_domain_stmt create_sequence_stmt do_stmt create_function_stmt drop_function_stmt call_stmt savepoint_stmt checkpoint_stmt discard_stmt deallocate_stmt prepare_stmt execute_stmt close_stmt declare_stmt fetch_stmt analyze_stmt vacuum_stmt reindex_stmt cluster_stmt lock_stmt tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt drop_view_stmt create_matview_stmt
 
 %type <telems>	opt_of_elements of_element_list
 %type <node>	of_element
@@ -506,6 +506,7 @@ explainable_stmt:
 				$$ = $1
 			}
 	| alter_schema_stmt
+	| alter_large_object_stmt
 			{
 				$$ = $1
 			}
@@ -2922,7 +2923,11 @@ c_expr:
 	   records it as the Qualified form with unit "second" and the precision. */
 	| INTERVAL '(' ICONST ')' SCONST
 			{
-				$$ = NewIntervalLitQualified($<p>1, $5, "second", true, $3)
+				if buildIntervalLit($<p>1, $5) == nil {
+					$$ = NewCastExpr($<p>5, NewStringConst($<p>5, $5), ObjectName{Name: "interval"}, nil)
+				} else {
+					$$ = NewIntervalLitQualified($<p>1, $5, "second", true, $3)
+				}
 			}
 	| INTERVAL SCONST
 			{
@@ -2933,8 +2938,9 @@ c_expr:
 				   fall-through blames. */
 				e := buildIntervalLit($<p>1, $2)
 				if e == nil {
-					raiseErr(yylex, &SyntaxError{Pos: $<p>2, Message: "'" + strings.ReplaceAll($2, "'", "''") + "'"})
-					e = NewNullConst($<p>1)
+					/* A body that is not an interval is reported by interval_in
+					   at the string, as makeStringConstCast leaves it to do. */
+					e = NewCastExpr($<p>2, NewStringConst($<p>2, $2), ObjectName{Name: "interval"}, nil)
 				}
 				// Remember the raw body for AT TIME ZONE — see lastIntervalNode.
 				l.lastIntervalNode, l.lastIntervalRaw, l.lastIntervalLitPos = e, $2, $<p>2
@@ -2947,8 +2953,27 @@ c_expr:
 			{ $$ = NewGroupingCall($<p>1, $3) }
 	| TYPEDLIT
 			{
-				typ, val := typedLitParts($1)
-				$$ = NewTypedStringLit($<p>1, typ, val)
+				/* $<ival>1 is the string's position: coerce_type reports a bad
+				   literal there (makeStringConstCast), not at the type name. */
+				$$ = typedLitExpr(yylex, $1, $<p>1, $<ival>1)
+			}
+	/* gram.y AexprConst: func_name Sconst — a typed literal of a type the
+	   lexer's TYPEDLIT fold does not know (a user type: `mood 'happy'`,
+	   or an unknown name, which the analyzer rejects
+	   as typenameType does; `schema.type 'x'` is the lexer's TYPEDLIT
+	   fold). As a grammar rule it applies only where an
+	   expression is expected, so option lists (`OPTIONS (host 'x')`) are
+	   untouched. M0149-0001h1a85. */
+	| IDENT SCONST
+			{ $$ = newTypedLitCast($<p>2, $2, ObjectName{Name: $1}, $<p>1) }
+	/* NCHAR Sconst and NATIONAL CHARACTER Sconst — gram.y ConstCharacter
+	   Sconst; both are bpchar. */
+	| NCHAR SCONST
+			{ $$ = NewCastExpr($<p>2, NewStringConst($<p>2, $2), ObjectName{Name: "bpchar"}, nil) }
+	| NATIONAL TYPEDLIT
+			{
+				/* The lexer has already folded `character 'x'`. */
+				$$ = typedLitExpr(yylex, $2, $<p>2, $<ival>2)
 			}
 	/* Multi-word typed literals — gram.y ConstDatetime Sconst. The lexer's
 	   TYPEDLIT fold needs the SCONST to follow the type name IMMEDIATELY, so
@@ -2956,13 +2981,13 @@ c_expr:
 	   WITH/WITHOUT arrive as WITH_LA/WITHOUT_LA because base_yylex substitutes
 	   them when TIME follows. */
 	| TIMESTAMP WITH_LA TIME ZONE SCONST
-			{ $$ = NewTypedStringLit($<p>1, "timestamptz", $5) }
+			{ $$ = NewTypedStringLit($<p>5, "timestamptz", $5) }
 	| TIMESTAMP WITHOUT_LA TIME ZONE SCONST
-			{ $$ = NewTypedStringLit($<p>1, "timestamp", $5) }
+			{ $$ = NewTypedStringLit($<p>5, "timestamp", $5) }
 	| TIME WITH_LA TIME ZONE SCONST
-			{ $$ = NewTypedStringLit($<p>1, "timetz", $5) }
+			{ $$ = NewTypedStringLit($<p>5, "timetz", $5) }
 	| TIME WITHOUT_LA TIME ZONE SCONST
-			{ $$ = NewTypedStringLit($<p>1, "time", $5) }
+			{ $$ = NewTypedStringLit($<p>5, "time", $5) }
 	/* ARRAY[...] — gram.y array_expr: the inner brackets nest WITHOUT the
 	   keyword (`array[[1,2],[3,4]]`), and legacy builds nested
 	   ArrayConstructorExpr for them. */
@@ -3844,6 +3869,7 @@ cast_typename:
 opt_array_tail:
 		/* empty */          { $$ = 0 }
 	| '[' ']' opt_array_tail { $$ = $3 + 1 }
+	| '[' ICONST ']' opt_array_tail { $$ = $4 + 1 } /* bounds are not enforced (gram.y opt_array_bounds) */
 
 character_word:
 		CHARACTER  { $$ = "character" }

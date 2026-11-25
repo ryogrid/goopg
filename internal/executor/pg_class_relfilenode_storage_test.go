@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -64,6 +65,13 @@ func TestPgClassRelfilenodeZeroForStorageLessRelkinds(t *testing.T) {
 		}
 		relname, relkind, relfilenode := row[colRelname], row[colRelkind], row[colRelfilenode]
 		seen[relname] = true
+		// System relations are PG 18.3's captured rows (M0149-0001h1a35): a
+		// mapped catalog and its indexes legitimately carry relfilenode 0
+		// (the relation mapper holds the file), so the rule is checked on
+		// user relations only.
+		if oid, err := strconv.ParseUint(row[0], 10, 32); err == nil && uint32(oid) < catalog.FirstUserOID {
+			continue
+		}
 		if catalog.RelkindHasStorage(relkind) {
 			if relfilenode == "0" {
 				t.Errorf("%s (relkind %q) has relfilenode 0; a kind with storage must carry its own relfilenode", relname, relkind)

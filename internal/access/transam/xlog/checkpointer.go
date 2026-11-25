@@ -291,6 +291,9 @@ func (c *CheckpointerConfig) withDefaults() {
 // Checkpointer periodically flushes dirty pages and writes a
 // checkpoint marker to WAL.
 type Checkpointer struct {
+	// twoPhaseFn is CheckPointTwoPhase (SetTwoPhaseCheckpointFn).
+	twoPhaseFn atomic.Pointer[func(redo uint64) error]
+
 	flusher DirtyPageFlusher
 	wal     checkpointWAL
 	cfg     CheckpointerConfig
@@ -334,6 +337,10 @@ type Checkpointer struct {
 	lastCheckpointLSN      atomic.Uint64
 	lastCheckpointRedoLSN  atomic.Uint64
 	lastCheckpointStartLSN atomic.Uint64
+
+	// gucOverride holds the settings pg_control echoes, once the server
+	// has read them (SetGUCParams, M0149-0020).
+	gucOverride atomic.Pointer[GUCParameters]
 
 	// volumeAnchor is the fallback RedoRecPtr for the max_wal_size
 	// trigger before this process has completed its first checkpoint:
@@ -379,6 +386,7 @@ type Checkpointer struct {
 	//                 (currently only set at construction)
 	numTimed     stats.Counter
 	numRequested stats.Counter
+	numDone      stats.Counter // num_performed: checkpoints completed (M0149-0007)
 	writeTimeMs  stats.Counter
 	statsResetAt atomic.Int64 // unix nanos
 }
@@ -387,6 +395,7 @@ type Checkpointer struct {
 type Stats struct {
 	NumTimed          uint64
 	NumRequested      uint64
+	NumDone           uint64
 	WriteTimeMs       uint64
 	LastCheckpointLSN uint64
 	StatsResetAt      time.Time
@@ -399,9 +408,38 @@ func (c *Checkpointer) Stats() Stats {
 	return Stats{
 		NumTimed:          uint64(c.numTimed.Sum()),
 		NumRequested:      uint64(c.numRequested.Sum()),
+		NumDone:           uint64(c.numDone.Sum()),
 		WriteTimeMs:       uint64(c.writeTimeMs.Sum()),
 		LastCheckpointLSN: c.lastCheckpointLSN.Load(),
 		StatsResetAt:      time.Unix(0, c.statsResetAt.Load()),
+	}
+}
+
+// ResetStats is pgstat_reset_of_kind(PGSTAT_KIND_CHECKPOINTER)
+// (pg_stat_reset_shared('checkpointer')): the counters restart from zero and
+// stats_reset is now. M0149-0007.
+func (c *Checkpointer) ResetStats() {
+	c.numTimed.Reset()
+	c.numRequested.Reset()
+	c.numDone.Reset()
+	c.writeTimeMs.Reset()
+	c.statsResetAt.Store(time.Now().UnixNano())
+}
+
+// RestoreStats loads the counters a clean shutdown saved in
+// pg_stat/pgstat.stat (pgstat_read_statsfile's checkpointer chunk). A zero
+// StatsResetAt keeps the current one. M0149-0007.
+func (c *Checkpointer) RestoreStats(s Stats) {
+	c.numTimed.Reset()
+	c.numRequested.Reset()
+	c.numDone.Reset()
+	c.writeTimeMs.Reset()
+	c.numTimed.Add(int64(s.NumTimed))
+	c.numRequested.Add(int64(s.NumRequested))
+	c.numDone.Add(int64(s.NumDone))
+	c.writeTimeMs.Add(int64(s.WriteTimeMs))
+	if !s.StatsResetAt.IsZero() {
+		c.statsResetAt.Store(s.StatsResetAt.UnixNano())
 	}
 }
 
@@ -514,6 +552,12 @@ func (c *Checkpointer) CheckpointRedoLSN() uint64 {
 // against the original interval and a change here only affects a
 // subsequent Run invocation. The control-socket reload path will
 // hook into this once it observes the GUC registry.
+// SetTwoPhaseCheckpointFn installs CheckPointTwoPhase, called with each
+// checkpoint's redo pointer once the data files are synced.
+func (c *Checkpointer) SetTwoPhaseCheckpointFn(fn func(redo uint64) error) {
+	c.twoPhaseFn.Store(&fn)
+}
+
 func (c *Checkpointer) SetInterval(d time.Duration) {
 	if d <= 0 {
 		return
@@ -674,7 +718,7 @@ func (c *Checkpointer) segmentSize() uint64 {
 	if c.cfg.SegmentSize > 0 {
 		return uint64(c.cfg.SegmentSize)
 	}
-	return uint64(DefaultSegmentSize)
+	return uint64(WALSegmentSize())
 }
 
 // checkpointSegments mirrors upstream's CalculateCheckpointSegments
@@ -1018,7 +1062,7 @@ func (c *Checkpointer) runCheckpointOpts(ctx context.Context, o checkpointOpts) 
 		}
 		segSize := c.cfg.SegmentSize
 		if segSize <= 0 {
-			segSize = DefaultSegmentSize
+			segSize = WALSegmentSize()
 		}
 		leading := 0
 		if pos%XLOGBlockSize == 0 {
@@ -1100,6 +1144,15 @@ func (c *Checkpointer) runCheckpointOpts(ctx context.Context, o checkpointOpts) 
 		}
 	}
 	c.writeTimeMs.Add(time.Since(flushStart).Milliseconds())
+	// CheckPointGuts → CheckPointTwoPhase(checkPointRedo): prepared
+	// transactions whose PREPARE record precedes the redo point get their
+	// state files, since that WAL may be recycled after this checkpoint.
+	// M0149-0015a.
+	if fn := c.twoPhaseFn.Load(); fn != nil {
+		if err := (*fn)(redoLSN0); err != nil {
+			return fmt.Errorf("checkpoint two-phase state: %w", err)
+		}
+	}
 	// M0102-0007: redoLSN0 (computed and published above, BEFORE the flush)
 	// is what the PG-compatible checkpoint record carries — PG's xlogreader
 	// validates it.
@@ -1136,7 +1189,7 @@ func (c *Checkpointer) runCheckpointOpts(ctx context.Context, o checkpointOpts) 
 	cpFields := CheckPointFields{
 		ThisTLI:        c.timelineID(),
 		FullPageWrites: c.fullPageWrites(),
-		WalLevel:       uint32(max(c.cfg.GUCParams.WalLevel, 0)),
+		WalLevel:       uint32(max(c.gucParams().WalLevel, 0)),
 		NextXid:        nextXid,
 		NextOid:        nextOid,
 	}
@@ -1205,7 +1258,7 @@ func (c *Checkpointer) runCheckpointOpts(ctx context.Context, o checkpointOpts) 
 	if c.cfg.DataDir != "" {
 		checkLSN0 := startLSN - 1 // convert 1-based internal to 0-based PG LSN
 		now := time.Now().Unix()
-		guc := c.cfg.GUCParams
+		guc := c.gucParams()
 		if err := control.UpdateControlFile(c.cfg.DataDir, func(cd *control.ControlFileData) {
 			// A shutdown checkpoint leaves the cluster cleanly shut down
 			// (DB_SHUTDOWNED); every other checkpoint runs while the
@@ -1270,6 +1323,7 @@ func (c *Checkpointer) runCheckpointOpts(ctx context.Context, o checkpointOpts) 
 	} else {
 		c.numRequested.Add(1)
 	}
+	c.numDone.Add(1)
 	// NOTE (perf-optimize3-dash/03): the FPI epoch boundary is the redo
 	// publication at checkpoint START above — there is no post-record epoch
 	// reset any more (the old ResetCheckpointEpoch sweep here raced writers
@@ -1396,6 +1450,15 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context, shutdown bool) erro
 			return fmt.Errorf("sync recovery data files: %w", err)
 		}
 	}
+	// CreateRestartPoint → CheckPointGuts → CheckPointTwoPhase(redo): a
+	// standby writes the state files of prepared transactions replayed
+	// before the restartpoint's redo, so a restarted standby restores them
+	// (M0149-0016).
+	if fn := c.twoPhaseFn.Load(); fn != nil && haveRP {
+		if err := (*fn)(rp.Fields.RedoLSN0); err != nil {
+			return fmt.Errorf("restartpoint two-phase state: %w", err)
+		}
+	}
 	if c.cfg.DataDir != "" && (haveRP || shutdown) {
 		adopted, priorRedo, err := adoptRestartPointPrior(c.cfg.DataDir, rp, haveRP, shutdown)
 		if err != nil {
@@ -1471,8 +1534,8 @@ func (c *Checkpointer) runArchiveCleanupCommand(rp ReplayedCheckpoint) {
 	if cmd == "" {
 		return
 	}
-	if _, err := ExecuteRecoveryCommand(cmd, "archive_cleanup_command", rp.Fields.RedoLSN0, rp.Fields.ThisTLI, c.cfg.SegmentSize); err != nil {
-		c.cfg.Logger.Warn("archive_cleanup_command failed", "err", err)
+	if _, err := ExecuteRecoveryCommandIn(c.cfg.DataDir, cmd, "archive_cleanup_command", rp.Fields.RedoLSN0, rp.Fields.ThisTLI, c.cfg.SegmentSize); err != nil {
+		c.cfg.Logger.Warn(err.Error())
 	}
 }
 
@@ -1627,4 +1690,18 @@ func (c *Checkpointer) buildPacer(ctx context.Context, spread bool, start time.T
 			return nil
 		}
 	}
+}
+
+// SetGUCParams installs the server's current values of the settings
+// pg_control echoes (XLogReportParameters, M0149-0020); until called the
+// checkpointer echoes cfg.GUCParams (DefaultGUCParameters).
+func (c *Checkpointer) SetGUCParams(p GUCParameters) {
+	c.gucOverride.Store(&p)
+}
+
+func (c *Checkpointer) gucParams() GUCParameters {
+	if p := c.gucOverride.Load(); p != nil {
+		return *p
+	}
+	return c.cfg.GUCParams
 }

@@ -962,7 +962,9 @@ var heapExtendLocks sync.Map // map[storage.RelFileNode]*heapExtendLockSet
 // `RelationGetBufferForTuple` — see
 // `docs/design/perf-optimize/07-wal-fsm-insert.md` §3.
 func lockHeapExtend(rel storage.RelFileNode, procNum int32) (release func(), contended bool) {
-	v, _ := heapExtendLocks.LoadOrStore(rel, &heapExtendLockSet{})
+	// Keyed by the canonical identity (storage.StorageDBOid): one lock set
+	// per relation file whichever database-OID form the caller holds.
+	v, _ := heapExtendLocks.LoadOrStore(rel.Canonical(), &heapExtendLockSet{})
 	set := v.(*heapExtendLockSet)
 	mu := &set.locks[uint32(procNum)&(heapExtendLockStripes-1)].mu
 	if mu.TryLock() {
@@ -1292,6 +1294,8 @@ func renderHeapACLColumnInto(cat catalog.Catalog, tbl *catalog.Table, cols []cat
 		aclName = "attacl"
 	case catalog.PgDatabaseRelationOID:
 		aclName = "datacl"
+	case catalog.LargeObjectMetadataRelationId:
+		aclName = "lomacl" // M0149-0001h1a
 	default:
 		return
 	}
@@ -1614,10 +1618,12 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	// (execDatabaseACLChange → resyncDatabaseACLHeapRow) and rendered back to
 	// canonical aclitemout text here.
 	o.dbACLColIdx = -1
-	if o.tbl != nil && o.tbl.OID == catalog.PgDatabaseRelationOID {
+	// pg_largeobject_metadata.lomacl shares the slot: the same blob, written
+	// by GRANT … ON LARGE OBJECT (M0149-0001h1a).
+	if o.tbl != nil && (o.tbl.OID == catalog.PgDatabaseRelationOID || o.tbl.OID == catalog.LargeObjectMetadataRelationId) {
 		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 			for i, col := range o.cols {
-				if col.Name == "datacl" {
+				if col.Name == "datacl" || col.Name == "lomacl" {
 					o.dbACLColIdx = i
 					break
 				}
@@ -2696,12 +2702,62 @@ func dmlPrivilegePermitted(ctx *Context, tbl *catalog.Table, priv string) bool {
 // implicit default ACL (IsOwnerACLRevoked), the owner's remaining rights
 // come from the materialized owner ACL entry instead of an automatic true.
 // M0134-0069 bucket 7.
+// publicRevokedCatalogs are the system tables PG's initdb strips PUBLIC's
+// SELECT from: pg_authid (initdb.c setup_auth), pg_largeobject
+// (setup_privileges), and system_views.sql's REVOKE ALL ... FROM public on
+// pg_statistic, pg_statistic_ext_data, pg_user_mapping and pg_subscription.
+var publicRevokedCatalogs = map[uint32]bool{
+	1260: true, // pg_authid
+	2613: true, // pg_largeobject
+	2619: true, // pg_statistic
+	3429: true, // pg_statistic_ext_data
+	1418: true, // pg_user_mapping
+	6100: true, // pg_subscription
+}
+
+// publicRevokedCatalogNames covers the same catalogs by name: some are
+// virtual tables that carry no relation OID.
+var publicRevokedCatalogNames = map[string]bool{
+	"pg_authid": true, "pg_largeobject": true, "pg_statistic": true,
+	"pg_statistic_ext_data": true, "pg_user_mapping": true, "pg_subscription": true,
+}
+
+func isPublicRevokedCatalog(tbl *catalog.Table) bool {
+	if tbl == nil {
+		return false
+	}
+	if publicRevokedCatalogs[tbl.OID] {
+		return true
+	}
+	return (tbl.OID == 0 || catalog.IsSystemRelation(tbl.OID)) &&
+		strings.EqualFold(tbl.Schema, "pg_catalog") && publicRevokedCatalogNames[strings.ToLower(tbl.Name)]
+}
+
+// roleOIDPgReadAllData is ROLE_PG_READ_ALL_DATA.
+const roleOIDPgReadAllData = 6181
+
 func dmlPrivilegePermittedAs(ctx *Context, tbl *catalog.Table, priv, checkRole string) bool {
 	if ctx.NonSuperuserRole == "" {
 		return true // bootstrap superuser session: full privileges
 	}
 	if checkRole == "" {
 		return true // effective role is the bootstrap superuser (e.g. a superuser-owned view)
+	}
+	if priv == "SELECT" && isPublicRevokedCatalog(tbl) {
+		// initdb / system_views.sql REVOKE ALL ... FROM PUBLIC on these
+		// catalogs (pg_authid's password hashes, pg_largeobject's data,
+		// pg_statistic's sampled values, ...). Only an explicit grant, the
+		// owner (the bootstrap superuser) or pg_read_all_data
+		// (pg_class_aclmask_ext) reads them.
+		if ctx.Catalog.HasTablePrivilege(tbl.OID, checkRole, priv) {
+			return true
+		}
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			if m, ok := im.RoleOID(checkRole); ok && im.HasPrivsOfRole(m, roleOIDPgReadAllData) {
+				return true
+			}
+		}
+		return false
 	}
 	if priv == "SELECT" && tbl != nil && catalog.IsSystemRelation(tbl.OID) {
 		// PostgreSQL seeds every system catalog/view with an implicit PUBLIC
@@ -2748,6 +2804,9 @@ func selectPrivilegeCheckRole(ctx *Context, roleSet bool, role string) string {
 }
 
 func (o *insertOp) Open(ctx *Context) error {
+	if err := preventCommandDuringRecovery(ctx, "INSERT"); err != nil {
+		return err
+	}
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "Insert requires storage handles in Context"}
 	}
@@ -2813,8 +2872,14 @@ func coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i
 			coerced, cerr = evalCast(row[i], "date", pos, ctx)
 		case "timestamp":
 			coerced, cerr = evalCast(row[i], "timestamp", pos, ctx)
+			if cerr == nil {
+				coerced = roundTimestampDatumToPrecision(coerced, timeColumnPrecision(col.Type))
+			}
 		case "timestamptz":
 			coerced, cerr = evalCast(row[i], "timestamptz", pos, ctx)
+			if cerr == nil {
+				coerced = roundTimestampDatumToPrecision(coerced, timeColumnPrecision(col.Type))
+			}
 		case "time", "time without time zone":
 			// M0119-0006 (62nd slice): `time` joins the list so its declared
 			// precision reaches the value — before this, a `time(2)` column's value
@@ -3532,6 +3597,10 @@ func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory,
 				keyStrs = append(keyStrs, d.StringValue())
 			case KindNumeric:
 				keyStrs = append(keyStrs, d.StringValue())
+			case KindBool:
+				// The bound text a boolean bound stores (exprToString):
+				// "false" < "true" lexically, which is bool's order.
+				keyStrs = append(keyStrs, partitionKeyDatumToListStr(d))
 			default:
 				if d.IsNull() {
 					keyStrs = append(keyStrs, "null")
@@ -3896,17 +3965,57 @@ func indexScanPredicate(ix *optimizer.IndexScan) optimizer.Expr {
 		// declines this shape) still filters exactly the probed rows.
 		// The reconstructed InExpr carries ANY (OR) semantics by its
 		// zero value, matching the probe's union-of-descents.
-		col := ix.Index.Columns[0]
+		// M0148-0001c3a4 (b): an equality prefix (RangePrefix) puts the
+		// SAOP on Columns[len(RangePrefix)]; its equalities are rebuilt
+		// first, as the RangePrefix range arm below does, because the
+		// restriction path dropped them from the Filter.
+		np := len(ix.RangePrefix)
+		if np >= len(ix.Index.Columns) {
+			return nil
+		}
+		var combined optimizer.Expr
+		for i, key := range ix.RangePrefix {
+			pref, pok := indexScanColumnRef(ix, ix.Index.Columns[i])
+			if !pok {
+				return nil
+			}
+			eq := &optimizer.BinaryOp{Op: parser.OpEq, Left: pref, Right: key}
+			if combined == nil {
+				combined = eq
+			} else {
+				combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: eq}
+			}
+		}
+		col := ix.Index.Columns[np]
 		ref, ok := indexScanColumnRef(ix, col)
 		if !ok {
 			return nil
 		}
 		keys := make([]optimizer.Expr, 0, len(ix.SAOPKeys))
 		keys = append(keys, ix.SAOPKeys...)
-		var combined optimizer.Expr = &optimizer.InExpr{Operand: ref, List: keys}
-		// M0145-0029: a SAOP probe's bounds sit on the SECOND index column.
-		if (ix.LowKey != nil || ix.HighKey != nil) && len(ix.Index.Columns) > 1 {
-			ref2, ok2 := indexScanColumnRef(ix, ix.Index.Columns[1])
+		var in optimizer.Expr = &optimizer.InExpr{Operand: ref, List: keys}
+		if ix.SAOPOp != parser.OpUnknown && ix.SAOPOp != parser.OpEq {
+			// M0148-0001c3a4 (a): `col op ANY (keys)`.
+			in = &optimizer.InExpr{Operand: ref, List: keys, AnyOp: ix.SAOPOp}
+		}
+		if combined == nil {
+			combined = in
+		} else {
+			combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: in}
+		}
+		// M0148-0001c3a4 (i): the column quals merged into the array.
+		for _, q := range ix.SAOPColQuals {
+			var qe optimizer.Expr
+			if q.Array != nil {
+				qe = &optimizer.InExpr{Operand: ref, List: append([]optimizer.Expr(nil), q.Array...)}
+			} else {
+				qe = &optimizer.BinaryOp{Op: q.Op, Left: ref, Right: q.Key}
+			}
+			combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: qe}
+		}
+		// M0145-0029: a SAOP probe's bounds sit on the index column after it.
+		if (ix.LowKey != nil || ix.HighKey != nil) && len(ix.Index.Columns) > np+1 {
+			ref2, ok2 := indexScanColumnRef(ix, ix.Index.Columns[np+1])
 			if !ok2 {
 				return nil
 			}
@@ -3934,6 +4043,10 @@ func indexScanPredicate(ix *optimizer.IndexScan) optimizer.Expr {
 		// dropped them from the Filter above the scan, so a predicate without
 		// them would match (and update/delete) rows outside the probe.
 		np := len(ix.RangePrefix)
+		// M0148-0001c3a4 (j): a skip scan's bounds sit on Columns[SkipPrefix].
+		if ix.SkipPrefix > 0 && len(ix.Keys) == 0 && np == 0 {
+			np = ix.SkipPrefix
+		}
 		if np >= len(ix.Index.Columns) {
 			return nil
 		}
@@ -3982,6 +4095,32 @@ func indexScanPredicate(ix *optimizer.IndexScan) optimizer.Expr {
 			} else {
 				combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: high}
 			}
+		}
+		// M0148-0001c3a4 (i): the array on the second column behind the
+		// range.
+		if ts := ix.TrailingSAOP; ts != nil && combined != nil && len(ix.Index.Columns) > 1 {
+			ref, ok := indexScanColumnRef(ix, ix.Index.Columns[1])
+			if !ok {
+				return nil
+			}
+			combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: trailingSAOPPred(ref, ts)}
+		}
+		// M0148-0001c3a12: the bound above is the row comparison's lossy
+		// leading-column bound; the comparison itself makes it exact.
+		if rc := ix.RowCompare; rc != nil && combined != nil {
+			bad := false
+			pred, ok := optimizer.CloneExprReplacingColumnRefs(rc, func(cr *optimizer.ColumnRef) optimizer.Expr {
+				ref, found := indexScanColumnRef(ix, cr.Name)
+				if !found {
+					bad = true
+					return nil
+				}
+				return ref
+			})
+			if !ok || bad {
+				return nil
+			}
+			combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: pred}
 		}
 		return combined
 	}
@@ -4911,6 +5050,9 @@ func (o *updateOp) appendUpdateRetRowWithFrom(newRow Row, fromPortion Row) {
 }
 
 func (o *updateOp) Open(ctx *Context) error {
+	if err := preventCommandDuringRecovery(ctx, "UPDATE"); err != nil {
+		return err
+	}
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "Update requires storage handles in Context"}
 	}
@@ -6813,6 +6955,9 @@ func (o *deleteOp) appendDeleteRetRowWithUsing(oldRow Row, usingPortion Row) {
 }
 
 func (o *deleteOp) Open(ctx *Context) error {
+	if err := preventCommandDuringRecovery(ctx, "DELETE"); err != nil {
+		return err
+	}
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "Delete requires storage handles in Context"}
 	}
@@ -9657,6 +9802,12 @@ func isLiveForUniqueCheck(ctx *Context, xmin, xmax storage.TransactionID) bool {
 	selfXID := ctx.Tx.XID
 	if ctx.TxnMgr != nil {
 		switch {
+		case xidIsSelf(ctx, xmin) && ctx.TxnMgr.IsSubxact(xmin) && ctx.TxnMgr.IsAborted(xmin):
+			// Inserted by one of our subtransactions that ROLLBACK TO undid:
+			// TransactionIdIsCurrentTransactionId excludes an aborted
+			// subtransaction, so the row is dead, and inserting the same key
+			// again must succeed (018_wal_optimize idx_hint). M0149-0006.
+			xminLive = false
 		case xidIsSelf(ctx, xmin):
 			// Inserted by our own xact (top-level or any subtransaction) in
 			// this transaction — live. A sub-XID stays "self" even after
@@ -9702,6 +9853,11 @@ func isLiveForUniqueCheck(ctx *Context, xmin, xmax storage.TransactionID) bool {
 	// raise 23505 against the row we just deleted.
 	if selfXID != storage.InvalidTransactionID && xmax == selfXID {
 		return false
+	}
+	// A delete by one of our own subtransactions: undone by ROLLBACK TO (the
+	// row is live again), otherwise deleted by us. M0149-0006.
+	if ctx.TxnMgr != nil && xidIsSelf(ctx, xmax) && ctx.TxnMgr.IsSubxact(xmax) {
+		return ctx.TxnMgr.IsAborted(xmax)
 	}
 	if ctx.TxnMgr != nil {
 		if ctx.TxnMgr.IsXIDActive(xmax) {

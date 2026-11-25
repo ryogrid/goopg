@@ -73,13 +73,35 @@ func TestExactIntVarianceZeroAndDegenerate(t *testing.T) {
 // sibling so the two finishers cannot silently diverge again.
 func TestExactNumericVarianceZeroStddev(t *testing.T) {
 	r := func(v int64) *big.Rat { return new(big.Rat).SetInt64(v) }
-	got := exactNumericVariance(r(10), r(50), 2, true, true)
-	if got.IsNull() || got.StringValue() != "0" {
+	got := exactNumericVariance(r(10), r(50), 2, 0, true, true)
+	if got.IsNull() || got.Format() != "0" {
 		t.Fatalf("numeric stddev_samp of all-equal group: want \"0\", got %v", got)
 	}
-	got = exactNumericVariance(r(5), r(25), 1, true, true)
+	got = exactNumericVariance(r(5), r(25), 1, 0, true, true)
 	if !got.IsNull() {
-		t.Fatalf("numeric stddev_samp of single row: want NULL, got %q", got.StringValue())
+		t.Fatalf("numeric stddev_samp of single row: want NULL, got %q", got.Format())
+	}
+}
+
+// TestExactNumericVarianceFollowsPGScale pins digits measured on PG 18.3.
+func TestExactNumericVarianceFollowsPGScale(t *testing.T) {
+	rat := func(s string) *big.Rat {
+		v, ok := new(big.Rat).SetString(s)
+		if !ok {
+			t.Fatalf("bad number %s", s)
+		}
+		return v
+	}
+	xs := []string{"1000000000000000000000000000000", "2000000000000000000000000000000", "3"}
+	sx, sxx := new(big.Rat), new(big.Rat)
+	for _, s := range xs {
+		x := rat(s)
+		sx.Add(sx, x)
+		sxx.Add(sxx, new(big.Rat).Mul(x, x))
+	}
+	got := exactNumericVariance(sx, sxx, 3, 0, false, false).Format()
+	if want := "666666666666666666666666666664666666666666666666666666666669"; got != want {
+		t.Errorf("var_pop = %s, want %s", got, want)
 	}
 }
 
@@ -122,5 +144,18 @@ func TestExactIntVarianceMatchesPGDigits(t *testing.T) {
 		if got := exactIntVariance(sx, sxx, n, c.isSample, c.isSqrt).Format(); got != c.want {
 			t.Errorf("%v sample=%v sqrt=%v: got %s, PG %s", c.vals, c.isSample, c.isSqrt, got, c.want)
 		}
+	}
+}
+
+// TestCombineVarianceKeepsNumericScale: the result scale depends on the largest
+// input scale, which a worker's partial state must hand to the leader.
+func TestCombineVarianceKeepsNumericScale(t *testing.T) {
+	dst := aggRuntime{numericExact: true, count: 1, numericScale: 1,
+		numericSx: big.NewRat(1, 1), numericSxx: big.NewRat(1, 1)}
+	src := aggRuntime{numericExact: true, count: 1, numericScale: 4,
+		numericSx: big.NewRat(2, 1), numericSxx: big.NewRat(4, 1)}
+	combineVariance(&dst, &src)
+	if dst.numericScale != 4 {
+		t.Errorf("numericScale = %d, want 4", dst.numericScale)
 	}
 }

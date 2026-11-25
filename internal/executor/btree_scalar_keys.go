@@ -221,7 +221,7 @@ func coerceScalarKeyStringDatum(v Datum, col *catalog.Column, pos int) (Datum, *
 			return v, &ExecError{Code: "22007", Pos: pos,
 				Message: fmt.Sprintf("invalid input syntax for type time: %q", s)}
 		}
-		return NewTimeDatum(t), nil
+		return NewTimeOfDayDatum(t), nil
 	}
 	return v, nil
 }
@@ -302,6 +302,13 @@ func encodeScalarBTreeKey(v Datum, col *catalog.Column, pos int) (key []byte, ha
 // never errors (the M0119-0006 NUMERIC slice found that exact latent misread).
 func decodeScalarBTreeKey(key []byte, typeName string) (d Datum, n int, handled bool, err error) {
 	switch {
+	case isMoneyTypeName(typeName):
+		// Twin of encodeBTreeKeyForColumn's money arm. M0149-0001k5.
+		if len(key) < 8 {
+			return NullDatum, 0, true, fmt.Errorf("btree: money key truncated, got %d bytes", len(key))
+		}
+		v, derr := nbtree.DecodeInt8(key[:8])
+		return moneyDatum(v), 8, true, derr
 	case isInt2Type(typeName):
 		if len(key) < 4 {
 			return NullDatum, 0, true, fmt.Errorf("btree: int2 key truncated, got %d bytes", len(key))
@@ -363,7 +370,7 @@ func decodeScalarBTreeKey(key []byte, typeName string) (d Datum, n int, handled 
 		if derr != nil {
 			return NullDatum, 0, true, derr
 		}
-		return NewTimeDatum(pgTimeFromMicros(v)), 8, true, nil
+		return NewTimeOfDayDatum(pgTimeFromMicros(v)), 8, true, nil
 	case isInetType(typeName), isCidrType(typeName):
 		// M0134-0002 C5: inverts encodeInetBTreeKey. The key is fixed-width
 		// and self-describing (the family byte selects the address width), so

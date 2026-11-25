@@ -145,6 +145,7 @@ func (op *ReadOp) AlreadyValid() bool { return op.hit }
 // find a victim, which a look-ahead window must treat as "stop growing", not
 // as a failure — the window is discretionary, the consumer's own Pin is not.
 func (p *Pool) StartRead(tag BufferTag) (*ReadOp, error) {
+	tag.Rel = tag.Rel.Canonical()
 	// Fast path: already resident and valid. Pin it and report a hit; the
 	// window still owns the pin, so the accounting is identical either way.
 	if s, ok := p.TryPin(tag); ok {

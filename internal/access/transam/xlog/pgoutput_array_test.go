@@ -201,14 +201,20 @@ func TestPgoDecodeArrayColumns(t *testing.T) {
 	}
 }
 
-// Every ArrayType is a varlena, i.e. PG 'i' / 4-byte alignment — never the
-// ELEMENT's alignment. `interval[]` is the sharp case: the element's typalign
-// is 'd', so the pre-fix code aligned an array column to 8.
+// An ArrayType's typalign is its element's: pg_type.dat gives _interval and
+// _int8 typalign 'd' (8) and _uuid/_bool/_int2 'i' (4). This test used to pin
+// 4 for every array, which made a hosted PG mis-read int8[] values
+// ({1,2,3} came back as {1,12884901888,549755813888}); the pgoutput walker
+// shares catalog.PhysicalTypeAlign with the heap codec. M0149-0001g slice 14.
 func TestPgoPhysicalAlignArrayIsVarlenaAlign(t *testing.T) {
-	for _, elem := range []string{"interval", "int8", "uuid", "bool", "int2"} {
+	for _, tc := range []struct {
+		elem  string
+		align int
+	}{{"interval", 8}, {"int8", 8}, {"uuid", 4}, {"bool", 4}, {"int2", 4}} {
+		elem := tc.elem
 		typ := catalog.Type{Name: elem, IsArray: true}
-		if got := pgoPhysicalAlign(4, typ); got != 4 {
-			t.Errorf("pgoPhysicalAlign(4, %s[]) = %d, want 4", elem, got)
+		if got := pgoPhysicalAlign(4, typ); got != (4+tc.align-1)/tc.align*tc.align {
+			t.Errorf("pgoPhysicalAlign(4, %s[]) = %d, want %d", elem, got, (4+tc.align-1)/tc.align*tc.align)
 		}
 		if got := pgoPhysicalAlign(5, typ); got != 8 {
 			t.Errorf("pgoPhysicalAlign(5, %s[]) = %d, want 8", elem, got)

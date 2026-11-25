@@ -80,6 +80,12 @@ func TestEncodeValuePGAclItemArrayEmitsEmptyArrayType(t *testing.T) {
 				t.Fatalf("encodeValuePG: %v", err)
 			}
 			want := emptyArrayTypeBytes(tc.elemType)
+			if tc.elemType == 1033 {
+				// aclitem[] encodes PG's empty ACL, allocacl(0) — one
+				// dimension of length 0 — not the ndim-0 empty array, which
+				// check_acl rejects (M0149-0001g slice 12).
+				want = emptyACLBytes()
+			}
 			if len(got) != len(want) {
 				t.Fatalf("len: got %d, want %d", len(got), len(want))
 			}
@@ -98,9 +104,17 @@ func TestEncodeValuePGAclItemArrayEmitsEmptyArrayType(t *testing.T) {
 // int32; a wrong alignment shifts every subsequent column and breaks
 // nocachegetattr's physical-offset computation.
 func TestPhysicalPGTypeAlignArrayTypes(t *testing.T) {
-	for _, name := range []string{"aclitem[]", "_aclitem", "text[]", "_text", "pg_node_tree"} {
+	for _, name := range []string{"text[]", "_text", "pg_node_tree"} {
 		if got := physicalPGTypeAlign(catalog.Type{Name: name}); got != 4 {
 			t.Errorf("physicalPGTypeAlign(%q) = %d, want 4", name, got)
+		}
+	}
+	// _aclitem is typalign 'd' (aclitem's AclMode is 64-bit since PG 16);
+	// 4-byte padding made a hosted PG mis-deform a non-NULL proacl.
+	// M0149-0001g slice 13.
+	for _, name := range []string{"aclitem[]", "_aclitem"} {
+		if got := physicalPGTypeAlign(catalog.Type{Name: name}); got != 8 {
+			t.Errorf("physicalPGTypeAlign(%q) = %d, want 8", name, got)
 		}
 	}
 	// anyarray (OID 2277) is the exception, and this expectation was INVERTED

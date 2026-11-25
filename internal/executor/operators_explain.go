@@ -13,7 +13,9 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor/hashsize"
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/utils/adt/cash"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // explainOp renders the inner plan tree as a single-column
@@ -142,7 +144,7 @@ func (o *explainOp) Open(ctx *Context) error {
 			return nil
 		}
 		var b strings.Builder
-		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats, ctx.GatherLaunched, ctx.GatherWorkerStats, ctx.SortStats, ctx.SortWorkerStats, ctx.MemoizeWorkerStats, explainHashMem(ctx), o.plan.RtableSize)
+		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats, ctx.GatherLaunched, ctx.GatherWorkerStats, ctx.SortStats, ctx.SortWorkerStats, ctx.MemoizeWorkerStats, explainHashMem(ctx), o.plan.RtableSize, currentTimeLiteralTexts(o.plan.Child, ctx))
 		appendExplainSettingsRow(ctx, opts, &o.rows)
 		if summary {
 			o.rows = append(o.rows,
@@ -179,7 +181,7 @@ func (o *explainOp) Open(ctx *Context) error {
 		return nil
 	}
 	var b strings.Builder
-	walkPlan(&b, o.plan.Child, 0, &o.rows, opts, explainHashMem(ctx), o.plan.RtableSize)
+	walkPlan(&b, o.plan.Child, 0, &o.rows, opts, explainHashMem(ctx), o.plan.RtableSize, currentTimeLiteralTexts(o.plan.Child, ctx))
 	appendExplainSettingsRow(ctx, opts, &o.rows)
 	if plainSummary {
 		o.rows = append(o.rows,
@@ -479,9 +481,13 @@ func (o *explainOp) Close() error { return nil }
 // `(rows=N)` is only appended when opts.Costs is true (the PG
 // default). `EXPLAIN (COSTS OFF) ...` therefore renders bare
 // node labels, matching upstream `COSTS OFF` output.
-func walkPlan(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, hashMem int64, rtableSize int) {
+func walkPlan(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, hashMem int64, rtableSize int, lits ...map[optimizer.Expr]string) {
 	reg := &subPlanReg{rel: newExplainNamesSized(n, rtableSize, opts.Verbose), cte: collectCTEHoist(n), hashMemLimit: hashMem}
+	if len(lits) > 0 {
+		reg.currentTimeText = lits[0]
+	}
 	reg.reservePGPlanIDs(n)
+	depth = emitRootSRFResult(n, depth, rows, opts, reg)
 	walkPlanFiltered(n, depth, rows, opts, nil, nil, reg)
 }
 
@@ -606,7 +612,7 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 		// PG's cost annotation, from the path the planner chose (take2 P0-02).
 		// `rows=` comes from the SAME carrier since C-20a's successor, so the
 		// line no longer states one estimator's costs beside another's rows.
-		est, startup, total, width := explainCostFields(rowSrc, est)
+		est, startup, total, width := explainNodeCostFields(rowSrc, est)
 		label += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, total, est, width)
 	}
 	*rows = append(*rows, Row{NewStringDatum(label)})
@@ -689,6 +695,7 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 		}
 		if srfNeedsResultAbove(c) {
 			ci = emitHashNodeLine(rows, "Result", ci, c, showCosts, nil)
+			emitSRFResultOutput(rows, c, ci, opts, reg)
 		}
 		restore := reg.enterParamInner(n, c)
 		walkPlanFiltered(c, ci, rows, opts, nil, nil, reg)
@@ -714,24 +721,45 @@ func srfNeedsResultAbove(c optimizer.Node) bool {
 			c = w.Child
 			continue
 		case *optimizer.ProjectSet:
-			if len(w.Wrappers) > 0 {
-				return true
-			}
-			for _, u := range w.UnnestCols {
-				if u.ExplicitCast || u.Wrapped {
-					return true
-				}
-			}
-			for _, sc := range w.SrfCols {
-				if sc.Wrapped {
-					return true
-				}
-			}
-			return false
+			return optimizer.ProjectSetNeedsResult(w)
 		}
 		return false
 	}
 	return false
+}
+
+// emitRootSRFResult prints the Result PG plans above a top-level ProjectSet
+// whose SRFs feed enclosing expressions (`SELECT generate_series(1, 2) + 1`),
+// and returns the indent the ProjectSet then renders at. Below a parent the
+// Result is synthesised by the child loop instead (M0149-0001h1a78a).
+func emitRootSRFResult(n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, reg *subPlanReg) int {
+	if depth != 0 || !srfNeedsResultAbove(n) {
+		return depth
+	}
+	line := "Result"
+	if !opts.Set.Costs || opts.Costs {
+		ps := skipProjects(n)
+		est := optimizer.EstimateRows(ps)
+		if est <= 0 {
+			est = 1
+		}
+		est, startup, total, width := explainCostFields(ps, est)
+		line += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, total, est, width)
+	}
+	*rows = append(*rows, Row{NewStringDatum(line)})
+	emitSRFResultOutput(rows, n, 1, opts, reg)
+	return 1
+}
+
+// skipProjects steps down through Project wrappers, which EXPLAIN folds.
+func skipProjects(n optimizer.Node) optimizer.Node {
+	for {
+		p, ok := n.(*optimizer.Project)
+		if !ok || p.Child == nil {
+			return n
+		}
+		n = p.Child
+	}
 }
 
 // hashBuildChild reports whether c is the input a hash join n builds its
@@ -806,7 +834,13 @@ func emitHashNodeLine(rows *[]Row, label string, indent int, c optimizer.Node, s
 	line := strings.Repeat(" ", indent*2) + "->  " + label
 	if showCosts {
 		est, cost, width := hashNodeCost(c)
-		line += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", cost, cost, est, width)
+		startup := cost
+		if label == "Result" {
+			// The Result PG plans above a ProjectSet streams: its startup
+			// is the ProjectSet's, not its total (create_projection_path).
+			_, startup, _, _ = explainCostFields(skipProjects(c), est)
+		}
+		line += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, cost, est, width)
 	}
 	if s != nil && s.loops == 0 {
 		// explain.c ExplainNode: an instrumented node with nloops == 0.
@@ -1351,7 +1385,9 @@ func resolveKeySourceDepth(expr optimizer.Expr, node optimizer.Node, reg *subPla
 			// parent's refname (`Group Key: t1.a` over `Seq Scan on t1
 			// t1_1`). Decline, so the key is named at its own level where
 			// the Append claims the source (M0148-0001k).
-			if n.RTID != 0 && n.AppendRelName != "" && !n.IsUnionAllAppendRel() {
+			// A partitionwise join's Append likewise: its Vars are the two
+			// parent RTEs' (apprelids), named at this level (M0148-0001c3a9).
+			if (n.RTID != 0 && n.AppendRelName != "" && !n.IsUnionAllAppendRel()) || len(n.PartitionwiseParents) > 0 {
 				return nil, false
 			}
 			col, ok := cur.(*optimizer.ColumnRef)
@@ -1694,6 +1730,20 @@ func resolveKeySourceDepth(expr optimizer.Expr, node optimizer.Node, reg *subPla
 				return nil, false
 			}
 			j := col.Index
+			// M0149-0001h1a78d: a column computed over an SRF is the Result
+			// PG plans above the ProjectSet — its targetlist entry, as a
+			// non-Var referent, parenthesised (`(((generate_series(1, 2)) % 2))`).
+			if reg != nil && projectSetSelectList(n) && optimizer.ProjectSetNeedsResult(n) {
+				for _, w := range n.Wrappers {
+					if w.OutCol != j {
+						continue
+					}
+					_, res := projectSetVerboseLists(n, reg, reg.names().qualify())
+					if j < len(res) {
+						return displayColumn(col, "("+res[j]+")", reg), true
+					}
+				}
+			}
 			for _, sc := range n.SrfCols {
 				if sc.ColIdx != j {
 					continue
@@ -1704,6 +1754,9 @@ func resolveKeySourceDepth(expr optimizer.Expr, node optimizer.Node, reg *subPla
 				args := []optimizer.Expr{sc.Start, sc.Stop}
 				if sc.Step != nil {
 					args = append(args, sc.Step)
+				}
+				if sc.Zone != nil {
+					args = append(args, sc.Zone)
 				}
 				return &optimizer.FuncCall{Name: "generate_series", Args: args}, true
 			}
@@ -2872,7 +2925,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// "Filter")` BEFORE `Workers Planned`. Dropping it hid an executed
 		// qual (TPC-H Q20's `ps_availqty > (SubPlan 1)`) that JSON showed.
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 		// PG emits `Workers Planned:` in PLAIN EXPLAIN — it is a plan-time
 		// property. `Workers Launched:` is execution-time and belongs to the
@@ -2882,7 +2935,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 	case *optimizer.GatherMerge:
 		// The same qual line as Gather (explain.c's T_GatherMerge arm).
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 		// PG prints Workers Planned for Gather Merge and, unlike Sort, does NOT
 		// print the merge keys (explain.c has no show_sort_keys call in the
@@ -2922,7 +2975,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 					f = r
 				}
 			}
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(f, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(f, reg, qualify))})
 		}
 	case *optimizer.WindowAgg:
 		// M0146-0005cg: PG 18's `Window: w1 AS (PARTITION BY … ORDER BY …
@@ -2945,7 +2998,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			}
 		}
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 	case *optimizer.SetOp:
 		// M0141-S2b-4c: PG's Merge Append prints its `Sort Key:` (explain.c
@@ -2972,7 +3025,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// Keep the default arm's attached-Filter line (a qual goopg leaves
 		// above a set operation must not vanish from the plan text).
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 	case *optimizer.Distinct:
 		// M0141-S2b-4d: the hashed DISTINCT's `Group Key:` (explain.c
@@ -3030,7 +3083,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			*rows = append(*rows, Row{NewStringDatum(indent + "Group Key: " + strings.Join(parts, ", "))})
 		}
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 	case *optimizer.DistinctOn:
 		// M0146-0005dk: the hashed unique-ify Agg prints its uniq exprs as
@@ -3088,7 +3141,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			}
 		}
 		if filt != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(filt, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(filt, reg, qualify))})
 		}
 	case *optimizer.BitmapIndexScan:
 		// R49 Slice A: the NLI-bitmap probe binds Key/Keys per outer row
@@ -3101,7 +3154,27 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// leading-column bounds as the index scan arm does. A key-less
 		// bitmap renders nothing.
 		if p != nil && p.Index != nil {
-			if cond := formatIndexCondPartsPrefixed(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg)); cond != "" {
+			cond := formatIndexCondPartsPrefixed(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg), p.IndexCondOrder...)
+			if p.LeadingNullTest != optimizer.IndexNullTestNone {
+				cond = formatBitmapNullTestIndexCond(p, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg))
+			}
+			if s := p.SkipPrefix; s > 0 && s < len(p.Index.Columns) && (p.LowKey != nil || p.HighKey != nil) {
+				// M0148-0001c3a4 (j): a skip scan's range, under its column.
+				cond = indexCondAndText(rangeColumnCondParts(p.Table, p.Index, s, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg)+p.Index.Columns[s],
+					p.IndexCondOrder, p.LowKey, p.HighKey, p.LowOp, p.HighOp, optimizer.IndexNullTestNone, false, nil, reg))
+			} else if len(p.SAOPKeys) > 0 {
+				cond = formatBitmapSAOPIndexCond(p, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg))
+			} else if np := len(p.Keys); np > 0 && np < len(p.Index.Columns) && (p.LowKey != nil || p.HighKey != nil) {
+				// M0148-0001c3a2: bounds behind the equality Keys.
+				cond = formatPrefixRangeIndexCond(p.Table, p.Index, p.Keys, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests,
+					p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg), p.IndexCondOrder)
+			}
+			if p.RowCompare != nil && len(p.Keys) == 0 && p.Key == nil && p.SkipPrefix == 0 {
+				// M0148-0001c3a12: the row comparison whole.
+				cond = rangeCondWithRowCompare(p.Table, p.Index, p.LowKey, p.HighKey, p.LowOp, p.HighOp, p.RowCompare, p.RowCompareLow,
+					reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg), p.IndexCondOrder)
+			}
+			if cond != "" {
 				*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + cond)})
 			}
 		}
@@ -3133,7 +3206,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 				rc = &optimizer.BinaryOp{Op: parser.OpAnd, Left: rc, Right: q}
 			}
 			rc = qualifyForeignColumns(rc, p, reg)
-			*rows = append(*rows, Row{NewStringDatum(indent + "Recheck Cond: " + wrapParen(formatExprQual(rc, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Recheck Cond: " + qualText(rc, reg, qualify))})
 		}
 		filt := attachedFilter
 		if cond != nil {
@@ -3146,7 +3219,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			}
 		}
 		if filt != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(filt, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(filt, reg, qualify))})
 		}
 	case *optimizer.IndexOnlyScan:
 		// S6 min/max rewrite: the IOS's residual `col IS NOT NULL` qual is
@@ -3162,7 +3235,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			condParts = append(condParts, bound)
 		}
 		if p.Cond != nil {
-			condParts = append(condParts, wrapParen(formatExprQual(p.Cond, reg, qualify)))
+			condParts = append(condParts, qualText(p.Cond, reg, qualify))
 		}
 		if len(condParts) > 0 {
 			cond := strings.Join(condParts, " AND ")
@@ -3175,7 +3248,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// guard keeps one) is upstream's `show_scan_qual` line and was simply
 		// missing here, so a Filter that DOES run went unrendered.
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 	case *optimizer.Join:
 		// M0127-P2.1: render the join's equi-key list, upstream's
@@ -3218,7 +3291,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 					*rows = append(*rows, Row{NewStringDatum(indent + "Join Filter: " + jf)})
 				}
 			} else if join != nil {
-				*rows = append(*rows, Row{NewStringDatum(indent + "Join Filter: " + wrapParen(formatExprQual(join, reg, qualify)))})
+				*rows = append(*rows, Row{NewStringDatum(indent + "Join Filter: " + qualText(join, reg, qualify))})
 			}
 		})
 		if attachedFilter != nil {
@@ -3239,11 +3312,11 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		}
 		if residual != nil {
 			reg.withJoinRow(p, func() {
-				*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(residual, reg, qualify)))})
+				*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(residual, reg, qualify))})
 			})
 		}
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 	case *optimizer.Memoize:
 		// Upstream shape: `Cache Key: t.a, t.b` under the Memoize node.
@@ -3281,7 +3354,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			*rows = append(*rows, Row{NewStringDatum(indent + "Sampling: " + formatTableSample(p.TableSample, reg, qualify))})
 		}
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 	case *optimizer.GenerateSeries, *optimizer.GenerateSubscripts, *optimizer.FromUnnest, *optimizer.UserSrfScan:
 		// M0134-0001 P2 S2: the verbose-only `Function Call:` deparse
@@ -3297,7 +3370,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			}
 		}
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 	case *optimizer.Aggregate:
 		// S5 (0134-0001 P2): PG's show_agg_keys prints a `Group Key:` line
@@ -3491,7 +3564,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			// the S18 wrap (a qual is general-expression position, and
 			// PG prints the FuncCall bare there).
 			filt := expandAggOutputRefsInFilter(attachedFilter, p)
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(filt, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(filt, reg, qualify))})
 		}
 	case *optimizer.Values:
 		// M0146-0109: a WHERE over a one-row VALUES / FROM-less SELECT is a
@@ -3506,7 +3579,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 				}
 				*rows = append(*rows, Row{NewStringDatum(indent + "One-Time Filter: " + otf)})
 			} else {
-				*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+				*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 			}
 		}
 	default:
@@ -3516,7 +3589,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// Aggregate). Matches PG's behaviour of rendering Filter on
 		// the node it most directly applies to.
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + qualText(attachedFilter, reg, qualify))})
 		}
 	}
 }
@@ -3762,7 +3835,7 @@ func formatJoinFilter(p *optimizer.Join, reg *subPlanReg, qualify bool) string {
 	if isLiteralOneTimeFilterConst(residual) {
 		return formatExprQual(residual, reg, qualify)
 	}
-	return wrapParen(formatExprQual(residual, reg, qualify))
+	return qualText(residual, reg, qualify)
 }
 
 // formatIndexCond renders the equality / range condition of an
@@ -3781,92 +3854,140 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 		return ""
 	}
 	// B-14 (P2-09a): ScalarArrayOp probe — PG renders
-	// `Index Cond: (col = ANY (...))`, and so does this.
-	if len(p.SAOPKeys) > 0 && len(p.Index.Columns) > 0 {
+	// `Index Cond: (col = ANY (...))`, and so does this. M0148-0001c3a4 (b):
+	// behind an equality prefix (RangePrefix) the array binds
+	// Columns[len(RangePrefix)], printed after the prefix's equalities
+	// (`((thousand = 42) AND (tenthous = ANY (…)))`).
+	if np := len(p.RangePrefix); len(p.SAOPKeys) > 0 && np < len(p.Index.Columns) {
+		var clauses []string
+		for i, k := range p.RangePrefix {
+			clauses = append(clauses, indexCondClause(prefix+p.Index.Columns[i], "=", k, reg, indexKeyColumnType(p.Table, p.Index, i)))
+		}
 		parts := make([]string, 0, len(p.SAOPKeys))
 		for _, k := range p.SAOPKeys {
 			parts = append(parts, formatIndexCondKey(k, reg))
 		}
-		cond := prefix + p.Index.Columns[0] + " = ANY (" + strings.Join(parts, ", ") + ")"
+		arrCol := p.Index.Columns[np]
+		anyOp := saopOpText(p.SAOPOp)
+		cond := prefix + arrCol + " " + anyOp + " ANY (" + strings.Join(parts, ", ") + ")"
 		// M0146-0005ch: the same folded array Const the Filter-side
 		// formatInExprPG prints (sibling renderers of one SAOP).
 		if p.Table != nil {
 			for _, c := range p.Table.Columns {
-				if c.Name != p.Index.Columns[0] {
+				if c.Name != arrCol {
 					continue
 				}
 				if cast, lit, ok := inListArrayConst(c.Type, p.SAOPKeys); ok {
-					col := prefix + p.Index.Columns[0]
+					col := prefix + arrCol
 					if cast != "" {
 						col = "(" + col + ")::" + cast
 					}
-					cond = col + " = ANY (" + lit + ")"
+					cond = col + " " + anyOp + " ANY (" + lit + ")"
 				}
 				break
 			}
 		}
-		// M0145-0029: bounds on the second column (PG
+		// M0148-0001c3a4 (i): the column quals merged into the array, in
+		// restriction order around it.
+		colQual := func(q optimizer.SAOPColQual) string {
+			if q.ArrayText != "" {
+				// M0148-0001c3a6 (i): a cross-type literal prints as its
+				// own Const — `(unique1 = ANY ('{33,44}'::bigint[]))`.
+				return prefix + arrCol + " = ANY (" + q.ArrayText + ")"
+			}
+			if q.Array != nil {
+				keys := make([]string, 0, len(q.Array))
+				for _, k := range q.Array {
+					keys = append(keys, formatIndexCondKey(k, reg))
+				}
+				text := prefix + arrCol + " = ANY (" + strings.Join(keys, ", ") + ")"
+				if t := indexKeyColumnType(p.Table, p.Index, np); t != nil {
+					if cast, lit, ok := inListArrayConst(*t, q.Array); ok {
+						c := prefix + arrCol
+						if cast != "" {
+							c = "(" + c + ")::" + cast
+						}
+						text = c + " = ANY (" + lit + ")"
+					}
+				}
+				return text
+			}
+			return indexCondClause(prefix+arrCol, saopOpText(q.Op), q.Key, reg, indexKeyColumnType(p.Table, p.Index, np))
+		}
+		for _, q := range p.SAOPColQuals {
+			if q.BeforeArray {
+				clauses = append(clauses, colQual(q))
+			}
+		}
+		clauses = append(clauses, cond)
+		for _, q := range p.SAOPColQuals {
+			if !q.BeforeArray {
+				clauses = append(clauses, colQual(q))
+			}
+		}
+		// M0145-0029: bounds on the column after the array (PG
 		// `Index Cond: ((a = ANY (...)) AND (b > 1))`).
-		if (p.LowKey != nil || p.HighKey != nil) && len(p.Index.Columns) > 1 {
-			col := prefix + p.Index.Columns[1]
+		if (p.LowKey != nil || p.HighKey != nil) && len(p.Index.Columns) > np+1 {
+			col := prefix + p.Index.Columns[np+1]
 			if p.LowKey != nil {
 				op := ">="
 				if p.LowOp == parser.OpGt {
 					op = ">"
 				}
-				cond += ") AND (" + col + " " + op + " " + formatIndexCondKey(p.LowKey, reg)
+				clauses = append(clauses, indexCondClause(col, op, p.LowKey, reg, indexKeyColumnType(p.Table, p.Index, np+1)))
 			}
 			if p.HighKey != nil {
 				op := "<="
 				if p.HighOp == parser.OpLt {
 					op = "<"
 				}
-				cond += ") AND (" + col + " " + op + " " + formatIndexCondKey(p.HighKey, reg)
+				clauses = append(clauses, indexCondClause(col, op, p.HighKey, reg, indexKeyColumnType(p.Table, p.Index, np+1)))
 			}
-			// Each clause carries its own parens inside the AND list
-			// (make_ands_explicit), as the comment above shows.
-			return "((" + cond + "))"
 		}
-		return wrapParen(cond)
+		if len(clauses) == 1 {
+			return wrapParen(cond)
+		}
+		// Each clause carries its own parens inside the AND list
+		// (make_ands_explicit).
+		return "((" + strings.Join(clauses, ") AND (") + "))"
 	}
 	// M0145-0029 slice 2b: an equality prefix followed by bounds on the next
 	// column — PG's `Index Cond: ((a = 7) AND (b > 90))`, rendered in goopg's
 	// multi-clause style.
 	if np := len(p.RangePrefix); np > 0 && np < len(p.Index.Columns) {
-		parts := make([]string, 0, np+2)
-		for i, k := range p.RangePrefix {
-			parts = append(parts, prefix+p.Index.Columns[i]+" = "+formatIndexCondKey(k, reg))
-		}
-		col := prefix + p.Index.Columns[np]
-		if p.LowKey != nil {
-			op := ">="
-			if p.LowOp == parser.OpGt {
-				op = ">"
-			}
-			parts = append(parts, col+" "+op+" "+formatIndexCondKey(p.LowKey, reg))
-		}
-		if p.HighKey != nil {
-			op := "<="
-			if p.HighOp == parser.OpLt {
-				op = "<"
-			}
-			parts = append(parts, col+" "+op+" "+formatIndexCondKey(p.HighKey, reg))
-		}
-		return indexCondAndText(parts)
+		return formatPrefixRangeIndexCond(p.Table, p.Index, p.RangePrefix, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests,
+			p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder)
 	}
 	// M0146-0005v: a skip probe binds Columns[SkipPrefix+i] — PG prints
 	// only the bound quals (`Index Cond: (inv_item_sk = ...)`); the
 	// procedurally generated skip array never appears in Index Cond.
 	// Rendering it through the shared body would mislabel slot i with
 	// column i's name.
+	// M0148-0001c3a4 (j): a skip scan's range on a later column prints
+	// only the bounds, under that column.
+	if s := p.SkipPrefix; s > 0 && len(p.Keys) == 0 && s < len(p.Index.Columns) && (p.LowKey != nil || p.HighKey != nil) {
+		return indexCondAndText(rangeColumnCondParts(p.Table, p.Index, s, prefix+p.Index.Columns[s], p.IndexCondOrder,
+			p.LowKey, p.HighKey, p.LowOp, p.HighOp, optimizer.IndexNullTestNone, false, nil, reg))
+	}
 	if s := p.SkipPrefix; s > 0 && len(p.Keys) > 0 && s+len(p.Keys) <= len(p.Index.Columns) {
 		parts := make([]string, len(p.Keys))
 		for i, k := range p.Keys {
-			parts[i] = prefix + p.Index.Columns[s+i] + " = " + formatIndexCondKey(k, reg)
+			parts[i] = indexCondClause(prefix+p.Index.Columns[s+i], "=", k, reg, indexKeyColumnType(p.Table, p.Index, s+i))
 		}
 		return indexCondAndText(parts)
 	}
-	return formatIndexCondPartsPrefixed(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
+	// M0148-0001c3a: a NullTest index qual on the leading column, alone or
+	// beside its range bounds, in restriction-list order —
+	// `Index Cond: ((x IS NOT NULL) AND (x < 5))`.
+	if p.LeadingNullTest != optimizer.IndexNullTestNone && len(p.Index.Columns) > 0 {
+		nt := formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder)
+		return withTrailingSAOPCond(nt, nullTestCondParts(p.ExtraNullTests, p.LowKey, p.HighKey), p.Table, p.Index, p.TrailingSAOP, reg, prefix)
+	}
+	if p.RowCompare != nil && len(p.Keys) == 0 && p.Key == nil {
+		return rangeCondWithRowCompare(p.Table, p.Index, p.LowKey, p.HighKey, p.LowOp, p.HighOp, p.RowCompare, p.RowCompareLow, reg, prefix, p.IndexCondOrder)
+	}
+	rng, nRange := rangeCondWithExtraBounds(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, p.ExtraBounds, reg, prefix, p.IndexCondOrder)
+	return withTrailingSAOPCond(rng, nRange, p.Table, p.Index, p.TrailingSAOP, reg, prefix)
 }
 
 // formatIndexOnlyCond is formatIndexCond for an IndexOnlyScan. The two nodes
@@ -3878,21 +3999,368 @@ func formatIndexOnlyCond(p *optimizer.IndexOnlyScan, reg *subPlanReg) string {
 	return formatIndexOnlyCondPrefixed(p, reg, "")
 }
 
-// formatIndexOnlyCondPrefixed — see formatIndexCondPrefixed.
+// formatIndexOnlyCondPrefixed — see formatIndexCondPrefixed. An index-only
+// scan's quals read the index tuple, whose key attributes carry the operator
+// class's input type (a varchar key column is a text attribute of
+// varchar's text_ops index), so PG prints the key column bare where an
+// Index Scan prints the binary-compatible relabel: `(v = 'v42'::text)`
+// against `((v)::text = 'v42'::text)` (M0148-0001c3a5 (a), the parted_minmax
+// witness). indexOnlyCondDropRelabel removes the relabel the shared
+// renderer adds.
 func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, prefix string) string {
 	if p == nil || p.Index == nil {
 		return ""
+	}
+	return indexOnlyCondDropRelabel(formatIndexOnlyCondRelabeled(p, reg, prefix), p.Index, prefix)
+}
+
+// indexOnlyCondDropRelabel rewrites `(<col>)::<type> ` to `<col> ` for each
+// key column of idx in an Index Cond text.
+func indexOnlyCondDropRelabel(cond string, idx *catalog.Index, prefix string) string {
+	if !strings.Contains(cond, ")::") {
+		return cond
+	}
+	for _, c := range idx.Columns {
+		if c == "" {
+			continue
+		}
+		col := prefix + c // the renderer's own spelling (indexCondClause)
+		open := "(" + col + ")::"
+		for {
+			i := strings.Index(cond, open)
+			if i < 0 {
+				break
+			}
+			rest := cond[i+len(open):]
+			j := strings.IndexByte(rest, ' ')
+			if j < 0 {
+				break
+			}
+			cond = cond[:i] + col + rest[j:]
+		}
+	}
+	return cond
+}
+
+// formatIndexOnlyCondRelabeled is the shared renderer's text for an
+// IndexOnlyScan, relabels included.
+func formatIndexOnlyCondRelabeled(p *optimizer.IndexOnlyScan, reg *subPlanReg, prefix string) string {
+	// M0148-0001c3a4 (h): the index-only ScalarArrayOp probe renders exactly
+	// as the index scan's (one renderer for the one probe shape).
+	if len(p.SAOPKeys) > 0 {
+		return formatIndexCondPrefixed(&optimizer.IndexScan{Table: p.Table, Index: p.Index, RangePrefix: p.Keys, SAOPKeys: p.SAOPKeys, SAOPOp: p.SAOPOp,
+			SAOPColQuals: p.SAOPColQuals, LowKey: p.LowKey, HighKey: p.HighKey, LowOp: p.LowOp, HighOp: p.HighOp}, reg, prefix)
+	}
+	// M0148-0001c3a4 (j): a skip scan's range on a later column prints
+	// only the bounds, under that column (`Index Cond: (tenthous < 2)`).
+	if s := p.SkipPrefix; s > 0 && len(p.Keys) == 0 && s < len(p.Index.Columns) && (p.LowKey != nil || p.HighKey != nil) {
+		return indexCondAndText(rangeColumnCondParts(p.Table, p.Index, s, prefix+p.Index.Columns[s], p.IndexCondOrder,
+			p.LowKey, p.HighKey, p.LowOp, p.HighOp, optimizer.IndexNullTestNone, false, nil, reg))
 	}
 	// M0146-0005bt: the index-only skip probe, rendered as the index scan's
 	// (formatIndexCond) — only the bound quals, each under its own column.
 	if s := p.SkipPrefix; s > 0 && len(p.Keys) > 0 && s+len(p.Keys) <= len(p.Index.Columns) {
 		parts := make([]string, len(p.Keys))
 		for i, k := range p.Keys {
-			parts[i] = prefix + p.Index.Columns[s+i] + " = " + formatIndexCondKey(k, reg)
+			parts[i] = indexCondClause(prefix+p.Index.Columns[s+i], "=", k, reg, indexKeyColumnType(p.Table, p.Index, s+i))
 		}
 		return indexCondAndText(parts)
 	}
-	return formatIndexCondPartsPrefixed(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
+	if p.LeadingNullTest != optimizer.IndexNullTestNone {
+		nt := formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder)
+		return withTrailingSAOPCond(nt, nullTestCondParts(p.ExtraNullTests, p.LowKey, p.HighKey), p.Table, p.Index, p.TrailingSAOP, reg, prefix)
+	}
+	if p.RowCompare != nil && len(p.Keys) == 0 && p.Key == nil {
+		return rangeCondWithRowCompare(p.Table, p.Index, p.LowKey, p.HighKey, p.LowOp, p.HighOp, p.RowCompare, p.RowCompareLow, reg, prefix, p.IndexCondOrder)
+	}
+	rng, nRange := rangeCondWithExtraBounds(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, p.ExtraBounds, reg, prefix, p.IndexCondOrder)
+	return withTrailingSAOPCond(rng, nRange, p.Table, p.Index, p.TrailingSAOP, reg, prefix)
+}
+
+// withTrailingSAOPCond appends a scan's TrailingSAOP to its leading-range
+// Index Cond text (M0148-0001c3a4 (i)) — PG's `((thousand < 2) AND
+// (tenthous = ANY ('{1001,3000}'::integer[])))`. The array renders as the
+// index scan's own ScalarArrayOp, over the index shifted to its column, and
+// the two texts splice into one AND. Shared by IndexScan and IndexOnlyScan.
+func withTrailingSAOPCond(rng string, nRange int, tbl *catalog.Table, idx *catalog.Index, ts *optimizer.TrailingSAOP,
+	reg *subPlanReg, prefix string) string {
+	if ts == nil || len(idx.Columns) < 2 || rng == "" {
+		return rng
+	}
+	var arr string
+	nArr := 1 + len(ts.ColQuals)
+	if len(ts.Elems) == 0 {
+		// M0148-0001c3a5 (a): plain comparisons on the column, no array —
+		// `((a IS NOT NULL) AND (b = 5))`.
+		parts := make([]string, 0, len(ts.ColQuals))
+		for _, q := range ts.ColQuals {
+			parts = append(parts, indexCondClause(prefix+idx.Columns[1], saopOpText(q.Op), q.Key, reg, indexKeyColumnType(tbl, idx, 1)))
+		}
+		arr, nArr = indexCondAndText(parts), len(parts)
+	} else {
+		shifted := *idx
+		shifted.Columns = idx.Columns[1:]
+		arr = formatIndexCondPrefixed(&optimizer.IndexScan{Table: tbl, Index: &shifted, SAOPKeys: ts.Elems,
+			SAOPColQuals: ts.ColQuals}, reg, prefix)
+	}
+	return "(" + indexCondInner(rng, nRange) + " AND " + indexCondInner(arr, nArr) + ")"
+}
+
+// boundCount is how many of a range's two bounds are set.
+func boundCount(lowKey, highKey optimizer.Expr) int {
+	n := 0
+	if lowKey != nil {
+		n++
+	}
+	if highKey != nil {
+		n++
+	}
+	return n
+}
+
+// nullTestCondParts is how many clauses formatNullTestIndexCond prints: the
+// leading NullTest, its extra NullTests and the column's bounds.
+func nullTestCondParts(extras []optimizer.ExtraIndexNullTest, lowKey, highKey optimizer.Expr) int {
+	return 1 + len(extras) + boundCount(lowKey, highKey)
+}
+
+// indexCondInner strips indexCondAndText's outer wrapping from a text of n
+// parts, leaving `(a)` or `(a) AND (b)` for splicing into a longer AND.
+func indexCondInner(text string, n int) string {
+	if n > 1 && len(text) >= 2 {
+		return text[1 : len(text)-1]
+	}
+	return text
+}
+
+// indexCondClause renders one index clause `col op key`. A literal key is
+// printed as the Const PG's operator lookup makes of it (formatIndexCondKeyTyped);
+// when that operator belongs to another type — varchar's comparisons are
+// text's (texteq, via a binary-compatible RelabelType) — the column side
+// carries the relabel too: `((v)::text = 'v42'::text)` (M0148-0001c3a2).
+// A non-literal key keeps the plain rendering, its own type unknown here.
+func indexCondClause(col, op string, k optimizer.Expr, reg *subPlanReg, t *catalog.Type) string {
+	// M0148-0001c3a6 (i): a cross-type integer Const keeps its own type
+	// (`(tenthous = '3'::bigint)`), as in a Filter.
+	if t != nil && !t.IsArray {
+		if _, r, ok := formatCrossIntLiteralOperands(&optimizer.BinaryOp{Op: parser.OpEq,
+			Left: &optimizer.ColumnRef{Name: col, Type: *t}, Right: k}, reg, false); ok {
+			return col + " " + op + " " + r
+		}
+	}
+	if t != nil && !t.IsArray {
+		if lit, ok := coercibleLiteral(k); ok {
+			if otherCast, text, ok := coerceLiteralText(lit, *t); ok && otherCast != "" {
+				return "(" + col + ")::" + otherCast + " " + op + " " + text
+			}
+		}
+	}
+	return col + " " + op + " " + formatIndexCondKeyTyped(k, reg, t)
+}
+
+// formatPrefixRangeIndexCond renders an equality prefix followed by bounds
+// (and a NullTest) on the next column — PG's `Index Cond: ((a = 7) AND
+// (b > 90))`. IndexScan's RangePrefix probe and BitmapIndexScan's Keys plus
+// bounds (M0148-0001c3a2) share it, so the two print one text.
+func formatPrefixRangeIndexCond(tbl *catalog.Table, index *catalog.Index, prefixKeys []optimizer.Expr,
+	nullTest optimizer.IndexNullTest, nullTestAfterBounds bool, extras []optimizer.ExtraIndexNullTest, lowKey, highKey optimizer.Expr,
+	lowOp, highOp parser.OpCode, reg *subPlanReg, prefix string, order []optimizer.IndexCondItem) string {
+	np := len(prefixKeys)
+	parts := make([]string, 0, np+2)
+	for i, k := range prefixKeys {
+		parts = append(parts, indexCondClause(prefix+index.Columns[i], "=", k, reg, indexKeyColumnType(tbl, index, i)))
+	}
+	// M0148-0001c3a slice 3 / c3a2: the range column's bounds and NullTests.
+	parts = append(parts, rangeColumnCondParts(tbl, index, np, prefix+index.Columns[np], order,
+		lowKey, highKey, lowOp, highOp, nullTest, nullTestAfterBounds, extras, reg)...)
+	return indexCondAndText(parts)
+}
+
+// formatBitmapSAOPIndexCond renders a BitmapIndexScan's ScalarArrayOp index
+// qual behind its equality Keys (M0148-0001c3a2) —
+// `((thousand = 42) AND (tenthous = ANY ('{1,3,42}'::integer[])))` — with
+// the folded array Const formatIndexCondPrefixed prints for IndexScan's.
+func formatBitmapSAOPIndexCond(p *optimizer.BitmapIndexScan, reg *subPlanReg, prefix string) string {
+	np := len(p.Keys)
+	if np >= len(p.Index.Columns) {
+		return ""
+	}
+	parts := make([]string, 0, np+1)
+	for i, k := range p.Keys {
+		parts = append(parts, indexCondClause(prefix+p.Index.Columns[i], "=", k, reg, indexKeyColumnType(p.Table, p.Index, i)))
+	}
+	col := prefix + p.Index.Columns[np]
+	elems := make([]string, 0, len(p.SAOPKeys))
+	for _, k := range p.SAOPKeys {
+		elems = append(elems, formatIndexCondKey(k, reg))
+	}
+	anyOp := saopOpText(p.SAOPOp)
+	cond := col + " " + anyOp + " ANY (" + strings.Join(elems, ", ") + ")"
+	if t := indexKeyColumnType(p.Table, p.Index, np); t != nil {
+		if cast, lit, ok := inListArrayConst(*t, p.SAOPKeys); ok {
+			if cast != "" {
+				col = "(" + col + ")::" + cast
+			}
+			cond = col + " " + anyOp + " ANY (" + lit + ")"
+		}
+	}
+	if len(p.SAOPColQuals) == 0 {
+		return indexCondAndText(append(parts, cond))
+	}
+	// M0148-0001c3a4 (i): the column quals merged into the array print
+	// around it in restriction order, as the index scan's renderer prints
+	// them (shared through formatIndexCondPrefixed over the index shifted to
+	// the array's column).
+	shifted := *p.Index
+	shifted.Columns = p.Index.Columns[np:]
+	arr := formatIndexCondPrefixed(&optimizer.IndexScan{Table: p.Table, Index: &shifted, SAOPKeys: p.SAOPKeys,
+		SAOPOp: p.SAOPOp, SAOPColQuals: p.SAOPColQuals}, reg, prefix)
+	if np == 0 {
+		return arr
+	}
+	return "(" + indexCondInner(indexCondAndText(parts), np) + " AND " + indexCondInner(arr, 1+len(p.SAOPColQuals)) + ")"
+}
+
+// saopOpText is a ScalarArrayOp index qual's operator: `=` for the equality
+// array, or the inequality an OR of one comparison became
+// (M0148-0001c3a4 (a), `thousand < ANY (…)`).
+func saopOpText(op parser.OpCode) string {
+	switch op {
+	case parser.OpLt:
+		return "<"
+	case parser.OpLe:
+		return "<="
+	case parser.OpGt:
+		return ">"
+	case parser.OpGe:
+		return ">="
+	}
+	return "="
+}
+
+// formatBitmapNullTestIndexCond renders a BitmapIndexScan's NullTest index
+// qual (M0148-0001c3a1): behind its equality Keys —
+// `((a = 3) AND (b IS NULL))` — or on the leading column beside its bounds.
+func formatBitmapNullTestIndexCond(p *optimizer.BitmapIndexScan, reg *subPlanReg, prefix string) string {
+	if len(p.Keys) == 0 {
+		return formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder)
+	}
+	np := len(p.Keys)
+	if np >= len(p.Index.Columns) {
+		return ""
+	}
+	parts := make([]string, 0, np+1)
+	for i, k := range p.Keys {
+		parts = append(parts, indexCondClause(prefix+p.Index.Columns[i], "=", k, reg, indexKeyColumnType(p.Table, p.Index, i)))
+	}
+	before, after := nullTestIndexCondTexts(prefix+p.Index.Columns[np], p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests)
+	return indexCondAndText(append(append(parts, before...), after...))
+}
+
+// formatNullTestIndexCond renders a leading-column NullTest index qual
+// with its range bounds (IndexScan and IndexOnlyScan share it, M0148-0001c3a).
+func formatNullTestIndexCond(tbl *catalog.Table, index *catalog.Index, nullTest optimizer.IndexNullTest, afterBounds bool,
+	extras []optimizer.ExtraIndexNullTest, lowKey, highKey optimizer.Expr, lowOp, highOp parser.OpCode, reg *subPlanReg, prefix string,
+	order []optimizer.IndexCondItem) string {
+	if index == nil || len(index.Columns) == 0 {
+		return ""
+	}
+	return indexCondAndText(rangeColumnCondParts(tbl, index, 0, prefix+index.Columns[0], order,
+		lowKey, highKey, lowOp, highOp, nullTest, afterBounds, extras, reg))
+}
+
+// rangeColumnCondParts renders one scan's clauses on its range column — the
+// bounds and the NullTests — in IndexCondOrder, the restriction-list order PG
+// prints them in (`((a < 50) AND (a IS NOT NULL) AND (a > 10))`,
+// M0148-0001c3a2); with no recorded order, the NullTests before the bounds,
+// the lower bound, the upper bound, then the NullTests after.
+func rangeColumnCondParts(tbl *catalog.Table, index *catalog.Index, colPos int, col string, order []optimizer.IndexCondItem,
+	lowKey, highKey optimizer.Expr, lowOp, highOp parser.OpCode,
+	lead optimizer.IndexNullTest, leadAfter bool, extras []optimizer.ExtraIndexNullTest, reg *subPlanReg) []string {
+	low, high := "", ""
+	if lowKey != nil {
+		op := ">="
+		if lowOp == parser.OpGt {
+			op = ">"
+		}
+		low = indexCondClause(col, op, lowKey, reg, indexKeyColumnType(tbl, index, colPos))
+	}
+	if highKey != nil {
+		op := "<="
+		if highOp == parser.OpLt {
+			op = "<"
+		}
+		high = indexCondClause(col, op, highKey, reg, indexKeyColumnType(tbl, index, colPos))
+	}
+	if len(order) == 0 {
+		before, after := nullTestIndexCondTexts(col, lead, leadAfter, extras)
+		parts := append([]string(nil), before...)
+		if low != "" {
+			parts = append(parts, low)
+		}
+		if high != "" {
+			parts = append(parts, high)
+		}
+		return append(parts, after...)
+	}
+	var nts []string
+	if lead != optimizer.IndexNullTestNone {
+		all, _ := nullTestIndexCondTexts(col, lead, false, nil)
+		nts = append(nts, all...)
+		for _, x := range extras {
+			t, _ := nullTestIndexCondTexts(col, x.Kind, false, nil)
+			nts = append(nts, t...)
+		}
+	}
+	var parts []string
+	ni := 0
+	for _, it := range order {
+		switch it {
+		case optimizer.IndexCondLow:
+			if low != "" {
+				parts = append(parts, low)
+			}
+		case optimizer.IndexCondHigh:
+			if high != "" {
+				parts = append(parts, high)
+			}
+		case optimizer.IndexCondNullTest:
+			if ni < len(nts) {
+				parts = append(parts, nts[ni])
+				ni++
+			}
+		}
+	}
+	return parts
+}
+
+// nullTestIndexCondTexts renders a column's NullTest index quals — the
+// leading one and its ExtraNullTests (M0148-0001c3a2), in restriction-list
+// order — split into those printed before the column's bounds and those
+// after, as PG prints every NullTest clause of the column.
+func nullTestIndexCondTexts(col string, lead optimizer.IndexNullTest, leadAfter bool, extras []optimizer.ExtraIndexNullTest) (before, after []string) {
+	text := func(k optimizer.IndexNullTest) string {
+		if k == optimizer.IndexNullTestIsNotNull {
+			return col + " IS NOT NULL"
+		}
+		return col + " IS NULL"
+	}
+	if lead == optimizer.IndexNullTestNone {
+		return nil, nil
+	}
+	if leadAfter {
+		after = append(after, text(lead))
+	} else {
+		before = append(before, text(lead))
+	}
+	for _, x := range extras {
+		if x.AfterBounds {
+			after = append(after, text(x.Kind))
+		} else {
+			before = append(before, text(x.Kind))
+		}
+	}
+	return before, after
 }
 
 // indexCondColumnPrefix is the `<refname>.` an index qual's column side
@@ -3912,6 +4380,38 @@ func indexCondColumnPrefix(verbose bool, n optimizer.Node, tbl *catalog.Table, a
 		return strings.ToLower(tbl.Name) + "."
 	}
 	return ""
+}
+
+// indexKeyColumnType is the catalog type of idx's key column pos on tbl, or
+// nil when it cannot be resolved (an expression column, no table).
+func indexKeyColumnType(tbl *catalog.Table, idx *catalog.Index, pos int) *catalog.Type {
+	if tbl == nil || idx == nil || pos < 0 || pos >= len(idx.Columns) || idx.Columns[pos] == "" {
+		return nil
+	}
+	for i := range tbl.Columns {
+		if strings.EqualFold(tbl.Columns[i].Name, idx.Columns[pos]) {
+			return &tbl.Columns[i].Type
+		}
+	}
+	return nil
+}
+
+// formatIndexCondKeyTyped is formatIndexCondKey for a key bound to a column
+// of type t: a literal key prints as the Const parse analysis coerced it to
+// (get_const_expr — `(stringu1 = 'TVAAAA'::name)`, `(f1 >= 'foo'::bpchar)`,
+// `(e = '5'::numeric)`), the label coerceLiteralText gives the Filter path.
+// A coercion that would cast the column side instead (varchar compares as
+// text) keeps the bare literal: the index operand is the index column
+// itself. M0148-0001c3a1.
+func formatIndexCondKeyTyped(e optimizer.Expr, reg *subPlanReg, t *catalog.Type) string {
+	if t != nil && !t.IsArray {
+		if lit, ok := coercibleLiteral(e); ok {
+			if otherCast, text, ok := coerceLiteralText(lit, *t); ok && otherCast == "" {
+				return text
+			}
+		}
+	}
+	return formatIndexCondKey(e, reg)
 }
 
 // formatIndexCondKey renders the key side of one Index Cond bound. The
@@ -4020,11 +4520,11 @@ func nestLoopParamThroughOuter(x *optimizer.OuterColumnRef, reg *subPlanReg, use
 // formatIndexCondParts is the shared body of formatIndexCond /
 // formatIndexOnlyCond: sibling paths that must not disagree.
 func formatIndexCondParts(index *catalog.Index, keys []optimizer.Expr, key, lowKey, highKey optimizer.Expr, lowOp, highOp parser.OpCode, reg *subPlanReg) string {
-	return formatIndexCondPartsPrefixed(index, keys, key, lowKey, highKey, lowOp, highOp, reg, "")
+	return formatIndexCondPartsPrefixed(nil, index, keys, key, lowKey, highKey, lowOp, highOp, reg, "")
 }
 
 // formatIndexCondPartsPrefixed — see formatIndexCondPrefixed.
-func formatIndexCondPartsPrefixed(index *catalog.Index, keys []optimizer.Expr, key, lowKey, highKey optimizer.Expr, lowOp, highOp parser.OpCode, reg *subPlanReg, prefix string) string {
+func formatIndexCondPartsPrefixed(tbl *catalog.Table, index *catalog.Index, keys []optimizer.Expr, key, lowKey, highKey optimizer.Expr, lowOp, highOp parser.OpCode, reg *subPlanReg, prefix string, order ...optimizer.IndexCondItem) string {
 	p := struct {
 		Keys                 []optimizer.Expr
 		Key, LowKey, HighKey optimizer.Expr
@@ -4040,37 +4540,22 @@ func formatIndexCondPartsPrefixed(index *catalog.Index, keys []optimizer.Expr, k
 	// Multi-column equality probe.
 	if len(p.Keys) > 0 && len(cols) >= len(p.Keys) {
 		if len(p.Keys) == 1 {
-			return wrapParen(cols[0] + " = " + formatIndexCondKey(p.Keys[0], reg))
+			return wrapParen(indexCondClause(cols[0], "=", p.Keys[0], reg, indexKeyColumnType(tbl, index, 0)))
 		}
 		parts := make([]string, len(p.Keys))
 		for i, k := range p.Keys {
-			parts[i] = cols[i] + " = " + formatIndexCondKey(k, reg)
+			parts[i] = indexCondClause(cols[i], "=", k, reg, indexKeyColumnType(tbl, index, i))
 		}
 		return indexCondAndText(parts)
 	}
 	// Single-column equality.
 	if p.Key != nil && len(cols) > 0 {
-		return wrapParen(cols[0] + " = " + formatIndexCondKey(p.Key, reg))
+		return wrapParen(indexCondClause(cols[0], "=", p.Key, reg, indexKeyColumnType(tbl, index, 0)))
 	}
-	// Range scan.
+	// Range scan, its bounds in restriction-list order (M0148-0001c3a2).
 	if (p.LowKey != nil || p.HighKey != nil) && len(cols) > 0 {
-		col := cols[0]
-		var parts []string
-		if p.LowKey != nil {
-			loOp := ">="
-			if p.LowOp == parser.OpGt {
-				loOp = ">"
-			}
-			parts = append(parts, col+" "+loOp+" "+formatIndexCondKey(p.LowKey, reg))
-		}
-		if p.HighKey != nil {
-			hiOp := "<="
-			if p.HighOp == parser.OpLt {
-				hiOp = "<"
-			}
-			parts = append(parts, col+" "+hiOp+" "+formatIndexCondKey(p.HighKey, reg))
-		}
-		if len(parts) > 0 {
+		if parts := rangeColumnCondParts(tbl, index, 0, cols[0], order, p.LowKey, p.HighKey, p.LowOp, p.HighOp,
+			optimizer.IndexNullTestNone, false, nil, reg); len(parts) > 0 {
 			return indexCondAndText(parts)
 		}
 	}
@@ -4112,6 +4597,16 @@ func isLiteralOneTimeFilterConst(e optimizer.Expr) bool {
 }
 
 // wrapParen wraps s in parentheses unless it already is parenthesised.
+// qualText renders a plan qual as show_qual prints it: a bare column (a
+// boolean Var qual, `Filter: a`) carries no parentheses; any other
+// expression is wrapped (wrapParen). M0148-0001c3a5 (d).
+func qualText(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
+	if _, isCol := e.(*optimizer.ColumnRef); isCol {
+		return formatExprQual(e, reg, qualify)
+	}
+	return wrapParen(formatExprQual(e, reg, qualify))
+}
+
 func wrapParen(s string) string {
 	if strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
 		// Heuristic: avoid double-wrap when the whole expression
@@ -4162,6 +4657,11 @@ func forceParen(s string) string {
 // nothing, so callers without a registry (JSON rendering, direct
 // formatExprPG users) keep working unchanged.
 type subPlanReg struct {
+	// currentTimeText is the EXPLAIN text of each current-time literal
+	// ('today', 'now', ...) as the instant it denotes under the statement's
+	// clock (currentTimeLiteralTexts, M0149-0001h1a81). nil = print as written.
+	currentTimeText map[optimizer.Expr]string
+
 	num     map[optimizer.Expr]int
 	pending []subPlanEntry
 
@@ -4414,7 +4914,7 @@ func execParamOwnerChildren(n optimizer.Node) (children []optimizer.Node, recogn
 		*optimizer.PgAvailableWalSummaries, *optimizer.PgGetCatalogForeignKeys,
 		*optimizer.ScalarFuncScan, *optimizer.PgPartitionTree,
 		*optimizer.PgOptionsToTable, *optimizer.FromRegexpMatches,
-		*optimizer.FromRegexpSplitToTable, *optimizer.VerifyHeapam,
+		*optimizer.FromRegexpSplitToTable, *optimizer.VerifyHeapam, *optimizer.BuiltinSRFScan,
 		*optimizer.WorkTableScan, *optimizer.BitmapIndexScan:
 		return nil, true
 	default:
@@ -5107,6 +5607,11 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 	case *optimizer.StringConst:
 		// PG renders string literals as single-quoted; escape
 		// embedded single quotes per SQL convention.
+		if reg != nil {
+			if v, ok := reg.currentTimeText[x]; ok {
+				return "'" + strings.ReplaceAll(v, "'", "''") + "'"
+			}
+		}
 		return "'" + strings.ReplaceAll(x.Value, "'", "''") + "'"
 	case *optimizer.BooleanConst:
 		if x.Value {
@@ -5124,6 +5629,13 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 			// `(((a) AND (b)) AND (c))`.
 			var parts []string
 			for _, arm := range flattenBoolArms(x, x.Op, nil) {
+				// An AND / OR input is boolean, so a NULL arm is a
+				// boolean Const: get_const_expr prints `NULL::boolean`
+				// (`(a = 1) OR NULL::boolean`, M0148-0001c3a13).
+				if _, isNull := arm.(*optimizer.NullConst); isNull {
+					parts = append(parts, "NULL::boolean")
+					continue
+				}
 				parts = append(parts, formatExprQual(arm, reg, qualify))
 			}
 			return "(" + strings.Join(parts, " "+x.Op.String()+" ") + ")"
@@ -5156,13 +5668,71 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		}
 		return "(" + x.Op.String() + " " + formatExprQual(x.Operand, reg, qualify) + ")"
 	case *optimizer.CastExpr:
+		// time to interval is a real conversion (time_interval), so it is shown
+		// even when the operator resolution added it implicitly.
+		if isTimeOfDaySource(x.SourceType) && strings.EqualFold(x.TargetType, "interval") {
+			return "(" + formatExprQual(x.Operand, reg, qualify) + ")::interval"
+		}
 		if x.Explicit {
 			if txt, ok := explicitCastText(x, reg, qualify); ok {
 				return txt
 			}
 		}
+		// M0148-0001c3a1: an unknown literal coerced to name (namein at parse
+		// analysis) is a name-typed Const, which get_const_expr labels:
+		// `(stringu1 = 'TVAAAA'::name)`, regress create_index / select.
+		if sc, isStr := x.Operand.(*optimizer.StringConst); isStr && strings.EqualFold(x.TargetType, "name") {
+			return quoteLiteral(sc.Value) + "::name"
+		}
+		// A literal cast to money is a money Const upstream, printed through
+		// cash_out: `(m = '$12.00'::money)`. M0149-0001k5.
+		if sc, isStr := x.Operand.(*optimizer.StringConst); isStr && strings.EqualFold(x.TargetType, "money") {
+			if c, err := moneyCents(NewStringDatum(sc.Value)); err == nil {
+				return quoteLiteral(cash.Out(c)) + "::money"
+			}
+		}
 		return formatExprQual(x.Operand, reg, qualify)
 	case *optimizer.FuncCall:
+		// An operator implemented as a call (money arithmetic → cash_*) is an
+		// OpExpr upstream and prints infix. M0149-0001k1.
+		if x.Operator != "" && len(x.Args) == 2 {
+			return "(" + formatExprQual(x.Args[0], reg, qualify) + " " + x.Operator + " " + formatExprQual(x.Args[1], reg, qualify) + ")"
+		}
+		if x.Operator != "" && len(x.Args) == 1 {
+			// A prefix operator (~ on a bit string, M0149-0001h1a1).
+			return "(" + x.Operator + " " + formatExprQual(x.Args[0], reg, qualify) + ")"
+		}
+		if x.Name == "array_construct" {
+			// An ARRAY[...] constructor is an ArrayExpr to PG, folded to an
+			// array Const when every element is a constant
+			// (eval_const_expressions): `'{1,2}'::integer[]`, else
+			// `ARRAY[a, b]` (ruleutils T_ArrayExpr). M0149-0001h1a78d.
+			if lit, ok := constArrayLiteral(x.Args); ok {
+				return lit
+			}
+			parts := make([]string, len(x.Args))
+			for i, a := range x.Args {
+				parts[i] = formatExprQual(a, reg, qualify)
+			}
+			return "ARRAY[" + strings.Join(parts, ", ") + "]"
+		}
+		if x.Name == "array_subscript" && len(x.Args) == 2 {
+			// A SubscriptingRef: the container is parenthesised unless it is
+			// a plain column reference (ruleutils printSubscripts).
+			// M0149-0001h1a78d.
+			base := formatExprQual(x.Args[0], reg, qualify)
+			if _, isVar := x.Args[0].(*optimizer.ColumnRef); !isVar {
+				base = "(" + base + ")"
+			}
+			return base + "[" + formatExprQual(x.Args[1], reg, qualify) + "]"
+		}
+		if x.SQLName != "" {
+			// An overload resolved to its variant (bit_length(bit) →
+			// bitlength) prints under its SQL name. M0149-0001h1a1.
+			y := *x
+			y.Name, y.SQLName = x.SQLName, ""
+			return formatExprQual(&y, reg, qualify)
+		}
 		// Composite field selection's run-time form renders as the SQL it
 		// came from: ruleutils' T_FieldSelect arm parenthesises the operand
 		// (unless it is itself a field selection) and appends the quoted
@@ -5225,6 +5795,11 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 	case *optimizer.TypedStringLit:
 		// Upstream renders a typed literal as `'value'::type`
 		// (ruleutils.c get_const_expr with showtype).
+		if reg != nil {
+			if v, ok := reg.currentTimeText[x]; ok {
+				return "'" + strings.ReplaceAll(v, "'", "''") + "'::" + typedLiteralTypeName(x.Type)
+			}
+		}
 		return "'" + strings.ReplaceAll(typedLiteralValueText(x.Type, x.Value), "'", "''") + "'::" + typedLiteralTypeName(x.Type)
 	case *optimizer.IntervalLit:
 		// `interval 'N' <unit>` (Qualified) folds the unit into the
@@ -5581,10 +6156,20 @@ func formatInExprPG(x *optimizer.InExpr, reg *subPlanReg, qualify bool) string {
 // order, descending into nested nodes of the same op.
 func flattenBoolArms(e optimizer.Expr, op parser.OpCode, out []optimizer.Expr) []optimizer.Expr {
 	if b, ok := e.(*optimizer.BinaryOp); ok && b.Op == op {
-		out = flattenBoolArms(b.Left, op, out)
-		return flattenBoolArms(b.Right, op, out)
+		out = flattenBoolArmChild(b.Left, op, out)
+		return flattenBoolArmChild(b.Right, op, out)
 	}
 	return append(out, e)
+}
+
+// flattenBoolArmChild is flattenBoolArms for an arm: a Nested clause (a
+// group_similar_or_args sub-OR, M0148-0001c3a2) is one argument of its
+// parent and prints in its own parentheses.
+func flattenBoolArmChild(e optimizer.Expr, op parser.OpCode, out []optimizer.Expr) []optimizer.Expr {
+	if b, ok := e.(*optimizer.BinaryOp); ok && b.Nested {
+		return append(out, e)
+	}
+	return flattenBoolArms(e, op, out)
 }
 
 // intConstText is get_const_expr's text for an integer literal: an int4
@@ -5685,6 +6270,13 @@ func formatCoercedLiteralOperands(x *optimizer.BinaryOp, reg *subPlanReg, qualif
 	default:
 		return "", "", false
 	}
+	// M0148-0001c3a6 (i): an explicitly cast integer literal against an
+	// integer-family operand meets a cross-type operator of integer_ops
+	// (int48eq, int24lt, int48pl, …), so no coercion applies and the Const
+	// keeps its own type: `(tenthous = '3'::bigint)`, `(a = '1'::smallint)`.
+	if l, r, ok := formatCrossIntLiteralOperands(x, reg, qualify); ok {
+		return l, r, true
+	}
 	lit, litLeft := coercibleLiteral(x.Left)
 	other := x.Right
 	if !litLeft {
@@ -5713,6 +6305,74 @@ func formatCoercedLiteralOperands(x *optimizer.BinaryOp, reg *subPlanReg, qualif
 	if otherText != "" {
 		o = "(" + o + ")::" + otherText
 	}
+	if litLeft {
+		return litText, o, true
+	}
+	return o, litText, true
+}
+
+// formatCrossIntLiteralOperands renders `operand op CAST(int literal AS
+// T)` (either side) where T and the operand's type are both integer types
+// and differ: the literal is a Const of T, printed as get_const_expr does.
+func formatCrossIntLiteralOperands(x *optimizer.BinaryOp, reg *subPlanReg, qualify bool) (string, string, bool) {
+	intFam := func(name string) string {
+		switch strings.ToLower(name) {
+		case "int2", "smallint":
+			return "int2"
+		case "int4", "int", "integer":
+			return "int4"
+		case "int8", "bigint":
+			return "int8"
+		}
+		return ""
+	}
+	castLit := func(e optimizer.Expr) (*optimizer.CastExpr, string, bool) {
+		// `-3::int8` is -(3::int8), which eval_const_expressions folds to
+		// the Const '-3'::bigint.
+		if u, isNeg := e.(*optimizer.UnaryOp); isNeg && u.Op == parser.OpUnaryNeg {
+			if c, ok := u.Operand.(*optimizer.CastExpr); ok {
+				if ic, isInt := c.Operand.(*optimizer.IntegerConst); isInt {
+					neg := *c
+					neg.Operand = &optimizer.IntegerConst{Value: -ic.Value}
+					e = &neg
+				}
+			}
+		}
+		c, ok := e.(*optimizer.CastExpr)
+		if !ok || !c.Explicit || c.Typmod != 0 {
+			return nil, "", false
+		}
+		if _, isInt := c.Operand.(*optimizer.IntegerConst); !isInt {
+			return nil, "", false
+		}
+		f := intFam(c.TargetType)
+		return c, f, f != ""
+	}
+	c, fam, litLeft := castLit(x.Left)
+	other := x.Right
+	if !litLeft {
+		var ok bool
+		if c, fam, ok = castLit(x.Right); !ok {
+			return "", "", false
+		}
+		other = x.Left
+	}
+	t, ok := optimizer.ExprResultType(other)
+	if !ok || t.IsArray {
+		return "", "", false
+	}
+	if of := intFam(t.Name); of == "" || of == fam {
+		return "", "", false
+	}
+	typ, ok := castTypeName(c.TargetType, 0)
+	if !ok {
+		return "", "", false
+	}
+	litText, ok := castLiteralConstText(c.Operand, strings.ToLower(c.TargetType), 0, typ)
+	if !ok {
+		return "", "", false
+	}
+	o := formatExprQual(other, reg, qualify)
 	if litLeft {
 		return litText, o, true
 	}
@@ -5748,6 +6408,21 @@ func coerceLiteralText(lit optimizer.Expr, t catalog.Type) (otherCast, text stri
 	case "text":
 		if c, isStr := lit.(*optimizer.StringConst); isStr {
 			return "", quoteLiteral(c.Value) + "::text", true
+		}
+	case "money":
+		// The unknown literal resolves to money (cash_in), printed through
+		// cash_out: `(m = '$12.00'::money)`. M0149-0001k5.
+		if c, isStr := lit.(*optimizer.StringConst); isStr {
+			if cents, err := moneyCents(NewStringDatum(c.Value)); err == nil {
+				return "", quoteLiteral(cash.Out(cents)) + "::money", true
+			}
+		}
+	case "name":
+		// The unknown literal resolves to name (namein), the operator is
+		// name's own (nameeq / namelt …): `(stringu1 = 'TVAAAA'::name)`,
+		// regress create_index / select. M0148-0001c3a1.
+		if c, isStr := lit.(*optimizer.StringConst); isStr {
+			return "", quoteLiteral(c.Value) + "::name", true
 		}
 	case "date":
 		// date_in's value prints as date_out's ISO text (M0146-0005cw,
@@ -6173,8 +6848,45 @@ func castLiteralConstText(lit optimizer.Expr, target string, typmod int64, typ s
 		v = d
 	case "bool", "boolean":
 		return "", false
+	case "timestamp", "timestamp without time zone":
+		// The literal is a Const of the target type, printed by timestamp_out
+		// after its precision was applied.
+		if ts, err := parseCopyTimestampZoneSession(v, tsZoneModeForType("timestamp"), ""); err == nil {
+			d := NewTimeDatum(ts)
+			prec := int64(-1)
+			switch {
+			case typmod == -1:
+				prec = 0
+			case typmod > 0:
+				prec = typmod
+			}
+			v = misc.FormatTimestamp(roundTimestampDatumToPrecision(d, prec).TimeValue(), "ISO", "MDY")
+		}
 	}
 	return quoteLiteral(v) + "::" + typ, true
+}
+
+// fractionalCastTypeName is format_type_with_typemod's spelling of a time or
+// timestamp type with a precision: `timestamp(0) without time zone`. A typmod of
+// -1 is the cast encoding of precision 0.
+func fractionalCastTypeName(name string, typmod int64) (string, bool) {
+	if typmod == -1 {
+		typmod = 0
+	}
+	var base, zone string
+	switch strings.ToLower(name) {
+	case "timestamp", "timestamp without time zone":
+		base, zone = "timestamp", "without"
+	case "timestamptz", "timestamp with time zone":
+		base, zone = "timestamp", "with"
+	case "time", "time without time zone":
+		base, zone = "time", "without"
+	case "timetz", "time with time zone":
+		base, zone = "time", "with"
+	default:
+		return "", false
+	}
+	return fmt.Sprintf("%s(%d) %s time zone", base, typmod, zone), true
 }
 
 // castTypeName is format_type_with_typemod's spelling for the cast targets
@@ -6202,7 +6914,7 @@ func castTypeName(name string, typmod int64) (string, bool) {
 		return "bpchar", true
 	}
 	if typmod != 0 {
-		return "", false
+		return fractionalCastTypeName(name, typmod)
 	}
 	switch strings.ToLower(name) {
 	case "int", "int4", "integer":
@@ -6219,6 +6931,8 @@ func castTypeName(name string, typmod int64) (string, bool) {
 		return "text", true
 	case "date":
 		return "date", true
+	case "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange":
+		return strings.ToLower(name), true
 	case "bool", "boolean":
 		return "boolean", true
 	case "timestamp":
@@ -6255,12 +6969,25 @@ func quoteLiteral(v string) string {
 // not model (a NULL or non-literal element, an unmodelled type), and the
 // caller keeps its element-list rendering.
 func inListArrayConst(lt catalog.Type, list []optimizer.Expr) (cast, lit string, ok bool) {
-	if lt.IsArray || len(list) == 0 {
+	// An empty list prints `'{}'::type[]` (M0148-0001c3a4 (i)).
+	if lt.IsArray {
 		return "", "", false
+	}
+	// M0148-0001c3a6 (i): an OR of `col = 3::int8` arms converted to an array
+	// (match_orclause_to_indexcol) is an array of the Consts' own type,
+	// `'{3,42}'::bigint[]`, compared by the cross-type operator.
+	if t, vals, ok := sameTypeIntCastList(list); ok {
+		return "", "'{" + strings.Join(vals, ",") + "}'::" + t + "[]", true
 	}
 	elems := make([]string, len(list))
 	ints := func(wide bool) bool {
 		for i, e := range list {
+			// A NULL element is printed as NULL inside the array literal
+			// (`'{9,3,NULL}'::integer[]`, M0148-0001c3a4 (i)).
+			if _, isNull := e.(*optimizer.NullConst); isNull {
+				elems[i] = "NULL"
+				continue
+			}
 			ic, isInt := e.(*optimizer.IntegerConst)
 			if !isInt {
 				return false
@@ -6274,6 +7001,10 @@ func inListArrayConst(lt catalog.Type, list []optimizer.Expr) (cast, lit string,
 	}
 	strs := func() bool {
 		for i, e := range list {
+			if _, isNull := e.(*optimizer.NullConst); isNull {
+				elems[i] = "NULL"
+				continue
+			}
 			sc, isStr := e.(*optimizer.StringConst)
 			if !isStr {
 				return false
@@ -6367,6 +7098,12 @@ func inListArrayConst(lt catalog.Type, list []optimizer.Expr) (cast, lit string,
 	default:
 		return "", "", false
 	}
+	if len(list) == 1 {
+		if _, isNull := list[0].(*optimizer.NullConst); isNull {
+			// `= ANY (NULL)` is a NULL array, not an array holding NULL.
+			return cast, "NULL::" + typ + "[]", true
+		}
+	}
 	body := "{" + strings.Join(elems, ",") + "}"
 	return cast, "'" + strings.ReplaceAll(body, "'", "''") + "'::" + typ + "[]", true
 }
@@ -6446,6 +7183,26 @@ func explainOutputNames(n optimizer.Node, reg *subPlanReg) []string {
 	// helpful, so suppress it" — likewise MergeAppend (M0148-0001f1).
 	if so, ok := n.(*optimizer.SetOp); ok && setOpRendersAsAppend(so) {
 		return nil
+	}
+	// M0149-0001h1a78d: a SELECT-list ProjectSet's targetlist is its SRF
+	// calls (plus, under a Result, the input columns the Result reads).
+	if ps, ok := n.(*optimizer.ProjectSet); ok && projectSetSelectList(ps) {
+		psOut, _ := projectSetVerboseLists(ps, reg, qualify)
+		return psOut
+	}
+	// A Sort / Limit over that ProjectSet (or the Result above it) passes its
+	// entries through as OUTER_VARs: each non-Var referent parenthesised.
+	if child := explainPassThroughChild(n); child != nil {
+		// Through further pass-through nodes (Limit over Sort): each
+		// re-references the same entries.
+		for c := explainPassThroughChild(skipProjectsAndFilters(child)); c != nil; c = explainPassThroughChild(skipProjectsAndFilters(child)) {
+			child = c
+		}
+		if ps, ok := skipProjectsAndFilters(child).(*optimizer.ProjectSet); ok && projectSetSelectList(ps) && len(ps.Output()) == len(names) {
+			if txt := projectSetPassThroughNames(ps, reg, qualify); len(txt) == len(names) {
+				return txt
+			}
+		}
 	}
 	if txt, ok := explainScanProjectionOutput(n, reg, qualify); ok {
 		return txt
@@ -6621,11 +7378,15 @@ func schemaColumnNames(n optimizer.Node) []string {
 // `(actual time=startup..total rows=R loops=L)` suffix pulled
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
-func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, sortStats map[*optimizer.Sort]SortStat, sortWorkers map[*optimizer.Sort][]SortStat, memoWorkers map[*optimizer.Memoize][]MemoizeStats, hashMem int64, rtableSize int) {
+func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, sortStats map[*optimizer.Sort]SortStat, sortWorkers map[*optimizer.Sort][]SortStat, memoWorkers map[*optimizer.Memoize][]MemoizeStats, hashMem int64, rtableSize int, lits ...map[optimizer.Expr]string) {
 	reg := &subPlanReg{rel: newExplainNamesSized(n, rtableSize, opts.Verbose), cte: collectCTEHoist(n), hashMemLimit: hashMem}
+	if len(lits) > 0 {
+		reg.currentTimeText = lits[0]
+	}
 	reg.reservePGPlanIDs(n)
 	reg.sortStats, reg.sortWorkers = sortStats, sortWorkers
 	reg.memoWorkers = memoWorkers
+	depth = emitRootSRFResult(n, depth, rows, opts, reg)
 	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 }
 
@@ -6714,7 +7475,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		if est <= 0 {
 			est = 1
 		}
-		est, startup, total, width := explainCostFields(rowSrc, est)
+		est, startup, total, width := explainNodeCostFields(rowSrc, est)
 		label += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", startup, total, est, width)
 	}
 	// A collapsed Filter is rendered as part of THIS line, so the line's
@@ -7157,6 +7918,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		}
 		if srfNeedsResultAbove(c) {
 			ci = emitHashNodeLine(rows, "Result", ci, c, showCostsA, hashInputStats(c, stats))
+			emitSRFResultOutput(rows, c, ci, opts, reg)
 		}
 		restore := reg.enterParamInner(n, c)
 		walkPlanAnalyzeFiltered(c, ci, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
@@ -7392,7 +8154,7 @@ func planToJSONNamed(n optimizer.Node, opts parser.ExplainOptions, reg *subPlanR
 		if explainIsScanNode(n) {
 			fqual = reg.names().qualifyScan()
 		}
-		obj["Filter"] = wrapParen(formatExprQual(filter, reg, fqual))
+		obj["Filter"] = qualText(filter, reg, fqual)
 	}
 	if opts.Verbose {
 		if cols := explainOutputNames(n, reg); len(cols) > 0 {
@@ -7513,6 +8275,20 @@ func explainCostFields(n optimizer.Node, rows int64) (est int64, startup, total 
 	return planCostRows(d.PlanRows, rows), d.StartupCost + ch, d.TotalCost + ch, d.PlanWidth
 }
 
+// explainNodeCostFields is explainCostFields for a node's own line. A
+// SELECT-list ProjectSet that PG splits into a ProjectSet under a Result
+// prints the ProjectSet's own estimate here; explainCostFields (what a parent
+// and the synthesised Result line read) reports the pair's top
+// (M0149-0001h1a78a).
+func explainNodeCostFields(n optimizer.Node, rows int64) (est int64, startup, total float64, width int) {
+	if ps, ok := n.(*optimizer.ProjectSet); ok && optimizer.ProjectSetNeedsResult(ps) {
+		pc := optimizer.ProjectSetOwnCost(ps)
+		ch := optimizer.InitPlanChargeOf(n)
+		return planCostRows(pc.PlanRows, rows), pc.StartupCost + ch, pc.TotalCost + ch, pc.PlanWidth
+	}
+	return explainCostFields(n, rows)
+}
+
 // planCostRows converts a carrier's `PlanRows` to the integer EXPLAIN prints,
 // falling back to the caller's own estimate when the carrier has none.
 //
@@ -7592,6 +8368,9 @@ func srfFunctionCallArgs(n optimizer.Node) (string, []optimizer.Expr) {
 		if p.Step != nil {
 			args = append(args, p.Step)
 		}
+		if p.Zone != nil {
+			args = append(args, p.Zone)
+		}
 		return "generate_series", args
 	case *optimizer.GenerateSubscripts:
 		args := []optimizer.Expr{p.ArrExpr, p.Dim}
@@ -7600,6 +8379,9 @@ func srfFunctionCallArgs(n optimizer.Node) (string, []optimizer.Expr) {
 		}
 		return "generate_subscripts", args
 	case *optimizer.FromUnnest:
+		if p.FuncName != "" {
+			return p.FuncName, p.FuncArgs
+		}
 		if p.ArrExpr != nil {
 			return "unnest", []optimizer.Expr{p.ArrExpr}
 		}
@@ -7653,15 +8435,15 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 			parallelPrefix = "Parallel "
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("%sIndex Scan using %s on %s", parallelPrefix, explainIndexName(p.Index), scanTargetRef(schemaQualify(p.Table.QualifiedName()), dname))
+			return fmt.Sprintf("%sIndex Scan%s using %s on %s", parallelPrefix, indexScanDirection(p.Backward), explainIndexName(p.Index), scanTargetRef(schemaQualify(p.Table.QualifiedName()), dname))
 		}
 		// P0-04: print the FROM-clause alias like the SeqScan arm does, so
 		// a self-join's second scan renders `on customer c2` as PG's
 		// select_rtable_names does, not a bare second `on customer`.
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
-			return fmt.Sprintf("%sIndex Scan using %s on %s %s", parallelPrefix, explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()), p.Alias)
+			return fmt.Sprintf("%sIndex Scan%s using %s on %s %s", parallelPrefix, indexScanDirection(p.Backward), explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()), p.Alias)
 		}
-		return fmt.Sprintf("%sIndex Scan using %s on %s", parallelPrefix, explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()))
+		return fmt.Sprintf("%sIndex Scan%s using %s on %s", parallelPrefix, indexScanDirection(p.Backward), explainIndexName(p.Index), schemaQualify(p.Table.QualifiedName()))
 	case *optimizer.IndexOnlyScan:
 		// S6 max rewrite: PG's ExplainIndexScanDetails (explain.c:4330-4336)
 		// puts " Backward" between the scan name and " using".
@@ -7702,6 +8484,9 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 	case *optimizer.GenerateSubscripts:
 		return srfFunctionScanLabelQualified("pg_catalog.generate_subscripts", "generate_subscripts", p.Alias)
 	case *optimizer.FromUnnest:
+		if p.FuncName != "" {
+			return srfFunctionScanLabelQualified("pg_catalog."+p.FuncName, p.FuncName, p.Alias)
+		}
 		return srfFunctionScanLabelQualified("pg_catalog.unnest", "unnest", p.Alias)
 	case *optimizer.UserSrfScan:
 		return srfFunctionScanLabelQualified(p.Routine.QualifiedName(), p.Routine.Name, p.Alias)
@@ -7715,6 +8500,16 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 // describePlan renders the PLAIN (non-verbose) label. It is a thin wrapper so
 // that existing callers keep their meaning; the mode-carrying form below is
 // what the verbose walker falls through to.
+// indexScanDirection is the " Backward" ExplainIndexScanDetails puts
+// between an index scan's name and " using" for a BackwardScanDirection
+// scan (explain.c; M0148-0001c3a3).
+func indexScanDirection(backward bool) string {
+	if backward {
+		return " Backward"
+	}
+	return ""
+}
+
 func describePlan(n optimizer.Node, nm *explainNames) string {
 	return describePlanMode(n, nm, false)
 }
@@ -7930,13 +8725,13 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 			parallelPrefix = "Parallel "
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("%sIndex Scan using %s on %s", parallelPrefix, explainIndexName(p.Index), scanTargetRef(explainRelName(p.Table, verbose), dname))
+			return fmt.Sprintf("%sIndex Scan%s using %s on %s", parallelPrefix, indexScanDirection(p.Backward), explainIndexName(p.Index), scanTargetRef(explainRelName(p.Table, verbose), dname))
 		}
 		// P0-04: same alias branch as the verbose arm above.
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
-			return fmt.Sprintf("%sIndex Scan using %s on %s %s", parallelPrefix, explainIndexName(p.Index), explainRelName(p.Table, verbose), p.Alias)
+			return fmt.Sprintf("%sIndex Scan%s using %s on %s %s", parallelPrefix, indexScanDirection(p.Backward), explainIndexName(p.Index), explainRelName(p.Table, verbose), p.Alias)
 		}
-		return fmt.Sprintf("%sIndex Scan using %s on %s", parallelPrefix, explainIndexName(p.Index), explainRelName(p.Table, verbose))
+		return fmt.Sprintf("%sIndex Scan%s using %s on %s", parallelPrefix, indexScanDirection(p.Backward), explainIndexName(p.Index), explainRelName(p.Table, verbose))
 	case *optimizer.IndexOnlyScan:
 		// M0118-0009 (design 0118-0102): horizons.spec inspects the IOS
 		// label via `EXPLAIN (COSTS OFF)` (pruner_query_plan) — mirror
@@ -8128,6 +8923,9 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 	case *optimizer.GenerateSubscripts:
 		return srfFunctionScanLabel("generate_subscripts", p.Alias)
 	case *optimizer.FromUnnest:
+		if p.FuncName != "" {
+			return srfFunctionScanLabel(p.FuncName, p.Alias)
+		}
 		return srfFunctionScanLabel("unnest", p.Alias)
 	case *optimizer.UserSrfScan:
 		// PG's get_func_name returns the BARE function name in both plain
@@ -8206,6 +9004,8 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		return srfFunctionScanLabel("regexp_matches", "")
 	case *optimizer.FromRegexpSplitToTable:
 		return srfFunctionScanLabel("regexp_split_to_table", "")
+	case *optimizer.BuiltinSRFScan:
+		return srfFunctionScanLabel(n.(*optimizer.BuiltinSRFScan).Func, "")
 	case *optimizer.PgAvailableWalSummaries:
 		if f := n.(*optimizer.PgAvailableWalSummaries).Func; f != "" {
 			return srfFunctionScanLabel(f, "")
@@ -9219,4 +10019,188 @@ func explainAggProjectionOutput(n optimizer.Node, reg *subPlanReg, qualify bool)
 		}
 	}
 	return out, true
+}
+
+// sameTypeIntCastList reports a list of explicit casts of integer literals,
+// all to one integer type, with the type's display name and the values.
+func sameTypeIntCastList(list []optimizer.Expr) (string, []string, bool) {
+	if len(list) == 0 {
+		return "", nil, false
+	}
+	display := map[string]string{"int2": "smallint", "smallint": "smallint", "int4": "integer", "int": "integer",
+		"integer": "integer", "int8": "bigint", "bigint": "bigint"}
+	typ := ""
+	vals := make([]string, 0, len(list))
+	for _, e := range list {
+		c, ok := e.(*optimizer.CastExpr)
+		if !ok || !c.Explicit || c.Typmod != 0 {
+			return "", nil, false
+		}
+		ic, isInt := c.Operand.(*optimizer.IntegerConst)
+		if !isInt {
+			return "", nil, false
+		}
+		t, known := display[strings.ToLower(c.TargetType)]
+		if !known || (typ != "" && t != typ) {
+			return "", nil, false
+		}
+		typ = t
+		vals = append(vals, strconv.FormatInt(ic.Value, 10))
+	}
+	return typ, vals, true
+}
+
+// rangeCondWithExtraBounds is formatIndexCondPartsPrefixed for a leading-
+// column range scan that also carries ExtraBounds (M0148-0001c3a6 (i)): every
+// bound in restriction order — `((unique1 < 3) AND (unique1 < '-1'::bigint))`.
+// It returns the text and its clause count.
+func rangeCondWithExtraBounds(tbl *catalog.Table, idx *catalog.Index, keys []optimizer.Expr, key, lowKey, highKey optimizer.Expr,
+	lowOp, highOp parser.OpCode, extras []optimizer.ExtraIndexBound, reg *subPlanReg, prefix string, order []optimizer.IndexCondItem) (string, int) {
+	if len(extras) == 0 || len(keys) > 0 || key != nil || len(idx.Columns) == 0 {
+		return formatIndexCondPartsPrefixed(tbl, idx, keys, key, lowKey, highKey, lowOp, highOp, reg, prefix, order...), boundCount(lowKey, highKey)
+	}
+	col := prefix + idx.Columns[0]
+	var base []optimizer.IndexCondItem
+	for _, it := range order {
+		if it != optimizer.IndexCondExtraBound {
+			base = append(base, it)
+		}
+	}
+	baseParts := rangeColumnCondParts(tbl, idx, 0, col, base, lowKey, highKey, lowOp, highOp,
+		optimizer.IndexNullTestNone, false, nil, reg)
+	var parts []string
+	bi, ei := 0, 0
+	for _, it := range order {
+		if it == optimizer.IndexCondExtraBound {
+			if ei < len(extras) {
+				x := extras[ei]
+				parts = append(parts, indexCondClause(col, saopOpText(x.Op), x.Key, reg, indexKeyColumnType(tbl, idx, 0)))
+				ei++
+			}
+			continue
+		}
+		if bi < len(baseParts) {
+			parts = append(parts, baseParts[bi])
+			bi++
+		}
+	}
+	parts = append(parts, baseParts[bi:]...)
+	return indexCondAndText(parts), len(parts)
+}
+
+// rangeCondWithRowCompare renders a range scan carrying a row comparison
+// (M0148-0001c3a12): the comparison whole — `ROW(thousand, tenthous) >
+// ROW(NULL::integer, 5)`, index columns on the left as
+// expand_indexqual_rowcompare commutes it, a NULL labelled with its
+// column's type — beside the column's other bound, in restriction order.
+func rangeCondWithRowCompare(tbl *catalog.Table, idx *catalog.Index, lowKey, highKey optimizer.Expr, lowOp, highOp parser.OpCode,
+	rc *optimizer.BinaryOp, rowLow bool, reg *subPlanReg, prefix string, order []optimizer.IndexCondItem) string {
+	rowText := rowCompareCondText(tbl, idx, rc, reg, prefix)
+	if rowLow {
+		lowKey = nil
+	} else {
+		highKey = nil
+	}
+	var base []optimizer.IndexCondItem
+	for _, it := range order {
+		if it != optimizer.IndexCondRowCompare {
+			base = append(base, it)
+		}
+	}
+	var baseParts []string
+	if lowKey != nil || highKey != nil {
+		baseParts = rangeColumnCondParts(tbl, idx, 0, prefix+idx.Columns[0], base, lowKey, highKey, lowOp, highOp,
+			optimizer.IndexNullTestNone, false, nil, reg)
+	}
+	if len(order) == 0 {
+		return indexCondAndText(append([]string{rowText}, baseParts...))
+	}
+	var parts []string
+	bi := 0
+	for _, it := range order {
+		if it == optimizer.IndexCondRowCompare {
+			parts = append(parts, rowText)
+			continue
+		}
+		if bi < len(baseParts) {
+			parts = append(parts, baseParts[bi])
+			bi++
+		}
+	}
+	parts = append(parts, baseParts[bi:]...)
+	return indexCondAndText(parts)
+}
+
+// rowCompareCondText is a row comparison as an index qual's text.
+func rowCompareCondText(tbl *catalog.Table, idx *catalog.Index, rc *optimizer.BinaryOp, reg *subPlanReg, prefix string) string {
+	lr, _ := rc.Left.(*optimizer.RowExpr)
+	rr, _ := rc.Right.(*optimizer.RowExpr)
+	op := rc.Op
+	if lr == nil || rr == nil {
+		return formatExprQual(rc, reg, false)
+	}
+	if _, colsRight := rr.Elems[0].(*optimizer.ColumnRef); colsRight {
+		lr, rr = rr, lr
+		switch op {
+		case parser.OpLt:
+			op = parser.OpGt
+		case parser.OpLe:
+			op = parser.OpGe
+		case parser.OpGt:
+			op = parser.OpLt
+		case parser.OpGe:
+			op = parser.OpLe
+		}
+	}
+	cols := make([]string, len(lr.Elems))
+	vals := make([]string, len(rr.Elems))
+	for i := range lr.Elems {
+		cols[i] = prefix + idx.Columns[i]
+		t := indexKeyColumnType(tbl, idx, i)
+		if _, isNull := rr.Elems[i].(*optimizer.NullConst); isNull && t != nil {
+			if name, ok := castTypeName(t.Name, 0); ok {
+				vals[i] = "NULL::" + name
+				continue
+			}
+		}
+		vals[i] = formatIndexCondKeyTyped(rr.Elems[i], reg, t)
+	}
+	return "ROW(" + strings.Join(cols, ", ") + ") " + saopOpText(op) + " ROW(" + strings.Join(vals, ", ") + ")"
+}
+
+// constArrayLiteral renders an ARRAY[...] of constants the way PG prints the
+// array Const eval_const_expressions folds it to: the array_out text, quoted,
+// with the array type (`'{1,2}'::integer[]`, `'{a,b}'::text[]`). It reports
+// false unless every element is a non-NULL constant of one kind.
+func constArrayLiteral(args []optimizer.Expr) (string, bool) {
+	if len(args) == 0 {
+		return "", false
+	}
+	elems := make([]string, len(args))
+	typ := ""
+	for i, a := range args {
+		var t, v string
+		switch c := a.(type) {
+		case *optimizer.IntegerConst:
+			t, v = "integer", strconv.FormatInt(c.Value, 10)
+			if c.Value > math.MaxInt32 || c.Value < math.MinInt32 {
+				t = "bigint"
+			}
+		case *optimizer.NumericConst:
+			t, v = "numeric", c.Value
+		case *optimizer.StringConst:
+			if c.BitString {
+				return "", false
+			}
+			t, v = "text", c.Value
+		default:
+			return "", false
+		}
+		if typ != "" && typ != t {
+			return "", false
+		}
+		typ, elems[i] = t, v
+	}
+	lit := formatTextArray(elems)
+	return "'" + strings.ReplaceAll(lit, "'", "''") + "'::" + typ + "[]", true
 }

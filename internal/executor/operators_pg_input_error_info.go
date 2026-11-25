@@ -60,6 +60,19 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 	var message, sqlCode string
 
 	switch t {
+	case "aclitem":
+		if _, e := aclitemIn(v, o.ctx); e != nil {
+			message, sqlCode = e.Message, e.Code
+		}
+	case "regclass", "regtype", "regrole", "regnamespace", "regcollation", "regproc", "regprocedure", "regoper", "regoperator":
+		// reg* input functions, soft errors (M0149-0001h1a13)
+		if _, e := regIdentifierInput(NewStringDatum(v), t, o.ctx, 0); e != nil {
+			if ee, ok := e.(*ExecError); ok {
+				message, sqlCode = ee.Message, ee.Code
+			} else {
+				message, sqlCode = e.Error(), "XX000"
+			}
+		}
 	case "time":
 		// Validate time strings using the same parser as column INSERT. M0097-0004.
 		_, e := parseTimeString(v)
@@ -161,6 +174,13 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 		if _, err := parsePgLSN(v); err != nil {
 			message = "invalid input syntax for type pg_lsn: \"" + v + "\""
 			sqlCode = "22P02"
+		}
+	case "money":
+		// cash_in's soft errors (22P02 / 22003). M0149-0001k1.
+		if _, err := moneyCents(NewStringDatum(v)); err != nil {
+			if ee, ok := err.(*ExecError); ok {
+				message, sqlCode = ee.Message, ee.Code
+			}
 		}
 	case "tid":
 		// tid: validate "(block,offset)" via tidin semantics. M0097-0036.

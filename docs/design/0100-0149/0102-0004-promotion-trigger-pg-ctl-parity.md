@@ -5,6 +5,14 @@
 **Milestone:** M0102-0004
 **Upstream reference:** `postgres/src/backend/access/transam/xlogrecovery.c:4475` (`CheckForStandbyTrigger`), `postgres/src/bin/pg_ctl/pg_ctl.c:1186` (`do_promote`), `postgres/src/include/access/xlog.h:314` (`PROMOTE_SIGNAL_FILE` macro).
 
+> **Correction (2026-11-15, owner decision, M0149 compatibility contract).**
+> This document mis-stated the upstream file name. PG 18.3 defines
+> `PROMOTE_SIGNAL_FILE` as **`promote`** (`xlog.h:314`), and `pg_ctl
+> promote` (`do_promote`) writes `<datadir>/promote` — not
+> `promote.signal`. goopg polled `promote.signal`, so `pg_ctl promote`
+> could not actually promote a goopg standby. `initdb.PromoteSignalFile`
+> is now `"promote"`; read every `promote.signal` below as `promote`.
+
 ## Problem
 
 PostgreSQL's `pg_ctl promote -D <datadir>` works by creating a

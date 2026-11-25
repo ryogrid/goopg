@@ -66,6 +66,10 @@ type XactParsed struct {
 	// HAS_RELFILELOCATORS chunk), raw as PG wrote them. The WAL summarizer
 	// sets their limit block to 0 (walsummarizer.c SummarizeXactRecord).
 	DroppedRels []XactRelFileLocator
+	// TwophaseXid is the prepared transaction a COMMIT PREPARED / ABORT
+	// PREPARED record finishes (XACT_XINFO_HAS_TWOPHASE, xl_xact_twophase),
+	// or 0. M0149-0012.
+	TwophaseXid uint32
 }
 
 // XactRelFileLocator is a RelFileLocator as an xact record carries it.
@@ -148,9 +152,47 @@ func ParseXactRecord(info uint8, mainData []byte) (XactParsed, error) {
 				RelNumber: binary.LittleEndian.Uint32(b[8:12]),
 			}
 		}
+		data = data[n*sizeOfRelFileLocator:]
 	}
-	// Later chunks (stats items, invals, twophase, gid, origin) are not
-	// consumed here; the relcache-init-file signal is read separately by
-	// xactCommitCarriesInvals.
+	// ParseCommitRecord / ParseAbortRecord (xactdesc.c) continue with the
+	// dropped-stats items, then — commit records only — the invalidation
+	// messages, then the two-phase xid. M0149-0012.
+	if out.Xinfo&xactXinfoHasDroppedStats != 0 {
+		if len(data) < 4 {
+			return out, fmt.Errorf("wal: xact record xinfo has DROPPED_STATS but only %d bytes remain", len(data))
+		}
+		n := int(int32(binary.LittleEndian.Uint32(data[:4])))
+		data = data[4:]
+		if n < 0 || n > maxParsedSubxacts || len(data) < n*sizeOfXactStatsItem {
+			return out, fmt.Errorf("wal: xact record declares %d dropped stats items but only %d bytes remain", n, len(data))
+		}
+		data = data[n*sizeOfXactStatsItem:]
+	}
+	op := info & xlogXactOpMask
+	isCommit := op == xlogXactCommit || op == xlogXactCommitPrepared
+	if isCommit && out.Xinfo&xactXinfoHasInvals != 0 {
+		if len(data) < 4 {
+			return out, fmt.Errorf("wal: xact record xinfo has INVALS but only %d bytes remain", len(data))
+		}
+		n := int(int32(binary.LittleEndian.Uint32(data[:4])))
+		data = data[4:]
+		if n < 0 || n > maxParsedSubxacts || len(data) < n*sizeOfSharedInvalMsg {
+			return out, fmt.Errorf("wal: xact record declares %d invalidation messages but only %d bytes remain", n, len(data))
+		}
+		data = data[n*sizeOfSharedInvalMsg:]
+	}
+	if out.Xinfo&xactXinfoHasTwophase != 0 {
+		if len(data) < 4 {
+			return out, fmt.Errorf("wal: xact record xinfo has TWOPHASE but only %d bytes remain", len(data))
+		}
+		out.TwophaseXid = binary.LittleEndian.Uint32(data[:4])
+	}
 	return out, nil
 }
+
+const (
+	xactXinfoHasTwophase     = 1 << 4 // XACT_XINFO_HAS_TWOPHASE
+	xactXinfoHasDroppedStats = 1 << 8 // XACT_XINFO_HAS_DROPPED_STATS
+	sizeOfXactStatsItem      = 16     // sizeof(xl_xact_stats_item)
+	sizeOfSharedInvalMsg     = 16     // sizeof(SharedInvalidationMessage)
+)

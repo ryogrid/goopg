@@ -24,7 +24,7 @@ func TestPgProcViewEmptyByDefault(t *testing.T) {
 	// Built-in stubs + the hand-curated catalog.BuiltinProcs() table are
 	// always present; without user-defined routines we should see exactly
 	// their combined row count.
-	wantLen := len(builtinProcs) + len(catalog.BuiltinProcs())
+	wantLen := len(pgProcInitdbViewRows)
 	if len(rows) != wantLen {
 		t.Errorf("rows = %d, want %d (only built-in stubs)", len(rows), wantLen)
 	}
@@ -53,12 +53,12 @@ func TestPgProcViewRendersRoutine(t *testing.T) {
 	rows := tbl.VirtualRows()
 	// Built-in stubs + 1 user routine + the hand-curated catalog.BuiltinProcs()
 	// table (appended after user routines).
-	wantLen := len(builtinProcs) + 1 + len(catalog.BuiltinProcs())
+	wantLen := len(pgProcInitdbViewRows) + 1
 	if len(rows) != wantLen {
 		t.Fatalf("rows = %d, want %d", len(rows), wantLen)
 	}
 	// User routine is appended after built-ins, before catalog.BuiltinProcs().
-	row := rows[len(builtinProcs)]
+	row := rows[len(pgProcInitdbViewRows)]
 	// Columns: oid, proname, pronamespace, prolang, prorettype,
 	//          proargtypes, pronargs, proacl, proowner, prosrc.
 	if row[1] != "add" {
@@ -126,7 +126,7 @@ func TestPgProcViewRendersRoutineOwner(t *testing.T) {
 
 	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
 	rows := tbl.VirtualRows()
-	row := rows[len(builtinProcs)]
+	row := rows[len(pgProcInitdbViewRows)]
 	if row[8] != "16400" {
 		t.Errorf("proowner = %q, want 16400", row[8])
 	}
@@ -163,7 +163,7 @@ func TestPgProcViewRecordReturnType(t *testing.T) {
 	rows := tbl.VirtualRows()
 	// prorettype is column index 4.
 	const prorettype = 4
-	userRows := rows[len(builtinProcs):]
+	userRows := rows[len(pgProcInitdbViewRows):]
 	if userRows[0][1] != "ret_rec" || userRows[0][prorettype] != "2249" {
 		t.Errorf("ret_rec prorettype = %q, want 2249 (record OID)", userRows[0][prorettype])
 	}
@@ -203,13 +203,13 @@ func TestPgProcViewProretset(t *testing.T) {
 	rows := tbl.VirtualRows()
 	// proretset is the last column (index 15).
 	const proretset = 15
-	// Built-in stubs: never SRFs.
-	for i := range builtinProcs {
-		if rows[i][proretset] != "f" {
-			t.Errorf("built-in stub %q proretset = %q, want f", rows[i][1], rows[i][proretset])
+	// Built-in rows carry the PG 18.3 initdb value (M0149-0001h1a18).
+	for i := range pgProcInitdbViewRows {
+		if rows[i][proretset] != pgProcInitdbViewRows[i][proretset] {
+			t.Errorf("built-in %q proretset = %q, want %q", rows[i][1], rows[i][proretset], pgProcInitdbViewRows[i][proretset])
 		}
 	}
-	userRows := rows[len(builtinProcs):]
+	userRows := rows[len(pgProcInitdbViewRows):]
 	// Insertion order: gen (SETOF), scalar.
 	if userRows[0][1] != "gen" || userRows[0][proretset] != "t" {
 		t.Errorf("gen proretset = %q, want t", userRows[0][proretset])
@@ -241,8 +241,15 @@ func TestPgProcViewProbin(t *testing.T) {
 	rows := tbl.VirtualRows()
 	// probin is the last column (index 16), appended after proretset (15).
 	const probin = 16
-	for i := range rows {
-		if rows[i][probin] != "" {
+	// Built-in C conversion functions carry PG's $libdir path; every other
+	// row (built-in internal / SQL functions, user routines) has NULL.
+	for i := range pgProcInitdbViewRows {
+		if rows[i][probin] != pgProcInitdbViewRows[i][probin] {
+			t.Errorf("built-in %q probin = %q, want %q", rows[i][1], rows[i][probin], pgProcInitdbViewRows[i][probin])
+		}
+	}
+	for i := len(pgProcInitdbViewRows); i < len(rows); i++ {
+		if rows[i][probin] != "" && rows[i][probin] != catalog.VirtualNull { // either spelling is SQL NULL
 			t.Errorf("row %q probin = %q, want \"\" (NULL)", rows[i][1], rows[i][probin])
 		}
 	}
@@ -271,7 +278,7 @@ func TestPgProcViewProconfig(t *testing.T) {
 	// proconfig is the last column (index 17), appended after probin (16).
 	const proconfig = 17
 	for i := range rows {
-		if rows[i][proconfig] != "" {
+		if rows[i][proconfig] != "" && rows[i][proconfig] != catalog.VirtualNull { // either spelling is SQL NULL
 			t.Errorf("row %q proconfig = %q, want \"\" (NULL)", rows[i][1], rows[i][proconfig])
 		}
 	}
@@ -352,13 +359,13 @@ func TestPgProcViewProcost(t *testing.T) {
 	rows := tbl.VirtualRows()
 	// procost is the last column (index 18), appended after proconfig (17).
 	const procost = 18
-	// Built-in stubs are internal-language: cost 1.
-	for i := range builtinProcs {
-		if rows[i][procost] != "1" {
-			t.Errorf("built-in stub %q procost = %q, want 1", rows[i][1], rows[i][procost])
+	// Built-in rows carry the PG 18.3 initdb value (M0149-0001h1a18).
+	for i := range pgProcInitdbViewRows {
+		if rows[i][procost] != pgProcInitdbViewRows[i][procost] {
+			t.Errorf("built-in %q procost = %q, want %q", rows[i][1], rows[i][procost], pgProcInitdbViewRows[i][procost])
 		}
 	}
-	userRows := rows[len(builtinProcs):]
+	userRows := rows[len(pgProcInitdbViewRows):]
 	// Insertion order: plf (plpgsql → 100), cf (c → 1).
 	if userRows[0][1] != "plf" || userRows[0][procost] != "100" {
 		t.Errorf("plf procost = %q, want 100", userRows[0][procost])
@@ -400,13 +407,13 @@ func TestPgProcViewProrows(t *testing.T) {
 	rows := tbl.VirtualRows()
 	// prorows is the last column (index 19), appended after procost (18).
 	const prorows = 19
-	// Built-in stubs are never SRFs: 0.
-	for i := range builtinProcs {
-		if rows[i][prorows] != "0" {
-			t.Errorf("built-in stub %q prorows = %q, want 0", rows[i][1], rows[i][prorows])
+	// Built-in rows carry the PG 18.3 initdb value (M0149-0001h1a18).
+	for i := range pgProcInitdbViewRows {
+		if rows[i][prorows] != pgProcInitdbViewRows[i][prorows] {
+			t.Errorf("built-in %q prorows = %q, want %q", rows[i][1], rows[i][prorows], pgProcInitdbViewRows[i][prorows])
 		}
 	}
-	userRows := rows[len(builtinProcs):]
+	userRows := rows[len(pgProcInitdbViewRows):]
 	// Insertion order: gen (SETOF → 1000), scalar (→ 0).
 	if userRows[0][1] != "gen" || userRows[0][prorows] != "1000" {
 		t.Errorf("gen prorows = %q, want 1000", userRows[0][prorows])
@@ -438,7 +445,7 @@ func TestPgProcViewProtrftypes(t *testing.T) {
 	// protrftypes is the last column (index 20), appended after prorows (19).
 	const protrftypes = 20
 	for i := range rows {
-		if rows[i][protrftypes] != "" {
+		if rows[i][protrftypes] != "" && rows[i][protrftypes] != catalog.VirtualNull { // either spelling is SQL NULL
 			t.Errorf("row %q protrftypes = %q, want NULL (empty)", rows[i][1], rows[i][protrftypes])
 		}
 	}
@@ -465,20 +472,21 @@ func TestPgProcViewProparallel(t *testing.T) {
 	rows := tbl.VirtualRows()
 	// proparallel is the last column (index 21), appended after protrftypes (20).
 	const proparallel = 21
-	// Legacy builtin stubs + user routines default to "u" (unsafe, PG's CREATE
-	// FUNCTION default). The hand-curated catalog.BuiltinProcs() table (appended
-	// after user routines) instead carries PG's real pg_proc.h BKI_DEFAULT(s)
-	// for genuine built-ins, so it is excluded from this loop and checked below.
-	legacyRows := rows[:len(builtinProcs)+1]
-	for i := range legacyRows {
-		if legacyRows[i][proparallel] != "u" {
-			t.Errorf("row %q proparallel = %q, want u (unsafe)", legacyRows[i][1], legacyRows[i][proparallel])
+	// Built-in rows carry the PG 18.3 initdb value (M0149-0001h1a18); a user
+	// routine defaults to "u" (unsafe, PG's CREATE FUNCTION default).
+	nb := len(pgProcInitdbViewRows)
+	for i := 0; i < nb; i++ {
+		if rows[i][proparallel] != pgProcInitdbViewRows[i][proparallel] {
+			t.Errorf("built-in %q proparallel = %q, want %q", rows[i][1], rows[i][proparallel], pgProcInitdbViewRows[i][proparallel])
 		}
 	}
-	for _, row := range rows[len(builtinProcs)+1:] {
-		if row[proparallel] != "s" {
-			t.Errorf("built-in %q proparallel = %q, want s (safe, BKI_DEFAULT)", row[1], row[proparallel])
+	for _, row := range rows[nb:] {
+		if row[proparallel] != "u" {
+			t.Errorf("user row %q proparallel = %q, want u (unsafe)", row[1], row[proparallel])
 		}
+	}
+	if got := rows[nb][1]; got != "myfunc" {
+		t.Errorf("first user row = %q, want myfunc", got)
 	}
 }
 
@@ -518,9 +526,18 @@ func TestPgProcViewProsupport(t *testing.T) {
 	rows := tbl.VirtualRows()
 	// prosupport is the last column (index 22), appended after proparallel (21).
 	const prosupport = 22
-	for i := range rows {
+	// A user routine has no support function: "-" (regproc InvalidOid). The
+	// built-in rows carry the numeric OID from a PG 18.3 initdb ("0" when
+	// none), which the regproc-typed column renders as "-" or the name.
+	nb := len(pgProcInitdbViewRows)
+	for i := nb; i < len(rows); i++ {
 		if rows[i][prosupport] != "-" {
 			t.Errorf("row %q prosupport = %q, want - (regproc InvalidOid)", rows[i][1], rows[i][prosupport])
+		}
+	}
+	for i := 0; i < nb; i++ {
+		if rows[i][prosupport] != pgProcInitdbViewRows[i][prosupport] {
+			t.Errorf("built-in %q prosupport = %q, want %q", rows[i][1], rows[i][prosupport], pgProcInitdbViewRows[i][prosupport])
 		}
 	}
 }
@@ -602,7 +619,7 @@ func TestPgProcViewOrdering(t *testing.T) {
 	rows := tbl.VirtualRows()
 	// Built-in stubs + 3 user routines + the hand-curated catalog.BuiltinProcs()
 	// table (appended after user routines).
-	wantLen := len(builtinProcs) + 3 + len(catalog.BuiltinProcs())
+	wantLen := len(pgProcInitdbViewRows) + 3
 	if len(rows) != wantLen {
 		t.Fatalf("rows = %d, want %d", len(rows), wantLen)
 	}
@@ -610,7 +627,7 @@ func TestPgProcViewOrdering(t *testing.T) {
 	// order — user view rows are appended after built-ins in insertion order,
 	// before catalog.BuiltinProcs().
 	wantNames := []string{"zeta", "alpha", "mu"}
-	userRows := rows[len(builtinProcs) : len(builtinProcs)+3]
+	userRows := rows[len(pgProcInitdbViewRows) : len(pgProcInitdbViewRows)+3]
 	for i, want := range wantNames {
 		if userRows[i][1] != want {
 			t.Errorf("row %d proname = %q, want %q", i, userRows[i][1], want)
@@ -688,7 +705,7 @@ func TestPgProcViewIsPerDatabase(t *testing.T) {
 		}
 		return m
 	}
-	builtins := len(builtinProcs) + len(catalog.BuiltinProcs())
+	builtins := len(pgProcInitdbViewRows)
 	for _, c := range []struct {
 		label string
 		rows  [][]string

@@ -114,6 +114,13 @@ func TestPgTypeRowCanonicalTypcollation(t *testing.T) {
 		13292: 950, // sql_identifier
 		13299: 950, // _yes_or_no
 		13300: 950, // yes_or_no
+		// pg_type.dat declares these four internal-text types
+		// typcollation => 'default' (M0149-0001h1a15, measured on a PG 18.3
+		// initdb); their catalog COLUMNS stay attcollation C via genbki.
+		194:  100, // pg_node_tree
+		3361: 100, // pg_ndistinct
+		3402: 100, // pg_dependencies
+		5017: 100, // pg_mcv_list
 	}
 	for _, e := range pgTypeInitialEntries() {
 		row := pgTypeRow(e)
@@ -466,5 +473,50 @@ func TestPgTypeRowCanonicalTypelemTyparray(t *testing.T) {
 			t.Errorf("oid=%d: want {typelem,typarray,typsubscript}={%d,%d,%d}, got {%d,%d,%d}",
 				tc.oid, tc.elem, tc.array, tc.subscript, elem, array, subscript)
 		}
+	}
+}
+
+// TestPgTypeRowSupportProcsMatchInitdb pins the columns pgTypeRow now takes
+// from pg_type_support_generated.go (M0149-0001h1a15): every true array type
+// carries array_typanalyze (type_sanity's "array_typanalyze should be used
+// for all and only array types"), an array inherits its element's typmod I/O
+// (_bpchar: bpchartypmodin / bpchartypmodout), record's typarray is _record,
+// and the information_schema time_stamp domain keeps its typdefault.
+func TestPgTypeRowSupportProcsMatchInitdb(t *testing.T) {
+	const (
+		typarrayIdx   = 14
+		typmodinIdx   = 19
+		typmodoutIdx  = 20
+		typanalyzeIdx = 21
+		typdefaultIdx = 30
+	)
+	rows := map[uint32]executor.Row{}
+	for _, e := range pgTypeInitialEntries() {
+		rows[e.OID] = pgTypeRow(e)
+	}
+	check := func(oid uint32, idx int, want int64) {
+		t.Helper()
+		r, ok := rows[oid]
+		if !ok {
+			return // not in the bootstrap set
+		}
+		if r[idx].Int != want {
+			t.Errorf("oid=%d col %d = %d, want %d", oid, idx, r[idx].Int, want)
+		}
+	}
+	for oid, e := range pgTypeInitdbSupport {
+		if _, ok := rows[oid]; !ok {
+			continue
+		}
+		check(oid, typmodinIdx, int64(e.ModIn))
+		check(oid, typmodoutIdx, int64(e.ModOut))
+		check(oid, typanalyzeIdx, int64(e.Analyze))
+	}
+	check(1000, typanalyzeIdx, 3816) // _bool
+	check(1014, typmodinIdx, 2913)   // _bpchar
+	check(1014, typmodoutIdx, 2914)
+	check(2249, typarrayIdx, 2287) // record -> _record
+	if r, ok := rows[13298]; ok && r[typdefaultIdx].StringValue() != "CURRENT_TIMESTAMP(2)" {
+		t.Errorf("time_stamp typdefault = %v", r[typdefaultIdx])
 	}
 }

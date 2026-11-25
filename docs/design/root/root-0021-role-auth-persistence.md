@@ -279,3 +279,33 @@ derive exactly that count (parsed back out of the stored verifier via
 `auth.ParseSCRAMSecret`). Confirmed non-vacuous via `git stash` on
 `scram.go`/`role_ddl.go` (fails, both roles report 4096 regardless of the
 live GUC).
+
+## Follow-up \(2026-11-17, M0149-0001h1a5\): pg\_roles is the system\_views.sql view; bootstrap rows shaped like PG's
+
+- `pg_roles` was a four\-column stub \(oid, rolname, rolsuper, rolcanlogin,
+  typed text\). psql's `\du` / `\dg` select rolinherit, rolcreaterole,
+  rolconnlimit, rolvaliduntil and rolbypassrls by name, and failed with
+  "column r.rolinherit does not exist" for every user. It now has the view's
+  13 columns in system\_views.sql order, with PG's types \(bool, int4,
+  timestamptz, text\[\]\). Its rows project the live `pg_authid` rows:
+  - rolpassword is always `'********'`;
+  - rolconfig is NULL;
+  - oid comes last.
+
+  Callers that read it positionally were updated. pg\_dump selects
+  `oid, rolname` by name.
+- The initdb bootstrap rows \(OID 10 and the OS\-user row\) used to carry
+  rolcreatedb = false, an empty rolpassword and an epoch rolvaliduntil, which
+  kept HEAP\_HASNULL clear. psql therefore printed "Password valid until
+  1970\-01\-01" for the superuser. They now follow pg\_authid.dat:
+  - every privilege flag is true;
+  - rolpassword is NULL unless `--pwfile` supplies a verifier;
+  - rolvaliduntil is NULL, so the tuple carries a null bitmap \(t\_hoff 32\),
+    like the predefined\-role rows. A PG cold start on the data dir still
+    passes.
+
+  The catalog's own fallback for an unloaded `postgres` row takes the same
+  shape.
+- `VALID UNTIL '<literal>'` is normalised to timestamptz output text
+  \(`2030-01-01` → `2030-01-01 00:00:00+00`\) when the role DDL records it,
+  so the live row matches the heap\-reloaded one.

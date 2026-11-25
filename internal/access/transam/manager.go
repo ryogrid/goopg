@@ -62,6 +62,9 @@ type Manager struct {
 	xidgen    XidGen
 	procArray ProcArray
 
+	// twoPhase is the prepared-transaction registry (twophase_registry.go).
+	twoPhase twoPhaseRegistry
+
 	abortedMu   sync.RWMutex
 	abortedXIDs []storage.TransactionID
 
@@ -88,6 +91,9 @@ type Manager struct {
 	// installed by the server/initdb.Open recovery wiring via SetCLog. Read under
 	// abortedMu (cheap, already taken in captureSnapshot's neighbourhood).
 	clog *CLog
+	// inRecovery: hot-standby snapshots require a committed CLOG status
+	// (SetInRecovery). M0149-0012.
+	inRecovery atomic.Bool
 
 	xactMarkerMu sync.RWMutex
 	// The bool parameter is waitLocalFlush: true (every existing caller —
@@ -124,6 +130,11 @@ type Manager struct {
 	// (initdb.Open) via SetCatalogXminSource; nil keeps the pure in-memory v0
 	// behaviour. Read lock-free via atomic.Pointer on the hot prune path.
 	catalogXminSource atomic.Pointer[func() uint64]
+	// slotXminSource, when installed, returns the oldest data xmin any
+	// physical replication slot holds from a standby's hot_standby_feedback
+	// (0 = none). PG's procArray->replication_slot_xmin: it floors every xid
+	// horizon. M0149-0077i.
+	slotXminSource atomic.Pointer[func() uint64]
 
 	// WaitForXID uses waitMu + commitCond only.
 	waitMu     sync.Mutex
@@ -185,6 +196,12 @@ func (m *Manager) SetNextXID(x storage.TransactionID) {
 // committed XID, causing "xid >= Xmax → invisible" for every replayed tuple.
 func (m *Manager) ReplayXactCommit(xid storage.TransactionID) {
 	m.xidgen.SetNext(xid + 1)
+	// xact_redo_commit stamps the commit in clog (TransactionIdCommitTree),
+	// so a promoted standby's restart finds the primary's transactions
+	// committed rather than sweeping them to aborted. M0149-0010a.
+	if c := m.CLog(); c != nil {
+		_ = c.SetCommitted(xid)
+	}
 }
 
 // ReplayXactAbort is called by the standby's StreamReplayer when it applies a
@@ -193,6 +210,9 @@ func (m *Manager) ReplayXactCommit(xid storage.TransactionID) {
 // (so its heap tuples remain invisible to queries on the standby).
 func (m *Manager) ReplayXactAbort(xid storage.TransactionID) {
 	m.xidgen.SetNext(xid + 1)
+	if c := m.CLog(); c != nil {
+		_ = c.SetAborted(xid)
+	}
 	m.abortedMu.Lock()
 	m.abortedXIDs = insertSortedXID(m.abortedXIDs, xid)
 	m.abortedMu.Unlock()
@@ -222,6 +242,21 @@ func (m *Manager) SetCLog(c *CLog) {
 // SetCLog had no production caller at all for the whole of M0117..M0131, which
 // made the entire durable-abort visibility fallback dead code on every live
 // server (docs/design/0131-0027).
+// SetInRecovery marks the manager as serving a hot standby (true) or a
+// primary (false). Snapshots taken in recovery see a transaction only once
+// the commit log records its commit — the primary's in-progress xids are not
+// in this manager's own in-progress list, as PG's KnownAssignedXids are not
+// in its ProcArray (procarray.c). M0149-0012.
+func (m *Manager) SetInRecovery(on bool) { m.inRecovery.Store(on) }
+
+// CLog returns the manager's commit log, or nil when none is wired. The
+// standby's live catalog refresh reads catalog rows through it (M0149-0010a).
+func (m *Manager) CLog() *CLog {
+	m.abortedMu.RLock()
+	defer m.abortedMu.RUnlock()
+	return m.clog
+}
+
 func (m *Manager) HasCLog() bool {
 	m.abortedMu.RLock()
 	defer m.abortedMu.RUnlock()
@@ -241,6 +276,54 @@ func (m *Manager) SetCatalogXminSource(fn func() uint64) {
 		return
 	}
 	m.catalogXminSource.Store(&fn)
+}
+
+// SetReplicationSlotXminSource installs (or, with nil, clears) the hook that
+// returns the oldest physical-slot xmin (wal.Slots.MinXmin). OldestXmin and
+// ReplicationHorizons both honour it, as PG's ComputeXidHorizons honours
+// replication_slot_xmin. fn must be non-blocking.
+func (m *Manager) SetReplicationSlotXminSource(fn func() uint64) {
+	if fn == nil {
+		m.slotXminSource.Store(nil)
+		return
+	}
+	m.slotXminSource.Store(&fn)
+}
+
+// ReplicationHorizons is GetReplicationHorizons: the xmin a walreceiver
+// reports in hot_standby_feedback (the oldest xid any snapshot here or any
+// standby downstream of a slot here still needs — the data horizon without
+// the logical slots' catalog_xmin) and, separately, the logical slots'
+// catalog_xmin (0 when none). M0149-0077i.
+func (m *Manager) ReplicationHorizons() (xmin, catalogXmin storage.TransactionID) {
+	xmin = m.oldestDataXmin()
+	if src := m.catalogXminSource.Load(); src != nil {
+		catalogXmin = storage.TransactionID((*src)())
+	}
+	return xmin, catalogXmin
+}
+
+// oldestDataXmin is OldestXmin without the logical-slot catalog_xmin floor.
+func (m *Manager) oldestDataXmin() storage.TransactionID {
+	result := storage.TransactionID(m.xidgen.Peek())
+	for i := range m.procArray.slots {
+		s := &m.procArray.slots[i]
+		if s.inTxn.Load() == 0 {
+			continue
+		}
+		if xid := s.xid.Load(); xid != 0 && storage.TransactionID(xid) < result {
+			result = storage.TransactionID(xid)
+		}
+		if xmin := s.xmin.Load(); xmin != ^uint64(0) && storage.TransactionID(xmin) < result {
+			result = storage.TransactionID(xmin)
+		}
+	}
+	if src := m.slotXminSource.Load(); src != nil {
+		if sx := (*src)(); sx != 0 && storage.TransactionID(sx) < result {
+			result = storage.TransactionID(sx)
+		}
+	}
+	return result
 }
 
 // xidWarnAge is how many XIDs before uint32 overflow to emit a warning.
@@ -379,6 +462,9 @@ func (m *Manager) AssignXID(tx Transaction) (storage.TransactionID, error) {
 			"mvcc: database must be vacuumed within %d transactions to prevent XID wraparound",
 			^storage.TransactionID(0)-newXID)
 	}
+	if err := m.extendSubtrans(newXID); err != nil {
+		return 0, err
+	}
 	s.xid.Store(uint64(newXID))
 
 	// M0104-0002: stamp the new top-level XID onto the SSI
@@ -396,6 +482,17 @@ func (m *Manager) AssignXID(tx Transaction) (storage.TransactionID, error) {
 		m.ssiMu.Unlock()
 	}
 	return newXID, nil
+}
+
+// extendSubtrans is GetNewTransactionId's ExtendSUBTRANS call for a newly
+// allocated XID: the pg_subtrans page that will hold it exists before the
+// XID is used. M0149-0016c.
+func (m *Manager) extendSubtrans(xid storage.TransactionID) error {
+	sm := m.subxactMap.Load()
+	if sm == nil {
+		return nil
+	}
+	return sm.ExtendSubtrans(xid)
 }
 
 // FreshSnapshot captures a brand-new "latest" MVCC snapshot reflecting every
@@ -651,6 +748,9 @@ func (m *Manager) AllocateSubXid(parentXid storage.TransactionID) (storage.Trans
 			"mvcc: database must be vacuumed within %d transactions to prevent XID wraparound",
 			^storage.TransactionID(0)-subXid)
 	}
+	if err := m.extendSubtrans(subXid); err != nil {
+		return 0, err
+	}
 	// Register through RegisterSubXid (not addSubxactEntry directly) so the
 	// subxid→parent link lands in the persistent SubxactMap when one is attached
 	// (initdb.Open's SetSubxactMap, the real-server path). TopLevelXid / IsAborted
@@ -682,20 +782,9 @@ func (m *Manager) ActiveCount() int {
 // (b) the xmin of any active txn that has taken a snapshot
 // but not yet been assigned an XID.
 func (m *Manager) OldestXmin() storage.TransactionID {
-	result := storage.TransactionID(m.xidgen.Peek())
-	for i := range m.procArray.slots {
-		s := &m.procArray.slots[i]
-		// Skip idle slots — their zero xmin value would falsely pin VACUUM at 0.
-		if s.inTxn.Load() == 0 {
-			continue
-		}
-		if xid := s.xid.Load(); xid != 0 && storage.TransactionID(xid) < result {
-			result = storage.TransactionID(xid)
-		}
-		if xmin := s.xmin.Load(); xmin != ^uint64(0) && storage.TransactionID(xmin) < result {
-			result = storage.TransactionID(xmin)
-		}
-	}
+	// Active snapshots and xids, nextXID, and the physical slots' xmin
+	// (hot_standby_feedback, M0149-0077i).
+	result := m.oldestDataXmin()
 	// Hold the horizon back to the oldest catalog_xmin pinned by any active
 	// logical replication slot (0 = nothing pinned). A logical decoder rebuilds
 	// historic catalog snapshots from tuple versions at/after this xid; letting
@@ -1417,6 +1506,23 @@ func (m *Manager) captureSnapshot() Snapshot {
 			xmin = xid
 		}
 	}
+	// A hot standby's snapshot holds the prepared transactions replay knows
+	// about as running (KnownAssignedXids, which keeps prepared xacts until
+	// their COMMIT/ABORT PREPARED replays): once captured, the snapshot keeps
+	// them invisible even after the finish record later stamps clog — a
+	// REPEATABLE READ snapshot taken before COMMIT PREPARED replays must not
+	// start seeing its rows. M0149-0016a.
+	if m.inRecovery.Load() {
+		for _, x := range m.preparedRunningXIDs() {
+			if x >= xmax {
+				continue
+			}
+			inProgress = append(inProgress, x)
+			if x < xmin {
+				xmin = x
+			}
+		}
+	}
 	if len(inProgress) == 0 {
 		xmin = xmax
 	}
@@ -1441,6 +1547,7 @@ func (m *Manager) captureSnapshot() Snapshot {
 		InProgress:           inProgress,
 		Aborted:              aborted,
 		clog:                 clog,
+		inRecovery:           m.inRecovery.Load(),
 		PartitionDetachEpoch: CurrentPartitionDetachEpoch(),
 	}
 }

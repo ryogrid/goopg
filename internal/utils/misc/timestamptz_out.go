@@ -238,6 +238,9 @@ func appendZeroPad2(dst []byte, v int) []byte {
 	return strconv.AppendInt(dst, int64(v), 10)
 }
 
+// SessionLocation is the location named by the TimeZone setting zone.
+func SessionLocation(zone string) *time.Location { return sessionLocation(zone) }
+
 // FormatTimestampTZ renders a TIMESTAMPTZ value as PostgreSQL 18.3's
 // timestamptz_out does: convert the stored instant into the session's TimeZone,
 // format the local wall clock per the DateStyle (style, order) pair, then

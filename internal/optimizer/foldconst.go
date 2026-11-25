@@ -97,7 +97,7 @@ func FoldConstants(e Expr) Expr {
 		// it silently re-types the node as unknown downstream. M0119-0006.
 		// ArgWidth is likewise a plan-time overload-width stamp (to_hex's
 		// int4/int8 dispatch) that a clone must preserve. M0134-0070.
-		folded := &FuncCall{pos: x.pos, Name: x.Name, Args: foldedArgs, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, ArgWidth: x.ArgWidth}
+		folded := &FuncCall{pos: x.pos, Name: x.Name, Args: foldedArgs, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, Operator: x.Operator, ArgWidth: x.ArgWidth}
 		if out := simplifyConditionalCall(folded); out != nil {
 			return out
 		}
@@ -172,7 +172,69 @@ func foldQualConstants(e Expr) (out Expr, retErr error) {
 			}
 		}
 	}()
-	return FoldConstants(e), nil
+	return reduceQualConstArms(FoldConstants(e)), nil
+}
+
+// reduceQualConstArms is the constant-input handling of PG's
+// find_duplicate_ors in a WHERE qual (is_check = false; prepqual.c), which
+// canonicalize_qual applies after eval_const_expressions. In a qual NULL acts
+// as FALSE, so an OR drops its FALSE and NULL arms (a TRUE arm makes it
+// TRUE, no arm left makes it FALSE) and an AND drops its TRUE arms (a FALSE
+// or NULL arm makes it FALSE), at every AND / OR level from the top. Only the
+// qual's own truth value is used — NOT and other operators are not entered —
+// so the reduction cannot change which rows pass: `WHERE hundred = 3 OR
+// NULL` is `WHERE hundred = 3`, and the index can serve it as PG's does
+// (M0148-0001c3a2). An expression with nothing to reduce is returned as is.
+func reduceQualConstArms(e Expr) Expr {
+	b, ok := e.(*BinaryOp)
+	if !ok || (b.Op != parser.OpAnd && b.Op != parser.OpOr) {
+		return e
+	}
+	var arms []Expr
+	var walk func(x Expr)
+	walk = func(x Expr) {
+		if xb, ok := x.(*BinaryOp); ok && xb.Op == b.Op {
+			walk(xb.Left)
+			walk(xb.Right)
+			return
+		}
+		arms = append(arms, x)
+	}
+	walk(b)
+	changed := false
+	keep := make([]Expr, 0, len(arms))
+	for _, arm := range arms {
+		r := reduceQualConstArms(arm)
+		if r != arm {
+			changed = true
+		}
+		_, isNull := r.(*NullConst)
+		bc, isBool := r.(*BooleanConst)
+		switch {
+		case b.Op == parser.OpOr && (isNull || (isBool && !bc.Value)):
+			changed = true
+			continue
+		case b.Op == parser.OpOr && isBool && bc.Value:
+			return r
+		case b.Op == parser.OpAnd && isBool && bc.Value:
+			changed = true
+			continue
+		case b.Op == parser.OpAnd && (isNull || isBool):
+			return &BooleanConst{pos: b.pos, Value: false}
+		}
+		keep = append(keep, r)
+	}
+	if !changed {
+		return e
+	}
+	if len(keep) == 0 {
+		return &BooleanConst{pos: b.pos, Value: b.Op == parser.OpAnd}
+	}
+	out := keep[0]
+	for _, k := range keep[1:] {
+		out = &BinaryOp{pos: out.Pos(), Op: b.Op, Left: out, Right: k}
+	}
+	return out
 }
 
 func foldPlanConstantsInner(node Node) {
@@ -260,6 +322,9 @@ func foldPlanConstantsInner(node Node) {
 		if n.Step != nil {
 			n.Step = FoldConstants(n.Step)
 		}
+		if n.Zone != nil {
+			n.Zone = FoldConstants(n.Zone)
+		}
 	case *FromUnnest:
 		n.ArrExpr = FoldConstants(n.ArrExpr)
 	case *PgInputErrorInfo:
@@ -340,7 +405,8 @@ func tryFoldDateIntegerOp(pos int, op parser.OpCode, l, r Expr) Expr {
 			return asDate(t.AddDate(0, 0, days))
 		}
 		if t2, ok2 := dateLit(r); ok2 && op == parser.OpSub {
-			return &IntegerConst{pos: pos, Value: int64(t.Sub(t2) / (24 * time.Hour))}
+			// Whole seconds: time.Time.Sub saturates at 292 years.
+			return &IntegerConst{pos: pos, Value: (t.Unix() - t2.Unix()) / 86400}
 		}
 		return nil
 	}
@@ -492,6 +558,9 @@ func tryFoldBinaryOp(pos int, op parser.OpCode, l, r Expr) Expr {
 	if folded := tryFoldTemporalBinaryOp(pos, op, l, r); folded != nil {
 		return folded
 	}
+	if folded := simplifyBooleanEquality(pos, op, l, r); folded != nil {
+		return folded
+	}
 	// Boolean short-circuit for AND/OR regardless of the other operand's type.
 	switch op {
 	case parser.OpAnd:
@@ -543,6 +612,20 @@ func tryFoldBinaryOp(pos int, op parser.OpCode, l, r Expr) Expr {
 			}
 		}
 	}
+	// A NULL beside a non-constant arm of AND / OR does not decide the
+	// result: `x OR NULL` is TRUE wherever x is, `x AND NULL` FALSE wherever
+	// x is (three-valued logic; PG's simplify_or_arguments /
+	// simplify_and_arguments keep the NULL arm). Only the strict-operator
+	// propagation below may turn a NULL operand into a NULL result, and it
+	// used to catch these too — `WHERE hundred = 3 OR NULL` folded to
+	// `One-Time Filter: false` and returned no rows (M0148-0001c3a2).
+	if op == parser.OpAnd || op == parser.OpOr {
+		_, lNull := l.(*NullConst)
+		_, rNull := r.(*NullConst)
+		if lNull != rNull {
+			return nil
+		}
+	}
 
 	// `||` with an array operand is array_cat / array_append /
 	// array_prepend, which are not strict: a NULL operand acts as an empty
@@ -591,6 +674,12 @@ func tryFoldUnaryOp(pos int, op parser.OpCode, operand Expr) Expr {
 	case parser.OpNot:
 		if bc, ok := operand.(*BooleanConst); ok {
 			return &BooleanConst{pos: pos, Value: !bc.Value}
+		}
+		// negate_clause (eval_const_expressions' NOT arm): NOT (NOT x) is x
+		// in three-valued logic too; reached once simplifyBooleanEquality
+		// turns `NOT a = false` into NOT (NOT a) (M0148-0001c3a5 (d)).
+		if inner, ok := operand.(*UnaryOp); ok && inner.Op == parser.OpNot {
+			return inner.Operand
 		}
 	case parser.OpUnaryNeg:
 		if ic, ok := operand.(*IntegerConst); ok {
@@ -1167,7 +1256,7 @@ func simplifyConditionalCall(x *FuncCall) Expr {
 		if len(kept) == 0 || len(kept) == len(x.Args) {
 			return nil
 		}
-		return &FuncCall{pos: x.pos, Name: x.Name, Args: kept, ReturnType: x.ReturnType, ArgWidth: x.ArgWidth}
+		return &FuncCall{pos: x.pos, Name: x.Name, Args: kept, ReturnType: x.ReturnType, Operator: x.Operator, ArgWidth: x.ArgWidth}
 	case "nullif":
 		if len(x.Args) != 2 {
 			return nil
@@ -1268,3 +1357,34 @@ func exprIsArrayTyped(e Expr) bool {
 	name := strings.ToLower(t.Name)
 	return t.IsArray || strings.HasSuffix(name, "]") || strings.HasPrefix(name, "_")
 }
+
+// simplifyBooleanEquality is eval_const_expressions'
+// simplify_boolean_equality (clauses.c) over a boolean column: `b = true`
+// and `b <> false` become `b`, `b = false` and `b <> true` become `NOT b`
+// (either operand order). The forms agree on every input, NULL included.
+// PG prints the simplified clause (`Filter: b`) and prices it with
+// boolvarsel (M0148-0001c3a5 (d)). Only a bare boolean column is taken:
+// that is the shape whose type is known here without type inference.
+func simplifyBooleanEquality(pos int, op parser.OpCode, l, r Expr) Expr {
+	if op != parser.OpEq && op != parser.OpNe {
+		return nil
+	}
+	isBoolCol := func(e Expr) bool {
+		cr, ok := e.(*ColumnRef)
+		return ok && !cr.Type.IsArray && (strings.EqualFold(cr.Type.Name, "bool") || strings.EqualFold(cr.Type.Name, "boolean"))
+	}
+	var col Expr
+	var val bool
+	if c, ok := r.(*BooleanConst); ok && isBoolCol(l) {
+		col, val = l, c.Value
+	} else if c, ok := l.(*BooleanConst); ok && isBoolCol(r) {
+		col, val = r, c.Value
+	} else {
+		return nil
+	}
+	if (op == parser.OpEq) == val {
+		return col
+	}
+	return &UnaryOp{pos: pos, Op: parser.OpNot, Operand: col}
+}
+

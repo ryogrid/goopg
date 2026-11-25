@@ -639,6 +639,40 @@ func analyzeInsert(s *parser.InsertStmt, cat catalog.Catalog) error {
 	if len(s.Rows) == 0 {
 		return analyzeError(s.Pos(), "42601", "INSERT requires at least one row")
 	}
+	// transformInsertStmt (analyze.c): a single VALUES row is transformed as
+	// a target list, so a set-returning function in it expands to rows as
+	// in a SELECT list (ProjectSet) — `INSERT INTO t VALUES
+	// (generate_series(1, 3))` inserts three. goopg plans that row as
+	// INSERT … SELECT <row>. A multi-row VALUES list is a VALUES RTE, where
+	// set-returning functions are not allowed. A row with DEFAULT stays a
+	// VALUES row (SetToDefault has no SELECT-list form here). M0149-0023c.
+	if len(s.Rows) == 1 {
+		row := s.Rows[0]
+		hasSRF, hasDefault := false, false
+		for _, e := range row {
+			if _, ok := e.(*parser.DefaultMarker); ok {
+				hasDefault = true
+			} else if exprHasSRF(e, cat) {
+				hasSRF = true
+			}
+		}
+		if hasSRF && !hasDefault {
+			sel := parser.NewSelectStmt(s.Pos())
+			for _, e := range row {
+				sel.Targets = append(sel.Targets, parser.NewResTarget(e.Pos(), "", e))
+			}
+			s.Select, s.Rows = sel, nil
+			return analyzeSelectWithParent(s.Select, cat, cteCtx)
+		}
+	} else {
+		for _, row := range s.Rows {
+			for _, e := range row {
+				if exprHasSRF(e, cat) {
+					return analyzeError(e.Pos(), "0A000", "set-returning functions are not allowed in VALUES")
+				}
+			}
+		}
+	}
 
 	targetCols, err := resolveInsertTargetColumns(tbl, cat, s)
 	if err != nil {
@@ -651,6 +685,9 @@ func analyzeInsert(s *parser.InsertStmt, cat catalog.Catalog) error {
 		for i, e := range row {
 			typ, err := analyzeExpr(e, nil)
 			if err != nil {
+				return err
+			}
+			if err := castAssignmentError(e, targetCols[i].Name, targetCols[i].Type); err != nil {
 				return err
 			}
 			if !isAssignable(typ, targetCols[i].Type) {
@@ -814,6 +851,9 @@ func analyzeOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, cat cata
 		if err != nil {
 			return err
 		}
+		if err := castAssignmentError(assign.Expr, col.Name, col.Type); err != nil {
+			return err
+		}
 		if !isAssignable(typ, col.Type) {
 			return analyzeError(assign.Expr.Pos(), "42804",
 				fmt.Sprintf("column %q has type %q but expression has type %q", col.Name, col.Type.Name, typ.Name))
@@ -876,6 +916,9 @@ func analyzeUpdate(s *parser.UpdateStmt, cat catalog.Catalog) error {
 		}
 		typ, err := analyzeExpr(assign.Expr, ctx)
 		if err != nil {
+			return err
+		}
+		if err := castAssignmentError(assign.Expr, col.Name, col.Type); err != nil {
 			return err
 		}
 		if !isAssignable(typ, col.Type) {
@@ -1458,6 +1501,24 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		// is deferred to the planner's expandQualifiedStarToRowExpr.
 		return catalog.Type{Name: "record"}, nil
 	case *parser.CastExpr:
+		// transformTypeCast looks the target type up before it transforms
+		// the operand; typenameType rejects one that does not exist, for a
+		// `::` cast, CAST(... AS ...) and a typed literal alike.
+		// M0149-0001h1a85, widened from typed literals once domains over
+		// arrays and the information_schema domains resolved (h1a85a).
+		if TypeNameExists != nil {
+			if cat := scopeCatalog(ctx); cat != nil && !TypeNameExists(cat, x.Type.Schema, x.Type.Name) {
+				name := x.Type.Name // TypeNameToString keeps the "[]"
+				if x.Type.Schema != "" {
+					name = x.Type.Schema + "." + name
+				}
+				pos := x.TypeNamePos()
+				if pos == 0 {
+					pos = x.Pos()
+				}
+				return catalog.Type{}, analyzeError(pos, "42704", fmt.Sprintf("type \"%s\" does not exist", name))
+			}
+		}
 		// v0 treats `expr::type` as a no-op for type-checking. We
 		// recurse into the operand so analysis errors inside it
 		// surface, but report `unknown` for the cast result so
@@ -1525,6 +1586,12 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			}
 			return catalog.Type{Name: "bool"}, nil
 		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
+			if t, handled, err := timeArithResultType(x, leftTyp, rightTyp); handled {
+				return t, err
+			}
+			if t, handled, err := dateTimeLiteralResultType(x, leftTyp, rightTyp); handled {
+				return t, err
+			}
 			// timestamp/date ± interval → timestamp. TPC-H Q1
 			// (`l_shipdate <= date '...' - interval '90' day`)
 			// hits this; v0 returns the result as `timestamp`
@@ -1624,6 +1691,12 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			if strings.EqualFold(leftTyp.Name, "interval") && strings.EqualFold(rightTyp.Name, "date") && x.Op == parser.OpAdd {
 				return catalog.Type{Name: "timestamp"}, nil
 			}
+			// money arithmetic (pg_operator.dat: cash_pl / cash_mi /
+			// cash_mul_* / *_mul_cash / cash_div_* / cash_div_cash). The
+			// planner rewrites these into the cash_* builtins. M0149-0001k1.
+			if t, ok := moneyArithResultType(x.Op, leftTyp, rightTyp); ok {
+				return t, nil
+			}
 			if !isNumericLike(leftTyp) || !isNumericLike(rightTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires numeric operands", x.Op))
 			}
@@ -1663,6 +1736,23 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				(isJSONB(rightTyp) && isUnknownType(leftTyp)) {
 				return catalog.Type{Name: "jsonb"}, nil
 			}
+			// bit || bit is bitcat (pg_operator 1683, result bit varying);
+			// an unknown literal beside a bit string resolves to it.
+			// M0149-0001h1a1.
+			isBits := func(t catalog.Type) bool {
+				if t.IsArray {
+					return false
+				}
+				switch strings.ToLower(t.Name) {
+				case "bit", "varbit", "bit varying":
+					return true
+				}
+				return false
+			}
+			if (isBits(leftTyp) && (isBits(rightTyp) || isUnknownType(rightTyp))) ||
+				(isBits(rightTyp) && isUnknownType(leftTyp)) {
+				return catalog.Type{Name: "varbit"}, nil
+			}
 			// Require at least one string-like (or unknown) operand.
 			// When one side is non-string but the other is string-like,
 			// PostgreSQL implicitly casts the non-string side to text
@@ -1695,6 +1785,11 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		if x.Over != nil {
 			return analyzeWindowFuncCall(x, ctx)
 		}
+		if strings.EqualFold(x.Name.Name, "coalesce") && x.Name.Schema == "" {
+			if pos, ok := lastSRFPos(x.Args, scopeCatalog(ctx)); ok {
+				return catalog.Type{}, srfNotAllowed(pos, "COALESCE")
+			}
+		}
 		for _, a := range x.Args {
 			if _, err := analyzeExpr(a, ctx); err != nil {
 				return catalog.Type{}, err
@@ -1726,7 +1821,7 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			if err != nil {
 				return catalog.Type{}, err
 			}
-			if !isNumericLike(argTyp) {
+			if !isNumericLike(argTyp) && !isIntervalType(argTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", "sum() argument must be numeric")
 			}
 			if argTyp.Name == "unknown" {
@@ -1770,6 +1865,17 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		}
 		if _, err := analyzeExpr(x.Index, ctx); err != nil {
 			return catalog.Type{}, err
+		}
+		// `a[2][1]` is ONE SubscriptingRef with two subscripts to PG
+		// (transformContainerSubscripts): every subscript of a plain
+		// element fetch indexes one dimension of the same array, and the
+		// result is its element type. goopg nests the subscripts, so the
+		// inner one already typed the element; the outer one keeps it
+		// (M0149-0001h1a78b).
+		if inner, ok := x.Base.(*parser.ArraySubscriptExpr); ok && !inner.IsSlice && !baseTyp.IsArray && !strings.HasSuffix(baseTyp.Name, "[]") && !isUnknownType(baseTyp) {
+			if bt, err := analyzeExpr(inner.Base, ctx); err == nil && (bt.IsArray || strings.HasSuffix(bt.Name, "[]")) {
+				return baseTyp, nil
+			}
 		}
 		// Infer element type from array type (strip trailing []).
 		if strings.HasSuffix(baseTyp.Name, "[]") {
@@ -1837,12 +1943,15 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		// errors and return a generic text[] type. The planner's resolveExpr
 		// converts this to FuncCall{Name:"array_construct"} which the executor
 		// evaluates as a {v1,v2,...} text representation. M0097-0065.
+		elemTypes := make([]catalog.Type, 0, len(x.Elements))
 		for _, el := range x.Elements {
-			if _, err := analyzeExpr(el, ctx); err != nil {
+			t, err := analyzeExpr(el, ctx)
+			if err != nil {
 				return catalog.Type{}, err
 			}
+			elemTypes = append(elemTypes, t)
 		}
-		return catalog.Type{Name: "text[]"}, nil
+		return arrayConstructorType(elemTypes), nil
 	default:
 		return catalog.Type{}, analyzeError(e.Pos(), "0A000", fmt.Sprintf("unsupported expression %T", e))
 	}
@@ -1913,7 +2022,7 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 		case "count":
 			retType = catalog.Type{Name: "int8"}
 		case "sum":
-			if !isNumericLike(argTyp) {
+			if !isNumericLike(argTyp) && !isIntervalType(argTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", "sum() argument must be numeric")
 			}
 			if argTyp.Name == "unknown" {
@@ -1922,10 +2031,13 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 				retType = argTyp
 			}
 		case "avg":
-			if !isNumericLike(argTyp) {
+			if !isNumericLike(argTyp) && !isIntervalType(argTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", "avg() argument must be numeric")
 			}
 			switch strings.ToLower(argTyp.Name) {
+			case "interval":
+				// interval_avg returns interval (pg_aggregate.dat). M0149-0001h1a79.
+				retType = argTyp
 			case "float4", "float8", "real", "double precision", "double", "float":
 				retType = catalog.Type{Name: "float8"}
 			default:
@@ -2490,6 +2602,9 @@ func userFuncColumns(cat catalog.Catalog, tf *parser.TableFuncRef, alias string,
 		"regexp_split_to_table", "generate_subscripts":
 		return nil
 	}
+	if _, ok := catalog.LookupBuiltinSRFColumns(tf.Name); ok {
+		return nil
+	}
 	rs := cat.Routines()
 	if rs == nil {
 		return nil
@@ -2503,6 +2618,11 @@ func userFuncColumns(cat catalog.Catalog, tf *parser.TableFuncRef, alias string,
 // tableFuncBaseColumns dispatches on function name for tableFuncColumns,
 // before any WITH ORDINALITY column is appended.
 func tableFuncBaseColumns(tf *parser.TableFuncRef, alias string, colAliases []string) []catalog.Column {
+	// Built-in table functions planned as optimizer.BuiltinSRFScan share
+	// their column list with the planner (M0149-0016c).
+	if bc, ok := catalog.LookupBuiltinSRFColumns(tf.Name); ok {
+		return bc.Columns(alias, colAliases)
+	}
 	switch strings.ToLower(tf.Name) {
 	case "pg_get_publication_tables":
 		names := []string{"relid", "attrs", "qual"}
@@ -2576,6 +2696,41 @@ func tableFuncBaseColumns(tf *parser.TableFuncRef, alias string, colAliases []st
 		// with pg_catalog.pg_sequence. DU-002 slice 32 (M0110-0001).
 		names := []string{"last_value", "is_called"}
 		types := []string{"int8", "bool"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
+	case "pg_backup_stop":
+		// pg_backup_stop([wait_for_archive]) → (lsn pg_lsn, labelfile text,
+		// spcmapfile text), its OUT parameters (pg_proc.dat). Mirrors the
+		// planner's planRecordFuncScan arm. M0149-0021.
+		names := []string{"lsn", "labelfile", "spcmapfile"}
+		types := []string{"pg_lsn", "text", "text"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
+	case "pg_control_checkpoint":
+		// pg_control_checkpoint() → pg_controldata's checkpoint fields
+		// (misc/pg_controldata.c). Mirrors planPgControlCheckpoint. M0149-0076.
+		names := []string{"checkpoint_lsn", "redo_lsn", "redo_wal_file", "timeline_id",
+			"prev_timeline_id", "full_page_writes", "next_xid", "next_oid", "next_multixact_id", "next_multi_offset",
+			"oldest_xid", "oldest_xid_dbid", "oldest_active_xid", "oldest_multi_xid", "oldest_multi_dbid",
+			"oldest_commit_ts_xid", "newest_commit_ts_xid", "checkpoint_time"}
+		types := []string{"pg_lsn", "pg_lsn", "text", "int4", "int4", "bool", "text", "oid",
+			"xid", "xid", "xid", "oid", "xid", "xid", "oid", "xid", "xid", "timestamptz"}
 		for i := range names {
 			if i < len(colAliases) && colAliases[i] != "" {
 				names[i] = colAliases[i]
@@ -3623,6 +3778,9 @@ func isComparable(left, right catalog.Type) bool {
 // it assignable to any column). Real type unification (numeric
 // promotion, text/varchar coalescing) waits on the type system.
 func analyzeCaseExpr(x *parser.CaseExpr, ctx *scope) (catalog.Type, error) {
+	if err := caseSRFPlacement(x, ctx); err != nil {
+		return catalog.Type{}, err
+	}
 	// Operand of the simple form just needs to be a valid
 	// expression; type-checking the comparison is deferred until
 	// the type system can do real coercions.
@@ -3705,6 +3863,22 @@ func isAssignable(src, dst catalog.Type) bool {
 	}
 	if strings.EqualFold(src.Name, dst.Name) {
 		return true
+	}
+	// pg_cast date / timestamp / timestamptz inter-convert (implicit or
+	// assignment), and timestamp(tz) → time is an assignment cast. The
+	// analyzer types a `::date` cast as date, so date → timestamp needs this.
+	// M0149-0001k5a.
+	if sf, df := castFamily(src.Name), castFamily(dst.Name); sf == "datetime" && (df == "datetime" ||
+		(df == "time" && !strings.EqualFold(src.Name, "date"))) {
+		return true
+	}
+	// pg_cast assignment casts into money: numeric_cash, int4_cash and
+	// int8_cash (castcontext 'a'). int2 has no direct cast. M0149-0001k5.
+	if strings.EqualFold(dst.Name, "money") && !dst.IsArray {
+		switch strings.ToLower(src.Name) {
+		case "numeric", "decimal", "int4", "int", "integer", "int8", "bigint":
+			return true
+		}
 	}
 	if isNumericTypeName(src.Name) && isNumericTypeName(dst.Name) {
 		return true
@@ -3927,3 +4101,398 @@ func pgDisplayTypeName(name string) string {
 		return name
 	}
 }
+
+// moneyArithResultType is PG's money operator table: money ± money → money,
+// money × / ÷ a number → money, a number × money → money, money ÷ money →
+// float8. A bare literal operand (unknown) on the other side of + / - is
+// resolved to money, as PG resolves it. M0149-0001k1.
+func moneyArithResultType(op parser.OpCode, l, r catalog.Type) (catalog.Type, bool) {
+	lm, rm := strings.EqualFold(l.Name, "money") && !l.IsArray, strings.EqualFold(r.Name, "money") && !r.IsArray
+	if !lm && !rm {
+		return catalog.Type{}, false
+	}
+	money := catalog.Type{Name: "money"}
+	switch op {
+	case parser.OpAdd, parser.OpSub:
+		if (lm || isUnknownType(l)) && (rm || isUnknownType(r)) {
+			return money, true
+		}
+	case parser.OpMul:
+		if (lm && isNumericLike(r) && !strings.EqualFold(r.Name, "money")) || (rm && isNumericLike(l) && !strings.EqualFold(l.Name, "money")) {
+			return money, true
+		}
+	case parser.OpDiv:
+		if lm && rm {
+			return catalog.Type{Name: "float8"}, true
+		}
+		if lm && isNumericLike(r) {
+			return money, true
+		}
+	}
+	return catalog.Type{}, false
+}
+
+// timeArithResultType types + and - when an operand is time or timetz. The
+// planner applies the same rules in timeArithCall.
+func timeArithResultType(x *parser.BinaryOp, l, r catalog.Type) (catalog.Type, bool, error) {
+	kind := func(e parser.Expr, t catalog.Type) string {
+		if t.IsArray {
+			return ""
+		}
+		if isUnknownType(t) {
+			if isUntypedLiteral(e) {
+				return "unknown"
+			}
+			return ""
+		}
+		return strings.ToLower(t.Name)
+	}
+	// analyzeExpr reports most casts as unknown, but an operand cast to a
+	// date/time type is typed for operator resolution.
+	operand := func(e parser.Expr, t catalog.Type) string {
+		if c, ok := e.(*parser.CastExpr); ok {
+			switch n := strings.ToLower(c.Type.Name); n {
+			case "time", "timetz", "timestamp", "timestamptz", "interval":
+				return n
+			}
+		}
+		if _, ok := e.(*parser.IntegerConst); ok {
+			return "int4"
+		}
+		return kind(e, t)
+	}
+	lk, rk := operand(x.Left, l), operand(x.Right, r)
+	result, status := parser.ResolveTimeOperator(x.Op, lk, rk)
+	switch status {
+	case parser.TimeOperatorNone:
+		return catalog.Type{}, false, nil
+	case parser.TimeOperatorFound:
+		return catalog.Type{Name: result}, true, nil
+	}
+	code, message, hint := parser.TimeOperatorError(status, x.Op, lk, rk)
+	ae := analyzeError(x.Pos(), code, message)
+	ae.Hint = hint
+	return catalog.Type{}, true, ae
+}
+
+// isUntypedLiteral reports whether e is a string literal or NULL, the operands
+// PG types as unknown.
+func isUntypedLiteral(e parser.Expr) bool {
+	switch e.(type) {
+	case *parser.StringConst, *parser.NullConst:
+		return true
+	}
+	return false
+}
+
+// dateTimeLiteralResultType types the operators on timestamp, timestamptz, date
+// and interval with an untyped literal, and interval times or divided by a
+// number. The planner applies the same rules in dateTimeLiteralCall.
+func dateTimeLiteralResultType(x *parser.BinaryOp, l, r catalog.Type) (catalog.Type, bool, error) {
+	name := func(e parser.Expr, t catalog.Type) string {
+		if c, ok := e.(*parser.CastExpr); ok {
+			// analyzeExpr types most casts as unknown; the target is known.
+			switch n := strings.ToLower(c.Type.Name); n {
+			case "timestamp", "timestamptz", "interval", "date",
+				"int2", "int4", "int8", "numeric", "float4", "float8":
+				return n
+			}
+		}
+		if _, ok := e.(*parser.IntegerConst); ok {
+			return "int4"
+		}
+		if t.IsArray {
+			return ""
+		}
+		if isUnknownType(t) {
+			// Only a literal is PG's unknown; any other untyped
+			// expression is a type the analyzer does not track.
+			if isUntypedLiteral(e) {
+				return "unknown"
+			}
+			return ""
+		}
+		return strings.ToLower(t.Name)
+	}
+	kind := func(n string) string {
+		switch n {
+		case "int2", "int4", "int8", "numeric", "float4", "float8":
+			return "number"
+		}
+		return n
+	}
+	ln, rn := name(x.Left, l), name(x.Right, r)
+	result, _, status := parser.ResolveDateTimeLiteralOperator(x.Op, kind(ln), kind(rn))
+	switch status {
+	case parser.TimeOperatorNone:
+		return catalog.Type{}, false, nil
+	case parser.TimeOperatorFound:
+		return catalog.Type{Name: result}, true, nil
+	}
+	code, message, hint := parser.TimeOperatorError(status, x.Op, ln, rn)
+	ae := analyzeError(x.Pos(), code, message)
+	ae.Hint = hint
+	return catalog.Type{}, true, ae
+}
+
+// castFamily classifies a built-in type for castAssignmentError. "" means
+// the type is outside the modelled set, which never rejects.
+func castFamily(name string) string {
+	switch strings.ToLower(name) {
+	case "int2", "smallint", "int4", "int", "integer", "int8", "bigint",
+		"float4", "real", "float8", "double precision", "float", "numeric", "decimal":
+		return "number"
+	case "money":
+		return "money"
+	case "bool", "boolean":
+		return "bool"
+	case "date", "timestamp", "timestamp without time zone", "timestamptz", "timestamp with time zone":
+		return "datetime"
+	case "time", "time without time zone", "timetz", "time with time zone":
+		return "time"
+	case "text", "varchar", "character varying", "bpchar", "char", "character", "name":
+		return "string"
+	}
+	return ""
+}
+
+// pgTypeDisplayName is format_type's spelling for the modelled types.
+func pgTypeDisplayName(name string) string {
+	switch strings.ToLower(name) {
+	case "int2", "smallint":
+		return "smallint"
+	case "int4", "int", "integer":
+		return "integer"
+	case "int8", "bigint":
+		return "bigint"
+	case "float4", "real":
+		return "real"
+	case "float8", "double precision", "float":
+		return "double precision"
+	case "decimal":
+		return "numeric"
+	case "bool":
+		return "boolean"
+	case "timestamp":
+		return "timestamp without time zone"
+	case "timestamptz":
+		return "timestamp with time zone"
+	case "time":
+		return "time without time zone"
+	case "timetz":
+		return "time with time zone"
+	case "varchar":
+		return "character varying"
+	case "bpchar", "char":
+		return "character"
+	}
+	return strings.ToLower(name)
+}
+
+// castAssignmentError rejects an explicit cast written as an INSERT / UPDATE
+// value when PG has no assignment coercion from the cast's type to the
+// column's (parse_target.c transformAssignedExpr → coerce_to_target_type
+// fails: 42804 "column … is of type … but expression is of type …" with
+// HINT "You will need to rewrite or cast the expression."). The analyzer
+// types every cast as unknown (see analyzeExpr), so without this an
+// `x::float8` reached a money / date / bool column and either stored or
+// failed later with a non-PG error. Only pairs inside castFamily are judged,
+// per pg_cast's assignment entries:
+//   - numbers inter-convert; numeric / int4 / int8 → money (not float or
+//     int2);
+//   - date ↔ timestamp(tz), timestamp(tz) → time;
+//   - anything → a string type (automatic I/O cast);
+//   - nothing else crosses families.
+//
+// M0149-0001k5a.
+func castAssignmentError(e parser.Expr, colName string, colType catalog.Type) error {
+	ce, ok := e.(*parser.CastExpr)
+	if !ok || colType.IsArray || strings.HasSuffix(ce.Type.Name, "[]") {
+		return nil
+	}
+	if ce.Type.Schema != "" && !strings.EqualFold(ce.Type.Schema, "pg_catalog") {
+		return nil
+	}
+	src, dst := strings.ToLower(ce.Type.Name), strings.ToLower(colType.Name)
+	sf, df := castFamily(src), castFamily(dst)
+	if sf == "" || df == "" || sf == df || df == "string" {
+		return nil
+	}
+	switch {
+	case df == "money" && sf == "number":
+		switch src {
+		case "numeric", "decimal", "int4", "int", "integer", "int8", "bigint":
+			return nil
+		}
+	case df == "time" && sf == "datetime" && src != "date":
+		return nil
+	}
+	return &AnalyzeError{Pos: ce.Operand.Pos(), Code: "42804",
+		Message: fmt.Sprintf("column \"%s\" is of type %s but expression is of type %s", colName, pgTypeDisplayName(dst), pgTypeDisplayName(src)),
+		Hint:    "You will need to rewrite or cast the expression."}
+}
+
+func scopeCatalog(ctx *scope) catalog.Catalog {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.cat
+}
+
+// srfNotAllowed is the error transformCaseExpr and transformCoalesceExpr
+// (parse_expr.c) raise when a set-returning function appears inside them.
+// M0149-0001h1a78.
+func srfNotAllowed(pos int, construct string) error {
+	return analyzeErrorWithHint(pos, "0A000", "set-returning functions are not allowed in "+construct,
+		"You might be able to move the set-returning function into a LATERAL FROM item.")
+}
+
+// caseSRFPlacement applies transformCaseExpr's two rules: a WHEN condition
+// that returns a set fails coerce_to_boolean, and any other set-returning call
+// in the CASE is rejected at the last one transformed (p_last_srf).
+func caseSRFPlacement(x *parser.CaseExpr, ctx *scope) error {
+	cat := scopeCatalog(ctx)
+	for _, w := range x.Whens {
+		if exprHasSRF(w.When, cat) {
+			return analyzeError(leftmostPos(w.When), "42804", "argument of CASE/WHEN must not return a set")
+		}
+	}
+	var parts []parser.Expr
+	if x.Operand != nil {
+		parts = append(parts, x.Operand)
+	}
+	for _, w := range x.Whens {
+		parts = append(parts, w.When, w.Then)
+	}
+	if x.Else != nil {
+		parts = append(parts, x.Else)
+	}
+	if pos, ok := lastSRFPos(parts, cat); ok {
+		return srfNotAllowed(pos, "CASE")
+	}
+	return nil
+}
+
+// leftmostPos is exprLocation for an operator expression: the leftmost of its
+// operands' positions.
+func leftmostPos(e parser.Expr) int {
+	for {
+		b, ok := e.(*parser.BinaryOp)
+		if !ok {
+			return e.Pos()
+		}
+		e = b.Left
+	}
+}
+
+// lastSRFPos is the position of the last set-returning call in transform
+// order (arguments before the call itself) among exprs.
+func lastSRFPos(exprs []parser.Expr, cat catalog.Catalog) (int, bool) {
+	pos, found := 0, false
+	var walk func(e parser.Expr)
+	walk = func(e parser.Expr) {
+		if e == nil || !exprHasSRF(e, cat) {
+			return
+		}
+		switch x := e.(type) {
+		case *parser.BinaryOp:
+			walk(x.Left)
+			walk(x.Right)
+		case *parser.UnaryOp:
+			walk(x.Operand)
+		case *parser.CastExpr:
+			walk(x.Operand)
+		case *parser.CaseExpr:
+			walk(x.Operand)
+			for _, w := range x.Whens {
+				walk(w.When)
+				walk(w.Then)
+			}
+			walk(x.Else)
+		case *parser.FuncCall:
+			for _, a := range x.Args {
+				walk(a)
+			}
+			nested := false
+			for _, a := range x.Args {
+				nested = nested || exprHasSRF(a, cat)
+			}
+			if !nested || isSRFCallName(x, cat) {
+				pos, found = x.Pos(), true
+			}
+		default:
+			pos, found = e.Pos(), true
+		}
+	}
+	for _, e := range exprs {
+		walk(e)
+	}
+	return pos, found
+}
+
+func isSRFCallName(x *parser.FuncCall, cat catalog.Catalog) bool {
+	if builtinSRFNames[strings.ToLower(x.Name.Name)] {
+		return true
+	}
+	if cat != nil {
+		if rs := cat.Routines(); rs != nil {
+			for _, r := range rs.LookupByName(x.Name) {
+				if r.ReturnsSet {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+
+// arrayConstructorType is the type transformArrayExpr (parse_expr.c) gives
+// ARRAY[e1, e2, ...]: the array of the elements' common type
+// (select_common_type), with unknown literals resolving to text. Numeric
+// elements promote along the numeric lattice and an element that is itself
+// an array makes a multidimensional array of the same type. Anything this
+// does not settle keeps the analyzer's earlier text[], so that a subscript
+// over ARRAY[1, 2] types as int4 and `(ARRAY[1, 2])[1] + 1` passes the
+// arithmetic check (M0149-0001h1a78b).
+func arrayConstructorType(elems []catalog.Type) catalog.Type {
+	fallback := catalog.Type{Name: "text[]"}
+	var common catalog.Type
+	for _, t := range elems {
+		if isUnknownType(t) || t.Name == "" {
+			continue
+		}
+		if common.Name == "" {
+			common = t
+			continue
+		}
+		if strings.EqualFold(common.Name, t.Name) && common.IsArray == t.IsArray {
+			continue
+		}
+		if isNumericLike(common) && isNumericLike(t) && !common.IsArray && !t.IsArray {
+			if p := PromoteNumericType(common, t); p.Name != "" {
+				common = p
+				continue
+			}
+		}
+		return fallback
+	}
+	if common.Name == "" {
+		return fallback
+	}
+	if common.IsArray || strings.HasSuffix(common.Name, "[]") {
+		return common
+	}
+	return catalog.Type{Name: strings.ToLower(common.Name) + "[]"}
+}
+
+// isIntervalType reports an interval (not interval[]) type: sum and avg take
+// one (interval_accum / interval_sum / interval_avg). M0149-0001h1a79.
+func isIntervalType(t catalog.Type) bool {
+	return strings.EqualFold(t.Name, "interval") && !t.IsArray
+}
+
+// TypeNameExists reports whether a type name resolves in the catalog
+// (typenameType); the executor registers its regtype resolver. nil skips the
+// check. M0149-0001h1a85.
+var TypeNameExists func(cat catalog.Catalog, schema, name string) bool

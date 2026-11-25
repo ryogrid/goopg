@@ -2,6 +2,7 @@ package transam
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -85,6 +86,18 @@ func (m *SubxactMap) SetFsyncDisabled(disabled bool) {
 	if slru != nil {
 		slru.fsyncDisabled.Store(disabled)
 	}
+}
+
+// ExtendSubtrans is ExtendSUBTRANS for the attached SLRU (see
+// SubtransSLRU.ExtendForXID); without persistence it does nothing.
+func (m *SubxactMap) ExtendSubtrans(newestXact storage.TransactionID) error {
+	m.mu.RLock()
+	slru := m.slru
+	m.mu.RUnlock()
+	if slru == nil {
+		return nil
+	}
+	return slru.ExtendForXID(newestXact)
 }
 
 // RestoreFromSLRU reloads every persisted parent link from the on-disk
@@ -523,6 +536,20 @@ func (m *Manager) MarkSubxactAborted(subxid storage.TransactionID) {
 	} else {
 		m.markSubxactAborted(subxid)
 	}
+	// RecordTransactionAbort(isSubXact): ROLLBACK TO writes an abort record
+	// for the subtransaction (and its children) and stamps it aborted in
+	// clog, unflushed. Without it the rolled-back subxid had no durable
+	// status, and on restart the catalog reload treated the rows it had
+	// superseded as deleted: a table altered and rolled back inside a
+	// SAVEPOINT disappeared. M0149-0006.
+	if subxid != storage.InvalidTransactionID {
+		m.xactMarkerMu.RLock()
+		hook := m.xactMarker
+		m.xactMarkerMu.RUnlock()
+		if hook != nil {
+			_ = hook(subxid, XactAbort, false)
+		}
+	}
 	m.waitMu.Lock()
 	m.commitCond.Broadcast()
 	m.waitMu.Unlock()
@@ -556,13 +583,24 @@ func (m *Manager) TopLevelXid(xid storage.TransactionID) storage.TransactionID {
 
 // IsAborted reports whether xid was individually rolled back.
 func (m *Manager) IsAborted(xid storage.TransactionID) bool {
+	var v bool
 	if sm := m.attachedSubxactMap(); sm != nil {
-		return sm.IsAborted(xid)
+		v = sm.IsAborted(xid)
+	} else {
+		m.subxactMu.RLock()
+		v = m.subxactAborted[xid]
+		m.subxactMu.RUnlock()
 	}
-	m.subxactMu.RLock()
-	v := m.subxactAborted[xid]
-	m.subxactMu.RUnlock()
-	return v
+	if v {
+		return true
+	}
+	// The rolled-back set lives in memory, but the parent links survive a
+	// restart (pg_subtrans). After a crash, clog is the authority, as in
+	// TransactionIdDidCommit: a subtransaction whose status is aborted —
+	// stamped by its abort record or by the startup sweep of XIDs that never
+	// committed — stays rolled back instead of resolving to its committed
+	// parent. M0149-0006.
+	return m.clog != nil && m.clog.GetStatus(xid) == TxnStatusAborted
 }
 
 // IsSubxact reports whether xid is a registered subxact XID.
@@ -607,4 +645,60 @@ type subxactFields struct {
 // wiring (initdb.Open), after the map has been restored via RestoreFromSLRU.
 func (m *Manager) SetSubxactMap(sm *SubxactMap) {
 	m.subxactMap.Store(sm)
+}
+
+// SubxidsOf lists the subtransaction XIDs whose top-level transaction is
+// top, for its commit or abort record (RecordTransactionCommit /
+// RecordTransactionAbort list the transaction's children). committedOnly
+// omits a subtransaction rolled back on its own or under a rolled-back
+// ancestor: it stays aborted, and only the children that commit with top are
+// listed in its commit record. Replay stamps the listed XIDs with the record's
+// outcome (xact_redo_commit's TransactionIdCommitTree). M0149-0006.
+func (m *Manager) SubxidsOf(top storage.TransactionID, committedOnly bool) []storage.TransactionID {
+	var parents map[storage.TransactionID]storage.TransactionID
+	var aborted func(storage.TransactionID) bool
+	if sm := m.attachedSubxactMap(); sm != nil {
+		sm.mu.RLock()
+		parents = make(map[storage.TransactionID]storage.TransactionID, len(sm.parents))
+		for k, v := range sm.parents {
+			parents[k] = v
+		}
+		ab := make(map[storage.TransactionID]bool, len(sm.aborted))
+		for k, v := range sm.aborted {
+			ab[k] = v
+		}
+		sm.mu.RUnlock()
+		aborted = func(x storage.TransactionID) bool { return ab[x] }
+	} else {
+		m.subxactMu.RLock()
+		parents = make(map[storage.TransactionID]storage.TransactionID, len(m.subxactParents))
+		for k, v := range m.subxactParents {
+			parents[k] = v
+		}
+		m.subxactMu.RUnlock()
+		aborted = m.IsAborted
+	}
+	var out []storage.TransactionID
+	for sub := range parents {
+		x, ok, rolledBack := sub, false, false
+		for i := 0; i < 64; i++ {
+			if aborted(x) {
+				rolledBack = true
+			}
+			p, has := parents[x]
+			if !has {
+				break
+			}
+			if p == top {
+				ok = true
+				break
+			}
+			x = p
+		}
+		if ok && !(committedOnly && rolledBack) {
+			out = append(out, sub)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }

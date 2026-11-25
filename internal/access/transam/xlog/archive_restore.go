@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -148,6 +149,8 @@ func restoreArchivedFile(ctx context.Context, restoreCommand, walDir, xlogfname,
 		if expectedSize > 0 && st.Size() != expectedSize {
 			return &RestoreFatalError{Msg: fmt.Sprintf("archive file \"%s\" has wrong size: %d instead of %d", xlogfname, st.Size(), expectedSize)}
 		}
+		// RestoreArchivedFile's ereport(LOG) on success.
+		slog.Info(fmt.Sprintf("restored log file \"%s\" from archive", xlogfname))
 		if !keep {
 			return nil
 		}
@@ -270,8 +273,18 @@ func ReplacePercentPlaceholders(instr, paramName string, vals map[byte]string) (
 // failOnSignal (recovery_end_command). An invalid placeholder is an error
 // before anything runs.
 func ExecuteRecoveryCommand(command, commandName string, restartRedo uint64, restartTLI uint32, segSize int64) (anySignal bool, err error) {
+	return ExecuteRecoveryCommandIn("", command, commandName, restartRedo, restartTLI, segSize)
+}
+
+// ExecuteRecoveryCommandIn is ExecuteRecoveryCommand run in dir: PG runs
+// archive_cleanup_command and recovery_end_command from the data directory
+// (the postmaster's ChangeToDataDir), so a relative path in the command
+// names a file there (M0149-0018c). An empty dir keeps the server's
+// working directory. The error text is PG's: `<name> "<command>":
+// <wait_result_to_str>`.
+func ExecuteRecoveryCommandIn(dir, command, commandName string, restartRedo uint64, restartTLI uint32, segSize int64) (anySignal bool, err error) {
 	if segSize <= 0 {
-		segSize = DefaultSegmentSize
+		segSize = WALSegmentSize()
 	}
 	fname := XLogFileName(restartTLI, restartRedo/uint64(segSize), segSize)
 	cmd, err := ReplacePercentPlaceholders(command, commandName, map[byte]string{'r': fname})
@@ -279,6 +292,7 @@ func ExecuteRecoveryCommand(command, commandName string, restartRedo uint64, res
 		return false, err
 	}
 	c := exec.Command("sh", "-c", cmd)
+	c.Dir = dir
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	event := activity.WaitArchiveCleanupCommand
@@ -289,7 +303,7 @@ func ExecuteRecoveryCommand(command, commandName string, restartRedo uint64, res
 	err = c.Run()
 	endWait()
 	if err != nil {
-		return waitResultIsAnySignal(err), fmt.Errorf("%s \"%s\": %w", commandName, command, err)
+		return waitResultIsAnySignal(err), fmt.Errorf("%s \"%s\": %s", commandName, command, waitResultToStr(err))
 	}
 	return false, nil
 }

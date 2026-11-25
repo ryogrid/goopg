@@ -27,20 +27,16 @@ import (
 //	'2300-01-01'::date  ->  1715-06-13   (PG: 2300-01-01)
 //	'0000-01-01'::date  ->  1753-08-29   (PG: 22008, there is no year zero)
 //
-// Until the carrier moves to microseconds (deferral ledger, M0119-0006), the
-// input paths refuse what they cannot represent. Wrong answers become loud
-// 22008s; the representable range is untouched.
+// The carrier now holds PG's whole timestamp range, so these read correctly, and
+// a value outside that range is a 22008 rather than a wrapped date.
 func TestDateInputRejectsUnrepresentableInsteadOfWrapping(t *testing.T) {
 	for _, in := range []string{
-		"1000-01-01", "1600-12-31", "2300-01-01", "9999-12-31",
-		"1000-01-01 12:00:00", "2500-06-01 00:00:00",
-		// The era spellings: read correctly by the field decoder now, and then
-		// refused by the carrier rather than stored as a wrapped AD date.
-		"2020-01-01 BC", "0001-01-01 BC", "2020-01-01bc",
+		"294277-01-01", "294277-01-01 00:00:00", "300000-06-01",
+		"4714-11-23 BC", "4714-11-23 23:59:59 BC", "5000-01-01 BC",
 	} {
 		got, err := parseCopyTimestamp(in)
 		if err == nil {
-			t.Errorf("parseCopyTimestamp(%q) = %v, want a range error — the nanosecond carrier cannot hold this and must not wrap it", in, got)
+			t.Errorf("parseCopyTimestamp(%q) = %v, want a range error — outside PG's range cannot hold this and must not wrap it", in, got)
 			continue
 		}
 		if !errors.Is(err, errTimeCarrierRange) && !errors.Is(err, datetime.ErrFieldOutOfRange) {
@@ -69,8 +65,11 @@ func TestDateTimeInputErrorSeparatesRangeFromSyntax(t *testing.T) {
 		wantCode string
 	}{
 		{"0000-01-01", "22008"},
-		{"1000-01-01", "22008"},
-		{"2020-01-01 BC", "22008"},
+		{"1000-01-01", ""},
+		{"2020-01-01 BC", ""},
+		{"294277-01-01", ""},
+		{"5874898-01-01", "22008"},
+		{"4714-11-23 BC", "22008"},
 		{"not-a-date", "22007"},
 		// M0119-0006: ValidateDate()'s month/day range check—a month/day
 		// no layout can hold is a RANGE failure to PG (DecodeDateTime
@@ -92,12 +91,10 @@ func TestDateTimeInputErrorSeparatesRangeFromSyntax(t *testing.T) {
 		// astronomical year 0 (1 BC), which 0%400==0 makes leap — PG 18.3
 		// accepts it — but literal year 1 is not leap, so time.Parse's own
 		// day-out-of-range check rejects it a layer below
-		// validateDateTokenFull's (correct) astronomical-year check. Must
-		// not regress to the pre-fix 22007 ("day out of range" read as a
-		// syntax miss); the carrier's own range (1677-2262) still refuses
-		// year 0, so the code is 22008 either way — the assertion that
-		// matters is which PATH produces it.
-		{"0001-02-29 BC", "22008"},
+		// the (correct) astronomical-year check. Must
+		// be accepted, not reported as a syntax miss.
+		{"0001-02-29 BC", ""},
+		{"0002-02-29 BC", "22008"}, // 2 BC is not a leap year
 	} {
 		if c.wantCode == "" {
 			if _, err := parsePGDateText(c.in); err != nil {
@@ -205,32 +202,26 @@ func TestBCLeapDayTimestampDecodesAtTheAstronomicalYear(t *testing.T) {
 		// 5 BC is astronomical -4: divisible by 4, so leap as well.
 		{"0005-02-29 10:00:00 BC", tsDiscardZone, time.Date(-4, 2, 29, 10, 0, 0, 0, time.UTC)},
 	} {
-		got, carry, err := parsePGTimestampTextParts(c.in, c.zone)
+		got, _, err := decodeTimestampText(c.in, c.zone, dateInput{})
 		if err != nil {
-			t.Errorf("parsePGTimestampTextParts(%q) failed: %v — PG 18.3 accepts this", c.in, err)
+			t.Errorf("decodeTimestampText(%q) failed: %v — PG 18.3 accepts this", c.in, err)
 			continue
 		}
-		if carry != 0 {
-			t.Errorf("parsePGTimestampTextParts(%q) carry = %d, want 0", c.in, carry)
-		}
 		if !got.Equal(c.want) {
-			t.Errorf("parsePGTimestampTextParts(%q) = %v, want %v", c.in, got, c.want)
+			t.Errorf("decodeTimestampText(%q) = %v, want %v", c.in, got, c.want)
 		}
 	}
 	// The whole-day carry composes on top of the rebuilt date, so an hour-24 /
 	// leap-second time of day on the BC leap day rolls into March 1st exactly
 	// as it does upstream.
 	for _, in := range []string{"0001-02-29 24:00:00 BC", "0001-02-29 23:59:60 BC"} {
-		got, carry, err := parsePGTimestampTextParts(in, tsDiscardZone)
+		got, _, err := decodeTimestampText(in, tsDiscardZone, dateInput{})
 		if err != nil {
-			t.Errorf("parsePGTimestampTextParts(%q) failed: %v", in, err)
+			t.Errorf("decodeTimestampText(%q) failed: %v", in, err)
 			continue
 		}
-		if carry != 1 {
-			t.Errorf("parsePGTimestampTextParts(%q) carry = %d, want 1 (the whole day)", in, carry)
-		}
-		if want := time.Date(0, 3, 1, 0, 0, 0, 0, time.UTC); !got.AddDate(0, 0, carry).Equal(want) {
-			t.Errorf("parsePGTimestampTextParts(%q)+carry = %v, want %v", in, got.AddDate(0, 0, carry), want)
+		if want := time.Date(0, 3, 1, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+			t.Errorf("decodeTimestampText(%q) = %v, want %v", in, got, want)
 		}
 	}
 }
@@ -246,7 +237,6 @@ func TestBCLeapDayTimestampFallbackKeepsTheErrorClasses(t *testing.T) {
 		in       string
 		wantCode string
 	}{
-		{"0001-02-29 10:00:00 BC", "22008"}, // valid fields, carrier range
 		{"0001-02-30 10:00:00 BC", "22008"}, // no such day in ANY year
 		{"0002-02-29 10:00:00 BC", "22008"}, // astronomical -1: NOT leap
 		{"0000-02-29 10:00:00 BC", "22008"}, // no year zero
@@ -261,6 +251,9 @@ func TestBCLeapDayTimestampFallbackKeepsTheErrorClasses(t *testing.T) {
 		if got := dateTimeInputError(err, "timestamp", c.in, 0).Code; got != c.wantCode {
 			t.Errorf("dateTimeInputError(%q).Code = %s, want %s", c.in, got, c.wantCode)
 		}
+	}
+	if _, err := parsePGTimestampText("0001-02-29 10:00:00 BC"); err != nil {
+		t.Errorf("1 BC is a leap year, so its February 29 is valid: %v", err)
 	}
 	// Non-BC input never reaches the fallback (literal and astronomical years
 	// agree there), so the ordinary path's answers are untouched.

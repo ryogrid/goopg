@@ -88,6 +88,11 @@ type Snapshot struct {
 	// HeapTupleSatisfiesMVCC. nil (the default) preserves the pre-M0117-0002
 	// v0 behaviour exactly. Set via WithCLog / Manager.SetCLog.
 	clog *CLog
+	// inRecovery: the snapshot serves a hot standby, so an xid is committed
+	// only when the CLOG says so (replayed commit records stamp it). The
+	// primary's running xids are invisible to this process's in-progress
+	// list. M0149-0012.
+	inRecovery bool
 }
 
 // Clone returns a copy of the snapshot that callers can hold independently of
@@ -222,6 +227,18 @@ func (s *Snapshot) SeesCommittedXID(xid storage.TransactionID) bool {
 	// this off the repeat-scan hot path, exactly as upstream.
 	if !s.clogSaysNotAborted(xid) {
 		return false
+	}
+	// Hot standby (M0149-0012): a primary transaction still running has no
+	// entry in this process's in-progress list and an Unknown CLOG status, so
+	// the window test below would call it committed. PG's standby snapshot
+	// holds it in KnownAssignedXids until its commit record replays; here the
+	// replayed commit's CLOG stamp is that signal.
+	if s.inRecovery && s.clog != nil && xid >= FirstNormalTransactionID {
+		if oldest := s.clog.OldestClogXid(); oldest == 0 || !storage.XIDPrecedes(xid, oldest) {
+			if !s.clog.DidCommit(xid, nil) {
+				return false
+			}
+		}
 	}
 	if xid < s.Xmin {
 		return true

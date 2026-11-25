@@ -46,6 +46,7 @@ func setIsSuperuserGUC(sess *misc.SessionRegistry, isSuper bool) {
 // the same context/source, per the SQL spec; NOT miscinit.c
 // SetSessionAuthorization, which does not itself clear SetRoleIsActive).
 func applySetSessionAuthorization(connTx *connTxState, role string) {
+	connTx.snapshotTxRoleIfNeeded()
 	switch strings.ToUpper(strings.TrimSpace(role)) {
 	case "", "DEFAULT", "RESET":
 		role = connTx.LoginUser
@@ -66,6 +67,7 @@ func applySetSessionAuthorization(connTx *connTxState, role string) {
 // (current_user()/current_role), never session_user() (miscinit.c
 // GetSessionUserId is unaffected by SET ROLE).
 func applySetRole(connTx *connTxState, role string) {
+	connTx.snapshotTxRoleIfNeeded()
 	switch strings.ToUpper(strings.TrimSpace(role)) {
 	case "", "DEFAULT", "NONE":
 		// Only clear NonSuperuserRole if a SET ROLE was actually the thing
@@ -193,7 +195,9 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 	// alongside TYPE/DOMAIN/DATABASE instead. M0119-0004-ACLHEAP (parameter
 	// ACL half).
 	isHeapACLObject := strings.Contains(upper, " ON TYPE ") || strings.Contains(upper, " ON DOMAIN ") ||
-		strings.Contains(upper, " ON DATABASE ") || strings.Contains(upper, " ON PARAMETER ")
+		strings.Contains(upper, " ON DATABASE ") || strings.Contains(upper, " ON PARAMETER ") ||
+		// pg_largeobject_metadata.lomacl is heap-backed (M0149-0001h1a).
+		strings.Contains(upper, " ON LARGE OBJECT")
 	// A column-level GRANT/REVOKE — `GRANT <priv>(<cols>) ON [TABLE] <name> …` —
 	// changes pg_attribute.attacl, which is heap-backed like pg_type.typacl, so it
 	// too must run through the executor (where an *executor.Context re-syncs the heap

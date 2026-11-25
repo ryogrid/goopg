@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -182,6 +183,7 @@ func planWithRtableSize(stmt parser.Stmt, cat catalog.Catalog, plannerSet Planne
 	// could see refs==1 while a later sibling subquery adds a second
 	// reference to the same shared body.
 	pushQualsThroughSingleRefCTEs(node)
+	canonicalizeDateTimeLiterals(node, plannerSet)
 	// M0148-0001k: a restriction on an inheritance / partition appendrel
 	// filters at every member scan, as set_append_rel_size gives each
 	// child rel its own translated copy (appendrel_pushdown.go).
@@ -349,6 +351,7 @@ func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet Plan
 		*parser.CreateStatisticsStmt,
 		*parser.AlterStatisticsStmt,
 		*parser.AlterSchemaStmt,
+		*parser.AlterLargeObjectOwnerStmt,
 		*parser.LockTableStmt,
 		*parser.CreateTypeStmt, *parser.AlterTypeStmt, *parser.DropTypeStmt,
 		*parser.CreateDomainStmt, *parser.DropDomainStmt, *parser.AlterDomainStmt,
@@ -771,6 +774,10 @@ type rangeBinding struct {
 	// `tableoid` reference instead — correct for non-partitioned
 	// base relations. M0100-0005y.
 	tableOidColIdx int
+	// singleLeafOID is the one leaf partition a partitioned table's scan
+	// collapsed to (M0148-0001c3a5 (a)): `tableoid` is that leaf's OID,
+	// not the parent's. Zero otherwise.
+	singleLeafOID uint32
 	// appendrel marks a binding whose subquery passed the
 	// is_simple_union_all port (jointreeappendrel.go): a non-LATERAL
 	// FROM-clause `(... UNION ALL ...) alias` on the jointree pipeline.
@@ -1853,6 +1860,14 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// once came from the goroutine-unsafe package global `planParent`
 		// (now the per-statement planState.parent, P0-E8).
 		ctx.settings = plannerSet
+		// M0148-0001c3a9: a row-locking query keeps its appendrels whole.
+		// The finished plan's EPQ recheck reads a restriction above the
+		// appendrel's scan chain (planTakesRowMarksOrModifies keeps it on
+		// the Append), which a partitionwise child join would move into
+		// its member; ledgered.
+		if len(s.Locking) > 0 {
+			ctx.settings.KeepAppendRelsWhole = true
+		}
 		// A-01(ii) cut 2: the statement's rtableScope, stamped DIRECTLY
 		// like the fields above. Sublink planners without the pointer
 		// at hand read it back via rtableScopeFrom's parent walk.
@@ -2029,6 +2044,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
 		ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
 		addPulledBodyColumnNames(ctx)
+		addBareStarOnlyNeededColumns(ctx, s)
 		expandWholeRowColumnNames(ctx, s, cat)
 		// M0145-0003: the WHERE-clause sublinks are pulled up HERE —
 		// PG's pull_up_sublinks position, before join-order search —
@@ -2178,6 +2194,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
 		ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
 		addPulledBodyColumnNames(ctx)
+		addBareStarOnlyNeededColumns(ctx, s)
 		expandWholeRowColumnNames(ctx, s, cat)
 		if newChild, newPred := tryJoinSearch(node, nil, ctx, cat); newPred == nil {
 			node = newChild
@@ -4026,6 +4043,9 @@ func rebaseNLIProbeKeys(inner Node, outerMap []int, seen map[*ColumnRef]bool) {
 		for _, e := range in.Keys {
 			rebaseExprRefsSeen(e, outerMap, seen)
 		}
+		for _, e := range in.SAOPKeys {
+			rebaseExprRefsSeen(e, outerMap, seen)
+		}
 		rebaseExprRefsSeen(in.LowKey, outerMap, seen)
 		rebaseExprRefsSeen(in.HighKey, outerMap, seen)
 	case *BitmapHeapScan:
@@ -4476,6 +4496,15 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog, ps PlannerSe
 // with their own walker.
 func nodeReferencesOuter(n Node) bool {
 	switch x := n.(type) {
+	case *GenerateSeries:
+		// `FROM t, LATERAL generate_series(1, t.n)`: the arguments are plain
+		// *ColumnRefs against the left sibling, bound per outer row.
+		for _, a := range [...]Expr{x.Start, x.Stop, x.Step, x.Zone} {
+			if a != nil && exprContainsColumnRef(a) {
+				return true
+			}
+		}
+		return false
 	case *PgGetPublicationTables:
 		for _, a := range x.Args {
 			if exprContainsColumnRef(a) {
@@ -4533,6 +4562,16 @@ func nodeReferencesOuter(n Node) bool {
 		return exprContainsColumnRef(x.StringExpr) ||
 			exprContainsColumnRef(x.PatternExpr) ||
 			exprContainsColumnRef(x.FlagsExpr)
+	case *BuiltinSRFScan:
+		// `FROM pg_ls_dir(d) f, pg_stat_file(d || '/' || f) s`
+		// (009_twophase): builtinSRFScanOp.Open reads ctx.OuterRows, the
+		// same driver as *FromUnnest. M0149-0016c.
+		for _, a := range x.Args {
+			if exprContainsColumnRef(a) {
+				return true
+			}
+		}
+		return false
 	case *PgOptionsToTable:
 		// `FROM t, LATERAL pg_options_to_table(t.opts)`: the argument is a
 		// plain *ColumnRef against the left sibling, so the wrapping Join has
@@ -5262,7 +5301,27 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 			// concurrently detach-pending at or before this statement's
 			// snapshot epoch (snapshot-relative partition visibility).
 			// Design 0118-0059 (M0118-0008).
-			leaves := collectAllPartitionLeaves(im, tbl.OID, currentPartitionDetachEpoch(cat))
+			leaves := collectAllPartitionLeaves(im, tbl, currentPartitionDetachEpoch(cat))
+			// M0148-0001c3a5 (a): one leaf in the parent's column order. PG's
+			// appendrel of one child plans the child as the rel's only member
+			// and drops the single-child Append (setrefs), so EXPLAIN shows the
+			// child scan under the parent's refname (`Seq Scan on
+			// parted_minmax1 parted_minmax`) with every path the child has.
+			// goopg returns the bare leaf scan — a search leaf, unlike the
+			// tableoid Project the union wrapping adds — and resolves
+			// `tableoid` to the leaf through the binding.
+			if len(leaves) == 1 && columnsInSameOrder(leaves[0].Columns, tbl.Columns) && len(leaves[0].Columns) == len(tbl.Columns) {
+				leaf := leaves[0]
+				alias := rv.Alias
+				if alias == "" {
+					alias = strings.ToLower(tbl.Name)
+				}
+				leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: alias, schema: tableSchemaWithSource(leaf, sourceIdx), LockParentOID: tbl.OID, TableSample: tsSpec, RTID: rtid,
+					EstRelRows: stage1RelSizeRows(cat, leaf), SmallDim: smallDimensionTag(cat, leaf), UniqueKeys: uniqueKeyColumnSets(cat, leaf)}
+				b.singleLeafOID = leaf.OID
+				ctx.schema = leafScan.Output()
+				return leafScan, b, nil
+			}
 			if len(leaves) > 0 {
 				// Build a UNION ALL of SeqScans over all leaf partitions.
 				// Per-leaf wrap with a Project that adds `tableoid`
@@ -5323,6 +5382,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 					if top.AppendRelName == "" {
 						top.AppendRelName = strings.ToLower(tbl.Name)
 					}
+					top.partScheme = newPartScheme(tbl, leaves)
 				}
 				if root != nil {
 					b.tableOidColIdx = len(b.table.Columns)
@@ -5827,29 +5887,37 @@ func currentPartitionDetachEpoch(cat catalog.Catalog) uint64 {
 // the result — only their leaf descendants are. This is required for correct
 // scanning of multi-level partition hierarchies (e.g. range_parted → part_b_10_b_20
 // (partitioned) → part_c_1_100 (leaf)). M0097-0105.
-func collectAllPartitionLeaves(im *catalog.InMemory, parentOID uint32, detachEpoch uint64) []*catalog.Table {
+func collectAllPartitionLeaves(im *catalog.InMemory, root *catalog.Table, detachEpoch uint64) []*catalog.Table {
 	var leaves []*catalog.Table
 	seen := make(map[uint32]bool)
-	// VisiblePartitionChildren drops a child stamped detach-pending at or before
-	// detachEpoch at every level, so a concurrently-detached intermediate node
-	// (and all its leaves) vanishes from the scan for snapshots after the detach.
-	// Design 0118-0059 (M0118-0008).
-	queue := catalog.VisiblePartitionChildren(im.PartitionChildren(parentOID), detachEpoch)
-	for len(queue) > 0 {
-		child := queue[0]
-		queue = queue[1:]
-		if seen[child.OID] {
-			continue
+	// expand_partitioned_rtentry (inherit.c): the partitions in PartitionDesc
+	// (bound) order, each sub-partitioned child expanded in place —
+	// depth-first — so the leaves come out in the order PG's appendrel lists
+	// them (M0148-0001c3a9 slice 1, partitionDescOrder).
+	var walk func(parent *catalog.Table, oid uint32)
+	walk = func(parent *catalog.Table, oid uint32) {
+		// VisiblePartitionChildren drops a child stamped detach-pending at or
+		// before detachEpoch at every level, so a concurrently-detached
+		// intermediate node (and all its leaves) vanishes from the scan for
+		// snapshots after the detach. Design 0118-0059 (M0118-0008).
+		kids := catalog.VisiblePartitionChildren(im.PartitionChildren(oid), detachEpoch)
+		if parent != nil {
+			kids = partitionDescOrder(parent, kids)
 		}
-		seen[child.OID] = true
-		if len(child.PartitionKey) > 0 {
-			// Intermediate partitioned node: recurse into its children.
-			queue = append(queue, catalog.VisiblePartitionChildren(im.PartitionChildren(child.OID), detachEpoch)...)
-		} else {
-			// Leaf partition: include in the scan.
-			leaves = append(leaves, child)
+		for _, child := range kids {
+			if seen[child.OID] {
+				continue
+			}
+			seen[child.OID] = true
+			if len(child.PartitionKey) > 0 {
+				// Intermediate partitioned node: recurse into its children.
+				walk(child, child.OID)
+			} else {
+				leaves = append(leaves, child)
+			}
 		}
 	}
+	walk(root, root.OID)
 	return leaves
 }
 
@@ -6058,6 +6126,10 @@ func planStandaloneValuesSelect(s *parser.SelectStmt, cat catalog.Catalog, ps Pl
 	for i := 0; i < nCols; i++ {
 		name := fmt.Sprintf("column%d", i+1)
 		typ := resolveValuesColumnType(planRows, i)
+		typ, err := coerceValuesColumn(planRows, i, typ)
+		if err != nil {
+			return nil, err
+		}
 		schema[i] = SchemaColumn{Name: name, Type: typ}
 	}
 	var node Node = &Values{pos: s.Pos(), Rows: planRows, schema: schema}
@@ -6219,6 +6291,10 @@ func planValuesSubquery(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16
 		// `(VALUES ('2015-01-02'), ('2015-04-01'::date))` must resolve to date
 		// whichever row carries the cast. M0134-0156.
 		typ := resolveValuesColumnType(planRows, i)
+		typ, err := coerceValuesColumn(planRows, i, typ)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
 		cols[i] = catalog.Column{Name: name, Type: typ}
 		schema[i] = SchemaColumn{Name: name, Type: typ}
 	}
@@ -6599,20 +6675,57 @@ func projectSetCompositeSchema(name string) Schema {
 
 // isNestedSRFName reports whether fname is a built-in set-returning function
 // that buildSelectSrfProjectSet expands when it appears nested inside a larger
-// SELECT-list target expression (e.g. `generate_series(1,n) % 4`). Limited to
-// generate_series for now; bare and FROM-clause SRFs keep their existing paths.
-// M0118-0008.
+// SELECT-list target expression (e.g. `generate_series(1,n) % 4`,
+// `unnest(a) + 1`); bare and FROM-clause SRFs keep their existing paths.
+// M0118-0008, M0149-0001h1a78.
 func isNestedSRFName(fname string) bool {
-	return strings.EqualFold(fname, "generate_series")
+	return strings.EqualFold(fname, "generate_series") || strings.EqualFold(fname, "unnest") || strings.EqualFold(fname, "string_to_table")
+}
+
+// nestedSRFArityOK reports whether a nested SRF call has an arity the
+// ProjectSet wrapper can expand: generate_series takes 2 to 4 arguments and a
+// target-list unnest exactly one (the multi-array form is FROM-only).
+func nestedSRFArityOK(fc *FuncCall) bool {
+	switch {
+	case strings.EqualFold(fc.Name, "unnest"):
+		return len(fc.Args) == 1
+	case strings.EqualFold(fc.Name, "string_to_table"):
+		return len(fc.Args) == 2 || len(fc.Args) == 3
+	case strings.EqualFold(fc.Name, "regexp_matches"):
+		return len(fc.Args) == 2 || len(fc.Args) == 3
+	case strings.EqualFold(fc.Name, "generate_series"):
+		return len(fc.Args) >= 2 && len(fc.Args) <= 4
+	}
+	return true // a user SETOF routine, matched on its argument count
+}
+
+// foldPgTypeof replaces pg_typeof's argument with its type name. A
+// set-returning call inside the argument still has to run, because it sets the
+// number of rows, so the argument is kept as a second argument that the
+// executor does not read; buildSelectSrfProjectSet finds the call there.
+func foldPgTypeof(pos int, arg Expr) *FuncCall {
+	args := []Expr{&StringConst{Value: pgTypeofDisplayName(exprType(arg))}}
+	if findFirstNestedSRF(arg) != nil {
+		args = append(args, arg)
+	}
+	return &FuncCall{pos: pos, Name: "pg_typeof", Args: args}
 }
 
 // findFirstNestedSRF returns the first set-returning FuncCall (DFS) inside a
 // resolved SELECT-list target expression, or nil when none is present. It walks
 // the same node kinds as replaceExprNode so the two stay in lockstep. M0118-0008.
 func findFirstNestedSRF(e Expr) *FuncCall {
+	return findFirstNestedSRFWith(e, func(fc *FuncCall) bool { return isNestedSRFName(fc.Name) })
+}
+
+// findFirstNestedSRFWith is findFirstNestedSRF with the set-returning test
+// supplied by the caller, so buildSelectSrfProjectSet can also recognise
+// regexp_matches and the catalog's SETOF routines. M0149-0001h1a78.
+func findFirstNestedSRFWith(e Expr, isSRF func(*FuncCall) bool) *FuncCall {
+	findFirstNestedSRF := func(e Expr) *FuncCall { return findFirstNestedSRFWith(e, isSRF) }
 	switch x := e.(type) {
 	case *FuncCall:
-		if isNestedSRFName(x.Name) {
+		if isSRF(x) {
 			return x
 		}
 		for _, a := range x.Args {
@@ -6664,7 +6777,7 @@ func replaceExprNode(e Expr, target Expr, repl Expr) Expr {
 		for i, a := range x.Args {
 			args[i] = replaceExprNode(a, target, repl)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, Operator: x.Operator, SQLName: x.SQLName}
 	case *BinaryOp:
 		return &BinaryOp{pos: x.Pos(), Op: x.Op, Left: replaceExprNode(x.Left, target, repl), Right: replaceExprNode(x.Right, target, repl), ResultType: x.ResultType}
 	case *UnaryOp:
@@ -6692,9 +6805,8 @@ func replaceExprNode(e Expr, target Expr, repl Expr) Expr {
 func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveContext, agg *aggregateSurface) (*ProjectSet, error) {
 	type srfEntry struct {
 		colIdx int
-		start  parser.Expr
-		stop   parser.Expr
-		step   parser.Expr // may be nil
+		pos    int
+		args   []parser.Expr
 	}
 	type userSrfEntry struct {
 		colIdx  int
@@ -6705,6 +6817,7 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		colIdx   int
 		arrExpr  parser.Expr
 		castType string // element-level cast type (e.g. "int4"); empty = no cast. M0097-0035.
+		funcName string // the SQL function the unnest stands in for (string_to_table); "" = unnest
 	}
 	type regexpMatchesEntry struct {
 		colIdx      int
@@ -6735,15 +6848,19 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			continue
 		}
 		if strings.EqualFold(fc.Name.Name, "generate_series") {
-			if len(fc.Args) < 2 || len(fc.Args) > 3 {
+			if len(fc.Args) < 2 || len(fc.Args) > 4 {
 				return nil, &PlanError{Pos: fc.Pos(), Code: "42883",
-					Message: "generate_series requires 2 or 3 arguments"}
+					Message: "generate_series requires 2 to 4 arguments"}
 			}
-			e := srfEntry{colIdx: i, start: fc.Args[0], stop: fc.Args[1]}
-			if len(fc.Args) == 3 {
-				e.step = fc.Args[2]
-			}
+			e := srfEntry{colIdx: i, pos: fc.Pos(), args: fc.Args}
 			srfs = append(srfs, e)
+			continue
+		}
+		// string_to_table(s, d[, n]) in the target list is the unnest of
+		// string_to_array(s, d[, n]): the same split_text rows
+		// (text_to_table). M0149-0001h1a78f.
+		if strings.EqualFold(fc.Name.Name, "string_to_table") && (len(fc.Args) == 2 || len(fc.Args) == 3) {
+			unnests = append(unnests, unnestEntry{colIdx: i, arrExpr: &parser.FuncCall{Name: parser.ObjectName{Name: "string_to_array"}, Args: fc.Args}, castType: srfCastType, funcName: "string_to_table"})
 			continue
 		}
 		// unnest(array) → one row per element. M0097-0106.
@@ -6806,10 +6923,31 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 	// (M0118-0008). We resolve the target, locate the nested SRF, and rewrite it
 	// into a wrapper expression that reads the SRF's expanded per-step value from
 	// a temp eval-row slot.
+	type nestedSRFSlot struct {
+		srfNode *FuncCall        // the nested SRF call (resolved args reused verbatim)
+		slotIdx int              // temp eval-row slot holding the raw per-step SRF value
+		routine *catalog.Routine // the SETOF routine for a user function; nil for builtins
+	}
 	type wrappedSRF struct {
-		expr    Expr      // wrapper expr (SRF replaced by a ColumnRef temp slot)
-		srfNode *FuncCall // the nested SRF call (resolved args reused verbatim)
-		slotIdx int       // temp eval-row slot holding the raw per-step SRF value
+		expr  Expr            // wrapper expr (each SRF replaced by a ColumnRef temp slot)
+		slots []nestedSRFSlot // every SRF the expression holds, zipped like bare ones
+	}
+	// nestedUserSRF is the SETOF sql/plpgsql routine a resolved call names, or
+	// nil — the routines the bare-target scan above expands as UserSrfCols.
+	nestedUserSRF := func(fc *FuncCall) *catalog.Routine {
+		if rs == nil || isNestedSRFName(fc.Name) || strings.EqualFold(fc.Name, "regexp_matches") {
+			return nil
+		}
+		name := parser.ObjectName{Name: fc.Name}
+		if dot := strings.LastIndexByte(fc.Name, '.'); dot >= 0 {
+			name = parser.ObjectName{Schema: fc.Name[:dot], Name: fc.Name[dot+1:]}
+		}
+		for _, r := range rs.LookupByName(name) {
+			if r.ReturnsSet && (strings.EqualFold(r.Language, "sql") || strings.EqualFold(r.Language, "plpgsql")) && r.NumInputArgs() == len(fc.Args) {
+				return r
+			}
+		}
+		return nil
 	}
 	childWidth := 0
 	if child != nil {
@@ -6831,17 +6969,32 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		if rerr != nil {
 			continue // let the normal target-resolution path report the error
 		}
-		srfNode := findFirstNestedSRF(resolved)
-		if srfNode == nil {
+		// Replace every nested SRF, not only the first: PG's ProjectSet runs
+		// all the SRFs of `unnest(a) * generate_series(1, 3)` in lockstep and
+		// the Result above applies the operator (split_pathtarget_at_srfs).
+		expr := resolved
+		var slots []nestedSRFSlot
+		for {
+			srfNode := findFirstNestedSRFWith(expr, func(fc *FuncCall) bool {
+				return isNestedSRFName(fc.Name) || strings.EqualFold(fc.Name, "regexp_matches") || nestedUserSRF(fc) != nil
+			})
+			if srfNode == nil {
+				break
+			}
+			if !nestedSRFArityOK(srfNode) {
+				slots = nil
+				break
+			}
+			slotIdx := childWidth + wrapSlot + len(slots)
+			repl := &ColumnRef{pos: srfNode.Pos(), Index: slotIdx, Name: strings.ToLower(srfNode.Name), Type: exprType(srfNode)}
+			expr = replaceExprNode(expr, srfNode, repl)
+			slots = append(slots, nestedSRFSlot{srfNode: srfNode, slotIdx: slotIdx, routine: nestedUserSRF(srfNode)})
+		}
+		if len(slots) == 0 {
 			continue
 		}
-		if len(srfNode.Args) < 2 || len(srfNode.Args) > 3 { // generate_series arity
-			continue
-		}
-		slotIdx := childWidth + wrapSlot
-		repl := &ColumnRef{pos: srfNode.Pos(), Index: slotIdx, Name: strings.ToLower(srfNode.Name), Type: catalog.Type{Name: "int8"}}
-		wrapped[i] = wrappedSRF{expr: replaceExprNode(resolved, srfNode, repl), srfNode: srfNode, slotIdx: slotIdx}
-		wrapSlot++
+		wrapped[i] = wrappedSRF{expr: expr, slots: slots}
+		wrapSlot += len(slots)
 	}
 
 	if len(srfs) == 0 && len(unnests) == 0 && len(regexpMatchesEntries) == 0 && len(userSrfs) == 0 && len(wrapped) == 0 {
@@ -6855,9 +7008,14 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		if w, isWrapped := wrapped[i]; isWrapped {
 			// Nested-SRF column: the output is the enclosing wrapper expression
 			// (the raw SRF value lives in a temp eval-row slot). M0118-0008.
-			name := alias
+			// FigureColname over the SQL the user wrote: the resolved
+			// target has lost the subscript's base call name.
+			name := t.Alias
 			if name == "" {
-				name = exprOutputName(t.Expr)
+				name = parser.FigureIndexColname(t.Expr)
+			}
+			if name == "" {
+				name = "?column?"
 			}
 			schema[i] = SchemaColumn{Name: name, Type: exprType(w.expr)}
 			otherExprs[i] = nil // filled by the wrapper, not as a passthrough
@@ -6953,22 +7111,19 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 	// Resolve generate_series SRF args against ctx.
 	srfCols := make([]SrfCol, len(srfs))
 	for k, e := range srfs {
-		start, err := resolveExpr(e.start, ctx)
-		if err != nil {
-			return nil, err
-		}
-		stop, err := resolveExpr(e.stop, ctx)
-		if err != nil {
-			return nil, err
-		}
-		var step Expr
-		if e.step != nil {
-			step, err = resolveExpr(e.step, ctx)
+		args := make([]Expr, len(e.args))
+		for j, a := range e.args {
+			r, err := resolveExpr(a, ctx)
 			if err != nil {
 				return nil, err
 			}
+			args[j] = r
 		}
-		srfCols[k] = SrfCol{ColIdx: e.colIdx, Start: start, Stop: stop, Step: step}
+		if err := checkGenerateSeriesArgs(args, e.pos); err != nil {
+			return nil, err
+		}
+		srfCols[k] = newGenerateSeriesCol(e.colIdx, args)
+		schema[e.colIdx].Type = catalog.Type{Name: srfCols[k].Type}
 	}
 
 	// canonicalScalarTypeName folds a scalar type's spellings (int/integer/
@@ -7005,33 +7160,7 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		}
 		castType := u.castType
 		if castType == "" {
-			// Infer element type from array type suffix.
-			// Strip ALL [] suffixes to get the scalar base type (handles 2D arrays
-			// like int4[][] from array_agg(ARRAY[x]) where unnest flattens all dims).
-			at := exprType(arrResolved).Name
-			base := strings.ToLower(at)
-			for strings.HasSuffix(base, "[]") {
-				base = base[:len(base)-2]
-			}
-			if base != strings.ToLower(at) {
-				// Normalize type aliases → canonical form so int[]/integer[]/bigint[] etc. work.
-				switch base {
-				case "int4", "int", "integer":
-					castType = "int4"
-				case "int8", "bigint":
-					castType = "int8"
-				case "int2", "smallint":
-					castType = "int2"
-				case "float4", "real":
-					castType = "float4"
-				case "float8", "double precision", "float":
-					castType = "float8"
-				case "bool", "boolean":
-					castType = "bool"
-				case "numeric", "decimal":
-					castType = "numeric"
-				}
-			}
+			castType = unnestElementCastType(exprType(arrResolved).Name)
 		}
 		// M0148-0001i3: a cast the SQL wrote over the unnest that changes the
 		// element type is an expression over the SRF, which PG evaluates in a
@@ -7046,7 +7175,7 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			}
 			explicitCast = canonicalScalarTypeName(u.castType) != canonicalScalarTypeName(elem)
 		}
-		unnestCols[k] = UnnestCol{ColIdx: u.colIdx, ArrExpr: arrResolved, CastType: castType, ExplicitCast: explicitCast}
+		unnestCols[k] = UnnestCol{ColIdx: u.colIdx, ArrExpr: arrResolved, CastType: castType, ExplicitCast: explicitCast, FuncName: u.funcName}
 	}
 
 	// Resolve regexp_matches args against ctx. M0122-0002.
@@ -7089,11 +7218,33 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 	// output row) and applies the enclosing scalar expression. M0118-0008.
 	wrappers := make([]SrfWrapper, 0, len(wrapped))
 	for i, w := range wrapped {
-		sc := SrfCol{ColIdx: w.slotIdx, Start: w.srfNode.Args[0], Stop: w.srfNode.Args[1], Wrapped: true}
-		if len(w.srfNode.Args) == 3 {
-			sc.Step = w.srfNode.Args[2]
+		for _, sl := range w.slots {
+			if sl.routine != nil {
+				userSrfCols = append(userSrfCols, UserSrfCol{ColIdx: sl.slotIdx, FuncPos: sl.srfNode.Pos(), Args: sl.srfNode.Args, Routine: sl.routine, Wrapped: true})
+				continue
+			}
+			if strings.EqualFold(sl.srfNode.Name, "regexp_matches") {
+				rc := RegexpMatchesCol{ColIdx: sl.slotIdx, StringExpr: sl.srfNode.Args[0], PatternExpr: sl.srfNode.Args[1], Wrapped: true}
+				if len(sl.srfNode.Args) == 3 {
+					rc.FlagsExpr = sl.srfNode.Args[2]
+				}
+				regexpMatchesCols = append(regexpMatchesCols, rc)
+				continue
+			}
+			if strings.EqualFold(sl.srfNode.Name, "string_to_table") {
+				arr := &FuncCall{Name: "string_to_array", Args: sl.srfNode.Args}
+				unnestCols = append(unnestCols, UnnestCol{ColIdx: sl.slotIdx, ArrExpr: arr, Wrapped: true, FuncName: "string_to_table"})
+				continue
+			}
+			if strings.EqualFold(sl.srfNode.Name, "unnest") {
+				arr := sl.srfNode.Args[0]
+				unnestCols = append(unnestCols, UnnestCol{ColIdx: sl.slotIdx, ArrExpr: arr, CastType: unnestElementCastType(exprType(arr).Name), Wrapped: true})
+				continue
+			}
+			sc := newGenerateSeriesCol(sl.slotIdx, sl.srfNode.Args)
+			sc.Wrapped = true
+			srfCols = append(srfCols, sc)
 		}
-		srfCols = append(srfCols, sc)
 		wrappers = append(wrappers, SrfWrapper{OutCol: i, Expr: w.expr})
 	}
 
@@ -7112,6 +7263,39 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 	}, nil
 }
 
+// unnestElementCastType is the element-level cast a target-list unnest applies
+// so the executor produces typed elements (int4, not text): the canonical
+// scalar name of the array type's element, or "" when the type is not an
+// array of one of those scalars. Strips every [] suffix, since unnest
+// flattens all dimensions. M0097-0035, M0097-0125.
+func unnestElementCastType(arrayType string) string {
+	at := strings.ToLower(arrayType)
+	base := at
+	for strings.HasSuffix(base, "[]") {
+		base = base[:len(base)-2]
+	}
+	if base == at {
+		return ""
+	}
+	switch base {
+	case "int4", "int", "integer":
+		return "int4"
+	case "int8", "bigint":
+		return "int8"
+	case "int2", "smallint":
+		return "int2"
+	case "float4", "real":
+		return "float4"
+	case "float8", "double precision", "float":
+		return "float8"
+	case "bool", "boolean":
+		return "bool"
+	case "numeric", "decimal":
+		return "numeric"
+	}
+	return ""
+}
+
 // exprOutputName returns a human-readable column name for an expression that
 // has no explicit alias. Matches PostgreSQL's heuristic used in SELECT lists.
 func exprOutputName(e parser.Expr) string {
@@ -7123,6 +7307,10 @@ func exprOutputName(e parser.Expr) string {
 	case *parser.ArraySubqueryExpr:
 		_ = x
 		return "array"
+	case *parser.ArraySubscriptExpr:
+		if name := parser.FigureIndexColname(x); name != "" {
+			return name
+		}
 	}
 	return "?column?"
 }
@@ -7197,6 +7385,16 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	}
 	if strings.EqualFold(tf.Name, "pg_get_wal_summarizer_state") {
 		return planPgGetWalSummarizerState(rv, sourceIdx)
+	}
+	if strings.EqualFold(tf.Name, "pg_control_checkpoint") {
+		return planPgControlCheckpoint(rv, sourceIdx)
+	}
+	if strings.EqualFold(tf.Name, "pg_backup_stop") {
+		// pg_backup_stop([wait_for_archive]) is not SETOF: it returns one
+		// record of OUT parameters (lsn, labelfile, spcmapfile), and in FROM
+		// position ExecMakeTableFunctionResult scans it once, one column per
+		// OUT parameter (pg_proc.dat). M0149-0021.
+		return planRecordFuncScan(rv, sourceIdx, []string{"lsn", "labelfile", "spcmapfile"}, []string{"pg_lsn", "text", "text"})
 	}
 	if strings.EqualFold(tf.Name, "pg_get_catalog_foreign_keys") {
 		return planPgGetCatalogForeignKeys(rv, sourceIdx)
@@ -7279,6 +7477,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_options_to_table") {
 		return planPgOptionsToTable(rv, cat, sourceIdx, lateralCtx)
 	}
+	if strings.EqualFold(tf.Name, "string_to_table") {
+		return planFromStringToTable(rv, cat, sourceIdx, lateralCtx)
+	}
 	if strings.EqualFold(tf.Name, "unnest") {
 		return planFromUnnest(rv, cat, sourceIdx, lateralCtx)
 	}
@@ -7287,6 +7488,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	}
 	if strings.EqualFold(tf.Name, "regexp_split_to_table") {
 		return planFromRegexpSplitToTable(rv, cat, sourceIdx, lateralCtx)
+	}
+	if IsBuiltinSRF(tf.Name) {
+		return planBuiltinSRF(rv, cat, sourceIdx, lateralCtx)
 	}
 	if strings.EqualFold(tf.Name, "generate_subscripts") {
 		return planGenerateSubscripts(rv, sourceIdx, lateralCtx)
@@ -7365,9 +7569,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "0A000",
 			Message: fmt.Sprintf("table-valued function %q not supported", tf.Name)}
 	}
-	if len(tf.Args) < 2 || len(tf.Args) > 3 {
+	if len(tf.Args) < 2 || len(tf.Args) > 4 {
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
-			Message: "generate_series requires 2 or 3 arguments"}
+			Message: "generate_series requires 2 to 4 arguments"}
 	}
 	// Build arg context: lateral siblings + outer-scope parent chain so
 	// correlated references like pr.prattrs in generate_series args resolve.
@@ -7382,21 +7586,17 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 			argCtx = lateralCtx
 		}
 	}
-	start, err := resolveExpr(tf.Args[0], argCtx)
-	if err != nil {
-		return nil, rangeBinding{}, err
-	}
-	stop, err := resolveExpr(tf.Args[1], argCtx)
-	if err != nil {
-		return nil, rangeBinding{}, err
-	}
-	var step Expr
-	if len(tf.Args) == 3 {
-		step, err = resolveExpr(tf.Args[2], argCtx)
-		if err != nil {
+	seriesArgs := make([]Expr, len(tf.Args))
+	for i, a := range tf.Args {
+		var err error
+		if seriesArgs[i], err = resolveExpr(a, argCtx); err != nil {
 			return nil, rangeBinding{}, err
 		}
 	}
+	if err := checkGenerateSeriesArgs(seriesArgs, tf.Pos()); err != nil {
+		return nil, rangeBinding{}, err
+	}
+	series := newGenerateSeriesCol(0, seriesArgs)
 	alias := rv.Alias
 	if alias == "" {
 		alias = "generate_series"
@@ -7410,13 +7610,7 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if len(gsColAliases) > 0 {
 		colName = gsColAliases[0]
 	}
-	// Use int4 when args are integer literals or int4-typed (PG overload resolution). M0097-0122.
-	seriesType := "int8"
-	if _, ok := start.(*IntegerConst); ok {
-		seriesType = "int4"
-	} else if t := exprType(start); t.Name == "int4" || t.Name == "integer" || t.Name == "int" {
-		seriesType = "int4"
-	}
+	seriesType := series.Type
 	tbl := &catalog.Table{
 		Name: alias,
 		Columns: []catalog.Column{
@@ -7424,7 +7618,7 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		},
 	}
 	schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: seriesType}, SourceTableIdx: sourceIdx}}
-	node := &GenerateSeries{pos: tf.Pos(), Start: start, Stop: stop, Step: step, Alias: alias, schema: schema}
+	node := &GenerateSeries{pos: tf.Pos(), Start: series.Start, Stop: series.Stop, Step: series.Step, Zone: series.Zone, Alias: alias, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	if tf.WithOrdinality {
 		node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
@@ -7853,6 +8047,45 @@ func planFromRegexpMatches(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	return node, b, nil
 }
 
+// planFromStringToTable plans FROM string_to_table(string, delimiter[,
+// null_string]) (text_to_table, text_to_table_null in varlena.c). Its rows
+// are exactly unnest(string_to_array(...)): the same split_text, one row per
+// field, none for a NULL or empty string. The scan is planned as that unnest
+// and keeps the function's name and arguments for EXPLAIN; the default
+// column name is string_to_table. M0149-0001h1a78f.
+func planFromStringToTable(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if len(tf.Args) < 2 || len(tf.Args) > 3 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "function string_to_table requires 2 or 3 arguments"}
+	}
+	tf2 := *tf
+	tf2.Name = "unnest"
+	tf2.Args = []parser.Expr{&parser.FuncCall{Name: parser.ObjectName{Name: "string_to_array"}, Args: tf.Args}}
+	rv2 := rv
+	rv2.TableFunc = &tf2
+	if rv2.Alias == "" {
+		rv2.Alias = "string_to_table"
+	}
+	node, b, err := planFromUnnest(rv2, cat, sourceIdx, lateralCtx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	fu, ok := node.(*FromUnnest)
+	if !ok {
+		if ow, isOW := node.(*OrdinalityWrap); isOW {
+			fu, ok = ow.Child.(*FromUnnest)
+		}
+	}
+	if ok {
+		fu.FuncName = "string_to_table"
+		if fc, isFC := fu.ArrExpr.(*FuncCall); isFC {
+			fu.FuncArgs = fc.Args
+		}
+	}
+	return node, b, nil
+}
+
 // planFromRegexpSplitToTable plans FROM regexp_split_to_table(string,
 // pattern[, flags]) [AS alias(col)] [WITH ORDINALITY]. Produces a single
 // text output column (default name "regexp_split_to_table", the same
@@ -7944,6 +8177,43 @@ func planScalarFuncScan(rv parser.RangeVar, sourceIdx int16, colType string) (No
 	}
 	node := &ScalarFuncScan{pos: tf.Pos(), Func: fc, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planRecordFuncScan plans a non-SETOF builtin that returns a record of OUT
+// parameters in FROM position: a ScalarFuncScan called once, whose composite
+// result the operator splits into one column per OUT parameter (colNames,
+// colTypes), with rv.Columns overriding the names positionally.
+func planRecordFuncScan(rv parser.RangeVar, sourceIdx int16, colNames, colTypes []string) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	alias := rv.Alias
+	if alias == "" {
+		alias = strings.ToLower(tf.Name)
+	}
+	ctx := &resolveContext{}
+	args := make([]Expr, 0, len(tf.Args))
+	for _, a := range tf.Args {
+		pa, err := resolveExpr(a, ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+		args = append(args, pa)
+	}
+	names := append([]string(nil), colNames...)
+	for i := range names {
+		if i < len(rv.Columns) {
+			names[i] = rv.Columns[i]
+		}
+	}
+	schema := make(Schema, len(names))
+	cols := make([]catalog.Column, len(names))
+	for i := range names {
+		schema[i] = SchemaColumn{Name: names[i], Type: catalog.Type{Name: colTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: colTypes[i]}, Ordinal: i}
+	}
+	fc := &FuncCall{pos: tf.Pos(), Name: strings.ToLower(tf.Name), Args: args}
+	node := &ScalarFuncScan{pos: tf.Pos(), Func: fc, schema: schema}
+	b := rangeBinding{table: &catalog.Table{Name: alias, Columns: cols}, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }
 
@@ -8082,6 +8352,43 @@ func planPgGetWalSummarizerState(rv parser.RangeVar, sourceIdx int16) (Node, ran
 	}
 	tbl := &catalog.Table{Name: alias, Columns: cols}
 	node := &PgAvailableWalSummaries{pos: tf.Pos(), Func: "pg_get_wal_summarizer_state", schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// PgControlCheckpointColumns are pg_control_checkpoint()'s OUT columns and
+// types (pg_proc.dat, misc/pg_controldata.c). M0149-0076.
+var PgControlCheckpointColumns = []string{"checkpoint_lsn", "redo_lsn", "redo_wal_file", "timeline_id",
+	"prev_timeline_id", "full_page_writes", "next_xid", "next_oid", "next_multixact_id", "next_multi_offset",
+	"oldest_xid", "oldest_xid_dbid", "oldest_active_xid", "oldest_multi_xid", "oldest_multi_dbid",
+	"oldest_commit_ts_xid", "newest_commit_ts_xid", "checkpoint_time"}
+
+// PgControlCheckpointTypes are the types of PgControlCheckpointColumns.
+var PgControlCheckpointTypes = []string{"pg_lsn", "pg_lsn", "text", "int4", "int4", "bool", "text", "oid",
+	"xid", "xid", "xid", "oid", "xid", "xid", "oid", "xid", "xid", "timestamptz"}
+
+// planPgControlCheckpoint routes pg_control_checkpoint() into the shared
+// zero-argument SRF node (PgAvailableWalSummaries with Func set). M0149-0076.
+func planPgControlCheckpoint(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_control_checkpoint"
+	}
+	colNames := append([]string(nil), PgControlCheckpointColumns...)
+	for i := range colNames {
+		if i < len(rv.Columns) {
+			colNames[i] = rv.Columns[i]
+		}
+	}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: catalog.Type{Name: PgControlCheckpointTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: catalog.Type{Name: PgControlCheckpointTypes[i]}, Ordinal: i}
+	}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	node := &PgAvailableWalSummaries{pos: tf.Pos(), Func: "pg_control_checkpoint", schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }
@@ -9202,6 +9509,9 @@ func inferExprType(e Expr) catalog.Type {
 	case *NumericConst:
 		return catalog.Type{Name: "numeric"}
 	case *StringConst:
+		if x.BitString {
+			return catalog.Type{Name: "bit"} // M0149-0001h1a1
+		}
 		return catalog.Type{Name: "text"}
 	case *BooleanConst:
 		return catalog.Type{Name: "bool"}
@@ -9302,7 +9612,9 @@ func buildWindowFunc(fc *parser.FuncCall, inputCtx *resolveContext, agg *aggrega
 		case "sum":
 			outTyp = sumResultType(inputTyp)
 		case "avg":
-			if isFloatTypeName(inputTyp.Name) {
+			if strings.EqualFold(inputTyp.Name, "interval") && !inputTyp.IsArray {
+				outTyp = catalog.Type{Name: "interval"} // interval_avg. M0149-0001h1a79.
+			} else if isFloatTypeName(inputTyp.Name) {
 				outTyp = catalog.Type{Name: "float8"}
 			} else {
 				outTyp = catalog.Type{Name: "numeric"}
@@ -10533,7 +10845,7 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 	case *parser.NumericConst:
 		return &NumericConst{pos: x.Pos(), Value: x.Value}, nil
 	case *parser.StringConst:
-		return &StringConst{pos: x.Pos(), Value: x.Value}, nil
+		return &StringConst{pos: x.Pos(), Value: x.Value, BitString: x.BitString}, nil
 	case *parser.TypedStringLit:
 		return &TypedStringLit{pos: x.Pos(), Type: x.Type, Value: x.Value}, nil
 	case *parser.IntervalLit:
@@ -10590,6 +10902,7 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		if err != nil {
 			return nil, err
 		}
+		lv, rv = coerceTimestampOperands(lv, rv)
 		return &IsDistinctFromExpr{pos: x.Pos(), Left: lv, Right: rv, Negated: x.Negated}, nil
 	case *parser.ExtractExpr:
 		src, err := resolveExpr(x.Source, agg.input)
@@ -10701,6 +11014,28 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		if err != nil {
 			return nil, err
 		}
+		if fc, ok := bitStringOpCall(x.Pos(), x.Op, l, r); ok {
+			return fc, nil
+		}
+		if fc, ok := moneyArithCall(x.Pos(), x.Op, l, r); ok {
+			return fc, nil
+		}
+		if e, ok, err := timeArithCall(x.Pos(), x.Op, l, r); err != nil {
+			return nil, err
+		} else if ok {
+			return e, nil
+		}
+		if e, ok, err := dateTimeLiteralCall(x.Pos(), x.Op, l, r); err != nil {
+			return nil, err
+		} else if ok {
+			return e, nil
+		}
+		if e, ok := rangeOpCall(x.Pos(), x.Op, l, r); ok {
+			return e, nil
+		}
+		if x.Op == parser.OpConcat {
+			l, r = moneyConcatOperand(l), moneyConcatOperand(r)
+		}
 		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
 		switch x.Op {
 		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
@@ -10711,6 +11046,9 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		op, err := resolveExprAfterAggregate(x.Operand, agg)
 		if err != nil {
 			return nil, err
+		}
+		if x.Op == parser.OpBitNot && isBitStringType(exprType(op)) {
+			return &FuncCall{pos: x.Pos(), Name: "bitnot", Args: []Expr{op}, ReturnType: "bit", Operator: "~"}, nil
 		}
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: op}, nil
 	case *parser.CastExpr:
@@ -10757,8 +11095,7 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 			if err != nil {
 				return nil, err
 			}
-			typName := pgTypeofDisplayName(exprType(arg))
-			return &FuncCall{pos: x.Pos(), Name: "pg_typeof", Args: []Expr{&StringConst{Value: typName}}}, nil
+			return foldPgTypeof(x.Pos(), arg), nil
 		}
 		// pg_collation_for(ordered-set-agg(...) WITHIN GROUP (...)): the same
 		// structural problem pg_typeof solves just above -- a compile-time
@@ -10909,6 +11246,28 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
+		if fc, ok := bitStringOpCall(x.Pos(), x.Op, l, r); ok {
+			return fc, nil
+		}
+		if fc, ok := moneyArithCall(x.Pos(), x.Op, l, r); ok {
+			return fc, nil
+		}
+		if e, ok, err := timeArithCall(x.Pos(), x.Op, l, r); err != nil {
+			return nil, err
+		} else if ok {
+			return e, nil
+		}
+		if e, ok, err := dateTimeLiteralCall(x.Pos(), x.Op, l, r); err != nil {
+			return nil, err
+		} else if ok {
+			return e, nil
+		}
+		if e, ok := rangeOpCall(x.Pos(), x.Op, l, r); ok {
+			return e, nil
+		}
+		if x.Op == parser.OpConcat {
+			l, r = moneyConcatOperand(l), moneyConcatOperand(r)
+		}
 		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
 		switch x.Op {
 		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
@@ -10919,6 +11278,9 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		op, err := resolveExprAfterWindow(x.Operand, win)
 		if err != nil {
 			return nil, err
+		}
+		if x.Op == parser.OpBitNot && isBitStringType(exprType(op)) {
+			return &FuncCall{pos: x.Pos(), Name: "bitnot", Args: []Expr{op}, ReturnType: "bit", Operator: "~"}, nil
 		}
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: op}, nil
 	case *parser.CastExpr:
@@ -11027,6 +11389,7 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
+		lv, rv = coerceTimestampOperands(lv, rv)
 		return &IsDistinctFromExpr{pos: x.Pos(), Left: lv, Right: rv, Negated: x.Negated}, nil
 	}
 	return resolveExprForWindowInput(e, win.input, win.agg)
@@ -11993,7 +12356,9 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 	case "avg":
 		// avg(float4/float8) returns float8; avg(integer types) returns numeric. M0097-0020.
 		argType := exprType(argExpr)
-		if isFloatTypeName(argType.Name) {
+		if strings.EqualFold(argType.Name, "interval") && !argType.IsArray {
+			outType = catalog.Type{Name: "interval"} // interval_avg. M0149-0001h1a79.
+		} else if isFloatTypeName(argType.Name) {
 			outType = catalog.Type{Name: "float8"}
 		} else {
 			outType = catalog.Type{Name: "numeric"}
@@ -12001,12 +12366,12 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 	case "string_agg":
 		// string_agg(expr, delimiter) returns the same type as its first arg
 		// (text for text input, bytea for bytea input). M0097-0115.
-		outType = exprType(argExpr)
+		outType = typeWithoutTypmod(exprType(argExpr))
 		if outType.Name == "" || outType.Name == "unknown" {
 			outType = catalog.Type{Name: "text"}
 		}
 	case "min", "max":
-		outType = exprType(argExpr)
+		outType = typeWithoutTypmod(exprType(argExpr))
 	case "regr_count":
 		outType = catalog.Type{Name: "int8"}
 	case "regr_avgx", "regr_avgy", "regr_sxx", "regr_syy", "regr_sxy",
@@ -12193,6 +12558,9 @@ func parserExprKey(e parser.Expr) string {
 	case *parser.NumericConst:
 		return "n:" + x.Value
 	case *parser.StringConst:
+		if x.BitString {
+			return "b:" + x.Value // B'101' is bit, '101' unknown: distinct slots
+		}
 		return "s:" + x.Value
 	case *parser.NullConst:
 		return "null"
@@ -12787,12 +13155,12 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	if !ok || tbl.View != nil || tbl.IsMatView {
 		return nil, false, nil
 	}
-	// Partitioned parents store no rows (planIndexScanFromWhere:8316): the
-	// single-leaf inner scan would be wrong, and the partitioned appendrel
-	// is not built here (ledgered).
-	if len(tbl.PartitionKey) > 0 {
-		return nil, false, nil
-	}
+	// Partitioned parents store no rows (planIndexScanFromWhere:8316), so
+	// the rule arms' fresh scans over tbl would be wrong. The subquery
+	// planned by the path search expands the appendrel itself
+	// (M0148-0001c3a5 (a)): a partitioned parent takes only that route
+	// (searchOnly).
+	searchOnly := len(tbl.PartitionKey) > 0
 	// M0148-0001c slice (c2): a plain `FROM parent` over an inheritance tree
 	// is an appendrel (expand_inherited_rtentry). planagg.c:121-137 accepts
 	// it — the RTE is still one RTE_RELATION — and build_minmax_path's
@@ -12800,7 +13168,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	// index paths (generate_orderedappend_paths). `FROM ONLY parent`
 	// (rte->inh = false) stays the plain single-relation shape.
 	var members []*catalog.Table
-	if im := inMemoryCat(cat); im != nil && !rv.Only {
+	if im := inMemoryCat(cat); im != nil && !rv.Only && !searchOnly {
 		members = collectInheritanceDescendants(im, tbl.OID, currentTempOwner(cat))
 	}
 	refname := rv.Alias
@@ -12847,7 +13215,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		if !isCall {
 			return nil, false, nil
 		}
-		init, sc, ok, berr := buildMinMaxInitPlan(s, cat, ctx, tbl, members, refname, fc, &t)
+		init, sc, ok, berr := buildMinMaxInitPlan(s, cat, ctx, tbl, members, refname, fc, &t, searchOnly)
 		if berr != nil {
 			return nil, false, berr
 		}
@@ -12900,14 +13268,9 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 			// (createplan.c's MinMaxAggPath tlist keeps the funcexpr; the
 			// ProjectSet expands it against the childless Result's single
 			// row). goopg's SrfCol carries the resolved args instead.
-			sc := SrfCol{ColIdx: i, Start: fc.Args[0], Stop: fc.Args[1]}
-			if len(fc.Args) == 3 {
-				sc.Step = fc.Args[2]
-			}
+			sc := newGenerateSeriesCol(i, fc.Args)
 			srfCols = append(srfCols, sc)
-			// Element type: the select-list SRF mode's int8 (the builder's
-			// generate_series default at ~6808) — the zip emits int64 datums.
-			psSchema[i] = SchemaColumn{Name: name, Type: catalog.Type{Name: "int8"}}
+			psSchema[i] = SchemaColumn{Name: name, Type: catalog.Type{Name: sc.Type}}
 			continue
 		}
 		other[i] = &ColumnRef{pos: pos, Index: len(resTargets), Name: name, Type: exprType(e)}
@@ -12945,7 +13308,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 // members non-empty marks tbl as an inheritance parent whose appendrel the
 // subquery scans (slice (c2)); refname is the parent RTE's alias name the
 // member scans print under (`minmaxtest minmaxtest_1`).
-func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolveContext, tbl *catalog.Table, members []*catalog.Table, refname string, fc *parser.FuncCall, t *parser.ResTarget) (Expr, SchemaColumn, bool, error) {
+func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolveContext, tbl *catalog.Table, members []*catalog.Table, refname string, fc *parser.FuncCall, t *parser.ResTarget, searchOnly bool) (Expr, SchemaColumn, bool, error) {
 	// min → forward IOS (isMax=false); max → Backward IOS (isMax=true).
 	if fc.Name.Schema != "" {
 		return nil, SchemaColumn{}, false, nil
@@ -13026,7 +13389,22 @@ func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolve
 		}
 	}
 
-	if isColumn {
+	if searchOnly {
+		// A partitioned parent (M0148-0001c3a5 (a)): only the subquery the
+		// path search plans over the appendrel, presorted, or no rewrite.
+		if !isColumn || correlated {
+			return nil, SchemaColumn{}, false, nil
+		}
+		colType = argCR.Type
+		if col, ok := cat.LookupColumn(tbl, argCR.Name); ok {
+			colType = col.Type
+		}
+		planned, presorted, ok := planMinMaxSubqueryViaSearch(s, ctx, cat, fc.Args[0], isMax)
+		if !ok || !presorted {
+			return nil, SchemaColumn{}, false, nil
+		}
+		inner = planned
+	} else if isColumn {
 		// Column-arg branch (min/max over a column): the index-driven scan
 		// shapes. The const-arg else-branch below needs no index at all.
 		colType = argCR.Type
@@ -13285,6 +13663,24 @@ func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolve
 				schema: Schema{{Name: argCR.Name, Type: colType, SourceTableIdx: 1}}}
 			inner = &Limit{pos: pos, Child: proj, Limit: &IntegerConst{pos: pos, Value: 1}}
 		}
+		if inner == nil && !correlated && len(members) == 0 {
+			// M0148-0001c3a5 (a): build_minmax_path plans the subquery
+			// through query_planner — every index path the search knows,
+			// not only the rule arms above (whose IOS arm admits a WHERE
+			// over the agg column alone). `min(a) … WHERE b = 5` over
+			// (a, b) is then PG's `Index Only Scan … Index Cond: ((a IS
+			// NOT NULL) AND (b = 5))`. The Sort fallback below stays for
+			// a body the search declines.
+			planned, presorted, ok := planMinMaxSubqueryViaSearch(s, ctx, cat, fc.Args[0], isMax)
+			if ok && !presorted {
+				// No presorted path: build_minmax_path returns false and
+				// the plain Aggregate stands (planagg.c:443-448).
+				return nil, SchemaColumn{}, false, nil
+			}
+			if ok {
+				inner = planned
+			}
+		}
 		if inner == nil {
 			// SeqScan fallback: no qualifying index — neither the leading-column
 			// findBTreeIndexForColumn (which matches only when idx.Columns[0] is the
@@ -13361,6 +13757,69 @@ func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolve
 // order and Backward reverses it, so a DESC column flips the flag: `max(x)`
 // over `(x desc)` is a FORWARD scan. (Before M0148-0001c (c2) the flag was
 // isMax alone, and `max(x)` over a DESC index returned the minimum.)
+// planMinMaxSubqueryViaSearch is build_minmax_path's subquery planned by the
+// path search: `SELECT <arg> FROM <from> WHERE <arg> IS NOT NULL [AND
+// <where>] ORDER BY <arg> [DESC] LIMIT 1` (planagg.c:362-420: the NullTest
+// lcons'd ahead of the jointree quals; fetch_agg_sort_op's `<` for min
+// with NULLS LAST, `>` for max with NULLS FIRST), as a scalar sublink body
+// under the min/max query's own scope. presorted reports a Limit over a
+// presorted path (minmaxPlanPresorted); ok is false when planning fails —
+// the caller's rule-built fallback then stands.
+func planMinMaxSubqueryViaSearch(s *parser.SelectStmt, ctx *resolveContext, cat catalog.Catalog, arg parser.Expr, isMax bool) (plan Node, presorted, ok bool) {
+	if s == nil || ctx == nil || cat == nil || arg == nil {
+		return nil, false, false
+	}
+	where := parser.Expr(&parser.IsNullExpr{Operand: arg, Negated: true})
+	if s.Where != nil {
+		where = &parser.BinaryOp{Op: parser.OpAnd, Left: where, Right: s.Where}
+	}
+	sub := &parser.SelectStmt{
+		With:      s.With,
+		Targets:   []parser.ResTarget{{Expr: arg}},
+		From:      s.From,
+		FromExprs: s.FromExprs,
+		Where:     where,
+		OrderBy:   []parser.SortBy{{Expr: arg, Desc: isMax}},
+		Limit:     &parser.IntegerConst{Value: 1},
+	}
+	ps := ctx.settings
+	ps.scalarSublinkBody = true
+	n, err := planSelectWithParent(sub, cat, ctx, ps, rtableScopeFrom(ctx))
+	if err != nil || n == nil || len(n.Output()) != 1 {
+		return nil, false, false
+	}
+	return n, minmaxPlanPresorted(n), true
+}
+
+// minmaxPlanPresorted reports whether the planned min/max subquery reads a
+// presorted path under its Limit: build_minmax_path takes only
+// get_cheapest_fractional_path_for_pathkeys over the final rel's pathlist,
+// with no explicit Sort (planagg.c:443-448). A body whose Limit sits on a
+// Sort is not one PG would build: the min/max rewrite declines.
+func minmaxPlanPresorted(n Node) bool {
+	for depth := 0; depth < 8; depth++ {
+		switch x := n.(type) {
+		case *Project:
+			n = x.Child
+		case *Limit:
+			c := x.Child
+			for {
+				pr, ok := c.(*Project)
+				if !ok {
+					break
+				}
+				c = pr.Child
+			}
+			_, sorted := c.(*Sort)
+			_, incr := c.(*IncrementalSort)
+			return !sorted && !incr
+		default:
+			return false
+		}
+	}
+	return false
+}
+
 func minmaxScanBackward(idx *catalog.Index, k int, isMax bool) bool {
 	desc := k < len(idx.ColDescending) && idx.ColDescending[k]
 	return isMax != desc
@@ -13687,7 +14146,7 @@ func minmaxTListSurvivor(e parser.Expr, ctx *resolveContext) (Expr, bool) {
 		// FuncCall: it recurses on the args only, so a 0-arg call —
 		// `count(*)`, an aggregate the rewrite must never swallow — reads
 		// "constant".
-		if !strings.EqualFold(fc.Name, "generate_series") || len(fc.Args) < 2 || len(fc.Args) > 3 {
+		if !strings.EqualFold(fc.Name, "generate_series") || len(fc.Args) < 2 || len(fc.Args) > 4 {
 			return nil, false
 		}
 		for _, a := range fc.Args {
@@ -14061,7 +14520,7 @@ func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string
 			if err != nil || resolvedPred == nil {
 				continue
 			}
-			if !provePartialIndexPredicate(resolvedPred, queryClause) {
+			if !predicateImpliedBy(queryClause, resolvedPred) {
 				continue
 			}
 		}
@@ -15606,6 +16065,9 @@ func applyUpdateAssign(a parser.UpdateAssign, tbl *catalog.Table, set []Expr, ct
 }
 
 func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
+	// M0148-0001c3a9: modifying plans keep appendrels whole (see
+	// planSelectWithSettings' row-lock guard).
+	ps.KeepAppendRelsWhole = true
 	// A-01(ii) cut 2 (F5): the WITH list, the FROM list, the target
 	// scan, and every SET / WHERE / RETURNING sublink allocate from
 	// the statement scope.
@@ -15808,6 +16270,9 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog, ps PlannerSettings, s
 }
 
 func planDelete(s *parser.DeleteStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
+	// M0148-0001c3a9: modifying plans keep appendrels whole (see
+	// planSelectWithSettings' row-lock guard).
+	ps.KeepAppendRelsWhole = true
 	// A-01(ii) cut 2 (F5): same scope treatment as planUpdate (see it for
 	// the target-scan note).
 	restore, dmlPlans, err := preplanWithClause(s.With, nil, cat, ps, scope)
@@ -15981,6 +16446,9 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog, ps PlannerSettings, s
 // planMerge converts a MERGE INTO statement into a Merge plan node.
 // M0096-0010.
 func planMerge(s *parser.MergeStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
+	// M0148-0001c3a9: modifying plans keep appendrels whole (see
+	// planSelectWithSettings' row-lock guard).
+	ps.KeepAppendRelsWhole = true
 	// A leading WITH (M0146-0085): its CTEs are visible to the USING source,
 	// ON and WHEN clauses; data-modifying ones run first, as for DELETE.
 	restore, dmlPlans, err := preplanWithClause(s.With, nil, cat, ps, scope)
@@ -16425,6 +16893,15 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if fs, ok := t.Expr.(*parser.FieldSelect); ok {
 		return strings.ToLower(fs.Field), exprType(e)
 	}
+	// A subscript has no field name, so FigureColname names it by the
+	// subscripted expression: `(array[1,2])[1]` is array, `(regexp_match(s,
+	// p))[1]` is regexp_match (M0149-0001h1a78).
+	if _, ok := t.Expr.(*parser.ArraySubscriptExpr); ok {
+		if name := parser.FigureIndexColname(t.Expr); name != "" {
+			return name, exprType(e)
+		}
+		return "?column?", exprType(e)
+	}
 	// FigureColname (parse_target.c) names a bare column reference by the
 	// name as WRITTEN. The resolved ref carries the column it reads, which is
 	// the same name except through a pulled-up derived table
@@ -16513,6 +16990,28 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	// For column-ref casts (e.g. f1::int2), propagate the column's name.
 	// Matches PostgreSQL's FigureColname() logic. M0097-0003.
 	if cast, ok := e.(*CastExpr); ok {
+		// FigureColnameInternal's T_TypeCast keeps a strong (column or
+		// function) name from its argument through any number of casts and
+		// only falls back to the type name when the argument has none, so
+		// `member::regrole::text` is labelled `member`. Look through the
+		// whole cast chain for that base. M0149-0001h1a12.
+		base := cast.Operand
+		for inner, ok := base.(*CastExpr); ok; inner, ok = base.(*CastExpr) {
+			base = inner.Operand
+		}
+		if base != cast.Operand {
+			if cr, ok := base.(*ColumnRef); ok {
+				innerName, _ := targetMeta(cr, t)
+				return innerName, exprType(e)
+			}
+			if _, ok := base.(*TableOidExpr); ok {
+				return "tableoid", exprType(e)
+			}
+			if fc, ok := base.(*FuncCall); ok && fc.Operator == "" {
+				innerName, _ := targetMeta(fc, t)
+				return innerName, exprType(e)
+			}
+		}
 		if _, isCol := cast.Operand.(*ColumnRef); isCol {
 			innerName, _ := targetMeta(cast.Operand, t)
 			return innerName, exprType(e)
@@ -16527,11 +17026,19 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 		}
 		// For function-call casts (e.g. parse_ident(...)::name[]), propagate the
 		// function name as the column label (matches PostgreSQL's FigureColname). M0097-0003.
-		if _, isFuncCall := cast.Operand.(*FuncCall); isFuncCall {
+		// An operator implemented as a call (money / bit-string operators)
+		// is an OpExpr upstream and has no name, so the type label wins.
+		if fc, isFuncCall := cast.Operand.(*FuncCall); isFuncCall && fc.Operator == "" {
 			innerName, _ := targetMeta(cast.Operand, t)
 			return innerName, exprType(e)
 		}
 		if cast.TargetType != "" {
+			// Quoted "char" (OID 18) carries no typmod; bare CHAR always
+			// does (parser-synthesised length 1) and is named bpchar.
+			// Sibling of parser.figureColnameInternal's CastExpr case.
+			if cast.TargetType == "char" && cast.Typmod == 0 {
+				return "char", exprType(e)
+			}
 			// Use PostgreSQL's canonical short type names for column labels.
 			label := castTargetLabel(cast.TargetType)
 			return label, exprType(e)
@@ -16541,6 +17048,14 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	}
 	// Function call: use function name as the implicit column label.
 	// Matches PostgreSQL's FigureColname() logic for FuncCall nodes.
+	if fc, ok := e.(*FuncCall); ok && fc.Operator != "" {
+		// An operator implemented as a call (money arithmetic) is an OpExpr
+		// upstream: FigureColname gives "?column?". M0149-0001k1.
+		return "?column?", exprType(e)
+	}
+	if fc, ok := e.(*FuncCall); ok && fc.SQLName != "" {
+		return fc.SQLName, exprType(e)
+	}
 	if fc, ok := e.(*FuncCall); ok && fc.Name != "" {
 		// array_construct is the lowered form of ARRAY[...]; PostgreSQL
 		// FigureColname returns "array" for ArrayExpr nodes. M0097-0065.
@@ -16622,10 +17137,51 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 
 // castTargetLabel maps a cast target type name to the PostgreSQL column label
 // used for that type when the cast result has no explicit alias. M0097-0003.
+// castTypmodZeroPrecision is CastExpr.Typmod for `time(0)` and `timestamp(0)`.
+// Typmod 0 means "no modifier", and precision 0 is a real one that rounds to
+// whole seconds.
+const castTypmodZeroPrecision = -1
+
+// isFractionalSecondsType reports the types whose typmod is a fractional-second
+// precision.
+func isFractionalSecondsType(typeName string) bool {
+	switch strings.ToLower(typeName) {
+	case "time", "timetz", "timestamp", "timestamptz",
+		"time without time zone", "time with time zone",
+		"timestamp without time zone", "timestamp with time zone":
+		return true
+	}
+	return false
+}
+
+// FractionalPrecision is the declared precision of a cast to a time or timestamp
+// type, if it has one.
+func (c *CastExpr) FractionalPrecision() (int64, bool) {
+	if !isFractionalSecondsType(c.TargetType) {
+		return 0, false
+	}
+	switch {
+	case c.Typmod == castTypmodZeroPrecision:
+		return 0, true
+	case c.Typmod > 0:
+		return c.Typmod, true
+	}
+	return 0, false
+}
+
+// EncodeCastTypmod is CastExpr.Typmod for a cast to typeName with the declared
+// type arguments.
+func EncodeCastTypmod(typeName string, args []int64) int64 {
+	return encodeTypmod(typeName, args)
+}
+
 // encodeTypmod encodes the typmod for a cast target type.
 // For numeric(P,S), returns (P<<16)|S so the executor can decode both.
 // For other types, returns Typmods[0] if present (existing behaviour).
 func encodeTypmod(typeName string, typmods []int64) int64 {
+	if len(typmods) > 0 && typmods[0] == 0 && isFractionalSecondsType(typeName) {
+		return castTypmodZeroPrecision
+	}
 	switch strings.ToLower(typeName) {
 	case "numeric", "decimal":
 		if len(typmods) >= 2 {
@@ -16643,15 +17199,23 @@ func encodeTypmod(typeName string, typmods []int64) int64 {
 
 func castTargetLabel(t string) string {
 	// Strip array brackets: PostgreSQL FigureColname uses the element type name
-	// as the column label (e.g. ::rainbow[] → "rainbow"). M0097-enum-fix.
-	if strings.HasSuffix(t, "[]") {
-		t = t[:len(t)-2]
+	// as the column label (e.g. ::rainbow[] → "rainbow"), however many
+	// dimensions the cast spells (::int[][] → "int4"). M0097-enum-fix,
+	// M0149-0001h1a85b.
+	for strings.HasSuffix(t, "[]") {
+		t = strings.TrimSpace(t[:len(t)-2])
 	}
 	switch t {
 	case "boolean":
 		return "bool"
-	case "integer":
+	case "integer", "int":
+		// gram.y's SystemTypeName: INT / INTEGER are int4, DECIMAL / DEC
+		// numeric, CHAR / CHARACTER bpchar. M0149-0001h1a1.
 		return "int4"
+	case "decimal", "dec":
+		return "numeric"
+	case "char", "character":
+		return "bpchar"
 	case "bigint":
 		return "int8"
 	case "smallint":
@@ -16959,8 +17523,73 @@ func sumResultType(t catalog.Type) catalog.Type {
 			return catalog.Type{Name: "int8"}
 		}
 	}
+	return typeWithoutTypmod(t)
+}
+
+// castTypmodArgs turns a cast's encoded typmod (encodeTypmod) back into the
+// declared arguments, so a cast's result column keeps its typmod as PG's
+// exprTypmod reports it for a length-coercion. Types with no typmod get none.
+func castTypmodArgs(typeName string, typmod int64) []int64 {
+	if typmod == castTypmodZeroPrecision && isFractionalSecondsType(typeName) {
+		return []int64{0}
+	}
+	if typmod <= 0 {
+		return nil
+	}
+	if isFractionalSecondsType(typeName) {
+		return []int64{typmod}
+	}
+	switch strings.ToLower(typeName) {
+	case "numeric", "decimal":
+		if typmod >= 1<<16 {
+			return []int64{typmod >> 16, typmod & 0xffff}
+		}
+		return []int64{typmod}
+	case "interval":
+		// A bare precision is packed as INTERVAL_TYPMOD(p, INTERVAL_FULL_RANGE),
+		// the form a declared column's Args carry.
+		if typmod <= 6 {
+			return []int64{0x7fff<<16 | typmod}
+		}
+		return []int64{typmod}
+	case "varchar", "character varying", "bpchar", "character", "bit", "varbit", "bit varying":
+		return []int64{typmod}
+	}
+	return nil
+}
+
+// typeWithoutTypmod is t as the result of an expression that has no typmod of
+// its own. Bare `char(n)` is spelled "char" with Args, so without them it must
+// be named bpchar or it would read as the one-byte "char" type.
+func typeWithoutTypmod(t catalog.Type) catalog.Type {
+	if len(t.Args) == 0 {
+		return t
+	}
+	if strings.EqualFold(t.Name, "char") {
+		t.Name = "bpchar"
+	}
+	t.Args = nil
 	return t
 }
+
+// typeWithCommonTypmod keeps t's typmod only when every expression has the same
+// one, as exprTypmod does for CASE, COALESCE and GREATEST / LEAST.
+func typeWithCommonTypmod(t catalog.Type, exprs []Expr) catalog.Type {
+	for _, e := range exprs {
+		if !slices.Equal(exprType(e).Args, t.Args) {
+			return typeWithoutTypmod(t)
+		}
+	}
+	return t
+}
+
+func isTimestampResultName(name string) bool {
+	return strings.EqualFold(name, "timestamp") || strings.EqualFold(name, "timestamptz")
+}
+
+// ExprType is the SQL type of a planned expression, for executor functions whose
+// behaviour depends on the argument type PG resolved.
+func ExprType(e Expr) catalog.Type { return exprType(e) }
 
 func exprType(e Expr) catalog.Type {
 	switch x := e.(type) {
@@ -16992,6 +17621,9 @@ func exprType(e Expr) catalog.Type {
 	case *CTIDExpr:
 		return catalog.Type{Name: "tid"}
 	case *StringConst:
+		if x.BitString {
+			return catalog.Type{Name: "bit"} // B'...' / X'...', M0149-0001h1a1
+		}
 		return catalog.Type{Name: "text"}
 	case *BooleanConst:
 		return catalog.Type{Name: "bool"}
@@ -17003,6 +17635,8 @@ func exprType(e Expr) catalog.Type {
 		return catalog.Type{Name: "text"}
 	case *MergeWholeRowRef:
 		return catalog.Type{Name: "text"} // composite displayed as text
+	case *IntervalLit:
+		return catalog.Type{Name: "interval"}
 	case *TypedStringLit:
 		// Typed string literals carry their explicit type (e.g. int2 '2').
 		// Return it so downstream type inference (BinaryOp etc.) can use it.
@@ -17022,6 +17656,8 @@ func exprType(e Expr) catalog.Type {
 			// TypeOID in typeOIDFor, pg_typeof's pgTypeofDisplayName).
 			if strings.EqualFold(x.TargetType, "char") && x.Typmod > 0 {
 				t.Args = []int64{x.Typmod}
+			} else {
+				t.Args = castTypmodArgs(x.TargetType, x.Typmod)
 			}
 			return t
 		}
@@ -17065,6 +17701,16 @@ func exprType(e Expr) catalog.Type {
 			// before the numeric-dominance check below, which would otherwise
 			// misreport the wire TypeOID as numeric (right-aligning the
 			// interval text in psql instead of left-aligning it). M0134-0035.
+			if strings.EqualFold(lt.Name, "interval") && strings.EqualFold(rt.Name, "interval") &&
+				(x.Op == parser.OpAdd || x.Op == parser.OpSub) {
+				return catalog.Type{Name: "interval"}
+			}
+			// timestamp - timestamp and timestamptz - timestamptz (timestamp_mi).
+			if x.Op == parser.OpSub && lt.Name != "" && !lt.IsArray && !rt.IsArray &&
+				commonTypeCanonical(lt.Name) == commonTypeCanonical(rt.Name) &&
+				(commonTypeCanonical(lt.Name) == "timestamp" || commonTypeCanonical(lt.Name) == "timestamptz") {
+				return catalog.Type{Name: "interval"}
+			}
 			if strings.EqualFold(lt.Name, "interval") && (x.Op == parser.OpMul || x.Op == parser.OpDiv) {
 				return catalog.Type{Name: "interval"}
 			}
@@ -17081,6 +17727,14 @@ func exprType(e Expr) catalog.Type {
 			}
 			if isDateTypeName(lt.Name) && isDateTypeName(rt.Name) && x.Op == parser.OpSub {
 				return catalog.Type{Name: "int4"}
+			}
+			// timestamp[tz] ± interval / interval + timestamp[tz] keep the
+			// timestamp type (timestamp_pl_interval, timestamptz_pl_interval).
+			if isTimestampResultName(lt.Name) && strings.EqualFold(rt.Name, "interval") && (x.Op == parser.OpAdd || x.Op == parser.OpSub) {
+				return catalog.Type{Name: strings.ToLower(lt.Name)}
+			}
+			if strings.EqualFold(lt.Name, "interval") && isTimestampResultName(rt.Name) && x.Op == parser.OpAdd {
+				return catalog.Type{Name: strings.ToLower(rt.Name)}
 			}
 			// date ± interval / interval + date → timestamp
 			// (date_pl_interval / date_mi_interval / interval_pl_date),
@@ -17155,14 +17809,22 @@ func exprType(e Expr) catalog.Type {
 		if x.Op == parser.OpNot {
 			return catalog.Type{Name: "bool"}
 		}
-		return exprType(x.Operand)
+		return typeWithoutTypmod(exprType(x.Operand))
 	case *CaseExpr:
 		// All Whens unify to a single result type during analysis;
 		// take the first branch's type as the representative.
 		if len(x.Whens) > 0 {
 			t := exprType(x.Whens[0].Then)
 			if t.Name != "unknown" && t.Name != "" {
-				return t
+				results := make([]Expr, 0, len(x.Whens)+1)
+				for _, w := range x.Whens {
+					results = append(results, w.Then)
+				}
+				if x.Else == nil {
+					// The implicit ELSE NULL has no typmod.
+					return typeWithoutTypmod(t)
+				}
+				return typeWithCommonTypmod(t, append(results, x.Else))
 			}
 		}
 		if x.Else != nil {
@@ -17181,7 +17843,50 @@ func exprType(e Expr) catalog.Type {
 		if x.ReturnType != "" {
 			return catalog.Type{Name: x.ReturnType}
 		}
-		switch strings.ToLower(x.Name) {
+		// A pg_catalog-qualified call names the same builtin (the executor
+		// strips the qualifier too); without this every
+		// `pg_catalog.f(...)` typed as the text fallback below.
+		switch strings.TrimPrefix(strings.ToLower(x.Name), "pg_catalog.") {
+		case "cash_pl", "cash_mi", "cashlarger", "cashsmaller",
+			"cash_mul_flt8", "cash_mul_flt4", "cash_mul_int8", "cash_mul_int4", "cash_mul_int2",
+			"flt8_mul_cash", "flt4_mul_cash", "int8_mul_cash", "int4_mul_cash", "int2_mul_cash",
+			"cash_div_flt8", "cash_div_flt4", "cash_div_int8", "cash_div_int4", "cash_div_int2":
+			// pg_proc prorettype money (cash.c builtins). M0149-0001k1.
+			return catalog.Type{Name: "money"}
+		case "cash_div_cash":
+			return catalog.Type{Name: "float8"}
+		case "bitand", "bitor", "bitxor", "bitnot", "bitshiftleft", "bitshiftright":
+			return catalog.Type{Name: "bit"} // varbit.c, M0149-0001h1a1
+		case "bitcat":
+			return catalog.Type{Name: "varbit"}
+		case "bitoctetlength", "bitlength", "bitgetbit":
+			return catalog.Type{Name: "int4"}
+		case "bit_bit_count":
+			return catalog.Type{Name: "int8"}
+		case "bitsetbit":
+			return catalog.Type{Name: "bit"}
+		case "has_database_privilege", "has_table_privilege", "has_schema_privilege",
+			"has_column_privilege", "has_any_column_privilege", "has_sequence_privilege",
+			"has_function_privilege", "has_type_privilege", "has_largeobject_privilege":
+			return catalog.Type{Name: "bool"} // M0149-0001h / h1 / h1a
+		case "to_regtypemod":
+			return catalog.Type{Name: "int4"} // M0149-0001h1a13
+		case "regproc", "regprocedure", "regclass", "regtype", "regnamespace", "regrole", "regcollation", "regoper", "regoperator":
+			// a one-argument call named after a type is that cast
+			return catalog.Type{Name: strings.TrimPrefix(strings.ToLower(x.Name), "pg_catalog.")}
+		case "to_regclass", "to_regtype", "to_regrole", "to_regcollation", "to_regproc", "to_regprocedure", "to_regnamespace", "to_regoper", "to_regoperator":
+			return catalog.Type{Name: strings.TrimPrefix(strings.TrimPrefix(strings.ToLower(x.Name), "pg_catalog."), "to_")} // M0149-0001h1a12
+		case "lo_create", "lo_creat", "lo_from_bytea", "lo_import":
+			return catalog.Type{Name: "oid"} // M0149-0001h1a
+		case "lo_unlink", "lo_open", "lo_close", "lowrite", "lo_lseek", "lo_tell",
+			"lo_truncate", "lo_truncate64", "lo_export":
+			return catalog.Type{Name: "int4"}
+		case "lo_lseek64", "lo_tell64":
+			return catalog.Type{Name: "int8"}
+		case "loread", "lo_get":
+			return catalog.Type{Name: "bytea"}
+		case "lo_put":
+			return catalog.Type{Name: "void"}
 		case "row":
 			// `row(a, b)` reaches the planner as a call named row; PG's
 			// RowExpr is an anonymous record (M0146-0053) — a VALUES column
@@ -17219,6 +17924,14 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "int8"}
 		case "current_timestamp", "now", "transaction_timestamp", "statement_timestamp":
 			return catalog.Type{Name: "timestamp"}
+		case "scale", "min_scale":
+			return catalog.Type{Name: "int4"}
+		case "trim_scale":
+			return catalog.Type{Name: "numeric"}
+		case "current_time":
+			return catalog.Type{Name: "timetz"}
+		case "localtime":
+			return catalog.Type{Name: "time"}
 		case "current_date", "to_date":
 			return catalog.Type{Name: "date"}
 		case "to_timestamp":
@@ -17293,10 +18006,22 @@ func exprType(e Expr) catalog.Type {
 		case "pg_trigger_depth":
 			// pg_trigger_depth() -> int4 (pg_proc.dat oid 3163). M0146-0080.
 			return catalog.Type{Name: "int4"}
+		case "pg_create_restore_point":
+			// pg_create_restore_point(text) -> pg_lsn (pg_proc.dat oid 3098). M0149-0023a.
+			return catalog.Type{Name: "pg_lsn"}
 		case "pg_current_wal_lsn", "pg_current_wal_insert_lsn", "pg_current_wal_flush_lsn":
 			// xlogfuncs.c; pg_proc.dat oids 2849/2852/3330: prorettype pg_lsn.
 			// M0122-0009 S7.
 			return catalog.Type{Name: "pg_lsn"}
+		case "pg_sequence_last_value":
+			// pg_sequence_last_value(regclass) -> int8 (pg_proc.dat oid 4032). M0149-0077.
+			return catalog.Type{Name: "int8"}
+		case "pg_walfile_name":
+			// pg_walfile_name(pg_lsn) -> text (pg_proc.dat oid 2851). M0149-0017.
+			return catalog.Type{Name: "text"}
+		case "pg_wal_lsn_diff":
+			// pg_wal_lsn_diff(pg_lsn, pg_lsn) -> numeric (pg_proc.dat oid 3165). M0149-0019a.
+			return catalog.Type{Name: "numeric"}
 		case "crc32", "crc32c", "bit_count":
 			// crc32/crc32c(bytea) -> int8 (pg_proc.dat:7954/7957); bit_count(bytea|bit)
 			// -> int8 (pg_proc.dat:1534/4201). Untyped these fall through to TypeOID 25,
@@ -17344,6 +18069,13 @@ func exprType(e Expr) catalog.Type {
 				}
 			}
 			return catalog.Type{Name: "text[]"}
+		case "string_to_table":
+			// text_to_table returns setof text.
+			return catalog.Type{Name: "text"}
+		case "string_to_array", "regexp_split_to_array":
+			// text_to_array / text_to_array_null (pg_proc 394, 376) and
+			// regexp_split_to_array return text[].
+			return catalog.Type{Name: "text[]"}
 		case "array_construct":
 			// ARRAY[e1,...] constructor: return element type with [] suffix.
 			if len(x.Args) > 0 {
@@ -17382,6 +18114,15 @@ func exprType(e Expr) catalog.Type {
 				if strings.HasSuffix(arrT.Name, "[]") {
 					return catalog.Type{Name: arrT.Name[:len(arrT.Name)-2]}
 				}
+				// oidvector / int2vector subscripts are 0-based arrays of
+				// oid / int2 (pg_proc.proargtypes[0], pg_index.indkey[0]).
+				// M0149-0001h1a22.
+				if strings.EqualFold(arrT.Name, "oidvector") {
+					return catalog.Type{Name: "oid"}
+				}
+				if strings.EqualFold(arrT.Name, "int2vector") {
+					return catalog.Type{Name: "int2"}
+				}
 				// point[i] (0-based) yields the i-th coordinate as float8.
 				if strings.EqualFold(arrT.Name, "point") {
 					return catalog.Type{Name: "float8"}
@@ -17413,13 +18154,14 @@ func exprType(e Expr) catalog.Type {
 			for _, a := range x.Args {
 				t := exprType(a)
 				if t.Name != "unknown" && t.Name != "" {
-					return t
+					return typeWithCommonTypmod(t, x.Args)
 				}
 			}
 		case "nullif":
-			// NULLIF returns the type of its first argument (nullable).
+			// NULLIF returns the type of its first argument (nullable),
+			// without its typmod (exprTypmod has no NullIfExpr arm).
 			if len(x.Args) > 0 {
-				return exprType(x.Args[0])
+				return typeWithoutTypmod(exprType(x.Args[0]))
 			}
 		case "pg_size_bytes",
 			"pg_database_size", "pg_relation_size", "pg_total_relation_size",
@@ -17427,6 +18169,25 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "int8"}
 		case "bt_index_check", "bt_index_parent_check":
 			// amcheck verification functions RETURN void (slice S4 of 0110-0008).
+			return catalog.Type{Name: "void"}
+		case "pg_sleep", "pg_sleep_for", "pg_sleep_until",
+			"pg_advisory_lock", "pg_advisory_lock_shared", "pg_advisory_unlock_all",
+			"pg_advisory_xact_lock", "pg_advisory_xact_lock_shared",
+			"pg_notify", "setseed", "brin_desummarize_range",
+			"pg_stat_clear_snapshot", "pg_stat_force_next_flush", "pg_stat_reset",
+			"pg_stat_reset_backend_stats", "pg_stat_reset_replication_slot",
+			"pg_stat_reset_shared", "pg_stat_reset_single_function_counters",
+			"pg_stat_reset_single_table_counters", "pg_stat_reset_slru",
+			"pg_stat_reset_subscription_stats",
+			"pg_drop_replication_slot", "pg_sync_replication_slots",
+			"pg_replication_origin_advance", "pg_replication_origin_drop",
+			"pg_replication_origin_session_reset", "pg_replication_origin_session_setup",
+			"pg_replication_origin_xact_reset", "pg_replication_origin_xact_setup",
+			"pg_wal_replay_pause", "pg_wal_replay_resume",
+			"pg_clear_attribute_stats", "pg_clear_relation_stats",
+			"pg_extension_config_dump":
+			// Every pg_proc overload of these returns void, so RowDescription
+			// reports void (M0149-0001h1a3).
 			return catalog.Type{Name: "void"}
 		case "pg_my_temp_schema":
 			// Returns the OID of the session's temporary namespace (0 if none).
@@ -17437,7 +18198,7 @@ func exprType(e Expr) catalog.Type {
 			if len(x.Args) > 0 {
 				t := exprType(x.Args[0])
 				if t.Name != "unknown" && t.Name != "" {
-					return t
+					return typeWithoutTypmod(t)
 				}
 			}
 			return catalog.Type{Name: "numeric"}
@@ -17457,7 +18218,23 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "point"}
 		case "uuid_extract_version":
 			return catalog.Type{Name: "int2"}
-		case "uuid_extract_timestamp":
+		case "uuid_extract_timestamp", "date_add", "date_subtract":
+			return catalog.Type{Name: "timestamptz"}
+		case "date_bin":
+			// A timestamp argument selects the timestamp form unless the other
+			// is a timestamptz; otherwise the preferred type timestamptz wins.
+			plain, zoned := false, false
+			for _, a := range x.Args[min(1, len(x.Args)):] {
+				switch strings.ToLower(exprType(a).Name) {
+				case "timestamp", "timestamp without time zone":
+					plain = true
+				case "timestamptz", "timestamp with time zone":
+					zoned = true
+				}
+			}
+			if plain && !zoned {
+				return catalog.Type{Name: "timestamp"}
+			}
 			return catalog.Type{Name: "timestamptz"}
 		case "gen_random_uuid", "uuidv4", "uuidv7":
 			return catalog.Type{Name: "uuid"}
@@ -17475,19 +18252,7 @@ func exprType(e Expr) catalog.Type {
 			// output even though the runtime value is correct. M0134-0091.
 			return catalog.Type{Name: "float8"}
 		case "generate_series":
-			// generate_series returns int4 for int4 args or integer literals (PG overload rules).
-			if len(x.Args) >= 1 {
-				argT := exprType(x.Args[0]).Name
-				switch argT {
-				case "int4", "integer", "int":
-					return catalog.Type{Name: "int4"}
-				}
-				// Integer literals (untyped) default to int4 overload, matching PG's overload resolution.
-				if _, ok := x.Args[0].(*IntegerConst); ok {
-					return catalog.Type{Name: "int4"}
-				}
-			}
-			return catalog.Type{Name: "int8"}
+			return catalog.Type{Name: generateSeriesType(x.Args)}
 		case "unnest":
 			// unnest(array) returns the element type. M0097-0106.
 			// Strip ALL [] suffixes to handle 2D arrays (e.g. int[][] → int). M0097-0125.
@@ -17689,6 +18454,76 @@ func resolveValuesColumnType(planRows [][]Expr, col int) catalog.Type {
 	return typ
 }
 
+// valuesNumericRank orders the numeric types as unifyValueTypes does; 0 means the
+// type is not numeric.
+func valuesNumericRank(name string) int {
+	switch strings.ToLower(name) {
+	case "int2", "smallint", "smallserial":
+		return 1
+	case "int4", "integer", "int", "serial":
+		return 2
+	case "int8", "bigint", "bigserial":
+		return 3
+	case "numeric", "decimal":
+		return 4
+	case "float4", "real":
+		return 5
+	case "float8", "double precision", "double", "float":
+		return 6
+	}
+	return 0
+}
+
+// coerceValuesColumn is the select_common_type and coerce_to_common_type step of
+// transformValuesClause for one column, and returns the column's type. Every cell
+// takes that type: a string literal goes through the type's input function and a
+// value of another type is cast. Integer widths are left alone, because they share
+// one representation. Types select_common_type does not model keep typ.
+func coerceValuesColumn(planRows [][]Expr, col int, typ catalog.Type) (catalog.Type, error) {
+	cells := make([]Expr, len(planRows))
+	for r := range planRows {
+		cells[r] = planRows[r][col]
+	}
+	common, types, modelled, err := selectCommonType("VALUES", cells)
+	if err != nil {
+		return typ, err
+	}
+	if modelled && common != "" {
+		for i, cell := range cells {
+			if err := checkCommonTypeCoercion("VALUES", cell, types[i], common); err != nil {
+				return typ, err
+			}
+		}
+		if commonTypeCanonical(typ.Name) != common {
+			typ = catalog.Type{Name: common}
+		}
+	}
+	target := strings.ToLower(typ.Name)
+	if typ.IsArray && !strings.HasSuffix(target, "[]") {
+		target += "[]"
+	}
+	for r, cell := range cells {
+		if lit, ok := cell.(*StringConst); ok {
+			switch {
+			case target == "text" || target == "unknown" || target == "":
+			case castTargetTakesStringLiteral(target):
+				planRows[r][col] = &TypedStringLit{pos: lit.Pos(), Type: target, Value: lit.Value}
+			default:
+				planRows[r][col] = &CastExpr{pos: lit.Pos(), Operand: lit, TargetType: target, SourceType: "unknown"}
+			}
+			continue
+		}
+		if !modelled || types[r] == "" || types[r] == common {
+			continue
+		}
+		if isIntegerLikeType(types[r]) && isIntegerLikeType(common) {
+			continue
+		}
+		planRows[r][col] = &CastExpr{pos: cell.Pos(), Operand: cell, TargetType: target, SourceType: types[r]}
+	}
+	return typ, nil
+}
+
 // unifyValueTypes returns the "wider" of two types for VALUES column type inference.
 // Follows PostgreSQL's type unification rules for VALUES: integer types promote
 // to numeric when a non-integer numeric appears, and numeric/float types dominate.
@@ -17707,24 +18542,7 @@ func unifyValueTypes(a, b catalog.Type) catalog.Type {
 		return a
 	}
 	// Numeric type hierarchy: int2 < int4 < int8 < numeric < float4 < float8
-	numericRank := func(n string) int {
-		switch n {
-		case "int2", "smallint", "smallserial":
-			return 1
-		case "int4", "integer", "int", "serial":
-			return 2
-		case "int8", "bigint", "bigserial":
-			return 3
-		case "numeric", "decimal":
-			return 4
-		case "float4", "real":
-			return 5
-		case "float8", "double precision", "double", "float":
-			return 6
-		}
-		return 0
-	}
-	ra, rb := numericRank(an), numericRank(bn)
+	ra, rb := valuesNumericRank(an), valuesNumericRank(bn)
 	if ra > 0 && rb > 0 {
 		if ra >= rb {
 			return a
@@ -17888,6 +18706,11 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 	if cmp, ok := oneElementInAsComparison(x); ok {
 		return resolveExpr(cmp, ctx)
 	}
+	if tree, ok, err := rowInListAsBooleanTree(x); err != nil {
+		return nil, err
+	} else if ok {
+		return resolveExpr(tree, ctx)
+	}
 	// Row constructor IN (VALUES ...): expand to OR(AND(a=v1,b=v1b), ...) at plan time.
 	// M0097-0020.
 	if rowExpr, ok := x.Operand.(*parser.RowExpr); ok && x.Subquery != nil && len(x.Subquery.ValuesRows) > 0 {
@@ -17919,6 +18742,14 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 			r, err := resolveExpr(e, ctx)
 			if err != nil {
 				return nil, err
+			}
+			if t := timestampLiteralType(op); t != "" {
+				switch lit, isLit := r.(*StringConst); {
+				case !x.Quantified:
+					r = typedTimestampLiteral(r, t)
+				case isLit && !x.SplicedArray:
+					r = &CastExpr{pos: lit.Pos(), Operand: lit, TargetType: t + "[]", SourceType: "unknown"}
+				}
 			}
 			out.List[i] = r
 		}
@@ -17969,18 +18800,18 @@ func checkAnyAllArrayOperand(x *parser.InExpr, list []Expr) error {
 //
 // Only the IN (val_list) syntax qualifies: `= ANY (ARRAY[c])` desugars to the
 // same parser shape but is PG's AEXPR_OP_ANY, which stays an array
-// comparison (parser.InExpr.Quantified). A row operand or row item keeps the
-// IN form: PG builds make_row_comparison_op there, which goopg's `=` on rows
-// does not reproduce (ledgered).
+// comparison (parser.InExpr.Quantified). A row operand or row item is left
+// to rowInListAsBooleanTree: PG builds make_row_comparison_op there, which
+// goopg's `=` on rows does not reproduce.
 func oneElementInAsComparison(x *parser.InExpr) (parser.Expr, bool) {
 	if x == nil || x.Subquery != nil || x.Quantified || x.AnyOp != 0 || x.AllOp ||
 		x.NotEqualAny || len(x.List) != 1 {
 		return nil, false
 	}
-	if _, row := x.Operand.(*parser.RowExpr); row {
+	if _, row := rowConstructorElems(x.Operand); row {
 		return nil, false
 	}
-	if _, row := x.List[0].(*parser.RowExpr); row {
+	if _, row := rowConstructorElems(x.List[0]); row {
 		return nil, false
 	}
 	op := parser.OpEq
@@ -17988,6 +18819,104 @@ func oneElementInAsComparison(x *parser.InExpr) (parser.Expr, bool) {
 		op = parser.OpNe
 	}
 	return parser.NewBinaryOp(x.Pos(), op, x.Operand, x.List[0]), true
+}
+
+// rowInListAsBooleanTree is transformAExprIn's (parse_expr.c) "hard way"
+// for a row operand: `ROW(a, b) IN (ROW(1, 2), ROW(3, 4))`. The common type
+// of row items is RECORD, for which transformAExprIn never builds a
+// ScalarArrayOpExpr, so every list item becomes make_row_comparison_op of
+// the IN's operator and the items are combined with OR (`=`, IN) or AND
+// (`<>`, NOT IN), in list order:
+//
+//	(a, b) IN ((1, 2), (3, 4))      →  (a = 1 AND b = 2) OR (a = 3 AND b = 4)
+//	(a, b) NOT IN ((1, 2), (3, 4))  →  (a <> 1 OR b <> 2) AND (a <> 3 OR b <> 4)
+//
+// make_row_comparison_op (parse_expr.c) ANDs the per-column `=` and ORs the
+// per-column `<>`; one column is the bare comparison. The expansion is what
+// gives a NULL item PG's three-valued result — `(1, 3) IN ((1, 2), (NULL,
+// NULL))` is NULL, not false — and what lets FoldConstants and
+// reduceQualConstArms drop a constant-NULL item from a qual
+// (find_duplicate_ors), so `(thousand, tenthous) IN ((1, 1001), (NULL,
+// NULL))` is the index qual `thousand = 1 AND tenthous = 1001`
+// (M0148-0001c3a13).
+//
+// Only the IN (val_list) syntax qualifies (AEXPR_IN); every item must be a
+// row constructor, else the IN keeps its existing form. A nested row
+// element keeps the existing form too (make_op over rows is not
+// reproduced). A width mismatch is PG's 42601.
+func rowInListAsBooleanTree(x *parser.InExpr) (parser.Expr, bool, error) {
+	if x == nil || x.Subquery != nil || x.Quantified || x.AnyOp != 0 || x.AllOp ||
+		x.NotEqualAny || len(x.List) == 0 {
+		return nil, false, nil
+	}
+	lelems, ok := rowConstructorElems(x.Operand)
+	if !ok || len(lelems) == 0 {
+		return nil, false, nil
+	}
+	nested := func(es []parser.Expr) bool {
+		for _, e := range es {
+			if _, r := rowConstructorElems(e); r {
+				return true
+			}
+		}
+		return false
+	}
+	if nested(lelems) {
+		return nil, false, nil
+	}
+	items := make([][]parser.Expr, len(x.List))
+	for i, it := range x.List {
+		r, ok := rowConstructorElems(it)
+		if !ok || nested(r) {
+			return nil, false, nil
+		}
+		items[i] = r
+	}
+	colOp, combine := parser.OpEq, parser.OpAnd
+	itemOp := parser.OpOr
+	if x.Negated {
+		colOp, combine, itemOp = parser.OpNe, parser.OpOr, parser.OpAnd
+	}
+	pos := x.Pos()
+	var out parser.Expr
+	for _, r := range items {
+		if len(r) != len(lelems) {
+			return nil, false, &PlanError{Pos: pos, Code: "42601",
+				Message: "unequal number of entries in row expressions"}
+		}
+		var cmp parser.Expr
+		for j, l := range lelems {
+			c := parser.NewBinaryOp(pos, colOp, l, r[j])
+			if cmp == nil {
+				cmp = c
+			} else {
+				cmp = parser.NewBinaryOp(pos, combine, cmp, c)
+			}
+		}
+		if out == nil {
+			out = cmp
+		} else {
+			out = parser.NewBinaryOp(pos, itemOp, out, cmp)
+		}
+	}
+	return out, true, nil
+}
+
+// rowConstructorElems returns the fields of a row constructor: the implicit
+// `(a, b)` (parser.RowExpr) or the explicit `ROW(a, b)`, which the grammar
+// builds as a plain call named row (pg_grammar.y implicit_row note).
+func rowConstructorElems(e parser.Expr) ([]parser.Expr, bool) {
+	switch x := e.(type) {
+	case *parser.RowExpr:
+		return x.Elems, true
+	case *parser.FuncCall:
+		if x.Name.Schema == "" && strings.EqualFold(x.Name.Name, "row") && !x.Star &&
+			!x.Distinct && x.Over == nil && x.Filter == nil && len(x.OrderBy) == 0 &&
+			len(x.WithinGroup) == 0 {
+			return x.Args, true
+		}
+	}
+	return nil, false
 }
 
 // planExistsExpr plans the inner subquery and wraps in an
@@ -18461,6 +19390,9 @@ func resolveCaseExpr(x *parser.CaseExpr, ctx *resolveContext) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
+		if out.Operand != nil {
+			when = typedTimestampLiteral(when, timestampLiteralType(out.Operand))
+		}
 		then, err := resolveExpr(w.Then, ctx)
 		if err != nil {
 			return nil, err
@@ -18549,7 +19481,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 	case *parser.NumericConst:
 		return &NumericConst{pos: x.Pos(), Value: x.Value}, nil
 	case *parser.StringConst:
-		return &StringConst{pos: x.Pos(), Value: x.Value}, nil
+		return &StringConst{pos: x.Pos(), Value: x.Value, BitString: x.BitString}, nil
 	case *parser.TypedStringLit:
 		return &TypedStringLit{pos: x.Pos(), Type: x.Type, Value: x.Value}, nil
 	case *parser.IntervalLit:
@@ -18630,17 +19562,49 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		// comparisons like col > 'yellow' compare labels alphabetically instead
 		// of by declaration order. M0097-enum-cmp.
 		switch x.Op {
+		case parser.OpContains, parser.OpContainedBy, parser.OpOverlap:
+			l, r = coerceDatetimeArrayOperands(l, r)
 		case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+			l, r = coerceTimestampOperands(l, r)
+			l, r = coerceDatetimeArrayOperands(l, r)
 			lt, rt := exprType(l), exprType(r)
 			if strings.EqualFold(lt.Name, "name") && !strings.EqualFold(rt.Name, "name") && isTextLikePlannerType(rt.Name) {
 				r = &CastExpr{pos: x.Pos(), Operand: r, TargetType: "name"}
 			} else if strings.EqualFold(rt.Name, "name") && !strings.EqualFold(lt.Name, "name") && isTextLikePlannerType(lt.Name) {
 				l = &CastExpr{pos: x.Pos(), Operand: l, TargetType: "name"}
+			} else if strings.EqualFold(lt.Name, "money") && !strings.EqualFold(rt.Name, "money") && isTextLikePlannerType(rt.Name) {
+				// A literal compared with a money column is cash_in'd, as PG
+				// resolves the unknown literal to money. M0149-0001k1.
+				r = &CastExpr{pos: x.Pos(), Operand: r, TargetType: "money"}
+			} else if strings.EqualFold(rt.Name, "money") && !strings.EqualFold(lt.Name, "money") && isTextLikePlannerType(lt.Name) {
+				l = &CastExpr{pos: x.Pos(), Operand: l, TargetType: "money"}
 			} else if isUserDefinedPlannerType(lt.Name) && isTextLikePlannerType(rt.Name) {
 				r = &CastExpr{pos: x.Pos(), Operand: r, TargetType: strings.ToLower(lt.Name)}
 			} else if isTextLikePlannerType(lt.Name) && isUserDefinedPlannerType(rt.Name) {
 				l = &CastExpr{pos: x.Pos(), Operand: l, TargetType: strings.ToLower(rt.Name)}
 			}
+		}
+		if fc, ok := bitStringOpCall(x.Pos(), x.Op, l, r); ok {
+			return fc, nil
+		}
+		if fc, ok := moneyArithCall(x.Pos(), x.Op, l, r); ok {
+			return fc, nil
+		}
+		if e, ok, err := timeArithCall(x.Pos(), x.Op, l, r); err != nil {
+			return nil, err
+		} else if ok {
+			return e, nil
+		}
+		if e, ok, err := dateTimeLiteralCall(x.Pos(), x.Op, l, r); err != nil {
+			return nil, err
+		} else if ok {
+			return e, nil
+		}
+		if e, ok := rangeOpCall(x.Pos(), x.Op, l, r); ok {
+			return e, nil
+		}
+		if x.Op == parser.OpConcat {
+			l, r = moneyConcatOperand(l), moneyConcatOperand(r)
 		}
 		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
 		switch x.Op {
@@ -18654,6 +19618,9 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		op, err := resolveExpr(x.Operand, ctx)
 		if err != nil {
 			return nil, err
+		}
+		if x.Op == parser.OpBitNot && isBitStringType(exprType(op)) {
+			return &FuncCall{pos: x.Pos(), Name: "bitnot", Args: []Expr{op}, ReturnType: "bit", Operator: "~"}, nil
 		}
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: op}, nil
 	case *parser.FuncCall:
@@ -18713,8 +19680,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 			if err != nil {
 				return nil, err
 			}
-			typName := pgTypeofDisplayName(exprType(arg))
-			return &FuncCall{pos: x.Pos(), Name: "pg_typeof", Args: []Expr{&StringConst{Value: typName}}}, nil
+			return foldPgTypeof(x.Pos(), arg), nil
 		}
 		// pg_collation_for(expr): PostgreSQL resolves the collation OID during
 		// parse analysis (exprCollation), so the result is a static property of
@@ -18819,6 +19785,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 			}
 		}
 		fc := &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star, Variadic: varExp, ReturnType: returnType}
+		bitStringFuncOverload(fc)
 		if err := coerceCommonTypeArgs(fc); err != nil {
 			return nil, err
 		}
@@ -18874,7 +19841,9 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		// runtime cast.
 		if lit, isStr := operand.(*StringConst); isStr && typmod == 0 {
 			if castTargetTakesStringLiteral(typeName) {
-				return &TypedStringLit{pos: x.Pos(), Type: typeName, Value: lit.Value}, nil
+				// coerce_type reports a bad literal at the literal, not at the
+				// "::" that follows it.
+				return &TypedStringLit{pos: lit.Pos(), Type: typeName, Value: lit.Value}, nil
 			}
 		}
 		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: srcType, Typmod: typmod, Explicit: true}, nil
@@ -18900,6 +19869,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
+		lv, rv = coerceTimestampOperands(lv, rv)
 		return &IsDistinctFromExpr{pos: x.Pos(), Left: lv, Right: rv, Negated: x.Negated}, nil
 	case *parser.ArraySubscriptExpr:
 		if x.IsSlice {
@@ -19342,6 +20312,9 @@ func resolveTableoidForBinding(b rangeBinding, level, pos int) Expr {
 		}
 		return &OuterColumnRef{pos: pos, Level: level, Index: idx, Name: "tableoid", Type: catalog.Type{Name: "oid"}, SourceTableIdx: b.sourceIdx}
 	}
+	if b.singleLeafOID != 0 {
+		return &TableOidExpr{pos: pos, TableOID: b.singleLeafOID}
+	}
 	return &TableOidExpr{pos: pos, TableOID: b.table.OID}
 }
 
@@ -19445,6 +20418,12 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 	// and the promotion's re-costing has no num_sa_scans. PG 18 does make
 	// this an Index Only Scan — ledgered; declining is the safe half.
 	if idxScan.SkipPrefix > 0 {
+		return proj
+	}
+	// M0148-0001c3a3: likewise a backward scan. IndexOnlyScan.Backward is
+	// the S6 max rewrite's materialised reverse, not a reverse leaf walk;
+	// promoting would trade a lazy backward scan for a full materialisation.
+	if idxScan.Backward {
 		return proj
 	}
 	// M0134-0001 S4 (class 8): an EXCLUSIVE bound used to block promotion,
@@ -19562,8 +20541,14 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 		HighKey: idxScan.HighKey,
 		LowOp:   idxScan.LowOp,
 		HighOp:  idxScan.HighOp,
-		Covered: covered,
-		schema:  iosSchema,
+		// M0148-0001c3a: the NullTest index qual moves with the bounds (its
+		// Filter is already gone).
+		LeadingNullTest:     idxScan.LeadingNullTest,
+		NullTestAfterBounds: idxScan.NullTestAfterBounds,
+		ExtraNullTests:      idxScan.ExtraNullTests,
+		IndexCondOrder:      idxScan.IndexCondOrder,
+		Covered:             covered,
+		schema:              iosSchema,
 	}
 
 	var out Node = ios
@@ -19621,7 +20606,7 @@ func remapColumnRefsToSchema(e Expr, oldSchema Schema, newIndex map[string]int) 
 		for i, a := range x.Args {
 			args[i] = remapColumnRefsToSchema(a, oldSchema, newIndex)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, Operator: x.Operator, SQLName: x.SQLName}
 	case *InExpr:
 		list := make([]Expr, len(x.List))
 		for i, item := range x.List {
@@ -19855,7 +20840,7 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 		for i, a := range x.Args {
 			args[i] = shiftColumnRefsBy(a, delta)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, Operator: x.Operator, SQLName: x.SQLName}
 	case *InExpr:
 		// Mirror walkColumnRefs' InExpr handling so this rewriter stays in
 		// sync with the side-classifier (classifyConjunctSide). A literal-list
@@ -20267,4 +21252,196 @@ func modResultType(args []Expr) catalog.Type {
 		return catalog.Type{Name: "int8"}
 	}
 	return catalog.Type{Name: "numeric"}
+}
+
+// moneyArithCall rewrites an arithmetic operator with a money operand into
+// the PG builtin its pg_operator row names (pg_operator.dat: cash_pl,
+// cash_mi, cash_mul_flt8/flt4/int8/int4/int2, flt8/flt4/int8/int4/int2_mul_cash,
+// cash_div_flt8/flt4/int8/int4/int2, cash_div_cash). goopg's money Datum is a
+// scale-2 numeric, so generic numeric arithmetic would type the result as
+// numeric (printed without cash_out) and round division wrongly; the builtins
+// carry PG's own semantics (rint for float operands, truncating integer
+// division, 22012 on a zero divisor) and their result type. A numeric operand
+// takes the float8 operator, as PG's implicit numeric→float8 cast resolves
+// it; a bare literal beside + / - is cast to money. All three BinaryOp
+// resolvers (resolveExpr, resolveExprAfterAggregate, resolveExprAfterWindow)
+// call it. M0149-0001k1.
+func moneyArithCall(pos int, op parser.OpCode, l, r Expr) (*FuncCall, bool) {
+	lt, rt := exprType(l), exprType(r)
+	lm := strings.EqualFold(lt.Name, "money") && !lt.IsArray
+	rm := strings.EqualFold(rt.Name, "money") && !rt.IsArray
+	if !lm && !rm {
+		return nil, false
+	}
+	suffix := func(t catalog.Type) string {
+		switch strings.ToLower(t.Name) {
+		case "int2", "smallint":
+			return "int2"
+		case "int4", "integer", "int":
+			return "int4"
+		case "int8", "bigint":
+			return "int8"
+		case "float4", "real":
+			return "flt4"
+		case "float8", "double precision", "numeric", "decimal":
+			return "flt8"
+		}
+		return ""
+	}
+	call := func(name, ret string, args ...Expr) (*FuncCall, bool) {
+		return &FuncCall{pos: pos, Name: name, Args: args, ReturnType: ret, Operator: op.String()}, true
+	}
+	asMoney := func(e Expr, t catalog.Type, isMoney bool) (Expr, bool) {
+		if isMoney {
+			return e, true
+		}
+		if isTextLikePlannerType(t.Name) || t.Name == "" || strings.EqualFold(t.Name, "unknown") {
+			return &CastExpr{pos: pos, Operand: e, TargetType: "money"}, true
+		}
+		return nil, false
+	}
+	switch op {
+	case parser.OpAdd, parser.OpSub:
+		a, okA := asMoney(l, lt, lm)
+		b, okB := asMoney(r, rt, rm)
+		if !okA || !okB {
+			return nil, false
+		}
+		if op == parser.OpAdd {
+			return call("cash_pl", "money", a, b)
+		}
+		return call("cash_mi", "money", a, b)
+	case parser.OpMul:
+		if lm && !rm {
+			if sfx := suffix(rt); sfx != "" {
+				return call("cash_mul_"+sfx, "money", l, r)
+			}
+		}
+		if rm && !lm {
+			if sfx := suffix(lt); sfx != "" {
+				return call(sfx+"_mul_cash", "money", l, r)
+			}
+		}
+	case parser.OpDiv:
+		if lm && rm {
+			return call("cash_div_cash", "float8", l, r)
+		}
+		if lm {
+			if sfx := suffix(rt); sfx != "" {
+				return call("cash_div_"+sfx, "money", l, r)
+			}
+		}
+	}
+	return nil, false
+}
+
+// moneyConcatOperand renders a money operand of || as text: PG's anytextcat /
+// textanycat call the operand's output function (cash_out), so `m || 'x'`
+// is "$1.00x". goopg's money Datum is a scale-2 numeric, which a generic
+// concat would print bare; the implicit text cast carries SourceType money
+// to the executor's cash_out arm. M0149-0001k5.
+func moneyConcatOperand(e Expr) Expr {
+	t := exprType(e)
+	if !strings.EqualFold(t.Name, "money") || t.IsArray {
+		return e
+	}
+	return &CastExpr{pos: e.Pos(), Operand: e, TargetType: "text", SourceType: "money"}
+}
+
+// isBitStringType reports bit / bit varying (not their arrays).
+func isBitStringType(t catalog.Type) bool {
+	if t.IsArray {
+		return false
+	}
+	switch strings.ToLower(t.Name) {
+	case "bit", "varbit", "bit varying":
+		return true
+	}
+	return false
+}
+
+// bitStringOpCall resolves the bit-string operators (pg_operator.dat over
+// varbit.c) into their functions: & | # → bitand / bitor / bitxor and
+// << >> → bitshiftleft / bitshiftright, all returning bit; || on two bit
+// strings → bitcat, returning bit varying. A plain string literal next to a
+// bit operand is an unknown-type constant and resolves to bit, as PG's
+// operator resolution does. M0149-0001h1a1.
+func bitStringOpCall(pos int, op parser.OpCode, l, r Expr) (*FuncCall, bool) {
+	lt, rt := exprType(l), exprType(r)
+	lb, rb := isBitStringType(lt), isBitStringType(rt)
+	if !lb && !rb {
+		return nil, false
+	}
+	unknownLit := func(e Expr) bool {
+		sc, ok := e.(*StringConst)
+		return ok && !sc.BitString
+	}
+	bothBit := (lb || unknownLit(l)) && (rb || unknownLit(r))
+	if bothBit {
+		// The unknown literal is read by bit_in, so `B'1' | '12'` is 22P02.
+		if !lb {
+			l = &CastExpr{pos: l.Pos(), Operand: l, TargetType: "varbit"}
+		}
+		if !rb {
+			r = &CastExpr{pos: r.Pos(), Operand: r, TargetType: "varbit"}
+		}
+	}
+	call := func(name, ret string, args ...Expr) (*FuncCall, bool) {
+		return &FuncCall{pos: pos, Name: name, Args: args, ReturnType: ret, Operator: op.String()}, true
+	}
+	switch op {
+	case parser.OpBitAnd:
+		if bothBit {
+			return call("bitand", "bit", l, r)
+		}
+	case parser.OpBitOr:
+		if bothBit {
+			return call("bitor", "bit", l, r)
+		}
+	case parser.OpBitXor:
+		if bothBit {
+			return call("bitxor", "bit", l, r)
+		}
+	case parser.OpBitShiftLeft, parser.OpBitShiftRight:
+		if lb && isIntegerLikeType(rt.Name) {
+			if op == parser.OpBitShiftLeft {
+				return call("bitshiftleft", "bit", l, r)
+			}
+			return call("bitshiftright", "bit", l, r)
+		}
+	case parser.OpConcat:
+		if bothBit {
+			return call("bitcat", "varbit", l, r)
+		}
+	}
+	return nil, false
+}
+
+// bitStringFuncOverload resolves the functions overloaded on bytea / text
+// and bit (pg_proc.dat) to their bit variants when the first argument is a
+// bit string: octet_length → bitoctetlength, bit_length → bitlength (the
+// bit count, not 8 × octets), bit_count → bit_bit_count, get_bit →
+// bitgetbit, set_bit → bitsetbit. M0149-0001h1a1.
+func bitStringFuncOverload(fc *FuncCall) {
+	if len(fc.Args) == 0 || !isBitStringType(exprType(fc.Args[0])) || strings.Contains(fc.Name, ".") {
+		return
+	}
+	orig := strings.ToLower(fc.Name)
+	defer func() {
+		if fc.Name != orig {
+			fc.SQLName = orig
+		}
+	}()
+	switch orig {
+	case "octet_length":
+		fc.Name, fc.ReturnType = "bitoctetlength", "int4"
+	case "bit_length":
+		fc.Name, fc.ReturnType = "bitlength", "int4"
+	case "bit_count":
+		fc.Name, fc.ReturnType = "bit_bit_count", "int8"
+	case "get_bit":
+		fc.Name, fc.ReturnType = "bitgetbit", "int4"
+	case "set_bit":
+		fc.Name, fc.ReturnType = "bitsetbit", "bit"
+	}
 }

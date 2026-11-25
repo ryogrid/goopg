@@ -222,6 +222,15 @@ func (s *exprTreeSlab) buildExprCtx(e optimizer.Expr, ctx *Context) int32 {
 		return idx
 
 	case *optimizer.BinaryOp:
+		// `||` with a reg*-typed operand renders that operand through its
+		// output function (regArgText) on the interpreted twin; the compiled
+		// payload has no bit left to carry it, so it keeps the adapter.
+		// M0149-0001h1a33.
+		if t.Op == parser.OpConcat && (isRegTypedExpr(t.Left) || isRegTypedExpr(t.Right)) {
+			idx := int32(len(*s))
+			*s = append(*s, ExprNode{Kind: ExprAdapter, orig: e})
+			return idx
+		}
 		// Float-typed arithmetic must use evalExprSlot's float64 path; the
 		// fast path's exact arithmetic diverges from PostgreSQL float8 output.
 		if isFloatResultType(t.ResultType) {

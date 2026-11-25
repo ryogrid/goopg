@@ -64,6 +64,9 @@ type Options struct {
 	// line. Use it for synchronous_standby_names / synchronous_commit
 	// / etc.
 	ExtraConf []string
+	// InitDBArgs are extra initdb arguments (e.g. Cluster.pm's init
+	// extra => ['--wal-segsize' => 1]).
+	InitDBArgs []string
 	// StartupWait bounds the pg_ctl start invocation. Defaults to 30s.
 	StartupWait time.Duration
 	// RepoRoot resolves the default BinDir. Required when BinDir is
@@ -85,7 +88,13 @@ type Cluster struct {
 	startupWait time.Duration
 	postgresCmd *exec.Cmd
 	logFile     *os.File
+	startArgs   []string
+	initDBArgs  []string
 }
+
+// SetStartArgs sets extra postgres command-line arguments for every later
+// Start — e.g. Cluster.pm's `--cluster-name=<node>`.
+func (c *Cluster) SetStartArgs(args ...string) { c.startArgs = append([]string(nil), args...) }
 
 // Available skips the calling test when the upstream PG bin directory
 // is missing the binaries pgcluster needs.
@@ -177,6 +186,7 @@ func newClusterHandle(name string, opts Options) (*Cluster, error) {
 		database:    db,
 		libDir:      filepath.Join(filepath.Dir(bin), "lib"),
 		startupWait: opts.StartupWait,
+		initDBArgs:  opts.InitDBArgs,
 	}
 	return c, nil
 }
@@ -188,6 +198,7 @@ func (c *Cluster) runInitdb() error {
 		"--auth-local=trust", "--auth-host=trust",
 		"--no-sync",
 	)
+	cmd.Args = append(cmd.Args, c.initDBArgs...)
 	cmd.Env = c.env()
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("pgcluster: initdb: %v\n%s", err, out)
@@ -242,10 +253,8 @@ func (c *Cluster) Start() error {
 	if err != nil {
 		return fmt.Errorf("pgcluster: open log: %w", err)
 	}
-	cmd := exec.Command(filepath.Join(c.bin, "postgres"),
-		"-D", c.dataDir,
-		"-p", fmt.Sprintf("%d", c.port),
-		"-h", "127.0.0.1")
+	pgArgs := append([]string{"-D", c.dataDir, "-p", fmt.Sprintf("%d", c.port), "-h", "127.0.0.1"}, c.startArgs...)
+	cmd := exec.Command(filepath.Join(c.bin, "postgres"), pgArgs...)
 	env := c.env()
 	if soPath, ok, errPre := segvBacktraceLDPreload(); ok {
 		env = appendLDPreload(env, soPath)

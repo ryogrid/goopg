@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 
 	"github.com/goopg/goopg/internal/access/transam"
+	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
@@ -73,6 +74,14 @@ func replayCLogFromWAL(walDir string, clog *transam.CLog, txnMgr *transam.Manage
 	// skips pre-checkpoint records whose XIDs are already covered by the
 	// checkpoint's pg_control state.
 	startIdx, _ := xlog.ExportedReplayStart(records)
+	// Start at this node's own redo point when it is earlier — pg_control's
+	// checkpoint copy. On a standby that is its last restartpoint, which
+	// can precede the newest checkpoint record in the WAL it received from
+	// the primary: commits replayed between the two are only in memory
+	// (the restartpoint flushed clog up to its redo), so starting at the
+	// primary's checkpoint left them unknown and the sweep below stamped
+	// them aborted after a standby crash (M0149-0016b).
+	startIdx = replayStartFromControl(walDir, records, startIdx)
 	for _, r := range records[startIdx:] {
 		// M0131-S30.7: nextXID must be beyond EVERY replayed record's XID,
 		// not only the XIDs that reached a commit/abort record. Upstream does
@@ -132,14 +141,24 @@ func replayCLogFromWAL(walDir string, clog *transam.CLog, txnMgr *transam.Manage
 			// COMMIT/ABORT (and their two-phase variants, which goopg refuses
 			// in the physical pass).
 			op := r.XLog.Header.Info & xlog.XlogXactOpMask
-			if op != xlog.XlogXactCommit && op != xlog.XlogXactAbort {
-				continue
-			}
-			if r.XLog.Header.XID == 0 {
+			prepared := op == xlog.XlogXactCommitPrepared || op == xlog.XlogXactAbortPrepared
+			if op != xlog.XlogXactCommit && op != xlog.XlogXactAbort && !prepared {
 				continue
 			}
 			xid := storage.TransactionID(r.XLog.Header.XID)
-			isCommit := op == xlog.XlogXactCommit
+			if prepared {
+				// COMMIT/ABORT PREPARED finish the record's twophase xid, not
+				// the header xid (xact_redo, xact.c). M0149-0012.
+				parsed, perr := xlog.ParseXactRecord(r.XLog.Header.Info, r.XLog.MainData)
+				if perr != nil || parsed.TwophaseXid == 0 {
+					continue
+				}
+				xid = storage.TransactionID(parsed.TwophaseXid)
+			}
+			if xid == 0 {
+				continue
+			}
+			isCommit := op == xlog.XlogXactCommit || op == xlog.XlogXactCommitPrepared
 			xactStampAndAdvance(clog, txnMgr, xid, isCommit)
 			// M0131-S22: stamp the whole transaction TREE, as
 			// TransactionIdCommitTree / TransactionIdAbortTree do
@@ -300,4 +319,24 @@ func walHasXactRecords(walDir string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// replayStartFromControl moves startIdx back to the first record at or after
+// pg_control's checkpoint redo when that comes earlier — StartupXLOG replays
+// from ControlFile->checkPointCopy.redo, whatever later checkpoint records
+// the WAL holds. walDir is <datadir>/pg_wal.
+func replayStartFromControl(walDir string, records []xlog.Record, startIdx int) int {
+	cd, err := control.ReadControlFile(filepath.Dir(filepath.Clean(walDir)))
+	if err != nil || cd == nil || cd.CheckPointCopyRedo == 0 {
+		return startIdx
+	}
+	for i, r := range records {
+		if r.StartLSN >= cd.CheckPointCopyRedo {
+			if i < startIdx {
+				return i
+			}
+			return startIdx
+		}
+	}
+	return startIdx
 }

@@ -44,6 +44,7 @@ package postmaster
 // a crash, connections to a recovered database succeeding) still holds.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -59,6 +60,7 @@ import (
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/libpq"
 	"github.com/goopg/goopg/internal/utils/errcodes"
 	"github.com/goopg/goopg/internal/utils/misc"
@@ -73,8 +75,10 @@ import (
 // sqlstate.SystemError via databaseDDLErrorSQLState, matching an
 // internal-error rather than a user-facing PG error condition.
 type databaseDDLError struct {
-	code errcodes.Code
-	msg  string
+	code  errcodes.Code
+	msg   string
+	hint  string
+	fatal bool // ereport(FATAL): the session ends after the error (M0149-0005)
 }
 
 func (e *databaseDDLError) Error() string { return e.msg }
@@ -787,6 +791,15 @@ func (s *Server) resolveCreateDatabaseTemplate(templateName string) (srcOid uint
 		return 0, nil, nil, nil, nil, &databaseDDLError{
 			code: errcodes.UndefinedDatabase,
 			msg:  fmt.Sprintf("template database %q does not exist", templateName),
+		}
+	}
+	// createdb refuses a template left invalid by an interrupted DROP
+	// DATABASE (dbcommands.c, database_is_invalid_oid). M0149-0005.
+	if reg, ok := s.cfg.Catalog.(databaseConnLimitRegistry); ok && reg.DatabaseConnLimit(templateName) == catalog.DatconnlimitInvalidDB {
+		return 0, nil, nil, nil, nil, &databaseDDLError{
+			code: errcodes.ObjectNotInPrerequisiteState,
+			msg:  fmt.Sprintf("cannot use invalid database \"%s\" as template", templateName),
+			hint: "Use DROP DATABASE to drop invalid databases.",
 		}
 	}
 	if oid == catalog.DefaultDBOid {
@@ -1571,6 +1584,15 @@ func (s *Server) actingRoleIsSuperuser(actingRole string) bool {
 // datdba, and DROP DATABASE requires it to either own the target database or
 // be a superuser (mirrors dbcommands.c dropdb()'s object_ownercheck call).
 func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole string, resolveCurrent currentGUCResolver) (bool, string, error) {
+	return s.tryHandleDatabaseDDLWith(nil, sql, liveDBName, actingRole, resolveCurrent)
+}
+
+// tryHandleDatabaseDDLWith is tryHandleDatabaseDDL with the calling
+// session's statement context and lock identity (st may be nil).
+func (s *Server) tryHandleDatabaseDDLWith(st *ddlCallState, sql string, liveDBName string, actingRole string, resolveCurrent currentGUCResolver) (bool, string, error) {
+	if err := s.refuseAlterInvalidDatabase(sql); err != nil {
+		return true, "", err
+	}
 	if op, ok := parseAlterDatabaseConfig(sql); ok {
 		return s.applyAlterDatabaseConfig(op, liveDBName, resolveCurrent)
 	}
@@ -1867,6 +1889,22 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 		// Captured before DropDatabase below, which deletes the catalog's
 		// name->oid mapping along with the rest of the entry.
 		droppedOid := cat.DatabaseOid(name)
+		// dropdb (dbcommands.c): before anything irreversible, mark the
+		// database invalid (datconnlimit = DATCONNLIMIT_INVALID_DB, an
+		// in-place update that is durable at once), then take
+		// remove_dbtablespaces' AccessShareLock on pg_tablespace. A DROP
+		// cancelled while waiting for it leaves the database in place but
+		// invalid: no one can connect, and only DROP DATABASE works on it.
+		// M0149-0005.
+		s.markDatabaseInvalid(name, droppedOid)
+		releaseTblspc, lerr := executor.LockSharedCatalogForDDL(st.context(), st.backend(), pgTablespaceRelOID, lmgr.AccessShareLock)
+		if lerr != nil {
+			if ee, ok := lerr.(*executor.ExecError); ok {
+				return true, "", &databaseDDLError{code: errcodes.Code(ee.Code), msg: ee.Message}
+			}
+			return true, "", lerr
+		}
+		defer releaseTblspc()
 		if err := cat.DropDatabase(name); err != nil {
 			if errors.Is(err, catalog.ErrDatabaseNotFound) {
 				// Unreachable in practice (HasDatabase above already
@@ -1976,12 +2014,19 @@ func (s *Server) waitForDatabaseBackendsToDrain(name string) {
 // DATABASE parse-failure fallback). Returns handled=false when sql isn't a
 // database-DDL bypass form (or the bypass degrades to legacy no-op, e.g. no
 // catalog plumbed), so the caller continues its normal dispatch path.
-func (s *Server) handleDatabaseDDLBypass(sql, liveDBName, actingRole string, resolveCurrent currentGUCResolver, w *libpq.FrameWriter) (handled bool, err error) {
-	handled, notice, herr := s.tryHandleDatabaseDDL(sql, liveDBName, actingRole, resolveCurrent)
+func (s *Server) handleDatabaseDDLBypass(st *ddlCallState, sql, liveDBName, actingRole string, resolveCurrent currentGUCResolver, w *libpq.FrameWriter) (handled bool, err error) {
+	handled, notice, herr := s.tryHandleDatabaseDDLWith(st, sql, liveDBName, actingRole, resolveCurrent)
 	if !handled {
 		return false, nil
 	}
 	if herr != nil {
+		if de, ok := herr.(*databaseDDLError); ok && (de.fatal || de.hint != "") {
+			if de.fatal {
+				s.writeFatalHint(w, de.code, de.msg, de.hint)
+				return true, errDatabaseDDLFatal
+			}
+			return true, s.writeQueryError(w, de.code, de.msg, libpq.ErrorField{Code: libpq.FieldHint, Value: de.hint})
+		}
 		return true, s.writeQueryError(w, databaseDDLErrorSQLState(herr), herr.Error())
 	}
 	if notice != "" {
@@ -2118,13 +2163,10 @@ func (s *Server) applyAlterDatabaseConfig(op alterDatabaseConfigOp, liveDBName s
 		}
 		op.configValue = val
 	}
-	// FirstUserOID (16384) is the SAME SQL-visible placeholder OID
-	// pg_database.VirtualRows displays for the "postgres" row — NOT
-	// catalog.InMemory.DBOID() (the real on-disk physical OID datacl keys
-	// its heap resync under). pg_db_role_setting is a pure virtual table
-	// with no heap to resync, and pg_dump's dumpDatabaseConfig
-	// cross-references setdatabase against the oid it already read from
-	// pg_database, so the two must agree.
+	// PostgresDBOid (5) is the oid pg_database displays for the "postgres"
+	// row (M0149-0001a1 S2; it was the legacy 16384 placeholder). pg_dump's
+	// dumpDatabaseConfig cross-references setdatabase against the oid it
+	// already read from pg_database, so the two must agree.
 	if op.valueErr != nil {
 		return true, "", &databaseDDLError{code: errcodes.InvalidParameterValue, msg: op.valueErr.Error()}
 	}
@@ -2135,7 +2177,7 @@ func (s *Server) applyAlterDatabaseConfig(op alterDatabaseConfigOp, liveDBName s
 		}
 		op.configName = name
 	}
-	dbOid := catalog.FirstUserOID
+	dbOid := catalog.PostgresDBOid
 	switch {
 	case op.resetAll:
 		cat.ResetAllDatabaseConfig(dbOid)
@@ -2151,4 +2193,83 @@ func (s *Server) applyAlterDatabaseConfig(op alterDatabaseConfigOp, liveDBName s
 		return true, "", err
 	}
 	return true, "", nil
+}
+
+// alterDatabaseOptionRe matches AlterDatabaseStmt (gram.y: ALTER DATABASE
+// name [WITH] createdb_opt_list), whose options are the ones AlterDatabase
+// (dbcommands.c) handles: CONNECTION LIMIT, ALLOW_CONNECTIONS, IS_TEMPLATE
+// and TABLESPACE. SET / RESET / RENAME / OWNER are other statements.
+var alterDatabaseOptionRe = regexp.MustCompile(`(?is)^\s*alter\s+database\s+("(?:[^"]|"")+"|[^\s;]+)\s+(?:with\s+)?(connection\s+limit|allow_connections|is_template|tablespace)\b`)
+
+// refuseAlterInvalidDatabase is AlterDatabase's invalid-database check: a
+// database marked datconnlimit = -2 by an interrupted DROP DATABASE cannot
+// be altered, and PG ends the session (ereport FATAL). M0149-0005.
+func (s *Server) refuseAlterInvalidDatabase(sql string) error {
+	m := alterDatabaseOptionRe.FindStringSubmatch(sql)
+	if m == nil {
+		return nil
+	}
+	name := m[1]
+	if strings.HasPrefix(name, `"`) {
+		name = strings.ReplaceAll(name[1:len(name)-1], `""`, `"`)
+	} else {
+		name = strings.ToLower(name)
+	}
+	reg, ok := s.cfg.Catalog.(databaseConnLimitRegistry)
+	if !ok || reg.DatabaseConnLimit(name) != catalog.DatconnlimitInvalidDB {
+		return nil
+	}
+	return &databaseDDLError{
+		code:  errcodes.ObjectNotInPrerequisiteState,
+		msg:   fmt.Sprintf("cannot alter invalid database \"%s\"", name),
+		hint:  "Use DROP DATABASE to drop invalid databases.",
+		fatal: true,
+	}
+}
+
+// errDatabaseDDLFatal ends the session after a FATAL database-DDL error has
+// been written to the client.
+var errDatabaseDDLFatal = fmt.Errorf("session terminated by FATAL")
+
+// pgTablespaceRelOID is pg_tablespace's relation OID (TableSpaceRelationId).
+const pgTablespaceRelOID = 1213
+
+// markDatabaseInvalid is dropdb's in-place datconnlimit = -2 update: the
+// in-memory registry and the pg_database heap row, committed on its own so
+// it survives a cancelled or crashed DROP. Reports whether the heap row was
+// written.
+func (s *Server) markDatabaseInvalid(name string, oid uint32) bool {
+	im, ok := s.cfg.Catalog.(*catalog.InMemory)
+	if !ok {
+		return false
+	}
+	im.SetDatabaseConnLimit(name, catalog.DatconnlimitInvalidDB)
+	if oid == 0 {
+		return false
+	}
+	return s.runPgDatabaseHeapTxn(func(ectx *executor.Context) error {
+		return executor.PersistDatConnLimit(ectx, catalog.PgDatabaseRowOid(oid), catalog.DatconnlimitInvalidDB)
+	}) == nil
+}
+
+// ddlCallState carries what a database DDL statement needs from its
+// session: the statement context (cancelled by pg_cancel_backend) and the
+// connection's lock identity.
+type ddlCallState struct {
+	ctx         context.Context
+	lockBackend lmgr.BackendID
+}
+
+func (st *ddlCallState) context() context.Context {
+	if st == nil || st.ctx == nil {
+		return context.Background()
+	}
+	return st.ctx
+}
+
+func (st *ddlCallState) backend() lmgr.BackendID {
+	if st == nil {
+		return 0
+	}
+	return st.lockBackend
 }

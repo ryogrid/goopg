@@ -115,6 +115,10 @@ func createPlanNodeUnpriced(p *Path) (Node, outputLayout) {
 	case PathGatherMerge:
 		// The order-preserving twin, priced by cost_gather_merge.
 		return createGatherMergePlan(p)
+	case PathPartitionwiseAppend:
+		// M0148-0001c3a9: the Append over a partitionwise join's child
+		// joins. partitionwisejoin.go.
+		return createPartitionwiseAppendPlan(p)
 	case PathParamAppend:
 		// M0146-0049: the leaf's UNION ALL around its member probes; the keys
 		// are bound by the nested loop that consumes it

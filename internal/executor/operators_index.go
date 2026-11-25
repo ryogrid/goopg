@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
@@ -314,6 +315,7 @@ type indexScanOp struct {
 	// first of those three). `isFullKeyProbe` is stashed for that
 	// deferred call; `ssiDone` makes it once-only.
 	cur            *nbtree.ScanCursor
+	rcur           *nbtree.ReverseScanCursor // IndexScan.Backward's cursor (M0148-0001c3a3); one of cur/rcur is live
 	scanDone       bool
 	sawTID         bool
 	isFullKeyProbe bool
@@ -327,8 +329,15 @@ type indexScanOp struct {
 	// own lazy array-element advance in index_getnext_tid. saopSeen
 	// dedups TIDs across equal array elements (IN (1,1,2)).
 	saopBounds [][2][]byte
-	saopIdx    int
+	// saopExcl is each element's bound exclusivity (lo, hi), aligned with
+	// saopBounds (M0148-0001c3a4 (c)).
+	saopExcl [][2]bool
+	saopIdx  int
 	saopSeen   map[storage.ItemPointer]struct{}
+	// trailCheck applies IndexScan.TrailingSAOP to each entry's key before
+	// it is queued for a heap fetch (M0148-0001c3a4 (i)); built on the first
+	// Rescan.
+	trailCheck *trailingKeyCheck
 
 	// skip-scan state (M0146-0005v, PG18's `_bt_skiparray`): a probe that
 	// binds a NON-leading key column is executed as an outer loop over the
@@ -491,6 +500,7 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 	o.idx = 0
 	o.hasLast = false
 	o.cur = nil
+	o.rcur = nil
 	o.scanDone = true
 	o.sawTID = false
 	o.isFullKeyProbe = false
@@ -499,6 +509,7 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 	// a scan verdict is owed.
 	o.ssiDone = true
 	o.saopBounds = nil
+	o.saopExcl = nil
 	o.saopIdx = 0
 	o.saopSeen = nil
 	o.skip.reset(true)
@@ -566,16 +577,41 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// scan's verdict (if any) is recorded before its state is reset.
 	o.finalizeIndexScanSSI()
 	o.flushKills() // C3-S3: mark pending kills before discarding them
+	if o.skipRangeScan() && o.trailCheck == nil {
+		c, err := newIndexColumnCheck(o.ctx, o.plan.Table, o.plan.Index, o.plan.SkipPrefix, func(ref *optimizer.ColumnRef) optimizer.Expr {
+			return skipRangePred(ref, o.plan.LowKey, o.plan.HighKey, o.plan.LowOp, o.plan.HighOp)
+		})
+		if err != nil {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		o.trailCheck = c
+	}
+	if o.plan.RowCompare != nil && o.trailCheck == nil {
+		c, err := newIndexRowCheck(o.ctx, o.plan.Table, o.plan.Index, o.plan.RowCompare)
+		if err != nil {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		o.trailCheck = c
+	}
+	if o.plan.TrailingSAOP != nil && o.trailCheck == nil {
+		c, err := newTrailingKeyCheck(o.ctx, o.plan.Table, o.plan.Index, o.plan.TrailingSAOP)
+		if err != nil {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		o.trailCheck = c
+	}
 	o.tids = o.tids[:0]
 	o.poss = o.poss[:0]
 	o.killList = o.killList[:0]
 	o.idx = 0
 	o.hasLast = false
 	o.cur = nil
+	o.rcur = nil
 	o.scanDone = true
 	o.sawTID = false
 	o.ssiDone = false
 	o.saopBounds = nil
+	o.saopExcl = nil
 	o.saopIdx = 0
 	o.saopSeen = nil
 	o.skip.reset(false)
@@ -612,7 +648,13 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// the SAOP arm on purpose: a plan carrying both shapes is a planner bug,
 	// and rescanSkip's shape check is what reports it rather than silently
 	// running the SAOP half.
-	if o.plan.SkipPrefix > 0 {
+	if o.plan.Backward && ((o.plan.SkipPrefix > 0 && !o.skipRangeScan()) || len(o.plan.SAOPKeys) > 0 || o.pidx != nil) {
+		// PG runs these backward too (array keys and skip arrays in reverse,
+		// a parallel scan's backward seize); goopg's planner does not
+		// produce them yet, so one reaching here is a planner bug.
+		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "backward index scan with a ScalarArrayOp, skip or parallel probe is not supported"}
+	}
+	if o.plan.SkipPrefix > 0 && !o.skipRangeScan() {
 		return o.rescanSkip()
 	}
 
@@ -681,6 +723,10 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		if len(o.plan.Index.Columns) > 1 {
 			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, key)
 		}
+	} else if o.skipRangeScan() {
+		// M0148-0001c3a4 (j): a skip scan's range on Columns[SkipPrefix] —
+		// the whole index, each entry checked by trailCheck.
+		loBytes, hiBytes, loExcl, hiExcl = nil, nil, false, false
 	} else {
 		// Range scan: evaluate lo/hi bounds independently.
 		lo, hiB, ok, err := o.lookupRangeBounds()
@@ -728,13 +774,24 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// The cursor is re-aimed, not reallocated, per rescan (M0122-0012 slice
 	// 80): PG's btrescan reuses the scan's one BTScanOpaque, and a
 	// parameterised inner index scan rescans once per outer row.
-	if o.curSpare == nil {
-		o.curSpare = new(nbtree.ScanCursor)
+	if o.plan.Backward {
+		// M0148-0001c3a3: the same bounds, walked from the high end down
+		// (nbtree.ReverseScanCursor, _bt_lock_and_validate_left's
+		// concurrent-split recovery on every left step).
+		rcur, rerr := o.tree.NewReverseScanCursor(loBytes, hiBytes, loExcl, hiExcl)
+		if rerr != nil {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: rerr.Error()}
+		}
+		o.cur, o.rcur = nil, rcur
+	} else {
+		if o.curSpare == nil {
+			o.curSpare = new(nbtree.ScanCursor)
+		}
+		if err := o.tree.ResetScanCursor(o.curSpare, loBytes, hiBytes, loExcl, hiExcl, leafFilter); err != nil {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		o.cur, o.rcur = o.curSpare, nil
 	}
-	if err := o.tree.ResetScanCursor(o.curSpare, loBytes, hiBytes, loExcl, hiExcl, leafFilter); err != nil {
-		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
-	}
-	o.cur = o.curSpare
 	o.scanDone = false
 	if o.hashBucketScan {
 		if len(o.hashProbeFingerprint) > 0 {
@@ -776,10 +833,6 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 // its bucket-grain SIREAD on a hash index, and the gap lock is finalised
 // over the unioned TID set.
 func (o *indexScanOp) rescanSAOP() error {
-	col, ok := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[0])
-	if !ok {
-		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[0], o.plan.Table.Name)}
-	}
 	// M0142-0005b: element keys are still evaluated and encoded eagerly at
 	// Rescan — preserving the pre-cursor eval timing and the eager
 	// per-element hash-bucket SIREADs — but each element's descent and leaf
@@ -790,103 +843,22 @@ func (o *indexScanOp) rescanSAOP() error {
 	// holds only TIDs actually pulled.
 	o.saopSeen = make(map[storage.ItemPointer]struct{}, len(o.plan.SAOPKeys))
 	hashRecorded := false
-	// M0145-0029: a SAOP probe may carry bounds on the SECOND index column
-	// (PG `Index Cond: ((a = ANY (...)) AND (b > 1))`). Each element's
-	// descent then runs [elem, low] .. [elem, high]; a missing side keeps the
-	// element's own prefix bound. The bounds are evaluated once.
-	var boundCol *catalog.Column
-	var lowV, highV Datum
-	hasLow, hasHigh := o.plan.LowKey != nil, o.plan.HighKey != nil
-	if (hasLow || hasHigh) && rangeColumnReversed(o.ctx, o.plan.Index, 1) {
-		// A DESC second column orders its values backwards in the tree, so the
-		// ascending [elem, low] .. [elem, high] window would be empty or wrong.
-		// The bounds are a Filter recheck on this probe anyway (they never
-		// carry a `local`), so the descent just covers the element's whole
-		// prefix group and the recheck applies them.
-		hasLow, hasHigh = false, false
+	windows, err := o.ctx.saopWindows(saopProbeSpec{
+		table: o.plan.Table, index: o.plan.Index, prefix: o.plan.RangePrefix, elems: o.plan.SAOPKeys,
+		low: o.plan.LowKey, high: o.plan.HighKey, lowOp: o.plan.LowOp, highOp: o.plan.HighOp, pos: o.plan.Pos(),
+		op: o.plan.SAOPOp, colQuals: o.plan.SAOPColQuals,
+	}, o.tree, o.outerSlot)
+	if err != nil {
+		return err
 	}
-	if hasLow || hasHigh {
-		if len(o.plan.Index.Columns) < 2 {
-			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("SAOP probe on %q carries a bound but the index has no second column", o.plan.Index.Name)}
-		}
-		c2, ok2 := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[1])
-		if !ok2 {
-			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[1], o.plan.Table.Name)}
-		}
-		boundCol = c2
-		if hasLow {
-			v, err := evalExprSlot(o.plan.LowKey, o.outerSlot, o.ctx)
-			if err != nil {
-				return err
-			}
-			if v.IsNull() {
-				o.finalizeIndexScanSSI()
-				return nil
-			}
-			lowV = v
-		}
-		if hasHigh {
-			v, err := evalExprSlot(o.plan.HighKey, o.outerSlot, o.ctx)
-			if err != nil {
-				return err
-			}
-			if v.IsNull() {
-				o.finalizeIndexScanSSI()
-				return nil
-			}
-			highV = v
-		}
-	}
-	for _, ke := range o.plan.SAOPKeys {
-		v, err := evalExprSlot(ke, o.outerSlot, o.ctx)
-		if err != nil {
-			return err
-		}
-		if v.IsNull() {
-			continue
-		}
-		parts := []indexProbeKeyPart{{col: col, val: v, pos: ke.Pos()}}
-		key, encErr := o.ctx.indexProbeKey(o.plan.Index, parts)
-		if encErr != nil {
-			return encErr
-		}
-		o.hashProbeFingerprint = ssiHashProbeFingerprint(o.plan.Index, parts)
-		hiBytes := key
-		if len(o.plan.Index.Columns) > 1 {
-			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, key)
-		}
-		if boundCol != nil {
-			// Same padding rules as the range branch in Rescan, one column
-			// further in: an exclusive low skips every entry equal to it, an
-			// inclusive high covers every entry sharing it, when columns
-			// follow the bounded one.
-			more := len(o.plan.Index.Columns) > 2
-			if hasLow {
-				lk, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{parts[0], {col: boundCol, val: lowV, pos: o.plan.LowKey.Pos()}})
-				if encErr != nil {
-					return encErr
-				}
-				if more && o.plan.LowOp == parser.OpGt {
-					lk = o.ctx.compositeUpperBound(o.plan.Index, lk)
-				}
-				key = lk
-			}
-			if hasHigh {
-				hk, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{parts[0], {col: boundCol, val: highV, pos: o.plan.HighKey.Pos()}})
-				if encErr != nil {
-					return encErr
-				}
-				if more && o.plan.HighOp != parser.OpLt {
-					hk = o.ctx.compositeUpperBound(o.plan.Index, hk)
-				}
-				hiBytes = hk
-			}
-		}
+	for _, w := range windows {
+		o.hashProbeFingerprint = ssiHashProbeFingerprint(o.plan.Index, w.parts)
 		if o.hashBucketScan && len(o.hashProbeFingerprint) > 0 {
 			ssiRecordHashBucketRead(o.ctx, o.heapRel.DBOid, o.plan.Index.OID, o.hashProbeFingerprint)
 			hashRecorded = true
 		}
-		o.saopBounds = append(o.saopBounds, [2][]byte{key, hiBytes})
+		o.saopBounds = append(o.saopBounds, [2][]byte{w.lo, w.hi})
+		o.saopExcl = append(o.saopExcl, [2]bool{w.loExcl, w.hiExcl})
 	}
 	if o.hashBucketScan && !hashRecorded {
 		// No fingerprint (a key part this encoder cannot render, or every
@@ -903,6 +875,250 @@ func (o *indexScanOp) rescanSAOP() error {
 	}
 	o.scanDone = false
 	return nil
+}
+
+// saopProbeSpec is a ScalarArrayOp probe: optional equality prefix, the
+// array's elements on Columns[len(prefix)], optional bounds on the column
+// after it — IndexScan's and IndexOnlyScan's SAOP shape.
+type saopProbeSpec struct {
+	table         *catalog.Table
+	index         *catalog.Index
+	prefix        []optimizer.Expr
+	elems         []optimizer.Expr
+	low, high     optimizer.Expr
+	lowOp, highOp parser.OpCode
+	pos           int
+	// op is the array's operator: OpUnknown/OpEq for `= ANY`, or an
+	// inequality (`col < ANY (…)`, M0148-0001c3a4 (a)) — a union of
+	// half-open ranges, i.e. the one range of the extreme element
+	// (_bt_preprocess_array_keys' _bt_find_extreme_element).
+	op parser.OpCode
+	// colQuals are further quals on the array's column, merged into the
+	// array as _bt_preprocess_keys does (M0148-0001c3a4 (i)).
+	colQuals []optimizer.SAOPColQual
+}
+
+// saopWindow is one array element's index-order window and the key parts
+// it was probed with (for the hash-bucket SIREAD fingerprint).
+type saopWindow struct {
+	lo, hi         []byte
+	loExcl, hiExcl bool
+	parts          []indexProbeKeyPart
+}
+
+// saopWindows is the ScalarArrayOp probe's per-element windows, shared by
+// indexScanOp and indexOnlyScanOp so the two siblings cannot disagree
+// (M0148-0001c3a4 (h)). Empty when a prefix value or a bound is NULL, or
+// every element is.
+//
+//   - Each element's probe key is the prefix's parts plus the element
+//     (M0148-0001c3a4 (b)), as _bt_first's scan keys are.
+//   - The elements descend in INDEX order, each once:
+//     _bt_preprocess_array_keys sorts the array with the column's ordering
+//     proc and drops duplicates (_bt_sort_array_elements). The path claims
+//     the index's pathkeys, so list order would deliver `IN (182, 183, 5)`'s
+//     rows out of order under an elided Sort.
+//   - A bound on the next column (PG `((a = ANY (...)) AND (b > 1))`) makes
+//     each window indexRangeBounds with prefix + element as the equality
+//     prefix, so the DESC swap and the NULL-group stop apply and the bounds
+//     are exact index quals (M0148-0001c3a4 (c)).
+func (ctx *Context) saopWindows(sp saopProbeSpec, tree *nbtree.BTree, outerSlot SlotView) ([]saopWindow, error) {
+	np := len(sp.prefix)
+	if np >= len(sp.index.Columns) {
+		return nil, &ExecError{Code: "XX000", Pos: sp.pos, Message: fmt.Sprintf("SAOP probe on %q: an equality prefix of %d keys leaves no array column", sp.index.Name, np)}
+	}
+	col, ok := ctx.Catalog.LookupColumn(sp.table, sp.index.Columns[np])
+	if !ok {
+		return nil, &ExecError{Code: "XX000", Pos: sp.pos, Message: fmt.Sprintf("indexed column %q not found on table %q", sp.index.Columns[np], sp.table.Name)}
+	}
+	bounded := sp.low != nil || sp.high != nil
+	if bounded && len(sp.index.Columns) < np+2 {
+		return nil, &ExecError{Code: "XX000", Pos: sp.pos, Message: fmt.Sprintf("SAOP probe on %q carries a bound but the index has no column after the array", sp.index.Name)}
+	}
+	prefixParts := make([]indexProbeKeyPart, 0, np)
+	for i, pe := range sp.prefix {
+		pcol, pfound := ctx.Catalog.LookupColumn(sp.table, sp.index.Columns[i])
+		if !pfound {
+			return nil, &ExecError{Code: "XX000", Pos: sp.pos, Message: fmt.Sprintf("indexed column %q not found on table %q", sp.index.Columns[i], sp.table.Name)}
+		}
+		pv, perr := evalExprSlot(pe, outerSlot, ctx)
+		if perr != nil {
+			return nil, perr
+		}
+		if pv.IsNull() {
+			// `col = NULL` matches nothing.
+			return nil, nil
+		}
+		prefixParts = append(prefixParts, indexProbeKeyPart{col: pcol, val: pv, pos: pe.Pos()})
+	}
+	type saopElem struct {
+		ke    optimizer.Expr
+		parts []indexProbeKeyPart
+		key   []byte
+	}
+	elems := make([]saopElem, 0, len(sp.elems))
+	for _, ke := range sp.elems {
+		v, err := evalExprSlot(ke, outerSlot, ctx)
+		if err != nil {
+			return nil, err
+		}
+		if v.IsNull() {
+			continue
+		}
+		parts := append(append(make([]indexProbeKeyPart, 0, np+1), prefixParts...), indexProbeKeyPart{col: col, val: v, pos: ke.Pos()})
+		key, encErr := ctx.indexProbeKey(sp.index, parts)
+		if encErr != nil {
+			return nil, encErr
+		}
+		elems = append(elems, saopElem{ke: ke, parts: parts, key: key})
+	}
+	if tree != nil && len(elems) > 1 {
+		sort.SliceStable(elems, func(i, j int) bool { return tree.CompareLowBound(elems[i].key, elems[j].key) < 0 })
+		uniq := elems[:1]
+		for _, e := range elems[1:] {
+			if tree.CompareLowBound(e.key, uniq[len(uniq)-1].key) != 0 {
+				uniq = append(uniq, e)
+			}
+		}
+		elems = uniq
+	}
+	if len(sp.colQuals) > 0 && len(elems) > 0 {
+		// _bt_preprocess_keys merges the column's other quals into the
+		// array: another array keeps the intersection, a bound keeps the
+		// elements it admits (_bt_merge_arrays, _bt_compare_array_scankey_args).
+		if tree == nil {
+			return nil, &ExecError{Code: "XX000", Pos: sp.pos, Message: "ScalarArrayOp column quals without an index tree to compare them"}
+		}
+		reversed := rangeColumnReversed(ctx, sp.index, np)
+		qualKey := func(e optimizer.Expr) ([]byte, bool, error) {
+			v, err := evalExprSlot(e, outerSlot, ctx)
+			if err != nil || v.IsNull() {
+				return nil, false, err
+			}
+			k, encErr := ctx.indexProbeKey(sp.index, append(append(make([]indexProbeKeyPart, 0, np+1), prefixParts...), indexProbeKeyPart{col: col, val: v, pos: e.Pos()}))
+			if encErr != nil {
+				return nil, false, encErr
+			}
+			return k, true, nil
+		}
+		for _, q := range sp.colQuals {
+			var keep []saopElem
+			if q.Array != nil {
+				var keys [][]byte
+				for _, ae := range q.Array {
+					k, ok, err := qualKey(ae)
+					if err != nil {
+						return nil, err
+					}
+					if ok {
+						keys = append(keys, k)
+					}
+				}
+				for _, el := range elems {
+					for _, k := range keys {
+						if tree.CompareLowBound(el.key, k) == 0 {
+							keep = append(keep, el)
+							break
+						}
+					}
+				}
+			} else {
+				k, ok, err := qualKey(q.Key)
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					// `col op NULL` admits nothing.
+					return nil, nil
+				}
+				for _, el := range elems {
+					c := tree.CompareLowBound(el.key, k)
+					if reversed {
+						c = -c
+					}
+					var admit bool
+					switch q.Op {
+					case parser.OpLt:
+						admit = c < 0
+					case parser.OpLe:
+						admit = c <= 0
+					case parser.OpGt:
+						admit = c > 0
+					case parser.OpGe:
+						admit = c >= 0
+					case parser.OpEq:
+						admit = c == 0
+					default:
+						return nil, &ExecError{Code: "XX000", Pos: sp.pos, Message: fmt.Sprintf("ScalarArrayOp column qual with operator %v", q.Op)}
+					}
+					if admit {
+						keep = append(keep, el)
+					}
+				}
+			}
+			elems = keep
+		}
+		if len(elems) == 0 {
+			return nil, nil
+		}
+	}
+	switch sp.op {
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		// `col < ANY (a, b)` is `col < max(a, b)`: the extreme element in
+		// VALUE order — the last in index order, or the first on a DESC
+		// column, whose index order is reversed.
+		if bounded {
+			return nil, &ExecError{Code: "XX000", Pos: sp.pos, Message: fmt.Sprintf("inequality ScalarArrayOp probe on %q carries a bound on the next column", sp.index.Name)}
+		}
+		if len(elems) == 0 {
+			return nil, nil
+		}
+		if tree == nil {
+			return nil, &ExecError{Code: "XX000", Pos: sp.pos, Message: "inequality ScalarArrayOp probe without an index tree to order its elements"}
+		}
+		wantMax := sp.op == parser.OpLt || sp.op == parser.OpLe
+		ext := elems[0]
+		if wantMax != rangeColumnReversed(ctx, sp.index, np) {
+			ext = elems[len(elems)-1]
+		}
+		spec := indexRangeSpec{table: sp.table, index: sp.index, prefix: sp.prefix, pos: sp.pos}
+		if wantMax {
+			spec.high, spec.highOp = ext.ke, sp.op
+		} else {
+			spec.low, spec.lowOp = ext.ke, sp.op
+		}
+		lo, hi, lx, hx, ok, berr := ctx.indexRangeBounds(spec, outerSlot)
+		if berr != nil {
+			return nil, berr
+		}
+		if !ok {
+			return nil, nil
+		}
+		return []saopWindow{{lo: lo, hi: hi, loExcl: lx, hiExcl: hx, parts: ext.parts}}, nil
+	}
+	out := make([]saopWindow, 0, len(elems))
+	for _, el := range elems {
+		w := saopWindow{lo: el.key, hi: el.key, parts: el.parts}
+		if len(sp.index.Columns) > np+1 {
+			w.hi = ctx.compositeUpperBound(sp.index, el.key)
+		}
+		if bounded {
+			lo, hi, lx, hx, ok, berr := ctx.indexRangeBounds(indexRangeSpec{
+				table: sp.table, index: sp.index, prefix: append(append(make([]optimizer.Expr, 0, np+1), sp.prefix...), el.ke),
+				low: sp.low, high: sp.high, lowOp: sp.lowOp, highOp: sp.highOp, pos: sp.pos,
+			}, outerSlot)
+			if berr != nil {
+				return nil, berr
+			}
+			if !ok {
+				// A NULL bound matches nothing for any element.
+				return nil, nil
+			}
+			w.lo, w.hi, w.loExcl, w.hiExcl = lo, hi, lx, hx
+		}
+		out = append(out, w)
+	}
+	return out, nil
 }
 
 // rescanSkip initialises a btree skip-scan (M0146-0005v, PG18's
@@ -1056,9 +1272,21 @@ func (o *indexScanOp) ssiRecordIndexScanGapLock(isFullKeyProbe bool) {
 // across SAOP array elements when a dedup map is installed, and marks
 // sawTID — the deferred gap-lock oracle — on every index entry pulled
 // (a duplicate-suppressed entry still proves the probe touched the index).
-// The key argument aliases the pinned leaf and is deliberately unused.
-func (o *indexScanOp) scanAppendEntry(_ []byte, ptr storage.ItemPointer, pos nbtree.ScanPos) (bool, error) {
+// The key argument aliases the pinned leaf; only the trailing-array check
+// reads it, synchronously.
+func (o *indexScanOp) scanAppendEntry(key []byte, ptr storage.ItemPointer, pos nbtree.ScanPos) (bool, error) {
 	o.sawTID = true
+	if o.trailCheck != nil {
+		// M0148-0001c3a4 (i): the trailing array is an index qual — an
+		// entry it rejects is never fetched.
+		ok, err := o.trailCheck.admits(key)
+		if err != nil {
+			return false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		if !ok {
+			return true, nil
+		}
+	}
 	if o.saopSeen != nil {
 		if _, dup := o.saopSeen[ptr]; dup {
 			return true, nil
@@ -1077,7 +1305,7 @@ func (o *indexScanOp) scanAppendEntry(_ []byte, ptr storage.ItemPointer, pos nbt
 // Gather-declined blocks, high-key recovery leaves, admitted leaves with
 // no in-range items — are consumed inside the loop.
 func (o *indexScanOp) nextLeafBatch() (more bool, err error) {
-	if o.plan.SkipPrefix > 0 && o.skip.canWalk() {
+	if o.plan.SkipPrefix > 0 && !o.skipRangeScan() && o.skip.canWalk() {
 		// M0145-0008af: the skip scan's leaf walk (btree_skip.go walkLeaf),
 		// one leaf per call, matching entries appended to this batch.
 		for {
@@ -1096,13 +1324,31 @@ func (o *indexScanOp) nextLeafBatch() (more bool, err error) {
 			}
 		}
 	}
+	for o.rcur != nil {
+		// M0148-0001c3a3: a backward scan reads one leaf per batch, its
+		// entries already in descending order.
+		o.tids = o.tids[:0]
+		o.poss = o.poss[:0]
+		o.idx = 0
+		ok, cerr := o.rcur.Next(o.scanAppendEntry)
+		if cerr != nil {
+			return false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: cerr.Error()}
+		}
+		if !ok {
+			o.rcur = nil
+			return false, nil
+		}
+		if len(o.tids) > 0 {
+			return true, nil
+		}
+	}
 	for {
 		if o.cur == nil {
 			// Skip-scan (M0146-0005v): the active cursor is exhausted (or
 			// never opened) — enumerate the next distinct prefix and open
 			// its bounded descent. Enumeration laziness is what keeps an
 			// early-stopping consumer from paying for groups it never read.
-			if o.plan.SkipPrefix > 0 {
+			if o.plan.SkipPrefix > 0 && !o.skipRangeScan() {
 				lo, hi, ok, err := o.skipNextGroup()
 				if err != nil {
 					return false, err
@@ -1123,13 +1369,11 @@ func (o *indexScanOp) nextLeafBatch() (more bool, err error) {
 			if o.saopIdx >= len(o.saopBounds) {
 				return false, nil
 			}
-			b := o.saopBounds[o.saopIdx]
+			b, x := o.saopBounds[o.saopIdx], o.saopExcl[o.saopIdx]
 			o.saopIdx++
-			// Strictness applies only to a bound the plan actually carries;
-			// the element's own prefix bounds are inclusive.
-			loExcl := o.plan.LowKey != nil && o.plan.LowOp == parser.OpGt
-			hiExcl := o.plan.HighKey != nil && o.plan.HighOp == parser.OpLt
-			cur, cerr := o.tree.NewScanCursor(b[0], b[1], loExcl, hiExcl, nil)
+			// Each element's own exclusivity (indexRangeBounds); an
+			// unbounded element's prefix window is inclusive.
+			cur, cerr := o.tree.NewScanCursor(b[0], b[1], x[0], x[1], nil)
 			if cerr != nil {
 				return false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: cerr.Error()}
 			}
@@ -1383,7 +1627,9 @@ func (o *indexScanOp) Close() error {
 	o.poss = o.poss[:0]
 	o.killList = nil
 	o.cur = nil
+	o.rcur = nil
 	o.saopBounds = nil
+	o.saopExcl = nil
 	o.saopSeen = nil
 	o.skip.reset(true)
 	o.hasLast = false
@@ -1507,6 +1753,7 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 	loKey, hiKey, o.rangeLoExcl, o.rangeHiExcl, ok, err = o.ctx.indexRangeBounds(indexRangeSpec{
 		table: o.plan.Table, index: o.plan.Index, prefix: o.plan.RangePrefix,
 		low: o.plan.LowKey, high: o.plan.HighKey, lowOp: o.plan.LowOp, highOp: o.plan.HighOp,
+		nullTest: o.plan.LeadingNullTest, extraNullTests: o.plan.ExtraNullTests,
 		pos: o.plan.Pos(),
 	}, o.outerSlot)
 	return loKey, hiKey, ok, err
@@ -1522,7 +1769,14 @@ type indexRangeSpec struct {
 	prefix        []optimizer.Expr
 	low, high     optimizer.Expr
 	lowOp, highOp parser.OpCode
-	pos           int
+	// nullTest is a NullTest index qual on the same column
+	// (IndexScan.LeadingNullTest, M0148-0001c3a): IS NULL probes only the
+	// column's NULL group, IS NOT NULL stops the scan at it.
+	nullTest optimizer.IndexNullTest
+	// extraNullTests are the column's further NullTest quals; a mix of IS
+	// NULL and IS NOT NULL matches nothing (M0148-0001c3a2).
+	extraNullTests []optimizer.ExtraIndexNullTest
+	pos            int
 }
 
 // indexRangeBounds computes the INDEX-ORDER bounds and their exclusivity for
@@ -1533,6 +1787,11 @@ func (ctx *Context) indexRangeBounds(sp indexRangeSpec, outerSlot SlotView) (loK
 	// onto the column after it; each bound is then the prefix's parts plus the
 	// bound's own part. With no prefix this is the leading-column range scan,
 	// byte for byte as before.
+	if optimizer.NullTestsContradict(sp.nullTest, sp.extraNullTests) {
+		// _bt_preprocess_keys: `IS NULL AND IS NOT NULL` on one column is
+		// unsatisfiable, and the scan returns nothing.
+		return nil, nil, false, false, false, nil
+	}
 	np := len(sp.prefix)
 	if np >= len(sp.index.Columns) {
 		return nil, nil, false, false, false, &ExecError{
@@ -1643,12 +1902,37 @@ func (ctx *Context) indexRangeBounds(sp indexRangeSpec, outerSlot SlotView) (loK
 		hiKey, hiExcl = ctx.compositeUpperBound(sp.index, k), false
 	}
 
+	// M0148-0001c3a: `col IS NULL` (SK_SEARCHNULL) is the column's NULL group
+	// — every entry whose key starts with the prefix and a NULL there,
+	// bounded inclusively on both ends like an equality-prefix probe. With a
+	// value bound beside it the qual is unsatisfiable (no NULL satisfies a
+	// comparison; _bt_preprocess_keys reports it so), and the scan is empty.
+	// The planner files the qual only for an index that stores NULL-keyed
+	// entries, so a cluster without them is a planner bug here.
+	if sp.nullTest == optimizer.IndexNullTestIsNull {
+		if sp.low != nil || sp.high != nil {
+			return nil, nil, false, false, false, nil
+		}
+		k, _, stop, nerr := ctx.nullStopRangeBound(sp.index, prefix, col, np)
+		if nerr != nil {
+			return nil, nil, false, false, false, nerr
+		}
+		if !stop {
+			return nil, nil, false, false, false, &ExecError{Code: "XX000", Pos: sp.pos, Message: fmt.Sprintf(
+				"indexRangeBounds: IS NULL index qual on index %q, which stores no NULL-keyed entries", sp.index.Name)}
+		}
+		return k, ctx.compositeUpperBound(sp.index, k), false, false, true, nil
+	}
+
 	// An open end must not run into the NULL-keyed entries a capable cluster
 	// stores: `a > 5` excludes NULL, but the NULL group sits at one end of the
 	// index order. Only when the column carries exactly ONE value bound: with
 	// none this is a full scan or an equality-prefix probe, and both must keep
-	// the NULL entries (`a = 10` on (a, b) includes (10, NULL)).
-	if (vLo == nil) != (vHi == nil) {
+	// the NULL entries (`a = 10` on (a, b) includes (10, NULL)) — unless an
+	// `IS NOT NULL` index qual (SK_SEARCHNOTNULL, M0148-0001c3a) excludes
+	// them, which stops the unbounded scan at the NULL group the same way.
+	notNullOnly := sp.nullTest == optimizer.IndexNullTestIsNotNull && vLo == nil && vHi == nil
+	if (vLo == nil) != (vHi == nil) || notNullOnly {
 		if k, atHigh, stop, err := ctx.nullStopRangeBound(sp.index, prefix, col, np); err != nil {
 			return nil, nil, false, false, false, err
 		} else if stop {
@@ -1684,3 +1968,12 @@ func appendCompositeUpperPadding(key []byte) []byte {
 	}
 	return out
 }
+
+// skipRangeScan reports PG 18's skip scan with a range on
+// Columns[SkipPrefix] and no Keys (M0148-0001c3a4 (j)): the whole index is
+// read and trailCheck admits each entry. SkipPrefix with Keys is the
+// equality skip run (rescanSkip).
+func (o *indexScanOp) skipRangeScan() bool {
+	return o.plan.SkipPrefix > 0 && len(o.plan.Keys) == 0 && (o.plan.LowKey != nil || o.plan.HighKey != nil)
+}
+

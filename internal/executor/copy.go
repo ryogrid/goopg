@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -183,7 +184,11 @@ func runCopyToCore(ctx *Context, plan *optimizer.Copy, emit func([]byte) error) 
 		case format.csv:
 			buf, encErr = EncodeCopyCsvRow(buf, row, cols, format, dateStyle, dateOrder, timeZone, byteaMode, cat, qualify, argVisible)
 		default:
-			buf, encErr = EncodeCopyTextRow(buf, row, cols, dateStyle, dateOrder, timeZone, byteaMode, cat, qualify, argVisible)
+			delim, nullStr := format.delim, format.nullStr
+			if delim == 0 {
+				delim = '\t'
+			}
+			buf, encErr = EncodeCopyTextRowDelim(buf, row, cols, delim, nullStr, dateStyle, dateOrder, timeZone, byteaMode, cat, qualify, argVisible)
 		}
 		if encErr != nil {
 			return count, binary, encErr
@@ -485,7 +490,11 @@ func (c *CopyFromExecutor) PushLine(line []byte) error {
 		return c.pushCsvLine(line)
 	}
 	c.lineLen = len(trimCopyLineCR(line))
-	src, err := DecodeCopyTextRow(line, c.listedColumns(), c.format.nullStr, timeZoneFromCtx(c.ctx))
+	delim := c.format.delim
+	if delim == 0 {
+		delim = '\t'
+	}
+	src, err := DecodeCopyTextRowDelim(line, c.listedColumns(), delim, c.format.nullStr, timeZoneFromCtx(c.ctx), dateInputFromCtx(c.ctx).order)
 	if err != nil {
 		return &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: fmt.Sprintf("COPY: %v", err), Context: c.copyContext()}
 	}
@@ -970,6 +979,25 @@ func RunCopyFromFile(ctx *Context, plan *optimizer.Copy) (int64, error) {
 	fe, err := newCopyFromExecutor(ctx, plan)
 	if err != nil {
 		return 0, err
+	}
+
+	// FORMAT binary: the file is a PGCOPY stream, fed through the same binary
+	// reader COPY FROM STDIN uses. Before this the file was split into text
+	// lines, so a binary file failed on its "PGCOPY" signature as a column
+	// value. M0149-0001k4.
+	if fe.IsBinary() {
+		data, rerr := io.ReadAll(f)
+		if rerr != nil {
+			return 0, &ExecError{Code: "58030", Pos: plan.Pos(),
+				Message: fmt.Sprintf("error reading COPY file: %v", rerr)}
+		}
+		if _, err := fe.PushBinaryData(data); err != nil {
+			return fe.rowsIn, err
+		}
+		if err := fe.Finish(); err != nil {
+			return fe.rowsIn, err
+		}
+		return fe.rowsIn, nil
 	}
 
 	scanner := bufio.NewScanner(f)

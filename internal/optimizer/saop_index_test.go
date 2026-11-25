@@ -176,8 +176,18 @@ func TestSAOPWithConjunctMoves(t *testing.T) {
 	// and the seq path is priced as one row on one page, a state PG never
 	// plans against (M0145-0008 flip; M0145-0029 slice 5 records the oracle).
 	c.(*catalog.InMemory).SetRelationSizer(func(storage.RelFileNode) (int64, bool) { return 0, true })
-	node, err := Plan(parseOne(t,
-		"SELECT i_item_id FROM item WHERE i_item_sk IN (2, 3) AND i_flag > 1"), c)
+	// Bitmap scans off: this pins the INDEX producer's SAOP shape. Since
+	// M0148-0001c3a2 the bitmap producer takes `IN` too, as PG's does, and
+	// PG's own margin here is one hundredth (Index Scan 8.17 against Bitmap
+	// Heap Scan 8.18 on PG 18.3, both on idx_item_sk_flag; a goopg server in
+	// the same never-analyzed 10-page state also elects the 8.17 Index
+	// Scan). This catalog-only fixture prices the index path at 12.32 on
+	// item_pkey without the i_flag bound, so the bitmap would win
+	// (ledgered, M0148-0001c3a2).
+	ps := DefaultPlannerSettings()
+	ps.EnableBitmapScan = false
+	node, err := PlanWithSettings(parseOne(t,
+		"SELECT i_item_id FROM item WHERE i_item_sk IN (2, 3) AND i_flag > 1"), c, ps)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -344,9 +354,9 @@ func TestSAOPNumSAScansCost(t *testing.T) {
 
 	// The shared index side feeds the bitmap cost too: the same descent
 	// scaling applies there (rule #2 — sibling paths price together).
-	bmBase := costBitmapIndexScan(cp, base)
+	bmBase, _ := costBitmapIndexScan(cp, base, 1)
 	in.numSAScans = 10
-	bmMulti := costBitmapIndexScan(cp, in)
+	bmMulti, _ := costBitmapIndexScan(cp, in, 1)
 	if want := bmBase.Total + 9*descent - onePage + mlPages(10); math.Abs(bmMulti.Total-want) > 1e-9 {
 		t.Fatalf("bitmap SAOP total = %v, want bitmap base + 9 descents + ML(10) pages - 1 page = %v", bmMulti.Total, want)
 	}

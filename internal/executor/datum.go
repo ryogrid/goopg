@@ -11,8 +11,9 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/utils/adt/datetime"
+	"github.com/goopg/goopg/internal/utils/misc"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 )
 
 // DatumKind discriminates the value carrier in a Datum.
@@ -131,7 +132,7 @@ const (
 	TimeSubDate
 	// TimeSubTimestampTZ marks `timestamp with time zone`. Not yet populated.
 	TimeSubTimestampTZ
-	// TimeSubTime marks `time without time zone`. Not yet populated.
+	// TimeSubTime marks `time without time zone` (NewTimeOfDayDatum).
 	TimeSubTime
 	// TimeSubTimeTZ marks `time with time zone`; the offset east of UTC rides
 	// in Datum.Scale as minutes (see NewTimeTZDatum).
@@ -253,7 +254,160 @@ func (d Datum) BytesValue() []byte {
 // TimeValue returns the timestamp payload of a KindTime Datum,
 // reconstructed from the Unix nanoseconds stored in Int. Always UTC.
 func (d Datum) TimeValue() time.Time {
-	return time.Unix(0, d.Int).UTC()
+	return timeFromCarrier(d.Int)
+}
+
+// A KindTime Datum keeps its instant in Int as microseconds since 2000-01-01
+// UTC, PostgreSQL's own Timestamp representation, with the int64 extremes as
+// infinity (M0149-0001h1a48). The functions below and this constant are the only
+// code that knows this. Comparing or hashing Int needs no conversion.
+const timeCarrierUnitsPerSecond int64 = 1_000_000
+
+// pgEpochUnixSeconds is 2000-01-01 00:00:00 UTC as a Unix time.
+const pgEpochUnixSeconds int64 = 946684800
+
+// PG's timestamp range (datatype/timestamp.h): MIN_TIMESTAMP is 4714-11-24 BC and
+// END_TIMESTAMP, which is exclusive, is 294277-01-01. Dates share the lower bound
+// and run on to 5874897-12-31 (DATE_END_JULIAN is exclusive).
+//
+// A date at or past END_TIMESTAMP does not fit in microseconds, so its Int is
+// pgTimestampEnd plus the days since that point. The values lie between every
+// finite timestamp and +infinity, so comparing, sorting and hashing Int stay
+// correct, including a date against a timestamp, where PG also treats such a date
+// as later than any timestamp.
+const (
+	pgTimestampMin int64 = -211813488000000000
+	pgTimestampEnd int64 = 9223371331200000000
+	pgDateMinDay   int32 = -2451545
+	// pgDateFarDay is the day of pgTimestampEnd, the first date stored by day count.
+	pgDateFarDay int32 = 106751983
+	pgDateEndDay int32 = 2145031949
+)
+
+// The infinity sentinels convert to these instants, outside every finite value,
+// so time.Time comparisons order them correctly and a value converted to
+// time.Time and back stays infinite.
+var (
+	timeCarrierPosInfInstant = time.Date(6000000, 1, 1, 0, 0, 0, 0, time.UTC)
+	timeCarrierNegInfInstant = time.Date(-5000, 1, 1, 0, 0, 0, 0, time.UTC)
+)
+
+// validTimestampCarrier is IS_VALID_TIMESTAMP for a finite carrier value.
+func validTimestampCarrier(carrier int64) bool {
+	return carrier >= pgTimestampMin && carrier < pgTimestampEnd
+}
+
+// timeToCarrier is the Int of a KindTime Datum holding t, truncated to the
+// microsecond.
+func timeToCarrier(t time.Time) int64 {
+	sec := t.Unix()
+	switch {
+	case sec == timeCarrierPosInfInstant.Unix() && t.Equal(timeCarrierPosInfInstant):
+		return math.MaxInt64
+	case sec == timeCarrierNegInfInstant.Unix() && t.Equal(timeCarrierNegInfInstant):
+		return math.MinInt64
+	}
+	if sec >= pgEpochUnixSeconds+int64(pgDateFarDay)*86400 {
+		return farDateCarrier((sec - pgEpochUnixSeconds) / 86400)
+	}
+	return (sec-pgEpochUnixSeconds)*timeCarrierUnitsPerSecond + int64(t.Nanosecond())/1000
+}
+
+// farDateCarrier is the Int of a date at or past pgDateFarDay. It stays below the
+// +infinity sentinel for any day.
+func farDateCarrier(day int64) int64 {
+	span := day - int64(pgDateFarDay)
+	if span >= math.MaxInt64-pgTimestampEnd {
+		span = math.MaxInt64 - pgTimestampEnd - 1
+	}
+	return pgTimestampEnd + span
+}
+
+// isFarDateCarrier reports an Int holding a day count, past every timestamp.
+func isFarDateCarrier(carrier int64) bool {
+	return carrier >= pgTimestampEnd && carrier != math.MaxInt64
+}
+
+// timeFromCarrier is the instant a KindTime Datum's Int stands for.
+func timeFromCarrier(carrier int64) time.Time {
+	switch carrier {
+	case math.MaxInt64:
+		return timeCarrierPosInfInstant
+	case math.MinInt64:
+		return timeCarrierNegInfInstant
+	}
+	if isFarDateCarrier(carrier) {
+		day := int64(pgDateFarDay) + carrier - pgTimestampEnd
+		return time.Unix(day*86400+pgEpochUnixSeconds, 0).UTC()
+	}
+	sec, micros := carrier/timeCarrierUnitsPerSecond, carrier%timeCarrierUnitsPerSecond
+	if micros < 0 {
+		micros += timeCarrierUnitsPerSecond
+		sec--
+	}
+	return time.Unix(sec+pgEpochUnixSeconds, micros*1000).UTC()
+}
+
+// newTimestampDatumFromPGMicros is the timestamp or timestamptz Datum for a value
+// in PG's stored form. The infinity sentinels are the same numbers in both forms.
+func newTimestampDatumFromPGMicros(micros int64, withTimeZone bool) Datum {
+	if withTimeZone {
+		return Datum{Kind: KindTime, Int: micros, TimeSub: TimeSubTimestampTZ}
+	}
+	return Datum{Kind: KindTime, Int: micros}
+}
+
+// newDateDatumFromPGDays is the DATE Datum for PG's stored day count, with
+// PG_INT32_MAX and PG_INT32_MIN as infinity. ok is false for a finite day the
+// carrier cannot hold.
+func newDateDatumFromPGDays(days int32) (d Datum, ok bool) {
+	switch {
+	case days == math.MaxInt32:
+		return NewDateInfinity(true), true
+	case days == math.MinInt32:
+		return NewDateInfinity(false), true
+	case days < pgDateMinDay || days >= pgDateEndDay:
+		return Datum{}, false
+	}
+	if days >= pgDateFarDay {
+		return Datum{Kind: KindTime, Int: farDateCarrier(int64(days)), TimeSub: TimeSubDate}, true
+	}
+	return Datum{Kind: KindTime, Int: int64(days) * 86400 * timeCarrierUnitsPerSecond, TimeSub: TimeSubDate}, true
+}
+
+// pgDaysOfDatum is PG's stored day count for a date Datum, rounding a value that
+// carries a time of day down to its day.
+func pgDaysOfDatum(d Datum) int32 {
+	switch {
+	case d.IsTimestampPosInf():
+		return math.MaxInt32
+	case d.IsTimestampNegInf():
+		return math.MinInt32
+	case isFarDateCarrier(d.Int):
+		return int32(int64(pgDateFarDay) + d.Int - pgTimestampEnd)
+	}
+	perDay := 86400 * timeCarrierUnitsPerSecond
+	days := d.Int / perDay
+	if d.Int%perDay < 0 {
+		days--
+	}
+	return int32(days)
+}
+
+// addTimeCarrierMicros adds microseconds to a finite carrier value. ok is false
+// when the result is outside the timestamp range.
+func addTimeCarrierMicros(carrier, micros int64) (sum int64, ok bool) {
+	sum = carrier + micros
+	if (micros > 0 && sum < carrier) || (micros < 0 && sum > carrier) || !validTimestampCarrier(sum) {
+		return 0, false
+	}
+	return sum, true
+}
+
+// timeTZCompareKey is a timetz Datum's position in UTC, which timetz comparison
+// orders by. The offset lives in Scale, in minutes east of UTC.
+func timeTZCompareKey(d Datum) int64 {
+	return d.Int - int64(d.TimeTZOffsetSecs())*timeCarrierUnitsPerSecond
 }
 
 // IntervalMonthsValue extracts the months component of KindInterval.
@@ -309,9 +463,8 @@ func NewIntervalInfinity(positive bool) Datum {
 // IsTimestampPosInf / IsTimestampNegInf report whether a KindTime Datum
 // carries PostgreSQL's +infinity / -infinity timestamp sentinel. Upstream
 // (postgres/src/include/datatype/timestamp.h) uses TIMESTAMP_END/BEGIN =
-// PG_INT64_MAX/MIN in its micros-since-2000 domain; goopg stores KindTime as
-// Unix nanoseconds, so the same INT64 extremes are used as sentinels — a real
-// timestamp saturates ~year 2262, far below MaxInt64 ns, so they never collide.
+// PG_INT64_MAX/MIN in its micros-since-2000 domain, and KindTime is that domain,
+// so the same INT64 extremes are the sentinels here.
 // IsTimestampNotFinite is the union. (unimplemented_feat #5(d-iv))
 func (d Datum) IsTimestampPosInf() bool {
 	return d.Kind == KindTime && d.Int == math.MaxInt64
@@ -589,9 +742,17 @@ func cloneRowOwnedPrefix(src Row, bound int) Row {
 }
 
 // NewTimeDatum constructs a KindTime Datum from a time.Time.
-// The timestamp is normalized to UTC and stored as Unix nanoseconds.
+// The timestamp is normalized to UTC.
+// NewTimeOfDayDatum is a `time without time zone` value: a time of day on
+// 1970-01-01, tagged so the type-agnostic renderers print it as time_out does.
+func NewTimeOfDayDatum(t time.Time) Datum {
+	d := NewTimeDatum(t)
+	d.TimeSub = TimeSubTime
+	return d
+}
+
 func NewTimeDatum(t time.Time) Datum {
-	return Datum{Kind: KindTime, Int: t.UTC().UnixNano()}
+	return Datum{Kind: KindTime, Int: timeToCarrier(t)}
 }
 
 // NewDateDatum constructs a KindTime Datum tagged as a DATE
@@ -602,7 +763,7 @@ func NewTimeDatum(t time.Time) Datum {
 // timestamp shape otherwise. Use this at every date-producing site (literals,
 // casts, on-disk decode) so a date is indistinguishable regardless of origin.
 func NewDateDatum(t time.Time) Datum {
-	return Datum{Kind: KindTime, Int: t.UTC().UnixNano(), TimeSub: TimeSubDate}
+	return Datum{Kind: KindTime, Int: timeToCarrier(t), TimeSub: TimeSubDate}
 }
 
 // IsDate reports whether d is a KindTime Datum carrying a DATE. Prefer this to
@@ -625,7 +786,7 @@ func (d Datum) IsDate() bool { return d.Kind == KindTime && d.TimeSub == TimeSub
 // tagging them from a guess is the exact mislabelling this discriminator exists
 // to prevent.
 func NewTimestampTZDatum(t time.Time) Datum {
-	return Datum{Kind: KindTime, Int: t.UTC().UnixNano(), TimeSub: TimeSubTimestampTZ}
+	return Datum{Kind: KindTime, Int: timeToCarrier(t), TimeSub: TimeSubTimestampTZ}
 }
 
 // IsTimestampTZ reports whether d is a KindTime Datum carrying a
@@ -643,15 +804,21 @@ func (d Datum) IsTimestampTZ() bool {
 func NewTimeTZDatum(t time.Time, offsetSecs int) Datum {
 	return Datum{
 		Kind:    KindTime,
-		Int:     t.UTC().UnixNano(),
+		Int:     timeToCarrier(t),
 		Scale:   int16(offsetSecs / 60),
 		TimeSub: TimeSubTimeTZ,
+		// Hi keeps the offset to the second (timetz zones such as LMT ones
+		// have seconds); Scale stays the whole minutes for older readers.
+		Hi: uint64(int64(offsetSecs)),
 	}
 }
 
 // TimeTZOffsetSecs returns the timezone offset in seconds east of UTC for a
 // timetz Datum (stored in Scale as minutes). Returns 0 for plain time datums.
 func (d Datum) TimeTZOffsetSecs() int {
+	if d.TimeSub == TimeSubTimeTZ && d.Hi != 0 {
+		return int(int64(d.Hi))
+	}
 	return int(d.Scale) * 60
 }
 
@@ -796,10 +963,31 @@ func (d Datum) AppendValueText(dst []byte) []byte {
 		if d.Int == math.MinInt64 {
 			return append(dst, "-infinity"...)
 		}
-		return d.TimeValue().AppendFormat(dst, "2006-01-02 15:04:05.000000")
+		if d.TimeSub == TimeSubTimeTZ {
+			return append(dst, timeTZText(d)...)
+		}
+		if d.TimeSub == TimeSubTime {
+			return append(dst, timeOfDayText(d)...)
+		}
+		t := d.TimeValue()
+		if t.Year() <= 0 {
+			return append(dst, formatBCTimeDatum(d, t)...)
+		}
+		return t.AppendFormat(dst, "2006-01-02 15:04:05.000000")
 	}
 	// Fallback for KindInterval / KindNumeric / unknown kinds.
 	return append(dst, d.Format()...)
+}
+
+// formatBCTimeDatum is the type-agnostic text of a value before 1 AD: the usual
+// shape with PG's year digits and era marker. Go would print a negative year.
+func formatBCTimeDatum(d Datum, t time.Time) string {
+	year, era := misc.EraYear(t)
+	if d.TimeSub == TimeSubDate {
+		return fmt.Sprintf("%02d-%02d-%04d%s", int(t.Month()), t.Day(), year, era)
+	}
+	return fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d.%06d%s", year, int(t.Month()), t.Day(),
+		t.Hour(), t.Minute(), t.Second(), t.Nanosecond()/1000, era)
 }
 
 func isTimeOnlyValue(t time.Time) bool {
@@ -876,11 +1064,21 @@ func (d Datum) Format() string {
 		if d.Int == math.MinInt64 {
 			return "-infinity"
 		}
+		if d.TimeSub == TimeSubTimeTZ {
+			return timeTZText(d)
+		}
+		if d.TimeSub == TimeSubTime {
+			return timeOfDayText(d)
+		}
+		t := d.TimeValue()
+		if t.Year() <= 0 {
+			return formatBCTimeDatum(d, t)
+		}
 		if d.TimeSub == TimeSubDate {
 			// DATE type: render as Postgres MDY style "MM-DD-YYYY". M0097-0063.
-			return d.TimeValue().Format("01-02-2006")
+			return t.Format("01-02-2006")
 		}
-		return d.TimeValue().Format("2006-01-02 15:04:05.000000")
+		return t.Format("2006-01-02 15:04:05.000000")
 	case KindInterval:
 		return formatInterval(d.IntervalMonthsValue(), d.IntervalDaysValue(), d.IntervalMicrosValue())
 	case KindNumeric:

@@ -79,3 +79,82 @@ func matchZonePath(root string, parts []string) (string, bool) {
 	}
 	return strings.Join(matched, "/"), true
 }
+
+// TimezoneNameRow is one row of pg_timezone_names.
+type TimezoneNameRow struct {
+	Name, Abbrev string
+	Offset       int // seconds east of UTC
+	IsDST        bool
+}
+
+// TimezoneNames is pg_timezone_names: every zone of the tz database
+// (pg_tzenumerate_next) with its abbreviation, offset and DST flag at now.
+// Like pg_tzenumerate_next it skips hidden entries, files that are not zones
+// and leap-second zones (pg_tz_acceptable); like pg_timezone_names it skips
+// an abbreviation longer than 31 bytes.
+func TimezoneNames(now time.Time) []TimezoneNameRow {
+	root := ""
+	for _, d := range zoneInfoDirs() {
+		if st, err := os.Stat(d); err == nil && st.IsDir() {
+			root = d
+			break
+		}
+	}
+	if root == "" {
+		return nil
+	}
+	var rows []TimezoneNameRow
+	var walk func(dir, prefix string)
+	walk = func(dir, prefix string) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			name := e.Name()
+			// posixrules and localtime are host links, not zones of the
+			// database PG enumerates.
+			if strings.HasPrefix(name, ".") || (prefix == "" && (name == "posixrules" || name == "localtime")) {
+				continue
+			}
+			full := filepath.Join(dir, name)
+			rel := prefix + name
+			if e.IsDir() {
+				walk(full, rel+"/")
+				continue
+			}
+			if !isAcceptableZoneFile(full) {
+				continue
+			}
+			loc, err := time.LoadLocation(rel)
+			if err != nil {
+				continue
+			}
+			t := now.In(loc)
+			abbrev, off := t.Zone()
+			if len(abbrev) > 31 {
+				continue
+			}
+			rows = append(rows, TimezoneNameRow{Name: rel, Abbrev: abbrev, Offset: off, IsDST: t.IsDST()})
+		}
+	}
+	walk(root, "")
+	return rows
+}
+
+// isAcceptableZoneFile reports whether a file is a TZif zone without
+// leap-second records (tzload succeeds and pg_tz_acceptable holds).
+func isAcceptableZoneFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var hdr [44]byte
+	if n, _ := f.Read(hdr[:]); n < len(hdr) || string(hdr[:4]) != "TZif" {
+		return false
+	}
+	leapcnt := uint32(hdr[28])<<24 | uint32(hdr[29])<<16 | uint32(hdr[30])<<8 | uint32(hdr[31])
+	return leapcnt == 0
+}
+

@@ -66,10 +66,12 @@ func TestBuildPgControlCheckpointFields(t *testing.T) {
 		t.Errorf("checkPointCopy.wal_level at offset 60: got %d, want 1 (replica)", walLevel)
 	}
 
-	// CheckPoint.nextXid (FullTransactionId=uint64) at offset 64 — FirstNormalTransactionId=3
+	// CheckPoint.nextXid (FullTransactionId=uint64) at offset 64 — the NextXID a
+	// PG 18.3 initdb leaves (752), not BootStrapXLOG's FirstNormalTransactionId
+	// (M0149-0010b).
 	nextXid := le.Uint64(buf[64:])
-	if nextXid != pgFirstNormalXID {
-		t.Errorf("checkPointCopy.nextXid at offset 64: got %d, want %d", nextXid, pgFirstNormalXID)
+	if nextXid != pgInitdbNextXID {
+		t.Errorf("checkPointCopy.nextXid at offset 64: got %d, want %d", nextXid, pgInitdbNextXID)
 	}
 
 	// CheckPoint.nextOid (uint32) at offset 72 — FirstGenbkiObjectId=10000

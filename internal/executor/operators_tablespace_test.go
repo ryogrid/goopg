@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // tablespaceFixture builds a VM fixture with a real data directory and a
@@ -137,15 +139,59 @@ func TestCreateTablespaceReservedName(t *testing.T) {
 	}
 }
 
-// TestCreateTablespaceExternalLocation — an absolute external location is valid
-// in PG but unsupported in goopg (no relfile relocation) → 0A000.
+// TestCreateTablespaceExternalLocation pins create_tablespace_directories
+// (commands/tablespace.c) for an external LOCATION (M0149-0003):
+//   - a missing directory is 58P01 `directory "..." does not exist`;
+//   - an existing one gets PG_<major>_<catversion> inside it and the symlink
+//     pg_tblspc/<oid> -> location;
+//   - a second tablespace on the same location is 55006 "already in use";
+//   - DROP TABLESPACE removes the version directory and the link but keeps
+//     the location.
 func TestCreateTablespaceExternalLocation(t *testing.T) {
 	ctx, _, cleanup := tablespaceFixture(t)
 	defer cleanup()
 
-	err := runDDL(t, ctx, "CREATE TABLESPACE ts3 LOCATION '/var/lib/goopg/ts3'")
-	if got := execErrCode(err); got != "0A000" {
-		t.Fatalf("external LOCATION: want 0A000, got %q (%v)", got, err)
+	missing := filepath.Join(t.TempDir(), "no-such-dir")
+	err := runDDL(t, ctx, "CREATE TABLESPACE ts3 LOCATION '"+missing+"'")
+	if got := execErrCode(err); got != "58P01" {
+		t.Fatalf("missing LOCATION: want 58P01, got %q (%v)", got, err)
+	}
+	if _, ok := ctx.Catalog.LookupTablespaceOID("ts3"); ok {
+		t.Fatal("a failed CREATE TABLESPACE must not stay registered")
+	}
+
+	loc := t.TempDir()
+	if err := runDDL(t, ctx, "CREATE TABLESPACE ts3 LOCATION '"+loc+"'"); err != nil {
+		t.Fatalf("CREATE TABLESPACE: %v", err)
+	}
+	ents := tblspcEntries(t, ctx)
+	if len(ents) != 1 {
+		t.Fatalf("pg_tblspc entries = %v, want one link", ents)
+	}
+	link := filepath.Join(ctx.DataDir, "pg_tblspc", ents[0])
+	if target, err := os.Readlink(link); err != nil || target != loc {
+		t.Fatalf("pg_tblspc/%s -> %q (%v), want a symlink to %q", ents[0], target, err, loc)
+	}
+	versionDir := filepath.Join(loc, misc.TablespaceVersionDirectory)
+	if st, err := os.Stat(versionDir); err != nil || !st.IsDir() {
+		t.Fatalf("version directory %s: %v", versionDir, err)
+	}
+	err = runDDL(t, ctx, "CREATE TABLESPACE ts4 LOCATION '"+loc+"'")
+	if got := execErrCode(err); got != "55006" {
+		t.Fatalf("location in use: want 55006, got %q (%v)", got, err)
+	}
+
+	if err := runDDL(t, ctx, "DROP TABLESPACE ts3"); err != nil {
+		t.Fatalf("DROP TABLESPACE: %v", err)
+	}
+	if _, err := os.Lstat(link); !os.IsNotExist(err) {
+		t.Fatalf("pg_tblspc link survived DROP: %v", err)
+	}
+	if _, err := os.Stat(versionDir); !os.IsNotExist(err) {
+		t.Fatalf("version directory survived DROP: %v", err)
+	}
+	if _, err := os.Stat(loc); err != nil {
+		t.Fatalf("DROP removed the location itself: %v", err)
 	}
 }
 

@@ -102,13 +102,13 @@ func registerStatReplicationView(cat *catalog.InMemory, senders *xlog.Senders, w
 				formatLSN(s.WriteLSN),
 				formatLSN(s.FlushLSN),
 				formatLSN(s.ReplayLSN),
-				"00:00:00",                               // write_lag: lag intervals not wired in v0
-				"00:00:00",                               // flush_lag
-				"00:00:00",                               // replay_lag
-				syncPriority(syncRep, s.ApplicationName), // sync_priority
-				syncState(syncRep, s.ApplicationName),    // sync_state
-				"",                                       // reply_time: not tracked per-message in v0
-				s.SlotName,                               // slot_name
+				"00:00:00",               // write_lag: lag intervals not wired in v0
+				"00:00:00",               // flush_lag
+				"00:00:00",               // replay_lag
+				syncPriority(syncRep, s), // sync_priority
+				syncState(syncRep, s),    // sync_state
+				"",                       // reply_time: not tracked per-message in v0
+				s.SlotName,               // slot_name
 				hitsStr,
 				missesStr,
 				residentStr,
@@ -119,22 +119,30 @@ func registerStatReplicationView(cat *catalog.InMemory, senders *xlog.Senders, w
 	return cat.RegisterVirtualTable(tbl)
 }
 
-// syncState returns the pg_stat_replication.sync_state string for appName.
-// Returns "async" when syncRep is nil (no synchronous replication configured).
-func syncState(syncRep *xlog.SyncRep, appName string) string {
+// syncState returns the pg_stat_replication.sync_state string for the
+// walsender's SyncRep slot ("async" without synchronous replication).
+func syncState(syncRep *xlog.SyncRep, s xlog.SenderState) string {
 	if syncRep == nil {
 		return "async"
 	}
-	return syncRep.SyncStateFor(appName)
+	if s.SyncSlot < 0 {
+		return syncRep.SyncStateFor(s.ApplicationName)
+	}
+	_, st := syncRep.SlotSyncState(s.SyncSlot)
+	return st
 }
 
 // syncPriority returns the pg_stat_replication.sync_priority integer string
-// for appName. Returns "0" when syncRep is nil.
-func syncPriority(syncRep *xlog.SyncRep, appName string) string {
+// for the walsender's SyncRep slot ("0" without synchronous replication).
+func syncPriority(syncRep *xlog.SyncRep, s xlog.SenderState) string {
 	if syncRep == nil {
 		return "0"
 	}
-	return fmt.Sprintf("%d", syncRep.SyncPriorityFor(appName))
+	if s.SyncSlot < 0 {
+		return fmt.Sprintf("%d", syncRep.SyncPriorityFor(s.ApplicationName))
+	}
+	p, _ := syncRep.SlotSyncState(s.SyncSlot)
+	return fmt.Sprintf("%d", p)
 }
 
 // registerStatWalReceiverView installs `pg_catalog.pg_stat_wal_receiver`
@@ -378,7 +386,9 @@ func registerReplicationSlotsView(cat *catalog.InMemory, slots *xlog.Slots) erro
 				"f", // temporary: temp slots deferred
 				boolText(sl.Active),
 				"",  // active_pid: not yet tracked per-slot
-				"0", // xmin: physical-slot xmin tracking deferred
+				// xmin: a physical slot's hot_standby_feedback xmin
+				// (M0149-0077i); NULL when invalid (M0149-0077g).
+				formatXmin(sl.Xmin),
 				formatXmin(sl.CatalogXmin),
 				formatLSN(sl.RestartLSN),
 				formatLSN(sl.ConfirmedFlushLSN),
@@ -576,14 +586,9 @@ func registerSubscriptionViews(cat *catalog.InMemory, ps *catalog.PubSub) error 
 				// subdbid must match pg_database.oid for the live database so
 				// pg_dump's `s.subdbid = (SELECT oid FROM pg_database WHERE
 				// datname = current_database())` filter actually matches a row.
-				// catalog.InMemory.DBOID() is the unrelated *storage* identity
-				// (RelFileNode base/<oid> directory — see its doc comment); the
-				// SQL-visible pg_database.oid for any live non-template database
-				// is unconditionally catalog.FirstUserOID (16384) per the
-				// hardcoded convention pgDatabase.VirtualRows already uses
-				// (internal/catalog/catalog.go), so mirror that here rather than
-				// DBOID().
-				fmt.Sprintf("%d", catalog.FirstUserOID), // subdbid
+				// The live database is "postgres", whose pg_database.oid is
+				// catalog.PostgresDBOid (5) as in PG (M0149-0001a1 S2).
+				fmt.Sprintf("%d", catalog.PostgresDBOid), // subdbid
 				sub.Name,
 				fmt.Sprintf("%d", sub.Owner), // subowner
 				boolText(sub.Enabled),
@@ -715,9 +720,11 @@ func slotWalStatus(s xlog.Slot) string {
 	return "reserved"
 }
 
+// formatXmin renders a slot xid column: NULL for InvalidTransactionId
+// (pg_get_replication_slots: `nulls[i] = true` when !TransactionIdIsValid).
 func formatXmin(xid uint64) string {
 	if xid == 0 {
-		return ""
+		return catalog.VirtualNull
 	}
 	return fmt.Sprintf("%d", xid)
 }

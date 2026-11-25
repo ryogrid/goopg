@@ -144,6 +144,51 @@ func (o *bitmapIndexScanOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 	// Determine whether recheck is needed (prefix scan on composite index).
 	recheck := o.needsRecheck()
 
+	// M0148-0001c3a2: a ScalarArrayOp qual probes once per array element
+	// into the one bitmap — the union the index's array keys give PG.
+	if len(o.plan.SAOPKeys) > 0 {
+		if err := o.buildSAOPBitmap(tbm, recheck); err != nil {
+			return nil, err
+		}
+		tbmLossify(tbm)
+		return tbm, nil
+	}
+
+	// M0148-0001c3a4 (j): a skip scan's range on Columns[SkipPrefix] — the
+	// whole index, each entry's key column checked against the bounds.
+	if o.plan.SkipPrefix > 0 {
+		c, err := newIndexColumnCheck(o.ctx, o.plan.Table, o.plan.Index, o.plan.SkipPrefix, func(ref *optimizer.ColumnRef) optimizer.Expr {
+			return skipRangePred(ref, o.plan.LowKey, o.plan.HighKey, o.plan.LowOp, o.plan.HighOp)
+		})
+		if err != nil {
+			return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		if tbm.entries == nil {
+			tbm.entries = make(map[storage.BlockNumber]*pageEntry)
+		}
+		var checkErr error
+		scanFn := func(key []byte, ptr storage.ItemPointer, _ nbtree.ScanPos) (bool, error) {
+			ok, err := c.admits(key)
+			if err != nil {
+				checkErr = err
+				return false, err
+			}
+			if ok {
+				tbm.addOne(ptr.Block, ptr.Offset, false)
+				o.lastTuples++
+			}
+			return true, nil
+		}
+		if err := o.tree.RangeScanWithPos(nil, nil, false, false, scanFn); err != nil {
+			if checkErr != nil {
+				return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: checkErr.Error()}
+			}
+			return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		tbmLossify(tbm)
+		return tbm, nil
+	}
+
 	// Compute the lo/hi key bounds (same logic as indexScanOp.Rescan).
 	loBytes, hiBytes, nullKey, err := o.lookupBounds()
 	if err != nil {
@@ -169,7 +214,28 @@ func (o *bitmapIndexScanOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 	if tbm.entries == nil {
 		tbm.entries = make(map[storage.BlockNumber]*pageEntry)
 	}
-	scanFn := func(_ []byte, ptr storage.ItemPointer, _ nbtree.ScanPos) (bool, error) {
+	// M0148-0001c3a12: a row comparison's bound is lossy; each entry is
+	// checked against the comparison itself.
+	var rowCheck *trailingKeyCheck
+	if o.plan.RowCompare != nil {
+		c, err := newIndexRowCheck(o.ctx, o.plan.Table, o.plan.Index, o.plan.RowCompare)
+		if err != nil {
+			return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		rowCheck = c
+	}
+	var checkErr error
+	scanFn := func(key []byte, ptr storage.ItemPointer, _ nbtree.ScanPos) (bool, error) {
+		if rowCheck != nil {
+			ok, err := rowCheck.admits(key)
+			if err != nil {
+				checkErr = err
+				return false, err
+			}
+			if !ok {
+				return true, nil
+			}
+		}
 		if recheck {
 			tbm.recheckAny = true
 		}
@@ -178,6 +244,9 @@ func (o *bitmapIndexScanOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 		return true, nil
 	}
 	if err := o.tree.RangeScanWithPos(loBytes, hiBytes, o.rangeLoExcl, o.rangeHiExcl, scanFn); err != nil {
+		if checkErr != nil {
+			return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: checkErr.Error()}
+		}
 		return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 
@@ -186,11 +255,57 @@ func (o *bitmapIndexScanOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 	return tbm, nil
 }
 
+// buildSAOPBitmap fills tbm with the TIDs of every entry matching the
+// equality Keys followed by one of the SAOPKeys elements on the next index
+// column. A NULL element matches nothing under `=` and is skipped (a NULL
+// prefix key, nothing at all); a repeated element is probed once, as
+// _bt_preprocess_array_keys deduplicates the array.
+func (o *bitmapIndexScanOp) buildSAOPBitmap(tbm *TIDBitmap, recheck bool) error {
+	if len(o.plan.Keys) >= len(o.plan.Index.Columns) {
+		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "bitmap ScalarArrayOp qual past the index's last column"}
+	}
+	// M0148-0001c3a4: the same per-element windows as the index scans'
+	// (saopWindows: the equality Keys as the prefix, elements sorted and
+	// de-duplicated, an inequality array reduced to its extreme element),
+	// so the three ScalarArrayOp probes cannot disagree.
+	windows, err := o.ctx.saopWindows(saopProbeSpec{
+		table: o.plan.Table, index: o.plan.Index, prefix: o.plan.Keys, elems: o.plan.SAOPKeys,
+		pos: o.plan.Pos(), op: o.plan.SAOPOp, colQuals: o.plan.SAOPColQuals,
+	}, o.tree, o.outerSlot)
+	if err != nil {
+		return err
+	}
+	if tbm.entries == nil {
+		tbm.entries = make(map[storage.BlockNumber]*pageEntry)
+	}
+	scanFn := func(_ []byte, ptr storage.ItemPointer, _ nbtree.ScanPos) (bool, error) {
+		if recheck {
+			tbm.recheckAny = true
+		}
+		tbm.addOne(ptr.Block, ptr.Offset, recheck)
+		o.lastTuples++
+		return true, nil
+	}
+	for _, w := range windows {
+		if err := o.tree.RangeScanWithPos(w.lo, w.hi, w.loExcl, w.hiExcl, scanFn); err != nil {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+	}
+	return nil
+}
+
 // needsRecheck returns true when the index scan uses only a prefix of a
 // composite index key — the remaining key columns' conditions must be
 // rechecked against the heap tuple.
 func (o *bitmapIndexScanOp) needsRecheck() bool {
 	if len(o.plan.Index.Columns) == 0 {
+		return false
+	}
+	if len(o.plan.SAOPKeys) > 0 {
+		return len(o.plan.Keys)+1 < len(o.plan.Index.Columns)
+	}
+	// M0148-0001c3a4 (j): the skip scan checks every entry exactly.
+	if o.plan.SkipPrefix > 0 {
 		return false
 	}
 	// Key covers the first N columns; if there are more index columns,
@@ -223,12 +338,32 @@ func (o *bitmapIndexScanOp) lookupBounds() (loBytes, hiBytes []byte, nullKey boo
 	}
 
 	o.rangeLoExcl, o.rangeHiExcl = false, false
+	// M0148-0001c3a1: a NullTest index qual — behind the equality Keys or on
+	// the leading column beside the bounds — probes through the same bound
+	// computation as the plain index scan (the Keys are its prefix).
+	if o.plan.LeadingNullTest != optimizer.IndexNullTestNone {
+		lo, hi, loExcl, hiExcl, ok, rerr := o.ctx.indexRangeBounds(indexRangeSpec{
+			table: o.plan.Table, index: o.plan.Index, prefix: o.plan.Keys,
+			low: o.plan.LowKey, high: o.plan.HighKey, lowOp: o.plan.LowOp, highOp: o.plan.HighOp,
+			nullTest: o.plan.LeadingNullTest, extraNullTests: o.plan.ExtraNullTests,
+			pos: o.plan.Pos(),
+		}, o.outerSlot)
+		if rerr != nil {
+			return nil, nil, false, rerr
+		}
+		if !ok {
+			return nil, nil, true, nil
+		}
+		o.rangeLoExcl, o.rangeHiExcl = loExcl, hiExcl
+		return lo, hi, false, nil
+	}
 	if o.plan.LowKey != nil || o.plan.HighKey != nil {
 		// M0146-0061: a leading-column range probe, bounded exactly as the
 		// plain index scan bounds it (DESC swap, strictness, the NULL-keyed
 		// entries an open end must not run into).
+		// M0148-0001c3a2: behind the equality Keys when there are any.
 		lo, hi, loExcl, hiExcl, ok, rerr := o.ctx.indexRangeBounds(indexRangeSpec{
-			table: o.plan.Table, index: o.plan.Index,
+			table: o.plan.Table, index: o.plan.Index, prefix: o.plan.Keys,
 			low: o.plan.LowKey, high: o.plan.HighKey, lowOp: o.plan.LowOp, highOp: o.plan.HighOp,
 			pos: o.plan.Pos(),
 		}, o.outerSlot)
@@ -780,6 +915,15 @@ func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 				return slot, err
 			}
 		}
+		// Likewise a LOSSY page still being walked: the shared allocator
+		// hands each page out once, so claiming the next one here would
+		// drop the rest of this page's matches (M0148-0001c3a2).
+		if o.inLossyPage {
+			if slot, err := o.nextLossyTuple(o.pageBlock); err != nil || slot != nil {
+				return slot, err
+			}
+			o.inLossyPage = false
+		}
 		block, entry, ok := o.pbm.nextPage()
 		if !ok {
 			// Exhausted.
@@ -820,17 +964,20 @@ func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 			// does. The previous code `continue`d here and claimed to be
 			// matching the serial path — which was itself dropping lossy pages,
 			// so the two agreed only in being wrong together.
+			//
+			// The walk is a cursor across Next() calls (`inLossyPage` /
+			// `lossyOff`, resumed at the top of this loop), as the exact-page
+			// walk below is. This arm used to return the page's first match
+			// and fall out, so the next Next() claimed a NEW page and every
+			// other match on this one was LOST — one row per lossy page:
+			// regress bitmapops' `a = 1` under work_mem 64kB returned 1273 (its
+			// lossy page count) of 1321 rows once the scan ran parallel.
 			o.lossyOff = 0
-			for {
-				slot, err := o.nextLossyTuple(block)
-				if err != nil {
-					return nil, err
-				}
-				if slot == nil {
-					break
-				}
-				return slot, nil
+			o.inLossyPage = true
+			if slot, err := o.nextLossyTuple(block); err != nil || slot != nil {
+				return slot, err
 			}
+			o.inLossyPage = false
 			continue
 		}
 

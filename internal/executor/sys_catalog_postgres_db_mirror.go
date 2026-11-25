@@ -51,7 +51,11 @@ func mirrorCatalogRelToPostgresDB(ctx *Context, relOID uint32) error {
 	if ctx == nil || ctx.Pool == nil {
 		return nil
 	}
-	if catalog.DefaultDBOid == catalog.PostgresDBOid {
+	if catalog.DefaultDBOid == catalog.PostgresDBOid ||
+		storage.StorageDBOid(catalog.DefaultDBOid) == catalog.PostgresDBOid {
+		// M0149-0001a1 S1: the postgres namespace (1) is stored at base/5
+		// (storage.StorageDBOid), so source and destination are one file —
+		// copying a relation onto itself would only re-dirty its pages.
 		return nil
 	}
 	srcRel := storage.RelFileNode{

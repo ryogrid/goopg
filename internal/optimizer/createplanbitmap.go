@@ -29,6 +29,20 @@ func createBitmapHeapScanPlan(p *Path) (Node, error) {
 	// Build the bitmap qual subtree (outer) from the child path.
 	outer, _ := createPlanNode(p.Children[0])
 
+	// M0148-0001c3a2: a BitmapOr qual's recheck is its ORed arm quals, and
+	// the leaf conjuncts those imply leave the Filter (bitmapOrRecheck).
+	// A BitmapAnd's recheck is its children's quals (create_bitmap_subplan's
+	// AND arm) — whenever every index clause in the tree is exact; an
+	// inexact one keeps the older single-index handling below.
+	if k := p.Children[0].Kind; k == PathBitmapOr || (k == PathBitmapAnd && bitmapTreeExact(p.Children[0])) {
+		bitmapQual, drop := bitmapOrRecheck(p.Children[0], p.Rel.baseLeaf)
+		bhs := &BitmapHeapScan{
+			pos: id.pos, Table: id.table, Alias: id.alias, RTID: id.rtid,
+			BitmapQual: bitmapQual, Outer: outer, schema: id.schema,
+		}
+		return rewrapLeafDropping(p.Rel.baseLeaf, bhs, drop), nil
+	}
+
 	// Build the BitmapQual expression list from the index clauses.
 	// Each index clause becomes part of the recheck condition.
 	bitmapQual := bitmapQualExprs(p.Children[0])
@@ -39,9 +53,6 @@ func createBitmapHeapScanPlan(p *Path) (Node, error) {
 	// every heap tuple — the safety net for lossy bitmap pages, and the
 	// correct filter when the predicate-implication prover is absent.
 	partialPreds := collectBitmapPartialPredicates(p.Children[0])
-	if len(partialPreds) > 0 {
-		bitmapQual = append(bitmapQual, partialPreds...)
-	}
 
 	// A restriction probe's index quals came out of the leaf's own Filter:
 	// they are the recheck list, and the reinstated Filter drops them (PG's
@@ -57,8 +68,32 @@ func createBitmapHeapScanPlan(p *Path) (Node, error) {
 				}
 				drop[c.local] = true
 				bitmapQual = append(bitmapQual, c.local)
+				// M0148-0001c3a4 (i): the column quals merged into the
+				// array are index quals too.
+				for _, q := range c.saopColQuals {
+					if q.local != nil {
+						drop[q.local] = true
+						bitmapQual = append(bitmapQual, q.local)
+					}
+				}
 			}
 		}
+	}
+
+	// create_bitmap_subplan appends the index predicate after the index
+	// quals, and only when they do not already imply it
+	// (predicate_implied_by(indpred, subqual), M0148-0001c3a4 (e)).
+	for _, pp := range partialPreds {
+		if len(bitmapQual) > 0 {
+			var quals Expr = bitmapQual[0]
+			for _, q := range bitmapQual[1:] {
+				quals = &BinaryOp{Op: parser.OpAnd, Left: quals, Right: q}
+			}
+			if predicateImpliedBy(quals, pp) {
+				continue
+			}
+		}
+		bitmapQual = append(bitmapQual, pp)
 	}
 
 	bhs := &BitmapHeapScan{
@@ -84,82 +119,128 @@ func createBitmapIndexScanPlan(p *Path) Node {
 	if p.Rel == nil {
 		panic("createPlan: PathBitmapIndexScan with no RelOptInfo")
 	}
-	id, rewrap, ok := scanLeafFor(p.Rel.baseLeaf)
+	id, _, ok := scanLeafFor(p.Rel.baseLeaf)
 	if !ok {
 		panic(fmt.Sprintf("createPlan: PathBitmapIndexScan over relset %#08x whose leaf is not a rebuildable base scan", uint32(p.Rel.Relids)))
 	}
 	if p.IndexInfo == nil {
 		panic(fmt.Sprintf("createPlan: PathBitmapIndexScan over relset %#08x names no index", uint32(p.Rel.Relids)))
 	}
-
-	// Build Key/Keys from the index clauses, matching createIndexScanPlan's
-	// pattern for binding index columns positionally.
-	var key Expr
-	var keys []Expr
 	pred := bitmapQualExprs(p)
-	// M0146-0061: a range probe's clauses are leading-column bounds (`op` set),
-	// lowered onto LowKey/HighKey with their original strictness, as
-	// createIndexScanPlan lowers them for the plain index scan.
-	var low, high Expr
-	var lowOp, highOp parser.OpCode
-	if len(p.IndexClauses) > 0 && p.IndexClauses[0].op != parser.OpUnknown {
-		for _, c := range p.IndexClauses {
-			if c.indexCol != 0 || c.op == parser.OpUnknown || c.key == nil {
-				panic(fmt.Sprintf("createPlan: bitmap range clause of %s is not a leading-column bound", p.IndexInfo.Name))
-			}
-			switch c.op {
-			case parser.OpGt, parser.OpGe:
-				if low != nil {
-					panic(fmt.Sprintf("createPlan: bitmap range probe of %s carries two lower bounds", p.IndexInfo.Name))
-				}
-				low, lowOp = c.key, c.op
-			default:
-				if high != nil {
-					panic(fmt.Sprintf("createPlan: bitmap range probe of %s carries two upper bounds", p.IndexInfo.Name))
-				}
-				high, highOp = c.key, c.op
-			}
-		}
-		return &BitmapIndexScan{
-			pos:     id.pos,
-			Table:   id.table,
-			Alias:   id.alias,
-			Index:   p.IndexInfo,
-			LowKey:  low,
-			HighKey: high,
-			LowOp:   lowOp,
-			HighOp:  highOp,
-			Pred:    pred,
-			schema:  id.schema,
-		}
+	bis := &BitmapIndexScan{
+		pos: id.pos, Table: id.table, Alias: id.alias, Index: p.IndexInfo,
+		Pred: pred, schema: id.schema,
 	}
-	for i, c := range p.IndexClauses {
-		if c.indexCol != i {
+
+	// The clause list is an equality prefix on index columns 0..n-1, then
+	// at most one of: a ScalarArrayOp on column n (M0148-0001c3a2), or
+	// bounds and / or a NullTest on column n (M0146-0061 leading ranges,
+	// M0148-0001c3a1 NullTests, M0148-0001c3a2 bounds behind the prefix).
+	// Anything else is a producer bug.
+	clauses := p.IndexClauses
+	var prefix []Expr
+	for _, c := range clauses {
+		if c.op != parser.OpUnknown || c.nullTest != IndexNullTestNone || len(c.saop) > 0 {
+			break
+		}
+		if c.indexCol != len(prefix) {
 			panic(fmt.Sprintf("createPlan: bitmap index clause %d of %s claims index column %d; the index-column order was lost",
-				i, p.IndexInfo.Name, c.indexCol))
+				len(prefix), p.IndexInfo.Name, c.indexCol))
 		}
 		if c.key == nil {
-			panic(fmt.Sprintf("createPlan: bitmap index clause %d of %s has no probe expression", i, p.IndexInfo.Name))
+			panic(fmt.Sprintf("createPlan: bitmap index clause %d of %s has no probe expression", len(prefix), p.IndexInfo.Name))
 		}
-		if i == 0 {
-			key = c.key
-		}
-		keys = append(keys, c.key)
+		prefix = append(prefix, c.key)
 	}
-	// When no index clauses are pushed, Key/Keys stay nil (full index scan).
-	// Pred is the remaining index qual for recheck purpose (prefix of composite
-	// key that didn't have corresponding clauses). For a full scan with no
-	// clauses, Pred is nil.
-
-	bis := &BitmapIndexScan{
-		pos:    id.pos,
-		Table:  id.table,
-		Alias:  id.alias,
-		Index:  p.IndexInfo,
-		Key:    key,
-		Keys:   keys,
-		Pred:   pred,
-		schema: id.schema,
+	rest := clauses[len(prefix):]
+	np := len(prefix)
+	if len(rest) == 0 {
+		// Equality on a prefix (or none: a key-less full index scan).
+		if np > 0 {
+			bis.Key, bis.Keys = prefix[0], prefix
+		}
+		return bis
+	}
+	bis.Keys = prefix
+	if len(rest[0].saop) > 0 {
+		if len(rest) != 1 || rest[0].indexCol != np {
+			panic(fmt.Sprintf("createPlan: bitmap ScalarArrayOp clause of %s does not follow its equality prefix", p.IndexInfo.Name))
+		}
+		bis.SAOPKeys = append([]Expr(nil), rest[0].saop...)
+		bis.SAOPOp = rest[0].saopOp
+		bis.SAOPColQuals = lowerSAOPColQuals(rest[0], map[Expr]bool{})
+		return bis
+	}
+	sawBound := false
+	var condOrder []IndexCondItem
+	// M0148-0001c3a4 (j): a skip scan's bounds sit on a later column.
+	rangeCol := np
+	if sc := clausesSkipRange(clauses); sc > 0 && np == 0 {
+		rangeCol, bis.SkipPrefix = sc, sc
+	}
+	for _, c := range rest {
+		if c.indexCol != rangeCol {
+			panic(fmt.Sprintf("createPlan: bitmap range clause of %s bounds index column %d, not %d", p.IndexInfo.Name, c.indexCol, rangeCol))
+		}
+		if c.nullTest != IndexNullTestNone {
+			condOrder = append(condOrder, IndexCondNullTest)
+			if bis.LeadingNullTest != IndexNullTestNone {
+				// M0148-0001c3a2: a further NullTest on the column.
+				bis.ExtraNullTests = append(bis.ExtraNullTests, ExtraIndexNullTest{Kind: c.nullTest, AfterBounds: sawBound})
+				continue
+			}
+			bis.LeadingNullTest, bis.NullTestAfterBounds = c.nullTest, sawBound
+			continue
+		}
+		if c.key == nil || len(c.saop) > 0 {
+			panic(fmt.Sprintf("createPlan: bitmap range clause of %s has no bound", p.IndexInfo.Name))
+		}
+		if c.redundantBound {
+			continue // the bitmap producers drop these; defensive
+		}
+		if c.rowCompare {
+			// M0148-0001c3a12: the lossy leading bound; the scan checks the
+			// comparison on each entry.
+			bin, ok := c.local.(*BinaryOp)
+			if !ok || rangeCol != 0 {
+				panic(fmt.Sprintf("createPlan: bitmap range probe of %s carries a malformed row comparison", p.IndexInfo.Name))
+			}
+			if c.op == parser.OpGe {
+				if bis.LowKey != nil {
+					panic(fmt.Sprintf("createPlan: bitmap range probe of %s carries two lower bounds", p.IndexInfo.Name))
+				}
+				bis.LowKey, bis.LowOp, bis.RowCompareLow = c.key, c.op, true
+			} else {
+				if bis.HighKey != nil {
+					panic(fmt.Sprintf("createPlan: bitmap range probe of %s carries two upper bounds", p.IndexInfo.Name))
+				}
+				bis.HighKey, bis.HighOp = c.key, c.op
+			}
+			bis.RowCompare = bin
+			condOrder = append(condOrder, IndexCondRowCompare)
+			sawBound = true
+			continue
+		}
+		switch c.op {
+		case parser.OpGt, parser.OpGe:
+			if bis.LowKey != nil {
+				panic(fmt.Sprintf("createPlan: bitmap range probe of %s carries two lower bounds", p.IndexInfo.Name))
+			}
+			bis.LowKey, bis.LowOp = c.key, c.op
+			condOrder = append(condOrder, IndexCondLow)
+		case parser.OpLt, parser.OpLe:
+			if bis.HighKey != nil {
+				panic(fmt.Sprintf("createPlan: bitmap range probe of %s carries two upper bounds", p.IndexInfo.Name))
+			}
+			bis.HighKey, bis.HighOp = c.key, c.op
+			condOrder = append(condOrder, IndexCondHigh)
+		default:
+			panic(fmt.Sprintf("createPlan: bitmap range probe of %s mixes an equality clause into its bounds", p.IndexInfo.Name))
+		}
+		sawBound = true
+	}
+	if len(condOrder) > 1 {
+		bis.IndexCondOrder = condOrder
 	}
 	// Returned BARE: the leaf's `*Filter` wrappers must NOT be rebuilt here.
 	//
@@ -167,19 +248,9 @@ func createBitmapIndexScanPlan(p *Path) Node {
 	// asserts `outerOp.(bitmapProducer)` — and a `*Filter` is not one. Rewrapping
 	// therefore produced `Filter{BitmapIndexScan}` as the Outer and failed at
 	// execution with "BitmapHeapScan outer is not a bitmap producer", for every
-	// bitmap path over a FILTERED leaf. It was latent only because bitmap paths
-	// never won on cost; the moment they did, nine TPC-H queries failed.
-	//
-	// It is also what PG does. A `Bitmap Index Scan` node carries `Index Cond:`
-	// and nothing else; the relation's other quals appear as `Filter:` on the
-	// `Bitmap Heap Scan` above it. `createBitmapHeapScanPlan` rewraps there,
-	// which is where the leaf's wrappers belong and where they already go.
-	//
-	// `rewrap` is deliberately still taken from `scanLeafFor` above rather than
-	// dropped from the call: the identity it returns alongside is what supplies
-	// pos/table/alias/schema, and a future edit that needs the wrappers should
-	// find them here rather than re-derive them.
-	_ = rewrap
+	// bitmap path over a FILTERED leaf. It is also what PG does: a `Bitmap
+	// Index Scan` node carries `Index Cond:` and nothing else; the relation's
+	// other quals appear as `Filter:` on the `Bitmap Heap Scan` above it.
 	return bis
 }
 

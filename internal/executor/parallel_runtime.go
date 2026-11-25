@@ -10,6 +10,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -288,3 +289,23 @@ func (g *ParallelGroup) Wait() error {
 // Cancel stops the workers without waiting. Wait must still be called, and the
 // caller must drain the workers' output channel first.
 func (g *ParallelGroup) Cancel() { g.cancel() }
+
+// parallelLeaderOpenError picks the error a Gather returns when opening the
+// leader's own share failed with err. errParallelHashAbandoned only stops a
+// participant from probing: the group's first failure caused it and is what
+// the client must see, as when a worker fails during Next. fail records the
+// error before it cancels, so the failure is readable once the context is done
+// and the workers need not be joined here (Close joins them). A participant
+// that panicked in its build reports abandoned before its recover reaches
+// fail, which is why this waits. No recorded failure means the statement
+// itself was cancelled.
+func parallelLeaderOpenError(g *ParallelGroup, err error) error {
+	if !errors.Is(err, errParallelHashAbandoned) {
+		return err
+	}
+	<-g.ctx.Done()
+	if failure := g.errBox.get(); failure != nil {
+		return failure
+	}
+	return g.ctx.Err()
+}

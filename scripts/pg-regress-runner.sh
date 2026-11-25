@@ -32,6 +32,20 @@
 #                      already-initialised DB).
 #   --stop-on-first    Exit after first failure.
 #   --out-dir DIR      Directory to write per-test diff files (default: tmp/regress-diffs/).
+#   --counts-file FILE Append one TSV line per case:
+#                      name<TAB>PASS|FAIL|ERROR|TIMEOUT|SKIP<TAB>mismatch<TAB>expected
+#   --case-timeout S   Kill a case's psql after S seconds (0 = off, the default);
+#                      the case is reported TIMEOUT and the run continues.
+#   --update-inventory After the run, write the measured counts into
+#                      docs/test-port/postgres-oracle-target-inventory.csv
+#                      (cmd/regress-mismatch-update; only `failed` regress rows)
+#                      and regenerate docs/test-port/upstream-regress-coverage.md.
+#
+# Mismatch metric (recorded in the inventory for `failed` cases):
+#   mismatch = expected-side '-' lines of the unified diff between the
+#              normalised expected .out and the normalised actual output
+#              (the '---' file header excluded), i.e. expected lines goopg did
+#              not reproduce; expected = line count of the normalised .out.
 #
 # Test selection:
 #   The default "quick" set covers self-contained type/operator tests that
@@ -40,7 +54,7 @@
 #
 # Output format:
 #   PASS  int2      (486 lines)
-#   FAIL  int4      (diff in tmp/regress-diffs/int4.diff)
+#   FAIL  int4      (diff: 40 lines, mismatch: 12/470 → tmp/regress-diffs/int4.diff)
 #   ...
 #   ================================================
 #   pg-regress-runner: 12/20 PASS (60.0% parity)
@@ -98,6 +112,9 @@ VERBOSE=0
 RUN_SETUP=1
 STOP_ON_FIRST=0
 OUT_DIR="${REPO_ROOT}/tmp/regress-diffs"
+COUNTS_FILE=""
+CASE_TIMEOUT=0
+UPDATE_INVENTORY=0
 NAMED_TESTS=()
 
 # Quick set: self-contained type/operator tests that don't require extensions,
@@ -155,6 +172,9 @@ while [[ $# -gt 0 ]]; do
         --no-setup)      RUN_SETUP=0; shift ;;
         --stop-on-first) STOP_ON_FIRST=1; shift ;;
         --out-dir)       OUT_DIR="$2"; shift 2 ;;
+        --counts-file)   COUNTS_FILE="$2"; shift 2 ;;
+        --case-timeout)  CASE_TIMEOUT="$2"; shift 2 ;;
+        --update-inventory) UPDATE_INVENTORY=1; shift ;;
         --) shift; NAMED_TESTS+=("$@"); break ;;
         -*) echo "Unknown option: $1" >&2; exit 2 ;;
         *)  NAMED_TESTS+=("$1"); shift ;;
@@ -435,6 +455,18 @@ normalise_output() {
 # -------------------------------------------------------------------------- #
 mkdir -p "${OUT_DIR}"
 
+if [[ "$UPDATE_INVENTORY" -eq 1 && -z "$COUNTS_FILE" ]]; then
+    COUNTS_FILE="${OUT_DIR}/mismatch-counts.tsv"
+    : > "${COUNTS_FILE}"
+fi
+
+# record_counts NAME RESULT MISMATCH EXPECTED — one TSV line per case for
+# cmd/regress-mismatch-update (no-op without --counts-file/--update-inventory).
+record_counts() {
+    [[ -n "${COUNTS_FILE}" ]] || return 0
+    printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "${COUNTS_FILE}"
+}
+
 run_test() {
     local name="$1"
     local sql_file="${REGRESS_SQL}/${name}.sql"
@@ -443,10 +475,12 @@ run_test() {
 
     if [[ ! -f "$sql_file" ]]; then
         echo "SKIP  ${name}  (no .sql file)"
+        record_counts "$name" SKIP "" ""
         return 2
     fi
     if [[ ! -f "$exp_file" ]]; then
         echo "SKIP  ${name}  (no .out file)"
+        record_counts "$name" SKIP "" ""
         return 2
     fi
 
@@ -465,7 +499,21 @@ run_test() {
     # The -a echo-all flag is preserved (it lives in the PSQL array above), so
     # the echoed SQL still matches the expected output.
     local prc=0
-    "${PSQL[@]}" < "${sql_file}" >"${actual_raw}" 2>&1 || prc=$?
+    if [[ "${CASE_TIMEOUT}" -gt 0 ]]; then
+        timeout "${CASE_TIMEOUT}" "${PSQL[@]}" < "${sql_file}" >"${actual_raw}" 2>&1 || prc=$?
+    else
+        "${PSQL[@]}" < "${sql_file}" >"${actual_raw}" 2>&1 || prc=$?
+    fi
+
+    # timeout(1) exits 124 when it killed the client. The server may still be
+    # executing the case's last statement; the capture is a truncated prefix,
+    # so it is not a usable diff. Later cases open their own connection.
+    if [[ "${CASE_TIMEOUT}" -gt 0 && "$prc" -eq 124 ]]; then
+        echo "TIMEOUT ${name}  (psql killed after ${CASE_TIMEOUT}s — NOT a valid diff)"
+        record_counts "$name" TIMEOUT "" ""
+        rm -f "${actual_raw}" "${actual_norm}" "${expected_norm}"
+        return 4
+    fi
 
     # psql exits 2 when "connection to server went bad and the session was not
     # interactive" (postgres/doc/src/sgml/ref/psql-ref.sgml, "Exit Status"):
@@ -476,6 +524,7 @@ run_test() {
     # (no ON_ERROR_STOP), so this only fires on real connectivity loss.
     if [[ "$prc" -eq 2 ]]; then
         echo "ERROR ${name}  (psql lost the connection — NOT a valid diff)"
+        record_counts "$name" ERROR "" ""
         sed -n '$p' "${actual_raw}" | sed 's/^/      /'
         rm -f "${actual_raw}" "${actual_norm}" "${expected_norm}"
         return 3
@@ -488,13 +537,19 @@ run_test() {
     exp_lines="$(wc -l < "${expected_norm}")"
 
     if diff --unified=5 "${expected_norm}" "${actual_norm}" > "${diff_file}" 2>&1; then
-        echo "PASS  ${name}  (${exp_lines} lines)"
+        echo "PASS  ${name}  (${exp_lines} lines, mismatch: 0/${exp_lines})"
+        record_counts "$name" PASS 0 "${exp_lines}"
         rm -f "${actual_raw}" "${actual_norm}" "${expected_norm}" "${diff_file}"
         return 0
     else
         local diff_lines
         diff_lines="$(wc -l < "${diff_file}")"
-        echo "FAIL  ${name}  (diff: ${diff_lines} lines → ${diff_file})"
+        # Expected-side lines goopg did not reproduce: '-' lines past the
+        # two-line '--- / +++' file header.
+        local mismatch
+        mismatch="$(tail -n +3 "${diff_file}" | grep -c '^-' || true)"
+        echo "FAIL  ${name}  (diff: ${diff_lines} lines, mismatch: ${mismatch}/${exp_lines} → ${diff_file})"
+        record_counts "$name" FAIL "${mismatch}" "${exp_lines}"
         if [[ "$VERBOSE" -eq 1 ]]; then
             cat "${diff_file}"
         fi
@@ -510,6 +565,7 @@ pass=0
 fail=0
 skip=0
 oper=0
+tmo=0
 total=${#TESTS[@]}
 
 echo "pg-regress-runner: running ${total} tests against goopg:${PORT}"
@@ -522,6 +578,7 @@ for t in "${TESTS[@]}"; do
         0) pass=$((pass + 1)) ;;
         1) fail=$((fail + 1)); [[ "$STOP_ON_FIRST" -eq 1 ]] && break ;;
         2) skip=$((skip + 1)) ;;
+        4) tmo=$((tmo + 1)) ;;
         # Connection loss: the server is gone or was never ours. Every later
         # case would be fabricated the same way, so stop rather than emit a
         # sweep of meaningless diffs.
@@ -534,8 +591,18 @@ pct=0
 if [[ $((pass + fail)) -gt 0 ]]; then
     pct=$(awk "BEGIN {printf \"%.1f\", ${pass}*100/(${pass}+${fail})}")
 fi
-echo "pg-regress-runner: ${pass}/$((pass+fail)) PASS (${pct}% parity, ${skip} skipped)"
+echo "pg-regress-runner: ${pass}/$((pass+fail)) PASS (${pct}% parity, ${skip} skipped, ${tmo} timed out)"
 echo "  diffs in: ${OUT_DIR}/"
+
+if [[ "$UPDATE_INVENTORY" -eq 1 ]]; then
+    if [[ $oper -gt 0 ]]; then
+        echo "pg-regress-runner: --update-inventory skipped — run ABORTED, counts incomplete." >&2
+    else
+        echo "pg-regress-runner: updating inventory from ${COUNTS_FILE}..."
+        (cd "${REPO_ROOT}" && go run ./cmd/regress-mismatch-update --counts "${COUNTS_FILE}" \
+            && go run ./cmd/gen-regress-coverage)
+    fi
+fi
 
 if [[ $oper -gt 0 ]]; then
     echo "pg-regress-runner: ABORTED — lost the server connection mid-run." >&2

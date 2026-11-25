@@ -94,6 +94,10 @@ type Manager struct {
 	mu    sync.Mutex
 	files map[RelFileNode]*relFile
 
+	// tempRels maps a temporary relation's main-fork RelFileNode to its
+	// backend number, which names its files (SetRelTemp). M0149-0006a.
+	tempRels sync.Map
+
 	aio AIOEngine
 
 	// OnReadWait / OnWriteWait / OnExtendWait / OnSyncWait are optional
@@ -176,6 +180,23 @@ func (m *Manager) Close() error {
 	return firstErr
 }
 
+// CloseAllRelations closes every open file and forgets it, leaving the
+// Manager usable: the next access reopens the file and re-reads its size.
+// ResetUnloggedRelations replaces main forks underneath open handles, whose
+// cached block counts would otherwise be stale (M0149-0003).
+func (m *Manager) CloseAllRelations() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var firstErr error
+	for rel, f := range m.files {
+		if err := f.close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("close %v: %w", rel, err)
+		}
+		delete(m.files, rel)
+	}
+	return firstErr
+}
+
 // DataDir returns the root data directory this Manager was configured with.
 func (m *Manager) DataDir() string { return m.cfg.DataDir }
 
@@ -203,6 +224,7 @@ func (m *Manager) SetAIO(eng AIOEngine) {
 // Out-of-range blocks return an already-complete handle whose
 // Wait surfaces ErrShortRead, matching ReadBlock's behaviour.
 func (m *Manager) PrefetchBlock(rel RelFileNode, blk BlockNumber, buf []byte) (AIOHandle, error) {
+	rel = rel.Canonical()
 	if len(buf) != BlockSize {
 		return nil, fmt.Errorf("PrefetchBlock: buf is %d bytes, want %d", len(buf), BlockSize)
 	}
@@ -274,6 +296,7 @@ func (h preCompletedHandle) Wait() (int, error) { return h.n, h.err }
 // engine-less ones see the same blocking-pwrite behaviour
 // they had before.
 func (m *Manager) WriteBlockAIO(rel RelFileNode, blk BlockNumber, buf []byte) (AIOHandle, error) {
+	rel = rel.Canonical()
 	if len(buf) != BlockSize {
 		return nil, fmt.Errorf("WriteBlockAIO: buf is %d bytes, want %d", len(buf), BlockSize)
 	}
@@ -333,6 +356,7 @@ var ErrWritebackUnsupported = errors.New("storage: writeback hint unsupported on
 // upstream's coalesced multi-range WritebackContext — see
 // docs/design/0122-0003-explain-format-xml-yaml.md "writeback" section.
 func (m *Manager) SyncFileRangeHint(rel RelFileNode) error {
+	rel = rel.Canonical()
 	f, err := m.relFile(rel)
 	if err != nil {
 		return err
@@ -344,6 +368,7 @@ func (m *Manager) SyncFileRangeHint(rel RelFileNode) error {
 // BlockSize bytes. Returns ErrShortRead if the file ends before the
 // block (i.e. blk is beyond the current relation size).
 func (m *Manager) ReadBlock(rel RelFileNode, blk BlockNumber, buf []byte) error {
+	rel = rel.Canonical()
 	if len(buf) != BlockSize {
 		return fmt.Errorf("ReadBlock: buf is %d bytes, want %d", len(buf), BlockSize)
 	}
@@ -390,6 +415,7 @@ const DefaultIOCombineLimit = 128 * 1024 / BlockSize
 // landed and no error — ErrShortRead is reserved for a run that starts beyond
 // the relation, matching ReadBlock's contract for a single block.
 func (m *Manager) ReadBlocks(rel RelFileNode, first BlockNumber, bufs [][]byte) (int, error) {
+	rel = rel.Canonical()
 	if len(bufs) == 0 {
 		return 0, nil
 	}
@@ -419,6 +445,7 @@ func (m *Manager) ReadBlocks(rel RelFileNode, first BlockNumber, bufs [][]byte) 
 // bytes. The block must already exist (i.e. blk < NBlocks); use
 // Extend to grow the relation.
 func (m *Manager) WriteBlock(rel RelFileNode, blk BlockNumber, buf []byte) error {
+	rel = rel.Canonical()
 	if len(buf) != BlockSize {
 		return fmt.Errorf("WriteBlock: buf is %d bytes, want %d", len(buf), BlockSize)
 	}
@@ -444,6 +471,7 @@ func (m *Manager) WriteBlock(rel RelFileNode, blk BlockNumber, buf []byte) error
 // Extend appends buf as a new block at the end of rel and returns the
 // block number that was assigned. buf must be BlockSize bytes.
 func (m *Manager) Extend(rel RelFileNode, buf []byte) (BlockNumber, error) {
+	rel = rel.Canonical()
 	if len(buf) != BlockSize {
 		return InvalidBlockNumber, fmt.Errorf("Extend: buf is %d bytes, want %d", len(buf), BlockSize)
 	}
@@ -470,6 +498,7 @@ func (m *Manager) Extend(rel RelFileNode, buf []byte) (BlockNumber, error) {
 // `docs/design/perf-optimize/07-wal-fsm-insert.md` §3 registers blocks
 // firstBlk+1 .. firstBlk+n-1 in FSM and uses firstBlk for its own insert.
 func (m *Manager) ExtendBatch(rel RelFileNode, buf []byte, n int) (BlockNumber, error) {
+	rel = rel.Canonical()
 	if n <= 0 {
 		return InvalidBlockNumber, fmt.Errorf("ExtendBatch: n=%d must be > 0", n)
 	}
@@ -491,6 +520,7 @@ func (m *Manager) ExtendBatch(rel RelFileNode, buf []byte, n int) (BlockNumber, 
 
 // NBlocks returns the current size of rel in blocks.
 func (m *Manager) NBlocks(rel RelFileNode) (BlockNumber, error) {
+	rel = rel.Canonical()
 	f, err := m.relFile(rel)
 	if err != nil {
 		return 0, err
@@ -511,6 +541,7 @@ func (m *Manager) NBlocks(rel RelFileNode) (BlockNumber, error) {
 // reads relation sizes on every plan (estimate_rel_size's
 // RelationGetNumberOfBlocks), and an open fork's block counter is exact.
 func (m *Manager) CachedNBlocks(rel RelFileNode) (BlockNumber, bool) {
+	rel = rel.Canonical()
 	m.mu.Lock()
 	f, ok := m.files[rel]
 	m.mu.Unlock()
@@ -521,6 +552,7 @@ func (m *Manager) CachedNBlocks(rel RelFileNode) (BlockNumber, bool) {
 }
 
 func (m *Manager) Exists(rel RelFileNode) bool {
+	rel = rel.Canonical()
 	_, err := os.Stat(m.relPath(rel))
 	return err == nil
 }
@@ -536,6 +568,7 @@ func (m *Manager) Exists(rel RelFileNode) bool {
 // healthy empty table as corrupt. It is idempotent: relFile's cache and
 // O_CREATE open both no-op on a file that already exists. M0119-0006.
 func (m *Manager) CreateFile(rel RelFileNode) error {
+	rel = rel.Canonical()
 	_, err := m.relFile(rel)
 	return err
 }
@@ -545,24 +578,27 @@ func (m *Manager) CreateFile(rel RelFileNode) error {
 // can build the upstream-verbatim `could not open file "%s"` message when a
 // fork is found missing (the pg_amcheck heap file-removal corruption scenario).
 func (m *Manager) RelPath(rel RelFileNode) string {
+	rel = rel.Canonical()
+	stem := m.relFileStem(rel)
 	base := relDir(rel)
 	switch rel.Fork {
 	case MainFork:
-		return base + "/" + fmt.Sprint(rel.RelOid)
+		return base + "/" + stem
 	case FSMFork:
-		return base + "/" + fmt.Sprintf("%d_fsm", rel.RelOid)
+		return base + "/" + stem + "_fsm"
 	case VisibilityMapFork:
-		return base + "/" + fmt.Sprintf("%d_vm", rel.RelOid)
+		return base + "/" + stem + "_vm"
 	case InitFork:
-		return base + "/" + fmt.Sprintf("%d_init", rel.RelOid)
+		return base + "/" + stem + "_init"
 	}
-	return base + "/" + fmt.Sprintf("%d_fork%d", rel.RelOid, rel.Fork)
+	return base + "/" + fmt.Sprintf("%s_fork%d", stem, rel.Fork)
 }
 
 // Sync issues fdatasync(2) on rel's backing file. Used by the
 // checkpointer to make sure dirty buffers we already wrote are
 // durable before we advance the redo pointer.
 func (m *Manager) Sync(rel RelFileNode) error {
+	rel = rel.Canonical()
 	if m.cfg.FsyncDisabled {
 		return nil
 	}
@@ -617,6 +653,7 @@ func (m *Manager) SyncAll() error {
 // entry is gone; the buffer pool's InvalidateRel must run beforehand
 // to flush any pinned slots.
 func (m *Manager) DropRelation(rel RelFileNode) error {
+	rel = rel.Canonical()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if f, ok := m.files[rel]; ok {
@@ -641,6 +678,7 @@ func (m *Manager) DropRelation(rel RelFileNode) error {
 // caller performs itself (os.Remove), since a failure to clean up an orphan
 // is harmless but closing the wrong handle is not.
 func (m *Manager) CloseRelation(rel RelFileNode) {
+	rel = rel.Canonical()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if f, ok := m.files[rel]; ok {
@@ -661,6 +699,7 @@ func (m *Manager) CloseRelation(rel RelFileNode) {
 // M-NIGHTLY "0-byte relfilenode file" class). The file-open policy is
 // relFileForTruncate.
 func (m *Manager) TruncateRelation(rel RelFileNode) error {
+	rel = rel.Canonical()
 	f, opened, err := m.relFileForTruncate(rel)
 	if err != nil || !opened {
 		return err
@@ -677,6 +716,7 @@ func (m *Manager) TruncateRelation(rel RelFileNode) error {
 // buffer-pool slots that hold pages of rel at or past n before calling
 // this. M0131-S21a-2 part 6.
 func (m *Manager) TruncateRelationTo(rel RelFileNode, n BlockNumber) error {
+	rel = rel.Canonical()
 	f, opened, err := m.relFileForTruncate(rel)
 	if err != nil || !opened {
 		return err
@@ -696,6 +736,7 @@ func (m *Manager) TruncateRelationTo(rel RelFileNode, n BlockNumber) error {
 // relation directory means the relation has no storage, which is a no-op
 // for truncate.
 func (m *Manager) relFileForTruncate(rel RelFileNode) (*relFile, bool, error) {
+	rel = rel.Canonical()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if f, ok := m.files[rel]; ok {
@@ -732,6 +773,7 @@ func (m *Manager) relFileForTruncate(rel RelFileNode) (*relFile, bool, error) {
 }
 
 func (m *Manager) relFile(rel RelFileNode) (*relFile, error) {
+	rel = rel.Canonical()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if f, ok := m.files[rel]; ok {
@@ -806,18 +848,20 @@ func RelMainPath(rel RelFileNode) string {
 }
 
 func (m *Manager) relPath(rel RelFileNode) string {
+	rel = rel.Canonical()
+	stem := m.relFileStem(rel)
 	base := filepath.Join(m.cfg.DataDir, relDir(rel))
 	switch rel.Fork {
 	case MainFork:
-		return filepath.Join(base, fmt.Sprint(rel.RelOid))
+		return filepath.Join(base, stem)
 	case FSMFork:
-		return filepath.Join(base, fmt.Sprintf("%d_fsm", rel.RelOid))
+		return filepath.Join(base, stem+"_fsm")
 	case VisibilityMapFork:
-		return filepath.Join(base, fmt.Sprintf("%d_vm", rel.RelOid))
+		return filepath.Join(base, stem+"_vm")
 	case InitFork:
-		return filepath.Join(base, fmt.Sprintf("%d_init", rel.RelOid))
+		return filepath.Join(base, stem+"_init")
 	}
-	return filepath.Join(base, fmt.Sprintf("%d_fork%d", rel.RelOid, rel.Fork))
+	return filepath.Join(base, fmt.Sprintf("%s_fork%d", stem, rel.Fork))
 }
 
 // ErrShortRead indicates a ReadBlock landed past EOF.

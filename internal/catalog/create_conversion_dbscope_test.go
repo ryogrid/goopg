@@ -55,8 +55,8 @@ func TestCreateConversionCrossDatabaseIsolation(t *testing.T) {
 	}
 
 	// Each database's pg_conversion view sees only its own row.
-	rowsDefault := c.PGConversionRowsForDBOid(DefaultDBOid)
-	rowsOther := c.PGConversionRowsForDBOid(otherDB)
+	rowsDefault := userConversionRowsFor(c, DefaultDBOid)
+	rowsOther := userConversionRowsFor(c, otherDB)
 	if len(rowsDefault) != 1 {
 		t.Errorf("PGConversionRowsForDBOid(DefaultDBOid) rows = %d, want 1", len(rowsDefault))
 	}
@@ -68,10 +68,10 @@ func TestCreateConversionCrossDatabaseIsolation(t *testing.T) {
 	if !c.DropConversion("aliasconv", "public", DefaultDBOid) {
 		t.Fatal("DropConversion(aliasconv) under DefaultDBOid = false, want true")
 	}
-	if rows := c.PGConversionRowsForDBOid(otherDB); len(rows) != 1 {
+	if rows := userConversionRowsFor(c, otherDB); len(rows) != 1 {
 		t.Error("otherDB's aliasconv vanished after dropping DefaultDBOid's own copy")
 	}
-	if rows := c.PGConversionRowsForDBOid(DefaultDBOid); len(rows) != 0 {
+	if rows := userConversionRowsFor(c, DefaultDBOid); len(rows) != 0 {
 		t.Error("DefaultDBOid's aliasconv still resolvable after DropConversion")
 	}
 }

@@ -15,6 +15,7 @@ package xlog
 import (
 	"context"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -94,20 +95,37 @@ type syncRepWaiter struct {
 // SyncRep is the process-wide primitive that coordinates COMMIT-side waits
 // with walsender-side standby acknowledgements. Construct one per server.
 type SyncRep struct {
-	mu       sync.Mutex
-	standbys map[string]standbyProgress
-	waiters  []*syncRepWaiter
-	rule     syncRepRule
+	mu sync.Mutex
+	// slots mirrors WalSndCtl->walsnds: one entry per connected walsender
+	// that can count as a synchronous standby. A disconnect frees its slot
+	// and the next walsender takes the lowest free one, so slot order is
+	// PG's walsnd_index — the tie-break between standbys of equal priority.
+	slots   []syncRepSlot
+	waiters []*syncRepWaiter
+	rule    syncRepRule
+}
+
+// syncRepSlot is the part of a WalSnd that syncrep.c reads: the standby's
+// application_name and its last reported write/flush/apply positions.
+type syncRepSlot struct {
+	inUse    bool
+	gen      uint64 // bumped on reuse, so a stale handle cannot touch a new owner
+	appName  string
+	progress standbyProgress
+}
+
+// SyncRepStandby is a walsender's handle on its slot.
+type SyncRepStandby struct {
+	s   *SyncRep
+	idx int
+	gen uint64
 }
 
 // NewSyncRep constructs an empty SyncRep with an "off" rule. Callers should
 // invoke SetStandbyNames before commit-path waits can do anything other than
 // immediate return.
 func NewSyncRep() *SyncRep {
-	return &SyncRep{
-		standbys: map[string]standbyProgress{},
-		rule:     syncRepRule{},
-	}
+	return &SyncRep{rule: syncRepRule{}}
 }
 
 // SetStandbyNames re-parses synchronous_standby_names and atomically swaps
@@ -186,39 +204,128 @@ func (s *SyncRep) WaitForLSN(ctx context.Context, lsn uint64, mode SyncRepMode) 
 	}
 }
 
-// UpdateStandbyProgress records the latest reported LSNs for the named
-// standby and releases any waiters whose target is now satisfied. Called by
-// the walsender goroutine on every Standby Status Update message. An empty
-// appName falls back to "" which the rule will never match — upstream
-// behaves identically (a standby without application_name cannot participate
-// in sync replication).
-func (s *SyncRep) UpdateStandbyProgress(appName string, write, flush, apply uint64) {
+// RegisterStandby claims the lowest free walsender slot for a standby
+// streaming under appName (InitWalSenderSlot). Its sync priority follows
+// the current synchronous_standby_names (SyncRepGetStandbyPriority).
+func (s *SyncRep) RegisterStandby(appName string) *SyncRepStandby {
 	s.mu.Lock()
-	prev := s.standbys[appName]
-	// LSN values reported by walreceivers are monotonic; clamp here so a
-	// transient out-of-order message can never roll the registry backwards.
-	if write < prev.WriteLSN {
-		write = prev.WriteLSN
-	}
-	if flush < prev.FlushLSN {
-		flush = prev.FlushLSN
-	}
-	if apply < prev.ApplyLSN {
-		apply = prev.ApplyLSN
-	}
-	s.standbys[appName] = standbyProgress{WriteLSN: write, FlushLSN: flush, ApplyLSN: apply}
-	s.releaseWaitersLocked()
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	return s.registerLocked(appName)
 }
 
-// ForgetStandby drops the named standby from the registry. Called from the
-// walsender's deferred Unregister path so a disconnected standby no longer
-// counts toward the FIRST/ANY quorum on the next release pass.
+func (s *SyncRep) registerLocked(appName string) *SyncRepStandby {
+	idx := -1
+	for i := range s.slots {
+		if !s.slots[i].inUse {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		s.slots = append(s.slots, syncRepSlot{})
+		idx = len(s.slots) - 1
+	}
+	sl := &s.slots[idx]
+	sl.gen++
+	sl.inUse = true
+	sl.appName = appName
+	sl.progress = standbyProgress{}
+	return &SyncRepStandby{s: s, idx: idx, gen: sl.gen}
+}
+
+// slotLocked returns h's slot, or nil once h was released.
+func (h *SyncRepStandby) slotLocked() *syncRepSlot {
+	if h == nil || h.idx >= len(h.s.slots) {
+		return nil
+	}
+	sl := &h.s.slots[h.idx]
+	if !sl.inUse || sl.gen != h.gen {
+		return nil
+	}
+	return sl
+}
+
+// Update records the standby's reported LSNs (a Standby Status Update) and
+// releases any waiters now satisfied (SyncRepReleaseWaiters).
+func (h *SyncRepStandby) Update(write, flush, apply uint64) {
+	if h == nil {
+		return
+	}
+	h.s.mu.Lock()
+	defer h.s.mu.Unlock()
+	if sl := h.slotLocked(); sl != nil {
+		sl.progress.advance(write, flush, apply)
+		h.s.releaseWaitersLocked()
+	}
+}
+
+// Release frees the slot when the walsender exits (WalSndKill), so the
+// standby no longer counts toward synchronous_standby_names.
+func (h *SyncRepStandby) Release() {
+	if h == nil {
+		return
+	}
+	h.s.mu.Lock()
+	defer h.s.mu.Unlock()
+	if sl := h.slotLocked(); sl != nil {
+		sl.inUse = false
+		h.s.releaseWaitersLocked()
+	}
+}
+
+// Slot is the walsender slot index (walsnd_index); -1 for a nil handle.
+func (h *SyncRepStandby) Slot() int {
+	if h == nil {
+		return -1
+	}
+	return h.idx
+}
+
+// advance moves the positions forward; a reply never rolls them back.
+func (p *standbyProgress) advance(write, flush, apply uint64) {
+	if write > p.WriteLSN {
+		p.WriteLSN = write
+	}
+	if flush > p.FlushLSN {
+		p.FlushLSN = flush
+	}
+	if apply > p.ApplyLSN {
+		p.ApplyLSN = apply
+	}
+}
+
+// UpdateStandbyProgress is Update for the first slot streaming under
+// appName, registering one if none is — for callers without a handle.
+func (s *SyncRep) UpdateStandbyProgress(appName string, write, flush, apply uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx := s.slotByNameLocked(appName)
+	if idx < 0 {
+		idx = s.registerLocked(appName).idx
+	}
+	s.slots[idx].progress.advance(write, flush, apply)
+	s.releaseWaitersLocked()
+}
+
+// ForgetStandby releases every slot streaming under appName.
 func (s *SyncRep) ForgetStandby(appName string) {
 	s.mu.Lock()
-	delete(s.standbys, appName)
+	defer s.mu.Unlock()
+	for i := range s.slots {
+		if s.slots[i].inUse && s.slots[i].appName == appName {
+			s.slots[i].inUse = false
+		}
+	}
 	s.releaseWaitersLocked()
-	s.mu.Unlock()
+}
+
+func (s *SyncRep) slotByNameLocked(appName string) int {
+	for i := range s.slots {
+		if s.slots[i].inUse && s.slots[i].appName == appName {
+			return i
+		}
+	}
+	return -1
 }
 
 // StandbyProgress returns the last reported (write, flush, apply) LSN for
@@ -227,31 +334,89 @@ func (s *SyncRep) ForgetStandby(appName string) {
 func (s *SyncRep) StandbyProgress(appName string) (write, flush, apply uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	p := s.standbys[appName]
-	return p.WriteLSN, p.FlushLSN, p.ApplyLSN
+	if i := s.slotByNameLocked(appName); i >= 0 {
+		p := s.slots[i].progress
+		return p.WriteLSN, p.FlushLSN, p.ApplyLSN
+	}
+	return 0, 0, 0
 }
 
-// SyncStateFor returns the pg_stat_replication.sync_state string ("sync",
-// "potential", or "async") for the standby identified by appName. Called by
-// the pg_stat_replication virtual view row-builder.
+// SlotSyncState returns pg_stat_replication's sync_priority and sync_state
+// for walsender slot idx, as pg_stat_get_wal_senders computes them: the
+// priority is 0 (async) for a standby that has not reported a flush
+// position; a standby among SyncRepGetCandidateStandbys is "sync"
+// (FIRST) or "quorum" (ANY); any other prioritised one is "potential".
+func (s *SyncRep) SlotSyncState(idx int) (priority int, state string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if idx < 0 || idx >= len(s.slots) || !s.slots[idx].inUse {
+		return 0, "async"
+	}
+	sl := s.slots[idx]
+	priority = s.rule.priorityFor(sl.appName)
+	if sl.progress.FlushLSN == 0 {
+		priority = 0
+	}
+	if priority == 0 {
+		return 0, "async"
+	}
+	for _, c := range s.candidatesLocked() {
+		if c == idx {
+			if s.rule.mode == syncRepRuleAny {
+				return priority, "quorum"
+			}
+			return priority, "sync"
+		}
+	}
+	return priority, "potential"
+}
+
+// SyncStateFor is SlotSyncState for the first slot streaming under appName.
 func (s *SyncRep) SyncStateFor(appName string) string {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.rule.empty() {
-		return "async"
-	}
-	return s.rule.syncStateFor(appName)
+	idx := s.slotByNameLocked(appName)
+	s.mu.Unlock()
+	_, st := s.SlotSyncState(idx)
+	return st
 }
 
-// SyncPriorityFor returns the pg_stat_replication.sync_priority integer for
-// the standby identified by appName (0 for async standbys).
+// SyncPriorityFor is SlotSyncState's priority for the first slot streaming
+// under appName.
 func (s *SyncRep) SyncPriorityFor(appName string) int {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	idx := s.slotByNameLocked(appName)
+	s.mu.Unlock()
+	p, _ := s.SlotSyncState(idx)
+	return p
+}
+
+// candidatesLocked is SyncRepGetCandidateStandbys: the slots, in slot
+// order, of standbys with a non-zero priority and a valid flush position;
+// for FIRST with more of them than num_sync, the num_sync with the best
+// (lowest) priority, ties going to the lower slot. Caller holds s.mu.
+func (s *SyncRep) candidatesLocked() []int {
 	if s.rule.empty() {
-		return 0
+		return nil
 	}
-	return s.rule.syncPriorityFor(appName)
+	var out []int
+	for i := range s.slots {
+		sl := &s.slots[i]
+		if !sl.inUse || sl.progress.FlushLSN == 0 || s.rule.priorityFor(sl.appName) == 0 {
+			continue
+		}
+		out = append(out, i)
+	}
+	if s.rule.mode == syncRepRuleFirst && len(out) > s.rule.count {
+		sort.SliceStable(out, func(a, b int) bool {
+			pa, pb := s.rule.priorityFor(s.slots[out[a]].appName), s.rule.priorityFor(s.slots[out[b]].appName)
+			if pa != pb {
+				return pa < pb
+			}
+			return out[a] < out[b]
+		})
+		out = out[:s.rule.count]
+	}
+	return out
 }
 
 // releaseWaitersLocked walks the waiter list and closes the release channel
@@ -279,13 +444,27 @@ func (s *SyncRep) releaseWaitersLocked() {
 	s.waiters = kept
 }
 
-// ruleSatisfiedLocked reports whether the configured rule sees enough
-// standbys at or beyond targetLSN for the given mode. Caller must hold s.mu.
+// ruleSatisfiedLocked is SyncRepGetSyncRecPtr's test: with fewer
+// candidates than num_sync nothing is released; FIRST releases up to the
+// oldest candidate position (SyncRepGetOldestSyncRecPtr), ANY up to the
+// num_sync-th latest (SyncRepGetNthLatestSyncRecPtr). Caller holds s.mu.
 func (s *SyncRep) ruleSatisfiedLocked(targetLSN uint64, mode SyncRepMode) bool {
 	if s.rule.empty() {
 		return true
 	}
-	return s.rule.satisfied(s.standbys, targetLSN, mode)
+	cands := s.candidatesLocked()
+	if len(cands) < s.rule.count {
+		return false
+	}
+	vals := make([]uint64, len(cands))
+	for i, c := range cands {
+		vals[i] = s.slots[c].progress.progressFor(mode)
+	}
+	sort.Slice(vals, func(a, b int) bool { return vals[a] > vals[b] })
+	if s.rule.mode == syncRepRuleFirst {
+		return vals[len(vals)-1] >= targetLSN
+	}
+	return vals[s.rule.count-1] >= targetLSN
 }
 
 // removeWaiterLocked detaches w from the waiter list. Caller must hold s.mu.
@@ -322,94 +501,19 @@ func (r syncRepRule) empty() bool {
 	return r.mode == syncRepRuleOff || len(r.names) == 0 || r.count == 0
 }
 
-// satisfied applies the rule to the current standby map and returns whether
-// the target LSN has been acknowledged by enough configured standbys.
-func (r syncRepRule) satisfied(standbys map[string]standbyProgress, targetLSN uint64, mode SyncRepMode) bool {
-	switch r.mode {
-	case syncRepRuleFirst:
-		// FIRST n: the first n listed names must all be at >= targetLSN.
-		// If fewer than n names exist in the list, the rule cannot be
-		// satisfied — but `parseSyncRepRule` rejects count > len(names)
-		// during parsing, so reaching here with insufficient names is
-		// impossible. Defensive guard keeps the loop simple.
-		if r.count > len(r.names) {
-			return false
-		}
-		for _, name := range r.names[:r.count] {
-			p, ok := standbys[name]
-			if !ok {
-				return false
-			}
-			if p.progressFor(mode) < targetLSN {
-				return false
-			}
-		}
-		return true
-	case syncRepRuleAny:
-		// ANY n: any n of the listed names must be at >= targetLSN.
-		// Equivalent: collect each named standby's progress (0 when
-		// missing), sort descending, check the n-th-largest >= target.
-		if r.count > len(r.names) {
-			return false
-		}
-		vals := make([]uint64, 0, len(r.names))
-		for _, name := range r.names {
-			p, ok := standbys[name]
-			if !ok {
-				vals = append(vals, 0)
-				continue
-			}
-			vals = append(vals, p.progressFor(mode))
-		}
-		sort.Slice(vals, func(i, j int) bool { return vals[i] > vals[j] })
-		return vals[r.count-1] >= targetLSN
+// priorityFor is SyncRepGetStandbyPriority: the 1-based position of the
+// first list member equal to appName (case-insensitively) or "*"; 0 when
+// none matches. Under ANY every match has priority 1.
+func (r syncRepRule) priorityFor(appName string) int {
+	if r.empty() {
+		return 0
 	}
-	return true
-}
-
-// syncStateFor returns the pg_stat_replication.sync_state string for the
-// given application_name: "sync", "potential", or "async".
-//
-//   - FIRST n: names[0..n-1] are "sync"; names[n..] are "potential".
-//   - ANY n: all listed names are "sync" (any can fulfil the quorum).
-//   - Off / empty: all are "async".
-func (r syncRepRule) syncStateFor(appName string) string {
-	switch r.mode {
-	case syncRepRuleFirst:
-		for i, name := range r.names {
-			if name == appName {
-				if i < r.count {
-					return "sync"
-				}
-				return "potential"
-			}
-		}
-	case syncRepRuleAny:
-		for _, name := range r.names {
-			if name == appName {
-				return "sync"
-			}
-		}
-	}
-	return "async"
-}
-
-// syncPriorityFor returns the pg_stat_replication.sync_priority integer for
-// the given application_name (1-indexed position for FIRST, 1 for any listed
-// standby in ANY mode, 0 if not in the rule).
-func (r syncRepRule) syncPriorityFor(appName string) int {
-	switch r.mode {
-	case syncRepRuleFirst:
-		for i, name := range r.names {
-			if name == appName {
-				return i + 1
-			}
-		}
-	case syncRepRuleAny:
-		for _, name := range r.names {
-			if name == appName {
+	for i, name := range r.names {
+		if name == "*" || strings.EqualFold(name, appName) {
+			if r.mode == syncRepRuleAny {
 				return 1
 			}
+			return i + 1
 		}
 	}
 	return 0

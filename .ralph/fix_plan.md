@@ -275,7 +275,8 @@ it to hold the lineage.)
    M0145-0003/0010, so these are NOT selectable work (archive 013).
 9. **M0143 remaining tasks: DISCHARGED** (milestone complete; archive 014).
 10. M-NIGHTLY open items, then the pre-existing milestones
-    (M0119 → **M0147** → the already-filed M0122 tasks → **M0148** → M0131 →
+    (M0119 → **M0147** → the already-filed M0122 tasks → **M0149** →
+    **M0148** → M0131 →
     M0134 → M0135/M0136 → M0095/M0110).
     (Reachable only after the S9 pass above files nothing.)
     **M0122 filing pause (owner decision 2026-10-29).** M0122-0012 is complete
@@ -284,9 +285,62 @@ it to hold the lineage.)
     new M0122 tasks until the owner lifts this pause. Mandatory S2 and M-NIGHTLY
     defect filing continues under their own rules, and M0148 discoveries are
     filed under the selected M0148 suite task, not under M0122.
-    **M0148 regress coverage closure (owner decision 2026-10-29).** After the
-    already-filed M0122 queue has no selectable task, take M0148's first open
-    suite task in its canonical queue. A failing suite is not parked or closed
+    **M0149 recovery/subscription TAP port (owner decision 2026-11-15).**
+    After the already-filed M0122 queue has no selectable task, take M0149's
+    first open task in its canonical queue. M0148 is paused while M0149 has
+    a selectable task; the M0148-0001c3a10 state recorded in the
+    baton/fix_plan is resumed when M0148 becomes selectable again. M0149
+    tasks and all their descendants inherit item-10 rank — the S7
+    correctness-only carve-out does not demote them. One task per upstream
+    `recovery/t/` or `subscription/t/` TAP test (74 ports + 9 re-ports of
+    the shortcut ports); every missing feature
+    is filed immediately as a `Kind: impl` child directly below its parent.
+    A task with an open descendant is not selected itself — take its first
+    open descendant in file order (depth-first); the parent returns for its
+    close-out run once all descendants are `[x]`. One task per loop. A
+    deferral-ledger row never completes or parks an M0149 task. Movement
+    uses the `tap` instrument (`tap <test> assertions a/n→b/n`).
+    **ANTI-DETOUR RULE (owner decision 2026-11-23).** The goal of every
+    M0149 task is ONE thing: the upstream TAP test it names passes against
+    PG 18.3 (`tap` Movement). Fixing a blocker is allowed ONLY when the
+    selected TAP test (or its mixed PG-node run) cannot pass without it.
+    A defect that is merely *found nearby* (client-tool conformance such as
+    `psql \l+`, regress-suite diffs, other types' output/labels, WRONG
+    RESULTS in features the TAP test never touches) is filed (S2 where it
+    applies) and is NOT selected under M0149. Before selecting any
+    `Kind: impl` child, the loop writes in working_set `Path-to-TAP:` one
+    line `<TAP test> ← <blocker> ← … ← <task>` and checks each arrow is a
+    *proven requirement* (a failing TAP assertion or PG-node crash that names
+    it), not "same family" or "found while fixing". If the chain is longer
+    than 3 links, or any arrow is only "found by", the task is a DETOUR:
+    do not select it, record it in `Skip-rationale:` as `detour`, and take the
+    next M0149 canonical-queue task. Every loop's status block states which
+    TAP assertion count (`a/n`) the work moved; `Movement: none` twice in a
+    row on one lineage = stop that lineage (park `[!]`, like M0149-0001g).
+    The parked roots M0149-0001h / -0001i / -0001l (and with them h1, h1a and
+    all their descendants, S7) are exactly such detours: M0149-0001 closed
+    `[x]` when 034 passed; they stay `[!]` until a selected TAP task cites
+    one as a proven prerequisite.
+    **PG 18.3 COMPATIBILITY IS THE PASS CONDITION:** goopg must match PG
+    18.3 on the wire (walsender commands, CopyBoth streaming, pgoutput
+    v1–4, `test_decoding`, matched log/error texts) and in EVERY file it
+    creates (WAL segments/records, `.history`, `archive_status`,
+    `backup_label`/`backup_manifest`, `pg_control`, signal files,
+    `pg_replslot`, `pg_logical/`, `pg_twophase`), proven by mixed runs
+    against real PG 18.3 nodes. goopg↔goopg-only, in-process shortcuts or
+    private formats = NOT ported. **Same commit as each port:** inventory
+    row → `status=port`, `pass_required=yes`, rationale names the
+    `TestPort_*` func, `deferred_to` = `-`; `make regen-testport`,
+    `make check-testport-inventory`, drop any `ci/batch/expected-failures.csv`
+    row. A port whose row is not promoted is not complete; a promoted row
+    whose test violates C1–C3 is a defect — except the nine shortcut rows
+    under re-port tasks M0149-0075…0083, which stay `port` until their
+    re-port closes. Design doc
+    `docs/design/0100-0149/0149-00NN-<slug>.md` is created when the task is
+    STARTED, not up front. Rules: `docs/milestones/0149-replication-tap-port.md`.
+    **M0148 regress coverage closure (owner decision 2026-10-29).** After
+    M0149 has no selectable task, take M0148's first open suite task in its
+    canonical queue. A failing suite is not parked or closed
     with a deferral-ledger row alone: immediately file each required missing
     feature as an implementation child of that suite task, implement the
     children, and keep the suite task open until the PG 18.3 expected output
@@ -317,7 +371,9 @@ why the instruments cannot see the change (the LINEAGE-BASELINE pins show
 why this matters for S4's budget). For M0147 lever-retirement tasks only,
 `lever-count` (`scripts/lever-count.sh`) is an instrument:
 `Movement: yes — lever-count 34→30 (census 22/22·99/99·99/99 held)`
-(owner decision 2026-10-21).
+(owner decision 2026-10-21). For M0149 TAP-port tasks only, `tap` (upstream
+assertions passing in the all-goopg + mixed PG 18.3 runs) is an instrument:
+`Movement: yes — tap 034_create_database 3/12→7/12` (owner decision 2026-11-15).
 
 FROZEN-PREFIXES:
 (empty — the M0142-0008 chain was UNFROZEN by owner decision 2026-09-20;
@@ -505,6 +561,36 @@ OWNER DECISION 2026-10-29 — M0122-0012 closed; regress closure queued:
 - M0148 must implement missing prerequisites as suite-task children; a
   deferral-ledger row by itself never completes or parks a suite task.
 
+OWNER DECISION 2026-11-15 — M0149 filed:
+- M0149 (`docs/milestones/0149-replication-tap-port.md`, section
+  `## M0149`) ports the 74 non-`port` `recovery/t/` + `subscription/t/`
+  TAP tests, one task per test, with every missing feature implemented as a
+  child of its test task. It ranks immediately above M0148 in item 10:
+  after the already-filed M0122 queue, before M0148.
+- The 2026-10-29 sequencing "finish the already-filed M0122 tasks, then
+  enter M0148" is superseded accordingly: after the M0122 queue, enter
+  M0149; enter M0148 only when M0149 has no selectable task.
+- M0148 is paused while M0149 has selectable work. The M0148-0001c3a10
+  state recorded in the baton/fix_plan is resumed, not discarded, when
+  M0148 becomes selectable again.
+- A port counts only at PG 18.3 compatibility on the wire and in every
+  file goopg writes, proven against real PG 18.3 nodes (milestone doc
+  C1–C4).
+- New Movement instrument `tap` for M0149:
+  `Movement: yes — tap <test> assertions <before>/<total>→<after>/<total>`
+  (upstream assertions passing in the all-goopg + mixed runs).
+- Owner decision 2026-11-15 — the 9 shortcut ports (recovery 001, 013,
+  019, 038, 039, 047; subscription 001, 004, 026) are re-implemented under
+  M0149 as re-port tasks M0149-0075 … M0149-0083. Their inventory rows stay
+  `port` while each re-port is open; on close the rationale is rewritten to
+  name the faithful `TestPort_*` func and its mixed variants.
+- Owner decision 2026-11-15 — the loop builds the missing PG 18.3 test
+  modules itself (`test_decoding`, `injection_points`, a server with
+  `--enable-injection-points`) from a copy of `./postgres` into a private
+  prefix, as a one-time child of M0149-0034. It never modifies `./postgres`
+  or `postgres/local_install`. Injection-point steps no longer get a
+  goopg-only allowance (milestone doc C3).
+
 **M-NIGHTLY filing is unconditional**: every loop reads
 `ci/logs/action-items.md` and files each new `## AI-` subject under M-NIGHTLY.
 Its selection condition lives in this section's **Selection rules**
@@ -517,7 +603,8 @@ repro at HEAD first, fix with normal gates, cite the AI-id, tick it.
   item larger than one agent invocation (new tasks carry `Parent:`).
 - Design docs: non-trivial subsystems land with `docs/design/<id>-NNNN-*.md`
   and a `docs/design/README.md` entry in the same commit. For M0137–M0145 and
-  `P0-` tasks follow `AGENT.md` §"Plan-parity harness" D3.
+  `P0-` tasks follow `AGENT.md` §"Plan-parity harness" D3, and M0149
+  (design doc created when the task is started).
 - Deferrals: never close a task with a forward reference. A deferral needs
   **both** a `.ralph/deferral_ledger.md` row (`date | task-id | landed |
   deferred | resume point | why`) **and** an unchecked task that owns the
@@ -1391,6 +1478,40 @@ heuristic stays live.)
   - Expected instrument: Movement: none — correctness fix — no plan instrument \(the repro returns PG's rows after
     two restarts\)\.
 
+- [x] **M\-NIGHTLY\-regress\-pprof\-port — testport/TestPort\_RegressSuite cluster start failed "bind: address already in use": the pprof endpoint took the server's own listen port** \(AI\-20261112\-000028\-001; repro: `go test \-v \-run '^TestPort\_RegressSuite$' \./internal/testport/`\)\.
+  Kind: impl
+  Parent: none
+  - Both ports were picked by bind\-to\-:0\-then\-close (reserveLoopbackPort before newCluster, cluster.New's freePort), so the
+    kernel handed 127\.0\.0\.1:45851 out twice; the server's pprof endpoint bound it first\.
+  - Fixed in `b1928e91c`: reserveLoopbackPortExcept runs after newCluster and excludes c\.ListenAddr\(\) \(RegressSuite and
+    RegressWedgeProbe\); TestPort\_RegressSuite \+ RegressWedgeProbe PASS\.
+  Movement: none — test\-only \(harness port allocation\)\.
+
+- [x] **M\-NIGHTLY\-race\-parallel\-hash\-cancel — race/internal/executor: TestParallelHashPathModelWinner failed "parallel hash join: build abandoned \(parallel group cancelled\)"** \(AI\-20261115\-011812\-001; repro: `go test \-race \-timeout 45m \./internal/executor/`; evidence: ci/logs/20261115\-011812/race/go\-test\.log\)\.
+  Kind: impl
+  Parent: none
+  - Filed 2026\-11\-15 by the loop \(nightly triage\)\. New tonight; the units lane passed the same package\.
+  - The subtest `SELECT f\.fid, d\.dname FROM pq\_fact f JOIN pq\_dim d ON f\.fk = d\.dk WHERE f\.amt >= 0` opened a
+    parallel hash join whose shared build was cancelled \(parallel\_hash\_shared\_test\.go:324\), under the race
+    detector with the host loaded \(load average ~16 during the batch\)\.
+  - Resume: rerun under `\-race` in a quiet host; if it reproduces, trace who cancels the parallel group before the
+    build finishes \(a worker error or a timeout firing early under race slowdown\)\.
+  - 2026\-11\-18 \(fixed\): a real intermittent query error, not a test artefact, and not a race\-detector finding.
+    - Cause: ParallelGroup.Wait cancels the group context after every worker returned normally, and
+      gatherOp's channel closer calls Wait. A leader reaching the build barrier after that saw `ph.done` and
+      `groupDone` both closed, and parallelHashBuild.wait's select picked one at random.
+    - Two ways in: workers finish the whole query before a slow leader opens its share \(the nightly case\),
+      and a Gather that launched no worker, whose group ends at once \(any zero\-worker Parallel Hash join\).
+    - Reproduced before the fix: the barrier unit test failed on its first wait, and the zero\-worker query
+      failed on run 52 of 64.
+    - Fix: a completed build always wins in wait, which still reports abandoned when the build cannot
+      complete. Same barrier for Gather and Gather Merge.
+    - Found alongside: a genuine abandon reached the client as `build abandoned` instead of the worker's
+      error, because both Gathers returned the leader's Open error as it stood.
+      parallelLeaderOpenError now returns the group's first failure. Pinned at helper level only.
+    - Tests: parallel\_hash\_barrier\_cancel\_test.go.
+    Movement: none — correctness fix — no plan instrument
+
 - [ ] **P0\-E25 — after a server restart, columns of user\-defined types \(enum, composite, domain\) reload as `text`**
   \(filed 2026\-11\-04 by the loop, found while probing M0148\-0001j2; S2 — wrong results and unvalidated data\)\.
   Kind: impl
@@ -1411,6 +1532,187 @@ heuristic stays live.)
     CREATE TABLE does; prove with a two\-restart test per type kind\.
   - Expected instrument: Movement: none — correctness fix — no plan instrument \(the repro matches PG after two
     restarts\)\.
+  - 2026\-11\-18 \(M0149\-0001h1a39\): a domain column now carries the domains typmod on the live catalog; after a restart it is lost with the rest of the columns type, so this reload must also restore `DeclaredTypeName` and the base typmod \(catalog.InMemory.DomainBaseType\).
+- [ ] **P0\-E26 — after a server restart, every composite type is gone from the type registry: field selection
+  fails, new columns of it become `text`, `DROP TYPE` says it does not exist** \(filed 2026\-11\-11 by the loop, found
+  while probing M0148\-0001j4 item 2; S2 — wrong results and unvalidated data\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-11 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Pre\-existing\.
+  - Repro on a fresh cluster: `create type st as (a int, b text);` → restart →
+    - `select (row(1,'a')::st).b` errors `column notation .b applied to type st, which is not a composite type`
+      \(PG: `a`\);
+    - `create table tt (x st)` succeeds, but pg\_attribute.atttypid is 25 \(text\);
+    - `drop type st` errors `type "st" does not exist`, although its pg\_type row \(typtype `c`, typrelid set\)
+      is still there.
+  - Enum, domain and range types survive the restart. P0\-E25 \(columns reload as text\) assumes the type
+    registries reload, which does not hold for composites.
+  - Cause \(read, not yet fixed\): InMemory.compositeTypes / compositeTypeNames / compositeTypeFields are filled
+    only by RegisterCompositeType\[WithFields\] from DDL. No startup path re\-registers composites from the
+    pg\_type rows \(typtype `c`\) and the field list from the typrelid relation's pg\_attribute rows.
+  - First step: reload composites from pg\_type \+ pg\_attribute per database, with their stored OID, ArrayOID
+    and RelOID, before the user\-table reload. Then advance the OID counter and prove with a two\-restart test
+    that covers field access, a new column, DROP TYPE and pg\_proc OIDs.
+  - Expected instrument: Movement: none — correctness fix — no plan instrument.
+- [ ] **P0\-E33 — a goopg standby of a PG 18\.3 primary writes the primary's template1 WAL into its own postgres catalogs**
+  \(filed 2026\-11\-15 by the loop, found while designing M0149\-0001a1 S3; S2 — corrupts a shared resource on the
+  standby\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-15 \(S2, standby catalog corruption\) — OWNER PLACEMENT NEEDED\.** Filed, not selected
+    > by itself: the fix is M0149\-0001a1 S3 \(the current item\-10 task\), which closes this when it lands\.
+  - Mechanism \(read from code, not yet reproduced\): PG 18\.3 WAL for template1 names `1663/1/<rel>`\. goopg redo
+    decodes DBOid 1 and the Pool's `storage.StorageDBOid` \(S1, `1 → 5`\) writes the block into `base/5`, the
+    postgres catalogs\. Before S1 it went to `base/1`, which was then goopg's primary postgres catalog copy — the
+    same corruption, so it is pre\-existing\. Any template1 write on the primary \(autovacuum of template1, DDL in
+    template1\) triggers it\.
+  - PG: `RelFileLocator.dbOid` 1 is template1 \(`relpath.c`\); redo writes the block to `base/1`\.
+  - Fix: M0149\-0001a1 S3 Option C — namespace and storage OIDs coincide, so DBOid 1 is template1 everywhere
+    \(design doc 0149\-0001a1 § "S3 design"\)\.
+  - Verification: PG 18\.3 primary → goopg standby; on the primary `\\c template1` + CREATE TABLE + INSERT;
+    on the standby postgres' catalogs are unchanged and template1 shows the table\.
+  - 2026\-11\-15: fix landed with M0149\-0001a1 S3 \(DBOid 1 is template1 at every layer; the legacy `1 → 5` map
+    applies only to the migrating cluster's own pre\-S3 WAL\)\. Still open until the verification above runs\.
+- [ ] **M0122\-0008a — apply `pg_db_role_setting` at session start: `ALTER DATABASE / ROLE … SET` never reaches a new connection**
+  \(filed 2026\-11\-15 by the loop, found while verifying M0149\-0001a1 S2; below\-item\-10 fallback, not S2: no wrong
+  query result, a missing session\-setup step\)\.
+  Kind: impl
+  Parent: none
+  - Repro: `alter database postgres set work_mem = '9MB'; alter role al in database postgres set search_path =
+    public;` then a NEW connection: `show work_mem` → `512MB`, and `al` sees `"$user", public`\. PG 18\.3: `9MB` and
+    `public`\. The rows are stored and survive restarts \(`pg_db_role_setting` shows them\); nothing reads them back
+    into the session\.
+  - PG: `process_settings` \(`utils/init/postinit.c`\) calls `ApplySetting` \(`catalog/pg_db_role_setting.c`\) four
+    times — \(db, role\), \(0, role\), \(db, 0\), \(0, 0\) — with `PGC_S_DATABASE_USER` / `PGC_S_USER` /
+    `PGC_S_DATABASE` / `PGC_S_GLOBAL` sources, before the startup packet's options\.
+  - Suggested first step: at session start in internal/postmaster \(after authentication, before the client's
+    startup options\), read `DatabaseConfigEntries\(dbOid\)` and `RoleConfigEntries\(role, dbOid / 0\)` in PG's order
+    and apply each through the GUC set path with the matching source; `SHOW` / `pg_settings.source` must report
+    `database` / `user` / `database user`\.
+  - Expected instrument: Movement: none — correctness fix — no plan instrument\.
+- [ ] **P0\-E32 — `ALTER TABLE … ADD COLUMN … DEFAULT <const>` loses attmissingval across a restart: old rows read NULL**
+  \(filed 2026\-11\-15 by the loop, found while verifying M0149\-0001a1 S1 WAL replay; S2 — wrong results\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-15 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Pre\-existing: reproduced with the pre\-S1 binary too, after a clean or a crash
+    > restart\.
+  - Repro: `create table t (a int); insert into t values (1),(2); alter table t add column z int default 3;
+    select sum(z) from t;` → 6; restart the server; `select sum(z) from t;` → NULL \(PG 18\.3: 6\)\.
+    - After the restart `pg_attribute` still shows `atthasmissing = t`, but `attmissingval` is empty, so pre\-ALTER
+      tuples \(natts < attnum\) deform the column as NULL\.
+  - PG: `StoreAttrMissingVal` \(catalog/heap\.c\) writes attmissingval as a one\-element array in the pg\_attribute
+    row; relcache rebuilds `TupleConstr.missing` from it \(`RelationBuildTupleDesc`\)\.
+  - Suggested first step: check whether the ALTER path writes attmissingval into the pg\_attribute HEAP row
+    \(the heap re\-sync, memory pg\_attribute\_alter\_needs\_heap\_resync\) and whether the startup reload reads it back
+    into catalog\.Column's missing value; fix whichever side drops it, and prove with a two\-restart test\.
+  - Expected instrument: Movement: none — correctness fix — no plan instrument\.
+- [ ] **P0\-E31 — INSERT into a table partitioned by an expression key fails: `no partition of relation … found for row`**
+  \(filed 2026\-11\-15 by the loop, found while measuring M0148\-0001c3a10 slice 9; S2 — wrong error: PG stores
+  the row\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-15 \(S2, wrong error\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. The regress partition\_join table plt1\_e stays EMPTY on goopg, which skews every
+    > plan that reads it \(and blocks applying cost\_append to appendrels inside joins, slice 9\)\.
+  - Repro: `create table ex1 (c text) partition by list (upper(c)); create table ex1_a partition of ex1 for values
+    in ('A'); insert into ex1 values ('a');`
+    - PG 18.3: `INSERT 0 1`\.
+    - goopg: `ERROR: no partition of relation "ex1" found for row`\. Regress partition\_join's `PARTITION BY
+      LIST(ltrim(c, 'A'))` table plt1\_e fails the same way\.
+  - Cause: routeToPartitionDepth \(internal/executor/operators_storage\.go\) evaluates key expressions with
+    evalPartitionKeyExpr, a hand\-rolled evaluator that knows ColumnRef, a few operators, constants and `abs()`
+    only; any other function returns NULL, and the NULL key matches no partition\.
+  - PG: FormPartitionKeyDatum \(executor/execPartition\.c\) evaluates partexprs with ExecPrepareExprList over the
+    row \(any immutable expression\)\.
+  - Suggested first step: evaluate PartitionKeyExprs through the executor's real expression evaluator \(the
+    analyzer/planner expression for the key, bound to the parent's columns\), the same evaluator CHECK
+    constraints use; keep evalPartitionKeyExpr only as a fallback\.
+
+- [ ] **P0\-E30 — `(A JOIN B) LEFT JOIN C … WHERE <qual on A>` returns A's columns in B's place**
+  \(filed 2026\-11\-15 by the loop, found while probing M0148\-0001c3a9 slice 5; S2 — wrong results\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-15 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Pre\-existing on plain tables; it also blocks M0148\-0001c3a9 slice 5, whose
+    > plans reach this shape \(the executor TestSortKeyChaseKeepsTheKeysRelation fixture\)\.
+  - Repro on plain tables: `create table r1 (a int, b int, c varchar); create table r2 (like r1); create table r3
+    (a int, b int, c int); insert into r1 select i, i % 25, to_char(i, 'FM0000') from generate_series(0, 599) i
+    where i % 2 = 0; insert into r2 select i % 25, i, to_char(i, 'FM0000') from generate_series(0, 599) i where
+    i % 3 = 0; insert into r3 select i, i, i % 25 from generate_series(0, 599, 2) i; analyze r1; analyze r2;
+    analyze r3; select t1.a, t1.c, t2.b, t2.c from (r1 t1 join r2 t2 on t1.a = t2.b) left join r3 t3 on (t1.a =
+    (t3.a + t3.b)/2) where t1.b = 0 order by 1;`
+    - PG 18.3: `150 | 0150 | 150 | 0150` \(…\)\.
+    - goopg: `150 | 0150 | 0 | 0150` — t2.b holds t1.b \(the filtered 0\)\.
+    - goopg's plan keeps the WHERE qual on the outer join \(`Hash Left Join … Filter: (t1.b = 0)`\) and prints the
+      join clause as `Hash Cond: (t1.a = ((t2.a + t2.b) / 2))` — t3's columns named t2: the coordinates of the
+      upper join's inputs are off by one relation\.
+  - PG pushes `t1.b = 0` to t1's scan \(a restriction on the non\-nullable side is a base restriction\)\.
+  - Suggested first step: the M0146\-0224 pushed\-down qual path \(joinrel.pricedPushedDown / s.pushedDown\) and
+    the createPlan layout of the outer join that carries it; compare with the same query minus the WHERE clause\.
+
+- [ ] **P0\-E29 — `(A LEFT JOIN B) FULL JOIN C … WHERE coalesce(a, 0) …` returns B columns that do not exist in B**
+  \(filed 2026\-11\-15 by the loop, found while probing M0148\-0001c3a9 slice 5; S2 — wrong results\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-15 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Pre\-existing: identical with enable\_partitionwise\_join on or off, and on plain
+    > \(non\-partitioned\) copies of the tables\.
+  - Repro \(regress partition\_join's `plt1_adv` / `plt2_adv` / `plt3_adv` data, copied into plain tables q1 / q2 /
+    q3\): `SELECT … FROM (q1 t1 LEFT JOIN q2 t2 ON (t1.c = t2.c)) FULL JOIN q3 t3 ON (t1.c = t3.c) WHERE
+    coalesce(t1.a, 0) % 5 != 3 AND coalesce(t1.a, 0) % 5 != 4`\.
+    - Both return 55 rows, but the md5 of the rows differs: PG `cb4cd9c1…`, goopg `d6bec509…`\.
+    - goopg prints `0 | 0000 | 0 | 0000 | |` and `1 | 0001 | 1 | 0001 | 1 | 0001`, where PG prints
+      `0 | 0000 | | | |` and `1 | 0001 | | | 1 | 0001`: t2's columns carry t1's values for t1 rows with no B match
+      \(q2 has no c = '0000' or '0001' rows\)\. A plain `t1 LEFT JOIN t2` alone is correct\.
+  - Suggested first step: EXPLAIN \(VERBOSE\) the query and check the FULL JOIN's output mapping of the nested left
+    join's nullable side — it looks like a column\-position mix\-up between t1 and t2 above the left join
+    \(the WHERE clause over the FULL JOIN is not strict for t1, so reduce\_outer\_joins keeps both joins\)\.
+
+- [ ] **P0\-E28 — a whole\-row reference to the NULL\-extended side of an outer join is a row of NULLs, not NULL**
+  \(filed 2026\-11\-15 by the loop, found while probing M0148\-0001c3a9 slice 5; S2 — wrong results\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-15 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Pre\-existing \(identical with enable\_partitionwise\_join off\)\.
+  - Repro: `create temp table wa(a int, b text); create temp table wb(a int, b text); insert into wa values
+    (1,'x'),(2,'y'); insert into wb values (1,'z'); select wa.a, wb, wb is distinct from null,
+    coalesce(wb::text,'<null>') from wa left join wb on wa.a = wb.a order by 1;`
+    - PG 18.3, row 2: `wb` NULL, `is distinct from null` false, coalesce `<null>`.
+    - goopg, row 2: `(,)`, true, `(,)`.
+  - Also regress partition\_join `SELECT t1, t2 FROM prt1 t1 LEFT JOIN prt2 t2 …` prints `(,,)` for the
+    unmatched rows.
+  - PG: a whole\-row Var of a nullable rel is nulled by the outer join \(varnullingrels; the join's NULL
+    extension produces a NULL datum for the whole\-row column, not a composite of NULLs\)\.
+  - Suggested first step: find where goopg builds the whole\-row value \(row constructor over the scan's
+    columns, evaluated above the join\) and make a NULL\-extended side yield NULL — evaluate it at the scan
+    and let the join null\-extend the datum, as PG does\.
+
+- [ ] **P0\-E27 — an aggregate over an ORDER BY subquery is split into parallel partial aggregates, losing the order:
+  `array_agg` returns elements out of order** \(filed 2026\-11\-14 by the loop, found while chasing a regress
+  arrays flake during M0148\-0001c3a12; S2 — wrong results\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-14 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Pre\-existing; nondeterministic in the regress run \(arrays \+13 lines twice this
+    > session: `{0,1,7,2,3,…}`, `{…,1,2,3,NULL,0}`\), because the plan depends on the parallel settings and the
+    > worker interleaving\.
+  - Repro on a fresh cluster: `create table tk (unique1 int, ten int)` with 10000 rows and an index on unique1;
+    `set max_parallel_workers_per_gather=4; set parallel_setup_cost=0; set parallel_tuple_cost=0;
+    set min_parallel_table_scan_size=0; set min_parallel_index_scan_size=0;`
+    `select md5(array_agg(ten)::text) from (select ten from tk where unique1 < 15000 order by unique1) ss`:
+    - goopg plans `Finalize Aggregate → Gather → Partial Aggregate → Parallel Index Scan` and its digest differs
+      from PG's;
+    - PG plans `Aggregate → Gather Merge → Sort → Parallel Seq Scan`, keeping the order.
+  - Cause \(not yet read\): the partial\-aggregation arm accepts an aggregate whose input carries required
+    pathkeys from a subquery ORDER BY. An order\-sensitive aggregate's input order must be preserved — PG keeps
+    it with Gather Merge and never splits it across workers.
+  - First step: in the partial\-aggregation path builder, decline when the aggregate input's pathkeys come from a
+    subquery sortClause and the aggregate is order\-sensitive \(array\_agg, string\_agg, json\_agg, …\), and file
+    the Gather Merge \+ Sort path. Then test with the repro and the regress arrays queries under forced parallelism.
+  - Expected instrument: Movement: none — correctness fix — no plan instrument.
+
 
 - [x] **`DROP TABLE IF EXISTS` of a missing relation routes through the TRUNCATE executor and creates 0\-byte relfilenode files** \(filed 2026\-10\-31 by the loop diagnosing AI\-20261031\-002109\-005\)
   Kind: impl
@@ -1582,6 +1884,29 @@ heuristic stays live.)
   - Movement: landed; residuals \(a\) scan width column 36 vs 0, \(b\) TRUNCATE ROLLBACK stats undo,
     \(c\) UPDATE pg\_class \-1 sidecar persistence, \(d\) index relstats reset on TRUNCATE → ledger
     2026\-10\-31 "post\-TRUNCATE cost" row\. No M\-NIGHTLY items remain from the 20261031 run\.
+
+- [ ] **testport/TestPort\_PgoutputInteropGoopgToGoopgRefreshData — subscriber table u held 6 rows after DROP PUBLICATION p2, want 3** \(AI\-20261118\-010916\-001; repro: `go test \-v \-run '^TestPort\_PgoutputInteropGoopgToGoopgRefreshData$' \./internal/testport/`\) \(S2 — possible duplicate primary\-key rows on a logical\-replication subscriber\)
+  Kind: impl
+  Parent: none
+  - **ESCALATION 2026\-11\-18 \(S2\).** On the publisher, u \(id int PRIMARY KEY\) only ever holds ids 1–3,
+    inserted before CREATE PUBLICATION p2. In the 2026\-11\-18 01:09 nightly \(18\.2 s run, host disk full at
+    the time\), the subscriber's `count\(*\) FROM u` was 6 after DROP PUBLICATION p2
+    \(pgoutput\_interop\_test\.go:3733\). Six rows in a primary\-keyed table whose source has three ids means
+    duplicate keys were stored: unique enforcement was bypassed on the subscriber's apply or COPY path.
+    Awaiting owner placement; not self\-selected.
+  - Unverified lead: the ADD PUBLICATION p2 COPY lands ids 1–3, and the walsender, still lagging behind the
+    pre\-p2 INSERT under load, decodes that INSERT against the *current* publication set rather than the
+    historic snapshot PG's pgoutput uses. Streaming then delivers the same ids again, and the apply insert
+    does not raise the unique violation PG would \(23505, worker restart\).
+  - 2026\-11\-18: 6/6 passes on an idle host \(5–6 s each\); intermittent, not reproduced. The cluster dirs were
+    not kept: the stale tmp/pubsubclusters/pgoutput\_g2g\_refreshdata had to be removed before rerunning.
+  - Separate harness defect, fixed the same loop: `pubsubcluster.NewMixed` reused the fixed default base dir
+    tmp/pubsubclusters/<name> without clearing it, so any rerun of the 26 pgoutput interop tests failed in
+    0\.1 s with `goopg init: directory ... already exists and is not empty`. NewMixed now removes the stale
+    default dir first.
+  - Resume: reproduce under synthetic CPU load \(the stress approach from AI\-20261019\-001758\-003\), keeping
+    the cluster dirs; then check u for duplicate ids and the walsender's publication filter for the
+    historic\-snapshot rule.
 
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
@@ -8399,6 +8724,29 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
     relacl column back; probe REVOKE \.\.\. FROM PUBLIC and column grants too\.
   > \#\# ESCALATION 2026\-10\-12 \(S2\) — M0146\-0161 loses granted privileges on restart
   > Filed under M0146\-0157\. RESOLVED 2026\-10\-13 (OWNER DECISIONS 2026\-10\-13): NOT placed — queues below item 10 under the S7 correctness carve\-out\.
+  - 2026\-11\-16 reconfirmed by M0149\-0001g slice 12: GRANT ON TABLE / ON SEQUENCE and
+    REVOKE ALL are all gone after a goopg restart. The pg\_class heap row is built only at
+    CREATE time \(its relacl is now NULL rather than "\{\}"\), and tryRecordTableGrant /
+    tryRecordTableRevoke \(postmaster/grant\_ddl.go\) never rewrite it. Resume point:
+    call resyncTableClassHeapRowForIndexSet after the ACL store changes — it rebuilds
+    the row through userRelACLDatum — and reload relacl into the ACL store at Open,
+    as reloadDatabaseACLsFromHeap does for datacl.
+- [ ] **M0146\-0161a — WRONG RESULTS: GRANT / REVOKE inside an explicit transaction or a multi\-statement query records nothing** \(filed 2026\-11\-16 by M0149\-0001g slice 24; S2\)
+  Kind: impl
+  Parent: M0146\-0161
+  - Repro on goopg \(a8252b3f9\):
+    - `CREATE TABLE t3\(a int\)`, then `BEGIN; GRANT SELECT ON t3 TO PUBLIC; COMMIT;` → relacl stays NULL;
+    - `CREATE TABLE t2\(a int\); GRANT SELECT ON t2 TO PUBLIC;` sent as one simple query → the same.
+    - pg\_dump then omits the GRANT, so a dump/restore silently drops the privilege. Autocommit GRANT works.
+  - Known since 2026\-08\-21: deferral ledger M0134\-0069 and the M0122\-0008 row. The statement reaches the executor as a CompatNoopStmt with no grantee list, and the ACL recorders \(postmaster grant\_ddl.go tryRecordTableGrant\) run only on the autocommit path. It was never filed as a task.
+  - PG: ExecuteGrantStmt \(postgres/src/backend/catalog/aclchk.c\) updates relacl transactionally; it becomes visible at COMMIT and disappears on ROLLBACK.
+  - Rank: below item 10 — correctness\-only \(S7 carve\-out\), like its parent.
+  - First step:
+    - parse GRANT/REVOKE into a typed statement \(like TypeACLChange / DatabaseACLChange\);
+    - apply it through the recorders at transactional\-DDL commit, and discard it on ROLLBACK;
+    - parser change: read the goyacc playbook §12 first.
+  > \#\# ESCALATION 2026\-11\-16 \(S2\) — M0146\-0161a drops GRANT/REVOKE issued inside BEGIN … COMMIT
+  > Filed under M0146\-0161 \(below item 10 by the 2026\-10\-13 carve\-out\). The privilege is silently lost and pg\_dump omits it. Owner placement requested.
 - [x] **M0146\-0158 — PGC\_SUSET parameters can be SET by a non\-superuser**
   (full entry archived → `completed_milestones/completed_fix_plan_015.md`)
 - [ ] **M0146\-0162 — WRONG RESULTS: a non\-superuser that logs in directly runs with superuser
@@ -8496,6 +8844,7 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
   - Rank: below item 10 — correctness\-only, no owner placement \(S7 carve\-out\)\.
   - First step: the BinaryOp `\+` / `\*` typing arms for timestamp/interval and int/interval \(PG timestamp\_pl\_interval,
     interval\_mul, mul\_d\_interval\) and the timestamp output path for a folded constant\.
+  - 2026\-11\-19: `g \* interval '1 minute'` now works \(M0149\-0001h1a65, mul\_d\_interval\). make\_interval is still missing.
 - [ ] **M0146-0175 — the ordered index producer builds a clauseless twin of an index that has restriction clauses**
   \(filed 2026\-10\-13 by M0146\-0172\)\. PG\'s build\_index\_paths builds ONE path per index and adds the clauseless
   ordered one only when no clause matches \(indxpath\.c\)\. goopg\'s `addOneOrderedIndexPath` \(pathindexordered\.go\) always
@@ -11127,11 +11476,5396 @@ Basis: the 2026-10-21 lever census and its review
     \(not a residual Filter above the tree, not a scan restriction\), admit it in `outerOnQualsOK`, and check the
     witness plans as PG does; then census \+ regress\.
 
+## M0149 — Recovery/subscription TAP port with prerequisite implementation (filed 2026-11-15, owner decision)
+
+**Milestone doc:** `docs/milestones/0149-replication-tap-port.md` — its
+compatibility contract \(C1–C4\), task model, inventory rule and canonical
+queue are binding.
+**Rank:** banner item 10, after the already-filed M0122 queue and
+immediately before M0148; M0148 is paused while M0149 has a selectable
+task. M0149 tasks and all their descendants inherit item-10 rank — the S7
+correctness-only carve-out does not demote them.
+**Task model:** one task per upstream TAP test, in the order below, plus
+nine re-port tasks \(`M0149-0075` … `M0149-0083`\) for the shortcut ports
+already `port` at filing — their inventory rows stay `port` while the
+re-port is open; when a re-port closes, its row's rationale is rewritten to
+name the faithful `TestPort_*` func and its mixed PG 18.3 variants. Every
+missing feature is filed immediately as a `Kind: impl` child
+\(`M0149-00NNa`, `b`, …; `Parent: M0149-00NN`\), placed immediately below
+its parent entry, and implemented before the test task can close. A test
+task with an open descendant is not selected itself: take its first open
+descendant in file order \(depth-first\); the parent is re-selected for its
+close-out run once all descendants are `[x]`. A test task normally spans
+many loops; each loop works exactly one task \(the parent or one
+descendant\). If a prerequisite is already an open task elsewhere
+\(e.g. M0122-0014 for the subscription tiers\), the child references it
+\(`Prerequisite: <id>`\) and adopts or waits on it — no duplicate.
+Ledger-only parking is not a completion path. A step needing a change to
+goopg's process model \(per-backend OS processes, SysV shared memory\) is
+escalated as `[!] blocked-on owner: architecture` on a child — no
+substitution, no further filing.
+**Compatibility is the pass condition.** A port counts only if goopg is
+PG 18.3-compatible on the wire \(walsender commands, CopyBoth streaming,
+pgoutput v1–4, `test_decoding` text, log/error texts the test matches\)
+and in every file it writes \(WAL segments/records, `.history`,
+`archive_status`, `backup_label`/`backup_manifest`, `pg_control`, signal
+files, `pg_replslot`, `pg_logical/`, `pg_twophase`, …\), proven by mixed
+runs against real PG 18.3 nodes from `postgres/local_install/bin` \(or the
+private test-module build, milestone C3\). A
+goopg↔goopg-only port, an in-process shortcut, or a goopg-private format
+is NOT a port. A mirrored upstream skip condition must evaluate false in
+the all-goopg run; a test that skips there is not ported.
+**Movement:** M0149 tasks report the `tap` instrument —
+`Movement: yes — tap <test> assertions <before>/<total>→<after>/<total>`
+\(upstream assertions passing in the all-goopg + mixed runs, e.g.
+`tap 034_create_database 3/12→7/12`\).
+**On close:** inventory row → `status=port`, `pass_required=yes`,
+rationale names the `TestPort_*` func, `deferred_to` = `-`, id
+`R-<NNN>`/`S-<NNN>` \(upstream 3-digit number\); then
+`make regen-testport`, `make check-testport-inventory`, and delete any
+`ci/batch/expected-failures.csv` row — same commit.
+**Design doc at start:** the first loop that selects a task creates
+`docs/design/0100-0149/0149-00NN-<slug>.md` and indexes it in
+`docs/design/README.md`; none are written up front.
+The "Likely prerequisites" lines are filing-time hints from a grep survey —
+verify each at HEAD when the task starts.
+
+- [x] **M0149-0001 — port recovery/t/034_create_database.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/034_create_database.pl` — WAL replay of `CREATE DATABASE … STRATEGY WAL_LOG` after template DDL.
+  Likely prerequisites \(verify at start\): PG-format `XLOG_DBASE_CREATE_WAL_LOG` emission and replay \(`dbcommands.c`\), immediate-stop crash recovery; first test also files the Go `Cluster.pm`-equivalent harness child \(goopg and PG nodes behind one API\).
+  - 2026-11-15 STARTED \(design docs/design/0100-0149/0149-0001-create-database-wal-log.md\).
+    - Baseline: all-goopg A1/A2 pass \(2/2\). goopg's WAL already carries
+      PG's `Database CREATE_WAL_LOG` sequence \(pg\_waldump\);
+      pg\_controldata reads pg\_control.
+    - Mixed \(PG 18.3 cold start on the crashed goopg copy\): A2 passes, A1
+      fails — `FATAL: could not open file "base/1/pg_filenode.map"`.
+    Movement: none — tap 034\_create\_database baseline 3/4 recorded \(no
+    TestPort func yet\)
+- [x] **M0149-0001a — template1 carries the full PG per-database catalog image, including `base/1/pg_filenode.map`**
+  Kind: impl
+  Parent: M0149-0001
+  - PG: initdb's bootstrap writes `base/1` as the complete template1
+    \(`bootstrap.c`; `relmapper.c` `write_relmap_file` per database\). PG's
+    base/1 holds 300 files; goopg's holds 138 and no `pg_filenode.map`.
+  - goopg: `internal/initdb/initdb.go` — base/5 "additionally carries
+    pg\_filenode.map and the per-database placeholder files"
+    \(refreshTemplate0Image's comment\); base/1 never gets them.
+  - Verification: a fresh `goopg init` has `base/1/pg_filenode.map`; PG
+    18.3 `postgres` started on a goopg directory connects to `template1`;
+    034's A1 returns 1 in the mixed run; the initdb and template unit tests
+    stay green.
+  - 2026-11-15 investigated — blocked on its own prerequisite, filed as
+    M0149-0001a1:
+    - goopg's database layout is not PG's. pg\_database shows template1=1,
+      template0=4, postgres=16384, where PG has postgres=5.
+    - goopg stores the `postgres` namespace at catalog OID 1
+      \(`catalog.DefaultDBOid` sentinel, mirrored to base/5\) and template1 at
+      base/2 \(`Template1NamespaceDBOid`; owner Option A, 2026-09-25\).
+    - PG reads template1 from base/1, so writing a `pg_filenode.map` there
+      would expose goopg's postgres catalogs as "template1".
+    - A storage-only remap is not enough: WAL records carry the
+      RelFileNode database OID, so PG replay needs PG's OIDs in the WAL too.
+  - 2026-11-15 COMPLETE \(after M0149-0001a1\):
+    - initdb's `refreshTemplate0Image` now writes the finished base/5 image to
+      base/1 as well as base/4. A fresh `goopg init` has base/1 byte-identical
+      to base/4: 165 files including `pg_filenode.map`. Before, it had 138
+      files and no map until the first `goopg start`.
+    - PG 18.3 cold start on a freshly initialised directory, never started by
+      goopg, connects to template1 \(pg\_class 320 rows\).
+    - Manual mixed run of 034, done by hand because the 0001b harness does
+      not exist yet. goopg ran CREATE DATABASE test\_db\_1 STRATEGY WAL\_LOG
+      TEMPLATE template1, CREATE TABLE in template1, CHECKPOINT and kill -9;
+      then PG 18.3 recovered the directory: **A1 = 1, A2 = 0** with no
+      FATAL/PANIC/ERROR. All-goopg on the same crash copy: A1 = 1, A2 = 0.
+    - Gates: units, postmaster, testport template/CREATE DATABASE/interop/
+      Recovery/pg\_dump 24, spotcheck, sf025 99.
+    Movement: none — tap 034\_create\_database 3/4 \(mixed A1/A2 measured by hand; the inventory row is promoted by the 034 port with the 0001b harness\)
+- [x] **M0149-0001a1 — one OID per database at every layer: remove the `DefaultDBOid` sentinel \(postgres → 5, template1 → 1\)**
+  Kind: impl
+  Parent: M0149-0001a
+  - PG: `template_pg_database.h` Template1DbOid=1; initdb creates template0
+    \(4\) and postgres \(5\) by copying template1 \(`make_template0`,
+    `make_postgres`\). base/<oid> is the database's storage and RelFileNode
+    dbOid in every WAL record \(`relpath.c`\).
+  - goopg: `catalog.DefaultDBOid = 1` is the namespace the `postgres`
+    database reads and writes \(603 references in 61 non-test files;
+    catalog.go 329, initdb/catalog\_heap\_reload.go 32, postmaster/dispatch.go
+    25, executor/operators.go 24, operators\_ddl.go 23, initdb/open.go 22,
+    executor/context.go 19, …\). base/1 is mirrored to base/5
+    \(sys\_catalog\_postgres\_db\_mirror.go\); template1 lives at base/2
+    \(Template1NamespaceDBOid\).
+  - This is the "Option B / M0122-0007 4b-4e" epic recorded in the
+    deferral ledger \(2026-10-10 row\). No open fix\_plan entry existed, so it
+    is filed here per M0149's task model rule 4. NOTE for the owner: it
+    reverses the bounded Option A \(2026-09-25\); M0149's C2 contract
+    \(PG 18.3 file formats\) requires it.
+  - First step: a census design doc
+    \(`docs/design/0100-0149/0149-0001a1-database-oid-layout.md`\)
+    classifying every DefaultDBOid use as namespace / storage / WAL /
+    display, then slices: storage+WAL OID mapping, postgres → 5, template1
+    → 1, mirror removal.
+  - Verification: `goopg init` matches PG's base/<oid> set \(1, 4, 5\) and
+    pg\_database OIDs; PG 18.3 pg\_waldump shows template1 writes under
+    `1663/1/…`; PG cold start on a goopg directory sees template1 and
+    postgres contents; existing multi-database / template / pg\_dump tests
+    stay green.
+  - 2026-11-15 census and slice plan
+    \(docs/design/0100-0149/0149-0001a1-database-oid-layout.md\):
+    - Only the displayed and storage/WAL OIDs must equal PG's. The
+      catalog-namespace key is internal, so the 603-reference sentinel need
+      not be removed for C2.
+    - Storage sites: 23 literal `RelFileNode{DBOid: DefaultDBOid}` catalog
+      writers plus the 68-call base/1 → base/5 mirror. Display:
+      `databaseDisplayOID` 16384.
+    - Slices: S1 postgres catalogs stored at base/5 \(the mirror kept base/5
+      complete, so old clusters read unchanged\); S2 displayed postgres OID
+      5; S3 template1 at base/1 with a startup migration; S4 \(optional\)
+      namespace keys.
+    Movement: none — tap 034\_create\_database 3/4 \(design only\)
+  - 2026-11-15 S1 implementation findings \(design doc § "S1
+    implementation findings"\):
+    - A postgres CREATE TABLE writes about 40 WAL block references under
+      DBOid 1 \(pg\_attribute, pg\_class, pg\_index, pg\_constraint and
+      their indexes\) and 41 under DBOid 5 \(the mirror's FPI copies\). PG
+      replay would put postgres catalogs into its template1.
+    - 193 computed-DBOid `RelFileNode{}` constructions, so S1 normalizes at
+      the storage boundary instead \(storage.StorageDBOid 1 → 5 at the Pool
+      buffer tag, smgr path, WAL block-ref encoders, mirror guard\), all in
+      one commit.
+    Movement: none — tap 034\_create\_database 3/4 \(design only\)
+  - 2026-11-15 S1 landed \(design doc § "S1 as landed"\):
+    - storage.StorageDBOid \(1 → 5\) at every Pool / smgr entry, in the VM /
+      FSM / extension-lock keys and in the WAL block-ref and main-data
+      encoders; the mirror is now a no-op.
+    - The mirror had NOT kept base/5 complete \(SF0.25 corpus: 13 files,
+      pg\_statistic 688 KB vs 8 KB\), so a one-time startup migration
+      copies the newer-LSN base/1 file over base/5 \(feature
+      `postgres_catalogs_at_base5`\).
+    - Probe: 70 block refs at 1663/5, zero at 1663/1; pre-S1 WAL replays
+      correctly. Gates: units, postmaster, spotcheck, fire-set parity
+      99/99/22, sf025 99 \(plans = pre-S1 baseline\), acceptance, PG-interop
+      e2e \(4\) and Recovery ports \(6\) PASS.
+    - Found P0-E32 \(ADD COLUMN DEFAULT lost after restart, pre-existing\).
+    - Next: S2 \(displayed postgres OID 5\).
+    Movement: none — tap 034\_create\_database 3/4 \(storage layer only; mixed A1 needs S3\)
+  - 2026-11-15 S2 landed \(design doc § "S2 as landed"\):
+    - pg\_database displays postgres = 5 \(was 16384\); pg\_stat\_database
+      datid, subscription subdbid \(both producers\), pg\_db\_role\_setting
+      setdatabase \(ALTER DATABASE / ALTER ROLE … IN DATABASE\), the pg\_locks
+      static row and advisory-lock rows follow it.
+    - Legacy clusters: heap rows keyed 16384 fold into 5 at reload; the next
+      write of the key deletes the legacy row. Probe on a cluster built by the
+      pre-S1 binary: rows show 5 before and after a restart.
+    - Gates: units, catalog / postmaster / initdb / executor packages,
+      testport pg\_dump / subscription / pgoutput interop / PG cold start /
+      Recovery \(56 PASS\), spotcheck, sf025 99, acceptance PASS.
+    - Found M0122-0008a \(database / role settings are never applied at
+      session start; pre-existing\).
+    - Next: S3 \(template1 at base/1\) — that is M0149-0001a itself.
+    Movement: none — tap 034\_create\_database 3/4 \(display layer only; mixed A1 needs S3\)
+  - 2026-11-15 S3 designed and probed \(design doc § "S3 design"\):
+    - Adding `2 → 1` to StorageDBOid breaks idempotency: the Pool sees both
+      namespace OIDs \(executor\) and storage OIDs \(redo\), so redo of a
+      template1 record at DBOid 1 would land in base/5. The same conflict
+      already sends a PG primary's template1 WAL into a goopg standby's
+      postgres catalogs \(pre-existing, mixed topology\).
+    - Chosen: Option C — `DefaultDBOid = 5`, `Template1NamespaceDBOid = 1`,
+      StorageDBOid identity \(namespace = storage = WAL = display\).
+    - Probe in a worktree: one duplicate-case fix; 4 pinned tests to re-key
+      or retire. On a fresh cluster PG 18.3 cold start connects to template1
+      and postgres and reads goopg tables in both \(HEAD cannot open
+      template1\).
+    - Existing clusters: replace base/1 with base/2 before redo; a legacy
+      decode map \(1 → 5, 2 → 1\) during that startup's redo; record the
+      feature flag only after the end-of-recovery checkpoint.
+    - Next: implement S3 \(diff tmp/m0149-s3-optionC-probe.diff, then the
+      migration and the legacy map\).
+    Movement: none — tap 034\_create\_database 3/4 \(design only\)
+  - 2026-11-15 S3 landed — task COMPLETE \(design doc § "S3 as landed"\):
+    - `DefaultDBOid = 5`, `Template1NamespaceDBOid = 1`; namespace = storage
+      = WAL = display for template1 / template0 / postgres.
+    - Design correction: the legacy redo map must be idempotent
+      \(Canonical runs twice on one access\). Landed `1 → 5` only; legacy
+      template1 records replay into base/2, which is copied to base/1 after
+      legacy redo \(copy marker; feature after the end-of-recovery
+      checkpoint\).
+    - S2-binary cluster killed with a WAL tail in both databases: S3
+      recovers both exactly \(800/320400, 350/61425\), isolated, over two
+      restarts; PG 18.3 cold start on it reads template1 and postgres.
+    - Emptied template1 bootstrap catalogs \(pg\_namespace 0 bytes in a
+      pre-S3 base/2\) are restored from template0 during the copy.
+    - Gates: units, postmaster, race \(storage, xlog\), testport 58,
+      spotcheck, sf025 99, acceptance, fire-set fires=none ×3.
+    Movement: none — tap 034\_create\_database 3/4 \(PG now opens template1 on goopg data; the mixed run needs the 0001b harness\)
+- [x] **M0149-0001b — Go `Cluster.pm`-equivalent harness for single-node ports \(goopg and PG 18.3 nodes behind one API\)**
+  Kind: impl
+  Parent: M0149-0001
+  - Methods 034 needs: `init`, `start`, `stop('immediate')`, per-database
+    `safe_psql`, and the C3 copy-and-cold-start cross-check \(copy a stopped
+    goopg data directory, start PG 18.3 `postgres` on it, run the same
+    assertions\); later tests add methods as their children.
+  - Build on `internal/testutil/cluster` \(goopg\) and
+    `internal/testutil/pgcluster` \(PG\); precedent
+    `e2e_pg_crashstart_on_goopgdata_test.go`.
+  - Verification: TestPort\_Recovery034CreateDatabase runs all-goopg and the
+    PG cold-start variant through the one API.
+  - 2026-11-15 COMPLETE \(design doc 0149-0001b-tap-node-harness.md\):
+    - `internal/testutil/tapnode`: NewGoopg \(durable\), Start,
+      Stop\(fast/immediate\), SafePSQL / PSQL, and ColdStartPG \(copy a
+      stopped goopg directory, start PG 18.3 on the copy\), over the existing
+      cluster / pgcluster harnesses.
+    - TestPort\_Recovery034CreateDatabase: variants pg18-cold-start and
+      all-goopg PASS, 2/2 assertions each. Inventory row R-034 promoted to
+      `port`; M0149-0001 closes with it.
+    Movement: yes — tap 034\_create\_database assertions 3/4→4/4 \(all-goopg 2/2 + mixed 2/2\)
+- [x] **M0149-0001c — per-database pg\_class heaps carry every shared catalog's row \(19 missing: pg\_shdepend, pg\_shdescription, shared TOAST\)**
+  Kind: impl
+  Parent: none
+  - 2026-11-15 re-parented from M0149-0001: 034 does not need it \(the PG
+    side never runs CREATE DATABASE in the 034 port\), so it no longer
+    blocks that port. It stays an M0149 task \(C3 finding, item-10 rank\)
+    and is the next M0149 task in file order.
+  - Found 2026-11-15 by the M0149-0001a1 S3 probe: with template1 at base/1, a PG 18.3 cold start on a goopg
+    directory connects to every database, but PG `CREATE DATABASE` fails with "could not open relation with OID
+    1214" — pg\_class \(in postgres and in template1\) has no row for pg\_shdepend.
+  - Missing relisshared rows vs a scratch PG 18.3 \(46 rows there\): 1214 pg\_shdepend, 1232/1233 its indexes,
+    2396 pg\_shdescription, 2397 its index, and the shared TOAST pairs 2846/2847 \(2396\), 2966/2967 \(2964\),
+    4060/4061 \(3592\), 4177/4178 \(1262\), 4183/4184 \(6100\), 4185/4186 \(1213\), 6244/6245 \(6243\).
+    `global/1214` exists and is in `global/pg_filenode.map`.
+  - PG: every database's pg\_class carries a row for each shared catalog, index and TOAST relation
+    \(`BKI_SHARED_RELATION`, genbki / initdb bootstrap\); relcache opens shared relations through it.
+  - First step: compare goopg initdb's pg\_class bootstrap row list with PG's postgres.bki shared set, then add
+    the missing rows \(with their pg\_attribute / pg\_index / pg\_type rows\) to the bootstrap image every database
+    copies.
+  - Verification: on a fresh goopg cluster under a PG 18.3 cold start, `CREATE DATABASE` succeeds and the
+    relisshared row set equals PG's \(46\).
+  - 2026-11-15 COMPLETE:
+    - initdb bootstraps pg\_shdepend \(1214, reltype 10060\) and
+      pg\_shdescription \(2396, reltype 10062\) as shared catalogs, with
+      their indexes 1232 / 1233 / 2397, plus the seven shared TOAST pairs
+      \(4177/4178, 2966/2967, 4060/4061, 2846/2847, 4183/4184, 4185/4186,
+      6244/6245\). Parents carry reltoastrelid.
+    - Each new relation gets its pg\_class / pg\_attribute / pg\_index rows
+      and its global/ file \(empty heap page, or btree metapage\).
+      `toastRelPair.Shared` routes shared pairs to global/.
+    - Also fixed: the placeholder list labelled 3592 as pg\_shdescription.
+      3592 is pg\_shseclabel, and global/2396 was never written.
+    - PG 18.3 cold start on a fresh goopg cluster: relisshared rows = 46 in
+      postgres and template1 \(PG: 46\). PG-side CREATE DATABASE succeeds
+      \(before: "could not open relation with OID 1214"\).
+    - Found: M0149-0001d \(S2\), M0149-0001e and M0149-0001f, filed below.
+    - Gates: units, postmaster, testport interop / Recovery / pg\_dump /
+      subscription / pgoutput / template1 / CREATE DATABASE, spotcheck,
+      sf025 99.
+    Movement: none — C3 cold-start finding \(no TAP assertion moved\)
+- [x] **M0149-0001d — PG 18.3 inserts into goopg-bootstrapped pg\_database indexes are unreachable: a PG-created database cannot be connected to** \(filed 2026-11-15 by the loop; S2 — catalog corruption on the PG side of a mixed setup\)
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026-11-15 \(S2\) — OWNER PLACEMENT NEEDED.** Filed under M0149 \(item-10 rank\); the loop continues
+    > in file order. A PG 18.3 node hosting a goopg-initialised directory cannot use a database it creates itself.
+  - Repro: fresh `goopg init`, start and stop goopg, copy the directory, start PG 18.3 on the copy, then
+    `CREATE DATABASE pgside` \(succeeds\). After that, `psql -d pgside` fails with FATAL "database \"pgside\" does not
+    exist". After a PG restart the error becomes FATAL "cache lookup failed for database 16408".
+    `SELECT … FROM pg_database WHERE datname='pgside'` finds the row with both seq and index scans disabled or
+    enabled, and base/16408 exists.
+  - Diagnosis so far: the backend's name lookup \(pg\_database\_datname\_index 2671\) and OID lookup
+    \(pg\_database\_oid\_index 2672, DATABASEOID syscache\) miss the PG-inserted tuple. Suspect the goopg-built btree
+    images for 2671 / 2672 \(bootstrapped leaf/meta layout\), or the shared relcache init file's index descriptors.
+  - PG: `GetDatabaseTuple` / `GetDatabaseTupleByOid` \(utils/init/postinit.c\) use these indexes once
+    criticalSharedRelcachesBuilt.
+  - First step: on the PG copy, run amcheck `bt_index_check` on 2671 / 2672 from a private PG build, or dump the
+    index pages with `pg_filedump`. Compare them with a PG-initdb'd 2671 after the same CREATE DATABASE.
+  - 2026-11-15 COMPLETE:
+    - Root cause: pg\_class.relhasindex was false on every goopg-bootstrapped
+      catalog heap \(PG: true\). PG does not re-derive it:
+      ExecOpenIndices \(execIndexing.c:173\) and RelationGetIndexList
+      \(relcache.c:5338\) return no indexes, so CatalogTupleInsert never
+      touched 2671 / 2672. The index files were byte-identical after PG's
+      CREATE DATABASE + CHECKPOINT.
+    - Fix: relhasindex = true for shared catalogs with a bootstrap index
+      \(and TOAST heaps\). Also added pg\_rewrite\_oid\_index 2692's
+      missing pg\_class row, which PG opened "could not open relation with
+      OID 2692" once relhasindex was on. New tests:
+      TestPgClassRelhasindexMatchesBootstrapIndexes and
+      TestBootstrapIndexEntriesHavePgClassRows.
+    - Verified: on PG 18.3, CREATE DATABASE pgside, connect, restart,
+      connect, DROP DATABASE all work, and 2671 holds PG's entry.
+    - Local catalogs keep relhasindex false. Turning it on made PG's planner
+      use goopg-built local indexes that are incomplete
+      \(pg\_attribute\_relid\_attnam\_index 2658 has zero leaf tuples\),
+      so TestE2E\_PGColdStartOnGoopgDataDir read no pg\_attribute row by
+      attname. Filed M0149-0001g.
+    - Gates: units, postmaster, testport interop / Recovery / pg\_dump /
+      subscription / pgoutput / template1 / CREATE DATABASE, spotcheck,
+      sf025 99.
+    Movement: none — C3 cold-start fix \(no TAP assertion moved\)
+  - 2026-11-16 COMPLETE:
+    - pg\_catalog.pg\_shdepend \(1214, 7 columns\) is now a virtual table. It is
+      empty: goopg records no shared dependencies, and a fresh PG 18.3 has 0
+      rows too.
+    - pg\_shdescription already existed as an empty stub with the wrong OID
+      \(3592, which is pg\_shseclabel\). It now has OID 2396 and serves the
+      comment store's shared classes \(databases, roles, tablespaces:
+      IsSharedCommentClass\). The store is seeded with the three database
+      descriptions PG's initdb writes.
+    - pg\_description no longer lists shared-object comments.
+      shobj\_description\(5, 'pg\_database'\) now returns "default
+      administrative connection database", as on PG.
+    - Regress A/B on the 7 cases that read these catalogs: misc\_sanity
+      18→15, privileges 1252→1242 \(inventory updated\); the others are
+      unchanged.
+    - Found: psql `\\l+` fails on goopg because has\_database\_privilege\(name,
+      text\) is not implemented. Filed M0149-0001h, below the item-10 rank.
+    - Not done: goopg records no pg\_shdepend rows \(shdepend.c\) and has no
+      COMMENT ON DATABASE / ROLE / TABLESPACE writer \(ledgered\).
+    - Gates: units, postmaster, testport \(pg\_dump, Recovery, interop, template1,
+      CREATE DATABASE\), spotcheck, sf025 99.
+    Movement: yes — regress misc\_sanity 18→15, privileges 1252→1242
+- [!] **M0149-0001h — has\_database\_privilege is not implemented: psql \\l+ fails** \(filed 2026-11-16; correctness / client-tool conformance, below the item-10 rank\)
+  Kind: impl
+  Parent: none
+  - **PARKED `[!]` 2026-11-23 (owner, anti-detour):** not a proven prerequisite of any M0149 TAP test (M0149-0001 closed `[x]` with 034 passing). Reopen only when a selected TAP task cites this as a proven blocker; its descendants stay unselectable (S7).
+  - Repro: goopg `psql -c '\\l+'` → "function pg\_catalog.has\_database\_privilege does not exist". pg\_proc
+    seeds OIDs 2250/2251 \(and the other overloads\), but the executor has no handler.
+  - PG: `has_database_privilege` family in utils/adt/acl.c \(name/oid user × text/oid database × privilege
+    text, plus the two-argument current\_user forms\), with CREATE / CONNECT / TEMP / TEMPORARY privileges.
+  - First step: implement the six overloads over goopg's datacl store \(the same ACL source pg\_database.datacl
+    renders\), then compare `\\l+` against the PG oracle.
+  - 2026-11-17 first slice: has\_database\_privilege works and `\\l+` equals PG.
+    - executor has\_database\_privilege.go is a port of acl.c's six
+      overloads:
+      - role by name via get\_role\_oid\_or\_public \(42704\), by OID, or the
+        effective user;
+      - database by name \(3D000\) or display OID \(NULL when unknown, via the
+        new catalog DatabaseNameByDisplayOID\);
+      - convert\_database\_priv\_string: comma list, case\-insensitive,
+        WITH GRANT OPTION, 22023;
+      - aclmask: superuser; the owner's privileges give every grant option;
+        entries for PUBLIC, the role and the roles it has privileges of;
+        NULL datacl = acldefault\('d'\).
+      - The planner's exprType gives bool.
+    - Found and fixed: goopg's initdb left template0 / template1 datacl NULL.
+      PG's initdb REVOKEs CREATE,TEMPORARY FROM public, giving
+      `\{=c/postgres,postgres=CTc/postgres\}`. templateDatacl seeds it, and
+      the heap reload restores it on restart.
+      TestDatabaseACLSurvivesRestartViaCatalogHeap's control now asserts PG's
+      value instead of the old NULL divergence.
+    - Probe \(tmp/catidx/s53\):
+      - a 13\-statement script \(grants, revokes, PUBLIC, grant options,
+        errors\) is identical to PG 18.3;
+      - `\\l+` is identical apart from database sizes;
+      - restart\-stable.
+    - Test: TestHasDatabasePrivilege.
+    - Regress A/B over 7 cases unchanged.
+    - Gates: units, postmaster, fire\-set \(fires=none\), testport interop
+      set, spotcheck, sf025 99, acceptance.
+    - The rest of the has\_\*\_privilege family is missing \(filed as
+      M0149\-0001h1\).
+    Movement: none — client\-tool conformance \(psql `\\l\+`\); regress A/B unchanged
+- [ ] **M0149-0001h1 — the rest of the has\_\*\_privilege family is missing: has\_table / schema / column / sequence / function / type / language / foreign\_data\_wrapper / server / tablespace / parameter / largeobject\_privilege** \(filed 2026-11-17 by M0149-0001h\)
+  Kind: impl
+  Parent: M0149-0001h
+  - Repro on goopg: `select has\_table\_privilege\('pg\_class','select'\)` →
+    "function has\_table\_privilege does not exist". The same holds for
+    has\_schema\_privilege and the rest. pg\_proc seeds them; there is no
+    executor handler. psql `\\dp`, pg\_dump and many regress cases
+    \(privileges, rowsecurity\) call them.
+  - PG: utils/adt/acl.c, one family per object kind, with the same role /
+    object / privilege\-string resolution as has\_database\_privilege.
+  - First step: generalise has\_database\_privilege.go's aclmask evaluation
+    over goopg's per\-object ACL texts \(relacl / nspacl / attacl / proacl /
+    typacl\). Start with has\_table\_privilege and has\_schema\_privilege,
+    then measure regress privileges.
+  - 2026-11-17 first slice: has\_table\_privilege and has\_schema\_privilege; shared evaluator.
+    - executor has\_privilege\_common.go:
+      - privilegeArgs: role via get\_role\_oid\_or\_public / OID / effective
+        user;
+      - parsePrivList: convert\_\*\_priv\_string, WITH GRANT OPTION, 22023;
+      - aclAnyHeld: aclmask with ACLMASK\_ANY — superuser; owner\-privileged
+        roles hold every grant option; PUBLIC / role / HasPrivsOfRole
+        entries; acldefault for a NULL ACL; pg\_read\_all\_data /
+        pg\_write\_all\_data / pg\_maintain implied privileges.
+      - has\_database\_privilege now uses it.
+    - has\_table\_privilege:
+      - a name goes through regclass input \(42P01, no cursor\); an OID
+        returns NULL when unknown;
+      - letters arwdDxtm; sequences use SequenceRelaclText / rwU.
+    - has\_schema\_privilege: by name \(3F000\) or OID \(NULL\); UC.
+    - Probe \(tmp/catidx/s54\): a 34\-statement grant / role / PUBLIC /
+      predefined\-role / error script matches PG 18.3 on every function
+      result. The remaining differences: the GRANT role command tag
+      \("GRANT" vs PG's "GRANT ROLE", pre\-existing\).
+    - Regress: privileges 1242→993 \(inventory updated\); 11 other cases
+      unchanged.
+    - Still missing in privileges.sql: has\_largeobject / function / column /
+      sequence / type\_privilege. Also missing: pg\_read\_all\_stats SELECT
+      grants on the stats views \(system\_views.sql\), and the
+      pg\_shmem\_allocations\* views.
+    - Tests: TestHasTableSchemaPrivilege.
+    - Gates: units, fire\-set \(fires=none\), testport, spotcheck, sf025 99,
+      acceptance.
+    Movement: regress privileges 1242→993
+  - 2026-11-17 second slice: has\_column / has\_any\_column / has\_sequence / has\_function / has\_type\_privilege.
+    - executor has\_privilege\_objects.go, on the shared evaluator:
+      - column: column\_privilege\_check — attacl first, then relacl; a name
+        \(42703; the pg.dropped name → NULL\) or an int2 attnum; system
+        columns; a missing table OID or attnum → NULL;
+      - any\_column: table privilege, else any non\-dropped column;
+      - sequence: USAGE / SELECT / UPDATE parsed before the name; 42809 for a
+        non\-sequence;
+      - function: regprocedure input \(42883\) or OID; user routines,
+        aggregates and the full builtin pg\_proc table; PUBLIC EXECUTE;
+      - type: regtype input \(42704\) or OID; arrays follow the element type;
+        PUBLIC USAGE.
+    - Found: object\_aclmask\_ext checks superuser before the lookup, so a
+      superuser gets **true** for an unknown function / type / schema /
+      database OID \(NULL for other roles\). has\_schema / has\_database
+      returned NULL; missingObjectResult fixes all four. Relations stay NULL.
+    - Probe \(tmp/s55 vs PG 18.3\): grants, revokes, dropped / system /
+      unknown columns, sequences, arrays, unknown OIDs, errors, and a
+      `SET ROLE` non\-superuser pass — identical.
+    - Regress: privileges 993→889 \(inventory updated\); 10 other cases
+      unchanged.
+    - Remaining in privileges.diff: has\_largeobject\_privilege \(26\) —
+      goopg has no large objects \(filed M0149\-0001h1a\). Still missing
+      here: has\_language / foreign\_data\_wrapper / server / tablespace /
+      parameter\_privilege.
+    - Test: TestHasObjectPrivileges.
+    - Gates: units, fire\-set \(fires=none\), spotcheck, sf025 99,
+      acceptance \(values identical\).
+    Movement: regress privileges 993→889
+- [ ] **M0149-0001h1a — large objects are not implemented: lo\_create / lo\_unlink / lo\_\* and has\_largeobject\_privilege do not exist** \(filed 2026-11-17 by M0149-0001h1\)
+  Kind: impl
+  Parent: M0149-0001h1
+  - Repro on goopg: `select lo_create(1001)` → "function lo\_create does not
+    exist"; `select has_largeobject_privilege(1001, 'SELECT')` → "function
+    has\_largeobject\_privilege does not exist". Regress privileges has 26
+    such errors plus 8 lo\_create and 4 lo\_unlink.
+  - PG: be\-fsstubs.c / inv\_api.c over pg\_largeobject\_metadata \(lomowner,
+    lomacl\) and pg\_largeobject \(loid, pageno, data\); GRANT / REVOKE ON
+    LARGE OBJECT; has\_largeobject\_privilege \(acl.c, pg\_largeobject\_aclmask\_snapshot;
+    lo\_compat\_privileges\).
+  - goopg bootstraps pg\_largeobject \(2613\) and its index for PG nodes
+    \(M0149\-0001g slice 30\) but has no SQL\-side store or functions.
+  - First step: a metadata store \(OID, owner, ACL\) with lo\_create /
+    lo\_unlink / lo\_from\_bytea / lo\_get, rendered as
+    pg\_largeobject\_metadata; then has\_largeobject\_privilege on the shared
+    evaluator \(letters rw, acldefault owner rw, no PUBLIC\).
+  - 2026-11-17 first slice: pg\_largeobject\_metadata as a real heap; lo\_create / lo\_creat / lo\_unlink; has\_largeobject\_privilege.
+    - initdb open.go registers pg\_largeobject\_metadata \(2995\) per database
+      as a real MVCC table; RegisterRealTable replaces the virtual placeholder.
+    - executor largeobject.go:
+      - lo\_create: OID 0 → fresh OID ≥ 16384; duplicate → 23505 on
+        pg\_largeobject\_metadata\_oid\_index; row via writeHeapRowCanonical;
+        catalogIndexDefs gains 2995 → 2996;
+      - lo\_unlink: 42704, 42501 "must be owner", lo\_compat\_privileges;
+        DELETE through internal SQL so rollback is MVCC;
+      - has\_largeobject\_privilege: missing → NULL even for a superuser;
+        compat → true; owner rw default, no PUBLIC;
+      - read\-only transactions → 25006.
+    - Found: stampCatalogRows sets XMAX\_COMMITTED at once, so it cannot
+      carry a transactional delete; the internal\-SQL DELETE does.
+    - New GUC lo\_compat\_privileges \(PGC\_SUSET, off; sample config\).
+    - Probe \(tmp/s56 vs PG 18.3\): identical, including non\-superuser,
+      rollback, other databases, restart, and a PG cold start reading the
+      objects through index 2996.
+    - Regress: privileges 889→700; largeobject 176→218 — the case now runs
+      past lo\_create into the missing data functions, ALTER LARGE OBJECT
+      and libpq's lo\_\* OID lookup \(inventory updated\); 7 other cases
+      unchanged.
+    - Test: TestLargeObjectMetadataSurvivesRestart \(testport\).
+    - Gates: units, fire\-set \(fires=none\), spotcheck, sf025 99,
+      acceptance \(values identical\), PG cold\-start e2e.
+    - Next slice: pg\_largeobject data pages and the descriptor API
+      \(lo\_open / loread / lowrite / lo\_lseek / lo\_tell / lo\_truncate /
+      lo\_close, lo\_get / lo\_put / lo\_from\_bytea\); then GRANT / REVOKE
+      ON LARGE OBJECT and ALTER LARGE OBJECT OWNER.
+    Movement: regress privileges 889→700
+  - 2026-11-17 second slice: pg\_largeobject data pages and the descriptor API.
+    - initdb registers pg\_largeobject \(2613\) as a real heap; catalogIndexDefs
+      gains 2613 → 2683.
+    - executor largeobject\_data.go:
+      - inv\_read / inv\_write / inv\_truncate over 2048\-byte pages, with holes
+        as zeros; a page is replaced by an internal\-SQL DELETE plus
+        writeHeapRowCanonical;
+      - descriptors: lowest free slot, INV\_READ / INV\_WRITE, 42704 / 42501 /
+        55000 / 22023 / 22003 as be\-fsstubs.c;
+      - lo\_get / lo\_put / lo\_from\_bytea; lo\_import / lo\_export
+        \(superuser only\);
+      - lo\_unlink drops the pages and closes the session's descriptors on it.
+    - Found: transam.Transaction.Handle is procNum\+1, the same for every
+      transaction of a backend. Descriptor lifetime therefore hooks
+      ReleaseAdvisoryTransactionLocks, which every transaction\-end path
+      calls with the connection identity.
+    - Probe \(80 statements, tmp/s57 vs PG 18.3\): identical. A PG cold
+      start reads and updates goopg\-written pages through index 2683.
+      Data survives a restart, and lo\_put rollback holds.
+    - Regress: privileges 700→692; largeobject 218→220 \(inventory
+      updated\). Both are now blocked mainly by the bit\-string gap: filed
+      M0149\-0001h1a1.
+    - Test: TestLargeObjectMetadataSurvivesRestart extended \(pages, rollback,
+      descriptor lifetime\).
+    - Gates: units, fire\-set \(fires=none\), spotcheck, sf025 99,
+      acceptance, PG cold\-start e2e.
+    Movement: regress privileges 700→692
+  - 2026-11-17 third slice \(landed\): GRANT / REVOKE ON LARGE OBJECT and ALTER LARGE OBJECT … OWNER TO.
+    - parser: LargeObjectACLChange on CompatNoopStmt \(dump:"omitempty"\);
+      alter\_large\_object\_stmt grammar rule, routed via
+      routedCreatePairs\["alter"\]\["large"\]. postmaster/query.go sends
+      `ON LARGE OBJECT` to the executor.
+    - executor largeobject\_acl.go: ExecGrant\_Largeobject
+      \(select\_best\_grantor, restrict\_and\_check\_grant, aclupdate with
+      RESTRICT / CASCADE\), AlterObjectOwner\_internal and aclnewowner. The row
+      is rewritten by an internal\-SQL DELETE plus writeHeapRowCanonical, and
+      lomacl is a PG\-native \_aclitem blob.
+    - Found:
+      - a string\-encoded aclitem\[\] column gets the text element type,
+        which PG's check\_acl rejects;
+      - PG prints "permission denied for large object large object %u"
+        \(the doubled phrase is real\).
+    - Probes identical \(GRANT 43 statements, OWNER 22\); a PG cold start
+      agrees.
+    - Regress: privileges 673→616, largeobject 46→45 \(inventory updated,
+      staged\).
+    - Gates so far: units PASS, internal/postmaster PASS, parser goldens
+      PASS, e2e TestLargeObjectMetadataSurvivesRestart PASS. The fire\-set
+      gate ran out of disk twice \(ENOSPC\) in the first attempt.
+    - Gates on the committed tree \(next loop, after the disk was
+      relieved\): fire\-set PASS \(fires=none, sf025 and sf1 99/99\),
+      spotcheck Q12=2 Q13=35, sf025 sweep PASS, acceptance arm 24 MATCH
+      against tmp/h1a1\-arm\-on.txt, units PASS.
+    Movement: regress privileges 673→616, largeobject 46→45
+    - > **ESCALATION 2026\-11\-17 \(disk\) — the root volume is 100% full
+      \(about 6.6 GB free\); the fire\-set gate's SF1 clones need more.**
+      `tmp/fireset-bin` holds about 76 GB of per\-label engine binaries from
+      earlier loops; the gate never prunes them. This loop removed only its
+      own artefacts. Owner action requested: prune `tmp/fireset-bin` \(or
+      approve the loop doing it\).
+      Mitigation 2026\-11\-17 \(loop\): Go build\-cache entries unused for
+      more than 2 days were deleted \(about 50 GB; regenerable, Go trims them
+      at 5 days anyway\), which leaves about 56 GB free. `tmp/fireset-bin`
+      \(77 GB\) and the old `tmp/*-tpcds-sf1-data-*` clones are still
+      untouched and still need an owner prune.
+  - 2026-11-17 fourth slice \(landed\): COMMENT ON LARGE OBJECT, PL/pgSQL exception\-condition matching, zero\-filled lo holes.
+    - COMMENT ON LARGE OBJECT: grammar comment\_target arm, routed kind
+      "large"; executor checks existence \(42704\) and ownership \(42501,
+      lo\_compat\_privileges\), classoid 2613; lo\_unlink drops the comment.
+    - cmd/gen\-sqlstate emits plerrcodes.h's 251\-entry name table;
+      exceptionHandlerMatches ports exception\_matches\_conditions \(OTHERS
+      exclusions, class match\); `WHEN SQLSTATE 'xxxxx'` keeps its code.
+    - Found:
+      - `EXCEPTION WHEN SQLSTATE '…'` never matched: the PL/pgSQL parser
+        dropped the string literal;
+      - only about 12 condition names were known, so `WHEN undefined_file`
+        missed lo\_export's 58P01.
+    - loRead zero\-fills a hole before a later page \(lo\_truncate extend\).
+    - Regress: largeobject 45→35 \(inventory updated\). privileges
+      unchanged on an A/B against HEAD \(616 = 616\). plpgsql A/B 1244→1236
+      \(nondeterministic case, inventory not re\-pinned\): `WHEN sqlstate
+      '22012'` handlers now fire.
+    - The remaining 35 lines are all libpq lo\_\*: pg\_proc OID lookup plus
+      the fast\-path FunctionCall protocol — next slice.
+    Movement: regress largeobject 45→35
+  - 2026-11-17 fifth slice \(landed\): fast\-path FunctionCall protocol; libpq lo\_\* client calls work; regress largeobject PASSES.
+    - postmaster fastpath.go: 'F' → lowered `SELECT pg_catalog.f\(…\)` over
+      the simple\-query path with a capture writer → 'V' + ReadyForQuery.
+      The result is encoded with prorettype.
+    - The virtual pg\_proc gains the 13 lo\_\* rows lo\_initialize looks up,
+      from pg\_proc.dat.
+    - Found:
+      - exprType typed every pg\_catalog\-qualified call as text \(fixed\);
+      - lo\_get over a 4 GB hole tried to zero\-fill it \(23 GB RSS\) —
+        PG's MaxAllocSize check is ported;
+      - untyped literals to lowrite / lo\_put / lo\_from\_bytea now go
+        through byteain;
+      - goopg's wire RowDescription advertises bytea / void / other unlisted
+        types as text \(filed M0149\-0001h1a3\).
+    - Regress: largeobject 35→0 \(status pass, pass\_required yes;
+      TestPort\_RegressSuite/largeobject PASS after the harness exports
+      PG\_ABS\_BUILDDIR\); opr\_sanity 733→717. A/B against HEAD over 15
+      cases: no other movement \(alter\_generic ±2, a known flaky case\).
+    Movement: regress largeobject 35→0, opr\_sanity 733→717
+- [x] **M0149-0001h1a3 — the wire RowDescription advertises bytea, void and every other type typeOIDFor does not list as text \(OID 25\)** \(filed 2026-11-17 by M0149-0001h1a\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Repro: `create table tb\(b bytea\); select b from tb \\gdesc` → text
+    \(PG: bytea\); `select decode\('00','hex'\)`, `lo_put\(…\)` likewise.
+  - A client that asks for binary results \(or keys its decoding on the
+    type OID — JDBC, psycopg, libpq PQftype users\) decodes bytea's text
+    form as data.
+  - goopg: internal/postmaster/dispatch.go typeOIDFor falls back to 25 for
+    every type name it does not list. PG sends the column's real type OID
+    \(printtup.c SendRowDescriptionMessage\).
+  - > **ESCALATION \(S2, wrong results for binary\-format clients\):** filed
+    here; owner to place.
+  - 2026\-11\-18 \(landed\): RowDescription carries the column's real pg\_type OID on every path.
+    - Selected in M0149 depth\-first order; the entry's S2 note asked for placement, and the banner's item 10
+      rule already reaches this task.
+    - internal/postmaster/wire\_type\_oid.go: wireTypeOID resolves built\-ins \(typeOIDFor, TypeNameToOID, captured
+      format\_type names\), arrays, and the connection database's enums, domains \(sent as their base type,
+      printtup.c\), composites, ranges, multiranges and relation rowtypes.
+    - Simple query, FETCH, extended Execute and Describe share it. The two extended paths had also dropped
+      IsArray, reporting an array column as its element type.
+    - Functions whose every overload returns void are typed void in exprType.
+    - Client impact is narrower than the entry says: Bind refuses binary result formats \(0A000\), so no client
+      can receive binary values under a wrong OID.
+    - Probe: a protocol client compared reported types with PG 18.3 for about 60 table column types and expressions;
+      the remaining differences are planner or catalog\-stub types, filed as h1a38.
+    - Regress, all 165 failed cases on HEAD and this build, same list: 80454→80425 mismatch lines, 5 better,
+      alter\_generic \+1 from tied\-row order \(a known flaky case\). Inventory re\-measured for the moved cases.
+    - Tests: TestWireTypeOID, TestExprTypeWireTypeOID.
+    Movement: yes — regress groupingsets 468→454, domain 431→419, xid 212→211
+- [x] **M0149-0001h1a38 — RowDescription sends typlen and typmod; result expressions carry PG's typmod** (filed 2026-11-18 by M0149-0001h1a3)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - 2026\-11\-18 \(landed\): wireFieldDescription sends the column's OID, typlen and typmod on every path.
+    - Compared through a protocol client with PG 18.3: typlen matches for all 303 built\-in scalar, range and
+      multirange types queried, and typlen and typmod match for table columns apart from domains \(h1a39\).
+    - exprType follows PG's exprTypmod: a length\-coercing cast keeps its typmod; min, max, sum, string\_agg,
+      NULLIF, unary operators and rounding functions have none; CASE, COALESCE, GREATEST and LEAST keep one
+      only when every input has the same typmod.
+    - char\(n\) without its typmod is named bpchar, so it cannot read as the one\-byte `"char"`.
+    - Side effect, toward PG: views and CREATE TABLE AS keep types such as `varchar(4)` and `numeric(16,4)`.
+    - Plan shapes are unchanged \(99/99, 99/99 MATCH\). EXPLAIN widths moved on 363 SF0.25 nodes and 374 SF1
+      nodes: 85 and 89 now equal PG, 3 on Q5 at each scale moved away, and costs did not change. The next
+      census is therefore not IDENTICAL and commits its full capture.
+    - Regress, all 165 failed cases on HEAD and this build, same list: 80421→80415 mismatch lines.
+      polymorphism and plpgsql move either way between runs: HEAD alone gave polymorphism 683 and 677 \(h1a44\).
+    - Residual filed: h1a39, h1a40, h1a41; found while probing: h1a42, h1a43, h1a44.
+    - Tests: TestWireFieldDescription, TestExprTypeTypmod.
+    Movement: yes — regress create\_view 1189→1148, expressions 48→44, psql 299→297
+- [x] **M0149-0001h1a39 — WRONG RESULTS: a domain's typmod is dropped, so `varchar(5)` and `numeric(4,1)` domains are not enforced** (filed 2026-11-18 by M0149-0001h1a38; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Repro: `create domain d5 as varchar(5); create domain dn as numeric(4,1); create table td(a d5, b dn);`
+    - `insert into td values ('123456', 1)` succeeded; PG raises `value too long for type character varying(5)`.
+    - `insert into td values ('12345', 123.456)` stored 123.456; PG stores 123.5.
+    - `select 'abcdefg'::d5` returned abcdefg, PG abcde; `select 1.26::dn` returned 1.26, PG 1.3.
+  - Cause, corrected from the filing: Domain.Base did keep the typmod, and pg\_type.typtypmod was right. Table
+    columns took only the base type's name, and casts never applied the base typmod.
+  - 2026\-11\-18 \(landed\):
+    - CREATE TABLE, ADD COLUMN and ALTER COLUMN TYPE resolve a domain through resolveDomainColumnType. ADD COLUMN
+      and ALTER COLUMN TYPE did not resolve domains at all before.
+    - A cast to a domain converts to the base type and then applies an explicit length cast
+      \(domainCastWithTypmod\), so it truncates and rounds as PG does.
+    - Data loss fixed on the way: ALTER COLUMN TYPE truncated the heap before a too\-long value failed, leaving
+      the table empty, for plain types too. Values are now encoded before the truncate.
+    - ALTER COLUMN TYPE now replaces the pg\_attribute row, which kept the old type.
+    - Probe against PG 18.3 covers varchar, char, numeric, bit, varbit, interval and domains over domains.
+    - Regress, all 165 failed cases on HEAD and this build, same list: 80405→80371 mismatch lines; polymorphism
+      and plpgsql moved within their known variation \(h1a44\).
+    - Not covered \(ledgered\): after a restart the column reloads as text \(P0\-E25\), so the typmod stops
+      applying until that is fixed; h1a45, h1a46 and h1a47 hold the differences found alongside.
+    - Tests: TestDomainTypmodIsEnforced, TestAlterColumnTypeFailureKeepsRows.
+    Movement: yes — regress alter\_table 697→685, domain 419→404, fast\_default 117→88, replica\_identity 20→14, compression 90→87, identity 320→318
+- [x] **M0149-0001h1a45 — WRONG RESULTS: `timestamp(p)` is not applied: columns and casts keep all fractional digits** (filed 2026-11-18 by M0149-0001h1a39; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `create table t(ts timestamp(0)); insert into t values ('2020-01-01 00:00:01.6')` stored `00:00:01.6`; PG stores
+    `00:00:02`. `select '2020-01-01 00:00:01.6'::timestamp(0)` showed the same difference.
+  - PG: AdjustTimestampForTypmod \(timestamp.c\), used by timestamp\_in, timestamp\_scale and timestamptz\_scale.
+  - 2026\-11\-18 \(landed\):
+    - Columns round on INSERT, UPDATE, COPY and defaults; `RETURNING` shows the rounded value. Casts round too.
+    - `::timestamp(0)` and `::time(0)` were no\-ops because Typmod 0 means no modifier. encodeTypmod now stores \-1
+      for an explicit precision 0 on these types; CastExpr.FractionalPrecision reads it.
+    - `infinity` and `\-infinity` printed as dates in 2262 and 1677 for every timestamp column and cast. Fixed in
+      the wire formatter.
+    - EXPLAIN prints `'2020\-01\-01 00:00:00'::timestamp(0) without time zone`, as PG does.
+    - A probe of columns, casts, RETURNING, UPDATE, COPY, ALTER COLUMN TYPE and infinity matches PG 18.3, except
+      the two items under Not covered.
+    - Regress, all 165 failed cases on HEAD and this build, same list: 80405→80374 mismatch lines.
+    - `timestamp` 1570→1595 and `timestamptz` 2191→2223 got worse only in column padding. 18 and 20 real lines
+      were fixed, but the expected tables are as wide as BC and far\-future dates goopg rejects \(h1a48\), and the
+      old wrong infinity text happened to produce that width.
+    - Not covered \(ledgered\): EXPLAIN literals ignore DateStyle; a cast to a domain over a time type prints six
+      fractional digits \(h1a47\).
+    - Tests: TestTimestampPrecisionIsApplied, TestExprTypeTypmod.
+    Movement: yes — regress window 1112→1082, interval 771→764
+- [x] **M0149-0001h1a48 — timestamps outside 1677 to 2262 are rejected** (filed 2026-11-18 by M0149-0001h1a45)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `'4714-11-23 23:59:59 BC'::timestamp` and `'0055-06-10 15:44:17.71393 BC'::timestamp` fail with `date/time value out
+    of range for timestamp`, and the message says goopg's range. PG accepts 4713 BC to 294276 AD.
+  - Cause: KindTime keeps nanoseconds since 1970 in an int64 \(Datum.Int\). The on\-disk format is already PG's
+    microseconds, so the limit is in the in\-memory value.
+  - This also sets the column width of most tables in regress timestamp and timestamptz.
+  - Resume: carry timestamps as PG\-epoch microseconds in the Datum, then the parser, formatter and arithmetic.
+  - 2026\-11\-18: sized and split into h1a48a to h1a48e; plan in docs/design/0100\-0149/0149\-0001h1a48\-timestamp\-range.md.
+  - 2026\-11\-18 \(closed\): all five slices landed. Timestamps run from 4714\-11\-24 BC to 294276 AD as in PG. Dates past
+    294276 AD moved to h1a54.
+- [x] **M0149-0001h1a48a — every use of the time carrier's unit goes through helpers in datum.go** (filed 2026-11-18 by M0149-0001h1a48)
+  Kind: impl
+  Parent: M0149-0001h1a48
+  - timeToCarrier, timeFromCarrier, timeCarrierUnitsPerSecond and timeTZCompareKey now hold the unit. Spill frames
+    and the subplan hash key use Int directly, and timezone\(\) works from microseconds of the day.
+  - Check: with the helpers switched to microseconds in a throwaway worktree, executor, postmaster, optimizer and
+    catalog tests passed, except TestExecCurrentTimestamp, which compares now\(\) at nanosecond precision.
+  - Also fixed: `'infinity'::date` and `'\-infinity'::date` printed 2262\-04\-11 and 1677\-09\-21.
+  - Tests: TestTimeCarrierRoundTrip, TestTimeTZCompareKey, TestInfinityCellText.
+  Movement: yes — regress date 407→405
+- [x] **M0149-0001h1a48b — KindTime holds microseconds since 2000** (filed 2026-11-18 by M0149-0001h1a48)
+  Kind: impl
+  Parent: M0149-0001h1a48
+  - 2026\-11\-18 \(landed\): Datum.Int is PG's Timestamp value. The accepted input range is unchanged.
+    - The heap codec reads and writes it directly. Infinity stays at the int64 extremes and survives a trip
+      through time.Time.
+    - Precision below a microsecond is dropped when a Datum is built, as in PG.
+    - Audit result: the only persisted use of the raw value was the hash partition fallback.
+      hashPartitionFallbackWord keeps the old word, so stored rows stay reachable; PG's hash is filed as h1a50.
+    - Regress, all 165 failed cases on HEAD and this build, same list: 80402→80391 mismatch lines.
+    - Measure horology after timestamp's sibling cases: alone it needs their tables and reads 2606.
+    - Tests: TestTimeCarrierIsPGMicroseconds, TestHashPartitionWordIsStableForTimeValues.
+    Movement: yes — regress uuid 21→18, horology 2576→2574, timestamp 1595→1594
+- [x] **M0149-0001h1a48c — date and time arithmetic that overflows past 292 years** (filed 2026-11-18 by M0149-0001h1a48)
+  Kind: impl
+  Parent: M0149-0001h1a48
+  - 2026\-11\-18 \(landed\): timestamp and date differences, interval addition, binary COPY, index keys and index\-only
+    decoding work on the carrier, not on time.Duration. The planner's date folding was fixed too: `'2200\-01\-01'::date
+    \- '1700\-01\-01'::date` gave 106751, the 292\-year limit, and now gives 182621.
+    - Wrong results fixed: `'2020\-01\-31'::timestamp \+ '1 month'` gave March 2; PG's month\-end clamp is ported.
+    - `date_bin` returned NULL for a literal stride or one under a day. It is now a port of timestamp\_bin.
+    - Infinity is stored in timestamp and date index keys as PG stores it. An existing index holding infinity needs
+      REINDEX, because its entry was written under the old finite key.
+    - A probe of arithmetic, indexes, index\-only order, binary COPY and ON CONFLICT matches PG 18.3 except h1a51.
+    - Regress, all 165 failed cases on HEAD and this build, same list: 80393→80384 mismatch lines; alter\_generic,
+      plpgsql and polymorphism moved within their known variation.
+    - Tests: TestAddMonthsClamped, TestTimeArithmeticBeyondDurationRange, TestPGDaysOfDatum, TestDateBinFollowsTimestampBin.
+    Movement: yes — regress timestamp 1594→1580, interval 764→760, timestamptz 2223→2222
+- [x] **M0149-0001h1a48d — BC and long\-year output in every formatter** (filed 2026-11-18 by M0149-0001h1a48)
+  Kind: impl
+  Parent: M0149-0001h1a48
+  - 2026\-11\-18 \(landed\):
+    - DateStyle output keeps the value's own month and day, so a BC leap day no longer prints as March 1.
+    - Datum.Format and AppendValueText print ` BC`, not a negative year.
+    - to\_char for dates and times is a port of DCH\_to\_char: every template pattern, FM, TM, TH, quoting, the session
+      zone for timestamptz and for dates.
+    - Tests compare with output captured from PG 18.3 for BC dates, BC leap days, five\-digit years and ordinary dates.
+    - Regress, all 165 failed cases on HEAD and this build, same list: 80383→80111 mismatch lines, none worse.
+    Movement: yes — regress timestamptz 2222→2060, timestamp 1580→1482, horology 2574→2566
+- [x] **M0149-0001h1a48e — accept PG's full timestamp and date range** (filed 2026-11-18 by M0149-0001h1a48)
+  Kind: impl
+  Parent: M0149-0001h1a48
+  - Parse years over four digits; enforce MIN\_TIMESTAMP and END\_TIMESTAMP with PG's errors; range\-check arithmetic
+    and decoded values; then replace checkTimeCarrierRange's bounds \(copy\_text.go\).
+  - Decide how to hold dates past 294276 AD, which PG allows up to 5874897 AD.
+  - Afterwards re\-measure regress timestamp and timestamptz, whose column widths depend on these dates.
+  - 2026\-11\-18 \(landed\):
+    - Text, binary COPY, arithmetic and date\_bin use PG's bounds and errors: `timestamp out of range: "x"` and
+      `date out of range: "x"`, 22008. Years over four digits and BC years parse.
+    - EXTRACT and date\_trunc follow PG for BC years. A bad cast literal is reported at the literal, and
+      `'x'::timestamp` has PG's wording.
+    - Dates past 294276 AD stay refused, because they do not fit the carrier \(h1a54\).
+    - Regress, all 165 failed cases on HEAD and this build: 80106→79870 mismatch lines. polymorphism +2 is the known
+      flake \(`column "x" does not exist`, seen in plpgsql on the other build\).
+    Movement: yes — regress date 405→294, horology 2566→2517, timestamp 1482→1441, timestamptz 2060→2030
+- [x] **M0149-0001h1a53 — WRONG RESULTS: to\_char on numbers truncates instead of rounding; to\_char\(interval\) is not ported** (filed 2026-11-18 by M0149-0001h1a48d; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select to_char(12345.678, '99999.99')` returns ` 12345.67`; PG 18.3 returns ` 12345.68`.
+  - An interval argument reaches toCharNumericFormat, because only KindTime takes the date path. PG formats it with
+    DCH\_to\_char and is\_interval set \(interval\_to\_char, formatting.c\). The output has not been compared yet.
+  - Resume: toCharNumericFormat in expr.go, then an interval dchValue in to\_char\_datetime.go.
+  - 2026\-11\-18 \(landed\):
+    - to\_char for numbers is a port of NUM\_processor and the int4, int8, float4, float8 and numeric entry points, with
+      PG's template errors. The argument's SQL type selects the entry point; int2 resolves to float8.
+    - to\_char\(interval\) and to\_char\(time\) use the date formatter with interval rules.
+    - An error in an argument is raised, not turned into NULL.
+    - About 7,800 statements give the same output and errors as PG 18.3; a sample is kept as a test.
+    - Regress, all 165 failed cases on HEAD and this build: 79879→79726 mismatch lines, none worse.
+    Movement: yes — regress numeric 1139→995, timestamp 1441→1438, timestamptz 2030→2027
+  > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a53: to\_char prints a different number
+  > The formatted value differs from PG 18.3. Found while checking the to\_char port.
+- [x] **M0149-0001h1a51 — WRONG RESULTS: timestamptz plus an interval ignores the session time zone and loses its type** (filed 2026-11-18 by M0149-0001h1a48c; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - With `set timezone='America/New_York'`, `'2020\-03\-07 12:00\-05'::timestamptz \+ '1 day'` should cross the DST change
+    and give `2020\-03\-08 12:00:00\-04`; goopg gives `2020\-03\-08 17:00:00`, adding in UTC and printing no zone.
+    `date\_bin` on timestamptz also prints no zone.
+  - PG: timestamptz\_pl\_interval \(timestamp.c\) does month and day steps in the session zone.
+  - Resume: addTimeInterval in expr.go needs the session zone and must keep TimeSubTimestampTZ; exprType for the result.
+  - 2026\-11\-19 \(landed\):
+    - Month and day steps work on the session zone's wall clock, each settled by the DST rule, and the result stays a
+      timestamptz.
+    - date\_add and date\_subtract exist, with the optional zone argument.
+    - date\_bin resolves between its timestamp and timestamptz forms as PG does; date::timestamptz is local midnight.
+    - exprType reports the result types, and interval for an interval literal.
+    - Regress, all 165 failed cases on HEAD and this build: 79726→79650 mismatch lines. plpgsql +3 is the known flake
+      \(`column "x" does not exist`\).
+    Movement: yes — regress timestamptz 2027→1999, horology 2517→2482, timestamp 1438→1426, interval 760→756
+  > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a51: timestamptz arithmetic gives a different instant across DST
+  > The returned instant differs from PG 18.3. Found while porting month arithmetic.
+- [x] **M0149-0001h1a57 — WRONG RESULTS: later rows of a VALUES list keep their literal text instead of the column type** (filed 2026-11-18 by M0149-0001h1a53; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `with v(x) as (values ('0'::numeric),('4.2e9')) select x from v` prints `4.2e9`; PG 18.3 prints `4200000000`.
+  - `select d + interval '1 day' from (values ('2018-11-02'::timestamp),('2019-01-01')) v(d)` fails with `operator + requires
+    integer operands`. pg\_typeof reports the right type, so the column is typed but the values are not converted.
+  - Resume: coerce each VALUES cell to the column type that transformValuesClause resolves \(select\_common\_type\).
+  - 2026\-11\-19 \(landed\):
+    - Every cell takes the column's common type, in both VALUES planners, with PG's `cannot be matched` errors.
+    - select\_common\_type is shared with COALESCE, GREATEST and LEAST.
+    - A cast to numeric and `numeric 'x'` yield a value, so `'4.2e9'::numeric` prints 4200000000.
+    - var\_pop, var\_samp and the stddev aggregates give NaN when a group mixes finite values and an infinity.
+    - to\_char no longer needs its own text cast.
+    - Regress, all 165 failed cases on HEAD and this build: 79650→79621 mismatch lines. polymorphism moves with the known
+      flake.
+    Movement: yes — regress numeric 995→980, rangetypes 837→832, window 1082→1081
+  > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a57: VALUES rows are not converted to the column type
+  > Values print and compare as text. Found while checking to\_char in regress numeric and timestamp.
+- [x] **M0149-0001h1a60 — WRONG RESULTS: generate\_series over timestamps returns zeros or fails** (filed 2026-11-19 by M0149-0001h1a51; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select * from generate_series('2020-03-07 12:00'::timestamp, '2020-03-09 12:00', '1 day')` returns one row holding 0;
+    PG 18.3 returns three timestamps. The four\-argument timestamptz form fails with `generate_series requires 2 or 3 arguments`.
+  - PG: generate\_series\_timestamp and generate\_series\_timestamptz\_internal \(timestamp.c\).
+  - Resume: internal/executor/operators\_generate\_series.go, stepping with addTimeIntervalInZone.
+  - 2026\-11\-19 \(landed\):
+    - The numeric, timestamp and timestamptz forms work in FROM and in the target list, including the zone argument, with PG's
+      argument errors. The result column has the resolved type.
+    - A NULL argument gives no rows.
+    - A LATERAL call can use columns of earlier FROM items; this failed for integers too.
+    - Regress, all 165 failed cases on HEAD and this build: 79624→79379 mismatch lines. polymorphism +3 is the known flake.
+    Movement: yes — regress rangefuncs 895→802, numeric 980→929, timestamptz 1999→1949, timestamp 1426→1392, stats\_ext 440→432, misc\_functions 236→231
+  > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a60: generate\_series over timestamps returns wrong rows
+  > The rows differ from PG 18.3. Found while checking timestamptz arithmetic.
+- [x] **M0149-0001h1a63 — WRONG RESULTS: a timestamptz compared with an untyped literal reads the literal in UTC** (filed 2026-11-19 by M0149-0001h1a60; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - With `set timezone='America/New_York'`, `select t from yz where t = '2020-01-01'` misses a row holding `2020-01-01 00:00-05`,
+    and `t > '2020-01-01'` returns it. PG 18.3 reads the literal in the session zone. `IN`, `BETWEEN` and `CASE` are affected too.
+  - Resume: the comparison's literal coercion \(coerceUnknownLit and its interpreted twin\) must use the session zone for timestamptz.
+  - 2026\-11\-19 \(landed\):
+    - The planner types a bare literal opposite a timestamp or timestamptz in comparisons, row comparisons, IS DISTINCT FROM,
+      NULLIF, IN lists and simple CASE, so timestamptz reads it in the session zone and timestamp discards its zone.
+    - Only spellings the executor can read are typed, until h1a56 ports the input parser.
+    - Regress, all 165 failed cases on HEAD and this build: 79382→79368 mismatch lines, none worse apart from the known flakes.
+    Movement: yes — regress horology 2482→2480
+  > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a63: timestamptz filters return different rows
+  > WHERE clauses return different rows from PG 18.3 outside UTC. Found while checking generate\_series.
+- [x] **M0149-0001h1a67 — WRONG RESULTS: timestamp array literals keep their text** (filed 2026-11-19 by M0149-0001h1a63; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - With `set timezone='America/New_York'`, `'{2020-07-01}'::timestamptz[]` prints `{2020-07-01}`; PG prints
+    `{"2020-07-01 00:00:00-04"}`. `t = ANY ('{2020-07-01}'::timestamptz[])` misses the matching row.
+  - Resume: the array input path must run each element through the element type's input function \(array\_in\).
+  - 2026\-11\-19 \(landed\):
+    - Casts to date, time, timetz, timestamp, timestamptz and interval arrays read and reprint every element, with PG's errors.
+    - ARRAY\[...\] and bare literals opposite such arrays do the same, and stored elements use the session zone.
+    - Interval input skips `@`, which is most of the interval movement.
+    - Regress, all 165 failed cases on HEAD and this build: 79373→79293 mismatch lines. plpgsql and polymorphism moved within
+      their known flake range.
+    Movement: yes — regress interval 756→662
+  > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a67: timestamp arrays print and compare differently
+  > Output and matched rows differ from PG 18.3. Found while checking timestamp literal comparison.
+- [x] **M0149-0001h1a56 — most PG date and timestamp input spellings are rejected** (filed 2026-11-18 by M0149-0001h1a48e)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `'Feb 10 17:32:01 1997'`, `'Mon Feb 10 17:32:01 1997 PST'`, `'19970210 173201 PST'`, `'1997/02/10 17:32:01-0800'`,
+    `'1997-06-10 18:32:01 PDT'` and `'01-08-1999'` fail with `invalid input syntax`. PG accepts them.
+  - This is the largest remaining cause in regress timestamp \(58 errors\), timestamptz \(153\) and date \(54\).
+  - Resume: port ParseDateTime, DecodeDateTime and DecodeDate \(datetime.c\) with the zone abbreviation table, in place
+    of the layout list in copy\_text.go.
+  - When this lands, remove timestampLiteralIsReadable \(internal/optimizer/common\_type.go\), so every untyped literal opposite
+    a timestamp is typed and a bad one raises PG's input error.
+  - 2026\-11\-19 \(landed\):
+    - ParseDateTime, DecodeDateTime and their helpers are ported, with the Default zone abbreviation table. date, timestamp and
+      timestamptz input from literals, casts, COPY and row encoding all use them, and follow DateStyle.
+    - timestampLiteralIsReadable is gone: every untyped literal opposite a timestamp is typed.
+    - Errors follow DateTimeParseError, including the DateStyle hint and the time zone errors.
+    - About 2,000 inputs under three field orders match PG 18.3, apart from dates past 294276 AD \(h1a54\).
+    - Regress, all 165 failed cases on HEAD and this build: 79283→76077 mismatch lines. subscription +3 now raises PG's error
+      for an empty `stats_reset` value, which an earlier gap in that case produces.
+    Movement: yes — regress timestamp 1392→213, timestamptz 1949→343, date 294→56, horology 2480→2360, merge 759→431, interval 662→654, copy2 254→249
+- [x] **M0149-0001h1a55 — date and timestamp literal errors: caret and DateStyle hint** (filed 2026-11-18 by M0149-0001h1a48e)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `date 'x'` and `timestamp 'x'` put the caret on the type name. PG puts it on the string \(makeStringConstCast\).
+    The position comes from the grammar \(NewTypedStringLit\).
+  - 2026\-11\-19: the DateStyle hint landed with h1a56; the caret remains.
+  - 2026\-11\-19 \(landed\): a typed literal's position is its string, for the one\-word, char\(n\) and multi\-word forms.
+    The TYPEDLIT token keeps the type name's position for source spans.
+    Movement: none — error positions only; regress over all 165 failed cases changed only in the known flakes
+- [x] **M0149-0001h1a54 — dates from 294277 to 5874897 AD are rejected** (filed 2026-11-18 by M0149-0001h1a48e)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `'294276-12-31'::date + 1` and `date '294277-01-01'` fail with `date out of range`. PG accepts dates up to 5874897 AD.
+  - Cause: KindDate shares the KindTime carrier, microseconds since 2000, which ends at 294277 AD.
+  - Resume: hold a date as PG's day count, then the formatter, comparison, arithmetic and codec paths.
+  - 2026\-11\-19 \(landed\):
+    - A date past 294276 AD is held as a day count above the timestamp range and below \+infinity, so ordering and hashing are unchanged.
+    - Input, arithmetic, output, indexes and COPY cover dates up to 5874897\-12\-31.
+    - Converting such a date to a timestamp raises `date out of range for timestamp`.
+    - COPY writes `infinity` and `\-infinity` for dates and timestamps; it wrote a far\-future date before.
+    - Regress, all 165 failed cases on HEAD and this build: 76082→76067 mismatch lines, none worse apart from the known flakes.
+    Movement: yes — regress horology 2360→2342, date 56→52
+- [x] **M0149-0001h1a58 — to\_char ignores lc\_numeric and lc\_monetary** (filed 2026-11-18 by M0149-0001h1a53)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `L`, `G`, `D` and `S` print the C locale's values. PG takes them from localeconv \(NUM\_prepare\_locale, PGLC\_localeconv\).
+  - Resume: numProcess in internal/executor/to\_char\_number.go.
+  - 2026\-11\-19 \(landed\):
+    - to\_char reads the decimal point, thousands separator, signs and currency symbol from the glibc locale data of
+      lc\_numeric and lc\_monetary, from a locale directory, LOCPATH or locale\-archive.
+    - About 3,800 statements under C, C.UTF\-8, en\_US, de\_DE, fr\_FR and ja\_JP match PG 18.3 started with the same LOCPATH.
+    Movement: none — the regress suite runs in the C locale; all 165 failed cases changed only in the known flakes
+- [x] **M0149-0001h1a59 — time plus or minus an interval prints a date and has no result type** (filed 2026-11-19 by M0149-0001h1a51)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `'10:00'::time + '1 hour'::interval` prints `1970-01-01 11:00:00`, and pg\_typeof says unknown. PG prints `11:00:00` and wraps
+    at midnight \(time\_pl\_interval\).
+  - Cause: a time value is an ordinary KindTime Datum, because TimeSubTime is declared but not set.
+  - Resume: set TimeSubTime where time values are made, then handle it in addTimeIntervalInZone and exprType.
+  - 2026\-11\-19 \(landed\):
+    - `+` and `-` on time and timetz resolve from static types through one table, parser.ResolveTimeOperator, used by the
+      analyzer and the planner. This includes untyped operands and the implicit time to interval cast.
+    - timetz keeps its offset in text output. timestamptz casts to time and timetz, current\_time and localtime use the session zone.
+    - Design: docs/design/0100\-0149/0149\-0001h1a59\-time\-operators.md. Remaining gaps are filed as M0149\-0001h1a74.
+    Movement: yes — regress runner over all 165 failed cases 76077 → 76007 lines; horology 2348 → 2294, interval 654 → 646
+- [x] **M0149-0001h1a61 — date\_add matches time zone names case\-sensitively** (filed 2026-11-19 by M0149-0001h1a51)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG finds zone names without regard to case \(pg\_tzset\). lookupTimeZoneName uses time.LoadLocation, which follows the file
+    system. This comes from reading the code and has not been run.
+  - 2026\-11\-19 \(landed\):
+    - date\_add, date\_subtract and generate\_series find zones in any case through misc.CanonicalZoneName, the pg\_tzset lookup.
+    - Zone tokens in date/time input, timetz input and `AT TIME ZONE` on timetz use the same lookup.
+    - The comparison with PG found wrong results under other zone functions, filed as M0149\-0001h1a75 \(S2\), and smaller gaps, M0149\-0001h1a76.
+    Movement: yes — `date_add(..., 'america/new_york')` errored and now equals PG; regress over all 165 failed cases changed only in the known flakes, 76007 → 76008
+- [x] **M0149-0001h1a62 — numeric variance and stddev use a fixed result scale** (filed 2026-11-19 by M0149-0001h1a57)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `var_pop(x::numeric)` over `1e30`, `2e30` and `3` prints 12 fractional digits; PG 18.3 prints none, because
+    numeric\_stddev\_internal uses select\_div\_scale. stddev goes through 15 significant digits instead of sqrt\_var.
+  - Resume: exactNumericVariance in internal/executor/operators\_join\_agg.go; the state must keep the input display scale.
+  - 2026\-11\-19 \(landed\):
+    - exactNumericVariance follows numeric\_stddev\_internal with exact integers: select\_div\_scale, rounded division and sqrt\_var.
+    - The largest input scale is kept in aggRuntime.numericScale, merged across parallel workers and serialized.
+    - 150 randomized input sets plus NaN, infinity, window and grouped queries match PG 18.3. The numeric scale\(\) function is missing \(M0149\-0001h1a77\).
+    - Design: docs/design/0100\-0149/0149\-0001h1a62\-numeric\-variance.md.
+    Movement: yes — regress runner numeric 929 → 925, window 1081 → 1069
+- [x] **M0149-0001h1a64 — a set\-returning call inside pg\_typeof returns one row** (filed 2026-11-19 by M0149-0001h1a60)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select pg_typeof(generate_series(1,2))` returns one row; PG 18.3 returns two.
+  - 2026\-11\-19 \(landed\):
+    - foldPgTypeof keeps a nested set\-returning argument beside the folded type name, so the call still sets the row
+      count. Correlated, grouped and filtered forms match PG 18.3.
+    - Remaining nested set\-returning differences are filed as M0149\-0001h1a78.
+    Movement: none — regress runner over all 165 failed cases changed only in known flakes \(75996 → 76001: plpgsql, alter\_generic, copy2's FREEZE block\)
+- [x] **M0149-0001h1a65 — a number times an interval is rejected** (filed 2026-11-19 by M0149-0001h1a60)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select 2 * interval '1 day'` fails with `operator * requires numeric operands`; PG gives `2 days` \(mul\_d\_interval\).
+    Swapping the operands in evalBinary was not enough, so another path rejects it first.
+  - `interval * interval` should raise `operator does not exist: interval * interval` with PG's hint.
+  - `t - '2020-01-01'` and `t + '1 day'` on a timestamptz fail the same way, with `operator - requires numeric operands`.
+  - 2026\-11\-19 \(landed\):
+    - parser.ResolveDateTimeLiteralOperator, shared by the analyzer and the planner, types interval, timestamp and date
+      next to an untyped literal, and an interval times or divided by a number. A number times an interval is mul\_d\_interval.
+    - PG's errors for `interval * interval`, `interval / interval`, `number / interval` and `date + unknown` are raised.
+    - sum and avg over interval are missing \(M0149\-0001h1a79\). EXPLAIN keeps the spelling of these literals \(h1a74\).
+    Movement: yes — regress runner timestamp 213 → 185
+- [x] **M0149-0001h1a66 — compare generate\_series row estimates for numeric and timestamps with PG** (filed 2026-11-19 by M0149-0001h1a60)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG has planner support functions for these forms \(generate\_series\_numeric\_support, generate\_series\_timestamp\_support\).
+    goopg's estimates for them have not been compared.
+  - 2026\-11\-19 \(landed\):
+    - Every FROM generate\_series was estimated at 1 row, the integer form included. generateSeriesRows now applies the
+      formulas of the support functions to arguments evaluated at plan time, and prorows 1000 otherwise.
+    - Rows match PG 18.3 for integer, numeric and timestamp forms, NULL, zero step, now\(\), volatile and correlated
+      arguments. Remaining cost differences are M0149\-0001h1a80.
+    - Design: docs/design/0100\-0149/0149\-0001h1a66\-generate\-series\-estimates.md.
+    Movement: yes — regress runner misc\_functions 231 → 208
+- [x] **M0149-0001h1a68 — timestamp literals are read at execution instead of parse time** (filed 2026-11-19 by M0149-0001h1a63)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - A prepared statement or view with `t = '2020-01-01'` follows the zone in force when it runs. PG fixes the value when the
+    statement is parsed, so it keeps the earlier zone, and pg\_get\_viewdef shows the resolved instant.
+  - EXPLAIN has the same cause: it prints `'2020-01-01'::timestamp with time zone`, where PG prints the resolved
+    `'2020-01-01 00:00:00-05'::timestamp with time zone`.
+  - Resume: the planner needs the session TimeZone to fold these literals; views need their stored text rewritten.
+  - 2026\-11\-19 \(landed\):
+    - TimeZone and DateStyle are planner settings and part of the plan cache key. After planning, every date/time literal,
+      cast string and compared string gets its output text, checked to read back as the same value.
+    - PREPARE keeps its TimeZone and DateStyle for EXECUTE, so a prepared statement keeps the zone it was prepared under.
+    - The regress A/B found an endless loop when reading a zone abbreviation under a POSIX session zone \(horology\); fixed in zonePeriods.
+    - Views, current\-time literals and the `epoch` index condition remain \(M0149\-0001h1a81\).
+    - Design: docs/design/0100\-0149/0149\-0001h1a68\-datetime\-literals\-at\-plan\-time.md.
+    Movement: yes — regress runner alter\_table 685 → 672, partition\_prune 1675 → 1674
+- [x] **M0149-0001h1a69 — interval input rejects `ago`** (filed 2026-11-19 by M0149-0001h1a67)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `'3 mons ago'::interval` fails with `invalid input syntax`, and `interval '3 mons ago'` with a syntax error. PG gives `-3 mons`
+    \(DecodeInterval negates every field\).
+  - Resume: decodeIntervalFields in internal/parser/interval.go.
+  - 2026\-11\-19 \(landed\):
+    - decodeIntervalFields negates every field when the last one is `ago`, and rejects it elsewhere, twice, or after a bare
+      number, as DecodeInterval does. The cast and the typed literal both match PG 18.3.
+    - Design: docs/design/0100\-0149/0119\-0006\-interval\-column\-storage.md \(new section\).
+    Movement: yes — regress runner interval 646 → 605
+- [x] **M0149-0001h1a70 — time and timetz input do not use PG's parser** (filed 2026-11-19 by M0149-0001h1a56)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `'10:00+05:30:15'::timetz` loses its offset, because parseTimeString and parseTimeTZString are separate from DecodeTimeOnly.
+  - timezone\_abbreviations is not honoured: input always uses the Default set.
+  - Resume: port DecodeTimeOnly onto internal/utils/adt/datetime/decode.go; load the abbreviation set the setting names.
+  - 2026\-11\-19 \(landed\):
+    - DecodeTimeOnlyInput ports DecodeTimeOnly onto the shared decoder; every time and timetz input path uses it.
+    - timetz offsets keep their seconds \(Datum.Hi\) and print them. `now` reads the session zone, not UTC.
+    - About 120 inputs match PG 18.3 apart from the clock value of `now`. timezone\_abbreviations is filed as M0149\-0001h1a82.
+    - Design: docs/design/0100\-0149/0149\-0001h1a56\-datetime\-input\-parser.md \(new section\).
+    Movement: yes — regress runner horology 2328 → 2318
+- [x] **M0149-0001h1a71 — typed literals the grammar does not accept** (filed 2026-11-19 by M0149-0001h1a55)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `uuid 'x'`, `inet 'x'`, `cidr 'x'`, `macaddr 'x'`, `money 'x'`, `bytea 'x'`, `bit '1'`, `varbit '1'`, `regclass 'x'`, `xml 'x'`,
+    `double precision 'x'`, `timestamp(3) 'x'`, `time(3) 'x'`, `numeric(5,2) 'x'`, `pg_catalog.date 'x'` and `"date" 'x'` are syntax errors.
+    PG accepts them \(ConstTypename Sconst, func_name Sconst\).
+  - `interval 'x'` is a syntax error and `interval(3) 'x'` says `invalid interval count`, where PG reports
+    `invalid input syntax for type interval` at the string.
+  - Resume: replace knownTypeNames in internal/parser/adapter.go with gram.y's productions; playbook §12 first.
+  - 2026\-11\-19 \(landed\):
+    - The adapter folds type modifiers, pg\_catalog qualification, double precision and more type names into TYPEDLIT, and
+      typedLitExpr builds a cast of the string for them. An invalid interval body is interval\_in's error at the string.
+    - Parity goldens 1716 → 1721 statements; only the new forms changed.
+    - Accepting `tid '(2, 0)'` sent brin.sql into an endless DO loop because RETURNING ctid is NULL; tid stays out \(M0149\-0001h1a84\).
+    - Remaining forms are M0149\-0001h1a85; string casts to bit\(n\) are M0149\-0001h1a83.
+    - Design: docs/design/0100\-0149/0149\-0001h1a71\-typed\-literals.md.
+    Movement: yes — regress runner interval 605 → 586
+- [x] **M0149-0001h1a72 — range operators such as `@>` reject range operands** (filed 2026-11-19 by M0149-0001h1a54)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `daterange('2020-01-01','2020-01-05') @> '2020-01-02'::date` and `int4range(1,5) @> 2` fail with `operator @> requires box
+    operands`. PG returns true \(range\_contains\_elem\).
+  - Resume: the operator's dispatch in evalBinary, by operand type.
+  - 2026\-11\-19 \(landed\):
+    - The planner resolves range operators by type to the rangetypes.c functions \(rangeOpCall\); the executor ports their
+      bodies over the canonical text. New operator codes for `&<`, `&>` and `-|-`.
+    - Containment, overlap, position, adjacency, union, intersection, difference and ordering match PG 18.3.
+    - Equality on non\-canonical numrange text, range ordering in sorts, the range functions and user range types are M0149\-0001h1a86.
+    - Design: docs/design/0100\-0149/0149\-0001h1a72\-range\-operators.md.
+    Movement: yes — regress runner rangetypes 832 → 463, multirangetypes 1843 → 1830, without\_overlaps 563 → 558, box 312 → 310, polygon 155 → 151
+- [x] **M0149-0001h1a73 — monetary and numeric locale data beyond to\_char** (filed 2026-11-19 by M0149-0001h1a58)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Locale strings are not converted to the database encoding when the locale's codeset differs \(db\_encoding\_convert in
+    PGLC\_localeconv\), and PG's warning for an undeterminable codeset is not raised.
+  - money input and output ignore lc\_monetary \(cash\_in, cash\_out\); internal/utils/adt/cash is fixed to the C locale's form.
+  - Resume: misc.LocaleConvFor needs the remaining monetary fields; pass them to cash.In and cash.Out.
+  - 2026\-11\-19 \(landed\):
+    - misc.MonetaryConvFor reads all monetary localeconv fields; cash.InLocale and cash.OutLocale port cash\_in and cash\_out
+      over them. Money casts, int and numeric to money scaling, and the wire output follow lc\_monetary.
+    - 90 statements under C, en\_US, de\_DE, fr\_FR and ja\_JP match PG 18.3 with the same LOCPATH.
+    - COPY and array money, money::numeric under other frac\_digits, codeset conversion and `-1234.56::money` precedence are M0149\-0001h1a87.
+    - Design: docs/design/0100\-0149/0149\-0001h1a53\-to\-char\-numbers.md \(new section\).
+    Movement: none — the regress suite runs in the C locale; regress runner over all 165 failed cases changed only in known flakes \(75464 → 75465\)
+- [x] **M0149-0001h1a74 — remaining time output and operator error gaps** (filed 2026-11-19 by M0149-0001h1a59)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - A plain time value prints with a date in format, concat and row output: `format('%s', '10:00'::time)` gives
+    `1970-01-01 10:00:00`, PG gives `10:00:00`. TimeSubTime is declared but never set.
+  - `'10:00'::time + 1` raises `operator + requires integer operands`; PG raises `operator does not exist: time without
+    time zone + integer` with its hint. Bare integer literals are typed int8 here, so the message needs the literal's PG type.
+  - EXPLAIN prints a time literal as written \(`'09:00'`, or `'11:00'` in a comparison\); PG prints `'09:00:00'::time without
+    time zone`.
+  - A literal range operand prints without its type label \(`'[1,3)'` for PG's `'[1,3)'::int4range`\).
+  - The same holds for timestamptz literals \(`'2020-01-01'` for PG's `'2020-01-01 00:00:00+00'`\), and PG prints a number
+    multiplying an interval as `'2'::double precision`.
+  - Resume: set TimeSubTime in NewTimeDatum's time\-of\-day callers, parser.ResolveTimeOperator for the error, castLiteralConstText for EXPLAIN.
+  - 2026\-11\-19 \(landed\):
+    - NewTimeOfDayDatum tags every time\-of\-day value with TimeSubTime; the generic renderers print it as time\_out, 24:00:00
+      included. The packed\-tuple round trip now keeps the subtype.
+    - time and timetz with a number, text or boolean operand raise PG's `operator does not exist`.
+    - EXPLAIN prints `'2'::double precision` for a constant interval factor and labels literal range operands.
+    - Fixed on the way: `2::float8 * interval` had been rejected since h1a65; the analyzer now reads numeric cast targets.
+    - to\_json, EXPLAIN over VALUES, CURRENT\_DATE deparse and `'1 day' * 2` are M0149\-0001h1a88.
+    Movement: none — regress runner over all 165 failed cases changed only in known flakes \(75468 → 75467\)
+- [ ] **M0149-0001h1a75 — WRONG RESULTS: time zone arguments on timestamps are mishandled** (filed 2026-11-19 by M0149-0001h1a61; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `'2020-07-01 00:00+00'::timestamptz at time zone 'Asia/Tokyo'` returns `1970-01-01 09:00:00`; PG returns
+    `2020-07-01 09:00:00`. `timestamp at time zone` also loses the date, and so does timezone\(\).
+  - `date_trunc('day', '2020-07-01 12:00+00'::timestamptz, 'asia/tokyo')` ignores the zone: `2020-07-01 00:00:00`, PG
+    `2020-06-30 15:00:00+00`.
+  - `make_timestamptz(2020,7,1,0,0,0,'asia/tokyo')` ignores the zone: `2020-07-01 00:00:00`, PG `2020-06-30 15:00:00+00`.
+  - `AT LOCAL` assumes the session zone is UTC.
+  - 2026\-11\-23 \(found by M0149\-0001h1a81\): the session zone is ignored in three more places.
+    - Under `set timezone='Asia/Tokyo'`, `'2020-01-01 20:00+00'::timestamptz::date` and `date(...)` return
+      `2020-01-01`; PG returns `2020-01-02` \(timestamptz\_date\).
+    - Two\-argument `date_trunc('day', timestamptz)` truncates in UTC and returns a timestamp; PG truncates in the
+      session zone and returns `2020-01-02 00:00:00+09`.
+    - `current_date` and the `'today'`/`'now'` literals already read the local date since h1a81, so
+      `current_date = now()::date` is `f` near midnight.
+  - Resume: the timezone arm of expr.go treats every value as timetz; add timestamp\_zone and timestamptz\_zone, then the
+    zone arguments of date\_trunc and evalMakeTimestamp.
+  > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a75: `AT TIME ZONE` on a timestamp returns a 1970 date
+  > The result differs from PG 18.3 for every timestamp input. Found while comparing zone names in h1a61.
+- [x] **M0149-0001h1a76 — smaller differences in time zone input and listing** (filed 2026-11-19 by M0149-0001h1a61)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `'12:00 asia/tokyo'::timetz` is accepted as `12:00:00+09`; PG raises invalid input syntax because the zone needs a date.
+  - `pg_timezone_names` returns no row for `Asia/Tokyo`.
+  - Resume: parseTimeTZString for the first; the pg\_timezone\_names source for the second.
+  - 2026\-11\-20 \(landed\):
+    - The timetz case was already fixed by M0149\-0001h1a70's DecodeTimeOnly port.
+    - pg\_timezone\_names enumerates the tz database \(pg\_tzenumerate\_next\); pg\_timezone\_abbrevs lists the session zone's
+      abbreviations and then the Default set, as its view does. Names, abbreviations, offsets and DST flags match PG 18.3.
+    - utc\_offset stays in postgres\_verbose: goopg has no IntervalStyle output \(M0149\-0001h1a89\).
+    - Design: docs/design/0100\-0149/0149\-0001h1a51\-timestamptz\-interval.md \(new section\).
+    Movement: none — regress runner over all 165 failed cases changed only in known flakes \(75461 → 75455\); sysviews stays passing
+- [x] **M0149-0001h1a77 — the numeric scale function is missing** (filed 2026-11-19 by M0149-0001h1a62)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select scale(1.50)` raises `function scale does not exist`; PG returns 2 \(numeric\_scale\). min\_scale and trim\_scale exist.
+  - Resume: the trim\_scale and min\_scale arm in internal/executor/expr.go, plus the function's result type.
+  - 2026\-11\-20 \(landed\):
+    - scale\(\) is numeric\_scale, with NULL for NaN and infinity and PG's error for other argument types; scale, min\_scale
+      and trim\_scale have result types in exprType.
+    - Design: docs/design/0100\-0149/0149\-0001h1a62\-numeric\-variance.md \(new section\).
+    Movement: yes — regress runner numeric 925 → 871, numeric\_big 688 → 685
+- [x] **M0149-0001h1a78 — other set\-returning calls nested in an expression** (filed 2026-11-19 by M0149-0001h1a64)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select unnest(array[1,2]) + 1` raises `function unnest does not exist`; PG returns 2 and 3. Only
+    generate\_series is expanded when nested \(isNestedSRFName\).
+  - `select case when generate_series(1,2) > 1 then 'a' else 'b' end` returns rows; PG raises `argument of CASE/WHEN must
+    not return a set`. `coalesce(generate_series(1,2), 0)` likewise returns rows where PG raises an error.
+  - EXPLAIN VERBOSE of `select generate_series(1,2) + 1` prints a ProjectSet with `Output: ?column?`; PG prints a Result
+    over a ProjectSet with the expressions.
+  - Resume: isNestedSRFName and buildSelectSrfProjectSet in internal/optimizer/planner.go; the analyzer for the errors.
+  - 2026\-11\-22 \(landed\):
+    - unnest, regexp\_matches and user SETOF routines nested in an expression expand like generate\_series. Every
+      SRF in one expression gets its own slot, and they run in lockstep: `unnest(array[1,2]) * generate_series(1,3)`
+      is 1, 4, NULL. `abs(unnest(...))` used to return one NULL row, and `(regexp_matches(s, p, 'g'))[1]` one row.
+    - The analyzer raises PG's CASE and COALESCE errors: 42804 for a WHEN that returns a set, and 0A000 at the last
+      SRF otherwise \(transformCaseExpr, transformCoalesceExpr\).
+    - Subscripted targets are named by FigureColname's A\_Indirection arm, so `(array[1,2])[1]` is `array`.
+    - The EXPLAIN shape is split out as M0149\-0001h1a78a. Two gaps found along the way are M0149\-0001h1a78b and
+      M0149\-0001h1a78c.
+    - Design: docs/design/0100\-0149/0118\-0034\-select\-list\-srf\-nested\-in\-expression.md \(new section\).
+    Movement: yes — regress runner tsrf 205 → 197, arrays 1281 → 1277, subselect 852 → 844, jsonb 2484 → 2473 \(same\-list A/B against HEAD; plpgsql moved only in its known nondeterministic block\)
+- [x] **M0149-0001h1a78a — EXPLAIN of a set\-returning call nested in an expression** (filed 2026-11-22 by M0149-0001h1a78)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `explain verbose select generate_series(1,2) + 1`: PG prints `Result (rows=2)` with
+    `Output: ((generate_series(1, 2)) + 1)` over `ProjectSet (rows=2)` with `Output: generate_series(1, 2)`.
+    goopg prints only the ProjectSet, with `rows=1` and `Output: ?column?`. The same applies to unnest.
+  - Resume: srfNeedsResultAbove in internal/executor/operators\_explain.go synthesises the Result only below a
+    Sort; the row estimate for a wrapped SRF is missing in the ProjectSet costing.
+  - 2026\-11\-22 \(landed\):
+    - A SELECT\-list ProjectSet now carries PG's rows and costs \(create\_set\_projection\_path\), and the Result above
+      it carries create\_projection\_path's. That Result is now printed at the top level too.
+    - A Project that returns the ProjectSet's columns unchanged costs nothing, as in PG.
+    - The verbose Output lists, the Sort Key deparse and the `width=0` input Result are split out as
+      M0149\-0001h1a78d.
+    - Design: docs/design/0100\-0149/0118\-0034\-select\-list\-srf\-nested\-in\-expression.md \(new section\).
+    Movement: yes — regress runner tsrf 197 → 193 \(same\-list A/B against HEAD over 20 cases; plpgsql moved only in its known nondeterministic block\)
+- [x] **M0149-0001h1a78d — VERBOSE output for a SELECT\-list ProjectSet** (filed 2026-11-22 by M0149-0001h1a78a)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `explain verbose select generate_series(1,2) + 1`:
+    - PG prints `Output: ((generate_series(1, 2)) + 1)` on the Result and `Output: generate_series(1, 2)` on the ProjectSet.
+    - goopg prints no Output on the Result and `Output: ?column?` on the ProjectSet.
+    - A bare `generate_series(1,2)` prints `Output: generate_series` without its arguments.
+  - The Sort Key over a wrapped column is `?column?`; PG deparses `(((generate_series(1, 2)) % 2))`.
+  - An input Result with no columns prints `width=1`; PG prints `width=0`. This is also true under `select count(*)`.
+  - Resume: explainOutputNames for *optimizer.ProjectSet and the synthesised Result in
+    internal/executor/operators\_explain.go. srfFunctionCallArgs already deparses the FROM\-clause SRF calls.
+  - 2026\-11\-23 \(landed\):
+    - VERBOSE Output of the ProjectSet and of the Result above it follows split\_pathtarget\_at\_srfs, with ruleutils'
+      parentheses. So do pass\-through Sort and Limit Output and the Sort Key over a wrapped column.
+    - formatExprQual deparses array\_construct as `'{..}'::T[]` or `ARRAY[..]`, and array\_subscript as `(x)[i]`.
+    - A display width of 0 is printed for an empty targetlist.
+    - The Values Scan column naming \(`x` vs `"*VALUES*".column1`\) and the stamped Seq Scan width under count\(\*\)
+      are not specific to ProjectSet and stay open; they are recorded in the ledger.
+    - Design: docs/design/0100\-0149/0118\-0034\-select\-list\-srf\-nested\-in\-expression.md \(new section\).
+    Movement: yes — regress runner tsrf 193 → 181, rangefuncs 802 → 796, subselect 844 → 839 \(same\-list A/B against HEAD over 22 cases; plpgsql flaps 1213/1221 on one build\)
+- [x] **M0149-0001h1a78b — arithmetic on an array subscript is rejected** (filed 2026-11-22 by M0149-0001h1a78)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select (array[1,2])[1] + 1` fails with `operator + requires numeric operands`; PG returns 2. The same happens
+    on HEAD before M0149\-0001h1a78.
+  - Resume: the element type that exprType gives an ArraySubscript over an ARRAY constructor.
+  - 2026\-11\-22 \(landed\):
+    - The analyzer types ARRAY\[...\] as the array of its elements' common type \(transformArrayExpr\), not text\[\].
+      A chained subscript over a multidimensional array keeps the element type.
+    - A subscript over a date\[\] yields a date datum read with the session DateStyle, so `d[1] + 1` is date\_pli.
+    - FigureColname drops a cast's array bounds, so the column of `('{1}'::date[])` is named `date`.
+    - Multidimensional subscripts return wrong values; this is filed as M0149\-0001h1a78e \(S2\).
+    - Design: docs/design/0100\-0149/0149\-0001h1a78b\-array\-constructor\-type.md \(new\).
+    Movement: yes — regress runner arrays 1277 → 1271 \(same\-list A/B against HEAD over 23 cases; plpgsql and polymorphism moved only in their known nondeterministic OUT\-parameter block\)
+- [ ] **M0149-0001h1a78e — WRONG RESULTS: subscripts of a multidimensional array** (filed 2026-11-22 by M0149-0001h1a78b; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select ('{{1,2},{3,4}}'::int[])[2][1]` returns `}`; PG returns 3. `(array[array[1,2],array[3,4]])[2]` returns `2}`;
+    PG returns NULL, because a single subscript of a 2\-D array is out of range for the element fetch.
+  - Resume: the array\_subscript arm in internal/executor/expr.go. parseTextArray splits only the top level, and goopg
+    nests `[2][1]` as two subscripts where PG's SubscriptingRef carries both. Fold the chain into one multi\-index fetch
+    in the planner, and return NULL for fewer subscripts than dimensions.
+  > \#\# ESCALATION 2026\-11\-22 \(S2\) — M0149\-0001h1a78e: multidimensional array subscripts return wrong values
+  > Any `a[i][j]` over a 2\-D array returns a fragment of the array text instead of the element. Found while fixing
+  > h1a78b; this is not new, because array literals fail the same way on HEAD.
+- [x] **M0149-0001h1a78c — string\_to\_array is missing** (filed 2026-11-22 by M0149-0001h1a78)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select string_to_array('a,b', ',')` raises `function string_to_array does not exist`; PG returns `{a,b}`
+    \(text\_to\_array, text\_to\_array\_null in varlena.c\). Only the pg\_proc rows exist.
+  - Resume: add the function to the executor's builtin dispatch next to array\_to\_string.
+  - 2026\-11\-23 \(landed\):
+    - string\_to\_array ports split\_text, including NULL\-delimiter character splitting, null\_string and the empty cases.
+    - string\_to\_array and regexp\_split\_to\_array have the result type text\[\].
+    - array output quotes an element spelling NULL.
+    - string\_to\_table is missing; this is filed as M0149\-0001h1a78f.
+    - Design: docs/design/0100\-0149/0149\-0001h1a78b\-array\-constructor\-type.md \(new section\).
+    Movement: yes — regress runner arrays 1271 → 1214 \(same\-list A/B against HEAD over 19 cases, none worse\)
+- [!] **M0146-0014-s9rename — s9\-census\-due.sh misses a census directory that was renamed** (filed 2026-11-23 by the census routing-20261123a pass; owner-only file)
+  Kind: harness
+  Parent: M0146-0014
+  - The local census helper tmp/census.sh had a bug: one shell variable held both the series name and the binary's
+    sha256. It committed 5bf05c07e under `routing-<sha>a`. 2246e213c renamed the directory to `routing-20261123a`.
+  - scripts/s9-census-due.sh finds the newest census with `--diff-filter=A`, so it does not see a renamed ROUTING.md.
+    It then reports DUE with `unparsable-capture-sha`, read from the old path.
+  > \#\# ESCALATION 2026\-11\-23 \(owner\-only\) — M0146\-0014\-s9rename
+  > The loop changed both `--diff-filter=A` in scripts/s9\-census\-due.sh to `AR`, and with that the check reports
+  > REUSE on routing\-20261123a. The pre\-commit protected\-region guard rejected the commit, and the shell guard
+  > blocks reverting the file. The change is still in the working tree and STAGED. Please commit or revert it.
+  > Without it, the next census that adds routing\-20261123b restores discovery: an added ROUTING.md is the newest
+  > again. Until then the check reports a spurious DUE.
+- [x] **M0149-0001h1a78f — string\_to\_table is missing** (filed 2026-11-23 by M0149-0001h1a78c)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select * from string_to_table('a,b', ',')` raises `table-valued function "string_to_table" not supported`;
+    PG returns two rows \(text\_to\_table, text\_to\_table\_null in varlena.c\). The target\-list form is missing too.
+  - Resume: planTableFuncRangeVar in internal/optimizer/planner.go, next to regexp\_split\_to\_table. Reuse
+    splitTextToArray from internal/executor/expr.go.
+  - 2026\-11\-23 \(landed\):
+    - FROM, bare target\-list and nested string\_to\_table are planned as unnest\(string\_to\_array\(...\)\). EXPLAIN keeps
+      the function name and its prorows of 1000.
+    - `ROWS FROM (string_to_table(...))` is not covered and is recorded in the ledger.
+    - Design: docs/design/0100\-0149/0149\-0001h1a78b\-array\-constructor\-type.md \(new section\).
+    Movement: yes — regress runner arrays 1214 → 1134 \(same\-list A/B against HEAD over 14 cases, none worse\)
+- [x] **M0149-0001h1a79 — sum and avg over interval are rejected** (filed 2026-11-19 by M0149-0001h1a65)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select sum(i), avg(i) from (values ('1 hour'::interval),('2 hours')) v(i)` raises `aggregate sum requires numeric argument
+    in v0`; PG returns `03:00:00` and `01:30:00` \(interval\_sum, interval\_avg\).
+  - Resume: the sum/avg transition in internal/executor/operators\_join\_agg.go.
+  - 2026\-11\-23 \(landed\):
+    - sum and avg take an interval argument, ported from interval\_accum, interval\_sum and interval\_avg.
+      - The finite sum adds with overflow checking. Infinities are counted by sign, and mixed signs raise 22008.
+      - avg divides the finite sum by the finite count with interval\_div.
+      - avg\(interval\) is typed interval in the analyzer, the planner and window functions.
+    - The parallel combine \(interval\_combine\) and the state serialization share the numericSum/floatSpecial fields.
+      Results matched PG under a parallel plan and with a spilling hash aggregate.
+    - interval input overflow returns wrong values; this is filed as M0149\-0001h1a79a \(S2\).
+    - Design: docs/design/0100\-0149/0149\-0001h1a79\-interval\-sum\-avg.md \(new\).
+    Movement: yes — regress runner window 1069 → 1050, interval 586 → 584 \(same\-list A/B against HEAD over 13 cases, none worse\)
+- [ ] **M0149-0001h1a79a — WRONG RESULTS: interval input overflow wraps instead of raising** (filed 2026-11-23 by M0149-0001h1a79; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select interval '2147483647 years 1 decade'` returns `9 years`; PG raises 22008 `interval field value out of range`.
+    The same happens for every `2147483647 years` plus a decade, century or millennium, and for the fractional forms
+    \(`'0.1 millennium 2147483647 months'` returns `-178956870 years -9 mons`\). This is interval.sql's overflow block.
+  - Resume: the interval input parser \(parser.ParseIntervalBody and DecodeInterval's unit scaling\). Port PG's
+    overflow\-checked accumulation \(int64 multiply and add with the 22008 error\) from datetime.c DecodeInterval and
+    AdjustYears/AdjustFractYears.
+  > \#\# ESCALATION 2026\-11\-23 \(S2\) — M0149\-0001h1a79a: interval input overflow returns wrong values
+  > An out\-of\-range interval literal silently wraps to a different interval instead of raising 22008. Found in the
+  > interval.sql regress diff while working on h1a79. It is not caused by that change: HEAD has the same lines.
+- [x] **M0149-0001h1a80 — function scan and small\-table costs differ from PG** (filed 2026-11-19 by M0149-0001h1a66)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `generate_series(now(), now() + '1 day', '1 hour')` costs `0.00..0.25`; PG `0.01..0.26`, because cost\_functionscan
+    charges the argument evaluation as startup cost.
+  - A one\-row table analyzed just after insert shows `Seq Scan ... cost=0.00..0.01`; PG `0.00..1.01` \(one page\).
+  - A Hash Join over two function scans costs `0.33..2.80`, PG `0.23..1.71`.
+  - Resume: DeriveLegacyDisplayCost's GenerateSeries arm in internal/optimizer/plancost.go; then compare the join costs.
+  - 2026\-11\-23 \(landed\):
+    - Function scans follow cost\_functionscan: the call's evaluation is startup cost, and each returned tuple costs
+      cpu\_tuple\_cost plus the quals. This covers the display cost, a Filter over the scan, and the join\-search leaf.
+    - unnest estimates the array length, and a SETOF routine its prorows.
+    - The one\-row table case already matched PG \(`0.00..1.01`\) when re\-measured.
+    - Three divergences that are not specific to function scans are in the ledger: lateral Seq Scan filter cost,
+      `a = b + 1` join selectivity, and the scan width under count\(\*\).
+    - Design: docs/design/0100\-0149/0149\-0001h1a80\-function\-scan\-cost.md \(new\).
+    Movement: yes — regress runner misc\_functions 210 → 207 \(same\-list A/B against HEAD over 18 cases, none worse\)
+- [x] **M0149-0001h1a81 — date/time literals in views, current\-time literals and epoch** (filed 2026-11-19 by M0149-0001h1a68)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - A view keeps its source text and is planned again at each use, so `create view v as select t = '2020-01-01' ...`
+    compares with the zone of the query; PG fixes the instant at CREATE VIEW and pg\_get\_viewdef prints it.
+  - `'now'`, `'today'`, `'tomorrow'` and `'yesterday'` are read at run time and EXPLAIN prints them as written; PG converts them
+    at parse time. goopg's plan cache reuses plans across statements, so converting needs a cache rule first.
+  - `t > 'epoch'` on an indexed timestamptz column stays a filter; PG uses it as an index condition.
+  - Resume: the view definition store \(CREATE VIEW\) for the first; the plan cache key for the second.
+  - 2026\-11\-23 \(landed\):
+    - `today`, `tomorrow`, `yesterday`, `now` \(as a timestamp\) and `current_date` read the session zone's date and
+      wall clock. They used UTC: `'today'::timestamptz` in New York was 19:00 the day before, and in Tokyo a whole
+      day off.
+    - EXPLAIN \(text\) prints current\-time literals as the instant they denote; a literal compared with a date column is
+      typed `::date`.
+    - Evaluation stays at run time, so the plan cache is unaffected.
+    - `t > 'epoch'` was already an index condition when re\-measured.
+    - Views are split out as M0149\-0001h1a81a. Zone gaps in `timestamptz::date` and `date_trunc` were appended to
+      the S2 M0149\-0001h1a75.
+    - Design: docs/design/0100\-0149/0149\-0001h1a68\-datetime\-literals\-at\-plan\-time.md \(new section\).
+    Movement: yes — regress runner timestamptz 343 → 341 \(same\-list A/B against HEAD over 14 cases, none worse\)
+- [x] **M0149-0001h1a81a — date/time literals in a view follow the querying session's zone** (filed 2026-11-23 by M0149-0001h1a81)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `create view v as select t = '2020-01-01 00:00' as m from tz1` is created under UTC. Selected under
+    `set timezone='Asia/Tokyo'` it returns `f` for the 00:00 UTC row; PG returns `t`, because the literal became a Const
+    at CREATE VIEW.
+  - pg\_get\_viewdef prints the stored source text. PG prints the deparsed query with
+    `'2020-01-01 00:00:00+00'::timestamp with time zone`.
+  - Resume: CREATE VIEW in internal/executor. Store the canonicalized literals \(canonicalizeDateTimeLiterals under the
+    creating session's settings\) in the view definition, or record the creation\-time TimeZone and DateStyle and plan
+    view bodies with them, the way PREPARE does \(PreparedLiterals\).
+  - 2026\-11\-23 \(landed\):
+    - CREATE VIEW rewrites the stored view text. Each date/time literal is replaced by its value read under the
+      creating session's TimeZone and DateStyle, printed in ISO style \(`bindViewDateTimeLiterals`\). The view then
+      answers the same in any zone or DateStyle, and the binding survives a restart.
+    - pg\_get\_viewdef prints the bound literal but not PG's deparsed query or cast.
+    - After a restart, pg\_get\_viewdef returns the raw pg\_rewrite node tree, on HEAD as well; this is filed as
+      M0149\-0001h1a81b \(S2\).
+    - Design: docs/design/0100\-0149/0149\-0001h1a68\-datetime\-literals\-at\-plan\-time.md \(new section\).
+    Movement: none — regress runner same\-list A/B over 12 view and date cases unchanged; probes match PG under UTC,
+    Asia/Tokyo, America/New\_York and German DMY
+- [ ] **M0149-0001h1a81b — WRONG RESULTS: pg\_get\_viewdef returns the rule's node tree after a restart** (filed 2026-11-23 by M0149-0001h1a81a; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Steps: `create view v as select t + 1 as m from tz3`, restart the server, then `select pg_get_viewdef('v')`. It returns
+    `({QUERY :commandType 1 ...})`, the pg\_rewrite ev\_action, and not the view's SQL. pg\_dump of any view breaks after
+    a restart.
+  - Resume: internal/initdb/catalog\_heap\_reload.go sets `tbl.ViewDef = r.evAction`. Keep the SQL text somewhere
+    durable, or deparse the node tree as ruleutils does, and have pg\_get\_viewdef use it.
+  > \#\# ESCALATION 2026\-11\-23 \(S2\) — M0149\-0001h1a81b: pg\_get\_viewdef returns a node tree after restart
+  > Every view's definition is unreadable through pg\_get\_viewdef \(and pg\_dump\) after a server restart. Found while
+  > checking that h1a81a's literal binding persists. HEAD behaves the same.
+- [x] **M0149-0001h1a82 — the timezone\_abbreviations setting is ignored** (filed 2026-11-19 by M0149-0001h1a70)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Date/time input always reads abbreviations from the Default set; PG loads the file the setting names
+    \(load\_tzoffsets, share/timezonesets\), and `SET timezone_abbreviations = 'India'` changes what `IST` means.
+  - pg\_timezone\_abbrevs should list the active set.
+  - Resume: defaultZoneAbbrevs in internal/utils/adt/datetime; a loader for share/timezonesets and the GUC hook.
+  - 2026\-11\-23 \(landed\):
+    - The Default, Australia and India sets are embedded and parsed by a ParseTzFile port.
+      - Date/time input, the plan\-time literal canonicalizer \(part of the plan cache key\), PREPARE and
+        pg\_timezone\_abbrevs all use the set the setting names.
+      - An unknown or dotted name is rejected with 22023.
+    - Probes match PG: IST under India, EST and CST under Australia, timetz input.
+    - pg\_timezone\_abbrevs' utc\_offset formatting remains M0149\-0001h1a89.
+    - Design: docs/design/0100\-0149/0149\-0001h1a82\-timezone\-abbreviations.md \(new\).
+    Movement: none — regress runner same\-list A/B over 9 date/time and GUC cases unchanged \(sysviews stays PASS\)
+- [x] **M0149-0001h1a83 — a string cast to bit\(n\) or varbit\(n\) raises instead of padding** (filed 2026-11-19 by M0149-0001h1a71)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select '10'::bit(4)` and `bit(4) '10'` raise `bit string length 2 does not match type bit(4)`; PG returns `1000`.
+    `'111'::varbit(2)` raises where PG returns `11`. coerce\_type reads an unknown literal with typmod \-1 and then applies
+    the explicit length coercion \(bit\(\), varbit\(\) with isExplicit\).
+  - Resume: bitStringCast in internal/executor/expr.go, for a StringConst operand.
+  - 2026\-11\-23 \(landed\):
+    - An explicit cast with a typmod from a string \(literal, typed literal or text column\) is read with typmod \-1 and
+      then padded or truncated \(bit\(\)/varbit\(\) with isExplicit\). Assignment keeps the length errors.
+    - An invalid\-digit error points at the literal, as in PG.
+    - The pin in TestBitTextPrefixInsert expected `'B01'::bit(4)` to raise. PG stores `0100`, so it now checks the
+      assignment form.
+    - Design: docs/design/0100\-0149/0149\-0001h1a1\-bit\-string\-operators.md \(new section\).
+    Movement: none — regress runner same\-list A/B over 6 cases unchanged \(bit 27 → 27\); probes match PG
+- [ ] **M0149-0001h1a84 — WRONG RESULTS: RETURNING ctid is NULL and RETURNING xmin is rejected** (filed 2026-11-19 by M0149-0001h1a71; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `insert into t values (1) returning ctid` returns NULL; PG returns `(0,1)`. The same in PL/pgSQL `RETURNING ctid INTO`.
+    `returning xmin` raises `column "xmin" does not exist`.
+  - brin.sql's `LOOP INSERT ... RETURNING ctid INTO curtid; EXIT WHEN curtid > tid '(2, 0)'` never ends once the tid literal
+    parses, so the `tid` typed literal waits for this \(M0149\-0001h1a85\).
+  - Resume: the RETURNING projection of Insert/Update/Delete in internal/executor; system columns of the new tuple.
+  > \#\# ESCALATION 2026\-11\-19 \(S2\) — M0149\-0001h1a84: RETURNING ctid returns NULL
+  > The result differs from PG 18.3 for every INSERT. Found while testing typed literals in h1a71.
+- [x] **M0149-0001h1a85 — remaining typed literal forms** (filed 2026-11-19 by M0149-0001h1a71)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - User\-defined and unknown types \(`mood 'happy'`, `nosuchtype 'x'` → PG `type "nosuchtype" does not exist`\), `nchar`,
+    `national character` and `tid` are not folded; `schema.type 'x'` only for pg\_catalog.
+  - A general `IDENT Sconst` fold must not capture FDW option lists \(`OPTIONS (host 'x')`\); gram.y separates them by context.
+  - Resume: peekTypedLitForm in internal/parser/adapter.go; tid after M0149\-0001h1a84.
+  - 2026\-11\-23 \(landed\):
+    - `mood 'happy'` is a grammar rule \(IDENT SCONST, gram.y func\_name Sconst\); option lists are untouched and there
+      are still 60 conflicts.
+    - `schema.type 'x'` is folded by the lexer for any schema; `nchar 'x'` and `national character 'x'` are bpchar.
+    - An unknown type name raises 42704 at the type name, through analyzer.TypeNameExists \(the regtype resolver\).
+    - Goldens: 3 new statements; `nchar 'c'` flipped from rejected to accepted, which PG 18.3 accepts.
+    - The remaining `tid 'x'` and `'x'::nosuchtype` are split out as M0149\-0001h1a85a.
+    - Design: docs/design/0100\-0149/0149\-0001h1a71\-typed\-literals.md \(new section\).
+    Movement: none — regress runner same\-list A/B over 15 cases unchanged; probes match PG
+- [x] **M0149-0001h1a85a — `tid 'x'` and a cast to an unknown type** (filed 2026-11-23 by M0149-0001h1a85)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select 'x'::nosuchtype` returns `x`; PG raises 42704 `type "nosuchtype" does not exist` at the type name.
+    analyzer.TypeNameExists already checks typed literals; extend it to every CastExpr target. First confirm that
+    the regtype resolver knows every name goopg accepts as a cast target, including the SQL aliases.
+  - `tid '(0,1)'` is not folded; this waits for M0149\-0001h1a84.
+  - 2026\-11\-23 \(partial, still open\):
+    - The typed\-literal check \(h1a85\) refused types that the resolver cannot see; it is fixed for three cases.
+      - A type in a schema reached only through search\_path is accepted: the analyzer has no session, so an
+        unqualified user type of that name in any schema passes.
+      - Array spellings check their element type.
+      - `float` and `dec` are accepted as SQL aliases.
+    - `::` casts now record the type name's position \(`typePos`, stripped from the goldens like `pos`\).
+    - Checking every cast target was tried and reverted: the same\-list A/B regressed domain 400 → 404, copy2
+      249 → 253 and subselect 839 → 844, with false 42704 errors on valid casts.
+    - The resolver \(regtype input plus userTypeOIDForName\) misses:
+      - a domain over an array \(`create domain orderedpair as int[2] ...`; `array[1,2]::orderedpair` then
+        fails\);
+      - the information\_schema domains \(`'1'::information_schema.sql_identifier`\);
+      - whatever copy2 casts to, which is not yet diagnosed.
+    - Resume: make `'orderedpair'::regtype` and `'information_schema.sql_identifier'::regtype` resolve, and diagnose
+      copy2's delta in tmp/h1a78/rd15\-new/copy2.diff. Then widen the check in the analyzer's CastExpr arm \(drop
+      `x.IsTypedLiteral() &&`\) and repeat the 60\-case A/B.
+  - 2026\-11\-23 \(done\): every cast target is checked, and `'x'::nosuchtype` is 42704 at the type name.
+    - Array bounds parse in type names \(`int[2]`\); the Makefile conflict count is 61.
+    - The information\_schema domains resolve through regtype.
+    - The copy2 delta was the COPY FREEZE vistest block, not a cast.
+    - The 56\-case same\-list A/B \(tmp/h1a78/ab60.txt\) moved two cases. plpgsql went 1221 → 1213 \(flaky\).
+      multirangetypes went 1830 → 1834: `varbitmultirange` comes from rangetypes.sql, which is not in the list,
+      so the new error is PG's. With the type created, the query matches PG.
+    - The `tid` literal moves to M0149\-0001h1a84; follow\-ups are in M0149\-0001h1a85b.
+- [ ] **M0149-0001h1a85b — casts to information_schema domains and the `int[][]` column name** (filed 2026-11-23 by M0149-0001h1a85a)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Casts to the information\_schema domains evaluate as text.
+    - PG: `pg_typeof('1'::information_schema.cardinal_number)` is cardinal\_number, and the value is right\-aligned
+      as an integer.
+    - goopg: text.
+  - `select '{{1}}'::int[][]` names its column `int[]`; PG names it `int4` \(FigureColname takes the last name
+    component\). A single `[]` is already right.
+  - Resume: the CastExpr evaluator's domain lookup \(information\_schema OIDs are in
+    internal/catalog/information\_schema\_types.go\); systemTypeColname in internal/parser/figurecolname.go.
+  - 2026\-11\-23 \(partial, still open\):
+    - The `int[][]` column name is fixed. The label came from the planner's castTargetLabel, which stripped one `[]`;
+      the parser's systemTypeColname was already right.
+    - Still open: casts to the information\_schema domains.
+      - PG evaluates them as domains: the base type's input plus the CHECK. `'-1'::cardinal_number` and
+        `'maybe'::yes_or_no` fail the check; time\_stamp is timestamptz.
+      - goopg has no built\-in domain objects. User domains live in catalog.Domain, and the cast evaluator looks
+        them up by name \(expr.go LookupDomain, domainCastWithTypmod\).
+      - Resume: register the five domains \(base types and CHECKs from information\_schema.sql\) where both the
+        cast evaluator and exprType see them. Keep them out of the user\-domain pg\_type/pg\_dump output: they
+        already have bootstrap pg\_type rows.
+- [ ] **M0149-0001h1a86 — remaining range type behaviour** (filed 2026-11-19 by M0149-0001h1a72)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `numrange(1.50, 2) = numrange(1.5, 2)` is false; PG compares bounds with the subtype \(range\_eq\).
+  - `order by` over a range column sorts the text: `[1,20)` after `[1,3)`; PG sorts by range\_cmp.
+  - isempty, lower\_inc, upper\_inf, range\_merge and the rest of the range functions do not exist.
+  - Operators over user\-defined range types and multiranges are not resolved.
+  - Resume: range\_ops.go in internal/executor; the sort comparator for range types; rangeOpCall for catalog range types.
+- [ ] **M0149-0001h1a87 — money locale gaps outside casts and output** (filed 2026-11-19 by M0149-0001h1a73)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - COPY text input and output and array input of money use the C locale; PG uses cash\_in and cash\_out under lc\_monetary.
+  - `money::numeric` divides by 100 whatever frac\_digits is \(cash\_numeric uses the locale's scale\).
+  - Locale strings in a codeset other than the database encoding are not converted \(PGLC\_localeconv's db\_encoding\_convert\),
+    and PG's warning for an undeterminable codeset is not raised.
+  - `select -1234.56::money` returns a value; PG applies the cast first and raises `operator does not exist: - money`.
+  - Resume: datumToCopyText and copyTextToDatum need the session's lc\_monetary; the money to numeric cast; doNegate in the parser.
+- [ ] **M0149-0001h1a88 — to\_json and remaining EXPLAIN spellings** (filed 2026-11-19 by M0149-0001h1a74)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select to_json('10:00'::time)` raises `function to_json does not exist`; PG returns `"10:00:00"` \(to\_json, json.c\).
+  - `explain (verbose) select '10:00'::time + i from (values ('1 hour'::interval)) v(i)` prints `Output: i`; PG pulls the
+    VALUES up and prints the folded constant. `CURRENT_DATE` deparses as `current_date()`.
+  - `select '1 day' * 2` raises `operator * requires integer operands`; PG reads the literal as an integer and raises
+    `invalid input syntax for type integer`.
+  - Resume: the json function table in internal/executor; VALUES pull\-up in the planner; the SQLValueFunction deparse.
+- [ ] **M0149-0001h1a89 — IntervalStyle is ignored** (filed 2026-11-20 by M0149-0001h1a76)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `set intervalstyle = postgres_verbose; select '05:30:00'::interval` prints `05:30:00`; PG prints `@ 5 hours 30 mins`.
+    sql\_standard and iso\_8601 are ignored too. pg\_regress and goopg's regress runner set postgres\_verbose, so every
+    interval in the regress output follows the wrong style.
+  - The timezone views pre\-render utc\_offset in postgres\_verbose to keep sysviews passing; once this lands they should
+    emit interval values.
+  - Resume: EncodeInterval's four styles in internal/utils/adt/datetime/interval\_format.go, read from the session in the
+    wire output and the text casts.
+- [ ] **M0149-0001h1a52 — btree indexes on timestamp and date arrays fail to build** (filed 2026-11-18 by M0149-0001h1a48c)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `create table a(x timestamp[]); insert ...; create index on a(x)` raises `column "x" is not a timestamp at runtime`;
+    `date[]` raises the matching error. PG builds both with array\_ops.
+  - Resume: the scalar arms of the key encoder in operators\_ddl.go are reached for array columns; compare btree\_array\_key.go.
+- [ ] **M0149-0001h1a50 — hash partitioning on date, timestamp and other non\-int4, non\-text keys does not use PG's hash** (filed 2026-11-18 by M0149-0001h1a48b)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - computeHashPartitionRowHash hashes the low 32 bits of a value for every type it does not list. PG calls the type's
+    extended hash function \(hashint8extended for timestamp, hashint4extended for date, and so on\), so a row lands in
+    a different partition from PG's, which breaks physical compatibility.
+  - Changing it moves rows between partitions, so a cluster with such tables needs a rewrite or a compatibility rule.
+  - Resume: internal/executor/hash\_partition.go, then satisfies\_hash\_partition and partition pruning.
+- [ ] **M0149-0001h1a49 — WRONG RESULTS: `AT TIME ZONE '+05'` on timetz uses the opposite sign** (filed 2026-11-18 by M0149-0001h1a48; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select '10:00+01'::timetz at time zone '+05'` returns `14:00:00+05`; PG 18.3 returns `04:00:00\-05`, because a
+    POSIX zone string counts hours west of Greenwich.
+  - Resume: parseTimezoneOffsetString's callers in the timezone\(\) arm of expr.go; compare the timestamptz path.
+  > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a49: `AT TIME ZONE` with a numeric zone string gives a different time
+  > The result differs from PG 18.3. Found while checking the timetz arithmetic in h1a48a.
+- [ ] **M0149-0001h1a46 — WRONG RESULTS: array elements and CREATE TABLE AS columns ignore their typmod** (filed 2026-11-18 by M0149-0001h1a39; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `create table t(a varchar(5)[]); insert into t values ('{123456}')` succeeds; PG raises value too long. A
+    `d5[]` column behaves the same.
+  - `create table c as select 'abc'::varchar(5) a, 1.26::numeric(4,1) b`, then inserting `'123456'` into a and
+    1.26 into b: goopg accepts and stores them unchanged; PG raises and rounds to 1.3.
+  - Resume: encodeArrayValuePGCtx for element typmods; execCreateTableAs for the column Args.
+  > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a46: declared lengths are not enforced for arrays and CREATE TABLE AS
+  > Over\-long values are stored. Found while testing domain typmods.
+- [ ] **M0149-0001h1a47 — remaining domain differences from PG 18.3** (filed 2026-11-18 by M0149-0001h1a39)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - A cast to a domain over time or timestamp prints as a timestamp with six fractional digits
+    \(`'00:00:01.26'::dtm` is `1970-01-01 00:00:01.300000`, PG `00:00:01.3`\): the output formatter sees the domain
+    name, not the base type.
+  - `length('a'::dc)` for a `char(3)` domain is 3; PG returns 1.
+  - On INSERT the domain's CHECK runs before the typmod, so an over\-long value reports the check; PG reports
+    value too long.
+  - `format_type(oid, typtypmod)` of a domain prints `dn`; PG prints `dn(262149)`.
+  - Resume: exprType for casts to domains needs the catalog; operators\_fk.go's domain check runs before encoding.
+- [ ] **M0149-0001h1a40 — RowDescription sends table OID 0 and column 0 for every field** (filed 2026-11-18 by M0149-0001h1a38)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG sends resorigtbl and resorigcol for a column that is a plain reference to a table column
+    \(printtup.c; set by markTargetListOrigins, parse\_target.c\). libpq exposes them as PQftable and PQftablecol.
+  - Resume: record the origin on optimizer.SchemaColumn where the target list is built, carry it through
+    subqueries and views as markTargetListOrigin does, and fill FieldDescription in wireFieldDescription.
+- [ ] **M0149-0001h1a41 — result types and labels that still differ from PG 18.3** (filed 2026-11-18 by M0149-0001h1a38)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Types: `select wt from wt` is record \(PG: the rowtype\); a `wdom[]` column is `integer[]`; `current_user`
+    and `current_schema()` are text \(name\); `generate_series(1,1)` is bigint \(integer\); `abs(numeric)` is
+    bigint; `max(varchar)` and `nullif(varchar, ...)` are varchar \(text\); `now()` is M0146\-0163.
+  - Catalog stubs: pg\_proc.proname and provolatile are text, pg\_attribute.attoptions, attfdwoptions and
+    attmissingval are text; other catalogs have similar gaps.
+  - Typmod: UNION with differing branch typmods keeps the left one \(PG \-1\); `array[vc]` and `array[nu]` drop
+    the element typmod \(PG keeps it\).
+  - Labels: `case when true then vc end` is named vc \(PG case\); `vc collate "C"` is `?column?` \(PG vc\).
+  - `order by` and `distinct` on a void column succeed; PG raises 42883.
+  - Resume: optimizer exprType and targetMeta \(compare parser.figureColnameInternal\); the catalog stub schemas.
+- [ ] **M0149-0001h1a42 — `trim(x)` without a keyword is a syntax error** (filed 2026-11-18 by M0149-0001h1a38)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select trim('a')` and `select trim(ch) from t` fail with `syntax error at or near ")"`; `trim(both from 'a')`
+    works. PG accepts both \(gram.y func\_expr\_common\_subexpr, trim\_list\) and maps the first to btrim.
+  - Read docs/design/not\_ralph/06\-goyacc\-parser\-playbook.md before changing the grammar.
+- [ ] **M0149-0001h1a43 — WRONG RESULTS: timestamp plus or minus an interval: a cast operand is rejected and the result prints `.000000`** (filed 2026-11-18 by M0149-0001h1a38; S2)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - On a timestamp column: `ts + '1 s'::interval` and `ts - '1 s'::interval` fail with `operator + requires numeric
+    operands`; PG returns the timestamp.
+  - `ts + interval '1 s'` returns `2020-01-01 00:00:01.000000`; PG prints `2020-01-01 00:00:01`.
+  - Resume: the analyzer's BinaryOp operand check for a CastExpr to interval, and the result's output formatter.
+  - `date\_trunc('hour', ts)` also prints `.000000`, so the formatter problem is wider than interval arithmetic: the result column's type is not timestamp there.
+  > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a43: timestamp arithmetic prints a different value text
+  > Valid queries fail, and a result row differs from PG's output.
+- [ ] **M0149-0001h1a44 — regress polymorphism and plpgsql vary between runs on one build: `column "x" does not exist`** (filed 2026-11-18 by M0149-0001h1a38)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - `select x, pg_typeof(x), y, pg_typeof(y) from polyf(11, array[1, 2], 42, 34.5)`, where polyf has polymorphic
+    OUT parameters, sometimes fails. Four isolated runs of polymorphism on HEAD gave 683, 683, 683 and 677.
+  - Resume: reproduce in a loop and look for map iteration in the resolution of a function's OUT columns.
+- [x] **M0149-0001h1a12 — `'name'::regrole` returned the text unresolved; to\_regrole and the other to\_reg\* functions did not exist; `col::a::b` was labelled with the type name** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG:
+    - regproc.c regrolein and to\_regclass / to\_regtype / to\_regrole /
+      to\_regcollation / to\_regproc / to\_regprocedure, which use a soft
+      error context: NULL for a missing object and \(PG 16\+\) for bad
+      syntax;
+    - parse\_target.c FigureColnameInternal T\_TypeCast: an argument's
+      column or function name survives the cast chain.
+  - Landed:
+    - the CastExpr evaluator routes string → regrole through
+      regIdentifierInput \(42704 / 42602 / '\-' / numeric OID\);
+    - the to\_reg\* family in evalFuncCall, with result types in exprType;
+    - targetMeta looks through nested casts for a named base.
+  - Tests: TestRegroleInput, TestCastChainColumnName.
+  - Regress A/B vs HEAD over 29 cases: privileges 576→553, regproc
+    288→197, update 274→267, constraints 17→16, insert 254→253 \(inventory
+    updated\); the other 24 unchanged.
+  Movement: regress privileges 576→553, regproc 288→197, update 274→267, constraints 17→16, insert 254→253
+- [x] **M0149-0001h1a13 — `'pg_catalog'::regnamespace`, the reg\* function-call forms, to\_regtypemod / to\_regnamespace, and builtin names in regprocin / regprocedurein** \(filed 2026-11-17 by M0149-0001h1a12, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG:
+    - regproc.c regnamespacein, regprocin \(42725 when the name is not
+      unique\), regprocedurein \(exact signature\) and regcollationin;
+    - to\_regtypemod and to\_regnamespace; pg\_input\_is\_valid /
+      pg\_input\_error\_info over the reg types.
+  - Landed:
+    - reg\_identifier.go: a regnamespace arm \(3F000 / 42602\) and output;
+      regproc / regprocedure fall back to the full pg\_proc seed; a
+      pg\_catalog-qualified seeded collation resolves; a regtype input with
+      a typmod clause resolves the base type;
+    - the regproc / regprocedure cast shares regIdentifierInput with the
+      function form; regclass\(\) / regtype\(\) / regnamespace\(\) / regrole\(\)
+      / regcollation\(\) calls exist;
+    - to\_regtypemod and to\_regnamespace; soft-error arms for the reg types.
+  - Tests: TestRegnamespaceAndRegprocInput.
+  - Regress A/B vs HEAD over 13 cases: regproc 197→72, misc\_sanity 15→7
+    \(inventory updated\); type\_sanity and misc\_sanity now run queries that
+    errored before and show catalog-seed gaps \(ledger row\); the other 11
+    unchanged.
+  Movement: regress regproc 197→72, misc_sanity 15→7
+- [x] **M0149-0001h1a14 — regoper / regoperator inputs and to\_regoper / to\_regoperator over the full pg\_operator seed; regprocedurein syntax errors** \(filed 2026-11-17 by M0149-0001h1a13, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: regproc.c regoperin \(parseNumericOid, OpernameGetCandidates,
+    42883 / 42725\), regoperatorin \(parseNameAndArgTypes with NONE, 42P02
+    missing argument, 54023 too many arguments, OpernameGetOprid\),
+    regoperout / regoperatorout \(format\_operator\).
+  - Landed:
+    - catalog: name / OID indexes over PGOperatorAllEntries and
+      InMemory.UserOperatorsByName;
+    - executor regoper\_input.go: regoperIn / regoperatorIn /
+      regParseNameAndArgTypes / regoperOut / regoperatorOut, reached from
+      regIdentifierInput, the CastExpr arm \(its curated-table copy is
+      gone\), the regoper\(\) / regoperator\(\) / to\_regoper\(\) /
+      to\_regoperator\(\) forms, the soft-error arms and regOutShared;
+    - isRegIdentifierTypeName now includes regnamespace / regoper /
+      regoperator, so column coercion and COPY agree with the cast;
+    - regprocedurein reports parseNameAndArgTypes' 22P02 syntax errors.
+  - Tests: TestRegoperInputOutput; TestRegInputSyntaxErrors corrected to the
+    oracle's 22P02 for an unterminated quoted regprocedure name.
+  - Design: docs/design/0100-0149/m0149-0001h1a14-reg-type-input-port.md.
+  - Regress A/B vs HEAD over 14 cases: regproc 72→14 \(inventory
+    updated\); the other 13 unchanged \(psql table-size jitter only\).
+  Movement: regress regproc 72→14
+- [x] **M0149-0001h1a15 — pg\_type typmodin / typmodout / typanalyze \(and typcollation, record's typarray, time\_stamp's typdefault\) match a PG 18.3 initdb; user arrays carry array\_typanalyze / array\_subscript\_handler** \(filed 2026-11-17 by M0149-0001h1a13's type\_sanity exposure, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: genbki assigns array\_typanalyze and the element's typmod I/O to
+    every array type; typecmds.c DefineRange / DefineDomain / DefineEnum and
+    heap.c AddNewRelationType choose typanalyze / typsubscript per kind.
+  - Landed:
+    - scripts/gen-pg-type-support-procs.py →
+      internal/initdb/pg\_type\_support\_generated.go \(621 rows\); pgTypeRow
+      reads it — every pg\_type column for OID < 16384 now equals the
+      oracle;
+    - user array rows: typanalyze 3816, typsubscript 6179; range 3916,
+      multirange 4242; a domain copies its base's \(domainTypanalyze /
+      domainTypsubscript\).
+  - Tests: TestPgTypeRowSupportProcsMatchInitdb,
+    TestUserPGTypeRowSupportProcs; TestPgTypeRowCanonicalTypcollation
+    extended with the four newly collatable types.
+  - Design: docs/design/0100-0149/0106-0010-step3da-pg-type-io-regproc-oids.md
+    \(follow-up section\).
+  - Regress A/B vs HEAD: type\_sanity 75→62 \(inventory 82→62\),
+    create\_type 115→112; domain, rangetypes, multirangetypes, enum,
+    oidjoins, arrays, opr\_sanity, misc\_sanity, psql, alter\_table,
+    regproc unchanged.
+  Movement: regress type_sanity 82→62, create_type 115→112
+- [x] **M0149-0001h1a16 — pg\_class.relam follows RELKIND\_HAS\_TABLE\_AM: TOAST rows carry heap, views / partitioned tables / composite / foreign rows InvalidOid** \(filed 2026-11-17 by M0149-0001h1a15's type\_sanity residue, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: pg\_class.h RELKIND\_HAS\_TABLE\_AM \(r, t, m\); heap\_create gives
+    every other relkind relam = InvalidOid unless an explicit ACCESS METHOD
+    is set on a partitioned table.
+  - Landed: the virtual pg\_class builder \(catalog\) and relamFor
+    \(executor heap rows\) share the rule; the virtual TOAST rows say 2.
+  - Tests: TestPgClassRelamFollowsRelkindHasTableAM; the pg\_amcheck and
+    pg\_dump testport families pass with TOAST rows now heap-verified.
+  - Regress A/B vs HEAD over 13 cases: type\_sanity 59→56 \(inventory
+    62→56\), create\_am 148→145; the other 11 unchanged \(psql: a view's
+    access-method column now blank, as in PG\).
+  Movement: regress type_sanity 62→56, create_am 148→145
+- [x] **M0149-0001h1a17 — `<oid>::regproc::oid` \(and every reg\* type\) returns the OID instead of oidin's 22P02 on the rendered name** \(found 2026-11-17 by the pg\_proc column-diff probe, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: pg\_cast reg\* → oid / int is binary-coercible \(castmethod 'b'\);
+    `prosupport::oid` on a '\-' regproc is 0.
+  - Landed: evalCastTyped resolves a reg\*-typed datum that the
+    `<oid>::reg*` arm already rendered as a name back through
+    regIdentifierInput before an oid / int4 / int8 cast.
+  - Tests: TestRegCastBackToOid.
+  - Regress A/B vs HEAD over 13 cases: no movement \(those cases fail
+    earlier; alter\_generic +1 is its known owner-order flake\).
+  Movement: none \(correctness: `0::regproc::oid` errored\)
+- [x] **M0149-0001h1a18 — serve the full pg\_proc \(3413 builtin rows\) instead of the 45-row curated list** \(filed 2026-11-17 by M0149-0001h1a17, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Finding: `select count\(\*\) from pg_proc` is 45 on goopg vs 3413 on
+    PG 18.3 \(oid < 16384\); `now` \(1299\) is absent, so every
+    opr\_sanity / type\_sanity / oidjoins / psql \\df query over builtins
+    diverges. Ledger row 2026-11-17 M0149-0001h1a "virtual pg\_proc gains
+    the 13 lo\_\* functions".
+  - Resume: internal/initdb/pg\_proc\_view.go registerPgProcView rowsFor —
+    render every pgProcInitialEntries / PGProcAllEntries row with the PG
+    column values \(capture a column diff vs a scratch PG initdb, as
+    M0149-0001h1a15 did for pg\_type\); then A/B opr\_sanity, type\_sanity,
+    oidjoins, psql, pg\_dump testport.
+  - Landed:
+    - scripts/gen-pg-proc-view-rows.py →
+      internal/initdb/pg\_proc\_view\_rows\_generated.go \(3413 rows in the
+      view's column order; NULL as catalog.VirtualNull\); rowsFor serves
+      them, then user routines; the curated builtinProcs stubs, the
+      catalog.BuiltinProcs\(\) block and the lo\_\* block are gone;
+    - a column-wise diff of the view vs the :5545 oracle is empty.
+  - Tests: the pg\_proc view tests now compare built-in rows with the
+    generated table and keep the user-routine expectations.
+  - Design: docs/design/0000-0049/0015-0002-pg-proc-catalog-and-routine-registry.md
+    \(follow-up\).
+  - Regress A/B vs HEAD over 23 cases: opr\_sanity 705→360 \(inventory
+    717→369\), type\_sanity 56→41, psql 739→608, plpgsql 1221→1208 \(flaky
+    case, inventory not updated\); polymorphism equal when run alone on
+    fresh servers \(683 both\); the rest unchanged.
+  Movement: regress opr_sanity 717→369, type_sanity 56→41, psql 739→608
+- [x] **M0149-0001h1a19 — the virtual pg\_operator serves all 799 pg\_operator.dat rows; regprocout qualifies an overloaded built-in name** \(filed 2026-11-17 by M0149-0001h1a18's catalog census, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: pg\_operator holds every built-in operator; oprcode / oprrest /
+    oprjoin are regproc; regprocout schema-qualifies a name regprocin would
+    not resolve uniquely.
+  - Landed: seedOperatorViewRows \(PGOperatorAllEntries\) leads the view;
+    the three function columns are regproc-typed; RegOut's regproc arm
+    qualifies an overloaded built-in. A column-wise diff of pg\_operator and
+    of pg\_type's regproc columns vs the :5545 oracle is empty.
+  - Tests: TestPgOperatorViewServesSeed,
+    TestRegprocOutQualifiesOverloadedBuiltin; pgOperatorVirtualRows \(test
+    helper\) skips the seed rows.
+  - Design: docs/design/0100-0149/m0149-0001h1a19-builtin-catalog-views.md
+    \(new; lists the catalogs still empty\).
+  - Regress A/B vs HEAD over 18 cases: opr\_sanity 360→306 \(inventory
+    369→315\), psql 608→601, alter\_operator 55→47; the other 15 unchanged.
+  Movement: regress opr_sanity 369→315, psql 608→601, alter_operator 55→47
+- [x] **M0149-0001h1a20 — serve the built-in rows of pg\_amop / pg\_amproc / pg\_opclass / pg\_opfamily / pg\_cast \(all empty on goopg\)** \(filed 2026-11-17 by M0149-0001h1a19, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Finding: goopg 0 rows each vs PG 945 / 714 / 177 / 146 / 235; the
+    remaining opr\_sanity lines are mostly these cross-checks. Full list in
+    the h1a19 design doc.
+  - Resume: internal/catalog/catalog.go pg\_amop / pg\_amproc / pg\_opclass
+    / pg\_opfamily / pg\_cast VirtualRows — lead with initdb-captured rows
+    \(the gen-pg-proc-view-rows.py pattern, or the initdb seed tables
+    pg\_amop\_oids\_generated.go et al.\); column-diff vs :5545; A/B
+    opr\_sanity, alter\_generic, create\_operator, pg\_dump testport.
+  - Landed: scripts/gen-pg-catalog-seed-rows.py →
+    internal/catalog/pg\_catalog\_seed\_rows\_generated.go; each view leads
+    with its seed rows; pg\_opclass's range-subtype special case is
+    subsumed. Column-wise diffs of all five vs :5545 are empty.
+  - Tests: TestBuiltinCatalogViewsServeSeed; the executor test helpers
+    skip the seed via catalog.SeedPg\*RowCount\(\).
+  - Design: m0149-0001h1a19-builtin-catalog-views.md updated.
+  - Regress A/B vs HEAD over 18 cases: opr\_sanity 313→155 \(inventory
+    315→155\), psql 601→511; the other 16 unchanged.
+  Movement: regress opr_sanity 315→155, psql 601→511
+- [x] **M0149-0001h1a21 — format\_type / regtypeout render many built-in types as ??? or a bare OID \(jsonb, anyrange, anyelement, int4range\)** \(filed 2026-11-17 by M0149-0001h1a20, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Finding: psql \\dAo prints `@>\(3802,3802\)` for `@>\(jsonb,jsonb\)`,
+    \\dAc prints `???` for anyrange; formatTypeOID is a hand list and
+    RegtypeName misses most built-ins.
+  - Resume: make the pg\_type seed \(internal/initdb pgTypeInitialEntries /
+    pg\_type\_seed\_data.go\) reachable from the executor \(move the
+    name/category table to the catalog package\) and port
+    format\_type\_extended \(utils/adt/format\_type.c\) over it, sharing
+    it with regtypeout; A/B psql, opr\_sanity, type\_sanity.
+  - Landed: gen-pg-catalog-seed-rows.py also captures format\_type\(oid,
+    NULL\) for the 473 pg\_catalog types \(builtinFormatTypeNames\);
+    catalog.BuiltinFormatTypeName is oidToBuiltinTypeName's first lookup
+    \(every ::regtype path\) and formatTypeOID's untypmodded fallback.
+    `oid::regtype` and `format_type\(oid, NULL\)` now equal the oracle for
+    all 473.
+  - Tests: TestBuiltinTypeNamesFollowFormatTypeBe.
+  - Regress A/B vs HEAD over 19 cases: psql 510→504 \(inventory 511→505\),
+    opr\_sanity 149→137 \(inventory 155→146\), polymorphism 683→677
+    \(inventory 683→680\); 16 unchanged.
+  Movement: regress psql 511→505, opr_sanity 155→146, polymorphism 683→680
+- [x] **M0149-0001h1a22 — pg\_conversion / pg\_range serve their built-in rows; oidvector / int2vector subscripts are 0-based OIDs; regtypein resolves every built-in name** \(filed 2026-11-18 by M0149-0001h1a21's next-step list, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: pg\_conversion \(128 rows\) and pg\_range \(6\) at initdb;
+    oidvector is a 0-based array of oid \(int2vector of int2\); regtypein
+    resolves any visible type name.
+  - Landed:
+    - gen-pg-catalog-seed-rows.py gains pg\_conversion and pg\_range \(KEY
+      map for pg\_range's rngtypid\); PGConversionRowsForDBOid and the
+      pg\_range view lead with the seed; column-wise diffs vs :5545 empty;
+    - the array\_subscript element type for an oidvector / int2vector base
+      is oid / int2 \(planner\), and the executor splits the
+      space-separated value 0-based — `proargtypes[0]` was the first
+      CHARACTER;
+    - regIdentifierInput's regtype arm falls back to
+      catalog.BuiltinTypeOIDByFormatName \(`'cstring'::regtype` was 42704\).
+  - Tests: TestOidvectorSubscriptIsZeroBasedOid,
+    TestRegtypeInputResolvesEveryBuiltin; the catalog conversion tests skip
+    the seed rows.
+  - Design: m0149-0001h1a19-builtin-catalog-views.md updated.
+  - Regress A/B vs HEAD: opr\_sanity 146→112, type\_sanity 41→20, psql
+    505→493 \(inventory updated\); conversion, rangetypes,
+    multirangetypes, oidjoins, alter\_generic, create\_type, misc\_sanity,
+    dependency, object\_address, create\_index, indexing unchanged.
+  Movement: regress opr_sanity 146→112, type_sanity 41→20, psql 505→493
+- [x] **M0149-0001h1a23 — pg\_get\_function\_result / \_arguments / \_identity\_arguments return PG's text for built-in functions \(psql \\df showed blank types\)** \(filed 2026-11-18 by M0149-0001h1a22's ledger row, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: ruleutils.c pg\_get\_function\_result / print\_function\_arguments
+    over every pg\_proc row.
+  - Landed: gen-pg-catalog-seed-rows.py captures the three texts for all
+    3413 built-ins \(builtinFunctionSignatures\);
+    catalog.LookupBuiltinFunctionSignature backs the three executor arms
+    after the user-routine lookup; NULL result for a procedure. A
+    column-wise diff vs :5545 is empty.
+  - Tests: TestBuiltinFunctionSignatureTexts.
+  - Regress A/B vs HEAD over 14 cases: psql 493→399 \(inventory
+    updated\); polymorphism ±1 is its known OUT-parameter variance; the
+    other 12 unchanged.
+  Movement: regress psql 493→399
+- [x] **M0149-0001h1a24 — pg\_get\_functiondef for built-in functions \(psql \\sf\); LANGUAGE internal validates the C symbol \(prosrc\), not the proname** \(filed 2026-11-18 by ranking psql's remaining hunks, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: ruleutils.c pg\_get\_functiondef; fmgr.c fmgr\_internal\_function
+    looks the AS clause up among the built-in C symbols.
+  - Landed: the seed generator captures pg\_get\_functiondef for every
+    non-aggregate built-in and the LANGUAGE internal prosrc set; the
+    executor arm falls back to the former, execCreateFunction validates
+    against the latter \(`AS 'dsin'` was rejected\). pg\_get\_functiondef
+    column-diff vs :5545 is empty.
+  - Finding \(filed as M0149-0001h1a25, S2\): ROLLBACK does not undo
+    CREATE FUNCTION.
+  - Tests: TestInternalFunctionSymbolsAndBuiltinDefs.
+  - Regress A/B vs HEAD over 11 cases: psql 399→361, misc\_functions
+    244→236 \(inventory 279→236\); opr\_sanity +3 in the shared-database
+    run only \(psql's rolled-back functions now leak into it — h1a25\);
+    the rest unchanged.
+  Movement: regress psql 399→361, misc_functions 279→236
+- [ ] **M0149-0001h1a25 — ROLLBACK does not undo CREATE FUNCTION: the routine stays in pg\_proc and callable** \(filed 2026-11-18 by M0149-0001h1a24; S2 — a rolled-back DDL persists\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - **ESCALATION 2026-11-18 \(S2\).** `BEGIN; CREATE FUNCTION f\(\) ...;
+    ROLLBACK;` leaves f in pg\_proc on HEAD and on this build \(probed on
+    :5533 / :5534\). In PG the pg\_proc insert is transactional. Effect:
+    catalog state diverges from what committed; regress cases leak
+    routines into later cases \(psql.sql's psql\_df\_\* reached
+    opr\_sanity\). Awaiting owner placement.
+  - Resume: the routine registry \(catalog.Routines Create\) needs the
+    RecordCatalogUndo treatment pg\_default\_acl got in M0149-0001h1a6 —
+    undo the registration and the pg\_proc heap row on abort.
+  - 2026-11-18 \(h1a29\): CREATE SCHEMA inside a rolled-back transaction
+    also persists — the same class; scope the fix to transactional DDL in
+    general.
+- [x] **M0149-0001h1a26 — pg\_class.relowner is the creating role \(SET ROLE counts\); an index on a partitioned table is relkind 'I' from creation** \(filed 2026-11-18 by ranking psql's \\dP hunks, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: heap\_create\_with\_catalog's ownerId = GetUserId\(\);
+    index\_create gives an index on a partitioned table
+    RELKIND\_PARTITIONED\_INDEX \(no storage\).
+  - Landed:
+    - the virtual pg\_class and the executor heap row render relowner from
+      Table.Owner \(set from the effective role at CREATE TABLE, and by ALTER
+      ... OWNER TO\); pg\_tables.tableowner likewise. Both used the
+      hardcoded 10. catalog.roleOIDLocked avoids a nested RLock;
+    - catalog.IndexRelkind: 'I' when the index's table is partitioned \(was:
+      only once partition children existed\); both builders use it, with
+      relfilenode 0.
+  - Findings, filed:
+    - S2 M0149-0001h1a27: INSERT ... VALUES \(srf\(\)\) inserts one row;
+    - ledger: PARTITION OF ... PARTITION BY leaves the child relkind 'r';
+      policy deparse prints Go pointers.
+  - Tests: TestPgClassOwnerAndPartitionedIndexRelkind.
+  - Regress A/B vs HEAD over 16 cases: psql 360→336 \(inventory
+    361→339\), indexing 309→299, dependency 27→26; the rest unchanged
+    \(alter\_generic ±1 flake\).
+  Movement: regress psql 361→339, indexing 309→299, dependency 27→26
+- [ ] **M0149-0001h1a27 — INSERT ... VALUES \(generate\_series\(1,5\)\) inserts ONE row \(PG: five\)** \(filed 2026-11-18 by M0149-0001h1a26; S2 — silent data loss\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - **ESCALATION 2026-11-18 \(S2\).** A set-returning function in a VALUES
+    row is evaluated as a scalar. `insert into t values
+    \(generate_series\(1,5\)\)` reports INSERT 0 1 and stores 1. PG 18.3
+    \(:5545\) reports INSERT 0 5. INSERT ... SELECT generate\_series\(1,5\)
+    is correct. It affects every regress case that seeds a table this way
+    \(psql.sql's parent\_tab\). Awaiting owner placement.
+  - Resume: the planner's VALUES → Result path must expand target-list SRFs
+    the way a SELECT target list does \(ProjectSet; PG's
+    transformValuesClause keeps the SRF, and the planner adds a ProjectSet
+    above the Values scan\).
+- [x] **M0149-0001h1a28 — a sub-partitioned partition \(PARTITION OF ... PARTITION BY\) is relkind 'p'; an index's relowner is its table's owner** \(filed 2026-11-18 by M0149-0001h1a26's ledger row, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: heap\_create\_with\_catalog gives any table with a PARTITION BY
+    RELKIND\_PARTITIONED\_TABLE, partition or not; index\_create's
+    relowner is the heap's.
+  - Landed:
+    - catalog.TableRelkind drops its `PartitionParentOID == 0` guard;
+      PartitionMethod is only set from the table's own PARTITION BY, and
+      the executor sibling already treated it so;
+    - InMemory.IndexRelkind follows the package rule \('I' on a
+      partitioned table\);
+    - index relowner = the table owner in both builders \(indexOwnerOID /
+      idxOwner\).
+  - Tests: TestPgClassOwnerAndPartitionedIndexRelkind \(sub / leaf
+    relkind\).
+  - Regress A/B vs HEAD over 14 cases: psql 339→324, create\_table
+    122→119, indexing 299→282, insert 253→249 \(inventory updated\); the
+    other 10 unchanged.
+  Movement: regress psql 339→324, create_table 122→119, indexing 299→282, insert 253→249
+- [x] **M0149-0001h1a29 — index partitions are linked \(pg\_inherits, relispartition\) on PARTITION OF and ATTACH; an ATTACHed table is relispartition** \(filed 2026-11-18 by M0149-0001h1a28's ledger row, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: DefineIndex / IndexSetParentIndex record the clone as a partition
+    of the parent index; AttachPartitionEnsureIndexes attaches a matching
+    child index \(CompareIndexInfo\) or builds a clone, for every parent
+    index; pg\_inherits and relispartition cover attached partitions.
+  - Landed:
+    - the non-unique index clone at CREATE TABLE ... PARTITION OF records
+      PartitionParentOID and registers the child;
+    - ATTACH links a matching child index \(attachIndexMatches\) for every
+      btree parent index, and clones the non-unique ones \(was:
+      unique / primary only, and a match was skipped unlinked\);
+    - pg\_inherits and table relispartition read the live partition
+      registry \(partitionParentsLocked / PartitionParentOf\), because
+      ATTACH leaves PartitionParentOID 0; index relispartition from
+      PartitionParentOID, in both pg\_class builders.
+  - Findings, filed:
+    - h1a25 class: CREATE SCHEMA also survives ROLLBACK;
+    - ledger: ATTACH and `'x'::regclass` resolve unqualified names without
+      the session search\_path \(ATTACH then silently does nothing\);
+      an ATTACH inside BEGIN is not visible to its own session until
+      COMMIT; conparentid of cloned FKs \(foreign\_key +2\).
+  - Tests: TestIndexPartitionsAreLinked; partition isolation specs
+    \(concurrent attach, detach 1-4, fk-partitioned 1-2, key-update\) pass.
+  - Regress A/B vs HEAD over 14 cases: psql 324→306, indexing 282→241,
+    alter\_table 726→720, tablespace 172→171; foreign\_key 801→803 \(a \\d
+    FK listing now takes the partition branch and exposes the conparentid
+    gap\); the rest unchanged. Inventory updated.
+  Movement: regress psql 324→306, indexing 282→241, alter_table 732→718, tablespace 177→171, foreign_key 801→803
+- [x] **M0149-0001h1a30 — unqualified ATTACH PARTITION children and '\<name\>'::regclass resolve through the session search\_path; a missing ATTACH child is 42P01; partition pg\_inherits rows carry inhseqno 1** \(filed 2026-11-18 by M0149-0001h1a29's ledger row, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: RangeVarGetRelid walks the search\_path for any unqualified
+    relation \(table or index\); a partition's single parent gets inhseqno 1.
+  - Landed:
+    - lookupTableOnSearchPath \(executor\): the planner's
+      catalog.SearchPathCatalog over the session search\_path;
+    - the regclass input arm and both ATTACH child lookups use it; the
+      regclass index fallback walks the path too;
+    - ATTACH of a missing child raises 42P01 \(was `break` — a silent
+      no-op, which is how search\_path misses went unnoticed\);
+    - pg\_inherits partition / index-partition rows: inhseqno 1 \(was a
+      per-parent counter\).
+  - Tests: TestAttachAndRegclassFollowSearchPath; partition isolation
+    specs, pg\_dump / psql testport pass.
+  - Regress A/B vs HEAD over 19 cases: alter\_table 720→719 \(inventory
+    718→717\); the rest unchanged \(indexing / foreign\_key now report
+    42P01 for children an earlier failure never created — same count\).
+  Movement: regress alter_table 718→717
+- [x] **M0149-0001h1a31 — pg\_partition\_tree / pg\_partition\_ancestors / pg\_partition\_root walk OIDs; regclassout qualifies by the relation's own schema visibility** \(filed 2026-11-18 by M0149-0001h1a30's ledger row, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: partfuncs.c takes a regclass and walks find\_all\_inheritors /
+    get\_partition\_ancestors by OID; regclassout qualifies unless
+    RelationIsVisible.
+  - Landed:
+    - operators\_pg\_partition\_tree.go rewritten OID-based: the argument
+      through regclassin \(search\_path\), parents from PartitionParentOID or
+      the live registry \(ATTACHed partitions\), detach-pending partitions
+      as one-node trees; pg\_partition\_root shares the walk and renders via
+      regclassout;
+    - regclassOIDToName \(the `<oid>::regclass` cast\) delegates to the
+      shared regOutShared renderer with per-object visibility — it returned
+      bare names and was a divergent sibling; the reg\* → text cast uses the
+      same per-object rule. A context with no GUC hook keeps the old
+      unqualified output.
+  - Tests: TestPartitionTreeByOIDAcrossSchemas; partition isolation specs
+    \(detach-concurrently-3 caught a first-cut regression on detach-pending
+    roots\), pg\_dump / psql / pg\_amcheck testport pass.
+  - Regress A/B vs HEAD over 22 cases: foreign\_key 803→796 \(inventory
+    updated\); the rest unchanged. stats\_ext now qualifies a stats object's
+    table in a \\dX whose search\_path excludes it — correct, but the row
+    should not be listed at all \(pg\_\*\_is\_visible are constant true,
+    ledgered\).
+  Movement: regress foreign_key 803→796
+- [x] **M0149-0001h1a32 — pg\_table / type / function / statistics\_obj\_is\_visible follow search\_path; regproc, regprocedure and regtype input resolve through it** \(filed 2026-11-18 by M0149-0001h1a31's ledger row, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: namespace.c RelationIsVisible / TypeIsVisible / FunctionIsVisible /
+    StatisticsObjIsVisible \(NULL for a missing OID; an earlier schema's
+    same\-named object hides a later one\); regprocin / regprocedurein /
+    regtypein resolve a bare name through the path \(FuncnameGetCandidates,
+    TypenameGetTypid\).
+  - goopg before: every pg\_\*\_is\_visible returned true; regproc and
+    regprocedure took the first same\-named routine in ANY schema and
+    ignored the argument list; regtype resolved a user type in any schema;
+    SELECT / COPY qualified every reg name once public was off the path.
+  - Landed:
+    - pg\_is\_visible.go: the four \*IsVisibleExt functions, by round\-trip of
+      the bare spelling through the reg\* input functions \(statistics
+      objects walk the path\);
+    - resolveUserRoutineOnPath \(schema order, argument match for
+      regprocedure, 42725 for an ambiguous regproc\); userTypeOnPath;
+    - builtin regprocedure matches the exact signature first
+      \(builtinProcByArgs; catalog.BuiltinProcOIDsByName and
+      BuiltinTypnameOID\): the name\-only shortcut sent
+      `'exp(double precision)'` to exp\(numeric\), which hid builtins from
+      psql's \\df;
+    - regtype input: multi\-word names, quoted keyword typnames \(`"char"`,
+      `"any"`\), `_elem` array typnames;
+    - output: RegOutVisible \(per\-object qualification\) on the SELECT and
+      COPY TO paths; builtin argument typnames render as format\_type
+      \(`aclitem[]`, `"any"`\).
+  - Found:
+    - TestRegCastToTextSiblingAgreeQualify cast a bare
+      `'f_varbit(varbit)'` under search\_path='', which PG 18.3 rejects
+      with 42883; the test now casts `public.f_varbit(varbit)`;
+    - CREATE STATISTICS accepts a duplicate column \(`ON a, a`\), which PG
+      rejects \(ledgered\).
+  - Probe \(tmp/vis.sql vs PG 18.3 on :5545\): identical except error cursor
+    positions, which also differ for regclass at HEAD \(ledgered\).
+  - Tests: TestObjectVisibilityFollowsSearchPath,
+    TestBuiltinFunctionsAreVisible \(all 3397 builtins visible\).
+  - Regress A/B vs HEAD over 24 cases: opr\_sanity 112→104 and stats\_ext
+    467→440 \(inventory updated\); alter\_generic 209→208 alone \(a
+    case\-order flake in the batch run\); the rest unchanged, psql 303 = 303.
+  Movement: regress opr_sanity 112→104, stats_ext 467→440
+- [x] **M0149-0001h1a33 — a reg value inside concat / concat\_ws / format / \|\| printed its OID, not its name** \(filed 2026-11-18 from M0149-0001h1a31's ledger row, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: concat\_internal and text\_format call each "any" argument's type
+    output function; `||` with a non-text operand is anytextcat /
+    textanycat. `format('%s', 'pt'::regclass)` is `pt`.
+  - goopg printed the OID \(Datum.Format of the KindInt\) in all four.
+  - Landed:
+    - regArgText: an argument whose static type \(ExprResultType\) is a
+      scalar reg type renders through the reg to text cast \(per\-object
+      qualification\), in concat, concat\_ws, format and the interpreted
+      `||`;
+    - the compiled twin sends a `||` with a reg operand to the adapter
+      \(payload\[16\] has no free bit\).
+  - Probe vs PG 18.3: identical for literals, per\-row `oid::regclass`
+    columns and search\_path changes. Remaining differences belong to other
+    gaps: a reg array prints OIDs \(ledgered\); `reltype::regtype` is `-`
+    because pg\_class.reltype is 0 \(filed M0149\-0001h1a34\).
+  - Test: TestRegArgsRenderAsNames.
+  - Regress A/B vs HEAD over 18 cases: no movement. plpgsql moved within
+    its known nondeterminism \(HEAD 1209–1220, new 1216–1221 over three
+    standalone runs; the extra lines are OUT\-parameter SRF expansion after
+    a DROP / CREATE FUNCTION, unrelated to reg values\).
+  Movement: probe format/concat/concat\_ws/\|\| reg rendering 0/9→9/9 vs PG 18.3
+- [x] **M0149-0001h1a34 — pg\_class.reltype is 0 for every relation; a user table has no composite row type in pg\_type** \(filed 2026-11-18 by M0149-0001h1a33\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: heap\_create\_with\_catalog → AddNewRelationType creates the
+    relation's composite type \(typtype 'c', typrelid = the relation\) and
+    its array type, and stores the type OID in pg\_class.reltype; views,
+    sequences, foreign and partitioned tables get one too, indexes and
+    TOAST tables do not \(reltype 0\).
+  - goopg: `select reltype from pg_class` is 0 for user tables and for
+    pg\_class itself, and `pg_type where typrelid = <table>` is empty for a
+    user table; `reltype::regtype` renders `-`.
+  - Resume: the pg\_class renderer and the user pg\_type rows
+    \(pg18\_user\_catalog\_rows.go\); check how ROW types of tables are typed
+    today \(composite type registry\) before allocating new OIDs.
+  - 2026-11-18 slice 1 \(landed\): reltype for system relations.
+    - catalog.SetBuiltinRelTypes / BuiltinRelType; initdb registers
+      pgClassRowtypeOIDs \(captured PG 18.3 rowtypes\) at package init; the
+      virtual pg\_class table arm and the hard\-coded pg\_class row read it.
+    - All 11 system relations goopg's pg\_class lists equal PG 18.3's
+      reltype \(pg\_type 71, pg\_attribute 75, pg\_class 83, pg\_largeobject
+      10025, pg\_largeobject\_metadata 10023, indexes 0\).
+    - Found: goopg's pg\_class lists only 11 system relations against PG's
+      415 \(filed M0149\-0001h1a35\).
+    - Test: TestBuiltinRelTypesRegistered.
+    - Next slice \(2\): user relations. Reserve OIDs as
+      heap\_create\_with\_catalog does \(relation N, array N\+1, rowtype N\+2,
+      except index / sequence / TOAST\), carry them on catalog.Table and
+      persist them with the pg\_class row, render the rowtype and array rows
+      in pg\_type, and resolve `'tbl'::regtype` / pg\_typeof\(row\) to them.
+      Check which tests pin consecutive user OIDs before changing the
+      allocator.
+    Movement: probe pg\_class.reltype for system relations 3/11→11/11 vs PG 18.3
+  - 2026-11-18 slice 2 \(landed\): user relations get PG's rowtype and array type.
+    - CreateTable / CreateView reserve relation N, array N\+1, rowtype N\+2
+      \(Table.RowTypeOID\); sequences use CreateSequenceRelation \(one OID\).
+    - syncTableToCatalogHeap writes the rowtype and `_name` array pg\_type
+      rows before the pg\_class row; deleteCatalogRowsForOID stamps them; the
+      reload restores RowTypeOID from reltype and advances the OID counter.
+    - `'tbl'::regtype`, `'tbl[]'::regtype`, regtypeout and format\_type resolve
+      relation rowtypes.
+    - Probe vs PG 18.3: reltype offset \(\+2\), typtype / typrelid / typarray /
+      typnamespace / typlen / typalign / record\_in, the array row, regtype both
+      ways, DROP removes both rows — identical; survives a restart without OID
+      reuse. Remaining OID differences come from TOAST and view rules \(h1a36\).
+    - Found and fixed an h1a32 regression: pg\_table\_is\_visible returned NULL
+      for a composite type's relation \(relkind 'c'\), so psql `\d <type>`
+      printed nothing; regress alter\_table went 717→775 at 6462c0800
+      \(bisected 617f1f80d / 38b9618ad = 717, 6462c0800 = 775\). Now 697.
+    - The h1a32 A/B left alter\_table out; the wide check over 20 more cases
+      found no other loss \(inherit / publication / opr\_sanity differences were
+      case\-order effects of a multi\-case run, identical to HEAD on the same
+      case list\).
+    - Tests: TestRelationRowtypeOIDReservation,
+      TestPort\_RelationRowtypeSurvivesRestart,
+      TestCompositeTypeRelationIsVisible; TestDropTableIfExistsMissingNoSideEffects
+      now expects the next table at OID \+3.
+    Movement: regress alter_table 717→697
+- [ ] **M0149-0001h1a37 — WRONG TYPE: schema\-qualified `pg_catalog."char"` resolves to character\(1\), not the one\-byte `"char"`** \(filed 2026-11-18 by M0149-0001h1a35; S2\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Repro on goopg vs PG 18.3:
+    - `pg_typeof('a'::pg_catalog."char")` is `character`; PG says `"char"`.
+      `pg_catalog.char` \(unquoted\) and `cast('a' as pg_catalog."char")` do
+      the same. `"pg_catalog"."char"` and bare `"char"` are right.
+    - `octet_length('é'::pg_catalog."char"::text)` is 2; PG returns 4.
+    - `create table t(c pg_catalog."char")` stores atttypid character with
+      atttypmod 5; PG stores `"char"` with \-1.
+    - The column label is also wrong: `bpchar`, PG `char`.
+  - Cause: parser/select.go synthesizeBareCharTypmod's two callers pass
+    `firstTok.Kind == TokenQuotedIdent`. For a qualified name the first token
+    is the schema, so the quoted type name counts as the bare CHAR keyword and
+    gets typmod 1.
+  - PG: gram.y maps only the keyword CHAR to SystemTypeName\("bpchar"\); any
+    qualified name goes through GenericType and looks up pg\_type.char.
+  - Resume: apply the synthesised typmod only to an unqualified, unquoted
+    name \(both callers, plus parseColumnType's sibling path for column
+    definitions\); then parser.figureColnameInternal's and the planner's
+    `"char"` tests cover the qualified form.
+  > \#\# ESCALATION 2026\-11\-18 \(S2\) — M0149\-0001h1a37: `pg_catalog."char"` is treated as character\(1\)
+  > Wrong type and wrong values for casts and for columns declared with the qualified name. Found while verifying h1a35's column\-label fix against PG 18.3. Owner placement requested \(below item 10 per the S7 carve\-out unless placed\).
+- [ ] **M0149-0001h1a36 — relation rowtype residue: RENAME / SET SCHEMA / OWNER leave the rowtype rows stale; TOAST relations and view rules take no OIDs; pg\_typeof\(whole row\) is text** \(filed 2026-11-18 by M0149-0001h1a34\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: RenameRelationInternal → RenameTypeInternal \(and the `_name` array
+    rename, makeArrayTypeName's collision rule `__name`\); AlterTableNamespace
+    / ATExecChangeOwner move the rowtype with the relation;
+    create\_toast\_table and DefineQueryRewrite allocate OIDs from the same
+    counter, so PG's user OIDs run rel, \_rel, rel type, toast, toast index.
+  - goopg: the rowtype rows keep the old name / namespace / owner \(regress
+    alter\_table's attmp\_array / \_\_attmp\_array lines\); TOAST relations use
+    synthetic OIDs \(\+100M\) and rules none, so a later user OID differs from
+    PG's; `pg_typeof(t)` for a whole\-row reference prints text.
+  - Resume: re\-write the rowtype rows in the rename / set\-schema / owner
+    paths \(deleteRelationRowtypeFromCatalogHeap \+ the two builders\); the
+    planner's whole\-row Var type.
+- [x] **M0149-0001h1a35 — the virtual pg\_class lists 11 system relations; PG 18.3 lists 415** \(filed 2026-11-18 by M0149-0001h1a34\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Probe: `select count(*) from pg_class where oid < 16384` is 11 on goopg
+    \(pg\_type, pg\_attribute, pg\_class, pg\_largeobject\[\_metadata\] and a
+    few indexes\), 415 on PG 18.3: pg\_namespace, pg\_proc, the other
+    catalogs, their indexes, TOAST tables and the system views are absent,
+    so psql `\dS`, `\dtS` and `pg_class` joins over system objects miss them.
+  - PG: genbki writes every catalog's pg\_class row; system\_views.sql and
+    information\_schema.sql add the views.
+  - Resume: catalog.go's virtual pg\_class renderer; the captured relation
+    list initdb already has \(pgBootstrapRelNameByOID, relcache\_init.go, the
+    system view OID pins\) as the row source.
+  - 2026-11-18 \(landed\): pg\_class lists all 415 system relations, identical to PG 18.3.
+    - gen\-pg\-catalog\-seed\-rows.py captures the 415 rows as seedPgClassRows
+      \(34 columns in PGClassRowsForDBOid's order\); the builder appends the
+      ones it did not produce and replaces its bootstrap facsimiles of the 11
+      live ones \(relhasindex, relisshared, index namespace and relnatts were
+      wrong\), keeping a live non\-empty relacl.
+    - Probe: a 17\-column diff of `pg_class where oid < 16384` vs the oracle
+      is empty \(415 = 415 rows\).
+    - Regress, same 24\-case list on HEAD and this build: psql 306→299,
+      misc\_sanity 7→2, privileges 553→543 \(inventory updated\); no case
+      worse. Five cases sit above their pins on both builds \(case\-order
+      effects of a multi\-case run\).
+    - Test: TestPGClassListsEverySystemRelation.
+    - Not covered \(ledgered\): pg\_attribute / pg\_index rows for most system
+      relations \(psql `\d pg_namespace` lists no columns\); the captured
+      relpages / reltuples / relfrozenxid are the initdb's.
+    - pg\_amcheck walks pg\_class, so it now reaches captured relations with
+      no goopg storage: verify\_heapam and bt\_index\_check report no findings
+      for them \(catalog.IsCapturedSystemRelation; ledgered, PG really checks
+      those relations\).
+    - The full TestPort\_ run exposed an older must\-pass failure, regress
+      `char`: a cast to quoted `"char"` was named `bpchar` \(same at HEAD\).
+      Fixed in both namers, parser.figureColnameInternal and the planner's
+      targetMeta; the schema\-qualified spelling is filed as h1a37.
+    - Re\-measured on the committed build: psql 299/6452, misc\_sanity 2/93,
+      privileges 543/3144, char PASS.
+    Movement: regress psql 306→299, misc_sanity 7→2, privileges 553→543
+- [x] **M0149-0001h1a11 — `'x'::uuid` returned 'x': the uuid input cast did no validation, and storage rejected forms PG accepts** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: uuid.c string\_to\_uuid. Braces are optional, and a hyphen may
+    follow any odd byte index except the last; the result is uuid\_out's
+    lowercase 8\-4\-4\-4\-12.
+  - goopg:
+    - evalCast had no uuid arm;
+    - isValidUUIDStr, uuidToBytes and normalizeUUIDStr each accepted only
+      the 32\-digit and canonical 36\-character forms. INSERT therefore
+      rejected `a0ee-bc99-…`, which PG accepts.
+
+    All of them now share parseUUIDText \(a string\_to\_uuid port\) and
+    formatUUID, and the cast raises 22P02 like uuid\_in.
+  - Test: TestParseUUIDTextPG.
+  - Regress A/B vs HEAD over 10 cases \(uuid, btree\_index, create\_index,
+    hash\_func, hash\_index, brin\_bloom, brin\_multi, gin, opr\_sanity,
+    type\_sanity\): no change. The rest of uuid's 21 lines are INSERT error
+    carets, EXPLAIN rendering of uuid constants without `::uuid`, and
+    uuidv7 timestamps.
+  Movement: none \(correctness: invalid uuid input rejected; PG\-accepted forms stored\)
+- [x] **M0149-0001h1a10 — CREATE / DROP ROLE with a doubled\-quote identifier: `"regress_""quoted"` registered the role `regress_`** \(filed 2026-11-17 by M0149-0001h1a9, fixed the same day\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: scan.l quoted identifiers, where `""` inside a quoted name is one
+    literal quote.
+  - goopg: postmaster role\_ddl.go extractFirstSQLIdent cut the name at the
+    first `"`. It now unescapes doubled quotes. This covers every compat
+    role statement that uses it \(CREATE / DROP / ALTER ROLE, USER and
+    GROUP\).
+  - Test: TestExtractFirstSQLIdentQuoted.
+  - Regress A/B vs HEAD: privileges 584→576 \(inventory updated\);
+    create\_role / roleattributes / password / dependency / psql unchanged.
+  Movement: regress privileges 584→576
+- [x] **M0149-0001h1a9 — makeaclitem\(\) did not exist and aclitem input did no validation: `'""=r*/""'::aclitem`, an unknown role and a bad mode letter were all accepted** \(filed and fixed 2026-11-17 by M0149-0001h1a\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: acl.c aclitemin / aclparse / getid / is\_safe\_acl\_char; makeaclitem
+    and convert\_any\_priv\_string.
+  - Landed: executor aclitem\_input.go:
+    - aclitemIn validates and canonicalises, and is wired into the
+      `::aclitem` cast, pg\_input\_is\_valid and pg\_input\_error\_info.
+      Its errors are 22P02 for a missing "/" name, a bad mode character,
+      garbage after the item or a bad key word, and 42704 for an unknown
+      role. It emits the "defaulting grantor to user ID 10" WARNING.
+    - evalMakeAclItem, with its privilege list \(22023 on an unknown
+      privilege\) and grant option.
+  - Found:
+    - `CREATE ROLE "regress_""quoted"` registers no findable role \(it is
+      missing from pg\_roles, and DROP ROLE fails\);
+    - `'name'::regrole` passes the text through without resolving it;
+    - the caret of a cast input error points at `::`, not at the literal.
+
+    All three are ledgered.
+  - Regress A/B vs HEAD: privileges 604→584 \(inventory updated\). One
+    line HEAD matched by echoing text \(the quoted\-role aclitem\) now
+    hits the quoted\-role gap. database / hash\_func / psql /
+    type\_sanity / opr\_sanity / largeobject unchanged.
+  Movement: regress privileges 604→584
+- [x] **M0149-0001h1a8 — SCHEMAS default ACLs never applied at CREATE SCHEMA; a schema and the next object minted shared one OID** \(filed and fixed 2026-11-17 by M0149-0001h1a\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: NamespaceCreate → get\_user\_default\_acl\(OBJECT\_SCHEMA, owner,
+    InvalidOid\) \(global entries only\). OIDs come from GetNewOid and are
+    unique per catalog.
+  - Found:
+    - catalog RegisterSchema \(and CreateTablespace\) pre\-incremented
+      nextOID, so nextOID kept naming the OID just used. The next object —
+      e.g. the first table created in the schema, or a pg\_default\_acl
+      entry — got the same OID and shared its entry in every OID\-keyed store
+      \(a GRANT USAGE ON SCHEMA materialised the table's relacl\).
+    - Both now mint with allocOIDLocked \(use, then advance\).
+  - Landed: executor.ApplySchemaDefaultACL, called by both CREATE SCHEMA
+    paths \(the executor and the postmaster compat\-noop one\).
+  - Tests: TestSchemaAndNextObjectGetDistinctOIDs; catalog / initdb /
+    postmaster / units PASS; the PG cold\-start / crash\-start, pg\_dump and
+    schema testport families PASS.
+  - Regress A/B vs HEAD over 12 cases: privileges 607→604 \(inventory
+    updated\); namespace / create\_schema / alter\_table / dependency /
+    rowsecurity / create\_view / alter\_generic / object\_address /
+    tablespace / psql / largeobject unchanged.
+  Movement: regress privileges 607→604
+- [x] **M0149-0001h1a7 — default ACLs were never applied when a relation was created: ALTER DEFAULT PRIVILEGES [IN SCHEMA] ... ON TABLES / SEQUENCES only rendered in pg\_default\_acl** \(filed and fixed 2026-11-17 by M0149-0001h1a\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: heap\_create\_with\_catalog → get\_user\_default\_acl \(aclchk.c\):
+    the global entry \(or acldefault\) aclmerge'd with the schema entry,
+    NULL when equal to acldefault. OBJECT\_SEQUENCE for sequences,
+    OBJECT\_TABLE for every other relkind.
+  - Landed: InMemory.ApplyDefaultACL plus applyRelationDefaultACL, called by
+    CREATE TABLE, CREATE VIEW \(TABLES default\) and CREATE SEQUENCE
+    \(SEQUENCES default\) before the heap sync writes relacl.
+  - Regress A/B vs HEAD over 7 cases: privileges 611→607 \(inventory
+    updated\); the rest unchanged.
+  Movement: regress privileges 611→607
+- [x] **M0149-0001h1a6 — ALTER DEFAULT PRIVILEGES ... ON LARGE OBJECTS was accepted and dropped; lo\_create never applied a default ACL; pg\_default\_acl changes did not roll back** \(filed and fixed 2026-11-17 by M0149-0001h1a\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: aclchk.c SetDefaultACL \(DEFACLOBJ\_LARGEOBJECT\), get\_user\_default\_acl
+    at LargeObjectCreate \(pg\_largeobject\_metadata.c\); the catalog row is
+    transactional.
+  - Landed:
+    - catalog: 'L' privilege table and owner string;
+    - executor: the large\-object early return is removed, and
+      loDefaultACLText stamps lomacl at lo\_create;
+    - BasicSession.RecordCatalogUndo plus InMemory.SnapshotACLEntry make
+      pg\_default\_acl edits roll back.
+  - Regress A/B vs HEAD: privileges 615→611, largeobject stays PASS \(it
+    regressed to 1 before the rollback undo existed, because of the leaked
+    default\); dependency / event\_trigger / matview / object\_address /
+    select\_into / init\_privs unchanged on fresh servers.
+  Movement: regress privileges 615→611
+- [x] **M0149-0001h1a5 — psql `\\du` / `\\dg` failed for every user: pg\_roles was a four\-column stub \("column r.rolinherit does not exist"\)** \(filed and fixed 2026-11-17 by M0149-0001h1a\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: system\_views.sql pg\_roles \(13 columns over pg\_authid, rolpassword
+    masked, rolconfig from pg\_db\_role\_setting\); pg\_authid.dat bootstrap
+    superuser \(every flag true, rolpassword / rolvaliduntil NULL\).
+  - Landed:
+    - catalog pg\_roles is the full view, projected from pg\_authid's rows;
+    - initdb bootstrap pg\_authid rows are PG\-shaped, with a null bitmap
+      \(the "Password valid until 1970\-01\-01" and missing Create DB on the
+      superuser came from the old non\-NULL defaults\);
+    - VALID UNTIL text is normalised to timestamptz output.
+  - Tests: TestPgRolesIsPgAuthidProjection; catalog / initdb tests updated
+    for the PG layout; TestPort\_CreateRoleSurvivesRestart now reads the
+    bool column; PG cold\-start and crash\-start e2e PASS; the pg\_dump /
+    pg\_dumpall testport family PASS.
+  - Regress A/B vs HEAD over 10 role cases: psql 748→739 \(inventory
+    updated\); the rest unchanged.
+  Movement: regress psql 748→739
+- [x] **M0149-0001h1a4 — every role could SELECT pg\_authid \(password hashes\) and pg\_largeobject: the PUBLIC revokes initdb applies to six catalogs were not modelled** \(filed and fixed 2026-11-17 by M0149-0001h1a\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - PG: initdb.c `REVOKE ALL ON pg_authid FROM public` and
+    `... ON pg_largeobject FROM PUBLIC`; system\_views.sql revokes
+    pg\_statistic, pg\_statistic\_ext\_data, pg\_user\_mapping and
+    pg\_subscription.
+  - goopg: dmlPrivilegePermittedAs granted SELECT on every system relation.
+    These six are now checked like a user table \(explicit grant, owner,
+    superuser, or pg\_read\_all\_data membership, as in
+    pg\_class\_aclmask\_ext\). The virtual\-catalog scan
+    \(valuesOp, e.g. pg\_authid\) applies the same check.
+  - Regress A/B vs HEAD over 16 cases that read these catalogs: privileges
+    617→616 \(inventory 616→615\); the rest unchanged apart from
+    alter\_generic ±1 and polymorphism's known pg\_typeof flip.
+  Movement: regress privileges 616→615
+- [x] **M0149-0001h1a2 — RAISE without a format string ignores `USING MESSAGE = <expr>`: `raise notice using message = sqlstate` prints the expression text** \(filed 2026-11-17 by M0149-0001h1a\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Repro: regress plpgsql raise\_test — PG prints `NOTICE:  22012`; goopg
+    prints `NOTICE:  using message = sqlstate`.
+  - PG: pl\_gram.y stmt\_raise \(the RAISE level USING … form with no
+    format string\) and exec\_stmt\_raise, which evaluates the USING option
+    expressions \(pl\_exec.c\).
+  - 2026-11-17 \(landed\): RAISE ... USING ported from pl\_gram.y stmt\_raise and
+    pl\_exec.c exec\_stmt\_raise.
+    - Parser: the format and its arguments stop at a top\-level USING; the
+      options parse as `name = expr` / `name := expr`, and an unknown name is
+      "unrecognized RAISE statement option". `RAISE SQLSTATE 'xxxxx'` is a
+      condition, and a bare `RAISE;` re\-raises.
+    - Runtime \(execRaise\):
+      - ERRCODE takes a SQLSTATE or a condition name \(42704 when unknown\);
+        an option given twice is 42601 "RAISE option already specified: X";
+        a NULL option is 22004;
+      - with no message, the condition name, else the SQLSTATE, is used;
+      - level ERROR defaults to P0001;
+      - DETAIL / HINT reach errors, inline notices \(new NoticeFieldsFlush\)
+        and warnings \(hint only\);
+      - RAISE errors carry no query position, as in PG;
+      - `RAISE;` re\-throws the handled error \(0Z002 outside a handler\).
+    - Regress A/B vs HEAD over 14 cases: plpgsql 1231→1213 and triggers
+      788→784 \(inventory updated\); the rest unchanged apart from plpgsql's
+      known polymorphic f1 / pg\_typeof flake.
+    Movement: regress triggers 788→784
+- [x] **M0149-0001h1a1 — bit strings have no `\|` / `&` / `#` operators and no bit → int4 / int8 cast: `x'20000'::int` and `x'20000' \| x'40000'` fail** \(filed 2026-11-17 by M0149-0001h1a\)
+  Kind: impl
+  Parent: M0149-0001h1a
+  - Repro on goopg: `select x'20000'::int` → "value "00100000000000000000"
+    is out of range for type integer"; `select B'101' \| B'011'` →
+    "operator \| requires integer operands". PG: 131072 and 111.
+  - Impact: regress privileges and largeobject open every large object with
+    `x'20000'::int` / `x'40000'::int`, so most of their large\-object steps
+    fail before reaching the LO functions. Regress `bit` is also affected.
+  - PG: utils/adt/varbit.c — bitand / bitor / bitxor / bitnot / bitshiftleft /
+    bitshiftright, "cannot AND/OR/XOR bit strings of different sizes" \(22026\),
+    bittoint4 / bittoint8 \("integer out of range" 22003 when more than
+    32 / 64 bits are significant\), int4 → bit\(n\).
+  - First step: probe the bit operator and cast surface against PG; implement
+    the executor operators and casts; then re\-measure bit, privileges and
+    largeobject.
+  - 2026-11-17 DONE: bit literals typed bit; operators, casts and bit overloads.
+    - The root cause was more than missing operators: `B'…'` / `X'…'` were
+      plain StringConsts typed text. Now:
+      - decodeBitStringLit sets StringConst.BitString \(dump:"omitempty", so
+        only the 5 bit\-literal goldens changed\);
+      - exprType / inferExprType say bit;
+      - parserExprKey keys `b:`.
+    - Planner bitStringOpCall \(3 BinaryOp resolvers\) and the UnaryOp
+      resolvers map & \| \# ~ << >> \|\| to bitand / bitor / bitxor / bitnot /
+      bitshiftleft / bitshiftright / bitcat. An unknown literal operand is
+      read through a varbit cast at its own position.
+    - bitStringFuncOverload: octet\_length / bit\_length / bit\_count /
+      get\_bit / set\_bit on a bit string, with FuncCall.SQLName for the label
+      and EXPLAIN.
+    - Executor bitstring\_ops.go:
+      - varbit.c errors 22026 / 2202E / 22023;
+      - bit → int4 / int8 \(22003, and 42846 for int2 / varbit\);
+      - explicit bit\(n\) / varbit\(n\) length coercion.
+    - Analyzer: bit \|\| bit types as varbit.
+    - Labels: a cast over an operator call takes the type label; int →
+      int4, decimal → numeric, char → bpchar.
+    - Probe \(39 statements, tmp/s58 vs PG 18.3\): identical.
+    - Regress A/B over 51 cases: bit 254→27, largeobject 220→46, privileges
+      693→673, arrays 1286→1281; nothing else moved \(join ±1 flake\).
+      Inventory updated.
+    - Found an S2: explicit numeric\(p\) casts apply p as the scale \(filed
+      M0149\-0001l\).
+    - Residuals ledgered: position\(B'' IN B''\), the `\\d` default deparse,
+      pg\_input\_is\_valid bit\(n\), `::dec`, and post\-aggregate overload
+      resolution.
+    - Test: TestBitStringOps; parser goldens regenerated unfiltered.
+    - Gates: units \(TestParserExprKeyUsesEveryField caught the key; fixed\),
+      fire\-set \(fires=none\), spotcheck, sf025 99, acceptance.
+    Movement: regress bit 254→27, largeobject 220→46, privileges 693→673
+- [!] **M0149-0001l — WRONG RESULTS: an explicit cast to numeric\(p\) without a scale applies p as the scale and skips the overflow check** \(filed 2026-11-17 by M0149-0001h1a1; S2\)
+  Kind: impl
+  Parent: none
+  - **PARKED `[!]` 2026-11-23 (owner, anti-detour):** not a proven prerequisite of any M0149 TAP test (M0149-0001 closed `[x]` with 034 passing). Reopen only when a selected TAP task cites this as a proven blocker; its descendants stay unselectable (S7).
+  - Repro on goopg:
+    - `select 1.5::numeric(3), 12345::numeric(3), 1::numeric(3)` →
+      `1.500 | 12345.000 | 1.000`;
+    - PG 18.3 gives `2`, then 22003 "numeric field overflow" \(DETAIL "A field
+      with precision 3, scale 0 must round to an absolute value less than
+      10^3."\), and `1`.
+    - A numeric\(3\) column rounds correctly on INSERT, so only the cast path
+      is wrong.
+  - PG: numeric\(\) / apply\_typmod \(utils/adt/numeric.c\). `numeric(p)` is
+    scale 0, and typmod = \(\(p << 16\) \| s\) \+ VARHDRSZ.
+  - First step: find the cast\-path typmod decode in evalCastTyped's numeric
+    arm, compare it with the assignment path, and make the two agree \(Hard\-won
+    Rule \#2\).
+  > \#\# ESCALATION 2026\-11\-17 \(S2\) — M0149\-0001l: `x::numeric(p)` returns wrong values \(precision used as scale, no overflow check\)
+  > Wrong results for any query casting to a precision\-only numeric typmod. Found while probing bit casts. Owner placement requested \(below item 10 per the S7 carve\-out unless placed\).
+- [ ] **M0149-0001k — WRONG RESULTS on a PG node: goopg stores money / point / lseg / box / line / circle / tid / aclitem columns as varlena, not PG's fixed\-length form** \(filed 2026-11-16 by M0149-0001g; S2\)
+  Kind: impl
+  Parent: M0149-0001g
+  - Repro, 2026\-11\-16, at f2068bdbf:
+    - goopg: `CREATE TABLE g(id int, m money, p point, b box, t tid, after int)`
+      and `INSERT … VALUES (1, '12.34', '(1.5,2)', '(1,1),(0,0)', '(3,4)', 99)`;
+      goopg reads the row back correctly.
+    - PG 18.3 cold start on the directory reads m = $33,284,856,530,830,756.35,
+      p = \(8.03e\-96, 2.69e\-110\), b = garbage and t = \(535830532,0\).
+    - `after` reads **340322** instead of 99: the varlena widths shift every
+      later column, so one such column corrupts the whole row.
+  - PG: these are fixed\-length pass\-by\-reference \(or, for money, int8\-like
+    by\-value\) types. pg\_type typlen / typalign:
+    - money 8 'd';
+    - point 16 'd', lseg 32 'd', box 32 'd', line 24 'd', circle 24 'd';
+    - tid 6 's';
+    - aclitem 16 'd'.
+  - goopg: catalog.PhysicalTypeIsVarlena defaults them to varlena
+    \(knownAlignGaps in catalog/physical\_align\_bki\_test.go\).
+  - Fix design:
+    - give each type its PG fixed\-length encode/decode in the heap codec
+      \(executor codec.go encodeValuePG / decodePhysicalPGValueMctx\) and in
+      every sibling: physical\_align / PhysicalTypeIsVarlena, coltypeinfo,
+      pgoutput \(xlog\), COPY binary, array element encode/decode, and
+      btree keys for money / tid;
+    - then drop those knownAlignGaps entries.
+    - Existing goopg data in the old varlena form becomes unreadable, so a
+      decision is needed: dual\-read by format version, or accept for
+      pre\-release clusters. The bench corpora carry none of these types.
+    - Rule \#5: run the full regress suite.
+  - Also seen: goopg rejects `12.34::numeric` into a money column \("column
+    m has type money but expression has type numeric"\); PG has an
+    assignment cast numeric→money.
+  - Rank: S2, awaiting owner placement \(below item 10 per the S7
+    carve\-out unless placed\).
+  > \#\# ESCALATION 2026\-11\-16 \(S2\) — M0149\-0001k: a PG node misreads goopg\-written money/point/box/tid/… columns and every column after them
+  > Filed under M0149\-0001g. Wrong results in the C3 PG\-on\-goopg\-data setting; goopg itself reads its data correctly. The fix is a heap\-codec format change that needs an owner decision on existing data. Owner placement requested.
+  - 2026-11-16 first slice: point / lseg / box / line / circle / tid are stored in PG's fixed\-length form, behind a cluster capability.
+    - The data\-compat question is avoided rather than decided:
+      - initdb lists `fixed\_length\_geometric\_tid` in
+        global/pg\_goopg\_features, and open sets
+        catalog.FixedLengthGeoTid from it;
+      - this is the null\_keyed\_index\_entries pattern: older clusters
+        keep reading and writing varlena, so no stored value changes
+        meaning.
+    - New leaf package internal/utils/adt/fixedgeo: Width / Encode /
+      Decode over PG's structs \(Point, LSEG, BOX high\-then\-low, LINE,
+      CIRCLE, ItemPointerData bi\_hi/bi\_lo/ip\_posid\). Rendering uses
+      catalog.PGFloatOut, so a decoded value equals goopg's canonical text.
+    - Consumers:
+      - catalog PhysicalTypeIsVarlena / PhysicalTypeAlign \('d', or 's'
+        for tid\);
+      - executor encodeValuePG / decodePhysicalPGValueLowered \(the decode
+        arm falls through to the varlena default when the flag is off\);
+      - the pgoutput decoder.
+      The Datum stays the canonical text.
+    - Probe \(tmp/catidx/s42\):
+      - goopg round\-trips the rows and is identical across two restarts;
+      - a PG 18.3 cold start reads every value and the column after them
+        \(99, not 340322\), at PG's sizes \(16 / 32 / 6\);
+      - PG\-inserted rows read back on goopg;
+      - a cluster with the feature line removed keeps the varlena format.
+    - Tests:
+      - fixedgeo TestRoundTrip / TestPGLayout;
+      - catalog TestFixedLengthGeoTidMatchesPostgresBKI \(typlen/typalign
+        from postgres.bki, flag on and off\);
+      - executor TestFixedLengthGeoTidHeapImage \(36\-byte PG row\);
+      - xlog TestEncodePgoTuplePhysicalFixedGeoTid;
+      - TestGoopgFeaturesMarker now lists 7 features.
+    - Gates: units, postmaster, testport interop set, spotcheck, sf025 99,
+      acceptance. Rule \#5 regress A/B over 31 cases \(all geometric / tid
+      cases, create\_index, copy, arrays, alter\_table, type\_sanity,
+      opr\_sanity, …\): every count identical.
+    - Still open: money and aclitem \(children below\); the
+      knownAlignGaps entries stay for the flag\-off format.
+    Movement: none — C3 interop fix \(regress A/B 31 cases unchanged\)
+- [x] **M0149-0001k1 — money is not a real type: no fixed 8\-byte int64 cash image, cash\_in / cash\_out, arithmetic or ordering** \(filed 2026-11-16 by M0149-0001k\)
+  Kind: impl
+  Parent: M0149-0001k
+  - Repro on goopg: `create table m(v money)`, insert '12.34', '\-0.5', '1000000'.
+    - `ORDER BY v` returns \-0.5, 1000000, 12.34: it compares text.
+    - Output is `12.34`; PG prints `$12.34`.
+    - `sum\(v\)` errors; `create index on m\(v\)` errors.
+  - PG: cash.c. Cash is an int64 in the currency's minor units, typlen 8,
+    typbyval, typalign 'd'. cash\_in / cash\_out follow lc\_monetary.
+  - Depends on M0134\-0143 \(money.sql, PARKED as a from\-scratch type\).
+    The fixed image needs the int64 Datum first.
+  - First step: a KindInt\-backed money Datum with cash\_in / cash\_out
+    under lc\_monetary=C. Then put the 8\-byte image behind its own
+    capability, as fixedgeo did.
+  - 2026-11-16 first slice: money is a real value with cash\_in / cash\_out and 8\-byte Cash storage.
+    - New leaf internal/utils/adt/cash: In / Out are ports of cash\_in /
+      cash\_out under the C monetary locale \(`$`, `,` grouped by 3, two
+      places, `\-$1.00`\).
+    - The Datum is a scale\-2 KindNumeric whose mantissa is the Cash count
+      \(executor money.go\), not KindInt. Ordering, comparison and
+      max / min are then exact numeric ops with no money arm.
+    - Wired:
+      - evalCast `money` \(cash\_in, numeric rounded half away from zero,
+        int × 100\);
+      - the heap codec \(8 bytes behind the new `fixed\_length\_money`
+        cluster capability; legacy clusters store the cash\_out text and
+        decode it with cash\_in\);
+      - wire output and COPY TO / FROM;
+      - the pgoutput decoder;
+      - catalog varlena / align answers;
+      - the planner: a text literal compared with a money column becomes
+        CastExpr money.
+    - Probe \(tmp/catidx/s43\):
+      - a 12\-statement script is identical to PG 18.3 except two
+        error\-cursor positions \(goopg points at `::` for every cast
+        input error, e.g. int4 and pg\_lsn too; generic, ledgered\);
+      - a PG cold start reads the 8\-byte values, sums them and inserts;
+        goopg reads PG's rows back;
+      - legacy clusters now sort money correctly too.
+    - Regress: money 216→130 \(inventory updated\); 22 other cases
+      unchanged \(plpgsql 1244→1241, its known flake band\).
+    - Still open in money.sql:
+      - arithmetic: `\+ \- \* /` are rejected with "requires numeric
+        operands" because the planner/evaluator type\-checks by name;
+      - cashlarger / cashsmaller / cash\_words;
+      - sum\(money\) typing;
+      - money::text;
+      - the numeric→money assignment cast;
+      - lc\_monetary other than C;
+      - btree cash\_ops;
+      - typed stavalues.
+    - Gates: units, fire\-set \(fires=none\), postmaster, testport interop
+      set, spotcheck, sf025 99, acceptance.
+    Movement: regress money 216→130
+  - 2026-11-16 second slice (CLOSES k1): arithmetic and the remaining cash.c functions; regress money passes.
+    - The analyzer types money arithmetic by PG's pg\_operator table
+      \(moneyArithResultType\).
+    - The planner rewrites `\+ \- \* /` with a money operand into the cash\_\*
+      builtins \(moneyArithCall\), in all three BinaryOp resolvers:
+      resolveExpr, resolveExprAfterAggregate and resolveExprAfterWindow.
+      - The FuncCall carries ReturnType and the new Operator field, so the
+        column is `?column?` and EXPLAIN prints infix.
+      - Every FuncCall copier copies Operator.
+    - Executor evalCashBuiltin implements PG's semantics:
+      - cash\_pl / cash\_mi with overflow checks;
+      - rint for float operands;
+      - truncating integer division;
+      - 22012 on a zero divisor;
+      - cash\_div\_cash → float8;
+      - cashlarger / cashsmaller / cash\_words.
+    - Also:
+      - pg\_input\_is\_valid / pg\_input\_error\_info know money;
+      - the wire advertises CASHOID 790 \(psql right\-aligns it\);
+      - the most negative Cash rides the big\-numeric lane, so money::numeric
+        prints one minus sign.
+    - Regress: money 130→0, PASS; the inventory row is flipped to
+      pass / required. 24 other cases are unchanged \(join \+1, a known
+      flake\).
+    - Gates: units, fire\-set \(fires=none\), postmaster, testport interop
+      set, spotcheck, sf025 99, acceptance.
+    - Residue filed as M0149\-0001k5.
+    Movement: regress money 130→0 \(PASS\)
+- [x] **M0149-0001k2 — aclitem column values are stored as varlena text, not PG's 16\-byte AclItem** \(filed 2026-11-16 by M0149-0001k\)
+  Kind: impl
+  Parent: M0149-0001k
+  - PG: AclItem \{Oid ai\_grantee; Oid ai\_grantor; AclMode ai\_privs \(uint64\)\},
+    typlen 16, typalign 'd' \(utils/acl.h\). Output needs role\-name
+    resolution \(aclitemout\).
+  - goopg stores a user aclitem column as text; catalog aclitem\[\] arrays
+    are already PG\-format \(initdbACLDatum\).
+  - First step: reuse the catalog aclitem\[\] element encoder for the
+    scalar, behind a capability; decode through the role\-name renderer.
+  - 2026-11-16 \(CLOSES k2\): aclitem columns are PG's 16\-byte AclItem behind the `fixed\_length\_aclitem` capability.
+    - Encode \(executor aclitem\_scalar.go encodeAclItemScalar\):
+      parseAclItemText, then role names through the session catalog
+      \(RoleOID\). An unknown role is 42704, as get\_role\_oid reports it.
+    - Decode: the new leaf internal/utils/adt/aclitem \(Decode / Putid /
+      PrivLetters / RoleName\) is shared with pgoutput.
+      - The executor's aclPutid / aclModeToPrivLetters now delegate to it.
+      - Role names come from the scan's st.RegOut.
+      - colsHaveArray now also binds the renderer for scalar aclitem
+        columns. Without a renderer a role prints as its numeric OID, as
+        aclitemout prints a dropped role.
+    - Catalog varlena / align are gated on the capability;
+      TestGoopgFeaturesMarker lists 9 features.
+    - Probe \(tmp/catidx/s45\):
+      - goopg's SELECT and COPY render names, identical across a
+        restart;
+      - a PG cold start reads every value at 16 bytes;
+      - a PG\-inserted row reads back on goopg.
+    - Regress A/B over 19 cases unchanged \(alter\_generic −1, a known
+      flake\).
+    - Gates: units, postmaster, testport interop set, spotcheck, sf025 99,
+      acceptance.
+    Movement: none — C3 interop fix \(regress A/B unchanged\)
+- [x] **M0149-0001k3 — arrays of point / lseg / box / line / circle / tid still hold text elements \(elemtype 25\)** \(filed 2026-11-16 by M0149-0001k\)
+  Kind: impl
+  Parent: M0149-0001k
+  - goopg's ArrayType for `point\[\]` says elemtype 25, while
+    pg\_attribute.atttypid says \_point \(1017\). PG would deform the
+    elements wrongly.
+  - First step: utils/adt/array ElemTypeInfo arms \(sizes / aligns from
+    fixedgeo.Width\) plus encode / decode arms calling fixedgeo, gated on
+    catalog.FixedLengthGeoTid. Legacy elemtype\-25 blobs keep decoding on
+    the text path.
+  - 2026-11-17 \(CLOSES k3\): array elements of the six types are PG's fixed images, and box arrays use typdelim `;`.
+    - utils/adt/array ElemTypeInfo gains point / lseg / box / line /
+      circle / tid \(elemtype 600 / 601 / 603 / 628 / 718 / 27\), with sizes
+      and aligns from fixedgeo.Width, gated on catalog.FixedLengthGeoTid.
+      The encode and decode element arms call fixedgeo.
+    - box typdelim:
+      - parseTextArrayDelim splits a box\[\] literal on `;`, still taking
+        `,` after a quoted element for goopg's own constructor output;
+      - RenderTextStyled joins on ElemDelim, and QuoteTextElemDelim quotes
+        by it on both the typed and the legacy text paths.
+      - goopg's array output for box\[\] now equals PG's; `ARRAY\[box\]`
+        used to print quoted.
+    - Found and fixed on the way: goopg's bootstrap pg\_type wrote typdelim
+      `,` for every type. pgTypeDelim now gives `;` for box \(603\) and
+      \_box \(1020\). With `,`, a PG node could not even parse
+      `'\{\(1,1\),\(0,0\)\}'::box\[\]` on goopg data.
+    - Probe \(tmp/catidx/s46\):
+      - goopg's output equals PG on every column;
+      - a PG cold start reads elements and subscripts at PG's sizes
+        \(point\[2\] 56 B, box\[2\] 88 B\);
+      - PG\-inserted box\[\] rows read back on goopg;
+      - a legacy cluster also prints box\[\] as PG does.
+    - Tests: TestFixedGeoArrayElements \(capability on / off\),
+      TestPgTypeDelimBox.
+    - Regress A/B over 25 cases unchanged.
+    - Gates: units, postmaster, testport interop set, spotcheck, sf025 99,
+      acceptance.
+    Movement: none — C3 interop fix \(regress A/B unchanged\)
+- [x] **M0149-0001k4 — COPY BINARY sends point / lseg / box / line / circle / tid as text, not their send format** \(filed 2026-11-16 by M0149-0001k\)
+  Kind: impl
+  Parent: M0149-0001k
+  - Repro: `copy \(select p, t from ti\) to stdout with \(format binary\)`
+    writes the text `\(1,1\)` as the field body.
+  - PG point\_send writes two big\-endian float8. tidsend writes a
+    big\-endian uint32 block, then a uint16 offset. lseg, box, line and
+    circle work the same way \(geo\_ops.c, tid.c\).
+  - First step: executor copy\_binary.go send / recv arms for the six types.
+  - 2026-11-17 \(CLOSES k4\): binary COPY ships the six types and money in PG's send formats.
+    - fixedgeo Send / Recv:
+      - fields big\-endian in storage order; tid as a uint32 block then a
+        uint16 offset;
+      - Recv reorders box corners and rejects a negative circle radius and
+        line A = B = 0, as geo\_ops.c does \(22P02\).
+    - copy\_binary.go send / recv arms for point / lseg / box / line /
+      circle / tid, plus money \(cash\_send / cash\_recv, int64\).
+    - Found and fixed: server\-side `COPY … FROM 'file' WITH \(FORMAT
+      binary\)` ignored the format and split the file into text lines
+      \(an int column failed on the "PGCOPY" signature\). RunCopyFromFile
+      now feeds a binary file through PushBinaryData, the STDIN reader.
+    - Probe \(tmp/catidx/s47\):
+      - goopg's binary COPY of a 7\-type table is byte\-identical to PG
+        18.3's \(cmp\);
+      - PG loads goopg's file, and goopg loads PG's file through both STDIN
+        and a server\-side file.
+    - Tests: fixedgeo TestSendRecv, TestCopyBinaryGeoTidMoney.
+    - Regress A/B over 13 cases unchanged.
+    - Gates: units, testport interop set \(\+ copy ports\), spotcheck, sf025
+      99, acceptance.
+    Movement: none — C3 / client\-tool interop fix \(regress A/B unchanged\)
+- [ ] **M0149-0001k5 — money residue: btree cash\_ops index keys, lc\_monetary, typed stavalues, source\-typed money casts** \(filed 2026-11-16 by M0149-0001k1\)
+  Kind: impl
+  Parent: M0149-0001k
+  - `create index on m\(v\)` errors "btree v0 only supports int4 / numeric
+    keys, got money"; PG has cash\_ops \(cash\_cmp\).
+  - Only lc\_monetary=C is supported. PG reads PGLC\_localeconv for the
+    symbols, grouping and sign positions \(cash.c\).
+  - money stavalues still use the legacy text blob.
+  - Two cast gaps:
+    - money::text renders the bare numeric: evalCast "text" does not see
+      the source type;
+    - the numeric→money assignment cast is rejected by the analyzer
+      \("column … has type money but expression has type numeric"\).
+  - First step: the btree key codec for money \(int8\-like over the Cash
+    count\), then the analyzer's assignment\-cast table.
+  - 2026-11-17 first slice: btree indexes on money, PG\-valid indclass for every indexable type, the assignment casts and money::text.
+    - btree key \(operators\_ddl encodeBTreeKeyForColumn, decodeScalarBTreeKey\):
+      the int64 Cash count as an int8 key \(cash\_cmp order\). Probes go
+      through moneyCents.
+    - Tuple\-format \(PG\-on\-disk\) index keys: pgindex\_keydesc maps money
+      to OIDMoney with the int8 comparator, only under fixed\_length\_money,
+      where the heap image is the Cash.
+    - Found and fixed: pg\_index.indclass was written as 0 for money, time,
+      timetz, cidr and the reg\* family, because
+      defaultColumnOpclassNameForType had no arm for them. A PG node then
+      failed every query on such a table with "bogus pg\_index tuple". They
+      now map to money\_ops / time\_ops / timetz\_ops / inet\_ops /
+      oid\_ops.
+    - EXPLAIN prints a literal against money as `'$12.00'::money`, in both
+      the qual and the Index Cond paths.
+    - Analyzer: numeric / int4 / int8 → money are assignment casts
+      \(pg\_cast castcontext 'a'\).
+    - `money::text` and the other text targets go through cash\_out \(CastExpr
+      SourceType\).
+    - Probe \(tmp/catidx/s48\):
+      - goopg index scans return the right rows, order both ways and
+        enforce unique;
+      - a PG cold start uses goopg's money index for equality, range and
+        ORDER BY;
+      - a PG\-inserted row reads back through the index on goopg.
+    - Still open in k5:
+      - lc\_monetary other than C;
+      - typed stavalues and money\[\] elements;
+      - `money \|\| text` prints the bare numeric;
+      - float8 → money is wrongly accepted as an assignment.
+    - Tests: TestMoneyBTreeKey, TestDefaultBtreeOpclassForIndexableTypes.
+    - Regress A/B over 18 cases unchanged.
+    - Gates: units, postmaster, testport interop set, spotcheck, sf025 99,
+      acceptance.
+    Movement: none — C3 interop and correctness fix \(regress A/B unchanged\)
+  - 2026-11-17 second slice: money\[\] elements and money \|\| text.
+    - utils/adt/array ElemTypeInfo money arm \(790, 8, 'd'\), gated on
+      fixed\_length\_money. The encode element arm runs moneyCents; decode
+      renders cash\_out with array\_out quoting. A PG node reads the arrays
+      at 48 / 40 bytes.
+    - Planner moneyConcatOperand: a money operand of `\|\|` is cast to text
+      with SourceType money, so cash\_out renders it, as anytextcat does:
+      `m \|\| 'x'` = `$7.00x`. All three BinaryOp resolvers call it.
+    - Probe \(tmp/catidx/s49\): output equals PG 18.3, except the subscript
+      column name \(the pre\-existing k3 ledger row\) and the float8
+      assignment, filed as k5a.
+    - Test: TestMoneyArrayElements.
+    - Regress A/B over 10 cases unchanged.
+    - Gates: units, fire\-set \(fires=none\), testport interop set,
+      spotcheck, sf025 99, acceptance.
+    - Still open in k5: typed money stavalues \(they need money\-aware MCV
+      and histogram comparison in the optimizer\) and lc\_monetary for
+      non\-C locales.
+    Movement: none — correctness / interop fix \(regress A/B unchanged\)
+  - 2026-11-17 third slice: typed money statistics, with money\-aware optimizer comparison.
+    - executor statValueText renders money samples through cash\_out
+      \(`$42.00`\), so goopg's pg\_stats equals PG's. typedStatValueTypes
+      gains money \(8\-byte Cash elements under fixed\_length\_money, behind
+      the round\-trip guard\).
+    - Optimizer:
+      - moneyCastLiteral folds CastExpr\{StringConst → money\} to the
+        cash\_out text in both shape recognisers;
+      - numericValue and statNumericEqual compare money via cash\_in,
+        as convert\_numeric\_to\_scalar does for CASHOID.
+      - Before: money quals priced as column = expression, and histogram
+        bounds compared as text.
+    - Probe \(tmp/catidx/s51\): goopg vs PG 18.3 estimates for `=`, `=`,
+      `<` and `>` are 600 / 600 / 840 / 598 against 600 / 600 / 840 / 608,
+      with identical pg\_stats. Identical across a restart; a PG cold start
+      reads goopg's typed money stats.
+    - lc\_monetary: this host offers only C / C.utf8 / POSIX, which print
+      money identically, and PG rejects any other value here. goopg accepts
+      any lc\_\* value and always formats as C; filed as k5b.
+    - Tests: TestMoneyStatsComparison, plus a money case in
+      TestTypedStatValuesRoundTrip.
+    - Regress A/B over 9 cases unchanged \(join −1, a known flake\).
+    - Gates: units, fire\-set \(fires=none\), testport, spotcheck, sf025 99,
+      acceptance.
+    Movement: none — estimate / interop fix \(regress A/B unchanged; TPC fire\-set fires=none\)
+- [x] **M0149-0001k5b — lc\_monetary / lc\_numeric / lc\_time accept any value, and money always formats as C** \(filed 2026-11-17 by M0149-0001k5\)
+  Kind: impl
+  Parent: M0149-0001k5
+  - Repro on goopg: `set lc\_monetary = 'de\_DE.UTF\-8'` succeeds and `show`
+    returns it. PG 18.3 on the same host: 22023 "invalid value for
+    parameter "lc\_monetary"" \(check\_locale runs setlocale; the host has
+    only C / C.utf8 / POSIX\).
+  - On a host with other locales installed, PG formats money through
+    PGLC\_localeconv \(symbol, separators, sign position\). goopg's cash
+    package is C\-only.
+  - goopg's GUC registry has no check\-hook mechanism yet \(defaults.go
+    Variables carry no validator\).
+  - First step:
+    - a validator for the lc\_\* string GUCs that accepts "", C, POSIX and
+      the host's installed locales \(codeset spellings normalised\);
+    - then a cash locale table filled from the chosen lc\_monetary.
+  - 2026-11-17 \(CLOSES k5b\): lc\_\* values are validated as check\_locale does. Non\-C money formatting is not filed \(the lineage guard refused it\); it is in the 2026\-11\-17 ledger row.
+    - utils/misc locale\_check.go LocaleAvailable is setlocale's
+      availability answer on glibc:
+      - "", C, POSIX and C.UTF\-8 / C.utf8 are built in;
+      - otherwise a compiled locale directory under /usr/lib/locale or an
+        entry in locale\-archive \(its namehash table is read\), with the
+        codeset normalised as \_nl\_normalize\_codeset does \(UTF\-8 →
+        utf8\);
+      - LOCPATH, when set, replaces the default search, as in glibc.
+    - CheckFn localeCheck on lc\_monetary / lc\_numeric / lc\_time /
+      lc\_messages. The error is PG's 22023 "invalid value for parameter
+      "lc\_monetary": "de\_DE.UTF\-8"".
+    - Probe \(tmp/catidx/s52\): an 8\-statement SET / SHOW script is
+      identical to PG 18.3 on this C\-only host, apart from the verbose
+      LOCATION line.
+    - Test: TestLocaleAvailable \(fake locale dir, LOCPATH\).
+    - Regress A/B over 7 cases unchanged.
+    - Gates: units, postmaster, testport, spotcheck, sf025 99, acceptance.
+    Movement: none — correctness fix \(regress A/B unchanged\)
+- [x] **M0149-0001k5a — the analyzer accepts an explicit cast of any type into an INSERT / UPDATE target** \(filed 2026-11-17 by M0149-0001k5\)
+  Kind: impl
+  Parent: M0149-0001k5
+  - Repro on goopg: `create table zz\(d date, b bool, m money\)`, then:
+    - `insert into zz\(m\) values \(1.5::float8\)` stores $1.50;
+    - `insert into zz\(d\) values \(1.5::float8\)` fails "expected time,
+      got kind 7";
+    - `insert into zz\(b\) …` fails "expected bool, got kind 7".
+  - PG 18.3 rejects all three at parse analysis: 42804 "column "m" is of
+    type money but expression is of type double precision", with HINT "You
+    will need to rewrite or cast the expression."
+  - Cause: the analyzer's INSERT / UPDATE check does not see the cast's
+    target type. The analyzeExpr result for `x::float8` passes isAssignable.
+  - First step: find what analyzeExpr returns for a CastExpr in the VALUES
+    list, then make isAssignable reject casts with no pg\_cast assignment
+    path. Also adopt PG's message and HINT.
+  - 2026-11-17 \(CLOSES k5a\): explicit casts in assignment targets are judged by PG's assignment coercions.
+    - Analyzer castAssignmentError, called at INSERT VALUES, UPDATE SET and
+      ON CONFLICT DO UPDATE SET. A top\-level `x::T` is checked against
+      pg\_cast's assignment paths over a modelled family set:
+      - numbers inter\-convert;
+      - numeric / int4 / int8 → money \(not float or int2\);
+      - date ↔ timestamp\(tz\), and timestamp\(tz\) → time;
+      - anything → a string type;
+      - nothing else crosses families.
+    - The error is PG's 42804 "column "c" is of type X but expression is of
+      type Y", with HINT "You will need to rewrite or cast the expression."
+      and the cursor at the expression. Types outside the set \(domains,
+      user types, arrays\) keep today's acceptance.
+    - isAssignable now admits date ↔ timestamp\(tz\) and timestamp\(tz\) →
+      time. The analyzer types `::date` as date, so `'…'::date` into a
+      timestamp column used to be rejected.
+    - Probe \(tmp/catidx/s50\): a 12\-statement script \(INSERT / UPDATE
+      across money, date, bool, int, text, time, timestamp\) is identical to
+      PG 18.3, error text and cursors included.
+    - Test: TestCastAssignmentError.
+    - Regress A/B over 22 cases unchanged \(plpgsql 1233→1244→1235 on
+      re\-run, a known flake; no new message in its diff\).
+    - Gates: units, testport \(cold\-start / pg\_dump / logical\), spotcheck,
+      sf025 99, acceptance.
+    Movement: none — correctness fix \(regress A/B unchanged\)
+- [ ] **M0149-0001j — goopg-written pg\_statistic stavalues are unreadable on a PG node: 0-dimensional, text-typed arrays** \(filed 2026-11-16 by M0149-0001g; C3 interop, estimates only, below the item-10 rank\)
+  Kind: impl
+  Parent: M0149-0001g
+  - Repro, 2026\-11\-16, at 136ba8262:
+    - goopg: `CREATE TABLE s(i int, t text, d date)`, insert 2000 rows,
+      ANALYZE. goopg's own pg\_stats shows the right MCVs.
+    - PG 18.3 cold start on the directory: pg\_stats.most\_common\_vals is
+      `{}` and histogram\_bounds is NULL for all three columns.
+    - `EXPLAIN … WHERE i = 3` then estimates rows=1, where the true count
+      is 200.
+  - Cause 1: executor pgTextArrayBytes \(pg18\_user\_catalog\_rows.go\) never
+    writes ndim, so the ArrayType header says 0 dimensions.
+  - Cause 2: every stavalues slot is text\-element \(elemtype 25\) whatever
+    the column type. PG's update\_attstats \(analyze.c\) stores an anyarray of
+    the column's own type, and selfuncs compare its elements with the
+    column's operators.
+    - Fixing ndim alone would therefore be WORSE: int4eq / date\_lt /
+      numeric\_lt would run on text datums \(garbage selectivity; numeric
+      could crash\).
+  - Fix design:
+    - encode stavalues per column type in writeColumnStatRow: element
+      Datums from the value strings, encodeValuePG, typalign padding,
+      4\-byte varlena headers, ndim 1, elemtype = the column type's OID;
+    - decode in catalog.DecodePGStatisticRow: elemtype 25 keeps the legacy
+      path, which also reads the existing text blobs, including the TPC\-DS
+      corpora imports. Other element types go through a hook the executor
+      installs \(the RelAllVisibleFunc pattern\), formatting each element
+      exactly as ANALYZE produced it;
+    - siblings to keep in step: pg\_restore\_attribute\_stats import,
+      truncateColumnStatsToFit, the pg\_stats view.
+  - Gates: plan\-relevant through goopg's restart round\-trip. Run the census,
+    spotcheck and acceptance arm, plus a restart A/B of a goopg ANALYZE
+    \(EXPLAIN estimates must not move\). Then the PG cold\-start probe above:
+    the MCVs must be visible and the estimate rows=200.
+  - Unblocks: capturing the 412 catalog pg\_statistic rows of PG's initdb
+    \(the same typed encoder\).
+  - 2026-11-16 first slice: stavalues are typed for 10 column types.
+    - The types are int2, int4, int8, oid, numeric, float8, text, varchar,
+      bpchar and date. Their text form does not depend on session settings,
+      so ANALYZE's strings round\-trip exactly.
+    - pg\_statistic\_typed\_values.go:
+      - pgStatValuesBytes builds a 1\-D anyarray of the column's own type
+        through goopg's array codec \(ndim 1, elemtype = the type's OID\);
+      - decodeTypedStatValues is catalog.StatValuesDecoder, the hook that
+        catalog.DecodePGStatisticRow uses for non\-text element types. The
+        legacy text blobs on disk, including the TPC\-DS corpora imports,
+        still decode as before.
+    - The ANALYZE writer and truncateColumnStatsToFit pass the column type
+      \(buildUserPGStatisticRowTyped\). Other types keep the legacy
+      text\-element blob, which a PG node reads as empty rather than
+      mis\-typed.
+    - Probe \(tmp/catidx/s36\):
+      - a PG node now shows the MCVs of int / text / date / numeric columns;
+      - estimates move from rows=1 to rows=231 for i = 3 \(actual 200\) and
+        to 1132 for n > 50.5 \(actual 980\);
+      - timestamptz stays legacy;
+      - goopg's own EXPLAIN estimates are byte\-identical across a restart.
+    - TestTypedStatValuesRoundTrip pins ndim, elemtype and the exact
+      round\-trip for every type.
+    - Still open: timestamp / timestamptz / time \(DateStyle and TimeZone
+      dependent text\), bool, interval, array columns \(MCELEM / DECHIST
+      kinds\), and the 412 catalog pg\_statistic rows.
+    - Gates: units, initdb, postmaster, testport interop set, spotcheck,
+      sf025 99 \(run twice: \+20% then −25%, timing noise, plans 99/99 same\),
+      acceptance.
+    Movement: none — C3 interop fix \(goopg plans unchanged: restart A/B identical\)
+  - 2026-11-16 second slice: bool stavalues are typed too.
+    - ANALYZE renders bool as t / f \(Datum.Format\), the same as boolout and
+      the bool\[\] codec, so it round\-trips exactly.
+    - name was tried and dropped: goopg's array codec does not encode
+      name\[\] here and falls back to the text blob \(ledgered\).
+    - Probe \(tmp/catidx/s38\):
+      - a PG node reads b's MCVs `{f,t}` with frequencies `{0.9,0.1}`;
+      - PG estimates WHERE b at 222 and NOT b at 2001;
+      - goopg's own estimates are identical across a restart.
+    - Gates: units, postmaster, testport interop set, spotcheck, sf025 99,
+      acceptance.
+    Movement: none — C3 interop fix \(goopg restart A/B identical\)
+  - 2026-11-16 third slice: name\[\] has a real element image, and name stavalues are typed.
+    - utils/adt/array ElemTypeInfo gains name \(OID 19, typlen 64,
+      typalign 'c'\). Encode and decode arms are siblings of the scalar
+      NameData arm: 64 bytes NUL\-padded, input truncated to 63 bytes.
+      Legacy name\[\] blobs \(elemtype 25, text bodies\) still decode on
+      their text path.
+    - "name" joins typedStatValueTypes.
+    - Probe \(tmp/catidx/s39\):
+      - a PG node reads name MCVs with their frequencies \(0.2 / 0.04\);
+      - a PG node reads goopg\-written name\[\] columns at PG's sizes
+        \(152 bytes for 2 elements, 88 for 1\); subscripts and `= ANY`
+        work;
+      - goopg's pg\_stats and name\[\] values survive two restarts.
+    - Pre\-existing goopg\-side gaps, also present at HEAD, ledgered:
+      - goopg's planner ignores name MCVs \(rows=119 = 1/ndistinct, where
+        PG uses the 0.2 frequency\);
+      - goopg's pg\_column\_size\(name\[\]\) prints 6.
+    - Regress A/B: arrays / name / stats / rowtypes / privileges unchanged.
+    - Gates: units, postmaster, testport interop set, spotcheck, sf025 99
+      \(PLAN\-SHAPE same\), acceptance.
+    Movement: none — C3 interop fix \(regress A/B unchanged; goopg restart round\-trip identical\)
+  - 2026-11-16 fourth slice: goopg's planner reads name statistics.
+    - Cause: the resolver wraps a literal compared with a name column in
+      CastExpr\{StringConst → name\} \(planner.go, M0097\-0003\).
+      normalizeColumnConst did not see that as a constant, so `c = 'hot'`
+      was priced as column = expression \(1/ndistinct: rows=119 where PG
+      says 500\).
+    - Fix: optimizer nameCastLiteral folds that cast \(implicit or
+      explicit, no typmod\) to the name Const eval\_const\_expressions
+      produces, truncated to 63 bytes as namein does. Both shape
+      recognisers use it: normalizeColumnConst and
+      normalizeColumnConstRange.
+    - Probe vs PG 18.3 \(tmp/catidx/s40\):
+      - `c = 'hot'`: 500 = 500; `'hot' = c`: 500 = 500;
+      - `c <> 'hot'`: 2000 = 2000; `c < 'nm1'`: 600 = 600;
+      - on a 3000\-row unique\-ish column: `c < 'k2'`: 1139 = 1139,
+        `c = 'k5'`: 1 = 1.
+      - Still off: `c = 'zzz'` \(a value outside an MCV list that covers
+        every distinct value\) gives 12 where PG gives 1. Text columns do
+        the same; it is the generic fallback in eqSelectivityForColumn
+        \(ledgered\).
+    - TestNameCastLiteralReadsStatistics pins the fold, the truncation and
+      the MCV hit.
+    - Gates: units, fire\-set \(fires=none on all corpora\), spotcheck,
+      sf025 99 \(PLAN\-SHAPE same\), acceptance. Regress A/B over 9 cases
+      unchanged \(join 2837→2836, a known flake\).
+    Movement: none — estimate fix on name columns \(TPC\-H/TPC\-DS plans unchanged: fire\-set fires=none\)
+  - 2026-11-16 fifth slice: the date\-time types are typed, behind a round\-trip guard.
+    - Round\-trip guard \(pgStatValuesBytes\):
+      - a typed blob is kept only if it decodes back to exactly the
+        strings ANALYZE produced;
+      - so text rendered under a non\-default DateStyle / TimeZone keeps
+        the legacy blob, which a PG node reads as no statistics;
+      - this also closes a latent slice\-1 hole: a DMY `05/11/2026` date
+        would have been encoded as May 11.
+    - typedStatValueTypes gains time, timetz, timestamp, timestamptz and
+      interval.
+    - ANALYZE rendered time / timetz values as timestamps
+      \(`1970\-01\-01 23:00:00`, timetz losing its zone\). New
+      statValueText renders them through time\_out / timetz\_out, the leaf
+      functions COPY TO uses. All four sibling sites use it: MCVs,
+      histogram bounds, stats import \(statsColumnValueText\) and the index
+      endpoint probe.
+    - goopg's own estimates: `t < '06:00'` on a time column moved from
+      rows=1 \(HEAD\) to 764 \(actual 750\); timetz from 1 to 750.
+      Identical across two restarts.
+    - PG cold\-start probe \(tmp/catidx/s41\):
+      - all five types' MCVs and histograms are read;
+      - range estimates are 791\-814 against 750\-753 actual \(reltuples
+        scaling\);
+      - the DMY session's date column stays legacy.
+    - Pre\-existing gaps, ledgered:
+      - goopg ANALYZE writes no histogram for interval;
+      - goopg's timetz histogram order differs from timetz\_cmp;
+      - goopg lacks `timestamp \+ make\_interval\(…\)` and
+        `int \* interval`.
+    - Tests: TestTypedStatValuesRoundTrip gains the five types;
+      TestTypedStatValuesNonCanonicalFallsBack covers DMY, German, a \+09
+      session and Postgres style.
+    - Gates: units, spotcheck, sf025 99 \(PLAN\-SHAPE same\), acceptance.
+      Regress A/B over 11 cases unchanged \(join −1, a known flake\).
+    Movement: none — C3 interop fix plus a goopg time/timetz estimate fix \(TPC plans unchanged\)
+- [!] **M0149-0001i — regnamespace has no name-resolution seam: `'public'::regnamespace::oid` errors, `99::regnamespace` prints 99** \(filed 2026-11-16 by M0149-0001g slice 24; correctness, below the item-10 rank\)
+  Kind: impl
+  Parent: none
+  - **PARKED `[!]` 2026-11-23 (owner, anti-detour):** not a proven prerequisite of any M0149 TAP test (M0149-0001 closed `[x]` with 034 passing). Reopen only when a selected TAP task cites this as a proven blocker; its descendants stay unselectable (S7).
+  - Repro on goopg: `select 'public'::regnamespace::oid` → "invalid input syntax for type oid"; `select 99::regnamespace` → `99`. PG 18.3: 2200 and `pg_toast`.
+  - PG: regnamespacein / regnamespaceout \(postgres/src/backend/utils/adt/regproc.c\): a single identifier \(42602 "invalid name syntax" otherwise\), resolved by get\_namespace\_oid \(3F000 when missing\); output is quote\_identifier of the name, or the numeric OID when dangling.
+  - goopg: "regnamespace" is missing from every reg\* sibling list, so it stays unresolved text:
+    - regIdentifierInput / regOutShared / isRegIdentifierTypeName \(executor/reg\_identifier.go\);
+    - the 4\-byte encode arms \(executor/codec.go 649 / 1772, copy\_binary.go, codec\_array.go, btree\_scalar\_keys.go\);
+    - postmaster/dispatch.go's wire output list, utils/adt/array/pgarray.go, xlog/pgoutput.go, optimizer/planner.go, catalog physical\_align.go.
+  - First step:
+    - add the input and output arms;
+    - add "regnamespace" to all the lists above together \(Hard-won Rule \#2\);
+    - re-run the full regress suite, since a regnamespace column's on-disk encoding changes \(Rule \#5\).
+- [!] **M0149-0001g — goopg's bootstrap catalog image diverges from PG 18.3: 20 catalog descriptors, 19 missing and some empty indexes, 29 missing TOAST relations, local relhasindex false; PG-side CREATE TABLE segfaults** \(filed 2026-11-15; S2 — a PG 18.3 node crashes and would write malformed catalog rows on a goopg directory\)
+  Kind: impl
+  Parent: none
+  - **ESCALATION 2026\-11\-17 \(lineage budget, Rule A\)\.** The last five
+    completed descendants \(M0149\-0001k2 aclitem, k3 array elements, k4
+    COPY BINARY, k5a assignment casts, k5b lc\_\* validation\) all carry
+    `Movement: none`, so the root is parked `[!]` until the owner re\-opens
+    it.
+    - What was attempted: the C3 \(PG node on goopg data\) family. Each
+      slice measured a PG 18.3 cold start reading goopg\-written data
+      byte\-identically:
+      - catalog image;
+      - typed pg\_statistic;
+      - fixed\-length point / lseg / box / line / circle / tid / money /
+        aclitem;
+      - geometric / money arrays;
+      - binary COPY;
+      - money as a real type \(regress money 216 → 0, PASS\);
+      - money btree indexes;
+      - pg\_index.indclass for money / time / timetz / cidr / reg\*.
+    - What each step proved: the family is interop and correctness work
+      with no TPC instrument. `Movement: none` is structural; the census
+      stayed all\-match on all three corpora throughout.
+    - Remaining blocker: the lineage rule. Owner call: re\-baseline
+      \(`LINEAGE\-BASELINE`\) or close the family.
+    - Expected movement if unblocked: none on match / CATEGORIES /
+      ea\-ratchet. Gains show in regress and in PG\-on\-goopg probes.
+    - Remaining size — open descendants already filed:
+      - M0149\-0001k5 \(money: lc\_monetary formatting\);
+      - M0149\-0001k \(close\-out\);
+      - M0149\-0001j \(stats residue\);
+      - M0149\-0001i \(regnamespace\);
+      - M0149\-0001h \(has\_database\_privilege\).
+    - **Not filed** \(guard\-refused; recorded in the 2026\-11\-17 ledger
+      rows\): money formatting under a non\-C lc\_monetary
+      \(PGLC\_localeconv\). It is testable here via localedef \+ LOCPATH.
+  - > **ESCALATION 2026-11-15 \(S2\) — OWNER PLACEMENT NEEDED.** Filed under M0149 \(item-10 rank\). Any PG-side DDL
+    > on a goopg-initialised directory crashes the backend: CREATE TABLE → GenerateTypeDependencies →
+    > CatalogTuplesMultiInsertWithInfo \(pg\_depend\) → heap\_form\_tuple SIGSEGV. It happens with or without M0149-0001d.
+  - Measured on a PG cold start versus a scratch PG 18.3 \(pg\_attribute attnum > 0 of the 74 shared catalogs\):
+    - **Extra columns:** pg\_depend.objversion \(the crash: PG forms 7 values against 8 attributes\),
+      pg\_description.shared, pg\_namespace.nspblocked.
+    - **Missing columns:** pg\_operator \(oprcom, oprnegate, oprcode, oprrest, oprjoin\),
+      pg\_auth\_members \(inherit\_option, set\_option\), pg\_inherits \(inhdetachpending\).
+    - **Wrong types / flags:** oid columns typed int4 \(pg\_class.oid / relnamespace, pg\_attribute.attrelid /
+      atttypid\); pg\_am.amhandler typed oid, PG regproc; aclitem\[\] attalign i, PG d \(10 catalogs\);
+      attbyval false for xid \(datfrozenxid, datminmxid\) and timestamptz \(rolvaliduntil\).
+    - **Missing catalog indexes \(19\):** 2187, 2579, 2651, 2652, 2664, 2673, 2674, 2675, 2683, 2699, 2702, 2756, 2757,
+      2996, 3257, 3258, 3395, 3455, 3597.
+    - **Missing local TOAST relations \(29\):** e.g. those of pg\_proc, pg\_type and pg\_attrdef.
+    - **Empty / incomplete indexes:** pg\_attribute\_relid\_attnam\_index 2658 has zero leaf tuples, while 2659 has
+      2345. Audit every index's tuple count against its heap.
+    - **relhasindex:** false for local catalogs \(M0149-0001d set it only for shared catalogs\). Flip it once
+      the local indexes are complete.
+  - The goopg runtime writers use the PG shapes in places \(PGDependColumnsPG18 is 7 columns\). Only the nailed
+    descriptors \(relcache\_init.go \*Attrs\(\)\) are off, but the goopg readers of each catalog must be checked
+    before changing a descriptor.
+  - First step: drop pg\_depend.objversion \(the segfault\). Then align the descriptor table catalog by catalog
+    against pg\_\*.h, with a unit test that compares every nailed descriptor with a pinned PG 18.3 dump.
+  - Verification: on a PG cold start, CREATE TABLE / CREATE INDEX / DROP TABLE work, and the pg\_attribute and
+    pg\_index audits equal PG's.
+  - 2026-11-16 slice 1 landed:
+    - Dropped the three extra columns \(pg\_depend.objversion,
+      pg\_description.shared, pg\_namespace.nspblocked; relnatts 8→7 / 5→4 /
+      5→4\). The PG-side heap\_form\_tuple SIGSEGV is gone.
+    - Index audit \(leaf tuples vs heap rows, all 117 bootstrap indexes\):
+      only 2658 was wrong, with 0 vs 2802. It is now built at initdb from the
+      same row source as the heap \(pgAttrBootstrapHeapRows\). goopg maintains
+      it at runtime through insertPgAttributeIndexEntries, which all five
+      pg\_attribute writers use; 2658 is registered in the sys-btree split
+      table.
+    - relhasindex is now true for local catalogs too, completing
+      M0149-0001d's scope.
+    - PG 18.3 on a goopg directory now succeeds at CREATE TABLE, INSERT,
+      CREATE SCHEMA, CREATE INDEX, ALTER TABLE ADD COLUMN, CREATE VIEW /
+      SELECT and CREATE DATABASE + connect.
+    - Still failing on PG \(the missing-index item\): a PRIMARY KEY needs
+      2664 pg\_constraint\_conname\_nsp\_index; COMMENT needs 2675
+      pg\_description\_o\_c\_o\_index; DROP needs 2673 pg\_depend\_depender\_index.
+    - New finding: PG warns "invalid page in block 0 of relation
+      base/5/1247\_fsm \(1249\_fsm, 1259\_fsm\); zeroing out page" on its first
+      catalog write. goopg's catalog FSM forks are not PG-format.
+    - Gates: units, postmaster, testport interop set, regress A/B on 20
+      cases \(only the join ±1 flapper moved\), spotcheck, sf025 99,
+      acceptance.
+    - Next slice: bootstrap and maintain the 19 missing catalog indexes,
+      starting with 2673 / 2674 \(pg\_depend\), 2664 and 2675.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 2 \(committed with the slice-2 commit\):
+    - Generic CatalogIndexInsert: sys\_catalog\_index\_generic.go registers,
+      per catalog, the indexes no explicit inserter keeps. writeHeapRowCanonical
+      calls maintainCatalogIndexes after every write, and the split table
+      falls back to the registry for the layout.
+    - It covers 2606 \(2664 / 2665 / 2666 / 2667 / 2579\), 2611 \(2680 / 2187\),
+      1261 \(6303 / 2694 / 2695 / 6302\), 2619 \(2696\), 2964 \(2965\), 3381
+      \(3380 / 3379 / 3997\), 6106 \(6116\) and 2608 \(2673 / 2674\).
+    - Bootstrapped six missing indexes: 2673, 2674, 2187 and 2675 as empty
+      images over empty heaps; 2664 and 2579 built from the two bootstrap
+      pg\_constraint rows.
+    - Coverage audit after a 30-statement DDL workload \(constraints, FK,
+      domain, enum, range, inheritance, roles, GRANT, ALTER … SET, ANALYZE,
+      CREATE STATISTICS, publication, partitions\): every audited index covers
+      its heap. Before: 19 under-covered.
+    - PG 18.3 over goopg data: PRIMARY KEY / UNIQUE and COMMENT now work.
+    - Still failing on PG, all recorded here:
+      - FK needs 2702 pg\_trigger\_oid\_index; DROP needs 3597
+        pg\_seclabel\_object\_index \(remaining missing indexes: 2651 2652
+        2683 2699 2702 2756 2757 2996 3257 3258 3395 3455 3597\).
+      - obj\_description fails because pg\_proc prosrc is the placeholder
+        "see system\_functions.sql".
+      - `ORDER BY conname` fails with "could not determine which collation":
+        name columns lack attcollation 950.
+      - DROP … CASCADE of a goopg-created table warns "unexpected pg\_constraint
+        record".
+      - PG rejects goopg's catalog FSM forks \(1247 / 1249 / 1259 / 2606 /
+        2608 / 2610 / 2618\).
+      - pg\_enum: "could not find tuple for opclass 10012".
+      - pg\_ts\_template\_tmplname\_index 3766: "contains corrupted page at
+        block 0".
+    - Gates: units, postmaster, testport interop set, regress A/B over 16
+      constraint / FK / domain / inherit / stats / privilege / publication
+      cases \(no movement\), spotcheck. sf025 and acceptance are blocked by
+      the nightly batch \(01:15–\) and are re-run before the commit.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 3:
+    - Bootstrapped six indexes over catalogs that are empty at initdb and
+      that goopg does not write: 2699 / 2702 pg\_trigger, 2996
+      pg\_largeobject\_metadata, 3257 / 3258 pg\_policy, 3597 pg\_seclabel.
+    - Added the pg\_init\_privs catalog \(3394, reltype 10090, 5 columns,
+      empty heap\) and its index 3395. It had no pg\_class row and no file.
+    - PG 18.3 over goopg data, after the 30-statement goopg workload:
+      - CREATE TABLE … REFERENCES works, and the FK is enforced.
+      - DROP VIEW, DROP TABLE, DROP TABLE … CASCADE \(of goopg-created
+        tables\), DROP MATERIALIZED VIEW / TYPE / DOMAIN / SEQUENCE / FUNCTION
+        all succeed. Before: "could not open relation with OID 2702 / 3597 /
+        3394".
+      - No backend crash.
+    - Coverage audit: 130 indexes; only the already-recorded pg\_enum
+      \(opclass 10012\) and 3766 defects remain.
+    - Still missing: 2651 / 2652 pg\_am, 2756 pg\_amop, 2757 pg\_amproc and
+      3455 pg\_class \(all over heaps with bootstrap rows, so they must be built
+      from the rows\); 2683 needs the pg\_largeobject catalog \(no pg\_class
+      row\). pg\_init\_privs lacks PG's 229 initdb rows and its TOAST 4155.
+    - Gates: units, postmaster, testport interop set, spotcheck, sf025 99.
+    Movement: none — C3 cold-start fix
+  - 2026-11-16 slice 4:
+    - Built the indexes over catalogs that carry bootstrap rows, from those
+      rows: 2651 / 2652 pg\_am, 2756 pg\_amop, 2757 pg\_amproc, 3455 pg\_class
+      \(pgClassBootstrapRels is now the single pg\_class row source\).
+      Runtime maintenance is registered for pg\_am, pg\_amop and pg\_amproc.
+    - PG 18.3 now runs CREATE INDEX USING hash, pg\_filenode\_relation \(3455\)
+      and the pg\_am / pg\_amop OID lookups.
+    - **Not registered: pg\_class 3455 runtime maintenance.** With it,
+      TestE2E\_FailoverGoopgToPG tripped PG's Assert\("tuplesz <=
+      BTMaxItemSize"\) \(nbtdedup.c, \_bt\_dedup\_finish\_pending\) on a user-index
+      insert \(b5a\_idx\) on the promoted PG node.
+      - Bisect: 2 of 5 runs failed with the entry; 0 of 10 at the previous
+        commit; 0 of 5 without the entry.
+      - The mechanism is unknown. goopg's sys-btree inserter
+        \(insertCanonicalSysBtreeLeafInDB → MarkDirtyForceFPI\) WAL-logs a
+        3455 page that somehow corrupts the user index on the replayed
+        side. Investigate with pg\_waldump on the standby's WAL around b5a\_idx.
+      - Until fixed, 3455 lacks goopg-created relations.
+    - New findings:
+      - CREATE INDEX USING brin SIGSEGVs PG in index\_opclass\_options →
+        spg\_text\_leaf\_consistent: a pg\_amproc support function maps to
+        the wrong proc. Pre-existing \(the slice-3 binary crashes too\).
+      - PG autovacuum asserts !TransactionIdIsValid\(relfrozenxid\)
+        \(vacuum.c\): goopg's pg\_class rows for storage-less relations
+        \(views\) carry a valid relfrozenxid.
+      - The text search configuration "simple" is missing \(pg\_ts\_config is
+        empty\).
+    - Gates: units, postmaster, testport interop set, failover 5 of 5 on the
+      final tree, regress A/B on 7 DDL cases \(no movement\), spotcheck,
+      sf025 99, acceptance.
+    Movement: none — C3 cold-start fix
+  - 2026-11-16 slice 5: pg\_class relfrozenxid / relminmxid by relkind.
+    - PG gives a valid pair only to relkinds with a table AM \(r, t, m —
+      RELKIND\_HAS\_TABLE\_AM; heap\_create in catalog/heap.c\). goopg wrote
+      3/1 on every on\-disk row: views, indexes, sequences, partitioned
+      tables, initdb's nailed catalog indexes and information\_schema views.
+    - New executor.PGClassFrozenIDs is used by the user\-relation and index
+      builders, initdb's pgClassRow and the relcache init\-file blob.
+    - A/B with PG 18.3 cold\-started on a copy, database\-wide VACUUM:
+      - at the previous commit: TRAP Assert\("\!TransactionIdIsValid\(relfrozenxid\)"\)
+        vacuum.c:1696 \(vac\_update\_datfrozenxid\);
+      - now: VACUUM completes.
+      - To reach that step, the copies had pg\_enum's index \(opclass 10012\)
+        hidden and REINDEXed 3766 and 3767.
+    - relkind census on the copy now matches a PG 18.3 initdb \(r/t/m
+      valid; i/S/v/c/p 0\).
+    - New finding: pg\_ts\_template\_oid\_index 3767 is also a corrupted
+      page, not only 3766.
+    - Gates: units, postmaster, testport interop set ×3 \(failover,
+      standby full cycle, crash start, recovery 034, pg\_dump\), spotcheck.
+    Movement: none — C3 cold-start fix
+  - 2026-11-16 slice 6: pg\_ts\_template indexes 3766 / 3767 are btrees again.
+    - Cause: bootstrapPostgresDatabase wrote empty btree pages for them.
+      bootstrapMappedLocalCatalogHeaps, which runs later, overwrote both with
+      HEAP pages because they were in mappedLocalCatalogPlaceholderOIDs.
+      PG's \_bt\_checkpage then reported "contains corrupted page at block 0".
+    - Removed them, and the shared pg\_parameter\_acl TOAST index 6245
+      \(mislabelled as a local catalog\), from the heap\-placeholder list.
+    - New guard: TestMappedLocalCatalogPlaceholdersAreNotIndexes rejects any
+      bootstrap index OID in that list.
+    - TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages had pinned the
+      bug; its list was corrected.
+    - PG 18.3 cold start: an Index Scan on pg\_ts\_template\_oid\_index works.
+      With only pg\_enum's index hidden, database\-wide VACUUM completes.
+    - The last VACUUM blocker is "could not find tuple for opclass 10012".
+      10012 is PG's real btree float4\_ops OID, so the gap is goopg's
+      pg\_opclass heap or its index 2687.
+    - Gates: units, initdb, postmaster, testport interop set, spotcheck,
+      sf025 99, acceptance 24 MATCH.
+    Movement: none — C3 cold-start fix
+  - 2026-11-16 slice 7: pg\_opclass / pg\_opfamily match PostgreSQL 18.3's postgres.bki row for row.
+    - Opclass OIDs: goopg used private OIDs \(a 9000 series plus
+      1984–1987\) for the 164 opclasses that pg\_opclass.dat leaves to
+      genbki. pg\_index.indclass and goopg's runtime opclass map
+      \(catalog.go\) use PG's 10000\+ OIDs, so PG failed "could not find tuple
+      for opclass 10012" on pg\_enum's index. That was the last blocker of a
+      database\-wide VACUUM.
+    - Access methods: opcmethod and opfmethod had spgist and BRIN swapped
+      \(spgist is 4000, brin is 3580\). This was the cause of the slice\-4
+      BRIN CREATE INDEX SIGSEGV: BRIN resolved spgist opclasses and called
+      spg\_text\_leaf\_consistent.
+    - Renumbered from PG's own pg\_opclass, and fixed the four pg\_index
+      opclass constants \(name, char, oidvector and bool\_ops\).
+    - New oracle tests TestPgOpclassMatchesPostgresBKI and
+      TestPgOpfamilyMatchesPostgresBKI parse postgres.bki.
+    - PG 18.3 cold start with no workarounds:
+      - database\-wide VACUUM completes;
+      - CREATE INDEX USING brin and spgist work;
+      - float4 and bool btrees work, and index\-driven counts are correct.
+    - New finding: goopg's own SQL\-level pg\_opclass / pg\_opfamily return 0
+      rows on a fresh cluster. This predates the change; HEAD does the same.
+    - Gates: units, initdb, postmaster, testport interop set, spotcheck,
+      sf025 99, acceptance.
+    Movement: none — C3 cold-start fix
+  - 2026-11-16 slice 8: pg\_am / pg\_amop / pg\_amproc pinned to postgres.bki.
+    - Content already matched PG 18.3 on the natural key \(945 amop and 714
+      amproc rows\); only the OIDs were goopg's \(7000\+ and 7100\+\).
+    - pg\_amproc is in .dat order, so its base is now 10000, which equals
+      genbki's.
+    - pg\_amop is emitted in goopg's own order. Each row now takes its PG OID
+      from pg\_amop\_oids\_generated.go \(scripts/gen\-pg\-amop\-oids.py,
+      keyed on family, left type, right type and strategy\).
+    - Oracle tests: TestPgAmMatchesPostgresBKI, TestPgAmopMatchesPostgresBKI
+      and TestPgAmprocMatchesPostgresBKI.
+    - PG cold start: OID lookups through 2756 / 2757 return PG's rows;
+      VACUUM, BRIN and btree all work.
+    - Regress A/B against a HEAD worktree: no movement from this slice.
+    - The inventory was stale since e11971ba1. Re\-measured with
+      \-\-update\-inventory: opr\_sanity 774→733 and create\_am 153→148,
+      both already present at 6ffd8f664 \(slices 5–7\).
+    - Gates: units, initdb, postmaster, testport interop set, spotcheck,
+      sf025 99, acceptance.
+    Movement: regress opr\_sanity 774→733, create\_am 153→148 \(attributed to slices 5–7; this slice none\)
+  - 2026-11-16 slice 9: nailed\-catalog descriptors pinned to postgres.bki create declarations.
+    - TestNailedRelAttrsMatchPostgresBKI checks names, order, types and
+      relnatts. It checks both the nailed descriptor and the pg\_attribute
+      heap rows \(pgAttrEntriesForRel\).
+    - Fixed:
+      - pg\_operator: 10→15 columns. oprcom, oprnegate, oprcode, oprrest and
+        oprjoin were stored but not declared, so a PG node answered
+        "column oprcode does not exist".
+      - pg\_auth\_members: 5→7 columns \(inherit\_option, set\_option\).
+      - pg\_inherits: 3→4 columns \(inhdetachpending\).
+      - pg\_am.amhandler: oid→regproc.
+      - pgCatalogTypeOID mapped oid and xid to int4 \(23\). 14 pg\_class and
+        3 pg\_attribute columns are now oid 26 / xid 28.
+    - Also pinned: pg\_operator \(799\) and pg\_cast \(235\) Go tables
+      against postgres.bki. Both already matched.
+    - Cross\-catalog SQL census, PG cold start vs scratch PG:
+      - identical: pg\_operator, pg\_am, pg\_opclass, pg\_opfamily,
+        pg\_amop, pg\_amproc, pg\_aggregate, pg\_cast, pg\_conversion,
+        pg\_range, pg\_tablespace;
+      - still diverging: pg\_proc \(2669 rows\), pg\_type \(666 missing,
+        mostly initdb\-time rowtypes\), pg\_description / pg\_shdescription
+        \(empty\), pg\_ts\_\* \(empty\), pg\_collation \(7 vs 860\),
+        pg\_namespace \(4 vs 16\), pg\_language \(no plpgsql\),
+        pg\_auth\_members \(0 vs 3\).
+    - psql \\do\+ on PG fails on the SQL\-function prosrc placeholder
+      "see system\_functions.sql".
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B
+      on 6 cases \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 10: pg\_auth\_members carries PG initdb's three predefined memberships.
+    - The rows: pg\_monitor is granted pg\_read\_all\_settings,
+      pg\_read\_all\_stats and pg\_stat\_scan\_tables \(system\_functions.sql\),
+      OIDs 10308–10310, grantor 10, INHERIT and SET true.
+    - bootstrapPgAuthMembers writes global/1261 through the new
+      writeSharedHeapRows \(buildMultiPageHeapFile was factored out of the
+      local writer\). It also builds indexes 6303, 2694, 2695 and 6302.
+    - PG 18.3 cold start: pg\_has\_role\(mon, pg\_stat\_scan\_tables\) is true
+      for a pg\_monitor member. Index lookups, GRANT, REVOKE and VACUUM work.
+    - goopg loads the rows through reloadRoleMembershipsFromHeap and keeps
+      them across two restarts, next to a runtime GRANT.
+    - Findings:
+      - goopg has no pg\_has\_role function at all \(PG has 6 overloads\).
+      - goopg start runs on a directory whose init failed halfway \(no
+        global/pg\_control\) without complaint.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      6 role/catalog cases \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 11: pg\_namespace and pg\_language rows equal a PG 18.3 initdb.
+    - pg\_namespace:
+      - public is owned by pg\_database\_owner \(6171\).
+      - nspacl carries setup\_privileges' and information\_schema.sql's
+        GRANT USAGE TO PUBLIC: pg\_catalog and information\_schema
+        \{B=UC/B,=U/B\}; public
+        \{pg\_database\_owner=UC/pg\_database\_owner,=U/pg\_database\_owner\};
+        pg\_toast NULL. It used to be the empty array everywhere.
+      - The value is encoded through the new exported
+        executor.EncodeAclItemArrayText.
+    - User CREATE SCHEMA rows now store nspacl NULL \(acldefault\) instead of
+      "\{\}". On a PG node an explicit empty ACL denies even the owner USAGE,
+      because aclmask implies only the owner's grant options.
+    - pg\_language: sql.laninline was 2511, which is pg\_cursor and not an
+      inline handler. It is now 0, as in postgres.bki.
+    - Oracle tests: TestPgLanguageMatchesPostgresBKI and
+      TestPgNamespaceRowsMatchPG18Initdb.
+    - Found, recorded for the next slice:
+      - "\{\}" aclitem\[\] values are encoded with ndim 0, so PG's check\_acl
+        fails with "ACL arrays must be one\-dimensional". A non\-superuser on
+        a PG node cannot even read pg\_catalog.pg\_class.
+      - PG's catalog relacl is a real initdb ACL \(=r to PUBLIC\).
+      - goopg's CREATE SCHEMA … AUTHORIZATION records owner 10.
+      - pg\_language lacks plpgsql.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      6 cases \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 12: ACL columns — the catalogs carry PG initdb's relacl, and no ACL is the ndim\-0 array PG rejects.
+    - Cause: goopg wrote "\{\}" into every pg\_class.relacl and encoded it as
+      a 0\-dimensional array. PG's check\_acl rejects that with "ACL arrays
+      must be one\-dimensional", so a non\-superuser on a PG node could not
+      read pg\_catalog.pg\_class.
+    - Bootstrap pg\_class rows now carry the relacl a PG 18.3 initdb leaves:
+      - 205 relations, from pg\_class\_relacl\_generated.go;
+      - scripts/gen\-pg\-class\-relacl.sh regenerates it from its own
+        throwaway initdb; regeneration is idempotent;
+      - the rest stay NULL;
+      - pg\_largeobject has no bootstrap row yet.
+    - User relations: relacl is NULL until a GRANT, then the materialized
+      ACL \(userRelACLDatum, SequenceRelaclText for sequences\). Indexes and
+      composite\-type relations store NULL.
+    - A genuinely emptied ACL encodes as PG's allocacl\(0\) \(ndim 1, dims 0\).
+    - writeMultiPageHeap \(the pg\_class bootstrap writer\) built tuples with
+      no null bitmap. A NULL column was dropped but never marked NULL, so PG
+      asserted in build\_reloptions. It now delegates to the null\-aware
+      writer.
+    - PG cold start: catalog relacl values equal a PG initdb. A non\-superuser
+      reads pg\_class, information\_schema.tables and pg\_stat\_activity, and
+      is denied pg\_authid, as on PG.
+    - Reconfirmed: M0146\-0161, table grants lost on restart.
+    - The postmaster package flaked once: TestSimpleQueryBatchAbortUndoesEarlierCreateTable
+      failed 1 of 3 full runs and passed 3 of 3 in isolation.
+    - Gates: units, initdb, postmaster \(after the flake\), testport interop
+      set, regress A/B on 7 privilege cases \(no movement\), spotcheck,
+      sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 13: pg\_proc.proacl equals a PG 18.3 initdb, and aclitem\[\] is 8\-byte aligned.
+    - Bootstrap pg\_proc rows carry the 66 proacl values a PG initdb leaves.
+      system\_functions.sql REVOKEs EXECUTE from PUBLIC \(pg\_ls\_dir,
+      pg\_read\_file, signalling, replication control\) and GRANTs some of
+      them to pg\_monitor and pg\_read\_all\_stats.
+    - The table comes from scripts/gen\-pg\-initdb\-acls.sh, which supersedes
+      slice 12's gen\-pg\-class\-relacl.sh. One generated file,
+      pg\_initdb\_acls\_generated.go, now holds relacl and proacl.
+    - Found while verifying: \_aclitem is typalign 'd' \(AclMode is 64\-bit
+      since PG 16\). goopg aligned it to 4:
+      - The zero pad byte made a hosted PG align to 8 inside the array header.
+      - Reading a non\-NULL proacl asserted in execTuples.c.
+      - Fixed in all three siblings: catalog.PhysicalTypeAlign \(heap
+        codec\), initdb pgTypeAlignChar \(pg\_attribute rows\), and the
+        relcache init\-file attalign. The latter now takes a varlena's
+        typalign instead of 'i' from attlen alone.
+    - PG cold start: proacl is identical to a PG initdb \(66/66\).
+      - A plain user is denied pg\_ls\_dir; a pg\_monitor member runs
+        pg\_ls\_waldir.
+      - pg\_proc.proacl attalign is 'd'; database\-wide VACUUM passes.
+    - Old\-data check: a datacl written by the previous binary reloads
+      intact under the new one.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      7 privilege cases \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 14: catalog.PhysicalTypeAlign pinned to pg\_type.dat; arrays take their element's typalign.
+    - TestPhysicalTypeAlignMatchesPostgresBKI compares the shared alignment
+      table, used by the heap codec and the pgoutput walker, with every
+      pg\_type row in postgres.bki. Out\-of\-scope rows are listed in an
+      explicit knownAlignGaps allowlist:
+      - fixed\-length types goopg stores as varlena: tid, point, lseg, box,
+        line, circle, money, scalar aclitem;
+      - composite rowtypes;
+      - pseudo\-types.
+    - Fixed:
+      - Arrays take their element's alignment. \_int8, \_float8,
+        \_timestamp\(tz\), \_interval, \_time\(tz\), \_pg\_lsn, \_xid8 and the
+        geometric arrays are 8; all arrays used to be 4.
+      - 'd' varlenas: int8/ts/tstz range and multirange, path, polygon,
+        pg\_snapshot and txid\_snapshot.
+      - The colTypeDescriptor array branch now follows the same rule.
+    - WRONG RESULTS fixed: an int8\[\] column sitting 4 bytes off an 8\-byte
+      boundary read back on a PG 18.3 node as \{1,12884901888,549755813888\}
+      instead of \{1,2,3\}. goopg's user pg\_attribute rows already declared
+      'd'; only the codec padded to 4.
+    - The new binary still reads that old\-binary table correctly.
+    - Corrected TestPgoPhysicalAlignArrayIsVarlenaAlign, which had pinned
+      the wrong "every array is 'i'" rule.
+    - Gates: units, postmaster, testport interop set \(including the logical
+      ports\), regress A/B on 7 array/range/datetime cases \(no movement\),
+      spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 15: bootstrap pg\_proc scalar attributes are pg\_proc.dat's.
+    - Problem: goopg's seed defaulted most attributes. 2455 built\-ins were
+      VOLATILE where PG has IMMUTABLE or STABLE; on a PG node such functions
+      are rejected in index expressions and never constant\-folded. Also:
+      - proleakproof differed on 345 rows; prorows and procost on about
+        105 each;
+      - prosupport on 52, provariadic on 37 and prokind on 6;
+      - probin was NULL on 84 C\-language conversion functions.
+    - pgProcRow overlays pgProcBKIAttrsByOID, generated by
+      scripts/gen\-pg\-proc\-attrs.py \(idempotent; it honours bki quoting,
+      including empty ''\). The overlay covers:
+      - procost, prorows, provariadic, prosupport, prokind;
+      - prosecdef, proleakproof, proisstrict, proretset;
+      - provolatile, proparallel, probin.
+    - goopg's own pg\_proc reload skips built\-ins \(OID \< FirstUserOID\),
+      so goopg's semantics are unchanged.
+    - PG cold\-start census: pg\_proc rows identical to a PG initdb went
+      from 739 to 3327 of 3408.
+      - On the PG node, expression indexes on lower\(\) and sha256\(\) build,
+        and an index lookup through one works.
+      - The remaining 81 rows are system\_functions.sql SQL functions:
+        prosrc / prosqlbody \(46\), argument defaults \(35\), proargnames
+        \(22\), plus 2 procost values set there.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      7 cases \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 16: pg\_proc rows re\-created by system\_functions.sql equal a PG initdb — all 3408 built\-in rows identical.
+    - scripts/gen\-pg\-proc\-initdb\-overrides.py runs a throwaway initdb and
+      captures each built\-in's post\-initdb row. It emits only the 122 rows
+      that differ from postgres.bki, into pg\_proc\_initdb\_overrides\_generated.go.
+      Each row carries:
+      - prosrc, and prosqlbody as nodeToString;
+      - pronargdefaults and proargdefaults;
+      - proargnames;
+      - cost, rows, strictness, volatility, parallel and language.
+    - pgProcRow applies them after slice 15's pg\_proc.dat overlay.
+    - Node trees over the TOAST threshold are stored inline pglz\-compressed,
+      via pglzVarlenaDatum. ts\_debug's 19 KB prosqlbody becomes 3.6 KB inline,
+      where PG would store it out of line.
+    - PG cold start:
+      - 3408 of 3408 built\-in pg\_proc rows are identical to a PG initdb;
+      - pg\_relation\_size, obj\_description, make\_interval\(days =\> 2\) and
+        jsonb\_set\_lax with defaulted arguments all work;
+      - psql \\do\+ now fails one step later, on the known name\-column
+        attcollation residual \("could not determine which collation"\).
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      7 cases \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 17: bootstrap pg\_attribute metadata equals a PG 18.3 initdb.
+    - Rows identical to PG went from 1559 to 2817 of 2849. psql \\do\+, \\df\+,
+      \\dt\+ and \\d now work on a PG node.
+    - The values come from pg\_attribute\_meta\_generated.go, produced by
+      scripts/gen\-pg\-attribute\-meta.py from a throwaway initdb and keyed
+      by relname.attname. pgAttributeRow overlays them only when goopg
+      writes the same atttypid. Overlaid columns:
+      - attcollation: 950 on name / sql\_identifier, 100 on text;
+      - attalign and attbyval of the declared type;
+      - attndims for arrays and atttypmod;
+      - attstorage;
+      - attnotnull: false on index columns;
+      - attacl: the column GRANTs initdb issues.
+    - Sibling fixes found by the new TestPgAttributeMetaMatchesCodec:
+      - pgTypeAlignChar said 'i' for timestamptz, timestamp, interval, time,
+        timetz and xid8, which the codec already pads to 8.
+        pg\_authid.rolvaliduntil carried the wrong attalign.
+      - pgTypeByVal said false for xid, timestamps, date, cid and xid8.
+      - The relcache init file's pgTypeIsByVal kept its own shorter list.
+        It now delegates to pgTypeByVal.
+    - Left as is: 32 index columns on name, where PG's key type is cstring
+      \(atttypid 2275, attlen \-2\). goopg's index tuples store 64\-byte
+      NameData, so this needs an index\-format change.
+    - Not bootstrapped: 312 PG\-only system columns, on relations goopg
+      lacks.
+    - Gates:
+      - units, initdb, postmaster, testport interop set, regress A/B on
+        9 catalog\-reading cases, spotcheck, sf025 99, acceptance;
+      - type\_sanity read 79 once and 82 in two reruns, so no stable
+        movement. The stale inventory \(93\) was re\-measured to 82.
+    Movement: regress type\_sanity 93→82 \(inventory catch\-up; this slice no stable movement\)
+  - 2026-11-16 slice 18: system relations' rowtypes in pg\_type; pg\_class.reltype equals PG.
+    - Added rows: the composite rowtype of every bootstrap system relation
+      that has one \(59 catalogs, 145 views\) and each rowtype's array
+      type. The rows come from pg\_type\_rowtypes\_generated.go, produced by
+      scripts/gen\-pg\-type\-rowtypes.py from a throwaway initdb. They are
+      added only where goopg bootstraps the relation under the same OID and
+      name.
+    - Index support: pg\_type\_oid\_index now uses the multi\-level bulk
+      loader, since pg\_type outgrew one leaf. pg\_type\_typname\_nsp\_index
+      includes the new rows.
+    - pg\_class.reltype: pgClassRelType, shared by the heap row and the
+      relcache init file, points at the captured rowtype; indexes get 0.
+      Before, most catalogs carried the placeholder 83 and views or indexes
+      their own OID.
+    - PG cold start:
+      - pg\_type: 618 of 619 shared rows identical, from 213 rows present
+        before. Only pg\_largeobject's rowtype and array are missing.
+      - pg\_class.reltype: 358 of 358 identical.
+      - Row casts, array\_agg over a catalog rowtype, regtype lookups of
+        catalog names and \\d\+ all work.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      7 cases \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 19: built-in object descriptions in pg\_description / pg\_shdescription.
+    - Before: both heaps were empty placeholders. On a PG node,
+      obj\_description\(\) and the Description column of psql \\df\+, \\do\+
+      and \\l\+ came back empty.
+    - Source: scripts/gen\-pg\-description.py captures them from a throwaway
+      initdb into pg\_description\_generated.go:
+      - 4451 pg\_description rows for objects with fixed pg\_\*.dat OIDs in
+        catalogs goopg bootstraps \(pg\_proc, pg\_operator, pg\_conversion,
+        pg\_type, pg\_am, pg\_collation, pg\_namespace, pg\_language\);
+      - the 3 pg\_shdescription rows.
+    - bootstrapPgDescription writes the heaps \(base/\{1,5\}/2609 and
+      global/2396\) and bulk\-builds indexes 2675 and 2397. It runs after
+      the empty\-placeholder writer.
+    - PG cold start: obj\_description\(now\) and shobj\_description\(5\) work,
+      \\df\+, \\do\+ and \\l\+ show descriptions, lookups go through
+      pg\_description\_o\_c\_o\_index, and COMMENT ON TABLE still works next
+      to the bootstrap rows.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      6 cases \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 20: text\-search bootstrap catalogs \(postgres.bki rows\).
+    - Before: pg\_ts\_parser, pg\_ts\_template, pg\_ts\_dict, pg\_ts\_config
+      and pg\_ts\_config\_map were empty, so a PG node had no text search
+      configuration at all.
+    - Source: scripts/gen\-pg\-ts\-bootstrap.py generates
+      pg\_ts\_bootstrap\_generated.go straight from postgres.bki:
+      - the default parser;
+      - the simple, synonym, ispell and thesaurus templates;
+      - the simple dictionary and configuration;
+      - the 19 rows of the simple configuration's token map.
+    - bootstrapPgTS writes the five heaps and nine indexes: each object
+      catalog's oid index and \(name, namespace\) index, plus
+      pg\_ts\_config\_map\_index.
+    - goopg's TS heap reloads skip bootstrap OIDs; two restarts are clean.
+    - PG cold start:
+      - to\_tsvector\('simple', …\), @@ and ts\_debug work;
+      - \\dF and \\dFd list the simple configuration and dictionary;
+      - CREATE TEXT SEARCH CONFIGURATION … \(COPY = simple\) works.
+    - Not seeded: the 29 snowball dictionaries and configurations. They need
+      initdb's dict\_snowball C functions \(pg\_proc 13212/13213, probin
+      $libdir/dict\_snowball\).
+    - goopg itself has no to\_tsvector function \(goopg\-side gap\).
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      6 cases including tsearch and tsdicts \(no movement\), spotcheck,
+      sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 21: snowball text search — every pg\_ts\_\* catalog equals a PG 18.3 initdb.
+    - scripts/gen\-pg\-ts\-snowball.py captures from a throwaway initdb what
+      snowball\_create.sql adds, into pg\_ts\_snowball\_generated.go:
+      - the dict\_snowball C functions dsnowball\_init / dsnowball\_lexize
+        \(pg\_proc 13212/13213, probin $libdir/dict\_snowball\), which join the
+        pg\_proc seed through a new pgProcEntry.Bin field;
+      - the snowball template;
+      - 29 language dictionaries with their dictinitoption;
+      - 29 configurations and their token maps;
+      - the descriptions of all of these.
+    - bootstrapPgTS and bootstrapPgDescription append these rows to
+      slice 20's bki rows.
+    - PG cold start:
+      - pg\_ts\_template, pg\_ts\_dict, pg\_ts\_config and
+        pg\_ts\_config\_map are identical to a PG initdb;
+      - english and german stemming work through PG's dict\_snowball.so;
+      - plainto\_tsquery matches;
+      - \\dF lists 30 configurations, and their descriptions resolve.
+    - goopg restarts clean twice.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      6 cases including tsearch and tsdicts \(no movement\), spotcheck,
+      sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 22: pg\_init\_privs carries PG 18.3 initdb's 229 rows on disk and in goopg's view.
+    - scripts/gen\-pg\-init\-privs.sh captures setup\_privileges\(\)' rows from
+      a throwaway initdb in ctid order into
+      internal/catalog/pg\_init\_privs\_generated.go \(PGInitdbInitPrivs:
+      66 functions, 144 relations, 17 pg\_subscription columns, 2 schemas\).
+    - initdb's bootstrapPgInitPrivs writes them to base/\{1,5\}/3394 and
+      bulk\-builds pg\_init\_privs\_o\_c\_o\_index 3395.
+    - goopg's virtual pg\_init\_privs serves the same rows; the old synthetic
+      per\-relation renderer is gone.
+    - Sibling fix: goopg's SQL nspacl for pg\_catalog and information\_schema
+      is now \{postgres=UC/postgres,=U/postgres\}, so pg\_dump on goopg emits no
+      new REVOKE USAGE ON SCHEMA pg\_catalog.
+    - PG cold start: all 229 rows read back identical to a PG initdb, and an
+      index scan on 3395 finds schema public.
+    - Still open \(ledgered\):
+      - goopg reports schema public as owner postgres with NULL nspacl, so
+        pg\_dump on goopg still emits REVOKE USAGE ON SCHEMA public FROM
+        PUBLIC \(HEAD does the same\);
+      - pg\_class relpages/reltuples for catalog relations stay 0;
+      - pg\_init\_privs TOAST 4155/4156 is absent.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      6 cases \(init\_privs, privileges, namespace, rolenames, dependency,
+      psql; no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 23: a fresh goopg database pg\_dumps byte-identically to a fresh PG 18.3 one.
+    - goopg's comment store is seeded from PG initdb's built-in
+      descriptions. The generated tables moved to
+      internal/catalog/pg\_description\_generated.go \(PGInitdbDescriptions,
+      PGInitdbShdescriptions; initdb aliases pgDescriptionRow to
+      catalog.InitdbDescription\), so goopg's pg\_description and the
+      on\-disk 2609 / 2396 share one source.
+    - goopg's pg\_description now has 4451 rows; PG has 5354. The gap is
+      objects goopg's SQL catalog lacks: 835 ICU collations, plpgsql, and
+      text\-search objects.
+    - obj\_description\(oid, name\) resolves the catalog name. It ignored the
+      name and always keyed pg\_class, so \\dn\+ and \\dA\+ descriptions were
+      empty.
+    - Schema public on goopg's side:
+      - its owner is pg\_database\_owner \(6171\);
+      - its nspacl is \{pg\_database\_owner=UC/pg\_database\_owner,=U/pg\_database\_owner\}
+        \(aclOwnerDisplay; a superuser GRANT renders the owner as grantor\).
+    - Result: no ALTER SCHEMA public OWNER, COMMENT ON SCHEMA public IS
+      '' or REVOKE USAGE lines in pg\_dump.
+    - Still open \(ledgered\):
+      - goopg's pg\_namespace view omits pg\_toast;
+      - the ACL store renders any other non\-postgres owner as postgres;
+      - schema privileges are not enforced.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      10 cases \(psql 766→748, others unchanged\), spotcheck, sf025 99,
+      acceptance.
+    Movement: regress psql 774→748 \(inventory; A/B 766→748\)
+  - 2026-11-16 slice 24: goopg's pg\_namespace lists pg\_toast; every namespace row now equals PG 18.3's.
+    - PGNamespaceRowsForDBOid skipped pg\_toast as an "internal alias", a
+      leftover from when its OID collided with public's. It now lists
+      pg\_toast \(99, owner 10, NULL nspacl, "reserved schema for TOAST tables"\).
+    - Probe: oid, nspname, nspowner, nspacl and obj\_description match PG for
+      all four namespaces. A fresh\-db pg\_dump stays identical to PG.
+    - Filed from probes:
+      - M0149\-0001i: regnamespace has no input/output seam;
+      - M0146\-0161a \(S2\): GRANT inside BEGIN or a multi\-statement query records nothing.
+    - Gates: units, postmaster, testport interop set \+ toast/amcheck ports,
+      regress A/B on 7 cases \(no movement; alter\_generic 208–210 is its
+      known flake\), spotcheck, sf025 99, acceptance.
+    Movement: none — catalog conformance \(regress A/B unchanged\)
+  - 2026-11-16 slice 25: bootstrapped pg\_class rows carry relpages / reltuples / relallvisible measured from goopg's own catalog files.
+    - PG's initdb ends with VACUUM FREEZE, so its catalogs have real sizes;
+      goopg wrote 0 everywhere.
+    - goopg's heap packing differs from PG's: 79 of 219 relations have a
+      different block count. So the stats are measured, not copied.
+    - stampPgClassRelStats \(internal/initdb/pg\_class\_relstats.go\) patches
+      base/\{1,5\}/1259 in place, before template0 is cloned:
+      - heaps: relpages = blocks, reltuples = live line pointers,
+        relallvisible = PD\_ALL\_VISIBLE pages \(0, since goopg writes no VM\);
+      - btrees: leaf items without high keys;
+      - views: reltuples \-1.
+    - PG cold start:
+      - relpages equals pg\_relation\_size/8192 for every catalog \(0
+        mismatches\);
+      - pg\_proc reports 105 pages / 3412 tuples, and its plans use them.
+    - goopg restarts clean twice.
+    - Still open \(ledgered\):
+      - PG's initdb ANALYZE leaves 412 pg\_statistic rows for 38 catalogs;
+        goopg has none;
+      - relcache init files still carry 0;
+      - no visibility map, so relallvisible is 0;
+      - goopg's own SQL pg\_class reports 0 for catalogs.
+    - Gates: units, postmaster, testport interop set, regress A/B on 4 cases
+      \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 26: all 39 catalog TOAST relations of a PG 18.3 initdb.
+    - Before: goopg had 12. A PG node creating a function with a 40 KB body
+      failed with "row is too big: size 40184, maximum size 8160".
+    - nailedToastPairs gains the 27 per\-database DECLARE\_TOAST pairs:
+      pg\_proc, pg\_type, pg\_description, pg\_statistic, pg\_constraint, …
+      The existing machinery writes their pg\_class / pg\_attribute rows,
+      reltoastrelid and empty files.
+    - pgIndexInitialEntries derives the \(chunk\_id, chunk\_seq\) UNIQUE
+      PRIMARY pg\_index row for every pair not listed explicitly.
+    - pg\_class\_oid\_index now uses the multi\-level bulk loader, because
+      pg\_class outgrew one leaf.
+    - PG cold start:
+      - parent, toast and index OIDs equal a PG initdb for all 39;
+      - the 40 KB function stores 21 chunks in pg\_toast\_1255 and runs;
+      - a 12 KB COMMENT stores 7 chunks in pg\_toast\_2609.
+    - goopg restarts clean twice.
+    - Found while probing \(both pre\-existing on HEAD, still open\):
+      - goopg writes pg\_class.relfilenode = oid for all 63 mapped
+        catalogs; PG has 0 and resolves them through pg\_filenode.map.
+        On a PG node, VACUUM FULL pg\_proc leaves later backends reading
+        the truncated old file \("could not read blocks 56..56 in file
+        base/5/1255"\). This is the next slice.
+      - goopg's pg\_proc carries goopg\-private duplicates 8101 / 8102
+        of pg\_stat\_get\_ins\_since\_vacuum / mod\_since\_analyze \(PG: 5053 /
+        3177\). A PG node's REINDEX TABLE pg\_proc fails on the unique
+        pg\_proc\_proname\_args\_nsp\_index.
+      - Also: the stats stamped into relcache init files would be moot,
+        because PG deletes pg\_internal.init at every startup
+        \(StartupXLOG → RelationCacheInitFileRemove\). That edit was
+        dropped.
+    - Gates: units, initdb, postmaster, testport interop set \+ toast/amcheck
+      ports, regress A/B on 4 cases \(no movement\), spotcheck, sf025 99,
+      acceptance.
+    Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 27: the 63 mapped catalogs carry relfilenode 0, and both pg\_filenode.map files equal PG 18.3's byte for byte.
+    - Before:
+      - goopg wrote relfilenode = oid for pg\_class, pg\_attribute, pg\_proc,
+        pg\_type, every shared catalog, their indexes and TOAST pairs;
+      - the global map held 9 entries; the local map held ~60 non\-mapped
+        catalogs plus stale and duplicate OIDs.
+      - On a PG node, VACUUM FULL pg\_proc left every later backend reading
+        the truncated old file.
+    - internal/initdb/relmap\_catalogs.go holds PG's two map lists in
+      insertion order \(global 46, local 17\). They drive defaultRelMapFile,
+      the per\-database map, and pgClassRow \(relfilenode 0\). The 3455 index
+      follows from pgClassRow.
+    - Also fixed: pg\_class OID 2655 was named pg\_amproc\_oid\_index, the
+      same as 2757. That duplicated a pg\_class\_relname\_nsp\_index key;
+      2655 is now pg\_amproc\_fam\_proc\_index.
+    - PG cold start:
+      - every catalog's relname and relfilenode equal a PG initdb's, except
+        the known pg\_largeobject gap;
+      - VACUUM FULL pg\_proc / pg\_class / pg\_database, CLUSTER
+        pg\_attribute, REINDEX TABLE pg\_type / pg\_class all work, and
+        survive a PG restart.
+    - goopg restarts clean twice; its loader ignores relfilenode 0 rows.
+    - Gates: units, initdb, postmaster, testport interop set \+ toast,
+      amcheck, basebackup and rewind ports; regress A/B on 4 cases \(no
+      movement\); spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 28: goopg's bootstrap pg\_proc OIDs equal PG 18.3's, except plpgsql's three handler functions.
+    - Commit 1363ae002 \(2026\-08\-26\) hand\-added OIDs 8101 / 8102 for
+      pg\_stat\_get\_ins\_since\_vacuum / pg\_stat\_get\_mod\_since\_analyze to
+      two generated files. pg\_proc.dat already carries both functions, as
+      5053 / 3177.
+    - On a PG node REINDEX TABLE pg\_proc then failed: "could not create
+      unique index pg\_proc\_proname\_args\_nsp\_index".
+    - Both lines are removed; pg\_proc\_seed\_data.go is again byte\-identical
+      to cmd/gen\-pg\-proc\-data output. goopg resolves the functions by
+      name, so they keep working \(pg\_stat\_user\_tables.n\_ins\_since\_vacuum
+      probed\).
+    - New TestPgProcInitialEntriesSignaturesUnique guards \(proname,
+      proargtypes\) uniqueness.
+    - PG cold start:
+      - pg\_proc has 3410 rows; PG has 3413. The missing three are
+        13624–13626, plpgsql's handlers \(open plpgsql item\).
+      - REINDEX TABLE pg\_proc succeeds.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      4 cases \(no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 29: plpgsql is installed at initdb, as on PG 18.3 \(CREATE EXTENSION plpgsql\).
+    - scripts/gen\-pg\-plpgsql.py captures the extension's rows into
+      pg\_plpgsql\_generated.go:
+      - the three handlers \(pg\_proc 13624–13626, probin $libdir/plpgsql\);
+      - pg\_language 13627;
+      - pg\_extension 13623;
+      - its 7 pg\_depend rows \(4 'e' extension members, 3 'n' language →
+        handler\).
+    - The two descriptions come with gen\-pg\-description.py, whose filter
+      now also covers pg\_language / pg\_extension objects below 16384.
+    - bootstrapPgPlpgsql writes the pg\_extension heap with indexes 3080 /
+      3081, and pg\_depend with indexes 2673 / 2674. Before, goopg's
+      pg\_depend heap was empty.
+    - goopg's own SQL side:
+      - pg\_language carries PG's rows \(validators 2246–2248, sql laninline
+        0, plpgsql lanispl t and handlers 13624–13626\);
+      - pg\_extension lists plpgsql 13623 \(reloaded from the heap\);
+      - CREATE EXTENSION checks for an installed extension before the
+        control file, so `CREATE EXTENSION plpgsql` errors "already exists"
+        as on PG.
+    - PG cold start:
+      - all these rows equal a PG initdb's;
+      - a LANGUAGE plpgsql function returns 55 and a DO block runs;
+      - \\dx and \\dL match PG;
+      - forced index scans on 2673 / 2674 / 3080 / 3081 hit;
+      - DROP EXTENSION plpgsql CASCADE and CREATE EXTENSION plpgsql
+        round\-trip.
+    - goopg: restarts clean twice; a fresh\-db pg\_dump stays identical to
+      PG's; plpgsql functions work.
+    - Still open \(ledgered\):
+      - goopg's \\dx fails: pg\_available\_extensions has no
+        default\_version column;
+      - PG's initdb pg\_depend has 1725 rows; goopg writes only these 7.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      7 cases \(no movement; plpgsql's 1234–1244 is its known flake band\),
+      spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 30: pg\_largeobject \(2613\) and pg\_largeobject\_loid\_pn\_index \(2683\) are bootstrapped; every catalog relation's relname and relfilenode now equals a PG 18.3 initdb's.
+    - Before:
+      - a PG node's large\-object functions failed "could not open relation
+        with OID 2613";
+      - the bootstrap rowtype 10025 \(typrelid 2613\) named a pg\_class row
+        that did not exist.
+    - nailedLocalRels gains pg\_largeobject \(loid oid, pageno int4, data
+      bytea, all NOT NULL\). The index registry and the empty\-catalog index
+      list gain 2683, and pgIndexInitialEntries gains its UNIQUE PRIMARY
+      \(loid oid\_ops, pageno int4\_ops\) row.
+    - PG cold start:
+      - the pg\_class, pg\_attribute and pg\_index rows of 2613 / 2683 equal
+        a PG initdb's;
+      - the relname / relfilenode list of every catalog relation is now
+        identical;
+      - large objects round\-trip \(lo\_from\_bytea of 5000 bytes writes 3 pages; a
+        forced index scan finds them; lo\_unlink and VACUUM leave none\).
+    - goopg restarts clean twice. goopg's own SQL catalog still has no
+      pg\_largeobject relation \(ledgered\).
+    - The cold\-start test's tripwire had probed pg\_largeobject as "the one
+      PG catalog goopg never bootstraps". It now asserts pg\_largeobject is
+      readable and empty, and trips on a name that exists in neither system.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      4 cases \(largeobject, misc\_sanity, type\_sanity, oidjoins; no
+      movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 31: pg\_depend carries PG 18.3 initdb's dependency rows \(1719 of 1725\).
+    - Before: slice 29 wrote only plpgsql's 7 rows. On a PG node,
+      `DROP SCHEMA information_schema` silently dropped the schema and left
+      its views, functions and domains orphaned.
+    - scripts/gen\-pg\-depend.py captures every initdb pg\_depend row in
+      ctid order into pg\_depend\_generated.go. These are system views and
+      their rules and rowtypes, information\_schema, snowball and plpgsql.
+    - bootstrapPgDepend \(pg\_depend\_bootstrap.go\) writes them with
+      indexes 2673 / 2674. The plpgsql generator no longer emits its own copy.
+    - Left out: the 6 rows that reference pg\_settings' rewrite rules
+      pg\_settings\_u / pg\_settings\_n \(12108 / 12109\), which goopg does not
+      bootstrap \(pgDependMissingObjects, ledgered\).
+    - A check against the goopg image found every other depender and
+      referenced object present under PG's OID.
+    - PG cold start:
+      - the 1719 rows equal the oracle's in heap order;
+      - forced index scans hit;
+      - `DROP SCHEMA information_schema` is refused with PG's DETAIL
+        \(same as the oracle\); `DROP VIEW pg_roles` succeeds on both.
+    - goopg restarts clean twice, and serial sequences survive.
+    - goopg's own SQL pg\_depend still lists only runtime rows \(ledgered\).
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      5 cases \(dependency, misc\_sanity, sequence, alter\_table, create\_view;
+      no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 32: pg\_settings' two rewrite rules are bootstrapped; pg\_depend now equals PG 18.3 initdb's all 1725 rows.
+    - system\_views.sql creates pg\_settings\_u \(ON UPDATE … DO ALSO SELECT
+      set\_config\) and pg\_settings\_n \(ON UPDATE DO INSTEAD NOTHING\). goopg
+      lacked both, so `UPDATE pg_settings` on a PG node changed nothing.
+      Slice 31 had also left out their 6 pg\_depend rows.
+    - scripts/gen\-pg\-rewrite\-rules.py captures every non\-\_RETURN rule from
+      a throwaway initdb into pg\_rewrite\_rules\_generated.go, with ev\_qual /
+      ev\_action verbatim. pgRewriteInitialEntries appends them.
+      pgDependMissingObjects is now empty.
+    - PG cold start:
+      - both rules equal the oracle's \(md5 of ev\_qual and ev\_action\);
+      - pg\_depend equals the oracle's 1725 rows in heap order;
+      - `UPDATE pg_settings SET setting = '8MB' WHERE name = 'work_mem'`
+        sets work\_mem through set\_config and reports UPDATE 0, as on PG;
+      - pg\_rules lists both rules.
+    - goopg restarts clean twice.
+    - Found \(pre\-existing, same on HEAD, ledgered\): goopg's own SQL
+      pg\_settings has only 58 rows \(no work\_mem\), and goopg has no pg\_views
+      view.
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      4 cases \(rules, guc, misc\_sanity, sysviews; no movement\), spotcheck,
+      sf025 99, acceptance.
+    Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 33: pg\_collation carries a PG 18.3 initdb's 860 rows and their 842 descriptions.
+    - Before: goopg had the 7 pg\_collation.dat rows only. A PG node had no
+      ICU collations and no libc C.utf8, and `unicode` lacked its collversion.
+    - setup\_collation \(initdb.c\) imports `locale -a` libc locales and every
+      ICU locale through pg\_import\_system\_collations.
+    - scripts/gen\-pg\-collations.py captures the resulting heap, in ctid
+      order, into pg\_collation\_generated.go:
+      - the 7 bki rows as setup\_collation leaves them, with `unicode` moved
+        to the end of that group by its collversion UPDATE;
+      - C.utf8 \(12359\) and 852 ICU collations \(12360–13211\).
+    - pgCollationBootstrapEntries drives the heap and both indexes, 3085 and
+      3164. gen\-pg\-description.py now also covers pg\_collation objects
+      below 16384.
+    - The import is host\- and ICU\-version\-dependent, as in PG. goopg carries
+      the build host's PG 18.3 import \(ICU collversion 153.121; ledgered\).
+    - PG cold start:
+      - all 860 rows and 842 descriptions equal the oracle's in heap order;
+      - "de\-x\-icu" sorts ä after a;
+      - "en\-US\-x\-icu" orders 'a' < 'B', and "C" does not;
+      - a forced index scan finds fr\-x\-icu;
+      - information\_schema.collations lists ja\-x\-icu.
+    - goopg:
+      - restarts clean twice; user collations survive;
+      - a fresh\-db pg\_dump stays identical to PG's;
+      - its own SQL pg\_collation still lists 7 \(ledgered\).
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      5 cases \(collate, collate.icu.utf8, collate.utf8, misc\_sanity, psql;
+      no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold\-start fix \(regress A/B unchanged\)
+  - 2026-11-16 slice 34: goopg's own SQL pg\_depend lists PG 18.3 initdb's 1725 dependency rows, followed by its runtime rows.
+    - Before: goopg's view held only runtime rows \(sequence OWNED BY\), while
+      the on\-disk catalog \(slices 31–32\) had the initdb rows.
+    - pg\_depend\_generated.go moved to package catalog, as
+      PGDependInitdb / InitdbDepend; initdb aliases pgDependEntry to it.
+      PGDependRowsForDBOid prepends these rows, which also feeds the
+      per\-connection hook in postmaster dispatch.go.
+    - goopg probe:
+      - pg\_depend equals the oracle's 1725 rows, plus the runtime rows;
+      - a fresh\-db pg\_dump stays identical to PG's;
+      - a serial column still dumps ALTER SEQUENCE … OWNED BY.
+    - Probing also found that goopg's \\dx\+ fails because
+      pg\_describe\_object\(\) is missing \(pre\-existing, ledgered\).
+    - Deferred instead: catalog pg\_statistic \(412 rows\). It needs typed
+      anyarray stavalues per column type, including array\-of\-array values
+      for array columns. goopg's own ANALYZE writes text\-element stavalues
+      for every column type \(ledgered\).
+    - Gates: units, initdb, postmaster, testport interop set, regress A/B on
+      6 cases \(dependency, misc\_sanity, object\_address, psql, sequence,
+      alter\_table; no movement\), spotcheck, sf025 99, acceptance.
+    Movement: none — catalog conformance \(regress A/B unchanged\)
+- [x] **M0149-0001e — bootstrapped catalogs carry no system-column pg\_attribute rows \(ctid, xmin, …\)**
+  Kind: impl
+  Parent: none
+  - Found 2026-11-15: PG 18.3 on a goopg directory answers `SELECT ctid FROM pg_database` with "column \"ctid\" does
+    not exist". goopg's bootstrap writes attnum > 0 rows only.
+  - PG: genbki / heap\_create\_with\_catalog writes the six system attributes \(attnum −1 … −6: ctid, xmin, cmin,
+    xmax, cmax, tableoid\) for every heap relation \(`heap.c` AddNewAttributeTuples, SysAtt\[\]\).
+  - First step: in bootstrapPgAttributeTuples, emit the six system rows for every relkind 'r' / 't' nailed
+    relation, then rebuild pg\_attribute's indexes. Verify `SELECT ctid, xmin FROM pg_database` on a PG cold start.
+  - 2026-11-15 COMPLETE:
+    - initdb writes PG's six system attributes \(SysAtt\[\]: ctid −1, xmin −2,
+      cmin −3, xmax −4, cmax −5, tableoid −6, with values checked against a
+      scratch initdb\) for every bootstrapped relkind r / t catalog, and
+      indexes them in pg\_attribute\_relid\_attnum\_index 2659.
+    - User tables get the same rows at CREATE / ALTER TABLE through the
+      table-persist funnel \(buildUserPGSystemAttributeRows; every relkind
+      but views, per heap\_create\_with\_catalog\). goopg's reload already
+      filters attnum > 0.
+    - PG 18.3 cold start: `SELECT ctid, xmin, tableoid` works on pg\_database,
+      pg\_class and a goopg-created user table \(before: "column \"ctid\" does
+      not exist"\). goopg's own pg\_attribute now lists the system rows, as PG
+      does.
+    - goopg itself still rejects `SELECT xmin` / cmin / xmax / cmax: already
+      filed as M0146-0239.
+    - Seven tests that counted user columns now filter attnum > 0 or expect
+      the extra index entries.
+    - Gates: units, postmaster, testport interop set, regress A/B on the 20
+      pg\_attribute cases \(no movement; join ±1 is the known flapper\),
+      spotcheck, sf025 99, acceptance.
+    Movement: none — C3 cold-start fix \(regress A/B unchanged\)
+- [x] **M0149-0001f — goopg's own catalog does not expose pg\_shdepend / pg\_shdescription**
+  Kind: impl
+  Parent: none
+  - Found 2026-11-15: on goopg, `SELECT count(*) FROM pg_shdepend` returns 42P01 "relation \"pg\_shdepend\" does not
+    exist", although the on-disk catalog now exists \(M0149-0001c\). PG always has both relations.
+  - First step: register pg\_shdepend and pg\_shdescription as catalog tables backed by global/1214 and
+    global/2396. Then decide whether goopg records shared dependencies \(owner and ACL of databases, roles,
+    tablespaces: `shdepend.c`\).
+- [x] **M0149-0002 — port recovery/t/036_truncated_dropped.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/036_truncated_dropped.pl` — replay against relation files shorter than the WAL expects \(truncated/dropped\).
+  Likely prerequisites \(verify at start\): `XLOG_SMGR_TRUNCATE` replay, missing-page tolerance in `XLogReadBufferExtended`/`xlogutils.c`, VACUUM truncation WAL in PG format. Overlap: VACUUM tail truncation emitting no `XLOG_SMGR_TRUNCATE` is the M0122-0009c finding \(deferral ledger 2026-10-13; no fix\_plan entry exists at filing — reference it if filed, else file it here\).
+  - 2026\-11\-23 \(done\): TestPort\_Recovery036TruncatedDropped passes 8/8 assertions all\-goopg and on a PG 18\.3 cold
+    start of each crashed directory. Movement: tap 036 0/8 → 8/8. Design: docs/design/0100\-0149/0149\-0002\-truncated\-dropped\-recovery.md.
+    - Path\-to\-TAP \(each link a failing assertion or a PG\-node crash\):
+      - 036 ← tapnode ran scripts as one transaction \(`psql -c`\);
+      - 036 PG cold start ← `FATAL: resource manager with ID 128` \(the DROP\-time VM record\);
+      - 036 scenarios 3 and 4 ← TRUNCATE not WAL\-logged \(897 rows\);
+      - 036 scenario 5 on PG ← zero freeze plans \(NULL columns\).
+    - Fixes:
+      - tapnode runs scripts with `psql -f`;
+      - DROP and TRUNCATE drop the VM without a record;
+      - TRUNCATE and VACUUM's tail truncation log XLOG\_SMGR\_TRUNCATE. This closes the VACUUM half of the
+        M0122\-0009c finding;
+      - a rolled\-back TRUNCATE logs its restored pages as FPIs;
+      - freeze plans carry the frozen tuples' headers.
+    - Follow\-ups are filed as M0149\-0002a.
+- [ ] **M0149-0002a — TRUNCATE's new relfilenode and PG's freeze bits** (filed 2026-11-23 by M0149-0002)
+  Kind: impl
+  Parent: none
+  - Not a TAP prerequisite: 036 passes without them. Do not select under M0149 \(ANTI\-DETOUR RULE\) unless a TAP test
+    names one.
+  - goopg's TRUNCATE keeps the relfilenode and logs XLOG\_SMGR\_TRUNCATE. PG assigns a new relfilenode
+    \(RelationSetNewRelfilenumber\), so the files and pg\_class.relfilenode differ from PG after a TRUNCATE.
+  - goopg freezes by rewriting xmin to FrozenTransactionId. PG sets HEAP\_XMIN\_FROZEN \(heap\_prepare\_freeze\_tuple\)
+    and keeps xmin, so after replay the pages differ in xmin only.
+  - The executor's truncate record is not flushed before the file shrinks; RelationTruncate flushes when a VM or FSM
+    exists.
+- [x] **M0149-0003 — port recovery/t/014_unlogged_reinit.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/014_unlogged_reinit.pl` — unlogged tables/sequences reinitialised from `_init` forks after crash, incl. tablespaces.
+  Likely prerequisites \(verify at start\): on-disk `_init` forks, `ResetUnloggedRelations` \(`reinit.c`\) at crash-recovery start, in-place tablespace layout under `pg_tblspc/`.
+  - 2026\-11\-23 \(partial, still open\): ported as TestPort\_Recovery014UnloggedReinit, listed in
+    ci/batch/expected\-failures.csv. Movement: tap 014 4/27 → 5/27 all\-goopg; regress tablespace 171 → 164.
+    Design: docs/design/0100\-0149/0149\-0003\-unlogged\-reinit.md.
+    - Path\-to\-TAP:
+      - 014 ← external CREATE TABLESPACE refused \(the test aborted\). Fixed: create\_tablespace\_directories port
+        \(symlink \+ version dir\), also in tblspc\_redo; DROP removes both.
+      - 014 ← the main fork of a table created in a tablespace landed under base/ \(failing assertion\). Fixed:
+        placeTableInTablespace.
+      - 014 ← no `_init` forks \(3 pre\-crash assertions\), and goopg cannot start once a main fork is removed. Open.
+    - Next slices:
+      - init forks for unlogged heaps \(empty \+ XLOG\_SMGR\_CREATE INIT\), their indexes \(metapage\) and sequences
+        \(initial page\);
+      - ResetUnloggedRelations: cleanup before redo, init after redo, over base/ and every tablespace;
+      - nextval state taken from the reset sequence page.
+  - 2026\-11\-23 \(done\): TestPort\_Recovery014UnloggedReinit passes 27/27 all\-goopg and on the PG 18\.3 cold start.
+    Movement: tap 014 5/27 → 27/27, and the PG variant 0 → 27/27.
+    - Path\-to\-TAP \(each link a failing assertion or a PG error\):
+      - 014 ← no `_init` forks / goopg cannot start without the main fork. Fixed by init forks and
+        ResetUnloggedRelations.
+      - 014 seq\_unlogged2 ← ALTER SEQUENCE moved the first nextval. Fixed: sequence state is PG's
+        last\_value/is\_called.
+      - 014 identity sequence ← not unlogged. Fixed.
+      - 014 PG ← `File exists` in the init pass. Fixed: no WAL for unlogged forks.
+      - 014 PG ← `cache lookup failed for sequence`. Fixed: pg\_sequence index entry on update.
+      - 014 PG ← `no owned sequence found`. Fixed: identity deptype 'i'.
+    - Regress same\-list A/B \(sequence, identity, truncate, alter\_table, create\_table, tablespace, vacuum,
+      create\_index, plpgsql\): all equal HEAD except plpgsql 1218 → 1221 \(flaky\).
+    - Follow\-ups are filed as M0149\-0003a.
+- [ ] **M0149-0003a — remaining unlogged-relation and sequence-persistence gaps** (filed 2026-11-23 by M0149-0003)
+  Kind: impl
+  Parent: none
+  - Not a TAP prerequisite: 014 passes. Do not select under M0149 \(ANTI\-DETOUR RULE\) unless a TAP test names one.
+  - Init forks exist only for btree indexes; other access methods need their ambuildempty.
+  - ALTER TABLE SET LOGGED / UNLOGGED neither creates nor removes init forks, and does not change the pool's
+    unlogged set.
+  - A standby does not run ResetUnloggedRelations' init pass at promotion.
+  - A clean restart resumes a sequence at its WAL pre\-log horizon; PG resumes from the page its shutdown
+    checkpoint flushed.
+  - XLOG\_SEQ\_LOG's encoder writes spcOid 1663 for every sequence; a sequence in a tablespace is mis\-addressed.
+  - Sequence pages written by an older goopg for a never\-called sequence hold last\_value = start \- increment.
+- [!] **M0149-0004 — port recovery/t/022_crash_temp_files.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/022_crash_temp_files.pl` — temp-file removal after a backend crash.
+  Likely prerequisites \(verify at start\): postmaster crash-restart cycle after a killed backend \(`restart_after_crash`; `013` port substituted whole-server SIGKILL\), `remove_temp_files_after_crash`, PG `pgsql_tmp<PID>.<N>` naming. Never `kill()` a goopg "backend pid" — `pg_backend_pid()` is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID; a backend-kill step that needs per-backend OS processes goes to `[!] blocked-on owner: architecture`.
+  - **PARKED `[!]` 2026\-11\-23 — blocked\-on owner: architecture.**
+    - The test's central step is `pg_ctl kill KILL <pg_backend_pid()>`, run twice. The postmaster must survive
+      the killed backend and run its restart\_after\_crash cycle, terminating the other session with "terminating
+      connection because of crash of another server process".
+    - goopg serves every connection from one OS process, and pg\_backend\_pid\(\) is a synthetic per\-connection
+      number, so there is no per\-backend process to kill:
+      - signalling that number would hit an unrelated process;
+      - signalling goopg's own PID would end the whole server, with no postmaster left to restart it.
+    - Reopen when the owner decides a process model for backends.
+- [x] **M0149-0005 — port recovery/t/037_invalid_database.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/037_invalid_database.pl` — interrupted DROP DATABASE leaves an invalid database.
+  Likely prerequisites \(verify at start\): `datconnlimit = -2` invalid marker \(`DATCONNLIMIT_INVALID_DB`\) and its replay, connect/ALTER refusal texts, prepared-xact lock interplay, `vacuumdb` against goopg. `pg_backend_pid()` is used only at SQL level here \(fine\); never `kill()` it — on goopg it is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID.
+  - 2026\-11\-23 \(done\): TestPort\_Recovery037InvalidDatabase passes 11/11. Movement: tap 037 0/11 → 11/11.
+    Design: docs/design/0100\-0149/0149\-0005\-invalid\-database.md.
+    - Path\-to\-TAP \(each link a failing assertion or a startup failure\):
+      - 037 ← start refused `log_connections`. Fixed: GUC registered.
+      - 037 ← ALTER of an invalid database succeeded. Fixed: AlterDatabase's FATAL.
+      - 037 ← an invalid database was usable as a template. Fixed: createdb's ERROR.
+      - 037 ← the DROP did not wait for pg\_tablespace. Fixed: dropdb's invalid mark and lock, plus PREPARE
+        TRANSACTION's lock hand\-off.
+    - Regress A/B \(database, prepared\_xacts, lock, guc, sysviews, tablespace\): all equal HEAD.
+    - Isolation prepared\-transactions, prepared\-transactions\-cic, stats and the 2PC same\-backend port pass.
+    - Remaining PG differences are filed as M0149\-0005a.
+- [ ] **M0149-0005a — database DDL residue from 037** (filed 2026-11-23 by M0149-0005)
+  Kind: impl
+  Parent: none
+  - Not a TAP prerequisite: 037 passes. Do not select under M0149 \(ANTI\-DETOUR RULE\) unless a TAP test names one.
+  - The extended\-protocol path reports AlterDatabase's invalid\-database refusal as an ERROR, not a FATAL.
+  - DROP DATABASE is not one transaction: PG deletes the pg\_database tuple transactionally.
+  - The shared\-catalog lock\-tag list omits the shared catalogs' indexes and TOAST relations.
+  - A SERIALIZABLE prepared transaction is not detached and keeps its connection's lock identity.
+- [ ] **M0149-0006 — port recovery/t/018_wal_optimize.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/018_wal_optimize.pl` — replay after `wal_level=minimal` WAL-skipping operations.
+  Likely prerequisites \(verify at start\): `wal_level=minimal` skip-WAL + pending-sync at commit \(`storage.c` `smgrDoPendingSyncs`, `wal_skip_threshold`\), COPY/TRUNCATE/SET TABLESPACE in-xact matrix, PREPARE TRANSACTION. Overlap: SET TABLESPACE copying files without WAL is the M0122-0009b finding \(deferral ledger 2026-10-13; no fix\_plan entry at filing — reference it if filed, else file it here\).
+  - 2026\-11\-23 \(partial, still open\): ported as TestPort\_Recovery018WalOptimize, listed in
+    ci/batch/expected\-failures.csv. Movement: tap 018 0/42 → 40/42. Regress copy2 249 → 248.
+    Design: docs/design/0100\-0149/0149\-0006\-wal\-optimize.md.
+    - Path\-to\-TAP \(each link a failing assertion or a startup failure\):
+      - 018 ← unknown wal\_log\_hints / wal\_skip\_threshold. Fixed.
+      - 018 ← COPY DELIMITER ignored. Fixed, reader and writer.
+      - 018 spc\_\* ← catalog rows lost after an ALTER inside a savepoint. Fixed:
+        - subxacts in the commit record;
+        - ROLLBACK TO's abort record;
+        - stamps with the subxid.
+      - 018 spc\_abort ← SET TABLESPACE not rolled back. Fixed: transactional move.
+      - 018 idx\_hint ← unique check counting a rolled\-back row. Fixed.
+      - 018 ins\_trig ← NEW.id replaced inside NEW.id2. Fixed.
+      - 018 orphan check ← pg\_relation\_filepath NULL for system relations. Fixed; the remainder is below.
+    - 2026\-11\-23 slice 2: the orphan set shrank from 16 files plus 2 file\-less TOAST rows to 3 files. Fixed:
+      `base/<db>/0` \(sizer on RelOid 0\), shared\-catalog indexes in base/<db>, 7 stale placeholder heaps
+      \(fresh base/5 now equals PG's 224 files\), TOAST heap file created at CREATE TABLE. Still 40/42.
+    - Open, the last 2 assertions \(check\_orphan\_relfilenodes at both wal\_levels\), remaining orphans
+      `base/5/16860`, `base/5/16865`, `base/5/9410`:
+      - Path\-to\-TAP: 018 orphan check ← temp relation files named `<oid>`, not `t<procno>_<oid>`, and not
+        removed at startup → **M0149-0006a**.
+      - Path\-to\-TAP: 018 orphan check ← goopg\-private stats sidecar 9410 in base/<db> \(owner waiver
+        M0125-0029\) → **M0149-0006b** \[!\] owner.
+  - [x] **M0149-0006a — temp relation file naming `t<procno>_<oid>` + RemovePgTempFiles at startup**
+    Kind: impl
+    Parent: M0149-0006
+    Upstream: `relpath.c` GetRelationPath \(backend != INVALID\_PROC\_NUMBER\), `fd.c` RemovePgTempRelationFiles.
+    Proven by: 018 check\_orphan\_relfilenodes lists the temp table's `16860`/`16865` at both wal\_levels.
+    Also: skip of eager TOAST creation for temp tables \(`createToastStorage`\) is lifted once temp files carry
+    the `t` prefix.
+    - 2026\-11\-23 done: Manager/Pool.SetRelTemp \(t<backend>\_<n> naming, no WAL\), adoptTempStorage at the 3
+      CREATE TEMP sites, TOAST and btree indexes marked before creation, storage.RemovePgTempRelationFiles at
+      every startup, pg\_relation\_filepath reports the temp name. Movement: 018 orphan set 3 files → 1
+      \(`base/5/9410`, owner\-gated M0149-0006b\); assertions still 40/42.
+    - Filed, not worked \(nearby\): temp files are kept until the next startup, where PG removes them at backend
+      exit; non\-btree indexes and sequences on temp tables still get permanent names; pg\_relation\_filepath gives
+      base/<db>/<n> for shared catalogs \(PG: global/<n>\) — see M0149-0006c.
+  - [ ] **M0149-0006c — temp-relation and relation-path residuals \(filed from M0149-0006a\)**
+    Kind: impl
+    Parent: M0149-0006
+    Not a proven 018 blocker; do not self-select under the anti-detour rule unless a TAP assertion needs it.
+    - RemoveTempRelations at backend exit \(namespace.c\); non\-btree index AMs and temp sequences via
+      Pool.SetRelTemp; pg\_relation\_filepath for shared catalogs \(global/<n>, relpath.c\).
+  - [!] **M0149-0006b — relocate the goopg relation\-stats sidecar 9410 out of base/<db>**
+    Kind: impl \(owner\-gated: owner waiver M0125-0029 placed it there\)
+    Parent: M0149-0006
+    Proven by: 018 check\_orphan\_relfilenodes lists `base/5/9410` \(no pg\_class row\) at both wal\_levels.
+    - Also found and fixed on the way, because the path above required them:
+      - data rolled back to a savepoint came back after a crash;
+      - a re\-insert after ROLLBACK TO raised 23505.
+- [x] **M0149-0007 — port recovery/t/029_stats_restart.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/029_stats_restart.pl` — cumulative stats across clean/crash restarts and invalid stats files.
+  Likely prerequisites \(verify at start\): `pg_stat/pgstat.stat` in PG format \(`PGSTAT_FILE_FORMAT_ID`, `pgstat.c` write/read\), discard on crash, replication-slot stats persistence.
+  - 2026\-11\-23 slice 1 \(partial, still open\): ported as TestPort\_Recovery029StatsRestart, listed in
+    ci/batch/expected\-failures.csv; inventory R\-029 `failed`. Design docs/design/0100\-0149/0149\-0007\-stats\-restart.md.
+    - Landed: PG 18 pgstat.stat writer/reader \(exact layout, sizes measured against the PG 18.3 headers\),
+      written at clean shutdown, restored and removed at startup, discarded on crash or invalid file;
+      pg\_stat\_have\_stats; database entries created at flush.
+    - Movement: the 21 assertions from `initial` to `invalid_append` pass \(the run stopped at the first
+      checkpointer query before\). Regress stats 314 → 266.
+    - Path\-to\-TAP \(open\):
+      - 029 post restart ← `num_timed + num_requested` errors: pg\_stat\_checkpointer columns are text; `num_done`
+        missing. Fixed in slice 2.
+      - 029 wal\_\* ← pg\_stat\_wal is constant zeros. Fixed in slice 2.
+      - 029 startup ← pg\_stat\_io has no startup / standalone backend WAL rows. Open.
+  - 2026\-11\-23 slice 2: PG 18 pg\_stat\_checkpointer \(types, num\_done\) and pg\_stat\_wal \(5 columns over the WAL
+    writer's counters\) shapes; both persisted through their 'F' chunks; pg\_stat\_reset\_shared with PG's target
+    check. Movement: tap 029 31 → 42/44 \(the run had stopped at the first checkpointer query\). Regress stats
+    266 → 236.
+    - Open, the last 2 assertions \(startup\): the standalone backend's `init`/`wal` writes \(initdb's WAL segment
+      creation, persisted through initdb's own pgstat.stat\) and the startup process's `normal`/`wal` reads. Needs the
+      51848\-byte IO 'F' chunk \(PgStat\_IO: stat\_reset + 18 × PgStat\_BktypeIO of bytes/counts/times\[3\]\[5\]\[8\]\)
+      written by `goopg init` and accumulated by startup WAL reads.
+  - 2026\-11\-23 slice 3, DONE: PgStat\_IO chunk \(ioCumulative, layout measured with offsetof\); `goopg init` writes
+    pgstat.stat with the standalone backend's init WAL write; startup WAL reads counted; pg\_stat\_reset\_shared\('io'\).
+    Movement: tap 029 42 → 44/44, plus a pg18\-cold\-start subtest in which PG 18.3 loads goopg's pgstat.stat.
+    Inventory R\-029 `port`; expected\-failures row removed. Regress stats 236 → 235.
+- [!] **M0149-0008 — port recovery/t/017_shm.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/017_shm.pl` — shared-memory interlock via `postmaster.pid` key and orphaned backends.
+  Likely prerequisites \(verify at start\): `postmaster.pid` shmem-key line and `PGSharedMemoryIsInUse` interlock semantics for goopg's process model \(design doc must decide a PG-faithful answer\), `kill9` of postmaster with a live backend. Never `kill()` a goopg "backend pid" — `pg_backend_pid()` is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID; a backend-kill step that needs per-backend OS processes goes to `[!] blocked-on owner: architecture`.
+  - **PARKED `[!]` 2026\-11\-23 — blocked\-on owner: architecture.** Design docs/design/0100\-0149/0149\-0008\-shm.md.
+    - All three assertions need a backend that outlives a SIGKILLed postmaster: the restart must detect it through
+      the SysV segment's attach count \(PGSharedMemoryIsInUse\), normally and in `postgres --single`.
+    - goopg serves every connection from one OS process and has no SysV segment, so a kill9 ends every backend and
+      there is nothing to detect. The last step also kills a backend by OS PID, and assertion 1 needs the C
+      `wait_pid` function from regress.so.
+    - The milestone's C4 escape hatch names 017\_shm. Path\-to\-TAP: 017 ← orphan backend after postmaster kill9 ←
+      per\-backend OS processes \(architecture\). Reopen with M0149\-0004's process\-model decision.
+- [!] **M0149-0075 — re-port recovery/t/013_crash_restart.pl to the M0149 contract**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/013_crash_restart.pl` — postmaster crash-restart after a backend is killed with SIGQUIT and then SIGKILL.
+  Current shortcut \(audit\): `TestPort_Recovery013CrashRestart` kills the whole server \(`c.Kill()`\) and restarts it by hand instead of killing one backend and letting the postmaster run its crash-restart cycle. It makes 1 assertion against \~18 upstream: the in-progress-transaction loss, the client "server closed the connection" / "terminating connection" errors and the second SIGKILL round are dropped. No PG 18.3 cross-check.
+  Likely prerequisites \(verify at start\): the backend crash-restart child of M0149-0004 \(`restart_after_crash`\). Never `kill()` the synthetic `pg_backend_pid()` \(`internal/executor/expr.go`\); if a faithful backend kill needs per-backend OS processes, escalate `[!] blocked-on owner: architecture`. If its dependency \(the backend crash-restart child of M0149-0004\) is `[!]` on architecture, 0075 is too. Inventory row stays `port` until this closes.
+  - **PARKED `[!]` 2026\-11\-23 — blocked\-on owner: architecture**, by this entry's own rule: its dependency, the
+    backend crash\-restart of M0149\-0004, is `[!]` on architecture. 013's central steps `pg_ctl kill` QUIT/KILL a
+    backend by its OS PID and expect the postmaster to survive and run restart\_after\_crash \(milestone C4 names
+    013\_crash\_restart\). The inventory row stays `port` \(shortcut port\) until this closes.
+- [x] **M0149-0076 — re-port recovery/t/039_end_of_wal.pl to the M0149 contract**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/039_end_of_wal.pl` — end-of-WAL detection with hand-crafted defective page and record headers written into WAL files.
+  Current shortcut \(audit\): `TestPort_Recovery039EndOfWal` only checks that 24-character segment files exist after a checkpoint. None of the upstream defective-header cases \(`write_wal` page/record corruption\) and none of the "invalid magic number" / "invalid record length" / "invalid contrecord length" / "invalid info bits" log matches are ported \(\~14 upstream assertions\). No PG 18.3 cross-check.
+  Likely prerequisites \(verify at start\): PG-exact WAL page/record layout so byte-level writes land where PG's would \(`pg_logical_emit_message`, insert-LSN arithmetic\); PG 18.3 end-of-WAL log texts from `xlogreader.c`; a PG 18.3 server recovering the same doctored goopg WAL in the mixed run. Inventory row stays `port` until this closes.
+  - 2026\-11\-23 slice 1 \(partial, still open\): TestPort\_Recovery039EndOfWal is now a full transcription of the .pl
+    \(the shortcut is removed\), listed in ci/batch/expected\-failures.csv; inventory R\-039 stays `port`. Design
+    docs/design/0100\-0149/0149\-0076\-end\-of\-wal.md. Movement: tap 039 assertions 0/14 → 0/14; the run now gets past
+    the setup queries. Regress misc\_functions 207 → 203.
+    - Path\-to\-TAP:
+      - 039 setup ← `pg_settings` lacked wal\_segment\_size / wal\_block\_size. Fixed: preset rows.
+      - 039 setup ← `pg_control_checkpoint()` not a table function. Fixed.
+      - 039 setup ← `pg_switch_wal()` does not exist: no XLOG\_SWITCH in the WAL writer. Fixed in slice 2.
+      - 039 every case ← goopg's end\-of\-WAL log text is its own, not xlogreader.c's. Fixed in slice 3.
+  - 2026\-11\-23 slice 2: Writer.SwitchSegment \(XLOG\_SWITCH + zero\-filled segment tail + xl\_prev = switch record,
+    flushed\); pg\_switch\_wal\(\); readAllPageAware and the writer's position scan step to the next segment after
+    a switch. Movement: tap 039 0/14 → 0/14, now running all 14 cases \(before: stopped in setup\).
+  - 2026\-11\-23 slice 3, DONE: pgDecodeFailure / PGEndOfWALMessage reproduce XLogDecodeNextRecord's checks and
+    texts at goopg's replay stop point, logged after crash recovery. Each case also runs PG 18.3 on a copy of the
+    doctored directory \(C3\). Movement: tap 039 0/14 → 14/14. Inventory R\-039 stays `port` with the new
+    rationale; the expected\-failures row is removed.
+    - Filed nearby, not worked: `pg_settings` is a hard\-coded list of \~60 rows, not the GUC registry \(PG's
+      show\_all\_settings\); the other pg\_control\_\* functions \(system, init, recovery\) are missing.
+- [ ] **M0149-0009 — port recovery/t/008_fsm_truncation.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/008_fsm_truncation.pl` — FSM-driven INSERT after truncation on a promoted standby.
+  Likely prerequisites \(verify at start\): PG-format FSM fork + FPIs, FSM/VM truncation in `XLOG_SMGR_TRUNCATE` replay, promotion of a streaming standby. Overlap: VACUUM tail truncation emitting no `XLOG_SMGR_TRUNCATE` is the M0122-0009c finding \(deferral ledger 2026-10-13; no fix\_plan entry exists at filing — reference it if filed, else file it here\).
+- [ ] **M0149-0009a — a standby in recovery must be read-only: every transaction during recovery raises 25006 on writes** \(filed 2026-11-15 by the owner session; S2 — divergent data on a standby\)
+  Kind: impl
+  Parent: M0149-0009
+  - Found while verifying the 2026-11-15 promote-file rename \(`promote.signal` → PG's `promote`\): on a goopg
+    streaming standby with `pg_is_in_recovery()` = `t`, `CREATE TABLE zz\_sb \(x int\)` and
+    `INSERT INTO zz\_sb VALUES \(1\)` both succeed, `SELECT count\(\*\)` returns 1, and `txid\_current\(\)` assigns
+    a new xid on the standby. The primary has no such table — the standby has silently diverged.
+  - PG 18.3: `StartTransaction` sets `XactReadOnly = DefaultXactReadOnly || RecoveryInProgress\(\)`
+    \(`access/transam/xact.c`\); writes then fail in `PreventCommandIfReadOnly` / `ExecCheckXactReadOnly`
+    \(`executor/execMain.c`\) with 25006 "cannot execute <cmd> in a read-only transaction";
+    `GetNewTransactionId` errors "cannot assign TransactionIds during recovery"; `SET TRANSACTION READ WRITE`
+    during recovery raises 25006 "cannot set transaction read-write mode during recovery"
+    \(`check\_transaction\_read\_only`, `utils/misc/guc\_funcs` / `commands/variable.c`\).
+  - `SHOW transaction\_read\_only` answers 42704 \(unregistered\); PG reports `on` on a standby.
+  - Prerequisite: the open task "Read-only transactions are not enforced; `default\_transaction\_read\_only` is
+    ignored" \(placed below item 10\). This child adopts that enforcement work — it inherits M0149's item-10 rank —
+    and closes it too when both are satisfied.
+  - Test-validity note: a promotion test that proves promotion by a successful write proves nothing while this
+    is open \(e.g. `TestE2E\_NativeOnlyReplicationAndPromotion`\); such tests must assert `pg\_is\_in\_recovery\(\)`
+    and, before promotion, that the write fails with 25006.
+  - Verification: postmaster/testport test on a goopg standby \(writes, DDL, `txid\_current\(\)`, `SET TRANSACTION
+    READ WRITE` all fail with PG's SQLSTATEs and texts; `SHOW transaction\_read\_only` = `on`\), then the same
+    statements succeed after `pg\_ctl promote`; mixed variant with a PG 18.3 primary → goopg standby.
+- [x] **M0149-0010 — port recovery/t/015_promotion_pages.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/015_promotion_pages.pl` — WAL generated after promotion before the first checkpoint.
+  Likely prerequisites \(verify at start\): `XLOG_END_OF_RECOVERY` / fast promotion, crash recovery of a just-promoted node, `minRecoveryPoint` handling. Overlap: the ledger's M0122-0009 review found VM bits logged with a goopg-private HeapVisible record — PG `XLOG_HEAP2_VISIBLE` is required.
+  - 2026\-11\-23 slice 1 \(partial, still open\): ported as TestPort\_Recovery015PromotionPages \(expected failure\);
+    design docs/design/0100\-0149/0149\-0010\-promotion\-pages.md. The tapnode harness gains Cluster.pm's `backup`
+    \(pg\_basebackup\), `init_from_backup\(has_streaming\)` for goopg nodes, `promote` \(pg\_ctl promote\),
+    `restart`, `poll_query_until`, and the test's wait\_for\_catchup. Backup, streaming and pg\_ctl promote all work
+    against goopg. Movement: tap 015 0/1 → 0/1 \(the run now reaches the post\-promotion statements\).
+    - Path\-to\-TAP: 015 ← `truncate test1` on the promoted standby fails "relation \"test1\" does not exist" ←
+      a table created on the primary after the standby attached never appears in the goopg standby's catalog,
+      before or after promotion, and not even after a standby restart → **M0149-0010a** \(next\).
+  - [x] **M0149-0010a — a goopg streaming standby must see tables the primary creates after it attached**
+    Kind: impl
+    Parent: M0149-0010
+    Proven by: TestPort\_Recovery015PromotionPages — after wait\_for\_catchup \(replay\_lsn ≥ the primary's
+    current LSN\), `SELECT count\(\*\) FROM test1` on the standby fails 42P01; a standby restart does not help.
+    Every existing goopg→goopg replication test creates its tables before the clone \(PreCloneHook\), so none
+    covered this. PG: the catalog rows arrive as ordinary heap WAL and the relcache sees them after replay
+    \(invalidation records\).
+    - Resume: find why startup's heap catalog reload \(internal/initdb/catalog\_heap\_reload.go\) on the standby
+      does not see the replayed pg\_class/pg\_attribute rows — whether the rows are not replayed into the
+      standby's catalog heaps, or the standby's clog does not mark the creating xid committed
+      \(catalogRowLive\) — then make the running standby pick up new relations during replay.
+    - 2026\-11\-23 DONE. Two causes, both fixed:
+      - the running standby never refreshed its catalog: StreamReplayer now notes system\-catalog block
+        references \(relfilenode < 16384\) and, at the next replayed commit, calls Runtime.RefreshCatalogAfterReplay
+        for each such database \(idempotent loadUserTablesFromHeapForDB\) — PG's relcache invalidation;
+      - replayed commits never reached clog \(ReplayXactCommit only advanced nextXID\), so after promotion a restart's
+        implicit\-abort sweep \(MarkUnknownAsAborted\) declared the primary's DDL xids aborted and the table vanished.
+        ReplayXactCommit/Abort now stamp clog, for the record's subtransactions too \(xact\_redo\_commit,
+        TransactionIdCommitTree\).
+      - Found by: a PG 18.3 cold start on a copy of the standby saw test1 with all rows, so replay into the heaps
+        was right.
+    - Movement: tap 015 0/1 → 1/1 all\-goopg.
+  - [x] **M0149-0010b — 015 mixed runs: PG 18.3 primary → goopg standby, and goopg primary → PG 18.3 standby**
+    Kind: impl
+    Parent: M0149-0010
+    Required by the milestone's PASS condition \(mixed runs against real PG 18.3 nodes\) before R\-015 can be `port`.
+    - Needs tapnode `NewPG` \(fresh PG init with allows\_streaming\) and `InitFromBackupPG`.
+    - Known risk: PG 18.3 started in standby mode on a copy of a goopg standby crashed in standby\_redo
+      \(TRAP in standby\_redo\+0x124 on the cassert build\) — a goopg RM\_STANDBY record PG cannot replay. Reproduce in
+      the goopg\-primary → PG\-standby run before fixing.
+    - 2026\-11\-23 slice 1 \(partial, still open\): tapnode `NewPG` \(init allows\_streaming\), `InitFromBackupPG`, PG
+      `AppendConf`; the 015 port runs three subtests. Movement: tap 015 mixed 0/2 → 1/2 \(all\-goopg 1/1,
+      pg18\-primary\-goopg\-standby 1/1, goopg\-primary\-pg18\-standby 0/1\).
+      - Path\-to\-TAP \(PG primary → goopg standby\), each a proven failure, all fixed:
+        - goopg replay stopped on a PG FPI past the fork's end \("replay gap block=2 nblocks=0"\):
+          writeBlockOrExtend now zero\-extends as XLogReadBufferExtended does;
+        - the table had no columns: the startup/refresh pg\_attribute loader tried goopg's logical decoder first,
+          which misreads a PG\-physical row as garbage without an error; it is now physical\-first like its
+          executor siblings. The live refresh also counts only committed catalog rows;
+        - a restart failed on a checksummed \(PG 18 default\) cluster: WriteFSMFork wrote FSM pages without
+          pd\_checksum; FSM pages are now stamped when the cluster has checksums.
+      - Path\-to\-TAP \(goopg primary → PG standby\): the PG standby asserts
+        `TransactionIdIsNormal\(running->latestCompletedXid\)` \(procarray.c ProcArrayApplyRecoveryInfo\) on goopg's
+        XLOG\_RUNNING\_XACTS: a fresh goopg cluster has nextXid 3, so latestCompletedXid = nextXid−1 = 2. PG never
+        reaches that state, since its initdb consumes hundreds of xids. NEXT. Options: start goopg's nextXid past
+        FirstNormalTransactionId at init as PG does \(check what depends on xid 3\), or skip logging running xacts
+        until a normal xid has completed. Compare with PG initdb's pg\_control nextXid.
+    - 2026\-11\-23 DONE: goopg init now leaves NextXID 752 in pg\_control and the bootstrap checkpoint, as a PG 18.3
+      initdb does \(pg\_controldata on a fresh PG: `0:752`\); oldestXID stays 3, matching goopg's datfrozenxid. The
+      earlier standby\_redo crash was the same assertion \(standby\_redo → ProcArrayApplyRecoveryInfo\). Movement:
+      tap 015 mixed 1/2 → 2/2; all three subtests pass. M0149\-0010 closed: R\-015 `port`, expected\-failures row
+      removed.
+- [x] **M0149-0011 — port recovery/t/016_min_consistency.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/016_min_consistency.pl` — on-disk page LSNs never exceed `minRecoveryPoint` on a standby.
+  Likely prerequisites \(verify at start\): `UpdateMinRecoveryPoint` on buffer flush during recovery, PG page-header LSN layout read straight from relation files, PG `pg_controldata` on the goopg standby dir.
+  - 2026\-11\-23 DONE: TestPort\_Recovery016MinConsistency, three subtests \(all\-goopg, PG 18.3 primary → goopg
+    standby, goopg primary → PG 18.3 standby\), all pass with no product change. Movement: tap 016 0/1 → 1/1 in each
+    pairing. Design docs/design/0100\-0149/0149\-0011\-min\-consistency.md; inventory R\-016 `port`.
+- [x] **M0149-0012 — port recovery/t/021_row_visibility.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/021_row_visibility.pl` — hot-standby snapshot visibility incl. prepared transactions.
+  Likely prerequisites \(verify at start\): `XLOG_RUNNING_XACTS` + KnownAssignedXids, prepared-xact replay, `background_psql` harness method.
+  - 2026\-11\-23 DONE: TestPort\_Recovery021RowVisibility \(three pairings\) passes. Design
+    docs/design/0100\-0149/0149\-0012\-row\-visibility.md; inventory R\-021 `port`. Movement: tap 021 0/9 → 9/9 in each
+    pairing.
+    - Path\-to\-TAP, both proven and fixed:
+      - 021 all\-goopg "uncommitted update invisible" ← the goopg standby showed the primary's uncommitted UPDATE:
+        recovery snapshots now require a committed clog status \(Manager.SetInRecovery\);
+      - 021 PG primary ← goopg replay refused XLOG\_XACT\_PREPARE: PREPARE is a page no\-op; COMMIT/ABORT PREPARED
+        stamp the record's twophase xid \(ParseXactRecord parses xl\_xact\_twophase\) in the stream replayer and
+        the crash\-recovery clog pass.
+    - Harness: tapnode PumpedPSQL \(IPC::Run psql + send\_query\_and\_wait\).
+- [x] **M0149-0013 — port recovery/t/005_replay_delay.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/005_replay_delay.pl` — `recovery_min_apply_delay` and recovery pause.
+  Likely prerequisites \(verify at start\): apply-delay wait in the startup loop, `pg_wal_replay_pause/resume`, `pg_get_wal_replay_pause_state`, pause-at-promotion semantics.
+  - 2026\-11\-23 DONE: TestPort\_Recovery005ReplayDelay \(three pairings\) passes. Design
+    docs/design/0100\-0149/0149\-0013\-replay\-delay.md; inventory R\-005 `port`. Movement: tap 005 0/5 → 5/5 in each
+    pairing.
+    - Path\-to\-TAP, both proven and fixed:
+      - 005 goopg standby ← postgresql.conf rejected `recovery_min_apply_delay` \(unregistered GUC\): registered
+        \(int, ms, sighup\) and applied in the stream replayer to COMMIT/COMMIT PREPARED records;
+      - 005 pause checks ← `pg_wal_replay_pause/resume` and `pg_get_wal_replay_pause_state` missing: added with PG's
+        not\-in\-recovery and promotion\-ongoing errors; promotion releases a paused standby.
+- [x] **M0149-0014 — port recovery/t/007_sync_rep.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/007_sync_rep.pl` — `sync_priority`/`sync_state` transitions.
+  Likely prerequisites \(verify at start\): `synchronous_standby_names` FIRST/ANY/priority over ≥3 standbys, `application_name` from `primary_conninfo`, `pg_stat_replication` sync columns \(design 0102-0005 exists — verify against PG\).
+  - 2026\-11\-23 DONE: TestPort\_Recovery007SyncRep \(three pairings\) passes. Design
+    docs/design/0100\-0149/0149\-0014\-sync\-rep.md; inventory R\-007 `port`. Movement: tap 007 0/11 → 11/11 in each
+    pairing.
+    - Path\-to\-TAP, each a single link:
+      - 007 ← standbys must report their node name: `cluster_name` GUC, `goopg start --cluster-name` / `-c`,
+        walreceiver fallback\_application\_name; the harness passes `--cluster-name` like Cluster.pm;
+      - 007 ← sync\_priority/sync\_state per SyncRepGetCandidateStandbys \(walsender slots, `*`, num\_sync over the
+        list, quorum\): SyncRep rewritten around slots;
+      - 007 ← ALTER SYSTEM \+ reload: SIGHUP re\-applies synchronous\_standby\_names.
+- [x] **M0149-0015 — port recovery/t/012_subtransactions.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/012_subtransactions.pl` — subtransactions \(incl. overflowed and prepared\) across replay and promotion.
+  Likely prerequisites \(verify at start\): `XLOG_XACT_ASSIGNMENT` + subxid overflow on standby, prepared xact with many subxacts, plpgsql exception blocks, `pg_subtrans` SLRU format.
+  - 2026\-11\-24 probe: TestPort\_Recovery012Subtransactions written \(three pairings\), skipped unless
+    `GOOPG_TAP_012=1` until 0015a/b land. Design docs/design/0100\-0149/0149\-0015\-subtransactions.md.
+    - Path\-to\-TAP, each one link, proven by the probe run:
+      - 012 ← `log_checkpoints` unregistered \(goopg rejected the conf\): registered;
+      - 012 ← the old primary cannot rejoin the promoted standby: 0015c, done;
+      - 012 check 1 / goopg\-primary pairing ← durable 2PC on a goopg primary: 0015a;
+      - 012 pg18\-primary pairing ← replayed PREPARE kept and restored at promotion: 0015b.
+- [x] **M0149-0015a — durable two\-phase commit on a goopg primary**
+  Kind: impl
+  Parent: M0149-0015
+  PREPARE TRANSACTION writes PG's XLOG\_XACT\_PREPARE record \(TwoPhaseFileHeader \+ subxacts \+ locks\), state goes to
+  pg\_twophase at checkpoint, a restart restores the prepared xact \(xid and subxids in progress, its locks\), COMMIT/ROLLBACK
+  PREPARED write XLOG\_XACT\_COMMIT\_PREPARED / ABORT\_PREPARED, pg\_prepared\_xacts lists them. Today goopg keeps a prepared
+  xact in memory only \(internal/postmaster/twophase.go\). Proof: 012 check 1 reads 0 rows after a restart; PG standby
+  cannot COMMIT PREPARED a goopg primary's xact after promotion.
+  - [x] **M0149-0015a1 — PREPARE / COMMIT PREPARED / ABORT PREPARED WAL records** \(2026\-11\-24\)
+    - Movement: 012 goopg\-primary/PG\-standby pairing now passes its third segment \(PG standby finishes goopg's
+      PREPARE after promotion\); failures there 3, all slice\-2 / 0015b.
+    - Byte oracle: a PG 18.3 pg\_twophase file in xlog/testdata; pg\_waldump decodes goopg's records.
+  - [x] **M0149-0015a2 — pg\_twophase files at checkpoint, restart restore, finish without a live transaction**
+    \(2026\-11\-24\)
+    - Movement: 012 check 1 \(nextXid handling for prepared subtransactions\) 0 → 6 rows, passing in all three
+      pairings; TestE2E\_PreparedXactSurvivesRestart 2/2.
+    - pg\_prepared\_xacts not fed \(not a 012 requirement; ledger\).
+- [x] **M0149-0015b — a goopg standby keeps replayed prepared transactions** \(2026\-11\-24\)
+  - Movement: 012 all\-goopg 0 → full pass, pg18\-primary\-goopg\-standby → full pass \(GOOPG\_TAP\_012=1\);
+    TestE2E\_PreparedXactSurvivesPromotion 2/2.
+  - Restore runs before the production stamp: restoring after it let COMMIT PREPARED race pg\_ctl promote.
+- [x] **M0149-0015e — PG refuses goopg\-written pg\_proc rows \(was filed as a rejoined\-standby replay stall\)** \(2026\-11\-24\)
+  Kind: impl
+  Parent: M0149-0015
+  - Diagnosis: pg\_waldump of the rejoined node's WAL showed PG never ran the segment. Its CREATE OR REPLACE /
+    hs\_subxids failed: "cannot change return type of existing function"; "proargnames must have the same number of
+    elements as the function has arguments".
+  - Fixes: `pgTextArrayBytes` writes ndim 1 \(and PG's empty array\); `PGProcTypeOID` maps pseudo\-types \(void
+    → 2278, …\). Unit tests for both.
+  - Movement: 012 goopg\-primary/PG\-standby 2 not\-ok → 0; 012 3/3 pairings; R\-012 `port`, env gate removed.
+  - Regress, same build vs HEAD worktree: create\_function\_sql 39→39, create\_procedure 28→28 \(inventory said 33\);
+    reloptions 28, polymorphism 683, rangefuncs 796, stats\_ext 432 all equal to the inventory.
+- [ ] **M0149-0015f — CREATE OR REPLACE FUNCTION panics on a node promoted from a PG backup**
+  Kind: impl
+  Parent: M0149-0015
+  Update 2026\-11\-24 \(0016e\): truncated pivots \(0016f\) and cstring keys \(0016e\) are handled now. Converting
+  pg\_proc\_proname\_args\_nsp\_index showed the real gap: goopg's catalog does not know functions PG created
+  \(the 0015d family), so CREATE OR REPLACE inserts a second pg\_proc row and PG later says "function
+  hs\_subxids\(integer\) is not unique" \(012 pg18\-primary\). The index stays unconverted until goopg finds the
+  existing function. The enabling switch is the pgProcPronameArgsNspIndexOID check in
+  insertCanonicalSysBtreeLeafInDB.
+  `cmpKeyProcNameArgsNsp` \(executor/sys\_catalog\_btree\_insert\_split.go descent\) slices a\[:64\] of a PG
+  suffix\-truncated pivot tuple in pg\_proc\_proname\_args\_nsp\_index \(capacity 16\). It needs \_bt\_compare's
+  truncated\-attribute semantics: compare only BTreeTupleGetNAtts attributes; missing ones are minus infinity. Seen in
+  012's pg18\-primary pairing \(the error is ignored, so the test passes\). Reproduce: PG primary creates a function;
+  promote the goopg standby; CREATE OR REPLACE it.
+- [ ] **M0149-0015g — create\_function\_sql is recorded `pass` but fails 39/761 at HEAD**
+  Kind: test
+  Parent: M0149-0015
+  The inventory row says pass/pass\_required, but pg\-regress\-runner fails it identically at HEAD and on this branch
+  \(SQL\-body deparse, EXPLAIN of SQL functions\). Re\-measure with \-\-update\-inventory and file the deparse gap.
+- [ ] **M0149-0013a — TestPort\_Recovery005ReplayDelay flaked once**
+  Kind: test
+  Parent: M0149-0013
+  It failed once, 2026\-11\-24, inside the large replication regression set; the failing check was not captured. Five
+  reruns, alone and in the set, passed. Rerun the set with \-v until a failure shows its check.
+  - Same pattern 2026\-11\-24 for TestE2E\_PhysicalStandbyRestartPointAdvancesPgControl: it failed once in the 18\-min
+    set and passed 4/4 alone.
+- [x] **M0149-0015c — a stopped goopg primary rejoins its promoted standby**
+  Kind: impl
+  Parent: M0149-0015
+  - 2026\-11\-24 DONE. Movement: TestE2E\_OldPrimaryRejoinsAfterPromotion 0/2 → 2/2 pairings; 012 probe now passes both
+    rejoins.
+    - A fast stop now writes the shutdown checkpoint once regular backends are gone and before the walsenders finish.
+      The walsenders send it and wait for the standby's flush \(WalSndDone\). Before, the old primary's WAL ended one
+      checkpoint record past the promoted standby's switch point.
+    - Promotion chains the new history through the timeline replay is on \(recoveryTargetTLI\), not the stale
+      timeline\_id file.
+- [ ] **M0149-0015d — a goopg standby of a PG primary cannot see a user table after promotion**
+  Kind: impl
+  Parent: M0149-0015
+  2026\-11\-24: seen \(table in the base backup\) and \(table created while the standby streams\); a table created after
+  the backup but before the standby starts is visible.
+  Found nearby, not a proven 012 blocker \(012's pg18\-primary pairing reads its table\). In
+  TestE2E\_OldPrimaryRejoinsAfterPromotion's PG\-primary variant, a table created before the base backup, or after it,
+  gave `relation "r" does not exist` on the goopg standby and after its promotion. Filed per the detour guard; not
+  selectable ahead of 0015a/b.
+- [x] **M0149-0016 — port recovery/t/009_twophase.pl** \(2026\-11\-24\)
+  - Done: TestPort\_Recovery009Twophase passes ungated in all three pairings \(all\-goopg 330 s, PG london 268 s, PG
+    paris 188 s\). Inventory R\-009 → port/pass\_required.
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/009_twophase.pl` — two-phase commit across crashes and primary/standby role swaps.
+  Likely prerequisites \(verify at start\): `pg_twophase/` state files in PG format, `XLOG_XACT_PREPARE` replay, checkpoint-time state-file writes, standby→primary role swap via `primary_conninfo`.
+  - 2026\-11\-24 slice 1 \(port written, gated by GOOPG\_TAP\_009\). Design docs/design/0100\-0149/0149\-0016\-twophase.md.
+    - Path\-to\-TAP, each proven by the probe and fixed:
+      - 009 ← subtransaction\_buffers GUC;
+      - 009 ← pg\_prepared\_xacts fed from the registry;
+      - 009 ← standby pg\_twophase files at restartpoints and standby\-start restore, scanning from pg\_control redo;
+      - 009 ← rejoin after the third swap ← a standby adopts its latest local timeline; promotion uses the replayed
+        timeline;
+      - 009 mvcc ← COMMIT PREPARED of a restored xact waits for sync rep;
+      - regression set ← WalSndDone requests a reply \(a fast stop overran 10 s\).
+    - Movement \(all\-goopg\): failures went from \(start refused\) to 3 groups: old\-snapshot MVCC; rows 22–24 \(a
+      subxact row after promotion, a xact restored from files\); pg\_ls\_dir/pg\_stat\_file \+ pg\_subtrans files.
+  - [x] **M0149-0016a — hot\-standby snapshots keep prepared/in\-progress xids invisible after their commit replays** \(2026\-11\-24\)
+    - Recovery snapshots add the prepared registry's xids/subxids to in\-progress. Finishing a prepared xact stamps its
+      subxacts' clog from the 2PC state: the second fix closes the intermittent savepoint\-row loss \(0016b's
+      remainder, masked by hint bits whenever something read the rows\).
+    - Movement: 009 all\-goopg: 3 not\-ok \+ pg\_subtrans Fatal → only the pg\_subtrans step \(0016c\), 2/2 runs. Two
+      E2Es fail at the old HEAD and pass now.
+    Kind: impl
+    Movement: yes — tap 009 all\-goopg: 3 not\-ok \+ pg\_subtrans Fatal → only the pg\_subtrans step, 2/2 runs
+    Parent: M0149-0016
+    PG keeps them in KnownAssignedXids. 009: a RR snapshot taken before COMMIT PREPARED replays must still see 0 rows.
+    Resume: recovery snapshots capture the prepared registry xids \(and subxids\) in xip.
+  - [x] **M0149-0016b — prepared rows lost across promotion / standby restart** \(2026\-11\-24\)
+    - Root cause \(general, not 2PC\): after a standby crash, the startup clog pass started at the newest checkpoint
+      record in the received WAL rather than at pg\_control's redo \(its last restartpoint\). Commits replayed in
+      between were swept aborted. Fixed in initdb xact\_recovery.go replayStartFromControl.
+    - Movement: 009 all\-goopg final data checks fail → pass, 2 runs; TestE2E\_StandbyCrashKeepsCommitsBeforePrimaryCheckpoint
+      fails at the old HEAD and passes now.
+    Kind: impl
+    Movement: yes — tap 009 all\-goopg final data checks: 3 rows missing → 0, 2 runs
+    Parent: M0149-0016
+    009 all\-goopg final check misses row 22 \(subxact row of xact\_009\_10, prepared on london, torn down, committed on
+    promoted paris\) and rows 23–24 \(xact\_009\_11, prepared on paris, restored from files on restarted london,
+    committed after promotion\). TestE2E\_PreparedXactSurvivesPromotion does not hit it, so the missing ingredient is
+    the teardown or the standby restart.
+  - [ ] **M0149-0016d — the xmin system column is rejected \("column xmin does not exist"\)**
+    Kind: impl
+    Parent: M0149-0016
+    Found while probing 009 \(not a 009 requirement\). PG exposes xmin, xmax, cmin, cmax, ctid and tableoid on every
+    table.
+  - [x] **M0149-0016f — 009 mixed pairings: PREPARE waits for sync standbys; catalog btree descent handles truncated pivots** \(2026\-11\-24\)
+    - Movement: 009 goopg\-london/pg18\-paris: FAIL \(xact\_009\_10 missing on promoted PG, then a 24\-min hang\) → PASS.
+    - pivotAwareCmp \(sys\_catalog\_btree\_pivot.go\) and its unit test; descent uses it.
+  - [x] **M0149-0016e — catalog name\_ops index keys are cstring in PG, 64\-byte NameData in goopg** \(2026\-11\-24\)
+    - A PG\-built catalog index is recognised from its leftmost leaf \(INDEX\_VAR\_MASK on a fixed\-layout key\); goopg
+      writes its new tuple in the cstring layout and compares through NameData \(sys\_catalog\_btree\_cstring.go\).
+      Unit tests are pinned to PG 18.3 initdb tuple bytes. PG 18.3, started on the promoted goopg node's files,
+      resolves the new table through pg\_class\_relname\_nsp\_index and creates another table.
+    - pg\_proc\_proname\_args\_nsp\_index is held out \(see 0015f\): with it converted, 012 pg18\-primary regressed.
+    - Movement: 009 pg18\-london/goopg\-paris: CREATE TABLE panic → \(after 0016g\) only the pg\_subtrans step
+      \(0016c\), the same as all\-goopg. goopg\-london/pg18\-paris still PASS; 012 all three pairings PASS.
+    Kind: impl
+    Movement: yes — tap 009 pg18\-london: CREATE TABLE panic → past it \(with 0016g\); tap 012 3/3 pairings PASS
+    Parent: M0149-0016
+    PG's btree name\_ops has opckeytype = cstring \(pg\_opclass.dat\), so PG\-built catalog indexes on name columns
+    store cstring keys. goopg's cmpKey\*/buildIndexTuple\* assume 64\-byte NameData.
+  - [x] **M0149-0016g — heap insert takes an FSM block past EOF \("short read at block"\)** \(2026\-11\-24\)
+    - selectFSMCandidatePage now does freespace.c fsm\_does\_block\_exist: an entry past the relation's end is zeroed
+      and skipped. Unit test TestSelectFSMCandidatePageSkipsBlockPastEOF.
+    - Movement: 009 pg18\-london CREATE TABLE on promoted paris: "pg\_type \(rowtype\): short read at block" → OK.
+    Kind: impl
+    Movement: yes — tap 009 pg18\-london: "short read at block" → only the pg\_subtrans step remains
+    Parent: M0149-0016
+    Path\-to\-TAP: 009 pg18\-london ← CREATE TABLE on promoted paris ← FSM names pg\_type block 4069 of 15.
+  - [ ] **M0149-0016h — ReadFSMFork misreads a PG\-built FSM file**
+    Kind: impl
+    Parent: M0149-0016
+    Found while fixing 0016g \(not a 009 requirement once 0016g guards it\). The loader assumes goopg's leaves\-first
+    layout. PG's file is root\-first with three levels, so a 3\-page PG FSM is read as two leaf pages: page 1 \(an inner
+    page\) yields free space for heap block 4069, and the real leaf \(page 2\) is dropped. Either read the PG layout
+    \(fsm\_pgtree.go has the addressing\) or detect it.
+  - [ ] **M0149-0016i — a promoted goopg node keeps backup\_label**
+    Kind: impl
+    Parent: M0149-0016
+    Found while verifying 0016e. PG renames backup\_label to backup\_label.old when recovery starts. goopg leaves it, so
+    PG 18.3 refuses to start on the files \("could not locate required checkpoint record"\).
+  - [ ] **M0149-0016j — goopg's catalog name indexes use NameData keys typed name; PG's are cstring**
+    Kind: impl
+    Parent: M0149-0016
+    Found while scoping 0016e. A goopg initdb gives pg\_class\_relname\_nsp\_index attribute 1 atttypid 19 \(name,
+    attlen 64\) and 80\-byte tuples. PG gives atttypid 2275 \(cstring, attlen \-2\) and short var\-width tuples.
+    Self\-consistent, so PG nodes read goopg's indexes, but the bytes and pg\_attribute rows differ from PG's. Check
+    user indexes on name columns too \(buildUserPGAttributeRowsForIndex\). Owner call: changing the format
+    touches every existing goopg cluster.
+  - [x] **M0149-0016c — pg\_ls\_dir / pg\_stat\_file and pg\_subtrans files** \(2026\-11\-24\)
+    - pg\_ls\_dir \(1/3 args\) and pg\_stat\_file \(1/2 args\) in FROM, ported from genfile.c
+      \(convert\_and\_check\_filename, missing\_ok, include\_dot\_dirs, second\-resolution times, creation NULL\).
+      They use a generic BuiltinSRFScan node; the column list is shared by planner and analyzer
+      \(catalog.LookupBuiltinSRFColumns\). The lateral driver detects correlated arguments.
+    - ExtendSUBTRANS: every assigned XID that starts a pg\_subtrans page zeroes the page \(SubtransSLRU.ExtendForXID\).
+    - Movement: 009 all\-goopg and PG\-london: "column s.size does not exist" → PASS; 009 3/3 pairings PASS.
+    Kind: impl
+    Movement: yes — tap 009 3/3 pairings PASS \(all\-goopg and pg18\-london were failing at "column s.size"\)
+    Parent: M0149-0016
+    Path\-to\-TAP: 009 ← pg\_ls\_dir/pg\_stat\_file ← pg\_subtrans pages extended per XID \(2 links\).
+  - [ ] **M0149-0016k — FROM regexp\_split\_to\_table with a lateral argument fails \("column ref f/0 on nil slot"\)**
+    Kind: impl
+    Parent: M0149-0016
+    Found while fixing 0016c. nodeReferencesOuter has no FromRegexpSplitToTable case, so `FROM t,
+    regexp\_split\_to\_table\(t.x, ','\)` never gets the per\-outer\-row driver. Audit the other FROM SRF nodes too.
+  - [ ] **M0149-0016l — pg\_ls\_dir / pg\_stat\_file in the select list**
+    Kind: impl
+    Parent: M0149-0016
+    Only the FROM form exists. `SELECT pg\_ls\_dir\('x'\)` errors "function pg\_ls\_dir does not exist", and
+    `\(pg\_stat\_file\('x'\)\).size` does not resolve. The privilege check treats only superusers as members of
+    pg\_read\_server\_files \(has\_privs\_of\_role is not consulted\).
+- [x] **M0149-0017 — port recovery/t/026_overwrite_contrecord.pl** \(2026\-11\-24\)
+  - Done: TestPort\_Recovery026OverwriteContrecord passes ungated in all three pairings. Inventory R\-026 → port.
+  Movement: yes — tap 026 3/3 pairings PASS \(all\-goopg, pg18\-primary/goopg\-standby, goopg\-primary/pg18\-standby\)
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/026_overwrite_contrecord.pl` — segments ending in an incomplete record propagated to a replica.
+  Likely prerequisites \(verify at start\): `XLOG_OVERWRITE_CONTRECORD` + `XLP_FIRST_IS_OVERWRITE_CONTRECORD` emission after torn-record recovery \(see `e2e_pg_torn_contrecord_test.go`\), `backup_fs_cold`.
+  - 2026\-11\-24 slice 1 \(port written, gated by GOOPG\_TAP\_026\). Design docs/design/0100\-0149/0149\-0017\-overwrite\-contrecord.md.
+    - Path\-to\-TAP, each a failing step of the port, fixed:
+      - 026 ← unknown wal\_keep\_size \(goopg refused to start\): registered, with KeepLogSeg retention;
+      - 026 goopg primary ← DO block "declaration initializer: syntax error": PL/pgSQL SELECT\-shaped expressions;
+      - 026 goopg primary ← "function pg\_walfile\_name does not exist": implemented.
+    Movement: yes — tap 026 all\-goopg: start refused → only the "successfully skipped missing contrecord" log assertion fails \(data replays\)
+  - [x] **M0149-0017a — goopg crash recovery writes XLOG\_OVERWRITE\_CONTRECORD at the missing continuation** \(2026\-11\-24\)
+    - Crash recovery ends the WAL at the first segment missing after redo \(RemoveSegmentsAfterGap\). goopg had kept
+      the LAST contiguous run, so it replayed nothing from the redo segment: the test's `filler` table, 24430 rows,
+      vanished. It also resumed writing in a stale pre\-allocated segment.
+    - A record whose continuation page never reached disk is detected \(FindMissingContrecord\).
+      XLOG\_OVERWRITE\_CONTRECORD is written first on that page, under XLP\_FIRST\_IS\_OVERWRITE\_CONTRECORD, with
+      xl\_prev at the last complete record \(WriteOverwriteContrecord\). The writer's resume scan restarts at a
+      flagged page. Unit test: PG 18.3 pg\_waldump decodes "OVERWRITE\_CONTRECORD lsn 0/218".
+    - goopg never writes a record across a segment boundary \(NOOP pad, 0017d\), so 026's own shape is a clean end
+      of WAL at the boundary on a goopg primary.
+    Movement: yes — tap 026 goopg\-primary/pg18\-standby: standby catch\-up timeout → only the "successfully skipped missing contrecord" log assertion fails \(1 of 4\)
+    Kind: impl
+    Parent: M0149-0017
+    Path\-to\-TAP: 026 goopg\-primary/PG\-standby ← PG standby asks for 0/2000000, goopg's walsender cannot open
+    segment 2: goopg resumed at segment 3 \(detectWritePos drops everything below a segment hole\).
+    Upstream: xlogreader.c assembled\-record error \(abortedRecPtr, missingContrecPtr\); xlog.c StartupXLOG EndOfLog =
+    missingContrecPtr; CreateOverwriteContrecordRecord.
+  - [x] **M0149-0017b — goopg standby skips an overwritten contrecord and logs it** \(2026\-11\-24\)
+    - The streaming reader \(RecordIterator.readOneAt / overwritePageAhead\) and crash replay \(readAllPageAware,
+      sibling\) drop a partial record that runs onto an XLP\_FIRST\_IS\_OVERWRITE\_CONTRECORD page and restart there.
+      The dropped record's start rides on the next Record \(OverwrittenRecPtr\).
+    - Replay of XLOG\_OVERWRITE\_CONTRECORD verifies overwritten\_lsn \("mismatching overwritten LSN" otherwise) and
+      logs "successfully skipped missing contrecord at %X/%X, overwritten at %s".
+    - Regression: 005 flaked once in all\-goopg and passed 2/2 alone \(0013a\); 007, 009, 012 and the
+      physical/standby/crash/torn E2Es PASS.
+    Movement: yes — tap 026 pg18\-primary/goopg\-standby: standby catch\-up timeout → PASS 4/4
+    Kind: impl
+    Parent: M0149-0017
+    Path\-to\-TAP: 026 PG\-primary/goopg\-standby ← standby never catches up past PG's overwrite record; 026 all\-goopg ←
+    missing "successfully skipped missing contrecord at" log line.
+    Upstream: xlogreader.c XLP\_FIRST\_IS\_OVERWRITE\_CONTRECORD restart \(overwrittenRecPtr\); xlogrecovery.c
+    xlogrecovery\_redo verify \+ LOG.
+  - [x] **M0149-0017d — WAL records cross segment boundaries \(no XLOG\_NOOP segment pad\)** \(2026\-11\-24\)
+    - Both append paths let a record continue onto the next segment's first page under XLP\_FIRST\_IS\_CONTRECORD,
+      as PG's ReserveXLogInsertLocation does. The pad\-and\-re\-land layout of M0107/M0131\-S30.6 stays behind a
+      test\-only switch \(crossSegmentPadOn\), because the readers must still read WAL written that way.
+    - Found while closing it:
+      - a goopg standby's cold copy has the same stale segment past the hole, and replay started there. End of local
+        WAL at a missing segment now applies at standby start too;
+      - FindMissingContrecord now validates a whole\-page header first \(ValidXLogRecordHeader: rmid, prev\-link\), so
+        039's planted headers are no longer overwritten;
+      - the overwrite check runs on the raw xl\_tot\_len in all three readers;
+      - readAllPageAware compared a stream\-relative position to absolute page addresses.
+    - Regression: 039 and every recovery TAP and E2E PASS except 018 \(known, owner\-gated 0006b\); xlog under
+      \-race PASS.
+    Movement: yes — tap 026 all\-goopg and goopg\-primary/pg18\-standby: log assertion failing → PASS 4/4 each
+    - pgbench smoke A/B \(c=2\), new layout vs old pad layout: TPC\-B 303/372/308 vs 362 tps; simple update
+      294/299/281 vs 336; select only 7737/7437/7670 vs 7254. Within fsync noise: a 30 s smoke crosses about one
+      segment boundary.
+    Kind: impl
+    Parent: M0149-0017
+    Path\-to\-TAP: 026 goopg\-primary pairings ← "successfully skipped missing contrecord" needs the 600 kB message to
+    start in one segment and continue into the deleted one ← goopg pads the segment tail with XLOG\_NOOP and starts
+    the record at the next segment \(segment\_pad\_emit.go, insertPosTracker.onCrossSegment\). PG records span
+    segments freely; only XLOG\_SWITCH pads.
+  - [ ] **M0149-0017c — RAISE LOG reaches the client as NOTICE**
+    Kind: impl
+    Parent: none \(re\-parented 2026\-11\-24: a nearby defect, not a 026 requirement\)
+    Found while porting 026 \(not a 026 blocker: safe\_psql ignores stderr\). PG sends LOG to the server log only
+    \(below client\_min\_messages=notice\); goopg prints "NOTICE:  exiting after …" to psql.
+- [x] **M0149-0077 — re-port recovery/t/001_stream_rep.pl to the M0149 contract** \(2026\-11\-25\)
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/001_stream_rep.pl` — streaming replication with a cascading standby, hot-standby feedback, read-only checks and replication-connection commands.
+  Current shortcut \(audit\): `TestPort_Recovery001StreamRep` covers 2 of \~47 upstream assertions \(walreceiver streaming, one row visible\). Missing: the cascading `standby_2`; read-only transaction errors; `hot_standby_feedback` xmin/catalog\_xmin on slots; sequence and unlogged checks on the standby; replication-connection `SHOW` and `READ_REPLICATION_SLOT`; the `pg_backup_start` checks. The slot is pre-created by the harness. All-goopg only — no PG 18.3 primary/standby variant.
+  Likely prerequisites \(verify at start\): the Tier 2 substrate \(streaming, promotion, harness `wait_for_catchup` / `background_psql`\), a cascading walsender on a standby, `READ_REPLICATION_SLOT`, mixed goopg↔PG streaming \(`e2e_failover_*` precedents\). Inventory row stays `port` until this closes.
+  - 2026\-11\-24 slice 1: full port TestPort\_Recovery001StreamRepFull \(gated by GOOPG\_TAP\_001\), three pairings.
+    Design docs/design/0100\-0149/0149\-0077\-stream\-rep\-report.md.
+    - Path\-to\-TAP, fixed: 001 ← "function pg\_sequence\_last\_value does not exist" \(fatal\): implemented.
+    Movement: yes — tap 001 all\-goopg: fatal at the unlogged\-sequence check → runs to the walsender pg\_stat\_io wait \(25 of \~47 assertions evaluated, 19 not ok\)
+  - [x] **M0149-0077a — goopg standby shows no sequence state \(SELECT \* FROM seq1 is empty\)** \(2026\-11\-24\)
+    - Two gaps:
+      - the heap catalog reload registers a relkind S relation first, and CreateSequenceCatalogRelation then bailed
+        out on "already exists", so the sequence had no reader at all;
+      - nothing updated the sequence registry from replayed XLOG\_SEQ\_LOG.
+    - Now: the reader is wired onto the existing relation; a StreamReplayer sequence hook
+      \(Runtime.RefreshSequenceAfterReplay\) takes the counter from the replayed page; the standby's catalog refresh
+      reloads sequences.
+    - SELECT \* FROM seq shows the page \(last\_value, log\_cnt, is\_called\) as read\_seq\_tuple does, until this
+      server's own nextval/setval \(SetSequencePageState\). That also holds after a primary restart.
+    - Regression: 005 flaked 1 of 2 alone \(0013a timing\); 007, 009, 012, 026 and the physical/hot\-standby/failover
+      E2Es PASS.
+    Movement: yes — tap 001 all\-goopg: "check streamed sequence content on standby 1/2" not ok → ok \(2 assertions\)
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 "check streamed sequence content on standby 1/2" ← sequence state lives in memory
+    \(Table.VirtualRows\) and is not rebuilt from replayed WAL \(seq\_redo, sequence.c\).
+  - [x] **M0149-0077b — goopg standby is not read\-only** \(2026\-11\-24\)
+    - INSERT, UPDATE, DELETE, MERGE and upsert on a hot standby fail "cannot execute <CMD> in a read\-only transaction"
+      \(25006\), as ExecCheckXactReadOnly does while recovery forces XactReadOnly \(preventCommandDuringRecovery\).
+      The goopg standby had applied the INSERT.
+    - A standby session reports in\_hot\_standby=on in its startup ParameterStatus, which libpq's
+      target\_session\_attrs reads.
+    - Regression: postmaster package; 007, 009, 012, 026, 039 and the physical/hot\-standby/failover/standby/prepared
+      E2Es PASS.
+    Movement: yes — tap 001 all\-goopg: "read\-only queries on standby 1/2" not ok → ok; target\_session\_attrs routing now connects to the right node in all 17 cases \(13 still not ok only on SHOW port, 0077c\)
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 "read\-only queries on standby 1/2" \(INSERT exits 0, want 3\); the target\_session\_attrs
+    read\-only/standby/read\-write cases ← the standby must reject writes \(cannot execute INSERT in a read\-only
+    transaction\) and report in\_hot\_standby=on and default\_transaction\_read\_only=on in ParameterStatus.
+  - [x] **M0149-0077c — SHOW port reports 5432, not the listening port** \(2026\-11\-24\)
+    - `goopg start --listen host:port` now sets the port GUC from the listen port with command\-line source, as
+      postmaster's \-p does \(PGC\_S\_ARGV\).
+    - Also fixed, found in the same runs: a standby's commit\-time catalog refresh could put an older sequence page
+      read back over the counter the sequence replay hook had set \(1 run in 3 showed 1\|0\|f\). The refresh now registers
+      only sequences not yet known \(reloadSequencesFromHeapMode onlyNew\). 3/3 runs then clean.
+    Movement: yes — tap 001 all\-goopg: 13 target\_session\_attrs "connect to node" not ok → ok; every assertion before the walsender pg\_stat\_io wait now passes \(3/3 runs\)
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 target\_session\_attrs "connect to node … " compares SHOW port with the node's port.
+  - [x] **M0149-0077d — the walsender records no pg\_stat\_io WAL reads** \(2026\-11\-24\)
+    - The walsender counts each WAL chunk it reads for a standby as one walsender/wal/normal read with its bytes
+      \(WALRead's pgstat\_count\_io\_op\_time\). The walreceiver counts each received chunk it writes as one
+      walreceiver/wal/normal write \(XLogWalRcvWrite\). executor.CountWALSenderRead / CountWALReceiverWrite feed the
+      cumulative pg\_stat\_io store.
+    Movement: yes — tap 001 all\-goopg: fatal walsender pg\_stat\_io timeout → passes; the run now stops at the slot xmin wait \(0077g\)
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 waits for `sum(reads) > 0 FROM pg_stat_io WHERE backend_type = 'walsender' AND object = 'wal'`
+    \(fatal timeout\); later the walreceiver `writes` check.
+  - [x] **M0149-0077g — pg\_replication\_slots.xmin is 0 instead of NULL** \(2026\-11\-24\)
+    - pg\_replication\_slots renders xmin and catalog\_xmin as NULL for InvalidTransactionId \(catalog.VirtualNull\),
+      as pg\_get\_replication\_slots does; physical\-slot xmin is not tracked yet, so it is always NULL.
+    Movement: yes — tap 001 all\-goopg: fatal get\_slot\_xmins timeout → the 4 null\-xmin assertions pass on both slots; the run now stops at ALTER SYSTEM SET hot\_standby\_feedback \(0077i\)
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 get\_slot\_xmins waits for `xmin IS NULL AND catalog_xmin IS NULL` on the primary's physical
+    slot \(fatal timeout\): goopg shows `standby_1|t|0||…` — xmin 0, catalog\_xmin NULL. PG prints NULL for
+    InvalidTransactionId \(pg\_get\_replication\_slots: `nulls[i] = true` when !TransactionIdIsValid\).
+  - [x] **M0149-0077e — PG 18.3 standby of a goopg primary cannot read an unlogged sequence** \(2026\-11\-24\)
+    - Root cause: CREATE UNLOGGED SEQUENCE \(and an UNLOGGED table's serial/identity sequence\) stamped
+      relpersistence 'u' with a second syncTableToCatalogHeap. That function is insert\-only, so the catalog heap held
+      two live pg_class rows for the relation, one 'p' and one 'u', each with its own pg\_attribute rows and index
+      entries. The PG standby resolved the name to the 'p' row, and pg\_sequence\_last\_value read the missing main
+      fork in recovery.
+    - The unlogged flag now goes into createSeqCatalogTable's single write. The PG standby shows one 'u' row and
+      pg\_sequence\_last\_value returns NULL, as in PG.
+    - TestPort\_Recovery001StreamRepFull/goopg\-primary\-pg18\-standbys passes \(3/3, about 15 s\) and runs ungated.
+      Regress sequence 40→39 mismatch lines.
+    Movement: yes — tap 001 goopg\-primary/pg18\-standbys: fatal "could not open file base/5/<n>" → pairing PASS end to end; regress sequence 40→39
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 goopg\-primary/pg18\-standbys: pg\_sequence\_last\_value\('ulseq'\) on the PG standby fails "could
+    not open file base/5/<n>". PG returns NULL for an unlogged sequence in recovery, so its relpersistence must
+    not read 'u'; check goopg's pg\_class row and init fork for unlogged sequences.
+  - [x] **M0149-0077f — goopg standby does not serve a cascading standby** \(2026\-11\-25\)
+    - Two causes behind the timed\-out cascade wait.
+    - First cause, BASE\_BACKUP from a goopg standby that has not adopted a restartpoint:
+      - the checkpointer reports no redo, so BASE\_BACKUP started at the end of WAL;
+      - pg\_basebackup \-X stream got nothing, the label named an unwritten redo, and standby\_2 asked for segment 0;
+      - fix: BASE\_BACKUP now falls back to pg\_control's checkPoint/checkPointCopy.redo, as do\_pg\_backup\_start does.
+    - Second cause, intermittent, behind "SELECT \* FROM seq1" being empty:
+      - virtual pg\_catalog relations registered without an OID took user\-range OIDs \(pg\_subscription\_rel 16397,
+        pg\_stat\_wal\_io 16387\);
+      - a PG primary assigns those OIDs to user objects, so the standby's OID lookup sometimes found the catalog
+        instead of the sequence \(map order\);
+      - fix: RegisterVirtualTable gives such relations PG's own OID \(seeded pg\_class row, or the pinned system and
+        information\_schema view OIDs\). goopg\-only system views count down from 16383.
+    - All three 001 pairings pass 3/3 and run ungated. The must\-pass regress cases are identical to HEAD.
+    Movement: yes — tap 001 pg18\-primary/goopg\-standbys: fatal cascade catch\-up timeout → pairing PASS; TestPort\_Recovery001StreamRepFull PASS on all three pairings \(M0149 contract met\)
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 pg18\-primary/goopg\-standbys: standby\_2 never appears in standby\_1's pg\_stat\_replication
+    \(the first cascaded catch\-up wait times out\).
+  - [x] **M0149-0077h — a running standby does not see replayed event triggers** \(2026\-11\-24\)
+    - Corrected diagnosis: the failing assertion was standby\_2's, not standby\_1's. standby\_1 restarts, and its
+      startup reload reads pg\_event\_trigger from the heap; standby\_2 never restarts, and the running standby's
+      catalog refresh \(RefreshCatalogAfterReplay\) reloaded tables and sequences only.
+    - The refresh now replaces the event trigger registry and TID cache with the replayed heap's committed rows
+      \(reloadUserEventTriggersFromHeapMode sync, catalog.ReplaceEventTriggersDuringRecovery\). Verified live:
+      CREATE, ENABLE ALWAYS, RENAME and DROP on the primary all show on the streaming standby without a restart.
+    Movement: yes — tap 001 all\-goopg: "Name of login trigger" not ok → ok on both standbys; the run now stops at ALTER SYSTEM SET hot\_standby\_feedback \(0077i\)
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 all\-goopg "Name of login trigger": `SELECT evtname FROM pg_event_trigger WHERE evtevent='login'`
+    returned "" on the never\-restarted standby\_2. Non\-fatal assertion.
+  - [x] **M0149-0077i — hot\_standby\_feedback is not implemented** \(2026\-11\-24\)
+    - hot\_standby\_feedback GUC \(SIGHUP, off\). The walreceiver sends PG's 'h' message after each status update
+      with the standby's GetReplicationHorizons xmin \(transam.Manager.ReplicationHorizons\), and one invalid
+      message after the GUC is turned off \(primary\_has\_standby\_xmin\).
+    - The walsender sets the physical slot's xmin and catalog\_xmin from it \(Slots.SetPhysicalXmins, persisted in
+      slotdata.xmin\). Slots.MinXmin floors OldestXmin, as replication\_slot\_xmin does, so a cascading standby
+      forwards its downstream slot's xmin.
+    - Second link found on the way: standby\_2 changes primary\_slot\_name by reload only. The walreceiver read it once
+      at start, so the cascaded slot stayed inactive. The launcher now re\-reads primary\_conninfo and
+      primary\_slot\_name per connection and restarts the connection when a reload changes either
+      \(StartupRereadConfig pendingWalRcvRestart\). This also passes 001's "change primary\_conninfo without restart".
+    Movement: yes — tap 001 all\-goopg: fatal ALTER SYSTEM SET hot\_standby\_feedback → all 12 hs\_feedback slot xmin assertions, the primary\_conninfo reload and the walreceiver pg\_stat\_io writes check pass; next not ok is pg\_replication\_slot\_advance \(0077j\)
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 all\-goopg `ALTER SYSTEM SET hot_standby_feedback = on` on standby\_1 fails "unrecognized
+    configuration parameter" \(fatal\). Then get\_slot\_xmins needs a non\-null xmin on the primary's slot and on
+    standby\_1's slot: the GUC, walreceiver feedback messages and slot xmin tracking \(PhysicalReplicationSlotNewXmin\).
+  - [x] **M0149-0077j — pg\_replication\_slot\_advance does not exist** \(2026\-11\-24\)
+    - pg\_replication\_slot\_advance\(name, pg\_lsn\) for physical slots: the target is capped at the flushed WAL
+      \(the replayed WAL on a standby\). An invalid target, an unknown slot, an unreserved slot or a backward
+      target errors with PG's messages. Slots.AdvancePhysical persists the new restart\_lsn. A logical slot is
+      refused: decoding up to the target is not wired.
+    - Second link: retention read a slot's restart\_lsn \(a PG byte position\) as the writer's 1\-based LSN. A
+      restart\_lsn on a segment boundary therefore kept the previous segment; the retainer now adds 1, matching
+      KeepLogSeg's XLByteToSeg\(restart\_lsn\).
+    Movement: yes — tap 001 all\-goopg: "slot advancing with physical slot" and "WAL segment … recycled after physical slot advancing" not ok → ok; remaining not ok are the three 0077k backup checks
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 all\-goopg "slot advancing with physical slot": `SELECT pg_replication_slot_advance('phys_slot', lsn)`
+    fails "function does not exist". Then the advance must persist across a clean restart, and the shutdown checkpoint
+    must recycle the segment the slot no longer holds \("WAL segment … recycled after physical slot advancing"\).
+  - [x] **M0149-0077k — pg\_backup\_start / pg\_backup\_stop do not exist** \(2026\-11\-24\)
+    - Session\-level online backups, keyed by the connection's ProcNum \(PG's backend\-local sessionBackupState\).
+      - pg\_backup\_start\(label, fast\): refuses a second backup in the session, a too\-long label and wal\_level
+        minimal; checkpoints and returns the redo LSN.
+      - pg\_backup\_stop\(wait\): without a backup, "backup is not in progress" plus PG's hint; otherwise it switches
+        WAL and returns \(lsn, labelfile, spcmapfile\), with the archiving NOTICE.
+      - BASE\_BACKUP refuses while the session's backup runs; a disconnect aborts it with PG's WARNING.
+    - The label builder is shared with BASE\_BACKUP \(executor.BuildBackupLabel\).
+    Movement: yes — tap 001 all\-goopg: "BASE\_BACKUP cannot run in session already running backup" and "base backup cleanly canceled" not ok → ok; the only remaining all\-goopg not ok is "WAL sender sending base backup killed" \(0077l\)
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 all\-goopg: BASE\_BACKUP in a replication session after `SELECT pg_backup_start('backup', true)`
+    must fail "a backup is already in progress in this session"; pg\_backup\_stop with no backup must fail "backup is
+    not in progress".
+  - [x] **M0149-0077l — a running BASE\_BACKUP cannot be found and cancelled** \(2026\-11\-24\)
+    - Every piece is in place:
+      - pg\_stat\_progress\_basebackup reads a live BASEBACKUP progress registry \(phase, backup\_streamed, tablespace
+        counts; backup\_total NULL\);
+      - a walsender reports its replication command in pg\_stat\_activity \(exec\_replication\_command's
+        pgstat\_report\_activity\);
+      - MAX\_RATE is validated \(32..1048576 kB/s, 22003\) and throttles the copy stream;
+      - BASE\_BACKUP runs on the statement context, so pg\_cancel\_backend ends it with 57014 "canceling statement due
+        to user request" and the session continues.
+    - TestPort\_Recovery001StreamRepFull/all\-goopg now passes \(3/3, about 45 s\) and runs ungated. The two mixed
+      pairings stay behind GOOPG\_TAP\_001 until 0077e and 0077f land.
+    - 0077f observation \(not worked\): in the PG\-primary pairing, standby\_2 now appears in standby\_1's
+      pg\_stat\_replication as streaming, but at 0/0.
+    Movement: yes — tap 001 all\-goopg: "WAL sender sending base backup killed" not ok → ok; all\-goopg PASS end to end
+    Kind: impl
+    Parent: M0149-0077
+    Path\-to\-TAP: 001 all\-goopg "WAL sender sending base backup killed": the poll joins pg\_stat\_activity
+    \(`query ~ 'BASE_BACKUP'`\) with pg\_stat\_progress\_basebackup \(`phase = 'streaming database files'`\) and runs
+    pg\_cancel\_backend on the pid. Needs:
+    - live progress rows for a walsender running BASE\_BACKUP;
+    - the walsender's query text in pg\_stat\_activity;
+    - MAX\_RATE throttling, so the backup stays in that phase long enough;
+    - a cancel that reaches the BASE\_BACKUP stream, which runs on the connection ctx, not on queryCtx.
+
+- [ ] **M0149-0084 — read\-only transactions do not restrict DML on a primary**
+  Kind: impl
+  Parent: none \(found while fixing M0149-0077b; not a 001 requirement\)
+  `BEGIN READ ONLY; INSERT …` and `SET default_transaction_read_only = on; INSERT …` succeed on goopg. PG raises
+  "cannot execute INSERT in a read\-only transaction" \(ExecCheckXactReadOnly / PreventCommandIfReadOnly, also for
+  DDL\). `SHOW transaction_read_only` is unrecognised. On a standby, DDL is not refused either, and in\_hot\_standby
+  is not re\-reported to existing sessions at promotion.
+- [ ] **M0149-0085 — pg\_settings has 62 rows; PG 18.3 has 401**
+  Kind: impl
+  Parent: none \(found while fixing M0149-0077c; not a 001 requirement\)
+  `SELECT … FROM pg_settings WHERE name IN \('port', 'wal\_keep\_size', 'work\_mem'\)` returns no row on goopg. PG lists
+  every GUC with setting and source \(`port|5545|command line`\). pg\_settings should come from the GUC registry.
+- [ ] **M0149-0086 — pg\_basebackup's temporary slot survives the backup**
+  Kind: impl
+  Parent: none \(found while fixing M0149-0077d; not a 001 assertion\)
+  After `pg_basebackup` against a goopg primary, pg\_replication\_slots still lists `pg_basebackup_<pid>`
+  \(inactive\). PG creates it TEMPORARY \(CREATE\_REPLICATION\_SLOT … TEMPORARY\) and drops it when the walsender
+  session ends \(ReplicationSlotCleanup\).
+- [ ] **M0149-0087 — system columns are missing on virtual catalogs such as pg\_event\_trigger**
+  Kind: impl
+  Parent: none \(found while fixing M0149-0077h; not a 001 assertion\)
+  `SELECT ctid, xmin, xmax FROM pg_event_trigger` fails with `column "xmin" does not exist`. On PG every catalog is a
+  heap with system attributes. goopg renders pg\_event\_trigger from the in\-memory registry
+  \(catalog.go VirtualRows\), so the heap's system columns are not reachable.
+- [ ] **M0149-0088 — data race on the server's frame reader in the START\_REPLICATION path**
+  Kind: impl
+  Parent: none \(found while fixing M0149-0077i; pre\-existing — HEAD fails 3 of 10 runs\)
+  `go test -race ./internal/replication/ -run TestReplicationStartReplicationStreamsRecord` reports a race between
+  postmaster runPostStartupLoop's FrameReader.ReadFrame and the walsender's standby\-reply reader goroutine on the
+  same bufio.Reader.
+- [ ] **M0149-0089 — slot SQL functions: FROM\-clause calls and creation LSN differ from PG**
+  Kind: impl
+  Parent: none \(found while fixing M0149-0077j; not a 001 assertion\)
+  - `SELECT * FROM pg_replication_slot_advance(…)` and the other record\-returning slot functions fail with
+    "table\-valued function … not supported"; the scalar form returns record text, not a composite.
+  - `pg_create_physical_replication_slot(name, true)` reports WrittenLSN\+1 \(0/10000A1\), where PG reports the insert
+    position. Without immediately\_reserve, goopg still reserves WAL, so "cannot be advanced" \(never reserved\) cannot
+    happen.
+- [ ] **M0149-0090 — a walsender's pg\_stat\_activity backend\_type is "client backend"**
+  Kind: impl
+  Parent: none \(found while fixing M0149-0077l; not a 001 assertion\)
+  A replication connection running BASE\_BACKUP or START\_REPLICATION shows `backend_type = 'client backend'`. PG
+  reports `walsender` \(am\_walsender sets B\_WAL\_SENDER\).
+- [ ] **M0149-0091 — ALTER SEQUENCE … SET LOGGED/UNLOGGED duplicates the sequence's catalog rows**
+  Kind: impl
+  Parent: none \(found while fixing M0149-0077e; not a 001 assertion\)
+  - The ALTER path calls the insert\-only syncTableToCatalogHeap again, as CREATE UNLOGGED SEQUENCE did. The result is
+    a second pg\_class row plus pg\_attribute rows and index entries for the same oid, and a PG standby reads the stale
+    one.
+  - PG's ATExecSetRelPersistence rewrites the relation into a new relfilenode and updates the pg\_class row in place
+    \(heap\_update\).
+  - Audit the other callers that run syncTableToCatalogHeap on an already\-written relation.
+- [ ] **M0149-0092 — a backup taken from a goopg standby says "BACKUP FROM: primary"**
+  Kind: impl
+  Parent: none \(found while fixing M0149-0077f; not a 001 assertion\)
+  - do\_pg\_backup\_start in recovery writes "BACKUP FROM: standby", which tells a restoring server to treat
+    minRecoveryPoint as the backup end. goopg's BuildBackupLabel always writes "primary".
+  - BASE\_BACKUP on a standby also skips PG's checks: the full\_page\_writes requirement, and "the standby was
+    promoted during online backup".
+- [x] **M0149-0018 — port recovery/t/002_archiving.pl** \(2026\-11\-25\)
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/002_archiving.pl` — WAL archiving with a hot standby restoring from the archive.
+  Likely prerequisites \(verify at start\): a WAL archiver \(`pgarch.c`: `.ready` → `archive_command` → `.done`; only the GUC exists today\), `restore_command` `%f`/`%p`, `archive_cleanup_command`, `recovery_end_command`, `pg_stat_archiver`.
+  - 2026\-11\-25 slice 1: TestPort\_Recovery002ArchivingFull in three pairings; harness EnableArchiving / EnableRestoring /
+    ArchiveDir \(Cluster.pm enable\_archiving / enable\_restoring\). The goopg\-primary/PG\-standbys pairing passes and
+    runs ungated; the goopg\-standby pairings run only with GOOPG\_TAP\_002=1. Design
+    docs/design/0100\-0149/0149\-0018\-archiving.md.
+  - [x] **M0149-0018a — goopg has no WAL archiver** \(2026\-11\-25\)
+    - xlog.Archiver \(pgarch.c\):
+      - completed segments become archive\_status/<seg>.ready after their fsync \(XLogArchiveNotifySeg\), and a
+        promotion's history file becomes .ready too;
+      - archive\_command runs in the data directory with %p/%f/%% and history files first;
+      - on success the file is renamed .done; a failure is retried 3 times one second apart, with PG's WARNING and
+        DETAIL;
+      - the archiver wakes at notify, at reload and every 60 s;
+      - removal keeps segments not .done \(XLogArchiveCheckDone\);
+      - on a standby with archive\_mode = on, received segments are .done.
+    - pg\_stat\_archiver reads live counters. New GUCs: archive\_mode, archive\_command, archive\_library,
+      archive\_timeout, wal\_retrieve\_retry\_interval.
+    Movement: yes — tap 002 goopg\-primary/pg18\-standbys: no archive \(standby never catches up\) → pairing PASS
+    Kind: impl
+    Parent: M0149-0018
+    Path\-to\-TAP: 002 waits for the standby to replay WAL it can only get from the primary's archive.
+  - [x] **M0149-0018b — a goopg standby does not restore WAL from the archive** \(2026\-11\-25\)
+    - A standby with restore\_command and no primary\_conninfo runs an archive feeder in the walreceiver's slot
+      \(runArchiveFeeder, the XLOG\_FROM\_ARCHIVE source\):
+      - it restores the segment that holds its next WAL byte into RECOVERYXLOG, %r being the last restartpoint;
+      - it appends the bytes it lacks to the local WAL writer, which the replayer reads;
+      - it logs "restored log file … from archive";
+      - when the archive does not have the segment yet, it waits wal\_retrieve\_retry\_interval;
+      - at promotion it takes what the archive still has.
+    - Ungated witness: TestE2E\_GoopgStandbyRestoresFromArchive \(3/3\).
+    Movement: yes — tap 002 all\-goopg and pg18\-primary/goopg\-standbys: fatal "Timed out while waiting for standby to catch up" → run to the end; content, promotion and the 00000002.history archive pass; 4 not ok left \(0018c\)
+    Kind: impl
+    Parent: M0149-0018
+    Path\-to\-TAP: 002 all\-goopg and pg18\-primary pairings: standby.signal \+ restore\_command and no primary\_conninfo.
+    The standby starts, logs "walreceiver not started" and never replays; "Timed out while waiting for standby to catch
+    up". PG's WaitForWALToBecomeAvailable polls the archive \(XLOG\_FROM\_ARCHIVE\), then pg\_wal, then streaming, every
+    wal\_retrieve\_retry\_interval.
+  - [x] **M0149-0018c — archive\_cleanup\_command, recovery\_end\_command and the promotion checks of 002** \(2026\-11\-25\)
+    - Recovery commands now run in the data directory \(ExecuteRecoveryCommandIn\), and their failure WARNING is PG's
+      `<name> "<command>": <wait_result_to_str>`.
+    - Every successful restore logs "restored log file … from archive" \(RestoreArchivedFile's LOG\).
+    - Promotion probes the archive for history files \(FindNewestTimelineArchive, findNewestTimeLine under archive
+      recovery\). standby2 now skips the timeline 2 that standby1 already took and promotes onto 3; before, it
+      reused 2.
+    - Promotion removes RECOVERYXLOG / RECOVERYHISTORY \(exitArchiveRecovery\).
+    - Harness: tapnode LogSize / LogFrom render goopg's structured log lines in PG's `LEVEL:  message` form for the
+      ported log assertions.
+    - All three pairings pass 3/3 and run ungated. Inventory row 002 → port.
+    Movement: yes — tap 002 all\-goopg and pg18\-primary/goopg\-standbys: 4 not ok → PASS; TestPort\_Recovery002ArchivingFull PASS on all three pairings \(M0149 contract\)
+    Kind: impl
+    Parent: M0149-0018
+    Path\-to\-TAP: after 0018b, 002 checks:
+    - archive\_cleanup\_command runs at a standby restartpoint, in the data directory;
+    - recovery\_end\_command runs at promotion, and a failing one logs a WARNING;
+    - the promoted standby archives 00000002.history;
+    - standby2 restores 00000002.history from the archive at promotion \("restored log file … from archive"\), and
+      RECOVERYHISTORY / RECOVERYXLOG are removed.
+    Recovery commands currently run in the server's working directory, not the data directory.
+- [x] **M0149-0019 — port recovery/t/020_archive_status.pl** \(2026\-11\-25\)
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/020_archive_status.pl` — archiver failure/retry and `.ready`/`.done` on primary and standby.
+  Likely prerequisites \(verify at start\): `archive_mode=on|always` on standby, `.done` for streamed segments, `pg_stat_archiver` failure columns, archive status kept across `backup_fs_cold` restore.
+  - TestPort\_Recovery020ArchiveStatusFull ports 020 in three pairings, all passing 3/3 and ungated; inventory row → port.
+    Design docs/design/0100\-0149/0149\-0019\-archive\-status.md.
+  - Blockers found and fixed \(each a direct 020 requirement\):
+    - pg\_wal\_lsn\_diff did not exist \(every replay wait uses it\);
+    - after an XLOG\_SWITCH the replay position stopped at the switch record, not at the next segment boundary
+      \(XLogReadRecord's "pretend it extends to end of segment"\);
+    - a segment restored from the archive was never flushed, so it got no .done / .ready
+      \(KeepFileRestoredFromArchive marks it at once\);
+    - pg\_stat\_reset\_shared\('archiver'\) reset nothing;
+    - log\_min\_messages did not change the server log level, and the archiver's DEBUG1 shutdown message did not
+      exist, nor did the wait for the archiver's last pass at shutdown.
+  Movement: yes — tap 020: all\-goopg and pg18\-primary/goopg\-standbys fatal "Timed out while waiting for xlog replay on standby1" → PASS; 020 PASS on all three pairings \(M0149 contract\)
+- [x] **M0149-0020 — port recovery/t/024_archive_recovery.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/024_archive_recovery.pl` — archive recovery refusing WAL generated with `wal_level=minimal`.
+  Likely prerequisites \(verify at start\): `XLOG_PARAMETER_CHANGE` record + PG FATAL text, restart with changed `wal_level`.
+  - 2026\-11\-25 \(done\): TestPort\_Recovery024ArchiveRecoveryFull passes on all three pairings \(3 of 3 runs\), ungated; inventory row 024 → port. XLogReportParameters at startup, the wal\_level=minimal FATAL, archive recovery replays from the pg\_control redo. Design: docs/design/0100\-0149/0149\-0020\-archive\-recovery\-wal\-level.md.
+- [x] **M0149-0021 — port recovery/t/042_low_level_backup.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/042_low_level_backup.pl` — `pg_backup_start`/`pg_backup_stop` backups restored with/without `backup_label`.
+  Likely prerequisites \(verify at start\): non-exclusive low-level backup returning PG-exact `backup_label`/`tablespace_map` text, recovery from caller-written `backup_label`, the "missing backup\_label" behaviour.
+  - 2026\-11\-25 \(done\): TestPort\_Recovery042LowLevelBackupFull passes on all three pairings \(3 of 3 runs\), ungated; inventory row 042 → port. pg\_backup\_stop\(\) in FROM, XLOG\_BACKUP\_END \+ history file \+ archive wait, archive recovery from backup\_label, replayed commit status and catalog refresh. Design: docs/design/0100\-0149/0149\-0021\-low\-level\-backup.md.
+  - 2026\-11\-25 \(REOPENED\): the 042 port closed in d45d3a8b0 used recovery.signal for replica\_success, but Cluster.pm init\_from\_backup has\_restoring defaults to standby => 1. With the faithful standby, goopg\-primary\-pg18\-recovery passes and both goopg\-recovery pairings fail: "the database system is not yet accepting connections". The test is gated again \(GOOPG\_TAP\_042\) and the inventory row is back to failed. The archive\-recovery pieces of d45d3a8b0 \(pg\_backup\_stop in FROM, XLOG\_BACKUP\_END, history file, archive wait, backup\_label in archive recovery, commit stamping and catalog refresh\) stay: they are PG behaviour 042's PG\-restore pairing needs and archive recovery uses.
+- [x] **M0149-0021a — a goopg standby restored from backup\_label \(empty pg\_wal\) reaches consistency and serves reads**
+  Kind: impl
+  Parent: M0149-0021
+  - Path\-to\-TAP: 042 \(goopg recovery pairings\) ← a goopg standby \(standby.signal \+ restore\_command\) starting from backup\_label replays from the label's redo, reaches consistency and accepts read\-only connections ← M0149\-0021.
+  - Start: the standby path \(startStandby, runArchiveFeeder, StreamReplayer in cmd/goopg\) ignores backup\_label; the feeder starts at the writer's position \(0 for an empty pg\_wal\); the consistency point comes from pg\_control \(recoveryConsistencyPoint\), whose checkpoint is later than the WAL the label needs.
+  - 2026\-11\-25 \(done\): startStandbyFromBackupLabel reads backup\_label at standby start, logs "starting backup recovery with redo LSN …", moves an empty WAL writer to the redo segment \(Writer.StartAt\) so the archive feeder and the replayer start there, and renames the label to backup\_label.old. Second link: a goopg standby reported itself ready as soon as it listened, so the test's first query raced replay \("not yet accepting connections"\). The control socket now answers PMSTATUS with PG's postmaster.pid status line \("starting" until hot standby begins at consistency, "standby" with hot\_standby = off, else "ready"\), and the test cluster's Start waits past "starting" as pg\_ctl start \-w does. 042 passes on all three pairings 3 of 3, ungated, inventory row 042 → port; recovery TAPs 001–045 and 21 standby E2Es PASS.
+- [x] **M0149-0022 — port recovery/t/045_archive_restartpoint.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/045_archive_restartpoint.pl` — restartpoints during archive recovery.
+  Likely prerequisites \(verify at start\): `CreateRestartPoint` during archive recovery, segment recycling/removal on the recovering node.
+  - 2026\-11\-25: ported as TestPort\_Recovery045ArchiveRestartpointFull \(gated GOOPG\_TAP\_045\). Path\-to\-TAP links, each a direct requirement of the one 045 assertion \(the restore node reachable and paused at the target\): goopg cannot init with `--wal-segsize 1` \(0022a\); a goopg restore node shuts down at recovery\_target\_action = pause \(0022b\); a PG 18.3 restore of the goopg primary never becomes ready \(0022c\). PG oracle note: upstream 045 needs a record in the target's segment — on PG the bgwriter's RUNNING\_XACTS \(LogStandbySnapshot, every 15 s\) lands there during the 320 checkpoints and the final pg\_switch\_wal archives it; a short loop makes real PG FATAL "recovery ended before configured recovery target was reached" too.
+  - 2026\-11\-25 \(done\): TestPort\_Recovery045ArchiveRestartpointFull passes on all three pairings \(3 of 3 runs, plus 7 of 7 goopg\-primary\-pg18\-restore\), ungated; inventory row 045 → port. The restore node is a standby — Cluster.pm init\_from\_backup has\_restoring defaults to standby => 1 \(verified by running the real upstream 045 with PG 18.3: "entering standby mode", "waiting for WAL to become available"\) — so at the end of the archive it waits for WAL and pg\_last\_wal\_replay\_lsn\(\) reaches the boundary after the last XLOG\_SWITCH. The port first used recovery.signal, which made 0022b and 0022c look like 045 blockers; they are not. The only blocker was 0022a. Harness: tapnode psql runs under PostgreSQL::Test::Utils' $timeout\_default \(180 s, PG\_TEST\_TIMEOUT\_DEFAULT\) instead of cluster.PSQL's 30 s — the 320\-checkpoint loop takes ~30 s on goopg.
+- [x] **M0149-0022a — configurable WAL segment size \(initdb --wal-segsize, wal\_segment\_size from pg\_control\)**
+  Kind: impl
+  Parent: M0149-0022
+  - Path\-to\-TAP: 045 ← init `--wal-segsize 1` and a server running 1 MB segments ← M0149\-0022.
+  - 2026\-11\-25 \(done\): `goopg init --wal-segsize` \(PG's power\-of\-two validation\) writes xlog\_seg\_size into pg\_control, a bootstrap segment of that size \(checkpoint at segment 1 \+ 40\) and min/max\_wal\_size via pretty\_wal\_size. initdb.Open adopts xlog\_seg\_size as the process\-wide `xlog.WALSegmentSize\(\)` \(PG's wal\_segment\_size global\); segment naming \(FormatSegmentNameTLI\), highestLocalSegment and every segSize==0 fallback use it; SHOW wal\_segment\_size reports it. A 1 MB cluster runs, restarts, serves pg\_basebackup and archive recovery of PG 1 MB WAL.
+- [ ] **M0149-0022b — recovery\_target\_action = pause: stay in recovery and serve hot\-standby reads at the target**
+  Kind: impl
+  Parent: none \(found while porting 045; NOT a 045 blocker — 045's restore node is a standby\)
+  - goopg's start\-time archive recovery runs before the listener and turns pause into a shutdown \(shutdownAtRecoveryTarget, cmd/goopg/standby.go\). PG: recoveryPausesHere at the end of recovery, "pausing at the end of recovery" / HINT "Execute pg\_wal\_replay\_resume\(\) to promote.", ready for read\-only connections; pg\_wal\_replay\_resume\(\) then promotes. Verified oracle: PG replays to 0/1E00060 and reports pg\_is\_in\_recovery = t, pg\_is\_wal\_replay\_paused = t.
+- [ ] **M0149-0022c — the bgwriter's periodic standby snapshot \(LogStandbySnapshot every LOG\_SNAPSHOT\_INTERVAL\_MS\)**
+  Kind: impl
+  Parent: none \(found while porting 045; NOT a 045 blocker\)
+  - Diagnosed 2026\-11\-25: an idle goopg primary writes no XLOG\_RUNNING\_XACTS between checkpoints. PG's bgwriter writes one every 15 s when important WAL was written since the last \(bgwriter.c, GetLastImportantRecPtr\), so a hot standby reaches a consistent snapshot without a checkpoint, and WAL ending at a switch gets a record in the next segment. A tested implementation \(Checkpointer.LogStandbySnapshot \+ a 1 s ticker goroutine in cmd/goopg/main.go, compared with the snapshot's own end because goopg has no XLOG\_MARK\_UNIMPORTANT\) was written and set aside as off\-path: it reproduced PG's oracle output \(RUNNING\_XACTS at 0/1500028, PG restore paused at 0/1500060\).
+- [ ] **M0149-0093 — a TEMPORARY physical slot survives as a permanent one**
+  Kind: impl
+  Parent: none \(found while porting 045; not a 045 assertion\)
+  - After a failed pg\_basebackup against a goopg primary, its `pg_basebackup_<pid>` slot \(CREATE\_REPLICATION\_SLOT … TEMPORARY\) was still listed after a restart with temporary = f. PG drops temporary slots at session end and never persists them \(ReplicationSlotCleanup, RS\_TEMPORARY\). goopg's per\-start backend PIDs then make the next pg\_basebackup's slot name collide: "replication slot already exists".
+- [x] **M0149-0023 — port recovery/t/003_recovery_targets.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/003_recovery_targets.pl` — PITR to name/time/XID/LSN/immediate targets.
+  Likely prerequisites \(verify at start\): all `recovery_target*` GUCs + `recovery_target_action`, `pg_create_restore_point` \(`XLOG_RESTORE_POINT`\), conflicting-target FATAL texts, PG `pg_ctl` on goopg data dirs.
+  - 2026\-11\-25: ported as TestPort\_Recovery003RecoveryTargetsFull \(gated GOOPG\_TAP\_003\). Real upstream semantics: standby\_1..7 are standbys \(has\_restoring, standby => 1\), standby\_8 is archive recovery \(standby => 0\). Not\-oks split into children 0023a\-d below.
+- [x] **M0149-0023a — recovery targets by name, time and immediate; pg\_create\_restore\_point; the multiple\-target check**
+  Kind: impl
+  Parent: M0149-0023
+  - Path\-to\-TAP: 003 ← pg\_create\_restore\_point, the recovery\_target / \_name / \_time GUCs, "multiple recovery targets specified" at startup, and archive recovery's "recovery ended before configured recovery target was reached" for a name target \(standby\_8\) ← M0149\-0023.
+  - 2026\-11\-25 \(done\): pg\_create\_restore\_point writes XLOG\_RESTORE\_POINT \(xl\_restore\_point: rp\_time \+ 64\-byte name\), logs "restore point … created at …", returns the record end, with PG's recovery / wal\_level / length errors. GUCs recovery\_target \("immediate"\), recovery\_target\_name \(< 64\), recovery\_target\_time \(now/today/tomorrow/yesterday rejected by the hook; parsed as timestamptz at startup\). checkSingleRecoveryTarget counts all five and runs for every server at startup. Archive recovery stops at a restore point \(always after\), at a transaction end by time \(inclusive: after at = target, before > target; exclusive: before ≥ target\), and after reaching consistency for 'immediate'; StopReason/StopMessage carry PG's texts; the never\-reached FATAL covers them and is logged at FATAL. 003's standby\_8 passes in both goopg pairings.
+- [x] **M0149-0023b — a goopg standby stops at its recovery target and pauses there \(standby mode\)**
+  Kind: impl
+  Parent: M0149-0023
+  - Path\-to\-TAP: 003 standby\_1..6 \(goopg standbys\) ← the StreamReplayer honours recovery\_target / \_xid / \_time / \_name / \_lsn and pauses \(recovery\_target\_action = pause: "pausing at the end of recovery", reads served, pg\_wal\_replay\_resume\(\) promotes\) ← M0149\-0023.
+  - Today the standby ignores every target; with a PG primary the counts are whatever replay reached when the poll fired \(timing\-dependent passes\). Reuse the archive\-recovery stop logic \(RecoveryStop, RestorePointOf\) and ctx.RecoveryPause.
+  - 2026\-11\-25 \(done\): the per\-record stop decision is one function, EvaluateRecoveryStop \(recoveryStopsBefore/After\), shared by archive recovery and the StreamReplayer. The standby's replayer takes a ReplayTarget before it starts: it stops before a record or after it as the target says \('immediate' after the record that makes the standby consistent\), logs PG's "recovery stopping …", and for recovery\_target\_action = pause waits at the end of recovery \("pausing at the end of recovery", HINT "Execute pg\_wal\_replay\_resume\(\) to promote."; pg\_get\_wal\_replay\_pause\_state = paused, reads served\). pg\_wal\_replay\_resume\(\) then promotes; 'promote' promotes at once. 003 passes on all three pairings 3 of 3, ungated; inventory row 003 → port. M0149\-0023 closed.
+  - Same loop: TestE2E\_PGStandbyFullCycle failed 3 of 5 runs after the end\-of\-backup switch \(0023d\): it read row 2 right after pg\_stat\_replication said streaming, and replay landed ~100 ms later \(probe: replay 0/2000000 → 0/2000140\). The test now polls for the row \(30 s\), as upstream's wait\_for\_catchup would; 6 of 6 runs pass. Not the documented walreceiver start\-mismatch flake \(the row always arrived\).
+- [x] **M0149-0023c — all\-goopg 003: every standby counts 1005 rows of tab\_int**
+  Kind: impl
+  Parent: M0149-0023
+  - Path\-to\-TAP: 003 all\-goopg ← `INSERT INTO tab_int VALUES (generate_series(1001,2000))` inserts 1000 rows on the goopg primary ← M0149\-0023.
+  - 2026\-11\-25 \(done\): not the standby and not the epoch — the goopg primary inserted ONE row per `VALUES (generate_series(…))`, so five inserts gave 1005. transformInsertStmt treats a single VALUES row as a target list \(SRFs expand, in lockstep, NULL\-padded\); a multi\-row VALUES list is a VALUES RTE \("set\-returning functions are not allowed in VALUES", 0A000, caret at the SRF\). analyzeInsert now plans a single SRF row as INSERT … SELECT <row> and raises the error for multi\-row lists; output identical to PG 18.3 on the probe set. Regress: insert 249→240, tsrf 181→179, psql 297→297, vacuum 64→64 \(psql measured alone: run after insert it shows insert's leftover mlparted tables\). 003 all\-goopg now fails only on the standby\-mode target stops \(0023b\).
+- [ ] **M0149-0094 — pg\_current\_xact\_id\(\) ignores the xid epoch**
+  Kind: impl
+  Parent: none \(found while diagnosing M0149\-0023c; not a 003 assertion — recovery\_target\_xid truncates to 32 bits\)
+  - After `pg_resetwal --epoch 1`, PG's pg\_current\_xact\_id\(\) returns epoch<<32 \| xid \(4294968049 for xid 753\); goopg returns 753. pg\_control's nextXid epoch \(FullTransactionId\) is not carried into xid8 values.
+- [ ] **M0149-0095 — a standalone VALUES with a set\-returning function returns one row instead of erroring**
+  Kind: impl
+  Parent: none \(found while fixing M0149\-0023c\)
+  - `VALUES (generate_series(1,3))` and `SELECT … FROM (VALUES (generate_series(1,3))) v` return 1 row on goopg; PG raises "set\-returning functions are not allowed in VALUES" \(0A000\) — the check transformValuesClause applies to every VALUES RTE.
+- [ ] **M0149-0096 — promotion does not archive the old timeline's last segment as .partial**
+  Kind: impl
+  Parent: none \(found while porting M0149\-0027\)
+  - PG's CleanupAfterArchiveRecovery renames the last, partly\-filled segment of the old timeline to `<seg>.partial` and XLogArchiveNotify\-s it when archiving is active \(028's comment lists `000000010000000000000003.partial` in the archive\); goopg's standby and archive\-recovery promotions leave the segment under its full name with no .partial. 028 does not depend on it.
+- [x] **M0149-0023d — a PG 18.3 standby of a goopg primary with recovery\_target = 'immediate' never becomes ready**
+  Kind: impl
+  Parent: M0149-0023
+  - Path\-to\-TAP: 003 goopg\-primary\-pg18\-standbys ← PG reaches consistency from the goopg base backup \(and pauses\) ← M0149\-0023.
+  - Not diagnosed: "pgcluster: not ready within 1m30s" with no log tail; read the PG node's log \(possibly the epoch bump again, or the base backup's end\-of\-backup\).
+  - 2026\-11\-25 \(done\): PG's cassert build TRAPped in FinishWalRecovery \(Assert !XLogRecPtrIsInvalid\): "completed backup recovery … end LSN" = the redo, consistency before any record was read, "recovery stopping after reaching consistency" with no last record. Cause: BASE\_BACKUP shipped a pg\_control image with minRecoveryPoint = 1 and backupEndPoint = redo \(a shortcut so standbys became consistent\) and wrote no XLOG\_BACKUP\_END. Now BASE\_BACKUP does do\_pg\_backup\_stop's primary arm after the data files and before fetched WAL — XLOG\_BACKUP\_END \(its end is the stop LSN\), segment switch, backup history file \(.ready\) — and the image leaves minRecoveryPoint / backupEndPoint unset like the live file basebackup.c sends; PG raises minRecoveryPoint itself and waits for XLOG\_BACKUP\_END. Verified on real PG: "completed backup recovery with redo LSN … and end LSN …" at the record, then "pausing at the end of recovery", 1000 rows. Harness: StartExpectExit's PG branch starts its exit deadline after pgcluster.Start returns. 003 goopg\-primary\-pg18\-standbys PASSES.
+- [x] **M0149-0024 — port recovery/t/023_pitr_prepared_xact.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/023_pitr_prepared_xact.pl` — PITR with a prepared transaction, then promotion.
+  Likely prerequisites \(verify at start\): prepared-xact restore from WAL at a PITR stop point, `recovery_target_action=promote`, end-of-recovery checkpoint keeping `pg_twophase`.
+  - 2026\-11\-25 \(done\): Path\-to\-TAP: 023 goopg\-PITR pairings ← archive recovery keeps the transaction prepared before the restore point \(PrepareRedoAdd, RecoverPreparedTransactions\) ← M0149\-0024. Archive recovery's replay hooks now include Prepare / PreparedFinish \(the standby replayer's two\-phase bookkeeping\), and at the end of archive recovery the prepared transactions replay left open are restored into the promoted server \(restoreReplayedPrepared, shared with standby promotion\). Before: "prepared transaction with identifier "fooinsert" does not exist" after promotion. 023 passes on all three pairings 3 of 3, ungated; inventory row 023 → port.
+- [x] **M0149-0025 — port recovery/t/004_timeline_switch.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/004_timeline_switch.pl` — cascading standby follows a newly promoted standby.
+  Likely prerequisites \(verify at start\): streaming end-of-timeline exchange + `TIMELINE_HISTORY` \(design 0102-0002 — verify vs PG\), `recovery_target_timeline=latest`, `primary_conninfo` reload without restart.
+  - 2026\-11\-25 \(done\): ported as TestPort\_Recovery004TimelineSwitchFull; it passed on all three pairings on the first run and 3 of 3 runs with no product change — the cascading\-standby timeline follow, the walreceiver PID staying the same across the jump, and a standby following a primary that was restarted as a standby and promoted with archiving on were already in place \(M0149 timeline work\). Inventory row 004 → port. Observation only: the goopg\-standby pairings take ~38 s against ~11 s with PG 18.3 standbys \(the same assertions pass\).
+- [x] **M0149-0026 — port recovery/t/025_stuck_on_old_timeline.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/025_stuck_on_old_timeline.pl` — cascading standby without WAL fetches the history file from the archive.
+  Likely prerequisites \(verify at start\): archiving of `.history` before segments, `restore_command` history fetch, cascaded walsender on a promoted node.
+  - 2026\-11\-25 \(done\): ported as TestPort\_Recovery025StuckOnOldTimelineFull \(upstream's cp\_history\_files archive\_command, the standby's -Xnone backup via tapnode Backup\(name, options...\)\); it passed on all three pairings 3 of 3 with no product change — the promoted standby's cascade follows it onto TLI 2 with only history files in the primary's archive. Inventory row 025 → port.
+- [x] **M0149-0027 — port recovery/t/028_pitr_timelines.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/028_pitr_timelines.pl` — PITR whose target lies in a higher-TLI segment.
+  Likely prerequisites \(verify at start\): `XLogFileReadAnyTLI` / `expectedTLEs` segment selection, old-TLI `.partial` segment handling.
+  - Path\-to\-TAP \(3 links, all on 028's goopg\-PITR pairings\): \(1\) the "wait for the archiver" poll needs a pg\_stat\_activity row with backend\_type 'archiver'; \(2\) node\_pitr2 needs node\_pitr's 00000003.history in the archive — start\-time archive recovery promoted before the archiver existed, so XLogArchiveNotify was dropped; \(3\) it needs node\_pitr's timeline\-3 segment — PG's ShutdownXLOG rotates the last segment when archiving is active.
+  - 2026\-11\-25 \(done\): ported as TestPort\_Recovery028PitrTimelinesFull. Fixes: the archiver holds a pg\_stat\_activity slot \(ArchiverIdx, backend\_type archiver\) from when archiving is allowed until shutdown \(ArchiverConfig OnStart/OnStop\); attachWALArchiver constructs and attaches it before the start\-time archive\-recovery promotion, so the history file and the new timeline's segments get .ready; the primary's shutdown switches WAL segment first when archive\_mode is on/always \(RequestXLogSwitch in ShutdownXLOG\); adoptRestoredWAL skips an empty timeline span — node\_pitr stopped at 'rp' on TLI 1 before TLI 2's fork and, like PG, writes "2 <EndOfLog>" with EndOfLog below the 1→2 switch point. Passes 3 of 3 on all three pairings, ungated; the archiving ports 002/003/004/020/023/024/025/042/045 still pass. The 025 port no longer gives its standby its own archive\_command \(Cluster.pm has\_archiving only creates the directory\). Inventory row 028 → port. Nearby: M0149\-0096 \(.partial\) filed.
+- [ ] **M0149-0028 — port recovery/t/043_no_contrecord_switch.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/043_no_contrecord_switch.pl` — incomplete record at a segment boundary across a timeline switch.
+  Likely prerequisites \(verify at start\): contrecord handling at TLI switch on promotion, streaming from the promoted node.
+- [ ] **M0149-0029 — port recovery/t/032_relfilenode_reuse.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/032_relfilenode_reuse.pl` — relfilenode reuse after DROP/CREATE DATABASE without corrupting cached buffers.
+  Likely prerequisites \(verify at start\): buffer invalidation on DB/relation drop replay, `CREATE DATABASE` both strategies, tablespaces, `background_psql`. Overlap: SET TABLESPACE copying files without WAL is the M0122-0009b finding \(deferral ledger 2026-10-13; no fix\_plan entry at filing — reference it if filed, else file it here\).
+- [ ] **M0149-0030 — port recovery/t/033_replay_tsp_drops.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/033_replay_tsp_drops.pl` — replay of tablespace/database create/drop incl. missing directories.
+  Likely prerequisites \(verify at start\): `XLOG_TBLSPC_*` replay, `allow_in_place_tablespaces`, missing-directory tracking during `CREATE DATABASE` replay with PG log texts. Overlap: SET TABLESPACE copying files without WAL is the M0122-0009b finding \(deferral ledger 2026-10-13; no fix\_plan entry at filing — reference it if filed, else file it here\).
+- [ ] **M0149-0031 — port recovery/t/031_recovery_conflict.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/031_recovery_conflict.pl` — hot-standby query cancellation on recovery conflicts.
+  Likely prerequisites \(verify at start\): buffer-pin/lock/snapshot/tablespace/startup-deadlock/database conflicts with `max_standby_streaming_delay`, PG cancel texts + SQLSTATEs, `pg_stat_database_conflicts`.
+- [ ] **M0149-0032 — port recovery/t/030_stats_cleanup_replica.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/030_stats_cleanup_replica.pl` — standbys drop object stats on replayed drops and keep them across restart.
+  Likely prerequisites \(verify at start\): stats-drop items in xact commit/abort records and their replay \(`pgstat_execute_transactional_drops`\), stats on standby.
+- [ ] **M0149-0033 — port recovery/t/048_vacuum_horizon_floor.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/048_vacuum_horizon_floor.pl` — VACUUM removes all tuples dead before OldestXmin while the standby feedback horizon moves.
+  Likely prerequisites \(verify at start\): `hot_standby_feedback` xmin on the walsender slot, `GlobalVisState`/OldestXmin floor in VACUUM, walreceiver reconnect mid-VACUUM. `pg_backend_pid()` is used only at SQL level here \(fine\); never `kill()` it — on goopg it is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID.
+- [ ] **M0149-0034 — port recovery/t/041_checkpoint_at_promote.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/041_checkpoint_at_promote.pl` — restartpoint racing a promotion; WAL removal stays correct.
+  Likely prerequisites \(verify at start\): `injection_points` extension equivalent \(`injection_points_attach/wakeup/detach`, wait mode, PG point names\) — first test to need it; restartpoint/promotion race. Never `kill()` a goopg "backend pid" — `pg_backend_pid()` is a synthetic per-connection number \(`internal/executor/expr.go`\), not an OS PID; a backend-kill step that needs per-backend OS processes goes to `[!] blocked-on owner: architecture`. PG side: first task needing `injection_points` — file the one-time child "build the PG 18.3 test-module toolchain" first: `mkdir -p tmp/pg183-src && git -C postgres archive HEAD | tar -x -C tmp/pg183-src`; in `tmp/pg183-src` run `./configure --enable-cassert --enable-tap-tests --enable-injection-points --prefix=$PWD/../pg183-inj`, `make`, `make install`, `make -C contrib/test_decoding install`, `make -C src/test/modules/injection_points install`. Do not reuse the `--prefix` from `pg_config --configure` \(it is `postgres/local_install`\); never touch `./postgres` or `postgres/local_install` \(milestone C3\). If M0149-0034 is ever `[!]`, re-parent the toolchain child to M0149-0035 \(a held root holds its children\).
+- [ ] **M0149-0035 — port recovery/t/006_logical_decoding.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/006_logical_decoding.pl` — logical decoding via SQL and `pg_recvlogical`.
+  Likely prerequisites \(verify at start\): `test_decoding` output plugin \(absent today\), `pg_logical_slot_get/peek_changes`, PG 18.3 `pg_recvlogical` against goopg, slot persistence/`pg_replslot` format, drop-database-with-slot errors. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034.
+- [ ] **M0149-0036 — port recovery/t/010_logical_decoding_timelines.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/010_logical_decoding_timelines.pl` — logical slots surviving a timeline switch.
+  Likely prerequisites \(verify at start\): `pg_replslot` copied by `backup_fs_cold` and loaded at startup, catalog\_xmin via `hot_standby_feedback`, decoding across TLI. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034.
+- [ ] **M0149-0037 — port recovery/t/044_invalidate_inactive_slots.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/044_invalidate_inactive_slots.pl` — slot invalidation by `idle_replication_slot_timeout`.
+  Likely prerequisites \(verify at start\): checkpoint-time idle invalidation, `invalidation_reason = idle_timeout`, injection point `slot-timeout-inval`, PG log text. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034.
+- [ ] **M0149-0038 — port recovery/t/046_checkpoint_logical_slot.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/046_checkpoint_logical_slot.pl` — logical slot advanced during a checkpoint keeps a valid `restart_lsn`.
+  Likely prerequisites \(verify at start\): injection points in checkpoint/slot code \(`checkpoint-before-old-wal-removal`, etc.\), `restart_lsn` vs WAL removal ordering, standby slot sync paths. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034.
+- [ ] **M0149-0039 — port recovery/t/035_standby_logical_decoding.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/035_standby_logical_decoding.pl` — logical decoding on a standby, conflicts and promotion.
+  Likely prerequisites \(verify at start\): logical slots on standby \(`pg_log_standby_snapshot`\), invalidation `rows_removed`/`wal_level_insufficient`, `confl_active_logicalslot` stats, slots kept through promotion. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034.
+- [ ] **M0149-0079 — re-port recovery/t/047_checkpoint_physical_slot.pl to the M0149 contract**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/047_checkpoint_physical_slot.pl` — physical slot advanced during a checkpoint keeps a valid `restart_lsn` across a crash.
+  Current shortcut \(audit\): `TestPort_Recovery047CheckpointPhysicalSlot` has no injection point, no `pg_replication_slot_advance`, no `advance_wal`, and no crash + restart check that the WAL at `restart_lsn` still exists. `restart_lsn` is only logged, never asserted. The slot is created offline through the Go API, and the upstream `enable_injection_points` / `check_extension` skip gates are absent.
+  Likely prerequisites \(verify at start\): `injection_points` \(M0149-0034\) incl. `checkpoint-before-old-wal-removal` \(shared with M0149-0038\), `pg_replication_slot_advance`, slot `restart_lsn` vs old-WAL removal ordering. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034. Inventory row stays `port` until this closes.
+- [ ] **M0149-0040 — port subscription/t/003_constraints.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/003_constraints.pl` — FKs and triggers on the subscriber.
+  Likely prerequisites \(verify at start\): existing ports drive pgoutput in-process; verify the libpq apply path \(`internal/executor/applyworker.go`, `internal/postmaster/subscription_refresh.go`\) covers the test; `session_replication_role=replica` trigger rules, `ENABLE REPLICA/ALWAYS TRIGGER`. Overlap: M0122-0014 \(logical replication / decoding / subscription, open\) — reference it with `Prerequisite: M0122-0014` where its scope covers a gap.
+- [ ] **M0149-0041 — port subscription/t/005_encoding.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/005_encoding.pl` — publisher and subscriber databases in different encodings.
+  Likely prerequisites \(verify at start\): non-UTF8 database encodings \(LATIN1\), `client_encoding` conversion in the apply connection.
+- [ ] **M0149-0042 — port subscription/t/006_rewrite.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/006_rewrite.pl` — decoding across a heap rewrite.
+  Likely prerequisites \(verify at start\): decoding DML after a table rewrite \(new relfilenode, `RelidByRelfilenumber`, rewrite mappings\).
+- [ ] **M0149-0043 — port subscription/t/007_ddl.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/007_ddl.pl` — subscription DDL behaviour.
+  Likely prerequisites \(verify at start\): `ALTER SUBSCRIPTION … SET/ADD PUBLICATION` with missing-publication WARNING texts, DROP SUBSCRIPTION transaction-block rules.
+- [ ] **M0149-0044 — port subscription/t/008_diff_schema.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/008_diff_schema.pl` — subscriber with a different table schema.
+  Likely prerequisites \(verify at start\): attribute mapping by name, extra/missing-column errors with PG texts, Relation-message re-send after publisher ALTER.
+- [ ] **M0149-0045 — port subscription/t/009_matviews.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/009_matviews.pl` — materialized views are not replicated.
+  Likely prerequisites \(verify at start\): decoding skips matview refresh / transient heaps.
+- [ ] **M0149-0046 — port subscription/t/002_types.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/002_types.pl` — arrays, composites, enums, domains, ranges over logical replication.
+  Likely prerequisites \(verify at start\): pgoutput Type \(`Y`\) messages, text I/O of every listed type on both sides, range/multirange, domain constraints at apply.
+- [ ] **M0149-0047 — port subscription/t/010_truncate.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/010_truncate.pl` — TRUNCATE replication incl. CASCADE / RESTART IDENTITY and sync rep.
+  Likely prerequisites \(verify at start\): pgoutput Truncate message + options, `publish = 'truncate'`, logical walsender in `synchronous_standby_names`.
+- [ ] **M0149-0048 — port subscription/t/011_generated.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/011_generated.pl` — generated columns in initial sync and apply.
+  Likely prerequisites \(verify at start\): PG 18 `publish_generated_columns`, stored vs virtual generated columns on both sides.
+- [ ] **M0149-0049 — port subscription/t/012_collation.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/012_collation.pl` — nondeterministic ICU collations as replica identity.
+  Likely prerequisites \(verify at start\): ICU nondeterministic collations \(mirror upstream ICU skip only\); overlaps M0148's collation family.
+- [ ] **M0149-0050 — port subscription/t/014_binary.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/014_binary.pl` — `binary = true` subscriptions.
+  Likely prerequisites \(verify at start\): pgoutput `b` tuple data via type send/recv, binary initial COPY, mismatch errors with PG texts.
+- [ ] **M0149-0051 — port subscription/t/020_messages.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/020_messages.pl` — logical decoding messages through pgoutput.
+  Likely prerequisites \(verify at start\): `messages` option + `M` message, `pg_logical_slot_peek_binary_changes` with pgoutput, transactional vs non-transactional messages.
+- [ ] **M0149-0052 — port subscription/t/024_add_drop_pub.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/024_add_drop_pub.pl` — ALTER SUBSCRIPTION ADD/DROP PUBLICATION.
+  Likely prerequisites \(verify at start\): `REFRESH PUBLICATION` semantics, `pg_subscription_rel` states, publication created after the subscription.
+- [ ] **M0149-0053 — port subscription/t/025_rep_changes_for_schema.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/025_rep_changes_for_schema.pl` — `FOR TABLES IN SCHEMA` publications.
+  Likely prerequisites \(verify at start\): `pg_publication_namespace`, relation-sync-cache invalidation on schema changes, rename/move of tables between schemas.
+- [ ] **M0149-0054 — port subscription/t/032_subscribe_use_index.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/032_subscribe_use_index.pl` — apply uses non-PK indexes for REPLICA IDENTITY FULL lookups.
+  Likely prerequisites \(verify at start\): `FindUsableIndexForReplicaIdentityFull` equivalent, `pg_stat_all_indexes.idx_scan` counted by apply.
+- [ ] **M0149-0055 — port subscription/t/034_temporal.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/034_temporal.pl` — temporal PK/UNIQUE \(`WITHOUT OVERLAPS`\) as replica identity.
+  Likely prerequisites \(verify at start\): PG 18 `WITHOUT OVERLAPS` constraints, replica-identity rules and error texts.
+- [ ] **M0149-0056 — port subscription/t/035_conflicts.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/035_conflicts.pl` — `multiple_unique_conflicts` detection.
+  Likely prerequisites \(verify at start\): apply-side conflict detection and PG log text, `pg_stat_subscription_stats` conflict counters.
+- [ ] **M0149-0080 — re-port subscription/t/001_rep_changes.pl to the M0149 contract**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/001_rep_changes.pl` — the canonical publisher/subscriber logical-replication test.
+  Current shortcut \(audit\): `TestPort_Subscription001RepChanges` drives pgoutput in-process \(`PgOutput` → `DecodeMessage` → `ApplyWorker`\) with hand-built tuples. There are no publisher/subscriber servers, no CREATE PUBLICATION / SUBSCRIPTION, and no walsender or libpq connection. It covers 3 operations against \~38 upstream assertions \(publication add/drop table, replica identity full, publish options, ALTER SUBSCRIPTION, `wal_level=minimal` subscriber restart, slot checks, …\). No PG 18.3 variant.
+  Likely prerequisites \(verify at start\): the Tier 7 wire-apply substrate \(`internal/executor/applyworker.go`, `internal/postmaster/subscription_refresh.go`\); overlap M0122-0014 \(`Prerequisite: M0122-0014` where it covers a gap\). Inventory row stays `port` until this closes.
+- [ ] **M0149-0081 — re-port subscription/t/004_sync.pl to the M0149 contract**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/004_sync.pl` — initial table synchronisation by tablesync workers.
+  Current shortcut \(audit\): `TestPort_Subscription004Sync` simulates the initial COPY as a batch of INSERT messages applied in-process. There is no tablesync worker, no `copy_data`, no `pg_subscription_rel` state waits, no unique-violation-during-sync recovery, no REFRESH and no tablesync-slot cleanup check \(\~9 upstream\). No PG 18.3 variant.
+  Likely prerequisites \(verify at start\): tablesync over libpq \(COPY from the publisher, `pg_subscription_rel` i→d→s→r states\), sync-worker error retry, tablesync slot / origin cleanup on DROP SUBSCRIPTION; overlap M0122-0014. Inventory row stays `port` until this closes.
+- [ ] **M0149-0082 — re-port subscription/t/026_stats.pl to the M0149 contract**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/026_stats.pl` — `pg_stat_subscription_stats` error and conflict counters and their reset.
+  Current shortcut \(audit\): `TestPort_Subscription026Stats` checks goopg's in-process `xlog.Subscribers` registry \(the `pg_stat_subscription` backing\) — not the view upstream tests. `apply_error_count`, `sync_error_count`, `confl_insert_exists`, `confl_delete_missing`, `stats_reset`, `pg_stat_reset_subscription_stats` and stats removal on DROP SUBSCRIPTION are all absent \(\~12 upstream\). No servers, no PG 18.3 variant.
+  Likely prerequisites \(verify at start\): `pg_stat_subscription_stats` counters fed by real apply/sync errors and conflicts, `pg_stat_reset_subscription_stats`, stats persistence/drop; overlap M0122-0014 and M0149-0056 \(conflict stats\). Inventory row stays `port` until this closes.
+- [ ] **M0149-0083 — re-port recovery/t/038_save_logical_slots_shutdown.pl to the M0149 contract**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/038_save_logical_slots_shutdown.pl` — logical slots flushed at the shutdown checkpoint; `confirmed_flush_lsn` equals the latest checkpoint location.
+  Current shortcut \(audit\): `TestPort_Recovery038SaveLogicalSlots` creates a logical slot offline through the Go API and only checks that it survives a restart. Upstream's publisher + subscriber setup and the comparison of `confirmed_flush_lsn` with `pg_controldata`'s "Latest checkpoint location" are dropped. The func comment claims JSON slot files \(stale: `slots_pg.go` writes PG's 200-byte `ReplicationSlotOnDisk` plus a 64-byte goopg NameData extension — verify that extension against C2\). No PG 18.3 variant.
+  Likely prerequisites \(verify at start\): wire subscription \(Tier 7\), shutdown-checkpoint slot flush \(`CheckPointReplicationSlots` with `is_shutdown`\), PG 18.3 `pg_controldata` on the goopg data dir, a slot state file byte-identical to PG's. Inventory row stays `port` until this closes.
+- [ ] **M0149-0078 — re-port recovery/t/019_replslot_limit.pl to the M0149 contract**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/019_replslot_limit.pl` — `max_slot_wal_keep_size` WAL retention, `wal_status` / `safe_wal_size`, and slot invalidation.
+  Current shortcut \(audit\): `TestPort_Recovery019ReplslotLimit` creates two slots offline through the Go API \(`xlog.OpenSlots`\) and checks only that they are listed after start \(2 of \~24 upstream assertions\). Missing: no standby, no `max_slot_wal_keep_size`, no `wal_status` reserved/extended/unreserved/lost transitions, no `safe_wal_size`, no "invalidating obsolete replication slot" log, no walsender STOP/CONT termination case. No PG 18.3 variant.
+  Likely prerequisites \(verify at start\): `max_slot_wal_keep_size` retention and checkpoint-time invalidation \(`InvalidateObsoleteReplicationSlots`\) with PG log texts, `pg_replication_slots.wal_status` / `safe_wal_size`, standby on a slot, walsender termination on invalidation; wire subscription \(Tier 7\) for its `CREATE SUBSCRIPTION` / `wait_for_subscription_sync` steps. It `kill`s \(STOP/CONT\) the walsender and walreceiver pids read from `pg_stat_activity`: never `kill()` a synthetic goopg pid — without a faithful equivalent this needs the process-model escalation `[!] blocked-on owner: architecture`. Inventory row stays `port` until this closes.
+- [ ] **M0149-0057 — port subscription/t/027_nosuperuser.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/027_nosuperuser.pl` — logical replication respects permissions.
+  Likely prerequisites \(verify at start\): non-superuser subscription owners \(`pg_create_subscription`, `password_required`\), apply privilege checks incl. RLS, owner change mid-stream.
+- [ ] **M0149-0058 — port subscription/t/033_run_as_table_owner.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/033_run_as_table_owner.pl` — `run_as_owner` and table-owner apply.
+  Likely prerequisites \(verify at start\): `run_as_owner` option, apply switching to table owner under a security-restricted operation.
+- [ ] **M0149-0059 — port subscription/t/028_row_filter.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/028_row_filter.pl` — publication row filters.
+  Likely prerequisites \(verify at start\): `PUBLICATION … WHERE` parse/validation, old/new tuple transformation on UPDATE, filtered initial COPY, `publish_via_partition_root`.
+- [ ] **M0149-0060 — port subscription/t/031_column_list.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/031_column_list.pl` — publication column lists.
+  Likely prerequisites \(verify at start\): column lists in pgoutput Relation/tuple data, combining lists across publications, `pg_publication_tables.attnames`, column-subset initial sync.
+- [ ] **M0149-0061 — port subscription/t/013_partition.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/013_partition.pl` — partitioned tables on publisher and subscriber.
+  Likely prerequisites \(verify at start\): `publish_via_partition_root`, subscriber-side tuple routing into differently shaped partitions, ATTACH/DETACH.
+- [ ] **M0149-0062 — port subscription/t/030_origin.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/030_origin.pl` — `origin` parameter and `copy_data` interaction.
+  Likely prerequisites \(verify at start\): replication origins \(`pg_replication_origin_status`, `replorigin_checkpoint` file\), `origin = none` filtering, PG WARNING text for copy\_data with origin, bidirectional setups.
+- [ ] **M0149-0063 — port subscription/t/015_stream.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/015_stream.pl` — streaming of a large in-progress transaction.
+  Likely prerequisites \(verify at start\): `logical_decoding_work_mem` spill \(PG `xid-*.spill` files\), pgoutput Stream Start/Stop/Commit/Abort, `streaming = on|parallel` incl. parallel apply workers, `debug_logical_replication_streaming`.
+- [ ] **M0149-0064 — port subscription/t/016_stream_subxact.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/016_stream_subxact.pl` — streaming a transaction with subtransactions.
+  Likely prerequisites \(verify at start\): subxact assignment in streamed chunks, parallel apply of subxacts.
+- [ ] **M0149-0065 — port subscription/t/017_stream_ddl.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/017_stream_ddl.pl` — DDL inside a streamed transaction.
+  Likely prerequisites \(verify at start\): mid-stream Relation messages, catalog snapshots for in-progress DDL during decoding.
+- [ ] **M0149-0066 — port subscription/t/018_stream_subxact_abort.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/018_stream_subxact_abort.pl` — streamed subtransaction rollbacks.
+  Likely prerequisites \(verify at start\): Stream Abort for subxacts \(proto v4 abort LSN/timestamp\), parallel-apply subxact rollback.
+- [ ] **M0149-0067 — port subscription/t/019_stream_subxact_ddl_abort.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/019_stream_subxact_ddl_abort.pl` — streamed subxacts mixing DDL, DML and rollbacks.
+  Likely prerequisites \(verify at start\): aborted-subxact catalog changes invisible to later decoding.
+- [ ] **M0149-0068 — port subscription/t/021_twophase.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/021_twophase.pl` — logical replication of two-phase commit.
+  Likely prerequisites \(verify at start\): `two_phase` slots/subscriptions \(pending→enabled states, PG 18 ALTER\), Begin Prepare/Prepare/Commit Prepared/Rollback Prepared, subscriber gid `pg_gid_<subid>_<xid>`.
+- [ ] **M0149-0069 — port subscription/t/022_twophase_cascade.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/022_twophase_cascade.pl` — cascaded 2PC replication A→B→C.
+  Likely prerequisites \(verify at start\): forwarding prepared xacts through an intermediate subscriber/publisher, origin tracking, streaming + 2PC combination.
+- [ ] **M0149-0070 — port subscription/t/023_twophase_stream.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/023_twophase_stream.pl` — 2PC with streaming.
+  Likely prerequisites \(verify at start\): Stream Prepare message, parallel apply of prepared streamed xacts.
+- [ ] **M0149-0071 — port subscription/t/029_on_error.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/029_on_error.pl` — `disable_on_error` and `ALTER SUBSCRIPTION … SKIP`.
+  Likely prerequisites \(verify at start\): `disable_on_error`, `subskiplsn` + skip-transaction log texts, interplay with streaming and two-phase.
+- [ ] **M0149-0072 — port recovery/t/040_standby_failover_slots_sync.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/040_standby_failover_slots_sync.pl` — failover slots synced to a standby and used after promotion.
+  Likely prerequisites \(verify at start\): `failover` slots + `ALTER_REPLICATION_SLOT`, slotsync worker \(`sync_replication_slots`, `synchronized_standby_slots`\), `pg_sync_replication_slots()`, subscriber switching to the promoted standby. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034.
+- [ ] **M0149-0073 — port subscription/t/100_bugs.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/subscription/t/100_bugs.pl` — historical logical-replication regression cases.
+  Likely prerequisites \(verify at start\): triage each bug case at start; file one child per uncovered case.
+- [ ] **M0149-0074 — port recovery/t/027_stream_regress.pl**
+  Kind: impl
+  Parent: none
+  Upstream: `postgres/src/test/recovery/t/027_stream_regress.pl` — full regress schedule on a streaming primary; `pg_dumpall` of primary and standby compared.
+  Likely prerequisites \(verify at start\): replay of every regress-exercised WAL record; pass requires M0148 regress parity — if reached first, land the replication children, then mark `[!] blocked-on M0148 regress parity` \(explicit blocker, not a ledger park\).
+
 ## M0148 — pg_regress coverage closure with prerequisite implementation (filed 2026-10-29, owner decision)
 
 **Milestone doc:** `docs/milestones/0148-regress-coverage-closure.md`.
-**Rank:** banner item 10 after the already-filed M0122 queue. The milestone
-document defines the canonical suite queue and is binding. A suite parent stays
+**Rank:** banner item 10 after the already-filed M0122 queue and after M0149
+(paused while M0149 has a selectable task; owner decision 2026-11-15). The
+milestone document defines the canonical suite queue and is binding. A suite
+parent stays
 open until its output matches PostgreSQL 18.3; every missing prerequisite is
 filed and implemented as that suite task's child. Ledger-only parking is not a
 completion path.
@@ -11858,7 +17592,7 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
     scratch PG. Gates on code_tree 43a470fd: units, RegressSuite + PgDump
     + Isolation, spotcheck, sf025 99/99, acceptance, fire-set fires=none x3.
   Movement: regress — 37-suite A/B: alter_table 3648→3623, domain 1752→1718, create_table 639→615, plpgsql 4009→4000, insert 1057→1055; enum unchanged; create_type 402→406 and privileges 3879→3925 on residue (routine OID order, missing type USAGE checks)
-- [ ] **M0148-0001j3 — DROP TYPE residue: OID order across catalogs,
+- [x] **M0148-0001j3 — DROP TYPE residue: OID order across catalogs,
   type USAGE privilege checks, DROP TYPE of a domain, composite-array
   pg\_proc OIDs**.
   Kind: impl
@@ -11883,6 +17617,87 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   Resume: catalog OID allocation (one counter for routines and relations,
   as PG's GetNewOidWithIndex); executor type-reference resolution for an
   aclcheck on USAGE (pg_type typacl); execDropType domain arm.
+  - LANDED 88ef78511 + d5a987211 (2026-11-11) — CLOSED (residue split to
+    M0148-0001j4): items (5) and (6). Type USAGE aclchecks at every
+    aclcheck\_error\_type site (type\_usage\_acl.go checkTypeUsage; array
+    types use the element ACL, NULL typacl grants PUBLIC), ExecGrant\_Type
+    0LP01/42809 and restrict\_and\_check\_grant, ROLLBACK reverting
+    session-level SET ROLE / SESSION AUTHORIZATION (AtEOXact\_GUC;
+    connTxState.txRolePrior), CREATE CAST domain warning, user types in DROP
+    AGGREGATE/OPERATOR args; DROP TYPE resolves a domain. The 88ef78511 part
+    was committed together with the deepwiki docs, outside a loop.
+    Design doc docs/design/0100-0149/0148-0001j3-type-usage-privilege-and-drop-type-domain.md.
+  - Gates: units, postmaster, TestPort\_RegressSuite PASS; tpch-spotcheck
+    PASS; sf025 99/99; acceptance 24 MATCH; nightly 20261111-165815 PASS on
+    88ef78511; census routing-20261111a IDENTICAL x3.
+Movement: yes — regress privileges 3925→3781 (create\_operator 243→196, alter\_generic 840→804, domain 1718→1717)
+- [x] **M0148-0001j4 — DROP TYPE residue (2): OID order across catalogs,
+  composite-array pg\_proc OIDs, composite field-select on SQL-function
+  params, typed-table column options, view `_RETURN` type dependency**.
+  Kind: impl
+  Parent: M0148-0001j3
+  Residue of M0148-0001j3 items (1)-(4) and (7), unchanged in substance.
+  (1) Routine OIDs come from a counter apart from relation/type OIDs, so a
+  mixed function/column/domain dependent list reports out of PG order
+  (regress create\_type myvarchar; typed\_table `persons, get_all_persons(),
+  persons2`). (2) pg\_proc.proargtypes holds 0 for a composite-array
+  argument (`st[]`). (3) `(s).total` on a composite SQL-function parameter
+  errors "applied to type unknown"; `CREATE TABLE … OF t (name WITH OPTIONS
+  …)` repeating a column is accepted (PG 42701, transformOfType). (4)
+  Grouping sets with no sorted rollup hash an ordered aggregate. (5) View
+  columns over the type depend through the `_RETURN` rule, not modelled.
+  Also seen in regress privileges, outside type USAGE: the EXECUTE check
+  on an array-element coercion function (`'{1}'::int4[]::int8[]` as an
+  ungranted user), and `has_type_privilege` / `has_function_privilege`
+  failing "function … does not exist" in the default-privileges block.
+  Resume: catalog OID allocation (one GetNewOidWithIndex-style counter for
+  routines and relations/types); routine proargtypes for array-of-composite.
+  - Item (1) LANDED (2026-11-11, ddl(M0148-0001j4) commit): Routines.Create
+    draws from InMemory's counter (shareOIDCounter in NewInMemory; recovery
+    advances it); create\_type 406→402, typed\_table 133→131. Design doc
+    docs/design/0100-0149/0148-0001j4-shared-oid-counter.md. Gates: units,
+    TestPort\_RegressSuite + PgDump PASS, tpch-spotcheck PASS, sf025 99/99.
+  - Found: goopg CREATE TABLE draws one OID; PG draws three (relation, row
+    type, array type), so absolute OIDs drift while relative order is PG's
+    (ledger row).
+  - Item (2) LANDED (2026-11-11, 9de6fc9a8): pg\_proc proargtypes /
+    proallargtypes / prorettype carry user enum/domain/composite/range OIDs
+    and their array OIDs (executor.PGProcTypeOID; heap row, index key and
+    virtual view agree). It was TypeNameToOID's text fallback (25) in the heap
+    and 0 in the view. Regress neutral; gates units, RegressSuite+PgDump,
+    spotcheck, sf025 99/99, acceptance 24 MATCH.
+    - Found P0-E26: composite types are not re-registered at restart, so their
+      OIDs fall back after a restart (filed S2, escalated).
+  - Item (3a) LANDED (2026-11-11, 608929548): `(s).f`, `($1).f`, `s.f`,
+    `fn.s` over composite SQL-function parameters (typed Params through
+    SearchPathCatalog.ParamTypes, the sql\_fn\_parser\_setup analogue) and
+    PL/pgSQL `(v).f`. Regress rangefuncs 2289→2268, rowtypes −1,
+    updatable\_views −1. Gates units, RegressSuite+PgDump, spotcheck, sf025
+    99/99, acceptance 24 MATCH, fire-set fires=none ×3.
+    - Remaining (ledger): column-over-parameter precedence not modelled by
+      the text rewrite; a view row type is not a composite for
+      compositeTypeFields (rw\_view1\_aa); `(param).*` as a function
+      argument (IndirectionStar, rowtypes fcompos3).
+  - Item (3b) LANDED (2026-11-11, 2b010424e): a typed table's repeated
+    `col WITH OPTIONS` entry raises 42701 (MergeAttributes). Regress
+    typed\_table 131→117. Gates units, RegressSuite, spotcheck, sf025 99/99,
+    acceptance 24 MATCH.
+  - Item (4) LANDED (2026-11-11, 3ccf96d89): the residue was really the
+    unsortable-column case. Grouping sets mixing an unsortable (xid/cid/
+    aclitem) and an unhashable (bit/varbit/money/tsquery/tsvector) column,
+    or an unsortable set beside an ordered/DISTINCT aggregate, raise 0A000
+    could not implement GROUP BY (+DETAIL). Regress groupingsets 1523→1472.
+    Gates units, RegressSuite, spotcheck, sf025 99/99, acceptance 24 MATCH,
+    fire-set fires=none ×3.
+    - Remaining (ledger): sortability does not yet steer path choice, plain
+      GROUP BY has no check, domains over one-sided types are not classified.
+  - CLOSED 2026-11-11: items (1)-(4) landed. Item (5) — DROP TYPE reaching
+    views — moved to M0148-0001h1, whose OID-recorded view dependencies
+    (recordDependencyOnExpr at CREATE VIEW) it needs; goopg's view edges are
+    found by FROM-clause name matching with no column or type edges, and a
+    name-based shortcut here would cut against h1. Oracle output recorded
+    under h1.
+Movement: yes — regress create\_type 406→402, typed\_table 133→117, rangefuncs 2289→2268, groupingsets 1523→1472 (rowtypes −1, updatable\_views −1)
 - [x] **M0148-0001c3 — searched index paths take a NullTest as an index
   qual; NullTest-proven partial indexes; unanalysed partial-index size**.
   Kind: impl
@@ -11922,7 +17737,7 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
     indexes, unanalysed partial-index size, expression columns in HOT).
   Movement: none — correctness fix — no plan instrument (13-suite regress A/B byte-identical apart from join row-order noise; scratch-PG probe of partial unique/upsert/maintenance/restart now identical)
 
-- [ ] **M0148-0001c3a — `col IS [NOT] NULL` as a btree index qual on
+- [x] **M0148-0001c3a — `col IS [NOT] NULL` as a btree index qual on
   searched paths**.
   Kind: impl
   Parent: M0148-0001c3
@@ -11940,6 +17755,1191 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   internal/optimizer/pathindexrestrict.go addOneRestrictionIndexPath,
   createplanindex.go, executor operators_index.go,
   operators_explain.go formatIndexCond.
+  - Slice 1 LANDED (2026-11-11, 89031bbc1): plain index scans, leading
+    column. restrictionLeadingNullTest files the NullTest beside/instead of
+    the leading range (IS NULL only over an index with NULL-keyed entries),
+    lowered onto IndexScan.LeadingNullTest; indexRangeBounds bounds at the
+    NULL group (IS NULL = [k, upper(k)], empty beside a value bound; IS NOT
+    NULL = the exclusive NULL stop at either end). Design doc
+    docs/design/0100-0149/0148-0001c3a-nulltest-index-qual.md. Probe vs PG:
+    `where x is null` and `x is not null and x < 5` identical (ASC and DESC).
+    Gates units, RegressSuite, spotcheck, sf025 99/99, acceptance 24 MATCH,
+    fire-set fires=none ×3; regress 17 suites hunk-identical.
+  - Slice 2 LANDED (2026-11-11, f303d61c7): the index-only producer files
+    the NullTest too (indexOnlyLeafClauses, plainRestrictionBindsOnlyPrefix),
+    lowered onto IndexOnlyScan.LeadingNullTest; the IOS executor range code
+    got the sibling arm. `where x is not null order by x limit 1` = PG's
+    Index Only Scan + Index Cond. Gates units, RegressSuite, spotcheck,
+    sf025 99/99, acceptance 24 MATCH, fire-set fires=none ×3; regress neutral.
+    - Still open (ledger): duplicate/contradictory NullTests on one column
+      (create\_index `unique1 IS NULL AND unique1 IS NULL`); backward
+      path-based index scans (createplanindex refuses a non-forward
+      IndexScanDir — `order by x desc limit 1` sorts).
+  - Slice 3 LANDED (2026-11-11, 96d734112): a NullTest behind an equality
+    prefix (`a = 3 AND b IS NULL`), exact there so it leaves the Filter.
+    Gates units, RegressSuite (flake re-run green), spotcheck, sf025 99/99,
+    acceptance 24 MATCH, fire-set fires=none ×3.
+  - CLOSED 2026-11-11 (residue split to M0148-0001c3a1): the restriction
+    and index-only producers, nulltestsel, the SK\_SEARCHNULL /
+    SK\_SEARCHNOTNULL executor bounds and Index Cond rendering are in place.
+Movement: none — regress line counts held (17 suites); probes vs PG identical for the leading-column and index-only shapes; corpora fires=none
+- [x] **M0148-0001c3a1 — NullTest index quals: bitmap producer, duplicate
+  NullTests, backward ordered scans, Index Cond WHERE order**.
+  Kind: impl
+  Parent: M0148-0001c3a
+  Residue of c3a (design doc
+  docs/design/0100-0149/0148-0001c3a-nulltest-index-qual.md "Not covered").
+  (1) The bitmap producer (pathbitmap.go / createplanbitmap.go) files no
+  NullTest: regress create\_index `thousand = 42 AND (tenthous = 1 OR … OR
+  tenthous IS NULL)` is a BitmapOr with `Index Cond: ((thousand = 42) AND
+  (tenthous IS NULL))` in PG, and PG picks a Bitmap Heap Scan for `a = 3
+  AND b IS [NOT] NULL` where goopg plans a plain Index Scan or a
+  Filter-only bitmap. (2) Duplicate / contradictory NullTests on one
+  column (`unique1 IS NULL AND unique1 IS NULL`): only the first is an
+  index qual. (3) Backward path-based index scans: createplanindex.go
+  refuses a non-forward IndexScanDir, so `where x is not null order by x
+  desc limit 1` sorts where PG plans Index Only Scan Backward. (4) Index
+  Cond order follows the cost-sorted leaf Filter, not baserestrictinfo
+  order (`x < 5 AND x IS NOT NULL`). Resume: (1) first —
+  matchBitmapIndexQuals + the bitmap executor's indexRangeSpec (nullTest).
+  - Item (1) partly LANDED (2026-11-12, 49bbd0613): the bitmap producer
+    files the NullTest on the leading column or behind its equality Keys
+    (BitmapIndexScan.LeadingNullTest; exact conjunct → Recheck Cond).
+    Bitmap Index Scan Index Cond = PG's. Gates units, RegressSuite,
+    spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set fires=none ×3.
+    - Still open in (1): BitmapOr over OR clauses (generate\_bitmap\_or\_paths
+      — the create\_index `tenthous = 1 OR … OR tenthous IS NULL` case), a
+      range behind an equality prefix under a bitmap, and a literal
+      equality key kept as a Filter instead of joining the Recheck Cond
+      (M0146-0012 narrowing).
+  - Literal-key Recheck Cond LANDED (2026-11-12, a78d7dd43): an exact
+    literal bitmap key (restrictionKeyUsable) joins the Recheck Cond. `a = 3
+    AND b IS [NOT] NULL` = PG's plan exactly. Regress subselect 2477→2452.
+    Gates units, RegressSuite+PgDump, spotcheck, sf025 99/99, acceptance 24
+    MATCH, fire-set fires=none ×3.
+    - Still open in c3a1: BitmapOr over OR clauses, a bitmap range behind
+      an equality prefix, duplicate NullTests, backward scans, WHERE order,
+      Recheck Cond literal type labels (`'TVAAAA'::name`).
+  - `name` literal labels LANDED (2026-11-12, 8cc9a4e51): Filter / Recheck
+    Cond print `'TVAAAA'::name` (implicit CastExpr to name). Regress select
+    270→256. Gates units, RegressSuite+PgDump, spotcheck, sf025 99/99 (plan
+    shapes identical), acceptance 24 MATCH.
+    - Still open: Index Cond keys print literals without the column type's
+      label (formatIndexCondKey has no column type).
+  - Index Cond literal labels LANDED (2026-11-12, 4092290f9): probe keys
+    print as the column-typed Const (`'TN'::bpchar`, `'5'::numeric`,
+    `'x'::name`, `'2002-05-01'::date`) on every Index Cond builder; all six
+    PG lines verified on a scratch PG 18.3. Regress create\_index
+    3305→3286. Gates units, RegressSuite+PgDump, spotcheck, sf025 99/99
+    (plan shapes identical), acceptance 24 MATCH.
+    - Still open: varchar keys (PG `((v)::text = 'x'::text)`, column-side
+      cast).
+  - CLOSED 2026-11-12 (residue split to M0148-0001c3a2): landed the bitmap
+    NullTest (49bbd0613), exact literal bitmap keys in the Recheck Cond
+    (a78d7dd43), `name` literal labels (8cc9a4e51) and Index Cond literal
+    labels (4092290f9). Remaining items are separate producer features.
+Movement: yes — regress select 270→256, subselect 2477→2452, create\_index 3306→3286
+- [x] **M0148-0001c3a2 — BitmapOr over OR clauses; bitmap range behind an
+  equality prefix; duplicate NullTests; backward ordered scans; Index Cond
+  WHERE order; varchar Index Cond keys**.
+  Kind: impl
+  Parent: M0148-0001c3a1
+  Residue of c3a1 (design doc
+  docs/design/0100-0149/0148-0001c3a-nulltest-index-qual.md "Not covered").
+  (1) BitmapOr — PG's generate\_bitmap\_or\_paths (indxpath.c) builds a
+  BitmapOr of per-arm bitmap index paths for an OR restriction whose every
+  arm is indexable (`thousand = 42 AND (tenthous = 1 OR tenthous = 3 OR …)`,
+  `stringu1 = 'TVAAAA' OR stringu1 = 'TVAAAB'`); goopg has no OR arm (23
+  BitmapOr lines in regress create\_index / join / partition\_join /
+  select). (2) A range behind an equality prefix under a bitmap
+  (`a = 3 AND b IS NOT NULL AND b < 200`). (3) Duplicate / contradictory
+  NullTests on one column (only the first is an index qual). (4) Backward
+  path-based index scans (createplanindex.go refuses a non-forward
+  IndexScanDir). (5) Index Cond in baserestrictinfo (WHERE) order — the leaf
+  Filter is cost-sorted before the producers see it. (6) varchar keys:
+  PG `((v)::text = 'x'::text)`. Resume: (1) first — a BitmapOr path
+  producer in optimizer/pathbitmap.go (arms from bitmap index paths per OR
+  arm, cost_bitmap_or_node), BitmapOr plan node + executor (TBM union).
+    - Then: the bitmap producer (BitmapOr arm `(thousand = 42) AND
+      (tenthous IS NULL)`), a NullTest behind an equality prefix.
+    - Found: Index Cond order can't follow WHERE when the comparison comes
+      first — the leaf Filter is already cost-sorted (ledger).
+  - 2026-11-12 slice 1 LANDED: the core of item (1), a BitmapOr producer
+    (optimizer/pathbitmapor.go; design
+    docs/design/0100-0149/0148-0001c3a2-bitmap-or-paths.md).
+    - Each OR arm is served by build\_paths\_for\_OR-style index paths
+      (arm clauses plus the other restriction clauses), with
+      choose\_bitmap\_and per arm.
+    - The Recheck Cond is the ORed arm quals; implied conjuncts leave the
+      Filter.
+  - Found and fixed on the way (S2 wrong results, already on HEAD): a
+    Parallel Bitmap Heap Scan returned one row per LOSSY page
+    (nextParallel).
+    - Regress bitmapops `a = 1` at work\_mem 64 gave 1273 of 1321 rows.
+    - BitmapOr would have made the passing bitmapops case return 1273 of
+      2485.
+  - Item (1) residue:
+    - PG 18 SAOP grouping (group\_similar\_or\_args /
+      make\_bitmap\_paths\_for\_or\_group); such ORs are declined for now.
+    - Sub-ORs in AND arms.
+    - useful\_predicate.
+    - The OR path as a chooseBitmapAnd candidate.
+    - Join OR clauses (bitjoinpaths).
+  - Resume: the SAOP-grouped arm (needs a bitmap SAOP carrier — see the
+    P2-09b note in the matchBitmapIndexQuals header), then items (2)-(6).
+  Movement: yes — regress create\_index 3286→3271, join 17792→17724 (subselect 2452→2462: goopg's own VALUES→OR rewrite now plans a BitmapOr)
+  - 2026-11-12 slice 2 LANDED (21f23375c):
+    - Bitmap ScalarArrayOp carrier (BitmapIndexScan.SAOPKeys behind the
+      equality Keys): IN conjuncts, and same-column ORs via
+      match\_orclause\_to\_indexcol.
+    - PG 18 group\_similar\_or\_args (Nested sub-OR) and
+      make\_bitmap\_paths\_for\_or\_group, joint vs split compared by
+      IndexPath total\_cost.
+    - A verbatim predicate\_implied\_by\_recurse port for the Filter
+      split.
+    - Probe against PG: 7 of 10 plans identical; values identical, exact
+      and lossy.
+  - Residue after slice 2:
+    - Inequality OR groups (`< ANY`); these ORs are declined.
+    - Plain/IOS-path OR→SAOP (PG: an Index Scan for `thousand = 42 AND
+      (tenthous IN-like OR)`).
+    - SAOP + range bound under a bitmap.
+    - Sub-ORs in AND arms; useful\_predicate.
+    - The OR path inside chooseBitmapAnd (PG: BitmapAnd(hundred,
+      BitmapOr)).
+    - Join OR clauses.
+  - Resume: the OR path as a chooseBitmapAnd candidate (needs a
+    Children\[0\].IndexInfo-free redundancy check: PG's
+    PathClauseUsage), or plain-path OR→SAOP; then items (2)-(6).
+  Movement: yes — regress create\_index 3271→3235, join 17724→17655
+  - 2026-11-12 slice 3 LANDED (c8807e4c1):
+    - Leading-column OR→SAOP on the plain Index Scan / index-only paths
+      (restrictionLeadingSAOP via orEqualitySAOP).
+    - Found and fixed (S2 wrong results, already on HEAD):
+      tryFoldBinaryOp folded `x OR NULL` / `x AND NULL` to NULL.
+      `WHERE hundred = 3 OR NULL` returned 0 of 100 rows; select-list
+      `false AND NULL` gave NULL.
+    - foldQualConstants now applies find\_duplicate\_ors' qual-context
+      constant rules (reduceQualConstArms).
+  - Residue after slice 3:
+    - Inequality OR groups.
+    - OR→SAOP behind an equality prefix on plain paths (the plain SAOP
+      carrier is leading-column only).
+    - SAOP + range bound under a bitmap.
+    - Sub-ORs in AND arms; useful\_predicate.
+    - The OR path in chooseBitmapAnd.
+    - Join OR clauses.
+  - Resume: the OR path as a chooseBitmapAnd candidate (PG's clause-usage
+    redundancy check), then items (2)-(6).
+  Movement: none — regress 22 suites unchanged (the NULL-arm fix is a correctness fix; no regress case had a NULL OR arm)
+  - 2026-11-12 slice 4 LANDED (0617a1952):
+    - choose\_bitmap\_and ported: clause-usage redundancy via
+      find\_indexpath\_quals; OR paths are candidates.
+    - BitmapAnd costing fixes: the heap side prices on baserel tuples, and
+      the per-row charge is on path rows, charged once.
+    - PG's BitmapAnd and BitmapAnd(index, BitmapOr) plans now match, cost
+      for cost.
+  - Residue after slice 4:
+    - Inequality OR groups.
+    - OR→SAOP behind an equality prefix on plain paths.
+    - SAOP + range under a bitmap.
+    - Sub-ORs in AND arms; useful\_predicate.
+    - Join OR clauses (bitjoinpaths).
+    - The Bitmap Index Scan EXPLAIN cost line (startup 0.29 / width 84 vs
+      PG 0.00 / 0).
+  - Resume: c3a2 item (2) — a bitmap range behind an equality prefix (and
+    the SAOP + range form), then items (3)-(6).
+  Movement: yes — regress create\_index 3235→3166 (join +5 is a pre-existing Hash Right Join row-order flap)
+  - 2026-11-12 slice 5 LANDED (bd4ce891a): item (2) — range bounds behind
+    an equality prefix.
+    - They are now exact index quals on the plain RangePrefix path and on
+      the bitmap Keys+bounds path.
+    - The old "bound stays a Filter recheck" rule predated the prefix-aware
+      NULL stop in indexRangeBounds.
+    - Probe against PG: 25 statements identical across ASC, DESC and NULLS
+      FIRST indexes with a 1/7-NULL bounded column.
+  - Residue after slice 5:
+    - SAOP + range bound (plain: still a Filter recheck; bitmap: the bound
+      is not an index qual).
+    - Inequality OR groups.
+    - Plain-path OR→SAOP behind a prefix.
+    - Sub-ORs; useful\_predicate.
+    - Join ORs.
+    - Items (3)-(6): duplicate NullTests, backward ordered scans, Index
+      Cond WHERE order, varchar keys.
+  - Resume: item (3), duplicate / contradictory NullTests on one column
+    (PG `_bt_preprocess_keys`), or SAOP + range with a per-element NULL
+    stop.
+  Movement: none — regress 22 suites unchanged
+  - 2026-11-12 slice 6 LANDED (8b902c2c2): item (3) — duplicate and
+    contradictory NullTests.
+    - Every NullTest on an index column is an index qual (ExtraNullTests on
+      IndexScan / IndexOnlyScan / BitmapIndexScan).
+    - `IS NULL AND IS NOT NULL` is an empty scan (NullTestsContradict, PG's
+      \_bt\_preprocess\_keys).
+    - Probe against PG: 36 statements, values identical; plans identical
+      except where WHERE order matters (item 5).
+  - Residue after slice 6:
+    - Items (4) backward ordered scans, (5) Index Cond WHERE order (the
+      cost-sorted leaf Filter), (6) varchar keys.
+    - SAOP+range; inequality OR groups; plain-path OR→SAOP behind a
+      prefix; sub-ORs; useful\_predicate; join ORs.
+  - Resume: item (5) — carry baserestrictinfo order to the index-clause
+    producers. It now also orders NullTests behind bounds
+    (`a IS NOT NULL AND a < 100 AND a IS NOT NULL`). Or item (4) /
+    item (6).
+  Movement: yes — regress create\_index 3166→3159
+  - 2026-11-12 slice 7 LANDED (0b245f9c2): item (5) — Index Cond keeps
+    one column's clauses in restriction-list order.
+    - conjunctPrecedes orders by source position; IndexCondOrder is
+      recorded on the scan nodes; rangeColumnCondParts renders it.
+    - Probe against PG: 10 ordering statements identical.
+  - Item (4), backward scans, is split to M0148-0001c3a3 (filed below):
+    it needs an access-method reverse leaf walk.
+  - Remaining here: item (6) varchar keys. The regress hunk once listed
+    for it (subselect `stringu1 = ("*VALUES*".column1)::text`) is a name
+    column against a VALUES param, so item (6) needs its own PG probe.
+    Plus the c3a2 residue: SAOP+range, inequality OR groups, plain-path
+    OR→SAOP behind a prefix, sub-ORs, useful\_predicate, join ORs.
+  Movement: none — regress 22 suites unchanged
+  - 2026-11-12 slice 8 LANDED (d60a1d93a): item (6) — varchar Index Cond
+    relabels the column, `((v)::text = 'v42'::text)` (indexCondClause
+    applies coerceLiteralText's otherCast).
+  - CLOSED 2026-11-12. Items (1)(2)(3)(5)(6) landed in 8 slices; item (4)
+    is split to M0148-0001c3a3; the residue is filed as M0148-0001c3a4.
+  Movement: yes — regress create\_index 3286→3159, join 17792→17655 over slices 1-8
+- [x] **M0148-0001c3a3 — Backward ordered index scans (`Index Scan
+  Backward`, `Index Only Scan Backward`)**.
+  Kind: impl
+  Parent: M0148-0001c3a2
+  - Split from c3a2 item (4). PG builds a backward IndexPath beside the
+    forward one when the reversed pathkeys are useful (build\_index\_paths,
+    indxpath.c: index\_pathkeys built with ScanDirection backward). The
+    executor walks the btree right-to-left (\_bt\_first / \_bt\_steppage
+    with \_bt\_walk\_left, nbtsearch.c), which stays correct under
+    concurrent page splits.
+  - goopg today:
+    - indexPathOrdering can build backward pathkeys
+      (pathindexcarrier.go), but no producer asks for them.
+    - createIndexScanPlan panics on a non-forward IndexScanDir.
+    - The plain IndexScan executor has no reverse mode. The IOS
+      `Backward` flag only reverses a materialised max() rewrite.
+    - nbtree.ScanFromEnd walks left but tolerates skipped/repeated
+      entries under concurrent splits (fine for the endpoint probe, not
+      for query results).
+    - 26 `Index Scan Backward` lines in regress btree\_index /
+      create\_index / inherit / join / partition\_join.
+  - Resume:
+    - A correct reverse range cursor in internal/access/nbtree (left-link
+      walk with PG's move-right recovery after a concurrent split).
+    - Then IndexScan/IOS direction fields + executor reverse batches.
+    - Then producers emitting BackwardScanDirection paths, and EXPLAIN
+      ` Backward`.
+  - 2026-11-12 slice 1 LANDED (e527d5ad2): nbtree ReverseScanCursor.
+    - A backward range scan, one leaf at a time.
+    - lockAndValidateLeft ports \_bt\_lock\_and\_validate\_left, with an
+      unbounded walk-right fallback where PG errors.
+    - The concurrent-split test proves the recovery: a naive left step loses
+      keys. Design docs/design/0100-0149/0148-0001c3a3-backward-index-scans.md.
+  - Resume: slice 2 (executor).
+    - IndexScan.Backward + indexScanOp reverse leaf batches from
+      ReverseScanCursor (range and equality-prefix probes via
+      indexRangeBounds).
+    - IndexOnlyScan.Backward currently means the S6 max-rewrite reverse;
+      reconcile it.
+    - Then slice 3 (producers via indexPathOrdering backward=true, and
+      createIndexScanPlan stops panicking).
+    - Then EXPLAIN ` Backward` + regress A/B.
+  Movement: none — access-method slice, no caller yet
+  - 2026-11-12 slice 2 LANDED (c41356575): executor IndexScan.Backward over
+    ReverseScanCursor on the main probe path, plus the EXPLAIN `Index Scan
+    Backward` label.
+    - SAOP, skip and parallel backward scans are refused (XX000).
+    - TestIndexScanBackward flips planner-built plans: backward = forward
+      reversed, in both NULL-entry modes.
+  - Resume: slice 3 (planner).
+    - Where PG's build\_index\_paths makes a backward path
+      (index\_pathkeys built with ScanDirection backward when the reversed
+      order is useful — ORDER BY DESC, merge/min-max), goopg's ordered-index
+      producers (pathindexordered.go, pathindexrestrict.go indexPathOrdering
+      callers) should call indexPathOrdering(…, backward=true).
+    - createIndexScanPlan sets Backward instead of panicking.
+    - Then regress A/B on the 26 `Index Scan Backward` lines.
+    - IndexOnlyScan.Backward (S6 max-rewrite meaning) needs a real reverse
+      walk before IOS backward paths.
+  Movement: none — no producer emits a backward path yet
+  - 2026-11-12 slice 3 LANDED (7f773aa4b): planner backward paths.
+    - build\_index\_paths step 5 via truncateUselessPathkeys in the
+      ordered and restriction producers.
+    - createIndexScanPlan sets Backward; backward IndexScans are not
+      promoted to IOS.
+    - Probe against PG: 6 statements identical.
+  - Remaining: 24 PG `… Backward` regress lines.
+    - 15 `Index Only Scan Backward`: the IOS reverse walk + IOS producer
+      backward twin.
+    - 9 `Index Scan Backward` in inherit / partition\_join / join contexts
+      (MergeAppend children, parameterized paths).
+  - Resume: slice 4 — IndexOnlyScan reverse walk (operators\_indexonly.go;
+    reconcile with the S6 max-rewrite Backward) + pathindexonly.go
+    backward twin. Then parameterized backward paths (pathparamindex.go).
+  Movement: yes — regress btree\_index 499→457, create\_index 3159→3143
+  - 2026-11-12 slice 4 LANDED (537cf8603) — CLOSED.
+    - Index Only Scan Backward: backward twin in addOneIndexOnlyPath;
+      IndexOnlyScan.Backward's reversed materialisation is the backward
+      order.
+    - Descending merge join: Path.MergeDesc → Join.MergeKeyDesc →
+      JoinExecKeys.Desc, and compareMergeKeys negates a DESC key. A
+      NULLS FIRST outer key is refused only for LEFT/ANTI/FULL.
+    - right\_merge\_direction matches the query pathkey by equivalence
+      class, so the inner of a descending merge gets its backward path.
+    - Probe against PG: 5 statements, plans, costs and rows identical.
+  - The 21 PG `… Backward` lines left are other features, filed as
+    M0148-0001c3a5.
+  Movement: yes — regress create\_index 3143→3137, join 17655→17626
+- [x] **M0148-0001c3a4 — c3a2 residue: inequality OR groups, OR→SAOP
+  behind a prefix on plain paths, SAOP + range, sub-ORs in AND arms,
+  useful\_predicate, join OR bitmap paths, bitmap node cost line**.
+  Kind: impl
+  Parent: M0148-0001c3a2
+  Each item is ledgered with its resume point
+  (.ralph/deferral\_ledger.md, M0148-0001c3a2 rows, 2026-11-12):
+  - (a) `col < ANY (…)` groups: group\_similar\_or\_args'
+    non-equality groups. They are declined today and need a SAOP probe that
+    reduces to the extreme element.
+  - (b) match\_orclause\_to\_indexcol behind an equality prefix on plain
+    IndexScan paths: the plain SAOP carrier is leading-column only.
+  - (c) leading-SAOP + range: the plain SAOP descent's per-element bounds
+    lack the NULL stop and the DESC swap; the bitmap SAOP takes no bound.
+  - (d) the recursive generate\_bitmap\_or\_paths for sub-ORs inside AND
+    arms.
+  - (e) useful\_predicate arms (a partial index proved by the arm alone).
+  - (f) bitjoinpaths: BitmapOr over join OR clauses.
+  - (g) the Bitmap Index Scan / BitmapOr EXPLAIN cost line: startup 0.29
+    and width 84, where PG prints 0.00 and 0.
+  - 2026-11-12 (c) LANDED (ad771643c): a bound behind a leading SAOP is an
+    exact index qual.
+    - rescanSAOP bounds each element with indexRangeBounds (one-key
+      prefix: NULL stop, DESC swap, per-element exclusivity). The planner
+      files the bounds with restrictionRangeBehindPrefix, and
+      createSAOPIndexScanPlan drops them from the Filter.
+    - Pre-existing wrong-results bug fixed on the way: the elements
+      descended in IN-list order while the path claimed index order
+      (`IN (182, 183, 5) ORDER BY 1, 2 LIMIT 3` returned 182's rows). They
+      are now sorted and de-duplicated with the tree comparator
+      (\_bt\_sort\_array\_elements).
+    - Probe against PG: 13 statements identical.
+    Movement: yes — regress btree\_index 457→453
+  - (h) new: index-only SAOP (PG `Index Only Scan` with `= ANY` and a
+    bound; goopg's IOS path and indexOnlyScanOp have no SAOP probe), and
+    the bitmap SAOP carrier with second-column bounds.
+  - 2026-11-12 (b) LANDED (91b3bd618): an array behind an equality prefix
+    on a plain Index Scan (IndexScan.RangePrefix + SAOPKeys; PG
+    `((thousand = 42) AND (tenthous = ANY (…)))`).
+    - restrictionSAOPOnColumn generalises the leading builder; bounds on
+      the column after the array; indexScanPredicate rebuilds the prefix.
+    - Probe against PG: 12 statements identical except the pre-existing
+      constant-fixed-pathkey Sort (M0148-0001c3a5 (d)).
+    Movement: yes — regress create\_index 3137→3099
+  - 2026-11-12 (h) LANDED (2bb850c31): index-only ScalarArrayOp scans,
+    forward and backward (IndexOnlyScan.SAOPKeys over the shared
+    Context.saopWindows).
+    - Probe against PG: 7 statements identical (costs too), except the
+      pre-existing DISTINCT election (HashAggregate vs PG's Unique over an
+      ordered IOS, also for a range IOS).
+    Movement: yes — regress btree\_index 453→437, create\_index 3099→3063
+  - (i) new, from the (h) regress diff: an array behind a leading range
+    (`thousand < 2 AND tenthous IN (…)` → PG `((thousand < 2) AND
+    (tenthous = ANY (…)))`), a bound on the array's own column
+    (`unique1 IN (…) AND unique1 >= 42`), two arrays on one column, and
+    index-only SAOP behind an equality prefix (IndexOnlyScan has no
+    RangePrefix).
+  - 2026-11-12 (a) LANDED (2fbce36a9): inequality OR groups and explicit
+    `col op ANY (…)` as `col < ANY (…)` (saopOp; one range up to the
+    extreme element), plus operatorPredicateProof (BT\_implic\_table on
+    integer constants) in predicateImpliedBy.
+    - Probe against PG: 12 statements identical.
+    - A flattened-recheck shortcut dropped Filters PG keeps; reverted for
+      the operator proof, which is PG's actual mechanism.
+    Movement: yes — regress create\_index 3063→3015
+  - 2026-11-14 (i) slice 1 LANDED: quals on the array's own column, and
+    array literals.
+    - Further `= ANY` lists and bounds on the array's column merge into
+      the probe (saopColumnQuals → SAOPColQuals; saopWindows keeps the
+      admitted elements, as \_bt\_merge\_arrays /
+      \_bt\_compare\_array\_scankey\_args do). Index Cond prints them in
+      source order.
+    - A lone array literal (`= ANY ('{7, 8, 9}')`) is split into elements
+      (saopElementsFor). It used to fail with 22P02.
+    - Probe against PG: 5 of 7 statements identical. The 2 that differ
+      predate the slice and are listed in the next bullet.
+    Movement: yes — regress create\_index 3015→2933, inherit 3154→3153
+  - 2026-11-14 (i) slice 2 LANDED: index-only SAOP behind an equality
+    prefix.
+    - indexOnlyLeafClauses files prefix + array + next-column bounds
+      (IndexOnlyScan.Keys ahead of SAOPKeys).
+    - An equality array outranks a bound on its own column
+      (prefixEqualitySAOP); the bound merges into the array.
+    - A lone array literal is priced per element. `< ANY ('{100,300}')`
+      used to be estimated at 1/3.
+    - Live-server probe against PG: costs identical on 7 variants. The only
+      plan difference left is the constant-prefix Sort (c3a5 (d)).
+    Movement: none — regress 22 suites byte-identical; the IOS shapes show
+    only in the PG probe and TestIndexOnlySAOPBehindPrefix
+  - 2026-11-14 (i) slice 3 LANDED: an array behind a leading range on an
+    Index Only Scan.
+    - IndexOnlyScan.TrailingSAOP is checked per entry before the heap
+      fetch, and costed by btcostestimate's skip-array branch.
+    - Costing fixes to slices 1-2: every array multiplies num\_sa\_scans,
+      and column quals count as index quals.
+    - The bitmap SAOP carrier merges column quals.
+    - Live-server probe against PG: plans, costs and rows identical on all
+      new statements; the slice 1-2 two-array case now matches too.
+    Movement: yes — regress create\_index 2933→2856
+  - 2026-11-14 (i) slice 4 LANDED: the plain Index Scan trailing array.
+    - IndexScan.TrailingSAOP is checked on each entry's key before the heap
+      fetch (trailingKeyCheck), forward and backward.
+    - createPlan's backward guard had been panicking (recovered upstream)
+      on this shape, silently falling back to Sort + forward.
+    - Live-server probe against PG: plans, costs and rows identical; only
+      the pre-existing width differs.
+    Movement: none — regress unchanged from slice 3; the plain shapes show
+    only in the PG probe and TestIndexScanSAOPBehindLeadingRange
+  - 2026-11-14 (i) slice 5 LANDED: the empty array literal as a merged
+    column qual.
+    - Selectivity 0; prints `'{}'::integer[]`.
+    - A lone empty array is still a Filter (no zero-element probe shape).
+    Movement: none — regress unchanged (arrays byte-identical to HEAD);
+    the shapes show only in the PG probe and
+    TestSAOPArrayLiteralAndColumnQuals
+  - (i) still open:
+    - a lone empty array as the probe;
+    - cross-type array literals (`'{33, 44}'::bigint[]` on int4);
+    - index-only width counting index-qual-only columns;
+    - an index-only prefix + range.
+  - 2026-11-14 (d) LANDED: sub-ORs inside AND arms.
+    - bitmapOrArmPath keeps a sub-OR as an arm clause
+      (match\_orclause\_to\_indexcol → SAOP).
+    - bitmapOrPathsFor is generate\_bitmap\_or\_paths with the AND-arm
+      recursion.
+    - Probe against PG (regress tenk1): plan and cost identical, except the
+      (g) cost line.
+    Movement: yes — regress create\_index 2856→2832
+  - (j) new, from (d): skip scan with a range on a non-leading column (PG
+    18 `tenthous < 2` on (thousand, tenthous): a skip array on thousand plus
+    the range, as Index Only Scan and Bitmap Index Scan, cost 195.28).
+    - restrictionSkipRun takes only equality runs.
+    - Blocks PG's `BitmapAnd(hundred, BitmapOr(thousand = ANY, tenthous <
+      2))` in create\_index.
+  - 2026-11-14 (g) LANDED: the bitmap node cost line.
+    - A Bitmap Index Scan prints startup 0 and indextotalcost
+      (Path.BitmapIndexAMTotal); bitmap nodes print width 0.
+    - TPC-DS sf025: 7 queries' Bitmap Index Scan lines changed on the cost
+      line only; 6 of 7 now equal PG's text.
+    Movement: none — regress COSTS OFF; plan-capture cost lines moved toward
+    PG (7 sf025 queries)
+  - 2026-11-14 (j) LANDED: skip scan with a range on a later column.
+    - Plain, index-only and bitmap paths; whole-index read with a per-entry
+      key check.
+    - Completes (d)'s create\_index BitmapAnd.
+    - Probe against PG: plans, costs and rows identical on 10 statements
+      (widths aside).
+    Movement: yes — regress create\_index 2832→2801
+  - 2026-11-14 (e) LANDED: partial-index predOK through
+    predicate\_implied\_by.
+    - predicateImpliedBy now serves all four prover sites.
+    - `name` constants are compared bytewise.
+    - The Recheck Cond lists the index quals before the predicate.
+    - Probe against PG: 4 plans identical.
+    Movement: yes — regress select 256→45
+  - 2026-11-14 CLOSED: (a)-(e), (g), (h), (i) slices 1-5, (j) landed.
+    - (f) and the (i) residue move to M0148-0001c3a6.
+    - (f) has no witness: no regress expected output and no TPC-H/TPC-DS
+      plan has a parameterized BitmapOr, and join.out's 8 BitmapOr plans
+      already match.
+- [x] **M0148-0001c3a6 — c3a4 residue: join OR bitmap paths and the
+  array-literal / index-only leftovers**.
+  Kind: impl
+  Parent: M0148-0001c3a4
+  No regress or corpus witness today; ledgered 2026-11-14
+  (.ralph/deferral\_ledger.md, M0148-0001c3a4 rows).
+  - (f) generate\_bitmap\_or\_paths over join OR clauses (indxpath.c
+    bitjoinpaths / consider\_index\_join\_outer\_rels with OR clauses):
+    parameterized BitmapOr arms.
+  - (i) residue:
+    - a lone `= ANY ('{}')` as the probe (zero-element probe shape);
+    - cross-type array literals (`'{33,44}'::bigint[]` on int4);
+    - index-only scan width from the reltarget;
+    - an index-only prefix + range.
+  - Resume: (i) cross-type literals (moves one create\_index line); (f)
+    when a witness appears.
+  - 2026-11-14 (i) slice 1 LANDED: cross-type integer array literals
+    (`int4col = ANY ('{33,44}'::bigint[])`) merge into the index probe
+    as column quals (crossIntArrayLiteral).
+    - Out-of-range elements are dropped from the probe and kept in the
+      printed Const.
+    - Design: docs/design/0100-0149/0148-0001c3a6-c3a4-residue.md.
+    Movement: yes — regress create\_index 2708→2689
+    - Resume (i): the int2 untyped-literal rendering (`smallint[]`); the
+      primary cross-type probe; mixed-type OR bitmap arms (create\_index's
+      `tenthous = 1::int2 OR … 3::int8` BitmapOr).
+  - 2026-11-14 (i) slice 2 LANDED: explicitly cast integer literals of
+    another width (`int4col = 3::int8`, `-3::int8`, `1::int2`) are index
+    quals, plain and bitmap.
+    - They print as their own Const and are estimated from the column's
+      statistics.
+    Movement: yes — regress create\_index 2689→2664, partition\_prune
+    6755→6754
+    - Resume (i): group\_similar\_or\_args (per-type `= ANY` OR arms); an
+      out-of-range equality key as an empty-result probe; the int2
+      untyped-literal rendering.
+  - 2026-11-14 (i) slice 3 LANDED: an OR group of one cast integer type
+    becomes `= ANY ('{3,42}'::bigint[])` (orEqualitySAOP admits cast
+    Consts and requires one constant type).
+    - The create\_index mixed-type BitmapOr witness is identical to PG.
+    Movement: yes — regress create\_index 2664→2637
+    - Resume (i): an out-of-range equality key as an empty-result probe;
+      the int2 untyped-literal rendering; the primary cross-type array
+      probe. Then (f) when a witness appears.
+  - 2026-11-14 (i) slice 4 LANDED: every range bound is an index clause
+    (tightestIntBound + ExtraBounds).
+    - The tightest integer bound per direction is probed; the others print
+      in Index Cond in restriction order.
+    - Cast integer bounds merge behind an array and behind a leading
+      range.
+    Movement: yes — regress create\_index 2637→2535
+    - Resume (i): redundant bounds on bitmap scans and behind an array;
+      non-integer comparable bounds (text, numeric); out-of-range equality
+      probe; int2 literal rendering; primary cross-type array probe.
+  - 2026-11-14 (i) slice 5 LANDED: `col IN (…) AND col = const` is the
+    array path with the equality merged and printed after it, on plain,
+    index-only and bitmap producers (equalityMergedIntoLeadingSAOP).
+    Movement: yes — regress create\_index 2535→2500
+    - Resume (i): an equality behind the array on the next column
+      (multi-column prefix); the earlier leftovers.
+  - 2026-11-14 CLOSED. (i) landed in 5 slices (create\_index 2708→2500).
+    The remaining items have no regress or corpus witness, or belong to
+    another mechanism:
+    - (f) join OR bitmaps and every (i) leftover → M0148-0001c3a11
+      (parking item, no witness);
+    - row-comparison index quals with a non-catalog witness (create\_index
+      `ROW(thousand, tenthous) > ROW(NULL::integer, 5)`) →
+      M0148-0001c3a12;
+    - constant-NULL row elimination (create\_index `(thousand, tenthous)
+      in ((1,1001), (null,null))`) → M0148-0001c3a13.
+    Movement: none — instrument artefact — close-out bookkeeping; the
+    slices' own movement is recorded above
+- [ ] **M0148-0001c3a11 — c3a6 residue with no witness: join OR bitmaps and
+  array / bound leftovers**.
+  Kind: impl
+  Parent: M0148-0001c3a6
+  Parked 2026-11-14; take an item when a regress or corpus witness appears.
+  Ledgered in the M0148-0001c3a6 rows.
+  - (f) generate\_bitmap\_or\_paths over join OR clauses (parameterized
+    BitmapOr arms).
+  - A cross-type literal as the primary probe array.
+  - An untyped `'{1,2}'` on an int2 column printing `smallint[]`.
+  - An out-of-range equality key as an empty probe.
+  - Redundant bounds on bitmap scans, behind an array, beside a leading
+    NullTest; non-integer redundant bounds.
+  - An equality behind the array on the next column.
+  - A lone `= ANY ('{}')` probe; index-only width from the reltarget.
+  - From M0148-0001c3a12 \(closed 2026-11-14\):
+    - UPDATE / DELETE planning never takes a row-comparison index path;
+    - a row comparison behind an equality prefix, over DESC columns, or
+      one PG truncates to the index columns.
+- [x] **M0148-0001c3a12 — row-comparison index quals
+  (match\_rowcompare\_to\_indexcol)**.
+  Kind: impl
+  Parent: M0148-0001c3a6
+  Found 2026-11-14.
+  - Witness: create\_index `(thousand, tenthous) > (NULL, 5)` → PG `Index
+    Scan … Index Cond: (ROW(thousand, tenthous) > ROW(NULL::integer,
+    5))`; goopg `Seq Scan … Filter: (ROW(thousand, tenthous) > ROW(NULL,
+    5))`.
+    - It also names the NULL Const's type (`NULL::integer`).
+  - btree\_index's 5 pg\_proc lines (c3a5 (c)) need this too, plus
+    M0148-0001c3a7.
+  - Resume:
+    - indxpath.c match\_rowcompare\_to\_indexcol / expand\_indexqual\_
+      rowcompare: a RowExpr comparison whose leading columns are the
+      index's leading columns becomes an index qual;
+    - executor: a lexicographic row bound on the index (nbtree treats it
+      as an SK\_ROW\_HEADER scan key);
+    - EXPLAIN: `ROW(…) > ROW(…)` with typed Consts.
+  - 2026-11-14 slice 1 LANDED: a row comparison over the index's leading
+    columns is an index qual on Index Scan / Index Only Scan.
+    - The lossy leading bound is probed and the comparison checked per
+      entry (newIndexRowCheck); EXPLAIN prints `ROW(…) op ROW(NULL::integer,
+      …)`.
+    - A NULL constant estimates 0 rows.
+    - Design: docs/design/0100-0149/0148-0001c3a12-row-compare-index-quals.md.
+    Movement: yes — regress create\_index 2500→2483
+    - Resume: the bitmap form (BitmapIndexScan RowCompare + Recheck Cond);
+      prefix / DESC / truncated rows; btree\_index waits on c3a7.
+  - 2026-11-14 slice 2 LANDED: the bitmap form.
+    - BitmapIndexScan.RowCompare, a per-entry check and PG's Recheck Cond.
+    - indexScanPredicate (DML / FOR UPDATE reconstruction) includes the
+      comparison.
+    - Found and filed P0-E27 (S2, wrong results).
+    Movement: none — instrument artefact — the bitmap witnesses are not in
+    the diffed regress suites; the probe plans are identical to PG 18.3
+    (TestRowCompareIndexQual)
+    - Resume: DML index paths for row comparisons; prefix / DESC /
+      truncated rows; btree\_index waits on c3a7.
+  - 2026-11-14 CLOSED: the leftovers have no regress or corpus witness, so
+    they moved to M0148-0001c3a11 \(ledger row 2026-11-14\). btree\_index's
+    pg\_proc lines stay with M0148-0001c3a7.
+- [x] **M0148-0001c3a13 — constant-NULL row elimination in a row IN list**.
+  Kind: impl
+  Parent: M0148-0001c3a6
+  Found 2026-11-14.
+  - Witness: create\_index `(thousand, tenthous) in ((1,1001),
+    (null,null))` → PG `Index Scan … Index Cond: ((thousand = 1) AND
+    (tenthous = 1001))`; goopg `Seq Scan … Filter: (ROW(thousand,
+    tenthous) = ANY (ROW(1, 1001), ROW(NULL, NULL)))`.
+  - PG:
+    - transformAExprIn expands a row IN list into an OR of per-column
+      AND equalities (make\_row\_comparison\_op);
+    - eval\_const\_expressions folds the all-NULL AND to NULL;
+    - canonicalize\_qual / find\_duplicate\_ors drops a NULL or FALSE OR
+      arm in WHERE context (is\_check = false).
+  - Resume: expand RowExpr IN lists in the resolver (or a planner
+    pre-pass), then drop constant NULL OR arms in qual context.
+  - 2026-11-14 LANDED: planInExpr expands a row IN list
+    \(rowInListAsBooleanTree\); the existing FoldConstants and
+    reduceQualConstArms drop the NULL item.
+    - Both `(a, b)` and `ROW(a, b)` qualify; a width mismatch is 42601.
+    - Also fixes wrong values: a NULL item now gives NULL, not false
+      \(NOT IN: NULL, not true\).
+    - EXPLAIN prints a NULL AND / OR arm as `NULL::boolean`.
+    - Design: docs/design/0100-0149/0148-0001c3a13-row-in-list-expansion.md.
+    - Leftovers ledgered \(mixed row / scalar list; Result Output line\).
+    Movement: yes — regress create\_index 2483→2466
+- [x] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
+  `… Backward` regress lines**.
+  Kind: impl
+  Parent: M0148-0001c3a3
+  Backward scans themselves are done (c3a3). Each line below is missing
+  because another feature is missing; the forward plan is wrong too.
+  Ledgered 2026-11-12 (.ralph/deferral\_ledger.md, M0148-0001c3a3 slice 4
+  row):
+  - (a) inherit, 9 lines: the partition-ordered plain `Append`
+    (generate\_orderedappend\_paths with partitions\_are\_ordered) over
+    child index scans in either direction, including an expression index
+    (`mcrparted (a, abs(b), c)`); and min/max over partitions
+    (`parted_minmax`: per-child `Limit` + `Index Only Scan [Backward]`).
+  - (b) partition\_join, 4 lines: fractional partitionwise join — a Merge
+    Append of per-partition `Nested Loop Left Join`s over `Index Only Scan
+    [Backward]` under a LIMIT (`fract_t`).
+  - (c) btree\_index, 5 lines: row-comparison index quals
+    (`(proname, pronamespace) > ('abs', 0)` → `Index Cond: (ROW(...) >
+    ROW(...))`) on `pg_proc`.
+  - (d) create\_index, 3 lines: boolean index quals (`WHERE b`, `b IS
+    TRUE`, `b IS FALSE` → `Index Cond: (b = true)`,
+    match\_boolean\_index\_clause) and equality-prefix pathkeys
+    (`b = true ORDER BY i`).
+  - 2026-11-14 (d) LANDED: boolean index quals and constant-column
+    pathkeys.
+    - booleanIndexQual matches `b`, `NOT b`, `b IS TRUE` and `b IS FALSE`
+      as `b = true/false` (match\_boolean\_index\_clause).
+    - addConstEquatedColumns makes buildIndexPathkeys skip a column the
+      restriction pins (build\_index\_pathkeys' redundant pathkeys).
+    - Design: docs/design/0100-0149/0148-0001c3a5-backward-plan-residue.md.
+    Movement: yes — regress create\_index 2801→2750
+  - 2026-11-14 (d) slice 2 LANDED: `b = true` → `b` and `NOT NOT x` → `x`
+    (simplify\_boolean\_equality, negate\_clause).
+    - boolvarsel / booltestsel without statistics.
+    - A bare-column qual prints `Filter: b`.
+    - The isolation family passes.
+    Movement: yes — regress create\_index 2750→2727, partition\_prune
+    6783→6778
+  - 2026-11-14 analysis of (a)-(c); no code change.
+    - (c) is BLOCKED on M0148-0001c3a7. All 5 btree\_index witnesses scan
+      pg\_proc, which goopg plans as a bare `Result` + One-Time Filter. It
+      has no pg\_index entries and no heap/index scan paths, so no index
+      qual of any kind can appear there. Row-comparison quals on user
+      tables would move no instrument.
+    - (a) and (b) need the partitioned appendrel's members planned as
+      their own rels.
+      - Partition children arrive as pre-built SetOp UNION ALL members
+        (isInheritanceAppendRel), mostly Seq Scans.
+      - So there are no per-child ordered index paths for
+        generate\_orderedappend\_paths to choose from.
+      - Neither the partitions\_are\_ordered plain Append (range\_parted)
+        nor the Merge Append can form, and neither can the per-child
+        `Limit` + `Index Only Scan [Backward]` for min/max
+        (buildMinMaxAppendRelMerge exists but is not elected for
+        parted\_minmax).
+      - mcrparted's lines also need partition pruning over an expression
+        key `abs(b)`.
+    - Resume: (a) — give inheritance members child-rel index paths (a
+      per-member addOrderedIndexPaths over the member's leaf) and an
+      ordered-Append path in addOrderedAppendPaths when the partition
+      bounds are ordered (partitions\_are\_ordered).
+  - 2026-11-14 (a) slice 1 LANDED: the partition-ordered plain Append
+    (partitions\_are\_ordered arm).
+    - addOrderedPartitionAppendPaths (orderedpartitionappend.go) rebuilds
+      the inheritance SetOp chain with per-member Index (Only) Scans in
+      bound order, reversed and Backward for DESC.
+    - Admits a single-level RANGE parent with integer bounds and no
+      default partition, plain member indexes, and an ORDER BY led by
+      the partition key.
+    - range\_parted matches PG in both directions.
+    Movement: yes — regress inherit 3153→3118, missing `Backward` lines
+    9→7
+    - Resume (a): mcrparted needs an expression index column (`abs(b)`)
+      and pruning on it; parted\_minmax needs per-child min/max. Then (b).
+  - 2026-11-14 (a) slice 2 LANDED: PG index column names and expression
+    ORDER BY keys in the partition arm.
+    - parser.FigureIndexColname (FigureColnameInternal) names expression
+      index columns at all four naming sites and in the index's
+      pg\_attribute rows. `abs(b)` gives `t_abs_idx` and attname `abs`;
+      goopg gave `t__idx` / `t_expr_idx` and `pg_expression_1`.
+    - addOrderedPartitionAppendPaths matches expression keys against
+      PartitionKeyExprs and ColExprs (keyMatchesTableColumn).
+      - Not reachable end to end yet: indexUnboundKeysNotNull refuses
+        expression key columns, because blob-format expression indexes
+        store no NULL-keyed entries.
+      - mcrparted is now blocked on M0148-0001c3a8.
+    Movement: yes — regress create\_index 2727→2708 (inherit unchanged at
+    3118)
+    - Resume (a): parted\_minmax per-child min/max (1 line); then (b).
+      mcrparted's 6 lines resume once M0148-0001c3a8 lands.
+  - 2026-11-14 (a) slice 3 LANDED: the ordered full-scan producer no
+    longer files a Filter-only twin of an index that binds a local clause
+    (build\_index\_paths' one-path-per-index; indexBindsLocalRestriction).
+    - `where a is not null order by a limit 1` and `a >= -100 …` now plan
+      PG's `Index Only Scan … Index Cond:`.
+    Movement: none — instrument artefact — no regress case or corpus query
+    has a near-total leading index clause under ORDER BY; probe-verified
+    against PG and pinned by TestOrderedFullScanYieldsToIndexClausePath
+    - Resume (a) parted\_minmax, in order:
+      - trailing-column index quals behind a leading range or NullTest
+        (`((a IS NOT NULL) AND (b = 5))`): TrailingSAOP with ColQuals
+        only, on all three scan nodes;
+      - binary-compatible relabel (`(b)::text`) seen through in
+        normalizeColumnIndexKey;
+      - the one-member appendrel alias;
+      - multi-member min/max over an ordered Append.
+  - 2026-11-14 (a) slice 4 LANDED: plain comparisons on index column 1
+    behind a leading range or NullTest are index quals (trailingColumnQuals
+    → TrailingSAOP with no Elems) on Index Scan and Index Only Scan, with
+    plans, costs and rows identical to PG on a NULL-bearing probe.
+    Movement: none — instrument artefact — regress create\_index count
+    unchanged at 2708; two hunks now carry `tenthous = …` in Index Cond
+    (they still differ in a second redundant leading bound)
+    - Resume (a) parted\_minmax, in order:
+      - rewriteMinMaxAggregates: plan the min/max subquery through the
+        path search (build\_minmax\_path) instead of the rule-based IOS
+        arm, whose wherePredSafeForIOS refuses `b = 5`;
+      - the varchar relabel;
+      - the one-member appendrel alias;
+      - multi-member min/max.
+    - Bitmap trailing quals and redundant leading bounds are ledgered.
+  - 2026-11-14 (a) slice 5 LANDED: the min/max subquery is planned by
+    the path search (build\_minmax\_path).
+    - planMinMaxSubqueryViaSearch replaces the Sort fallback for a
+      non-correlated single relation; a body with no presorted path
+      declines to the Aggregate, as in PG.
+    - An Index Only Scan prints a varchar key column bare
+      (indexOnlyCondDropRelabel).
+    Movement: yes — regress subselect 2462→2443, partition\_prune
+    6778→6772 (aggregates still PASS)
+    - Resume (a) parted\_minmax:
+      - the one-member appendrel collapse: keep the parent alias and plan
+        the child as a search leaf (its `a > 0 ORDER BY a LIMIT 1` is
+        Sort over `Index Cond: (a >= 0) Filter: (a > 0)`);
+      - then per-member index clauses for addOrderedPartitionAppendPaths
+        (members with quals), and min/max over appendrel members through
+        the search.
+  - 2026-11-14 (a) slice 6 LANDED: a one-leaf partitioned table plans its
+    leaf as the appendrel's only member.
+    - The bare leaf scan carries the parent's refname and is a search
+      leaf, with the leaf's indexes and member sizing.
+    - `tableoid` comes from the binding (singleLeafOID).
+    - min/max over a partitioned parent goes through the search only.
+    Movement: yes — regress inherit 3118→3094 (parted\_minmax identical),
+    partition\_prune 6772→6755
+    - Resume (a): the remaining 6 inherit `Backward` lines are mcrparted,
+      blocked on M0148-0001c3a8.
+    - Open residue: per-member index clauses for multi-member appendrels
+      with a WHERE (addOrderedPartitionAppendPaths refuses Filter members).
+    - Then (b) fractional partitionwise join.
+  - 2026-11-14 CLOSED. (d) landed; (a) landed in 6 slices (range\_parted and
+    parted\_minmax now identical to PG). Every remaining line has its own
+    task:
+    - (a) mcrparted's 6 `Backward` lines → M0148-0001c3a8 (expression
+      index keys hold no NULL-keyed entries);
+    - (a) per-member index clauses for multi-member appendrels with a
+      WHERE → M0148-0001c3a10;
+    - (b) partition\_join fract\_t's 4 lines → M0148-0001c3a9 (goopg has
+      no partitionwise join at all — pathparam.go);
+    - (c) btree\_index's 5 lines → M0148-0001c3a7.
+    Movement: none — instrument artefact — close-out bookkeeping; the
+    slices' own movement is recorded above
+- [ ] **M0148-0001c3a9 — partitionwise join (enable\_partitionwise\_join)**.
+  Kind: impl
+  Parent: M0148-0001c3a5
+  Found 2026-11-14 by c3a5 (b).
+  - PG's try\_partitionwise\_join (joinrels.c) joins matching partitions
+    pairwise when both sides are partitioned on the join key with
+    equal bounds. generate\_partitionwise\_join\_paths then appends the
+    child joins.
+  - goopg's search joins the two appendrels as wholes: `Hash Left Join`
+    over two `Append`s, where PG has a `Merge Append` of per-partition
+    `Merge Left Join` / `Nested Loop Left Join`s.
+  - The witness is partition\_join's fract\_t: 4 `Backward` lines, and
+    the per-partition joins throughout that suite.
+  - goopg's GUC already defaults partitionwise on (owner-gated, see GUC
+    defaults), but nothing consumes it.
+  - Resume:
+    - design doc first: child RelOptInfos for appendrel members (also
+      needed by M0148-0001c3a10), partition-bounds matching
+      (partition\_bounds\_equal), and the child-join rel build;
+    - then the fractional Merge Append over child joins.
+  - 2026-11-15 slice 1 LANDED: partition members in PartitionDesc \(bound\)
+    order, expanded depth-first \(partitionDescOrder,
+    collectAllPartitionLeaves\).
+    - RANGE by lower bound; LIST by smallest value, NULL-only next; HASH by
+      \(modulus, remainder\); DEFAULT last. Undecidable bound types keep
+      catalog order.
+    - Also discharges M0148-0001k1 \(c\)'s partition half.
+    - Design: docs/design/0100-0149/0148-0001c3a9-partitionwise-join.md
+      \(slice 1 plus the design of the remaining slices\).
+    Movement: yes — regress partition\_prune 6754→6384, partition\_join
+    5801→5630, inherit 3122→3076
+    - Resume: slice 2 of the design doc \(partition scheme on the
+      appendrel binding\), then child rels shared with c3a10.
+  - 2026-11-15 slice 2 LANDED: partScheme on the appendrel's SetOp, plus
+    the matching predicates \(samePartitionScheme, partitionBoundsEqual,
+    partkeyEquiJoined\) in internal/optimizer/partscheme.go.
+    - Scope: one-level, plain-column keys; nothing in the search consults
+      them yet.
+    Movement: none — instrument artefact — groundwork only; plans are
+    unchanged until the child-join slice uses it
+    - Resume: design slice 3-4 — child rels and per-pair child joins at
+      makeJoinRel. Column refs are positional by source and name, and a
+      member's output layout equals the appendrel's, so a child problem
+      can reuse the parent's clauses with the leaves swapped.
+  - 2026-11-15 slice 3 LANDED: inner partitionwise join of two base
+    appendrels \(tryPartitionwiseJoin at makeJoinRel, child rels with
+    member leaves, PathPartitionwiseAppend, EXPLAIN parent naming via
+    SetOp.PartitionwiseParents\).
+    - Off for row-locking SELECTs and DML \(EPQ reads the Append Filter\).
+    - enable\_partitionwise\_join now reaches the planner
+      \(PlannerSettings.EnablePartitionwiseJoin, dispatch.go\).
+    Movement: yes — regress partition\_join 1990→1882, partition\_aggregate
+    587→584
+    - Resume: child rels with index / bitmap paths \(the second witness
+      merge-joins Index Scans\); child statistics for child joinrel sizing;
+      outer / semi / anti joins; N-way.
+  - 2026-11-15 slice 4 attempt — NOT landed; prerequisite found:
+    - Child index paths were built \(scratch rel over the member's bare scan;
+      restriction + ordered producers; lifted under the tableoid Project as
+      PathMemberProject\) and generated as expected \(Index Scans at cost
+      ~14 per partition\), but never won. regress partition\_join was
+      byte-identical, so the code was not committed. The patch is kept at
+      tmp/c3a9-slice4-child-index.patch \(tmp is not tracked; rebuild from
+      the description if lost\).
+    - Prerequisite: partition member seq scans are priced with 0 pages
+      \(`Seq Scan on prt1_p1 … cost=0.00..1.25` vs PG `2.25`; also in the
+      whole-rel Append\), so every member index path loses.
+      - Not ANALYZE: pg\_class shows relpages 1 / reltuples 125, and a
+        direct `ANALYZE prt1_p1` in the same session leaves the cost
+        unchanged.
+      - Member rows come from the block-count fallback
+        \(relSizeFallbackRows\), i.e. the leaf catalog.Table carries no
+        Stats. collectAllPartitionLeaves reads leaves from the InMemory
+        catalog \(im.PartitionChildren\), not through the session catalog
+        the top-level table is resolved with.
+      - Resume: resolve each leaf through the statement's catalog \(the same
+        lookup planScanRangeVar uses for tbl\) so it carries its Stats, then
+        check baseRelPages / the member SeqScan cost reach relpages 1; then
+        re-apply the patch and re-measure.
+    - Also seen: with enable\_seqscan off PG plans per-partition Index Only
+      Scans; child rels have no index-only arm \(scratch rels carry no
+      needed-column set\).
+    - CORRECTION 2026-11-15 \(next loop\): the 0-page diagnosis above was
+      wrong. The search's child costs read relpages \(2.25\); `1.25` is only
+      EXPLAIN's legacy display of a Seq Scan under the tableoid Project.
+  - 2026-11-15 slice 4 LANDED: child rels on the bare partition scan.
+    - Restriction, ordered and parameterised index paths come from the
+      base-rel producers \(addChildIndexPaths\); tableoid is filled with the
+      partition OID above each child join \(Path.pwFills\).
+    - Fixed a slice-3 wrong result: child joins with different output
+      widths were appended unprojected \(partition\_join "Join with pruned
+      partitions" returned `0|0300|0|0300`, PG `300|0300|300|0300`\). The
+      Append layout is now the coordinates every child provides.
+    Movement: yes — regress partition\_join 1882→1879
+    - Resume: index-only and bitmap child paths; remapped members; outer /
+      semi / anti; N-way.
+  - 2026-11-15 slice 5 attempt — NOT landed \(reverted before commit\):
+    LEFT / FULL / SEMI / ANTI partitionwise joins, each child join keeping
+    the parent's SpecialJoinInfo.
+    - It matched PG on the 2-way LEFT JOIN witness and moved regress
+      partition\_join 1879→1852 and partition\_aggregate 584→581, but it
+      returned WRONG ROWS when the partitionwise left join feeds another
+      join. The patch is kept at tmp/c3a9-slice5-outer.patch \(untracked\).
+      - Repro \(executor TestSortKeyChaseKeepsTheKeysRelation's fixture\):
+        `SELECT t1.a, t1.c, t2.b, t2.c, t3.a + t3.b, t3.c FROM (prt1 t1
+        LEFT JOIN prt2 t2 ON t1.a = t2.b) LEFT JOIN prt1_e t3 ON (t1.a =
+        (t3.a + t3.b)/2) WHERE t1.b = 0 ORDER BY …`.
+      - goopg with the patch: every row has `t2.b = 0` and `t2.c = t1.c`;
+        PG has NULLs for unmatched rows and the real values otherwise.
+      - ROOT CAUSE IS PRE-EXISTING, not the slice: the same wrong rows come
+        from plain tables and with partitionwise join off whenever the plan
+        keeps `Filter: (t1.b = 0)` on the upper outer join — filed as
+        P0-E30 \(S2\). The slice only changed costs so that shape wins.
+    - Found and filed P0-E28 and P0-E29 \(S2, pre-existing, escalation
+      blocks\).
+    - Resume: blocked on P0-E30 \(the patch makes an existing executor
+      test reach P0-E30's plan shape\). Once P0-E30 is fixed, re-apply the
+      patch, re-run the repro and the 2-way witness, and land.
+- [ ] **M0148-0001c3a10 — index clauses on appendrel members (WHERE quals
+  pushed into partitions)**.
+  Kind: impl
+  Parent: M0148-0001c3a5
+  Found 2026-11-14 by c3a5 (a) slices 1/5/6.
+  - Inheritance / partition members reach the search as pre-built
+    `Project → Filter → SeqScan` leaves of a UNION ALL chain, with no
+    RelOptInfo of their own. A member's pushed-down quals are therefore
+    never index clauses.
+    - PG: `Limit → Append → Index Only Scan … Index Cond: ((a IS NOT
+      NULL) AND (b = '12345'::text))` for min/max and for ORDER BY …
+      LIMIT over a partitioned table with a WHERE.
+    - goopg: Sort over Seq Scan + Filter members, or the plain Aggregate.
+  - addOrderedPartitionAppendPaths (orderedpartitionappend.go
+    memberSeqScan) refuses Filter members for this reason.
+  - Resume:
+    - give each member a base RelOptInfo built like a search leaf
+      (paramappend.go paramAppendPathFor already builds per-member
+      rels), and run the restriction / index-only producers over it;
+    - accept Filter members in addOrderedPartitionAppendPaths;
+    - let min/max members>0 take planMinMaxSubqueryViaSearch.
+  - 2026-11-15 slice 1 attempt — NOT landed \(net-neutral on the regress
+    instrument; patch at tmp/c3a10-slice1-appendrel-children.patch,
+    untracked\):
+    - What it does: addAppendRelChildPaths gives a partitioned base rel
+      with a restriction an Append over its partitions' cheapest child paths
+      \(the c3a9 child rels on the bare scan, plus bitmap paths\); the
+      one-relation search admits partitioned appendrel leaves
+      \(relfromjoinlist.go\); PlannerSettings.KeepAppendRelsWhole replaces
+      the row-lock / DML reuse of EnablePartitionwiseJoin.
+    - Witnesses: `select * from pa where b = 'v12'` and the same with ORDER
+      BY … LIMIT now match PG \(Append of per-partition Bitmap Heap Scans\).
+    - Regress vs a same-suite HEAD baseline: inherit 735→727, but
+      partition\_join 1879→1887, partition\_aggregate 584→586, join
+      2836→2837.
+      - The losses are EXPLAIN naming when the new Append sits inside a
+        sub-query or semi-join sub-problem: `Sort Key: t1_4.a` for the outer
+        `t1.a` \(the inner parent's binding id captures the outer level's
+        bySrc lookup in explain\_names.go\), `Filter: (prt1_1.b = 0)`.
+      - Dropping the parent's binding id from bySrc fixed that case but
+        broke slice-3 naming elsewhere \(partition\_aggregate 589\).
+    - Also seen: without a restriction, child ordering-only index paths
+      undercut seq scans \(aggregates p\_t1\), so the patch gates on a
+      restriction; multi-relation problems were excluded after the
+      partition\_join sort-key regression.
+    - Resume: make explain\_names.go register a partitionwise parent's
+      binding id only within its own query level \(level-scoped bySrc\),
+      then re-apply the patch and re-measure.
+  - 2026-11-15 slice 1 LANDED \(next loop\): the parked patch plus the
+    EXPLAIN scope fix \(scopeSources registers an Append's parent
+    appendrels\) and two more gates \(no correlated restriction; one-relation
+    problems with a restriction only\).
+    - Witnesses `select * from pa where b = 'v12'` \(+ ORDER BY LIMIT\) match
+      PG; TestAppendRelChildIndexPaths pins them.
+    - Design: docs/design/0100-0149/0148-0001c3a10-appendrel-child-paths.md.
+    Movement: yes — regress inherit 720→712
+    - Resume: multi-relation problems \(EXPLAIN key chase and parameterised
+      quals over the Append\); Merge Append over ordered children; min/max
+      per partition; index-only child paths.
+  - 2026-11-15 slice 2 LANDED: an index-only probe behind an
+    equality-bound prefix carries the index ordering \(and its backward
+    twin\), as the plain restriction path already did
+    \(pathindexonly.go addOneIndexOnlyPath\).
+    - Plain-table `where c = 3 order by a [desc] limit 1` now matches PG's
+      `Index Only Scan [Backward]`; TestIndexOnlyEqualityPrefixOrdering.
+    Movement: none — instrument artefact — no regress case or corpus query
+    has this shape on a non-partitioned table; the probe plans are PG 18.3's
+    \(TestIndexOnlyEqualityPrefixOrdering\)
+    - Resume: the partitioned min/max needs child rels to run the
+      index-only producer \(their needed-column set\) and an ordered Append
+      over them \(partitions\_are\_ordered, backward for DESC\).
+  - 2026-11-15 slice 3 LANDED: index-only child paths
+    \(addChildIndexOnlyPaths\) and the ordered Append over partition child
+    rels \(addOrderedAppendRelChildPath, partitions\_are\_ordered\).
+    - Per-partition min/max and ORDER BY … LIMIT now plan PG's Append of
+      Index Only Scan \[Backward\]; TestOrderedAppendRelChildPaths.
+    Movement: none — instrument artefact — inherit's parted\_minmax has one
+    partition and already matched; no regress or corpus query has the
+    multi-partition shape; the probe plans are PG 18.3's
+    \(TestOrderedAppendRelChildPaths\)
+    - Resume: indexOnlyLeafClauses with an equality prefix plus a trailing
+      NullTest \(nullable min/max column\); Merge Append; joins.
+  - 2026-11-15 slice 4 LANDED: indexOnlyLeafClauses takes an equality
+    prefix plus a NullTest on the next index column; the IOS lowering puts
+    the prefix on Keys and the NullTest on IndexOnlyScan.Cond.
+    - Nullable `max(a) where c = 3` now plans PG's `Index Only Scan
+      Backward … Index Cond: ((c = 3) AND (a IS NOT NULL))`, per partition
+      and on a plain table; TestIndexOnlyPrefixNullTest.
+    Movement: none — instrument artefact — the same-suite regress A/B moved
+    only join 2837→2836, the Hash Right Join row-order flap \(the same plan
+    in both runs; standalone join 2685 twice\); no corpus query has the
+    shape; the probe plans are PG 18.3's \(TestIndexOnlyPrefixNullTest\)
+    - Resume: Merge Append over ordered children \(default partition, LIST,
+      non-leading key\); multi-relation problems \(joins\).
+  - 2026-11-15 slice 5 LANDED: Merge Append over partition child rels
+    when the partitions are not ordered on the leading query key
+    \(addMergeAppendRelChildPaths: per-child startup / total / fractional
+    picks, Sort children, orderings from childOrderingPrefixes\). The
+    lowering arm moved to createplanpartitionwise.go.
+    - Default-partition, LIST and non-leading-key witnesses match PG 18.3
+      in plan, cost and values; TestMergeAppendRelChildPaths.
+    Movement: yes — regress inherit 712→692 \(inventory re-measured on this
+    build; same-suite A/B 727→707\); join 2836→2837 is the row-order flap
+    - Resume: plain Append for non-interleaved LIST partitions
+      \(partitions\_are\_ordered\); sorted children under the ordered plain
+      Append; multi-relation problems \(joins\).
+  - 2026-11-15 slice 6 LANDED: unrestricted partitioned tables with a query
+    ordering get child rels and the Merge Append arm \(no unordered Append\);
+    unrestricted child rels are sized by estimate\_rel\_size
+    \(childScanRows\).
+    - Gate finding, fixed in the same commit: INSERT … ON CONFLICT routed
+      to a partition filed the row twice in the leaf's arbiter index
+      \(skipOID was the parent's; arbiterIndexOIDOn\). It was a wrong-results
+      bug for every index scan of that leaf; isolation
+      partition-key-update-2/3 exposed it; TestPartitionedUpsertSingleArbiterEntry.
+    Movement: yes — regress inherit 692→690 \(inventory re-measured on this
+    build; same-suite A/B 707→705\); aggregates and the other suite cases
+    unchanged
+    - Resume: ordering on a child rel's full index-only scan \(PG's Index
+      Only Scan children\); restricted child sizing after the boolean
+      index-only clause gap \(bool\_rp\); LIST partitions\_are\_ordered;
+      joins.
+  - 2026-11-15 slice 7 LANDED: the child's full index-only scan already
+    carried ordering. The real gap was that a bare `*` voided the needed
+    set. addBareStarOnlyNeededColumns plus childNeededColumns let child rels
+    plan PG's Index Only Scans under `select *`.
+    - Gate finding, fixed in the same commit: the Merge Append dropped each
+      row's tid, so `ctid` read NULL above it \(wrong results since slice
+      5\); setOp.mergeTID carries it.
+    Movement: yes — regress inherit 690→664 \(inventory re-measured on this
+    build; same-suite A/B 705→679\); other cases unchanged \(join flap\)
+    - Resume: LIST partitions\_are\_ordered \(plain Append\); boolean
+      index-only clause then restricted child sizing \(bool\_rp\);
+      disabled-node choice under LIMIT; joins.
+  - 2026-11-15 slice 8 LANDED: listPartitionsOrdered \(create\_list\_bounds'
+    interleaved\_parts\); restricted ordered LIST queries plan PG's plain
+    Append \(TestListOrderedAppendRelChildPaths\).
+    Movement: none — instrument artefact — no regress case has a restricted
+    ordered LIST query \(same-suite A/B identical\); the probe plans are PG
+    18.3's \(TestListOrderedAppendRelChildPaths\)
+    - Unrestricted LIST stays Merge Append. Enabling it moved inherit
+      679→677 but aggregates 99→103 \(p\_t1: goopg prices the members'
+      Append at 148 where PG's cost\_append gives 75.5, so the HashAggregate
+      lost\).
+    - Resume: the UNION ALL appendrel display cost \(plancost.go
+      default arm: per-link and tableoid-Project cpu\_tuple\_cost; member
+      seq-scan pages without the 10-page floor\), then enable the
+      unrestricted LIST arm.
+  - 2026-11-15 slice 9 attempt — NOT landed \(code reverted; trace
+    recorded\). Aim: make the appendrel's Append cost PG's cost\_append
+    \(p\_t1 75.50, lt 6.50\).
+    - Tried and measured, none of which moved the printed Append cost
+      \(still p\_t1 92.50, lt 7.50\):
+      - a plancost.go SetOp arm \(Σ member totals plus 0.5 × cpu\_tuple\_cost
+        × rows over the flattened chain, gated by
+        setOpExpandsTableHierarchy\);
+      - a free tableoid-wrapper Project, and a free column-selection
+        Project over the appendrel;
+      - a search seed cost \(joinsearch.go appendRelSeqScanCost, members
+        sized via estimate\_rel\_size\).
+    - Debug-proven facts:
+      - The SetOp display arm runs. It sees childTotal 37 for p\_t1 and
+        computes 55.50.
+      - The members are \(tableoid Project → SeqScan\) at 18.50 each.
+      - The SetOp embeds PlanCost, so EXPLAIN prints a STAMPED cost, not
+        the display arm's.
+      - upperInputPathCost returns that carried stamp, and the upper stage
+        re-stamps the node from a prebuilt path's cost \(stampPlanCost\).
+      - The 92.50 stamp = 55.50 \+ 37, one extra cpu\_tuple\_cost per row.
+        Its producer is still unidentified: neither buildInitialRels'
+        seed nor the display arm is it.
+    - Resume: find the SetOp's first stamper \(instrument setPlanCost on
+      SetOp with a stack dump\), then apply cost\_append there; expect
+      every partition / inheritance EXPLAIN cost to move. Then drop the
+      `unrestricted && isList` guard and re-measure aggregates p\_t1 and
+      inherit mclparted.
+  - 2026-11-15 slice 9 LANDED: the stamper is createPlanNode over the seed
+    path that buildInitialRels prices with costSubplanLeaf for an appendrel
+    leaf. appendRelSeqScanCost \(cost\_append over the members'
+    estimate\_rel\_size seq scans\) now prices an unrestricted single-FROM
+    appendrel; the `unrestricted && isList` guard is dropped
+    \(TestUnrestrictedListOrderedAppend\).
+    Movement: yes — regress inherit 664→662 \(inventory re-measured on this
+    build; same-suite A/B 679→677\); aggregates p\_t1 keeps the
+    HashAggregate \(99 unchanged\)
+    - Scope limits: inside joins it moved partition\_join 1879→1897
+      \(pruning k1; expression routing P0-E31\); on restricted appendrels
+      it undercut the child-rel paths \(pm `order by a + 1`\).
+    - Resume: extend to joins after k1 and P0-E31; to restricted
+      appendrels with per-member quals once the child-rel and seed costs
+      agree.
+  - 2026-11-15 slice 10 LANDED: constant-pinned leading partition keys
+    \(constPinnedColumns, stripPinnedPathkeys\) and a bound-order check
+    for RANGE \(rangePartsAscending\); executor fix: boolean partition
+    bounds stored as `true` / `false`, which makes boolean-keyed tables
+    routable \(they errored "no partition found"\).
+    TestBoolPartitionBoundsAndPinnedOrder.
+    Movement: yes — regress inherit 662→651, create\_table 133→122,
+    alter\_table 733→732 \(inventory re-measured on this build;
+    same-suite A/B inherit 677→666\)
+    - Finding: regress `select` FAILS 8/874 at HEAD too \(onek2 index-only
+      scans, `Index Searches`, list\_parted\_tbl\) while the inventory still
+      says `pass`; not caused here \(HEAD worktree run identical\).
+    - Resume: plan-time pruning \(k1\) for bool\_rp's extra partitions;
+      `order by b, a desc` under `b` \(PG Incremental Sort on the pinned
+      prefix\); restricted-appendrel cost\_append; joins.
+- [ ] **M0148-0001c3a8 — expression index keys in the tuple key format
+  (NULL-keyed entries)**.
+  Kind: impl
+  Parent: M0148-0001c3a5
+  Found 2026-11-14 by c3a5 (a) slice 2.
+  - buildPGIndexKeyDesc (internal/executor/pgindex\_keydesc.go) refuses an
+    expression key ("key N is an expression"), so expression indexes keep
+    the blob format.
+    - The blob format stores no NULL-keyed entries.
+    - catalog.IndexHasNullKeyedEntries is therefore false, and
+      indexUnboundKeysNotNull refuses any unbound expression column.
+  - PG stores every heap row in an expression index, NULL results
+    included. Its full ordered scans (the mcrparted ordered Append and
+    Merge Append, ORDER BY expr via index) return every row.
+  - Blocks regress inherit's 6 mcrparted `Index Scan Backward using
+    mcrparted*_a_abs_c_idx` lines and the forward / Merge Append forms.
+  - Resume:
+    - give the key descriptor an expression column, typed from
+      exprType of ColExprs[i] (the pg\_attribute text fallback in
+      buildUserPGAttributeRowsForIndex is the same missing typer);
+    - build / insert / decode the computed key image;
+    - re-run the arm on the mcrparted witness.
+- [ ] **M0148-0001c3a7 — system catalogs plan as a bare `Result`: no
+  heap or index scan paths**.
+  Kind: impl
+  Parent: M0148-0001c3a5
+  Found 2026-11-14 by c3a5 (c).
+  - `select proname from pg_proc where proname = 'abs'` plans as `Result`
+    / `One-Time Filter: (proname = 'abs'::text)`. PG plans an Index (Only)
+    Scan using pg\_proc\_proname\_args\_nsp\_index.
+  - pg\_index lists no index on pg\_proc, and joins against pg\_proc
+    materialise a Result.
+  - Blocks btree\_index's 5 row-comparison lines (c3a5 (c)) and any
+    catalog-scan plan parity.
+  - Resume: find where catalog relations are lowered to Result
+    (virtual-catalog scan producer), give them a SeqScan path over their
+    rows, and decide whether the bootstrap catalog indexes
+    (pg\_proc\_oid\_index, pg\_proc\_proname\_args\_nsp\_index) are to be
+    materialised.
 - [x] **M0148-0001c3c — DROP VIEW / DROP INDEX / RENAME after a restart
   fail "does not exist"**.
   Kind: impl
@@ -12189,6 +19189,18 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   ALTER VIEW / COMMENT ON VIEW / GRANT on unqualified view names do not use
   resolveRelationBySearchPath. Measure: create_view / rules / alter_table /
   namespace regress runner HEAD vs change.
+  - Added 2026-11-11 from M0148-0001j4 item (5): DROP TYPE must reach views.
+    PG 18.3 (scratch oracle) for `create type t as (a int, b text); create
+    table tt (k int, x t); create view v as select k, x from tt; create view
+    v2 as select (x).a from tt; create view v3 as select null::t as c; drop
+    type t;` gives DETAIL `column x of table tt depends on type t` / `view v
+    depends on column x of table tt` / `view v2 depends on column x of table
+    tt` / `view v3 depends on type t`, and CASCADE drops `column x of table
+    tt`, `view v`, `view v2`, `view v3` (4 objects). goopg lists and drops only
+    the column. Needs view→column and view→type edges recorded at CREATE VIEW
+    (find\_expr\_references\_walker: Var → column, Const/typed expression →
+    type), then a view node in executor/drop\_type\_dependents.go
+    typeDependentObjects that follows column nodes to their dependent views.
 - [x] **M0148-0001i1 — views plan as opaque sub-plans: no pull-up into the
   outer query (top Sort, Result node, unqualified names)**.
   Kind: impl
@@ -12268,7 +19280,10 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   Member order: a partitioned table's DEFAULT partition expands first (PG:
   PartitionDesc bound order, default last), and inheritance children came
   back in a different order after a restart (InheritanceChildren reload
-  order; PG orders by inhseqno/child OID). Measure: partition_prune /
+  order; PG orders by inhseqno/child OID).
+  - 2026-11-15: the partition half of \(c\) landed with
+    M0148-0001c3a9 slice 1 \(bound order, default last, depth-first\).
+    The inheritance-children reload order is still open. Measure: partition_prune /
   partition_join / inherit regress runner HEAD vs change, and isolation
   eval-plan-qual for (a).
 - [ ] **M0148-0002 — copy.sql regress coverage closure**.

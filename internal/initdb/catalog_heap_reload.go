@@ -1708,10 +1708,19 @@ func reloadDbRoleSettingsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 				continue
 			}
 			name, value := entry[:eq], entry[eq+1:]
+			setDatabase := c.setDatabase
+			if setDatabase == catalog.FirstUserOID {
+				// Before M0149-0001a1 S2 the postgres database's settings were
+				// keyed by the legacy 16384 display placeholder (ALTER DATABASE /
+				// ALTER ROLE ... IN DATABASE only ever wrote the live postgres
+				// database). Fold them into PostgresDBOid; the next write of the
+				// key deletes the legacy heap row (SyncDbRoleSettingRow).
+				setDatabase = catalog.PostgresDBOid
+			}
 			if c.setRole == 0 {
-				cat.SetDatabaseConfig(c.setDatabase, name, value)
+				cat.SetDatabaseConfig(setDatabase, name, value)
 			} else {
-				cat.SetRoleConfig(c.setRole, c.setDatabase, name, value)
+				cat.SetRoleConfig(c.setRole, setDatabase, name, value)
 			}
 		}
 	}
@@ -1883,6 +1892,15 @@ var errSkipBuiltinRow = fmt.Errorf("catalog reload: builtin row skipped")
 // Pre-B1.3b data dirs (sequences journaled only via kind-65) need re-init:
 // their counters have no physical page and the WAL scanner is gone.
 func reloadSequencesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	return reloadSequencesFromHeapMode(mgr, cat, clog, false)
+}
+
+// reloadSequencesFromHeapMode is reloadSequencesFromHeap; with onlyNew it
+// registers only sequences not registered yet. A running standby's
+// catalog refresh uses that: a known sequence's counter follows its replayed
+// XLOG_SEQ_LOG pages through the sequence replay hook, and a refresh must
+// not put an older page read back over it. M0149-0077c.
+func reloadSequencesFromHeapMode(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, onlyNew bool) error {
 	// OWNED BY map: seqrelid → (tableOID, attnum) from pg_depend auto rows.
 	depCols := executor.PGDependColumnsPG18()
 	type depRow struct{ objid, refobjid, refsubid uint32 }
@@ -1894,7 +1912,9 @@ func reloadSequencesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, depCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
 				return nil, false, derr
 			}
-			if uint32(decoded[0].Int) != catalog.RelationRelationId || decoded[6].StringValue() != "a" {
+			// 'a' is a serial / OWNED BY sequence, 'i' an identity column's
+			// (DEPENDENCY_INTERNAL, M0149-0003).
+			if dt := decoded[6].StringValue(); uint32(decoded[0].Int) != catalog.RelationRelationId || (dt != "a" && dt != "i") {
 				return nil, false, errSkipBuiltinRow
 			}
 			return depRow{
@@ -1943,21 +1963,14 @@ func reloadSequencesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 		if tbl.Schema != "" && tbl.Schema != "public" {
 			name = tbl.Schema + "." + tbl.Name
 		}
+		if onlyNew && executor.LookupSequence(name, dbOid) != nil {
+			continue
+		}
 		// Counter from the physical sequence page — it lives at the
 		// USER-DATA location base/<cat.DBOID()> (the session's physical
 		// database), not the catalog-heap base/1 + mirror scheme.
 		seqFile := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: seqrelid, Fork: storage.MainFork}
-		last, called := int64(0), false
-		haveCounter := false
-		if n, nerr := mgr.NBlocks(seqFile); nerr == nil && n > 0 {
-			if rerr := mgr.ReadBlock(seqFile, 0, page); rerr == nil {
-				if ht, herr := storage.PageGetHeapTuple(page, 1); herr == nil && len(ht.Data) >= 17 {
-					last = int64(binary.LittleEndian.Uint64(ht.Data[0:8]))
-					called = ht.Data[16] != 0
-					haveCounter = true
-				}
-			}
-		}
+		last, logCnt, called, haveCounter := readSequencePageTuple(mgr, seqFile, page)
 		p := xlog.SequenceStatePayload{
 			Name:      name,
 			Start:     d[2].Int,
@@ -2004,6 +2017,11 @@ func reloadSequencesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			}
 		}
 		executor.RestoreSequenceFromWAL(p)
+		if haveCounter {
+			// SELECT * FROM seq shows the page as PG does, log_cnt included
+			// (M0149-0077a).
+			executor.SetSequencePageState(name, last, logCnt, called, dbOid)
+		}
 		executor.CreateSequenceCatalogRelation(cat, parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name}, name, dbOid)
 		// Restore the owning column's serial spelling (heap-reloaded columns
 		// read back as the base integer type).
@@ -3072,6 +3090,16 @@ func languageNameForOID(oid uint32) string {
 // no WHEN TAG filter). Seeds the TID cache so a post-restart ALTER updates
 // the row in place.
 func reloadUserEventTriggersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	return reloadUserEventTriggersFromHeapMode(mgr, cat, clog, false)
+}
+
+// reloadUserEventTriggersFromHeapMode is reloadUserEventTriggersFromHeap with
+// sync: a running standby's refresh (RefreshCatalogAfterReplay) reads only
+// rows of committed transactions and replaces the whole user event trigger
+// registry with them, so a replayed CREATE, ALTER (ENABLE/RENAME/OWNER) or
+// DROP EVENT TRIGGER shows in pg_event_trigger without a restart — on PG the
+// standby reads the replayed pg_event_trigger heap directly. M0149-0077h.
+func reloadUserEventTriggersFromHeapMode(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, sync bool) error {
 	cols := executor.PGEventTriggerColumnsPG18()
 	type etRow struct {
 		et  catalog.EventTrigger
@@ -3103,10 +3131,21 @@ func reloadUserEventTriggersFromHeap(mgr *storage.Manager, cat *catalog.InMemory
 					Tags:    tags,
 				},
 				tid: tid,
-			}, false, nil
+			}, sync, nil
 		})
 	if err != nil {
 		return err
+	}
+	if sync {
+		ets := make([]catalog.EventTrigger, 0, len(rows))
+		tids := make(map[uint32]catalog.SchemaHeapTID, len(rows))
+		for _, raw := range rows {
+			er := raw.(etRow)
+			ets = append(ets, er.et)
+			tids[er.et.OID] = catalog.SchemaHeapTID{Block: uint32(er.tid.Block), Offset: er.tid.Offset}
+		}
+		cat.ReplaceEventTriggersDuringRecovery(ets, tids)
+		return nil
 	}
 	for _, raw := range rows {
 		er := raw.(etRow)
@@ -3671,4 +3710,104 @@ func reloadUserExtensionsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemo
 		cat.CreateExtensionDuringRecovery(r.name, r.schema, r.version, dbName, r.oid)
 	}
 	return nil
+}
+
+// readSequencePageTuple reads a sequence relation's block 0 tuple
+// (FormData_pg_sequence_data: last_value int8, log_cnt int8, is_called
+// bool), as read_seq_tuple does.
+func readSequencePageTuple(mgr *storage.Manager, rel storage.RelFileNode, page storage.Page) (last, logCnt int64, called, ok bool) {
+	if n, err := mgr.NBlocks(rel); err != nil || n == 0 {
+		return 0, 0, false, false
+	}
+	if err := mgr.ReadBlock(rel, 0, page); err != nil {
+		return 0, 0, false, false
+	}
+	ht, err := storage.PageGetHeapTuple(page, 1)
+	if err != nil || len(ht.Data) < 17 {
+		return 0, 0, false, false
+	}
+	return int64(binary.LittleEndian.Uint64(ht.Data[0:8])), int64(binary.LittleEndian.Uint64(ht.Data[8:16])), ht.Data[16] != 0, true
+}
+
+// RefreshSequenceAfterReplay is seq_redo's visible effect on a running
+// standby: after XLOG_SEQ_LOG rebuilt the sequence page of rel, the
+// sequence's counter is taken from that page, so SELECT * FROM seq and
+// pg_sequence_last_value show what PG's standby reads from the buffer. A
+// sequence not registered yet (created in a transaction still open) is
+// picked up by the catalog refresh at its commit. M0149-0077a.
+func (r *Runtime) RefreshSequenceAfterReplay(rel storage.RelFileNode) {
+	cat, ok := r.Catalog.(*catalog.InMemory)
+	if !ok || cat == nil || r.StorageMgr == nil {
+		return
+	}
+	tbl, dbOid, ok := cat.LookupTableByOIDAllDBs(rel.RelOid)
+	if !ok || tbl == nil || !tbl.IsSequence {
+		return
+	}
+	name := tbl.Name
+	if tbl.Schema != "" && tbl.Schema != "public" {
+		name = tbl.Schema + "." + tbl.Name
+	}
+	page := make(storage.Page, storage.BlockSize)
+	rel.Fork = storage.MainFork
+	if last, logCnt, called, ok := readSequencePageTuple(r.StorageMgr, rel, page); ok {
+		executor.SetSequencePageState(name, last, logCnt, called, dbOid)
+	}
+}
+
+// RefreshAllCatalogsAfterReplay refreshes every database's catalog after
+// archive recovery replayed WAL past what initdb.Open loaded: relations
+// created after the backup started (042's canary) exist only in the
+// replayed catalog heaps. template0 never changes and is skipped. M0149-0021.
+func (r *Runtime) RefreshAllCatalogsAfterReplay() error {
+	cat, ok := r.Catalog.(*catalog.InMemory)
+	if !ok || cat == nil {
+		return nil
+	}
+	for _, name := range cat.ListDatabases() {
+		if name == "template0" {
+			continue
+		}
+		oid, ok := cat.ResolveDatabaseOid(name)
+		if !ok {
+			continue
+		}
+		if err := r.RefreshCatalogAfterReplay(oid); err != nil {
+			return fmt.Errorf("database %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// RefreshCatalogAfterReplay is the running standby's relcache invalidation:
+// after a replayed commit changed database dbOid's system catalogs, it reloads
+// that database's user tables from the replayed pg_class/pg_attribute heaps,
+// registering relations the primary created since the standby started.
+// Registration is idempotent (TryRegisterUserTable), so tables already known
+// are left as they are. M0149-0010a.
+func (r *Runtime) RefreshCatalogAfterReplay(dbOid uint32) error {
+	cat, ok := r.Catalog.(*catalog.InMemory)
+	if !ok || cat == nil || r.StorageMgr == nil {
+		return nil
+	}
+	var clog *transam.CLog
+	if r.TxnMgr != nil {
+		clog = r.TxnMgr.CLog()
+	}
+	heapDB := storage.StorageDBOid(dbOid)
+	if heapDB == storage.StorageDBOid(cat.DBOID()) {
+		if err := loadUserTablesFromHeapForDBMode(r.StorageMgr, cat, clog, cat.DBOID(), 0, true); err != nil {
+			return err
+		}
+		// Event triggers follow the replayed pg_event_trigger heap
+		// (M0149-0077h).
+		if err := reloadUserEventTriggersFromHeapMode(r.StorageMgr, cat, clog, true); err != nil {
+			return err
+		}
+		// Sequences the primary created register here, with their counters
+		// from the replayed pages (M0149-0077a); known ones are left to the
+		// sequence replay hook.
+		return reloadSequencesFromHeapMode(r.StorageMgr, cat, clog, true)
+	}
+	return loadUserTablesFromHeapForDBMode(r.StorageMgr, cat, clog, dbOid, dbOid, true)
 }

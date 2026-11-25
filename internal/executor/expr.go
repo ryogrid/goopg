@@ -77,7 +77,12 @@ func (e *ExecError) Error() string {
 // slot.Get(col) without materializing a Row per emitted match.
 // oidToBuiltinTypeName converts a PostgreSQL built-in type OID to its canonical
 // type name (e.g. 16 → "boolean"). Returns "" if the OID is unknown.
+// Every pg_catalog type resolves through format_type_be's PG 18.3 spelling
+// first (M0149-0001h1a21); the switch below covers the rest.
 func oidToBuiltinTypeName(oid uint32) string {
+	if name, ok := catalog.BuiltinFormatTypeName(oid); ok {
+		return name
+	}
 	switch oid {
 	case 16:
 		return "boolean"
@@ -380,33 +385,21 @@ func evalExpr(e optimizer.Expr, row Row, ctx *Context) (Datum, error) {
 // keys()'s fktable/pktable columns) prints as a raw integer instead of the
 // relation name.
 func regclassOIDToName(ctx *Context, connDBOid uint32, oid uint32) string {
-	// InvalidOid (0) renders as "-", matching PG's regclassout. Without this
-	// guard a `reltoastrelid::regclass` for a table with no TOAST relation
-	// (reltoastrelid = 0) matches the first virtual relation whose OID is
-	// unset (also 0), e.g. information_schema.routines. M0118-0008
-	// (reindex-concurrently-toast probing).
-	if oid == 0 {
-		return "-"
+	// One regclassout for every path (Hard-won Rule #2): the shared renderer
+	// handles InvalidOid ("-"), tables, indexes and synthetic TOAST
+	// relations, a dangling OID's number, and — what this sibling used to
+	// skip — qualification by the relation's own schema visibility
+	// (RelationIsVisible): s40.p prints qualified when s40 is not on the
+	// search_path. M0149-0001h1a31.
+	// A context without the session's GUC hook cannot know its search_path;
+	// treat every schema as visible there rather than qualifying against the
+	// "$user", public default.
+	visible := func(sc string) bool { return RegObjectSchemaVisible(ctx, sc) }
+	if ctx.GetSetting == nil {
+		visible = func(string) bool { return true }
 	}
-	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-		if tbl, found := im.LookupTableByOID(oid, connDBOid); found && tbl != nil {
-			return tbl.Name
-		}
-		// Synthetic TOAST relation OIDs (parent OID + 100M) live only in the
-		// virtual pg_class builder, not c.tables, so reconstruct the
-		// schema-qualified pg_toast.pg_toast_<oid> name PG's regclassout
-		// would emit. M0118-0008 TOAST-exposure slice 2 (0118-0084).
-		if name, found := im.ToastRelName(oid, connDBOid); found {
-			return name
-		}
-	}
-	// Also resolve index OIDs to index names. M0097-0023.
-	for _, idx := range ctx.Catalog.AllIndexes(connDBOid) {
-		if idx.OID == oid {
-			return idx.Name
-		}
-	}
-	return strconv.FormatUint(uint64(oid), 10)
+	render := RegOutRendererVisible(ctx.Catalog, visible, connDBOid)
+	return render("regclass", oid)
 }
 
 func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) {
@@ -623,6 +616,18 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		}
 		return evalUnary(x.Op, operand, x.Pos())
 	case *optimizer.CastExpr:
+		if dom, base := domainCastWithTypmod(ctx, x); dom != nil {
+			// The domain's typmod applies as a cast to the base type would
+			// apply it, then the domain's own checks run on the result.
+			result, err := evalExprSlot(base, slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			if err := checkDomainInValues(result, dom, x.Pos()); err != nil {
+				return Datum{}, err
+			}
+			return result, nil
+		}
 		v, err := evalExprSlot(x.Operand, slot, ctx)
 		if err != nil {
 			return Datum{}, err
@@ -645,56 +650,10 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		if strings.EqualFold(x.TargetType, "regproc") || strings.EqualFold(x.TargetType, "regprocedure") {
 			isProcedure := strings.EqualFold(x.TargetType, "regprocedure")
 			if v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
-				funcName := strings.TrimSpace(v.StringValue())
-				raw := funcName
-				// regprocedurein (regproc.c:244) splits the arg list off the name
-				// (parseNameAndArgTypes) before parsing; regprocin does not. Both
-				// feed the name through stringToQualifiedNameList, so a quoted
-				// routine name must be unquoted before the lookups, and the 42883
-				// keeps the RAW input (regprocin/regprocedurein's errmsg). This is
-				// the input half of RegOut's quote-emission (the 71st slice) — the
-				// two casts are sibling renderers and must agree (Hard-won Rule
-				// #2). M0119-0006 (72nd slice, deferral row 1341).
-				if isProcedure {
-					funcName = regprocedureNamePart(funcName)
-				}
-				schema, name, nameOK := splitRegQualifiedName(funcName)
-				if !nameOK {
-					return NullDatum, &ExecError{Code: "42602", Pos: x.Pos(), Message: "invalid name syntax"}
-				}
-				if rs := routineRegistry(ctx); rs != nil {
-					// Thread the connection's dbOid like regIdentifierInput's
-					// regproc/regprocedure arm does — an unscoped LookupByName
-					// resolves DefaultDBOid and leaks another database's
-					// same-named routine (deferral row 1348). Builtins fall
-					// through to the global pg_proc index below (pg_catalog is
-					// implicitly visible everywhere).
-					candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: name}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
-					if len(candidates) > 0 {
-						return NewIntDatum(int64(candidates[0].OID)), nil
-					}
-				}
-				// Not a user-created CREATE FUNCTION routine — fall back to the
-				// curated builtin pg_proc table (the same two-tier lookup
-				// resolveOpClassFunction uses for CREATE OPERATOR CLASS's own
-				// FUNCTION clause), so `'int4eq'::regproc` resolves like real PG
-				// instead of erroring on any bare builtin name. M0119-0006
-				// (005_opclass_damage UPDATE-path prerequisite).
-				if bp, found := catalog.LookupBuiltinProc(name); found {
-					return NewIntDatum(int64(bp.OID)), nil
-				}
-				// CREATE AGGREGATE routines never land in the Routines()
-				// registry (they live in their own userAggregates map — see
-				// InMemory.RegisterUserAggregate) even though
-				// writeAggregateCatalogRows gives them a real pg_proc heap
-				// row with prokind='a'. Sibling of regIdentifierInput's
-				// identical fallback (Hard-won Rule #2) — without it
-				// `'myavg'::regproc` misses despite the pg_proc row being
-				// visible to a plain SELECT. M0134-0108.
-				if agg, ok := ctx.Catalog.LookupUserAggregateByName(name); ok {
-					return NewIntDatum(int64(agg.OID)), nil
-				}
-				return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %q does not exist", raw)}
+				// One input port for both forms (Hard-won Rule #2): the cast
+				// and the regproc()/regprocedure() call share regIdentifierInput.
+				_ = isProcedure
+				return regIdentifierInput(v, strings.ToLower(x.TargetType), ctx, x.Pos())
 			}
 			// An OID input (oid→regproc/regprocedure) renders via
 			// regprocout/regprocedureout: InvalidOid (0) becomes "-", matching
@@ -773,75 +732,21 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			return v, nil
 		}
 		if strings.EqualFold(x.TargetType, "regoper") || strings.EqualFold(x.TargetType, "regoperator") {
-			// An OID input renders via regoperout/regoperatorout: InvalidOid
-			// (0) becomes the literal "0" (unlike regproc/regtype's "-" —
-			// regproc.c's regoperout/regoperatorout both special-case
-			// InvalidOid to "0"). regoperator additionally renders the
-			// (lefttype,righttype) pair ("NONE" for a missing/unary side,
-			// format_operator) so dumpOpclass/dumpOpfamily's
-			// amopopr::pg_catalog.regoperator cast resolves to a real name
-			// instead of a bare OID. Only user-defined operators are
-			// resolvable (goopg has no builtin-operator catalog — deferred,
-			// see the ledger). DU-002 (M0119-0004) slice 411.
-			// A `'name(left,right)'::regoperator` STRING input is the reverse
-			// direction — regoperatorin (regproc.c) — and must resolve to the
-			// operator's numeric OID (not a rendered name string) so
-			// `WHERE objid = '===(bool,bool)'::regoperator` compares
-			// correctly against an oid-typed column; mirrors the `regclass`
-			// CastExpr arm's identical asymmetry (KindInt to name string,
-			// KindString to raw OID), confirmed against a live PG 18.3 oracle
-			// via alter_operator.sql. Only the 2-arg `name(a,b)` shape is
-			// handled (regoperatorNameAndArgs) — a bare name with no parens
-			// falls through to the unresolved `return v, nil` below
-			// unchanged, same as before this fix. `regoper` (no arg list at
-			// all) is NOT handled here; it stays on the pre-fix pass-through
-			// path — a bare-name lookup would still need ambiguity detection
-			// this slice doesn't add. M0134-0089.
-			if v.Kind == KindString && strings.EqualFold(x.TargetType, "regoperator") && ctx != nil && ctx.Catalog != nil {
-				raw := strings.TrimSpace(v.StringValue())
-				if oid, perr := strconv.ParseUint(raw, 10, 32); perr == nil {
-					return NewIntDatum(int64(oid)), nil
-				}
-				if name, leftType, rightType, ok := regoperatorNameAndArgs(raw); ok {
-					if im, ok2 := ctx.Catalog.(*catalog.InMemory); ok2 {
-						var leftOID, rightOID uint32
-						if leftType != "" {
-							leftOID = catalog.TypeNameToOID(leftType)
-						}
-						if rightType != "" {
-							rightOID = catalog.TypeNameToOID(rightType)
-						}
-						if op, found := im.LookupUserOperatorByNameAndTypeOIDs(name, leftOID, rightOID); found {
-							return NewIntDatum(int64(op.OID)), nil
-						}
-					}
-					if bop, found := catalog.LookupBuiltinOperator(name, leftType, rightType); found {
-						return NewIntDatum(int64(bop.OID)), nil
-					}
-					return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("operator does not exist: %s", raw)}
-				}
+			// regoperin / regoperatorin on text, regoperout /
+			// regoperatorout on an OID — the shared port the regoper() /
+			// to_regoper() forms and the output paths use. M0149-0001h1a14.
+			if ctx == nil || ctx.Catalog == nil {
+				return v, nil
 			}
-			if v.Kind == KindInt {
-				oid := v.Int
-				if oid == 0 {
-					return NewStringDatum("0"), nil
+			isOperator := strings.EqualFold(x.TargetType, "regoperator")
+			switch v.Kind {
+			case KindString:
+				return regIdentifierInput(v, strings.ToLower(x.TargetType), ctx, x.Pos())
+			case KindInt:
+				if isOperator {
+					return NewStringDatum(regoperatorOut(uint32(v.Int), ctx)), nil
 				}
-				if ctx != nil && ctx.Catalog != nil {
-					if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-						if strings.EqualFold(x.TargetType, "regoperator") {
-							if schema, sig, found := im.RegoperatorNameAndSchema(uint32(oid)); found {
-								if !RegObjectSchemaVisible(ctx, schema) {
-									return NewStringDatum(schema + "." + sig), nil
-								}
-								return NewStringDatum(sig), nil
-							}
-						} else if op := im.LookupUserOperatorByOID(uint32(oid)); op != nil {
-							return NewStringDatum(op.Name), nil
-						} else if bop, found := catalog.LookupBuiltinOperatorByOID(uint32(oid)); found {
-							return NewStringDatum(bop.Name), nil
-						}
-					}
-				}
+				return NewStringDatum(regoperOut(uint32(v.Int), ctx)), nil
 			}
 			return v, nil
 		}
@@ -970,6 +875,15 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 				result := fmt.Sprintf("[0:%d]={%s}", len(names)-1, strings.Join(names, ","))
 				return NewStringDatum(result), nil
 			}
+		}
+		if (strings.EqualFold(x.TargetType, "regrole") || strings.EqualFold(x.TargetType, "regnamespace")) && v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
+			// regrolein: resolve the (possibly quoted) role name to its OID
+			// (42704 on a miss, '-' is InvalidOid, digits are an OID) through
+			// the shared reg* input port. The cast used to return the text
+			// itself, so 'nosuch'::regrole succeeded and ::oid on the result
+			// failed. The OID datum renders as the role name on output
+			// (regroleout). M0149-0001h1a12.
+			return regIdentifierInput(v, strings.ToLower(x.TargetType), ctx, x.Pos())
 		}
 		if strings.EqualFold(x.TargetType, "regclass") && ctx != nil && ctx.Catalog != nil {
 			// Scope every lookup below to the connection's own database
@@ -1108,11 +1022,33 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		// expand ×4). The same scan guards the assignment chokepoint
 		// (coerceTextLikeDatum's bit arms); this is its cast-time sibling
 		// (pattern_sibling_paths_must_agree).
+		// bit → bit(n) / bit varying(n) from a bit-typed source is the
+		// length coercion bit() / varbit() with isExplicit: an explicit cast
+		// zero-pads or truncates bit(n) and truncates bit varying(n), where
+		// an implicit one keeps the length checks below. M0149-0001h1a1.
+		if isB, isVB := isBitSourceType(x.SourceType); (isB || isVB) && x.Explicit && x.Typmod > 0 && v.Kind == KindString &&
+			(strings.EqualFold(castTargetType, "bit") || strings.EqualFold(castTargetType, "varbit") || strings.EqualFold(castTargetType, "bit varying")) {
+			return NewStringDatum(bitExplicitLength(v.StringValue(), int(x.Typmod), strings.EqualFold(castTargetType, "bit"))), nil
+		}
 		if v.Kind == KindString && (strings.EqualFold(castTargetType, "bit") || strings.EqualFold(castTargetType, "varbit") || strings.EqualFold(castTargetType, "bit varying")) {
 			digits, berr := scanBitInput(v.StringValue())
 			if berr != nil {
+				// bit_in's errposition is the literal's location when the
+				// input is a literal, else the cast's.
 				berr.Pos = x.Pos()
+				if sc, lit := x.Operand.(*optimizer.StringConst); lit {
+					berr.Pos = sc.Pos()
+				}
 				return Datum{}, berr
+			}
+			// An explicit cast from a string ('10'::bit(4), bit(4) '10',
+			// textcol::bit(4)) reads the value with typmod -1 (bit_in, or
+			// CoerceViaIO) and then applies the length coercion with
+			// isExplicit, as coerce_type does: pad or truncate bit(n),
+			// truncate bit varying(n). Assignment keeps the length errors
+			// below. M0149-0001h1a83.
+			if n := int(x.Typmod); n > 0 && x.Explicit {
+				return NewStringDatum(bitExplicitLength(digits, n, strings.EqualFold(castTargetType, "bit"))), nil
 			}
 			if n := int(x.Typmod); n > 0 {
 				if strings.EqualFold(castTargetType, "bit") {
@@ -1127,39 +1063,36 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			}
 			return NewStringDatum(digits), nil
 		}
-		result, err := evalCastTyped(v, castTargetType, x.SourceType, x.Pos(), ctx)
+		// money → a text type is the type's output function, cash_out
+		// ("$12.34"), not the scale-2 numeric goopg carries the value as.
+		// M0149-0001k5.
+		// bit → int4 / int8 (bittoint4 / bittoint8); no bit → int2 and no
+		// bit varying → integer cast. M0149-0001h1a1.
+		if d, ok, err := bitStringCast(v, x.SourceType, castTargetType, x.Pos()); ok {
+			return d, err
+		}
+		if isMoneyTypeName(x.SourceType) && !v.IsNull() {
+			switch strings.ToLower(castTargetType) {
+			case "text", "varchar", "character varying", "bpchar", "char", "character", "name":
+				return evalCastTyped(NewStringDatum(MoneyTextConv(v, moneyConvFromCtx(ctx))), castTargetType, "text", x.Pos(), ctx)
+			}
+		}
+		// A failing literal is reported at the literal, as PG does when it
+		// coerces the constant at parse time.
+		castPos := x.Pos()
+		if lit, isLit := x.Operand.(*optimizer.StringConst); isLit {
+			castPos = lit.Pos()
+		}
+		result, err := evalCastTyped(v, castTargetType, x.SourceType, castPos, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
 		// Domain CHECK constraint enforcement: VALUE IN (...). M0097-domain-check.
-		// A domain may carry several CHECK (VALUE IN (...)) constraints; each must
-		// admit the value. DU-002 slice 385 (multi-CHECK).
 		if ctx != nil && ctx.Catalog != nil {
 			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 				if dom, isDomain := im.LookupDomain(x.TargetType, ctx.CurrentDatabaseOid); isDomain {
-					// Get the string label of the value being cast. Format()
-					// (not StringValue(), which only extracts KindString's Buf
-					// payload) renders every Kind's canonical text form, e.g.
-					// KindInt's Int field as a decimal string. M0122-0005.
-					label := result.Format()
-					for _, ck := range dom.Checks {
-						if len(ck.InValues) == 0 {
-							continue
-						}
-						found := false
-						for _, allowed := range ck.InValues {
-							if strings.EqualFold(label, allowed) {
-								found = true
-								break
-							}
-						}
-						if !found {
-							return Datum{}, &ExecError{
-								Code:    "23514",
-								Pos:     x.Pos(),
-								Message: fmt.Sprintf("value for domain %s violates check constraint %q", strings.ToLower(dom.Name), ck.Name),
-							}
-						}
+					if err := checkDomainInValues(result, dom, x.Pos()); err != nil {
+						return Datum{}, err
 					}
 				}
 			}
@@ -1222,10 +1155,12 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		// zero via AdjustTimeForTypmod (date.c:1710), so `'23:59:59.999999'::time(2)`
 		// is 24:00:00, not the truncated 23:59:59.99 the old ns-division here
 		// produced. M0119-0006 (62nd slice).
-		if x.Typmod > 0 {
-			switch x.TargetType {
-			case "time", "timetz", "time with time zone":
-				result = roundTimeDatumToPrecision(result, x.Typmod)
+		if prec, ok := x.FractionalPrecision(); ok {
+			switch strings.ToLower(x.TargetType) {
+			case "time", "timetz", "time without time zone", "time with time zone":
+				result = roundTimeDatumToPrecision(result, prec)
+			default:
+				result = roundTimestampDatumToPrecision(result, prec)
 			}
 		}
 		return result, nil
@@ -1364,6 +1299,12 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		// gone by then) and reads them from the node payload instead — see
 		// exprnode.go's ExprBinaryOp arm. Both then apply the same helpers.
 		lbp, rbp := declaredBpcharTypmod(x.Left), declaredBpcharTypmod(x.Right)
+		if x.Op == parser.OpConcat {
+			// anytextcat / textanycat call the non-text operand's output
+			// function: a reg* operand contributes its name. The compiled
+			// twin sends this shape here (exprnode.go). M0149-0001h1a33.
+			left, right = regArgText(x.Left, left, ctx), regArgText(x.Right, right, ctx)
+		}
 		left, right = concatOperandsAsText(x.Op, left, right, lbp, rbp)
 		left, right = comparisonOperandsAsBpchar(x.Op, left, right, lbp, rbp,
 			isBareStringLit(x.Left), isBareStringLit(x.Right))
@@ -1851,10 +1792,10 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 		// timestamp - timestamp (returns interval upstream;
 		// scope-deferred until the type system).
 		if left.Kind == KindTime && right.Kind == KindInterval {
-			return addTimeInterval(left, right, op == parser.OpSub, pos)
+			return addTimeInterval(left, right, op == parser.OpSub, pos, ctx)
 		}
 		if op == parser.OpAdd && left.Kind == KindInterval && right.Kind == KindTime {
-			return addTimeInterval(right, left, false, pos)
+			return addTimeInterval(right, left, false, pos, ctx)
 		}
 		// timestamp − timestamp → interval; date − date → integer days.
 		// Mirrors upstream timestamp_mi / date_mi (timestamp.c / date.c):
@@ -3746,12 +3687,17 @@ func addDateTimeInt(dt, days Datum, subtract bool, pos int) (Datum, error) {
 	if dt.IsTimestampNotFinite() {
 		return NullDatum, timestampOutOfRange(pos)
 	}
-	t := time.Unix(0, dt.Int).UTC()
-	n := int(days.Int)
+	n := days.Int
 	if subtract {
 		n = -n
 	}
-	return NewDateDatum(t.AddDate(0, 0, n)), nil
+	// date_pli / date_mii: the result must be a valid date.
+	sum := int64(pgDaysOfDatum(dt)) + n
+	if sum < int64(pgDateMinDay) || sum >= int64(pgDateEndDay) {
+		return NullDatum, &ExecError{Code: "22008", Message: "date out of range"}
+	}
+	result, _ := newDateDatumFromPGDays(int32(sum))
+	return result, nil
 }
 
 // addTimeInterval applies an interval to a time value. When
@@ -3768,7 +3714,29 @@ func addDateTimeInt(dt, days Datum, subtract bool, pos int) (Datum, error) {
 // for the timestamp type and errors; a finite interval added to an already
 // infinite timestamp passes the timestamp through unchanged.
 // (unimplemented_feat #5(d-iv))
-func addTimeInterval(t, iv Datum, subtract bool, pos int) (Datum, error) {
+func addTimeInterval(t, iv Datum, subtract bool, pos int, ctx *Context) (Datum, error) {
+	zone := ""
+	if t.IsTimestampTZ() {
+		zone = timeZoneFromCtx(ctx)
+	}
+	return addTimeIntervalInZone(t, iv, subtract, pos, zone)
+}
+
+// addTimeIntervalInZone is timestamp_pl_interval, or for a timestamptz
+// timestamptz_pl_interval_internal with zone as attimezone.
+func addTimeIntervalInZone(t, iv Datum, subtract bool, pos int, zone string) (Datum, error) {
+	if t.IsDate() && isFarDateCarrier(t.Int) {
+		return NullDatum, dateOutOfRangeForTimestamp()
+	}
+	var sub TimeSubtype
+	if t.IsTimestampTZ() {
+		sub = TimeSubTimestampTZ
+	}
+	infinity := func(positive bool) (Datum, error) {
+		d := NewTimestampInfinity(positive)
+		d.TimeSub = sub
+		return d, nil
+	}
 	// timestamp_mi_interval negates the span first (interval_um_internal swaps
 	// the ±infinity sentinels), so fold subtract into the sentinel test.
 	spanNoBegin := iv.IsIntervalNoBegin() // interval == -infinity
@@ -3780,13 +3748,13 @@ func addTimeInterval(t, iv Datum, subtract bool, pos int) (Datum, error) {
 		if t.IsTimestampPosInf() {
 			return NullDatum, timestampOutOfRange(pos)
 		}
-		return NewTimestampInfinity(false), nil
+		return infinity(false)
 	}
 	if spanNoEnd { // span is +infinity
 		if t.IsTimestampNegInf() {
 			return NullDatum, timestampOutOfRange(pos)
 		}
-		return NewTimestampInfinity(true), nil
+		return infinity(true)
 	}
 	// Span is finite: an already-infinite timestamp passes through unchanged
 	// (TIMESTAMP_NOT_FINITE(timestamp) branch).
@@ -3801,11 +3769,124 @@ func addTimeInterval(t, iv Datum, subtract bool, pos int) (Datum, error) {
 		days = -days
 		micros = -micros
 	}
-	res := t.TimeValue().AddDate(0, months, days)
-	if micros != 0 {
-		res = res.Add(time.Duration(micros) * time.Microsecond)
+	var res time.Time
+	if t.IsTimestampTZ() {
+		res = addMonthsDaysInZone(t.TimeValue(), months, days, zone)
+	} else {
+		res = addMonthsClamped(t.TimeValue(), months).AddDate(0, 0, days)
 	}
-	return NewTimeDatum(res), nil
+	if checkTimeCarrierRange(res) != nil {
+		return NullDatum, timestampOutOfRange(pos)
+	}
+	carrier, ok := addTimeCarrierMicros(timeToCarrier(res), micros)
+	if !ok {
+		return NullDatum, timestampOutOfRange(pos)
+	}
+	return Datum{Kind: KindTime, Int: carrier, TimeSub: sub}, nil
+}
+
+// evalDateAdd is date_add and date_subtract (timestamptz_pl_interval and
+// timestamptz_pl_interval_at_zone): timestamptz arithmetic in the session zone or
+// in the named one.
+func evalDateAdd(x *optimizer.FuncCall, subtract bool, slot SlotView, ctx *Context) (Datum, error) {
+	if len(x.Args) < 2 {
+		return NullDatum, nil
+	}
+	targets := [...]string{"timestamptz", "interval", "text"}
+	var args [3]Datum
+	for i := range x.Args {
+		if i == len(args) {
+			break
+		}
+		v, err := evalExprSlot(x.Args[i], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if v.IsNull() {
+			return NullDatum, nil
+		}
+		if i < 2 && (v.Kind == KindString || (i == 0 && !v.IsTimestampTZ())) {
+			if v, err = evalCast(v, targets[i], x.Pos(), ctx); err != nil {
+				return Datum{}, err
+			}
+		}
+		args[i] = v
+	}
+	zone := timeZoneFromCtx(ctx)
+	if len(x.Args) > 2 {
+		var err error
+		if zone, err = lookupTimeZoneName(args[2].StringValue()); err != nil {
+			return Datum{}, err
+		}
+	}
+	return addTimeIntervalInZone(args[0], args[1], subtract, x.Pos(), zone)
+}
+
+// lookupTimeZoneName is lookup_timezone: an abbreviation, which becomes a POSIX
+// fixed-offset zone, or a time zone name or POSIX specification.
+func lookupTimeZoneName(name string) (string, error) {
+	if offset, ok := tzAbbrevOffsets[strings.ToUpper(name)]; ok {
+		west := -offset
+		sign := "+"
+		if west < 0 {
+			sign, west = "-", -west
+		}
+		return fmt.Sprintf("<%s>%s%d:%02d:%02d", "tz", sign, west/3600, west%3600/60, west%60), nil
+	}
+	canonical, ok := misc.CanonicalZoneName(name)
+	if !ok {
+		return "", &ExecError{Code: "22023", Message: fmt.Sprintf("time zone %q not recognized", name)}
+	}
+	return canonical, nil
+}
+
+// dateOutOfRangeForTimestamp is date2timestamp's error for a date no timestamp
+// can hold.
+func dateOutOfRangeForTimestamp() error {
+	return &ExecError{Code: "22008", Message: "date out of range for timestamp"}
+}
+
+// addMonthsDaysInZone does the month and day steps of
+// timestamptz_pl_interval_internal: each works on the wall clock in zone and is
+// converted back on its own, which is how PG settles a time in a DST change.
+func addMonthsDaysInZone(t time.Time, months, days int, zone string) time.Time {
+	loc := misc.SessionLocation(zone)
+	wallClock := func(t time.Time) time.Time {
+		l := t.In(loc)
+		y, mo, d := l.Date()
+		hh, mi, ss := l.Clock()
+		return time.Date(y, mo, d, hh, mi, ss, l.Nanosecond(), time.UTC)
+	}
+	if months != 0 {
+		t = misc.TimestampToTimestampTZ(addMonthsClamped(wallClock(t), months), zone)
+	}
+	if days != 0 {
+		t = misc.TimestampToTimestampTZ(wallClock(t).AddDate(0, 0, days), zone)
+	}
+	return t
+}
+
+// addMonthsClamped adds months as timestamp_pl_interval does: when the target
+// month is shorter, the day becomes that month's last day, so January 31 plus one
+// month is the end of February. time.AddDate would carry into March.
+func addMonthsClamped(t time.Time, months int) time.Time {
+	if months == 0 {
+		return t
+	}
+	year, month, day := t.Date()
+	total := year*12 + int(month) - 1 + months
+	newYear := total / 12
+	newMonth := total % 12
+	if newMonth < 0 {
+		newMonth += 12
+		newYear--
+	}
+	last := time.Date(newYear, time.Month(newMonth+2), 0, 0, 0, 0, 0, time.UTC).Day()
+	if day > last {
+		day = last
+	}
+	hour, minute, sec := t.Clock()
+	return time.Date(newYear, time.Month(newMonth+1), day, hour, minute, sec, t.Nanosecond(), time.UTC)
 }
 
 // timestampOutOfRange is PG's error for a non-representable timestamp result
@@ -3852,8 +3933,7 @@ func subDateDate(left, right Datum, pos int) (Datum, error) {
 	if left.IsTimestampNotFinite() || right.IsTimestampNotFinite() {
 		return Datum{}, &ExecError{Code: "22008", Pos: pos, Message: "cannot subtract infinite dates"}
 	}
-	diff := left.TimeValue().Sub(right.TimeValue())
-	return Datum{Kind: KindInt, Int: int64(diff / (24 * time.Hour))}, nil
+	return Datum{Kind: KindInt, Int: int64(pgDaysOfDatum(left)) - int64(pgDaysOfDatum(right))}, nil
 }
 
 func subTimeTime(left, right Datum, pos int) (Datum, error) {
@@ -3875,8 +3955,10 @@ func subTimeTime(left, right Datum, pos int) (Datum, error) {
 			return NewIntervalInfinity(false), nil
 		}
 	}
-	diff := left.TimeValue().Sub(right.TimeValue()) // time.Duration (ns)
-	micros := int64(diff / time.Microsecond)
+	micros := left.Int - right.Int
+	if (right.Int < 0 && micros < left.Int) || (right.Int > 0 && micros > left.Int) {
+		return Datum{}, intervalOutOfRange(pos)
+	}
 	days := micros / usecsPerDay
 	micros -= days * usecsPerDay
 	return NewIntervalDatumFull(0, int32(days), micros), nil
@@ -4338,6 +4420,24 @@ func hasISODatePrefix(s string) bool {
 // ledger rather than guessed at. Falling through leaves the pre-existing text
 // behaviour, which is already correct for ISO date/timestamp comparisons because
 // their spelling sorts the same way their values do.
+// arraySubscriptElemDatumCtx is arraySubscriptElemDatum plus the date element:
+// a DATE element is a date datum (date_in), so `d[1] + 1` reaches date_pli
+// instead of failing as text. It needs the session's date input settings: array_out spells a date element in the session
+// DateStyle (`31.01.2020` under German), which date_in reads back the same
+// way (M0149-0001h1a78b).
+func arraySubscriptElemDatumCtx(elemType, elem string, ctx *Context) (Datum, bool) {
+	if strings.EqualFold(elemType, "date") {
+		if d, ok := parseDateSpecialLiteral(elem, nowFromCtx(ctx), timeZoneFromCtx(ctx)); ok {
+			return d, true
+		}
+		if t, _, err := decodeDateTextSession(elem, dateInputFromCtx(ctx)); err == nil {
+			return NewDateDatum(t.UTC()), true
+		}
+		return NullDatum, false
+	}
+	return arraySubscriptElemDatum(elemType, elem)
+}
+
 func arraySubscriptElemDatum(elemType, elem string) (Datum, bool) {
 	switch strings.ToLower(elemType) {
 	case "interval":
@@ -4414,7 +4514,7 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 		}
 		// Try time-of-day first ("HH:MM:SS") then full timestamp.
 		if t, err := parseTimeString(s); err == nil {
-			return NewTimeDatum(t)
+			return NewTimeOfDayDatum(t)
 		}
 		if t, err := parseCopyTimestamp(s); err == nil {
 			return NewTimeDatum(t)
@@ -4754,8 +4854,8 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		// Plain time/timestamp datums (Scale == 0) compare by Int directly.
 		// M0097-0004.
 		if a.Scale != 0 || b.Scale != 0 {
-			aUTC := a.Int - int64(a.Scale)*60*1_000_000_000
-			bUTC := b.Int - int64(b.Scale)*60*1_000_000_000
+			aUTC := timeTZCompareKey(a)
+			bUTC := timeTZCompareKey(b)
 			switch {
 			case aUTC < bUTC:
 				return -1, nil
@@ -4905,6 +5005,8 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 			return NewDateDatum(x.CachedTime), nil
 		case isTimestampTZTypeName(x.Type):
 			return NewTimestampTZDatum(x.CachedTime), nil
+		case x.Type == "time":
+			return NewTimeOfDayDatum(x.CachedTime), nil
 		}
 		return NewTimeDatum(x.CachedTime), nil
 	}
@@ -4959,8 +5061,7 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		return floatInDatumOrErr(x.Value, bits, x.Pos())
 
 	case "numeric", "decimal":
-		// Return as string — goopg v0 stores numerics as text.
-		return NewStringDatum(strings.TrimSpace(x.Value)), nil
+		return evalCast(NewStringDatum(x.Value), "numeric", x.Pos(), ctx)
 
 	case "text", "bpchar", "char", "varchar":
 		return NewStringDatum(x.Value), nil
@@ -5021,29 +5122,25 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		// PG's 'infinity' / '-infinity' spellings have no finite time.Time and
 		// map to the DATEVAL_NOEND / DATEVAL_NOBEGIN sentinel; intercept before
 		// the layout parse (not time-cached). (unimplemented_feat #5(d-iv))
-		if inf, ok := parseDateSpecialLiteral(x.Value, nowFromCtx(ctx)); ok {
+		if inf, ok := parseDateSpecialLiteral(x.Value, nowFromCtx(ctx), timeZoneFromCtx(ctx)); ok {
 			return inf, nil
 		}
-		// M0125-0007 / M0119-0006: PG's DecodeDate reads each numeric field on
-		// its own ('2002-5-1' is '2002-05-01') and accepts a trailing era token
-		// ('2020-01-01 BC'); parsePGDateText applies both around the fixed Go
-		// layout, which can express neither.
-		t, err := parsePGDateText(x.Value)
+		// A spelling whose meaning depends on DateStyle must not stay cached on
+		// the plan node.
+		t, usedSession, err := decodeDateTextSession(x.Value, dateInputFromCtx(ctx))
 		if err != nil {
 			return Datum{}, dateTimeInputError(err, "date", x.Value, x.Pos())
 		}
-		x.CachedTime = t.UTC()
-		x.CacheValid = true
+		if !usedSession {
+			x.CachedTime = t.UTC()
+			x.CacheValid = true
+		}
 		// A DATE datum (date_in), not a timestamp: date ± integer
 		// (date_pli / date_mii) and date - date (date_mi) dispatch on it.
 		// M0146-0040.
-		return NewDateDatum(x.CachedTime), nil
+		return NewDateDatum(t.UTC()), nil
 	case "time":
-		// 'now' is the only RESERV token DecodeTimeOnly accepts (#5(d-iv), M0134-0182).
-		if inf, ok := parseTimeSpecialLiteral(x.Value, nowFromCtx(ctx)); ok {
-			return inf, nil
-		}
-		ts, err := parseTimeString(x.Value)
+		ts, _, err := decodeTimeOnlyText(x.Value, dateInputFromCtx(ctx), false)
 		if err != nil {
 			// parseTimeString already distinguishes 22007 (syntax) from 22008
 			// (range, e.g. "25:00:00") — see btree_scalar_keys.go's identical
@@ -5055,12 +5152,9 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 			}
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid input syntax for type time: %q", x.Value)}
 		}
-		return NewTimeDatum(ts), nil
+		return NewTimeOfDayDatum(ts), nil
 	case "timetz":
-		if inf, ok := parseTimeTZSpecialLiteral(x.Value, nowFromCtx(ctx), timeZoneFromCtx(ctx)); ok {
-			return inf, nil
-		}
-		ts, offsetSecs, err := parseTimeTZString(x.Value, timeZoneFromCtx(ctx))
+		ts, offsetSecs, err := decodeTimeOnlyText(x.Value, dateInputFromCtx(ctx), true)
 		if err != nil {
 			if ee, ok := err.(*ExecError); ok {
 				ee.Pos = x.Pos()
@@ -5088,7 +5182,7 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		// time.Time and so are intercepted before the layout loop; the
 		// ±infinity sentinel is not time-cached (detection is a trivial
 		// string compare). (unimplemented_feat #5(d-iv))
-		if inf, ok := parseTimestampSpecialLiteral(x.Value, nowFromCtx(ctx), isTimestampTZTypeName(x.Type)); ok {
+		if inf, ok := parseTimestampSpecialLiteral(x.Value, nowFromCtx(ctx), isTimestampTZTypeName(x.Type), timeZoneFromCtx(ctx)); ok {
 			return inf, nil
 		}
 		// M0125-0007: same field-at-a-time acceptance as the date case above —
@@ -5110,12 +5204,9 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		// arm above — it must not be written to x.CachedTime/x.CacheValid, or a
 		// different session with a different TimeZone reusing this plan node
 		// would get the wrong instant.
-		t, usedSession, err := parsePGTimestampTextZoneSession(x.Value, tsZoneModeForType(x.Type), timeZoneFromCtx(ctx))
+		t, usedSession, err := decodeTimestampText(x.Value, tsZoneModeForType(x.Type), dateInputFromCtx(ctx))
 		if err != nil {
-			if ee := dateTimeInputError(err, x.Type, x.Value, x.Pos()); ee.Code == "22008" {
-				return Datum{}, ee
-			}
-			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid timestamp %q", x.Value)}
+			return Datum{}, dateTimeInputError(err, timestampInputTypeName(isTimestampTZTypeName(x.Type)), x.Value, x.Pos())
 		}
 		if !usedSession {
 			x.CachedTime = t
@@ -5671,6 +5762,15 @@ func byteaToIntN(b []byte, width int, typeName string) (int64, error) {
 }
 
 func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context) (Datum, error) {
+	if d.Kind == KindTime && d.TimeSub == TimeSubTimeTZ {
+		switch strings.ToLower(targetType) {
+		case "text", "varchar", "character varying", "bpchar", "char", "character", "name":
+			return evalCast(NewStringDatum(timeTZText(d)), targetType, pos, ctx)
+		}
+	}
+	if isTimeOfDaySource(sourceType) && strings.EqualFold(targetType, "interval") && !d.IsNull() {
+		return timeToInterval(d)
+	}
 	if sourceType == "" {
 		return evalCast(d, targetType, pos, ctx)
 	}
@@ -5695,6 +5795,20 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context
 	// goopg used to satisfy this by accident, because the stored datum was
 	// already trimmed. Since the storage flip it is padded, so the cast has to
 	// do what upstream's does.
+	// A reg* value can reach a cast already rendered as its name (the
+	// `<oid>::regproc` arm renders eagerly). reg* → oid / int is binary
+	// coercible in PG (pg_cast castmethod 'b'), so the OID comes back
+	// through the type's input function: `0::regproc::oid` is 0 and
+	// `1299::regproc::oid` 1299 — not an oidin error on "-" / "now".
+	// M0149-0001h1a17.
+	if d.Kind == KindString && isRegIdentifierTypeName(sourceType) && ctx != nil && ctx.Catalog != nil {
+		switch strings.ToLower(targetType) {
+		case "oid", "int4", "integer", "int8", "bigint":
+			if out, err := regIdentifierInput(d, strings.ToLower(sourceType), ctx, pos); err == nil && out.Kind == KindInt {
+				return evalCast(out, targetType, pos, ctx)
+			}
+		}
+	}
 	if d.Kind == KindString && isBpcharTypeName(sourceType) && isTextTargetTypeName(targetType) {
 		return NewStringDatum(bcTrimRight(d.StringValue())), nil
 	}
@@ -5737,6 +5851,18 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context
 			// (TestRegclassCastScopedToConnectionDBOid). Nil ctx keeps the empty
 			// variadic → DefaultDBOid default, byte-identical to pre-scoping.
 			connDBOid = []uint32{catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)}
+		}
+		if ctx != nil {
+			// reg*out qualifies by the OBJECT's own schema visibility
+			// (RelationIsVisible & co), not by whether public is on the path:
+			// s40.p renders qualified when s40 is not searched.
+			// M0149-0001h1a31.
+			visible := func(sc string) bool { return RegObjectSchemaVisible(ctx, sc) }
+			if ctx.GetSetting == nil {
+				visible = func(string) bool { return !regCastQualify(ctx) }
+			}
+			render := RegOutRendererVisible(cat, visible, connDBOid...)
+			return NewStringDatum(render(sourceType, uint32(d.Int))), nil
 		}
 		return NewStringDatum(RegOut(sourceType, uint32(d.Int), cat, regCastQualify(ctx), connDBOid...)), nil
 	}
@@ -5822,6 +5948,20 @@ func dateStyleFromCtx(ctx *Context) (style, order string) {
 	return style, order
 }
 
+// localeConvFromCtx is localeconv under the session's lc_numeric and lc_monetary.
+func localeConvFromCtx(ctx *Context) misc.LocaleConv {
+	numeric, monetary := "C", "C"
+	if ctx != nil && ctx.GetSetting != nil {
+		if v, ok := ctx.GetSetting("lc_numeric"); ok {
+			numeric = v
+		}
+		if v, ok := ctx.GetSetting("lc_monetary"); ok {
+			monetary = v
+		}
+	}
+	return misc.LocaleConvFor(numeric, monetary)
+}
+
 // timeZoneFromCtx resolves the session's TimeZone GUC via ctx.GetSetting,
 // returning "" (which config.FormatTimestampTZ reads as UTC) when ctx is nil,
 // has no GetSetting wired, or the GUC is unset. Mirrors the same lookup
@@ -5881,6 +6021,10 @@ func formatTimeDatumDateStyle(d Datum, style, order, zone string) string {
 		return misc.FormatDate(d.TimeValue(), style, order)
 	case TimeSubTimestampTZ:
 		return misc.FormatTimestampTZ(d.TimeValue(), style, order, zone)
+	case TimeSubTimeTZ:
+		return timeTZText(d)
+	case TimeSubTime:
+		return timeOfDayText(d)
 	}
 	return misc.FormatTimestamp(d.TimeValue(), style, order)
 }
@@ -5967,6 +6111,15 @@ func CoerceParamToDeclaredType(d Datum, targetType string, ctx *Context) (Datum,
 func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) {
 	if d.IsNull() {
 		return NullDatum, nil
+	}
+	if d.Kind == KindString && strings.HasSuffix(targetType, "]") {
+		if elem, ok := datetimeArrayElem(targetType); ok {
+			text, err := normalizeDatetimeArray(d.StringValue(), elem, pos, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			return NewStringDatum(text), nil
+		}
 	}
 	switch strings.ToLower(targetType) {
 	case "bool", "boolean":
@@ -6417,6 +6570,42 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		default:
 			return d, nil
 		}
+	case "money":
+		// cash_in / numeric_cash / int8_cash (M0149-0001k1): the result is
+		// goopg's money Datum, a scale-2 numeric of the Cash value. Before
+		// this arm `::money` fell to the catch-all pass-through and kept the
+		// input text, so money compared and sorted as text.
+		c, err := moneyCentsCtx(d, ctx)
+		if err != nil {
+			if ee, ok := err.(*ExecError); ok {
+				ee.Pos = pos
+			}
+			return Datum{}, err
+		}
+		return moneyDatum(c), nil
+	case "uuid":
+		// uuid_in: string_to_uuid, then the canonical uuid_out text.
+		// M0149-0001h1a11 ('x'::uuid used to come back unchanged).
+		if d.Kind != KindString {
+			return d, nil
+		}
+		b, ok := parseUUIDText(d.StringValue())
+		if !ok {
+			return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+				Message: fmt.Sprintf("invalid input syntax for type uuid: \"%s\"", d.StringValue())}
+		}
+		return NewStringDatum(formatUUID(b)), nil
+	case "aclitem":
+		// aclitemin: validate and canonicalise (M0149-0001h1a9).
+		if d.Kind != KindString {
+			return d, nil
+		}
+		out, err := aclitemIn(d.StringValue(), ctx)
+		if err != nil {
+			err.Pos = pos
+			return Datum{}, err
+		}
+		return NewStringDatum(out), nil
 	case "pg_lsn":
 		switch d.Kind {
 		case KindString:
@@ -6459,7 +6648,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		if d.Kind == KindString {
 			s := d.StringValue()
 			// 'infinity' / '-infinity' → DATEVAL_NOEND / NOBEGIN (#5(d-iv)).
-			if inf, ok := parseDateSpecialLiteral(s, nowFromCtx(ctx)); ok {
+			if inf, ok := parseDateSpecialLiteral(s, nowFromCtx(ctx), timeZoneFromCtx(ctx)); ok {
 				return inf, nil
 			}
 			// date_in decodes a zone field and then ignores it, so the day comes
@@ -6467,7 +6656,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			// is 2020-01-02, not the previous day (tsZoneMode). It likewise never
 			// composes date with time, so an hour-24 / leap-second day carry is
 			// dropped too — '2020-01-01 24:00:00'::date is the 1st.
-			t, err := parseDateInputText(s)
+			t, err := decodeDateText(s, dateInputFromCtx(ctx))
 			if err != nil {
 				// M0119-0006: a range failure (no year zero, or a value the
 				// KindTime carrier cannot hold) keeps its own 22008 wording —
@@ -6491,33 +6680,46 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 	case "time":
 		// Cast to time: extract time-of-day from KindTime, parse strings. M0097-0004.
 		if d.Kind == KindString {
-			// 'now' is the only RESERV token DecodeTimeOnly accepts (#5(d-iv), M0134-0182).
-			if inf, ok := parseTimeSpecialLiteral(d.StringValue(), nowFromCtx(ctx)); ok {
-				return inf, nil
-			}
-			ts, err := parseTimeString(d.StringValue())
+			ts, _, err := decodeTimeOnlyText(d.StringValue(), dateInputFromCtx(ctx), false)
 			if err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = pos
+				}
 				return Datum{}, err
 			}
-			return NewTimeDatum(ts), nil
+			return NewTimeOfDayDatum(ts), nil
+		}
+		if d.Kind == KindTime && d.IsTimestampNotFinite() {
+			return NullDatum, nil
+		}
+		if d.Kind == KindTime && d.TimeSub == TimeSubTimestampTZ {
+			clock, _ := sessionClock(d.TimeValue(), ctx)
+			return NewTimeOfDayDatum(clock), nil
 		}
 		if d.Kind == KindTime {
 			t := d.TimeValue().UTC()
 			// Re-anchor to epoch to strip any date component.
-			return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)), nil
+			return NewTimeOfDayDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)), nil
 		}
 		return d, nil
 	case "timetz":
 		// Cast to timetz: parse strings with timezone offset. M0097-0004.
 		if d.Kind == KindString {
-			if inf, ok := parseTimeTZSpecialLiteral(d.StringValue(), nowFromCtx(ctx), timeZoneFromCtx(ctx)); ok {
-				return inf, nil
-			}
-			ts, offsetSecs, err := parseTimeTZString(d.StringValue(), timeZoneFromCtx(ctx))
+			ts, offsetSecs, err := decodeTimeOnlyText(d.StringValue(), dateInputFromCtx(ctx), true)
 			if err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = pos
+				}
 				return Datum{}, err
 			}
 			return NewTimeTZDatum(ts, offsetSecs), nil
+		}
+		if d.Kind == KindTime && d.IsTimestampNotFinite() {
+			return NullDatum, nil
+		}
+		if d.Kind == KindTime && d.TimeSub == TimeSubTimestampTZ {
+			clock, offset := sessionClock(d.TimeValue(), ctx)
+			return NewTimeTZDatum(clock, offset), nil
 		}
 		if d.Kind == KindTime {
 			t := d.TimeValue().UTC()
@@ -6530,7 +6732,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		tz := isTimestampTZTypeName(targetType)
 		if d.Kind == KindString {
 			// 'infinity' / '-infinity' have no finite time.Time (#5(d-iv)).
-			if inf, ok := parseTimestampSpecialLiteral(d.StringValue(), nowFromCtx(ctx), tz); ok {
+			if inf, ok := parseTimestampSpecialLiteral(d.StringValue(), nowFromCtx(ctx), tz, timeZoneFromCtx(ctx)); ok {
 				return inf, nil
 			}
 			// `::timestamp` discards a zone the text carries, `::timestamptz`
@@ -6542,9 +6744,9 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			// must be threaded through here too, not just the typed-literal
 			// arm (evalTypedStringLit). No caching hazard here: evalCast does
 			// not cache its result on a plan node.
-			ts, err := parseCopyTimestampZoneSession(d.StringValue(), tsZoneModeForType(targetType), timeZoneFromCtx(ctx))
+			ts, _, err := decodeTimestampText(d.StringValue(), tsZoneModeForType(targetType), dateInputFromCtx(ctx))
 			if err != nil {
-				return Datum{}, dateTimeInputError(err, "timestamp", d.StringValue(), pos)
+				return Datum{}, dateTimeInputError(err, timestampInputTypeName(tz), d.StringValue(), pos)
 			}
 			if tz {
 				return NewTimestampTZDatum(ts), nil
@@ -6566,6 +6768,24 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		// a real instant), so leave them untouched — as are DATE and the two
 		// time-of-day subtypes, whose carriers mean something else (see
 		// NewTimeTZDatum's offset in Datum.Scale).
+		if d.IsDate() {
+			// date2timestamp is the same day at midnight; date2timestamptz is
+			// midnight in the session zone.
+			if isFarDateCarrier(d.Int) {
+				return Datum{}, dateOutOfRangeForTimestamp()
+			}
+			switch {
+			case d.IsTimestampNotFinite() && tz:
+				d.TimeSub = TimeSubTimestampTZ
+				return d, nil
+			case d.IsTimestampNotFinite():
+				d.TimeSub = TimeSubTimestamp
+				return d, nil
+			case tz:
+				return NewTimestampTZDatum(misc.TimestampToTimestampTZ(d.TimeValue(), timeZoneFromCtx(ctx))), nil
+			}
+			return NewTimeDatum(d.TimeValue()), nil
+		}
 		if d.Kind == KindTime &&
 			(d.TimeSub == TimeSubTimestamp || d.TimeSub == TimeSubTimestampTZ) &&
 			d.Int != math.MaxInt64 && d.Int != math.MinInt64 {
@@ -6652,14 +6872,13 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			if strings.EqualFold(s, "-inf") || strings.EqualFold(s, "-infinity") {
 				return NewStringDatum("-Infinity"), nil
 			}
-			_, _, err := parseNumeric(s)
+			mantissa, scale, err := parseNumeric(s)
 			if err != nil {
 				return Datum{}, &ExecError{Code: "22P02", Pos: pos,
 					Message: fmt.Sprintf("invalid input syntax for type numeric: %q", d.StringValue())}
 			}
-			// Re-use the string datum rather than allocating a big.Int when fast
-			// path would suffice; the string form is already the canonical form.
-			return d, nil
+			// numeric_in's value, so '4.2e9' prints as 4200000000.
+			return newNumeric(mantissa, int(scale)), nil
 		default:
 			return Datum{}, &ExecError{Code: "22P02", Pos: pos,
 				Message: fmt.Sprintf("cannot cast type %v to numeric", d.Kind)}
@@ -7214,7 +7433,9 @@ func evalPgRelationFilenode(x *optimizer.FuncCall, slot SlotView, ctx *Context) 
 	}
 	rel, ok := relationStorageForOID(cat, oid)
 	if !ok {
-		return NullDatum, nil
+		if rel, ok = seedRelationStorage(ctx, oid); !ok {
+			return NullDatum, nil
+		}
 	}
 	return Datum{Kind: KindInt, Int: int64(rel.RelOid)}, nil
 }
@@ -7222,9 +7443,8 @@ func evalPgRelationFilenode(x *optimizer.FuncCall, slot SlotView, ctx *Context) 
 // evalPgRelationFilepath implements pg_relation_filepath(regclass) → text
 // (dbsize.c): the main fork's path relative to the data directory, NULL when
 // pg_relation_filenode is NULL. It names the file goopg actually stores the
-// relation in. One divergence: PG puts a temporary relation's file under a
-// per-backend name (base/<db>/t<procnumber>_<n>, relpathbackend); goopg
-// stores temporary relations like permanent ones, so the path has no t prefix.
+// relation in, including a temporary relation's per-backend name
+// (base/<db>/t<backend>_<n>, relpathbackend; M0149-0006a).
 func evalPgRelationFilepath(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) < 1 {
 		return NullDatum, nil
@@ -7242,9 +7462,36 @@ func evalPgRelationFilepath(x *optimizer.FuncCall, slot SlotView, ctx *Context) 
 	}
 	rel, ok := relationStorageForOID(cat, oid)
 	if !ok {
-		return NullDatum, nil
+		if rel, ok = seedRelationStorage(ctx, oid); !ok {
+			return NullDatum, nil
+		}
+	}
+	rel.Fork = storage.MainFork
+	if ctx.Pool != nil {
+		return NewStringDatum(ctx.Pool.Manager().RelPath(rel)), nil
 	}
 	return NewStringDatum(storage.RelMainPath(rel)), nil
+}
+
+// seedRelationStorage is the storage of a system relation known only by its
+// seeded pg_class row (catalog.SeedRelationStorage): base/<database>/<filenode>
+// in the session's database, or global/<filenode> for a shared catalog.
+// pg_relation_filepath returned NULL for these, so a check comparing the
+// files under base/<db> with pg_class saw every system relation as an orphan
+// (018_wal_optimize's check_orphan_relfilenodes). M0149-0006.
+func seedRelationStorage(ctx *Context, oid uint32) (storage.RelFileNode, bool) {
+	fn, relkind, shared, ok := catalog.SeedRelationStorage(oid)
+	if !ok || !catalog.RelkindHasStorage(relkind) {
+		return storage.RelFileNode{}, false
+	}
+	if shared {
+		return storage.RelFileNode{DBOid: 0, RelOid: fn}, true
+	}
+	db := ctx.CurrentDatabaseOid
+	if db == 0 {
+		db = catalog.DefaultDBOid
+	}
+	return storage.RelFileNode{DBOid: db, RelOid: fn}, true
 }
 
 // evalPgRelationSize implements pg_relation_size(relation [, fork]) → bigint,
@@ -8003,6 +8250,10 @@ func extractTimestampField(field string, t time.Time, pos int) (int64, error) {
 	// zone with .UTC(). A plain timestamp/date/time/timetz keeps its wall clock.
 	switch field {
 	case "year":
+		// There is no year 0: astronomical 0 is 1 BC, reported as -1.
+		if y := int64(t.Year()); y <= 0 {
+			return y - 1, nil
+		}
 		return int64(t.Year()), nil
 	case "month":
 		return int64(t.Month()), nil
@@ -8028,6 +8279,9 @@ func extractTimestampField(field string, t time.Time, pos int) (int64, error) {
 		return int64(week), nil
 	case "isoyear":
 		year, _ := t.ISOWeek()
+		if year <= 0 {
+			year-- // BC years, as for "year"
+		}
 		return int64(year), nil
 	case "isodow":
 		wd := t.Weekday()
@@ -8040,19 +8294,19 @@ func extractTimestampField(field string, t time.Time, pos int) (int64, error) {
 		if y >= 0 {
 			return y / 10, nil
 		}
-		return (y - 9) / 10, nil
+		return -((8 - (y - 1)) / 10), nil
 	case "century":
 		y := int64(t.Year())
 		if y > 0 {
 			return (y + 99) / 100, nil
 		}
-		return -((-y + 99) / 100), nil
+		return -((99 - (y - 1)) / 100), nil
 	case "millennium":
 		y := int64(t.Year())
 		if y > 0 {
 			return (y + 999) / 1000, nil
 		}
-		return -((-y + 999) / 1000), nil
+		return -((999 - (y - 1)) / 1000), nil
 	case "microseconds", "microsecond", "usec":
 		return int64(t.Second())*1_000_000 + int64(t.Nanosecond()/1000), nil
 	case "milliseconds", "millisecond", "msec":
@@ -8235,651 +8489,32 @@ func evalToChar(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, erro
 		return NullDatum, nil
 	}
 	srcArg, err := evalExprSlot(x.Args[0], slot, ctx)
-	if err != nil || srcArg.IsNull() {
-		return NullDatum, nil
+	if err != nil {
+		return Datum{}, err
 	}
 	fmtArg, err := evalExprSlot(x.Args[1], slot, ctx)
-	if err != nil || fmtArg.IsNull() {
+	if err != nil {
+		return Datum{}, err
+	}
+	if srcArg.IsNull() || fmtArg.IsNull() {
 		return NullDatum, nil
 	}
-	fmtStr := strings.TrimSpace(fmtArg.StringValue())
-	// to_char(timestamp/time, fmt) — time/date formatting.
-	if srcArg.Kind == KindTime {
-		t := srcArg.TimeValue().UTC()
-		goFmt := pgToCharToGoFormat(fmtStr)
-		return NewStringDatum(t.Format(goFmt)), nil
+	format := fmtArg.StringValue()
+	typeName := strings.ToLower(optimizer.ExprType(x.Args[0]).Name)
+	switch {
+	case srcArg.Kind == KindInterval:
+		return toCharInterval(srcArg, format)
+	case srcArg.Kind == KindTime && (typeName == "time" || typeName == "time without time zone"):
+		// No to_char(time) exists: PG casts the argument to interval.
+		return toCharInterval(timeOfDayAsInterval(srcArg), format)
+	case srcArg.Kind == KindTime:
+		return toCharDatetime(srcArg, format, ctx)
 	}
-	// to_char(numeric, fmt) — number formatting. M0097-0105.
-	return NewStringDatum(toCharNumericFormat(srcArg, fmtStr)), nil
-}
-
-// toCharNumericFormat formats a numeric Datum using a PostgreSQL numeric format string.
-// Supports: FM prefix, 0 (zero-fill), 9 (space-fill), . (decimal point),
-// , (grouping separator), S/MI/PL/PR signs. M0097-0105.
-func toCharNumericFormat(val Datum, fmtStr string) string {
-	orig := fmtStr
-	upper := strings.ToUpper(strings.TrimSpace(fmtStr))
-
-	// EEEE/eeee — scientific notation: delegate entirely.
-	if strings.Contains(upper, "EEEE") {
-		// Extract the mantissa format (everything before EEEE, minus FM/sign tokens).
-		eeeeIdx := strings.Index(strings.ToUpper(orig), "EEEE")
-		mantissaRaw := orig[:eeeeIdx]
-		mantissaFmt := strings.NewReplacer("FM", "", "fm", "", "S", "", "s", "").Replace(mantissaRaw)
-		lowercase := strings.Contains(orig, "eeee")
-		fmMode := strings.Contains(upper, "FM")
-		return toCharScientific(val, mantissaFmt, lowercase, fmMode)
+	text, err := toCharNumberLocale(srcArg, typeName, format, localeConvFromCtx(ctx))
+	if err != nil {
+		return Datum{}, err
 	}
-
-	// RN — Roman numerals: delegate entirely.
-	if strings.Contains(upper, "RN") {
-		fmMode := strings.Contains(upper, "FM")
-		return toCharRoman(val, fmMode)
-	}
-
-	// FM: fill mode — strip leading/trailing spaces.
-	fm := strings.Contains(upper, "FM")
-	if fm {
-		upper = strings.ReplaceAll(upper, "FM", "")
-	}
-
-	// Pre-scan original format for quoted literal text segments ("...").
-	// We extract them keyed by their byte-position range so we can splice them
-	// back into the result after digit formatting.
-	type quotedSeg struct {
-		// position in the upper-cased, stripped format string after quotes removed
-		insertAfterPos int // insert after this many chars of the stripped upper string
-		text           string
-	}
-	var quotedSegs []quotedSeg
-	{
-		// Build a parallel "stripped" upper string (no quote regions) and record where
-		// each quoted segment goes.
-		stripped := strings.Builder{}
-		i := 0
-		for i < len(upper) {
-			if upper[i] == '"' {
-				// Find closing quote; handle backslash-escaped quotes \"  inside.
-				j := i + 1
-				for j < len(upper) && upper[j] != '"' {
-					if upper[j] == '\\' && j+1 < len(upper) && upper[j+1] == '"' {
-						j += 2 // skip \"
-					} else {
-						j++
-					}
-				}
-				// Extract raw text from orig (preserving case) and unescape \" → ".
-				rawText := orig[i+1 : i+1+(j-(i+1))]
-				rawText = strings.ReplaceAll(rawText, `\"`, `"`)
-				quotedSegs = append(quotedSegs, quotedSeg{
-					insertAfterPos: stripped.Len(),
-					text:           rawText,
-				})
-				i = j + 1 // skip past closing '"'
-			} else {
-				stripped.WriteByte(upper[i])
-				i++
-			}
-		}
-		upper = stripped.String()
-	}
-
-	// TH/th ordinal suffix.
-	hasTHUpper, hasTHLower := false, false
-	if strings.Contains(upper, "TH") {
-		origNoFM := strings.ReplaceAll(strings.ReplaceAll(orig, "FM", ""), "fm", "")
-		hasTHUpper = strings.Contains(origNoFM, "TH")
-		hasTHLower = strings.Contains(origNoFM, "th")
-		upper = strings.ReplaceAll(upper, "TH", "")
-	}
-
-	// Detect SG (sign) in the middle of the format: 2-char code that outputs the sign (+/-)
-	// at that position without any extra leading sign space. Detect AFTER quoted-text removal
-	// so the position is relative to the stripped upper string. SG at position 0 is handled
-	// by the hasSStart path below (S at start of format). M0097-0147.
-	hasSGMid := false
-	sgMidInjectAt := 0
-	if idx := strings.Index(upper, "SG"); idx > 0 {
-		hasSGMid = true
-		sgMidInjectAt = idx
-		upper = upper[:idx] + upper[idx+2:]
-	}
-
-	// Detect sign modifiers. MI/PL positions matter (prefix vs suffix).
-	hasMIStart := strings.HasPrefix(upper, "MI")
-	hasMIEnd := !hasMIStart && strings.HasSuffix(upper, "MI")
-	hasMI := hasMIStart || hasMIEnd
-	hasPLEnd := strings.HasSuffix(upper, "PL")
-	hasPLStart := !hasPLEnd && strings.HasPrefix(upper, "PL")
-	hasPL := hasPLStart || hasPLEnd
-	hasPR := strings.Contains(upper, "PR")
-	hasSStart, hasSSuffix, hasS := false, false, false
-	if !hasMI && !hasPL && !hasPR {
-		// Remove G/D/L/C/spaces so they don't confuse S detection.
-		chk := strings.NewReplacer("G", "", "D", "", "L", "", "C", "", " ", "").Replace(upper)
-		if strings.HasPrefix(chk, "S") {
-			hasSStart = true
-		} else if strings.HasSuffix(chk, "S") {
-			hasSSuffix = true
-		}
-		hasS = hasSStart || hasSSuffix
-	}
-
-	// Strip sign specifiers for digit-format processing.
-	digitFmt := upper
-	digitFmt = strings.ReplaceAll(digitFmt, "MI", "")
-	digitFmt = strings.ReplaceAll(digitFmt, "PL", "")
-	digitFmt = strings.ReplaceAll(digitFmt, "PR", "")
-	digitFmt = strings.ReplaceAll(digitFmt, "S", "")
-	// Map locale separators to canonical chars.
-	digitFmt = strings.ReplaceAll(digitFmt, "G", ",")
-	digitFmt = strings.ReplaceAll(digitFmt, "D", ".")
-	digitFmt = strings.ReplaceAll(digitFmt, "L", " ")
-	digitFmt = strings.ReplaceAll(digitFmt, "C", "")
-
-	// V — decimal shift: multiply value by 10^N where N = digit positions after V.
-	vShift := 0
-	if vIdx := strings.Index(digitFmt, "V"); vIdx >= 0 {
-		afterV := digitFmt[vIdx+1:]
-		for _, c := range afterV {
-			if c == '0' || c == '9' {
-				vShift++
-			}
-		}
-		digitFmt = digitFmt[:vIdx]
-	}
-
-	// Split into integer and decimal parts.
-	dotIdx := strings.Index(digitFmt, ".")
-	var intFmt, decFmt string
-	if dotIdx >= 0 {
-		intFmt = digitFmt[:dotIdx]
-		decFmt = digitFmt[dotIdx+1:]
-	} else {
-		intFmt = digitFmt
-	}
-	intFmtDigits := strings.ReplaceAll(intFmt, ",", "")
-	intFmtDigits = strings.ReplaceAll(intFmtDigits, " ", "")
-	decFmtDigits := strings.ReplaceAll(decFmt, ",", "")
-	decFmtDigits = strings.ReplaceAll(decFmtDigits, " ", "")
-
-	// Zero-fill: a '0' format char at position i makes all positions j >= i use
-	// '0' fill instead of ' ' fill (propagates rightward from the leftmost '0').
-	zeroFillFrom := len(intFmtDigits) // default: no zero-fill
-	for i, c := range intFmtDigits {
-		if c == '0' {
-			zeroFillFrom = i
-			break
-		}
-	}
-	// totalDigitPositions is used to map right-to-left walk index → left-to-right position.
-	totalDigitPositions := 0
-	for _, c := range intFmtDigits {
-		if c == '0' || c == '9' {
-			totalDigitPositions++
-		}
-	}
-
-	decPositions := 0
-	for _, c := range decFmtDigits {
-		if c == '0' || c == '9' {
-			decPositions++
-		}
-	}
-
-	// Extract numeric value.
-	negative := false
-	var intVal int64
-	var fracStr string
-	switch val.Kind {
-	case KindInt:
-		intVal = val.Int
-		if intVal < 0 {
-			negative = true
-			intVal = -intVal
-		}
-	case KindNumeric:
-		m := val.NumericMantissaValue()
-		s := int(val.NumericScaleValue())
-		if m < 0 {
-			negative = true
-			m = -m
-		}
-		if s > 0 {
-			var divisor int64 = 1
-			for i := 0; i < s; i++ {
-				divisor *= 10
-			}
-			intVal = m / divisor
-			rem := m % divisor
-			if decPositions > 0 {
-				fracStr = fmt.Sprintf("%0*d", s, rem)
-				if len(fracStr) > decPositions {
-					fracStr = fracStr[:decPositions]
-				}
-			}
-		} else {
-			intVal = m
-		}
-	case KindString:
-		f, parseErr := strconv.ParseFloat(val.StringValue(), 64)
-		if parseErr == nil {
-			if f < 0 {
-				negative = true
-				f = -f
-			}
-			intVal = int64(f)
-			if decPositions > 0 {
-				frac := f - float64(intVal)
-				fs := fmt.Sprintf("%.*f", decPositions, frac)
-				if len(fs) > 2 {
-					fracStr = fs[2:]
-				}
-				if len(fracStr) > decPositions {
-					fracStr = fracStr[:decPositions]
-				}
-			}
-		}
-	}
-
-	// Apply V shift: multiply intVal by 10^vShift and clear decimal part.
-	if vShift > 0 {
-		mult := int64(1)
-		for i := 0; i < vShift; i++ {
-			mult *= 10
-		}
-		intVal *= mult
-		fracStr = ""
-		decPositions = 0
-		decFmt = ""
-		dotIdx = -1
-	}
-
-	// Format integer part: walk intFmt right-to-left, preserving comma/space positions.
-	// Track whether each char slot is a fill position (vs actual digit).
-	intStr := strconv.FormatInt(intVal, 10)
-	var intBuf []byte
-	var intIsFill []bool // parallel to intBuf: true = fill char
-	pos := len(intStr) - 1
-	digitPosFromRight := 0
-	for fi := len(intFmt) - 1; fi >= 0; fi-- {
-		fc := intFmt[fi]
-		switch fc {
-		case ',':
-			intBuf = append([]byte{','}, intBuf...)
-			intIsFill = append([]bool{true}, intIsFill...) // comma is fill until second pass
-		case ' ':
-			// Literal space in format — treat as fill spacer.
-			intBuf = append([]byte{' '}, intBuf...)
-			intIsFill = append([]bool{true}, intIsFill...)
-		case '0', '9':
-			digitPosFromLeft := totalDigitPositions - 1 - digitPosFromRight
-			digitPosFromRight++
-			fillCh := byte(' ')
-			if digitPosFromLeft >= zeroFillFrom {
-				fillCh = '0'
-			}
-			if pos >= 0 {
-				intBuf = append([]byte{intStr[pos]}, intBuf...)
-				intIsFill = append([]bool{false}, intIsFill...)
-				pos--
-			} else {
-				intBuf = append([]byte{fillCh}, intBuf...)
-				intIsFill = append([]bool{true}, intIsFill...)
-			}
-		}
-	}
-	// Overflow: more digits than format positions.
-	for pos >= 0 {
-		intBuf = append([]byte{intStr[pos]}, intBuf...)
-		intIsFill = append([]bool{false}, intIsFill...)
-		pos--
-	}
-
-	// Second pass: replace commas in the fill area (before first actual digit) with
-	// the appropriate fill char (space for '9' area, '0' for '0' area).
-	// gFillCount tracks how many G (comma) separators were in the fill area (before first
-	// actual digit); used later by the S-start sign handler to adjust column width.
-	gFillCount := 0
-	seenActualDigit := false
-	for i := range intBuf {
-		if !intIsFill[i] {
-			seenActualDigit = true
-		}
-		if intBuf[i] == ',' && !seenActualDigit {
-			gFillCount++
-			// Determine fill char at this position from the nearest digit slot.
-			// Use the rightmost fill char type in the prefix region.
-			// Simple heuristic: if any preceding fill slot used '0', use '0', else ' '.
-			fillCh := byte(' ')
-			for j := 0; j < i; j++ {
-				if intIsFill[j] && intBuf[j] == '0' {
-					fillCh = '0'
-					break
-				}
-			}
-			intBuf[i] = fillCh
-		}
-	}
-	result := string(intBuf)
-
-	// V-shift extends effective output width: 99999V99 with value 1234 → 1234×100=123400,
-	// width = 5 (before V) + 2 (after V) = 7 digit slots, not just 5. Pad with fill if needed.
-	if vShift > 0 && len(result) < totalDigitPositions+vShift {
-		result = strings.Repeat(" ", totalDigitPositions+vShift-len(result)) + result
-	}
-
-	// Append decimal part.
-	if dotIdx >= 0 && decPositions > 0 {
-		if fracStr == "" {
-			fracStr = strings.Repeat("0", decPositions)
-		} else if len(fracStr) < decPositions {
-			fracStr += strings.Repeat("0", decPositions-len(fracStr))
-		}
-		// Walk decFmt left-to-right to insert any commas at their positions (G separators).
-		decOut := strings.Builder{}
-		fracPos := 0
-		for _, dc := range decFmt {
-			switch dc {
-			case ',':
-				decOut.WriteByte(',')
-			case ' ':
-				decOut.WriteByte(' ')
-			case '0', '9':
-				if fracPos < len(fracStr) {
-					decOut.WriteByte(fracStr[fracPos])
-				} else {
-					decOut.WriteByte('0')
-				}
-				fracPos++
-			}
-		}
-		result = result + "." + decOut.String()
-	}
-
-	// FM mode: strip leading spaces only (from '9' fill without zero-fill propagation).
-	// '0' fill positions and propagated zero-fill are NOT stripped.
-	// For decimal: strip trailing zeros from '9' decimal positions; keep '0' positions.
-	if fm {
-		result = strings.TrimLeft(result, " ")
-		if result == "" || result == "." {
-			result = "0"
-		}
-		if dotIdx >= 0 {
-			hasAnyDecimalZero := strings.ContainsRune(decFmtDigits, '0')
-			if !hasAnyDecimalZero {
-				// Strip trailing fractional zeros (from '9' positions); keep dot.
-				result = strings.TrimRight(result, "0")
-			}
-		}
-	}
-
-	// Ordinal suffix (positive values only).
-	ordSuffix := ""
-	if (hasTHUpper || hasTHLower) && !negative {
-		sfx := toCharOrdinalSuffix(intVal)
-		if hasTHLower {
-			sfx = strings.ToLower(sfx)
-		}
-		ordSuffix = sfx
-	}
-
-	// Splice quoted literal segments into result BEFORE applying sign.
-	// The insertAfterPos values are relative to the stripped-upper (digit-only) coordinate
-	// system. Inserting before sign keeps them valid without a sign-prefix offset.
-	// Exception: hasSGMid injects the sign at a digit-column position; if quoted text also
-	// appears, positions shift and would require re-calculation — defer that edge case.
-	if len(quotedSegs) > 0 && !hasSGMid {
-		for i := len(quotedSegs) - 1; i >= 0; i-- {
-			seg := quotedSegs[i]
-			insertAt := seg.insertAfterPos
-			// Adjust insertion point when the literal format space immediately before
-			// the insertion is in the fill area (all preceding positions are fills).
-			// In PostgreSQL's to_char, a literal separator space adjacent to the fill
-			// region is output AFTER the quoted text rather than before, so we insert
-			// before it. For large values (digit at the preceding position) no shift.
-			if insertAt > 0 && insertAt <= len(intFmt) && intFmt[insertAt-1] == ' ' {
-				allFillBefore := true
-				for j := 0; j < insertAt-1; j++ {
-					if !intIsFill[j] {
-						allFillBefore = false
-						break
-					}
-				}
-				if allFillBefore {
-					insertAt--
-				}
-			}
-			if insertAt > len(result) {
-				insertAt = len(result)
-			}
-			result = result[:insertAt] + seg.text + result[insertAt:]
-		}
-	}
-
-	// Apply sign modifier.
-	if hasSGMid {
-		// SG in the middle: inject sign at the recorded position, no leading sign space.
-		sign := byte('+')
-		if negative {
-			sign = '-'
-		}
-		if sgMidInjectAt > len(result) {
-			sgMidInjectAt = len(result)
-		}
-		result = result[:sgMidInjectAt] + string(sign) + result[sgMidInjectAt:]
-	} else if hasMI {
-		if hasMIStart {
-			if negative {
-				// Place minus right before the first significant digit.
-				trim := strings.TrimLeft(result, " ")
-				spaces := len(result) - len(trim)
-				result = strings.Repeat(" ", spaces) + "-" + trim
-			} else if !fm {
-				result = " " + result
-			}
-		} else {
-			// hasMIEnd: sign at the end.
-			if negative {
-				result = result + "-"
-			} else if !fm {
-				result = result + " "
-			}
-		}
-	} else if hasPL {
-		if hasPLEnd {
-			if !negative {
-				// PL-end positive: add one more leading sign-space and trailing + symbol.
-				result = " " + result + "+"
-			} else {
-				// PL-end negative: sign right before digits, trailing space for PL position.
-				trim := strings.TrimLeft(result, " ")
-				spaces := len(result) - len(trim)
-				result = strings.Repeat(" ", spaces) + "-" + trim + " "
-			}
-		} else {
-			// hasPLStart: sign right before first significant digit.
-			trim := strings.TrimLeft(result, " ")
-			spaces := len(result) - len(trim)
-			if negative {
-				result = strings.Repeat(" ", spaces) + "-" + trim
-			} else {
-				result = strings.Repeat(" ", spaces) + "+" + trim
-			}
-		}
-	} else if hasPR {
-		if negative {
-			// Place < right before the first significant digit, > at end.
-			trim := strings.TrimLeft(result, " ")
-			spaces := len(result) - len(trim)
-			result = strings.Repeat(" ", spaces) + "<" + trim + ">"
-		} else if !fm {
-			result = " " + result + " "
-		}
-	} else if hasS {
-		if hasSSuffix {
-			if negative {
-				result = result + "-"
-			} else {
-				result = result + "+"
-			}
-		} else {
-			// hasSStart: sign right before first significant digit (no extra leading space).
-			trim := strings.TrimLeft(result, " ")
-			spaces := len(result) - len(trim)
-			if gFillCount > 0 {
-				// G separators in fill area produce an extra fill space; absorb them
-				// so the sign sits at position 0 with the correct total width.
-				fill := spaces - gFillCount
-				if fill < 0 {
-					fill = 0
-				}
-				if negative {
-					result = "-" + strings.Repeat(" ", fill) + trim
-				} else {
-					result = "+" + strings.Repeat(" ", fill) + trim
-				}
-			} else {
-				if negative {
-					result = strings.Repeat(" ", spaces) + "-" + trim
-				} else {
-					result = strings.Repeat(" ", spaces) + "+" + trim
-				}
-			}
-		}
-	} else {
-		// Default: sign immediately before first significant digit; positive
-		// reserves one extra leading space for the sign position.
-		if negative {
-			trim := strings.TrimLeft(result, " ")
-			spaces := len(result) - len(trim)
-			result = strings.Repeat(" ", spaces) + "-" + trim
-		} else if !fm {
-			result = " " + result
-		}
-	}
-
-	// hasSGMid + quoted text: sign position shifts with text insertion; fall back to
-	// post-sign insertion with a sign-prefix offset to keep sign embedded correctly.
-	if len(quotedSegs) > 0 && hasSGMid {
-		signPrefix := 0
-		if len(result) > 0 && (result[0] == ' ' || result[0] == '+' || result[0] == '-') {
-			signPrefix = 1
-		}
-		for i := len(quotedSegs) - 1; i >= 0; i-- {
-			seg := quotedSegs[i]
-			insertAt := seg.insertAfterPos + signPrefix
-			if insertAt > len(result) {
-				insertAt = len(result)
-			}
-			result = result[:insertAt] + seg.text + result[insertAt:]
-		}
-	}
-
-	return result + ordSuffix
-}
-
-// toCharOrdinalSuffix returns the English ordinal suffix (ST/ND/RD/TH) for n.
-
-// toCharScientific formats val in scientific notation for the EEEE/eeee format modifier.
-// mantissaFmt is the digit format string before the EEEE token (e.g. "9.99" from "9.99EEEE").
-// lowercase controls whether the exponent uses 'e' or 'E'. fm strips the leading sign space.
-func toCharScientific(val Datum, mantissaFmt string, lowercase bool, fm bool) string {
-	f, ok := datumToFloat64(val)
-	if !ok {
-		return "0"
-	}
-	negative := f < 0
-	if negative {
-		f = -f
-	}
-
-	// Count decimal positions in mantissaFmt (digits after the '.').
-	decPlaces := 0
-	dotSeen := false
-	for _, c := range mantissaFmt {
-		if c == '.' || c == 'D' {
-			dotSeen = true
-			continue
-		}
-		if dotSeen && (c == '0' || c == '9') {
-			decPlaces++
-		}
-	}
-
-	// Special values (Infinity/-Infinity/NaN): PostgreSQL never errors for these
-	// in EEEE format; it emits a fixed "#" pattern with no sign marker, regardless
-	// of Inf's sign or NaN. postgres/src/backend/utils/adt/formatting.c, the
-	// isnan(value) || isinf(value) branch inside float4_to_char/float8_to_char
-	// (numeric_to_char follows the identical NUMERIC_IS_SPECIAL pattern):
-	// one sign-slot space (stripped by FM), Num.pre '#'s (always 1 for a valid
-	// EEEE format), '.', then Num.post+4 '#'s.
-	if math.IsNaN(f) || math.IsInf(f, 0) {
-		const pre = 1
-		special := strings.Repeat("#", pre) + "." + strings.Repeat("#", decPlaces+4)
-		if !fm {
-			special = " " + special
-		}
-		return special
-	}
-
-	// Format using Go's scientific notation, then reformat the exponent to ±NN.
-	raw := fmt.Sprintf("%.*e", decPlaces, f)
-	// raw is like "1.23e+03" or "1.23e+003" (platform-dependent).
-	eIdx := strings.LastIndex(raw, "e")
-	mantissa := raw[:eIdx]
-	expPart := raw[eIdx+1:] // e.g. "+03" or "+003"
-
-	// Normalise exponent to sign + exactly 2 digits.
-	expSign := "+"
-	if len(expPart) > 0 && (expPart[0] == '+' || expPart[0] == '-') {
-		expSign = string(expPart[0])
-		expPart = expPart[1:]
-	}
-	// Strip leading zeros to get the numeric value, then re-pad to 2 digits.
-	expNum := strings.TrimLeft(expPart, "0")
-	if expNum == "" {
-		expNum = "0"
-	}
-	expFormatted := fmt.Sprintf("%s%02s", expSign, expNum)
-
-	// PostgreSQL always uses lowercase 'e' in scientific notation regardless of EEEE/eeee case.
-	result := mantissa + "e" + expFormatted
-
-	if negative {
-		result = "-" + result
-	} else if !fm {
-		result = " " + result
-	}
-	return result
-}
-
-// toCharRoman converts val to a Roman numeral string for the RN format.
-// Returns a 15-char right-justified string (or fm-stripped). Out-of-range values return "###############".
-func toCharRoman(val Datum, fm bool) string {
-	f, ok := datumToFloat64(val)
-	if !ok {
-		return "###############"
-	}
-	n := int64(f)
-	if n < 1 || n > 3999 {
-		return "###############"
-	}
-
-	thousands := []string{"", "M", "MM", "MMM"}
-	hundreds := []string{"", "C", "CC", "CCC", "CD", "D", "DC", "DCC", "DCCC", "CM"}
-	tens := []string{"", "X", "XX", "XXX", "XL", "L", "LX", "LXX", "LXXX", "XC"}
-	ones := []string{"", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX"}
-
-	roman := thousands[n/1000] + hundreds[(n%1000)/100] + tens[(n%100)/10] + ones[n%10]
-	if fm {
-		return roman
-	}
-	// Right-justify in 15 chars.
-	if len(roman) < 15 {
-		return strings.Repeat(" ", 15-len(roman)) + roman
-	}
-	return roman
+	return NewStringDatum(text), nil
 }
 
 // int64ToAbsUint64 returns the absolute value of v as uint64,
@@ -8892,81 +8527,6 @@ func int64ToAbsUint64(v int64) uint64 {
 		return uint64(math.MaxInt64) + 1
 	}
 	return uint64(-v)
-}
-
-func toCharOrdinalSuffix(n int64) string {
-	if n < 0 {
-		n = -n
-	}
-	if mod100 := n % 100; mod100 >= 11 && mod100 <= 13 {
-		return "TH"
-	}
-	switch n % 10 {
-	case 1:
-		return "ST"
-	case 2:
-		return "ND"
-	case 3:
-		return "RD"
-	default:
-		return "TH"
-	}
-}
-
-func pgToCharToGoFormat(pg string) string {
-	replacer := strings.NewReplacer(
-		"YYYY", "2006",
-		"YYY", "006",
-		"YY", "06",
-		"Y", "6",
-		"IYYY", "2006", // ISO year — approximate
-		"IYY", "006",
-		"IY", "06",
-		"I", "6",
-		"MM", "01",
-		"MON", "Jan",
-		"Mon", "Jan",
-		"mon", "jan",
-		"MONTH", "January",
-		"Month", "January",
-		"month", "january",
-		"DD", "02",
-		"D", "1", // day of week 1=Sun PostgreSQL, Go: Mon=1
-		"DAY", "Monday",
-		"Day", "Monday",
-		"day", "monday",
-		"DY", "Mon",
-		"Dy", "Mon",
-		"dy", "mon",
-		"HH24", "15",
-		"HH12", "03",
-		"HH", "03",
-		"MI", "04",
-		"SS", "05",
-		"MS", "000", // milliseconds
-		"US", "000000", // microseconds
-		"TZ", "UTC", // always UTC in v0
-		"tz", "utc",
-		"TZH", "-07",
-		"TZM", "00",
-		"AM", "PM",
-		"PM", "PM",
-		"am", "pm",
-		"pm", "pm",
-		"A.M.", "PM",
-		"P.M.", "PM",
-		"Q", "", // quarter — not supported in Go format
-		"WW", "", // week of year — not directly supported
-		"IW", "", // ISO week
-		"CC", "", // century
-		"J", "", // Julian day
-		"SSSSS", "", // seconds past midnight
-		"SSSS", "",
-		"Y,YYY", "", // year with comma
-		"OF", "-07:00",
-		"TZO", "-07:00",
-	)
-	return replacer.Replace(pg)
 }
 
 // evalDateTrunc implements date_trunc(field, source) → timestamp.
@@ -8992,6 +8552,9 @@ func evalDateTrunc(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, e
 		if src.Kind != KindTime {
 			return NullDatum, nil
 		}
+	}
+	if src.IsDate() && isFarDateCarrier(src.Int) {
+		return Datum{}, dateOutOfRangeForTimestamp()
 	}
 	t := src.TimeValue().UTC()
 	switch strings.ToLower(strings.TrimSpace(fieldArg.StringValue())) {
@@ -9022,22 +8585,29 @@ func evalDateTrunc(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, e
 	case "year":
 		t = time.Date(t.Year(), 1, 1, 0, 0, 0, 0, t.Location())
 	case "decade":
-		y := (t.Year() / 10) * 10
+		// timestamp_trunc: BC years are astronomical here, so these count from
+		// the other side of year 0.
+		y := t.Year()
+		if y > 0 {
+			y = (y / 10) * 10
+		} else {
+			y = -((8 - (y - 1)) / 10) * 10
+		}
 		t = time.Date(y, 1, 1, 0, 0, 0, 0, t.Location())
 	case "century":
-		y := ((t.Year() - 1) / 100) * 100
-		if y < 0 {
-			y = ((t.Year()) / 100) * 100
+		y := t.Year()
+		if y > 0 {
+			y = ((y+99)/100)*100 - 99
 		} else {
-			y++
+			y = -((99-(y-1))/100)*100 + 1
 		}
 		t = time.Date(y, 1, 1, 0, 0, 0, 0, t.Location())
 	case "millennium":
-		y := ((t.Year() - 1) / 1000) * 1000
-		if y < 0 {
-			y = (t.Year() / 1000) * 1000
+		y := t.Year()
+		if y > 0 {
+			y = ((y+999)/1000)*1000 - 999
 		} else {
-			y++
+			y = -((999-(y-1))/1000)*1000 + 1
 		}
 		t = time.Date(y, 1, 1, 0, 0, 0, 0, t.Location())
 	}
@@ -10242,32 +9812,84 @@ func evalDateBin(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, err
 	if len(x.Args) < 3 {
 		return NullDatum, nil
 	}
-	stepArg, err := evalExprSlot(x.Args[0], slot, ctx)
-	if err != nil || stepArg.IsNull() || stepArg.Kind != KindInterval {
+	args := [3]Datum{}
+	for i := range args {
+		v, err := evalExprSlot(x.Args[i], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if v.IsNull() {
+			return NullDatum, nil
+		}
+		args[i] = v
+	}
+	if args[0].Kind == KindString {
+		var err error
+		if args[0], err = evalCast(args[0], "interval", x.Pos(), ctx); err != nil {
+			return Datum{}, err
+		}
+	}
+	// Function resolution: a timestamp argument selects the timestamp form unless
+	// the other is a timestamptz; otherwise the preferred type timestamptz wins,
+	// also for dates and unknown literals.
+	plain := func(d Datum) bool { return d.Kind == KindTime && !d.IsTimestampTZ() && !d.IsDate() }
+	target := "timestamptz"
+	if (plain(args[1]) || plain(args[2])) && !args[1].IsTimestampTZ() && !args[2].IsTimestampTZ() {
+		target = "timestamp"
+	}
+	for i := 1; i < 3; i++ {
+		if args[i].Kind == KindString || args[i].IsDate() || (target == "timestamptz" && !args[i].IsTimestampTZ()) {
+			v, err := evalCast(args[i], target, x.Pos(), ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			args[i] = v
+		}
+	}
+	stride, source, origin := args[0], args[1], args[2]
+	if stride.Kind != KindInterval || source.Kind != KindTime || origin.Kind != KindTime {
 		return NullDatum, nil
 	}
-	srcArg, err := evalExprSlot(x.Args[1], slot, ctx)
-	if err != nil || srcArg.IsNull() || srcArg.Kind != KindTime {
-		return NullDatum, nil
+	outOfRange := func(msg string) (Datum, error) {
+		return Datum{}, &ExecError{Code: "22008", Message: msg}
 	}
-	originArg, err := evalExprSlot(x.Args[2], slot, ctx)
-	if err != nil || originArg.IsNull() || originArg.Kind != KindTime {
-		return NullDatum, nil
+	// timestamp_bin (timestamp.c).
+	if source.IsTimestampNotFinite() {
+		return source, nil
 	}
-	// Convert interval step to duration (days only for v0).
-	stepDays := int64(stepArg.IntervalDaysValue())
-	if stepDays == 0 {
-		return NullDatum, nil
+	if origin.IsTimestampNotFinite() {
+		return outOfRange("origin out of range")
 	}
-	stepDur := time.Duration(stepDays) * 24 * time.Hour
-	src := srcArg.TimeValue().UTC()
-	origin := originArg.TimeValue().UTC()
-	diff := src.Sub(origin)
-	bucket := (diff / stepDur) * stepDur
-	if diff < 0 {
-		bucket = ((diff - stepDur + 1) / stepDur) * stepDur
+	if stride.IsIntervalNoBegin() || stride.IsIntervalNoEnd() {
+		return outOfRange("timestamps cannot be binned into infinite intervals")
 	}
-	return NewTimeDatum(origin.Add(bucket)), nil
+	if stride.IntervalMonthsValue() != 0 {
+		return Datum{}, &ExecError{Code: "0A000",
+			Message: "timestamps cannot be binned into intervals containing months or years"}
+	}
+	strideMicros := int64(stride.IntervalDaysValue())*usecsPerDay + stride.IntervalMicrosValue()
+	if strideMicros <= 0 {
+		return outOfRange("stride must be greater than zero")
+	}
+	diff := source.Int - origin.Int
+	if (origin.Int < 0 && diff < source.Int) || (origin.Int > 0 && diff > source.Int) {
+		return outOfRange("interval out of range")
+	}
+	modulo := diff % strideMicros
+	result := origin.Int + diff - modulo
+	if modulo < 0 {
+		// Round toward -infinity, which can leave the range.
+		var ok bool
+		if result, ok = addTimeCarrierMicros(result, -strideMicros); !ok {
+			return outOfRange("timestamp out of range")
+		}
+	}
+	if !validTimestampCarrier(result) {
+		return outOfRange("timestamp out of range")
+	}
+	binned := source
+	binned.Int = result
+	return binned, nil
 }
 
 // parseIntervalCastString parses a runtime interval-cast string (the
@@ -12270,6 +11892,9 @@ func declaredBpcharTypmod(e optimizer.Expr) int64 {
 // no-arg time functions pgbench needs; HammerDB TPC-H also uses
 // to_timestamp(text, fmt) to load TIMESTAMP columns.
 func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
+	if fn, typ, ok := strings.Cut(x.Name, optimizer.RangeOpTypeSep); ok {
+		return evalRangeOperator(fn, typ, x, slot, ctx)
+	}
 	name := strings.ToLower(x.Name)
 	// Strip pg_catalog. prefix for matching — these are schema-qualified
 	// versions of the same built-in functions.
@@ -12289,6 +11914,64 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		case "bt_index_check", "bt_index_parent_check", "verify_heapam":
 			name = name[dot+1:]
 		}
+	}
+	if isHasPrivilegeBuiltin(name) {
+		args := make([]Datum, 0, len(x.Args))
+		for _, a := range x.Args {
+			v, err := evalExprSlot(a, slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			args = append(args, v)
+		}
+		switch name {
+		case "has_table_privilege":
+			return evalHasTablePrivilege(args, ctx, x.Pos())
+		case "has_schema_privilege":
+			return evalHasSchemaPrivilege(args, ctx, x.Pos())
+		case "has_column_privilege":
+			return evalHasColumnPrivilege(args, ctx, x.Pos())
+		case "has_any_column_privilege":
+			return evalHasAnyColumnPrivilege(args, ctx, x.Pos())
+		case "has_sequence_privilege":
+			return evalHasSequencePrivilege(args, ctx, x.Pos())
+		case "has_function_privilege":
+			return evalHasFunctionPrivilege(args, ctx, x.Pos())
+		case "has_type_privilege":
+			return evalHasTypePrivilege(args, ctx, x.Pos())
+		case "has_largeobject_privilege":
+			return evalHasLargeObjectPrivilege(args, ctx, x.Pos())
+		case "lo_create", "lo_creat":
+			return evalLoCreate(name, args, ctx)
+		case "lo_unlink":
+			return evalLoUnlink(args, ctx)
+		}
+		if isLargeObjectDataFunc(name) {
+			return evalLargeObjectFunc(name, args, ctx)
+		}
+		return evalHasDatabasePrivilege(args, ctx, x.Pos())
+	}
+	if isBitStringBuiltin(name) {
+		args := make([]Datum, 0, len(x.Args))
+		for _, a := range x.Args {
+			v, err := evalExprSlot(a, slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			args = append(args, v)
+		}
+		return evalBitStringFunc(name, args, x.Pos())
+	}
+	if isCashBuiltin(name) {
+		args := make([]Datum, 0, len(x.Args))
+		for _, a := range x.Args {
+			v, err := evalExprSlot(a, slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			args = append(args, v)
+		}
+		return evalCashBuiltin(name, args, x.Pos())
 	}
 	switch name {
 	case optimizer.FieldSelectFuncName:
@@ -12328,7 +12011,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		// `date(now())::text = current_date::text` (expressions.sql) always
 		// compared unequal regardless of the actual day. NewDateDatum is the
 		// same site every other date-producing path already uses.
-		t := ctx.Now.UTC()
+		// The current date is the session TimeZone's: date_in of 'today'
+		// and timestamptz_date(now()) both read the local date
+		// (M0149-0001h1a81); the UTC date was a day off near midnight.
+		t := misc.TimestampTZToTimestamp(ctx.Now, timeZoneFromCtx(ctx))
 		return NewDateDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)), nil
 	case "current_time":
 		// Returns time-of-day anchored at epoch, matching parseTimeString convention.
@@ -12340,8 +12026,8 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		// making `now()::time(3) = current_time(3)`-shaped comparisons flaky
 		// (they only matched when the discarded digits happened to floor and
 		// round to the same value).
-		t := ctx.Now.UTC()
-		d := NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC))
+		clock, offset := sessionClock(ctx.Now, ctx)
+		d := NewTimeTZDatum(clock, offset)
 		if len(x.Args) > 0 {
 			prec, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err == nil && prec.Kind == KindInt {
@@ -12450,16 +12136,14 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				Message: fmt.Sprintf("time zone %q not recognized", zoneStr)}
 		}
 		oldOffsetSecs := src.TimeTZOffsetSecs()
-		// Int stores LOCAL time nanoseconds (epoch-anchored). Compute UTC then
-		// apply new offset.
-		utcNanos := src.Int - int64(oldOffsetSecs)*1_000_000_000
-		newLocalNanos := utcNanos + int64(newOffsetSecs)*1_000_000_000
-		// Wrap within [0, 24h).
-		const dayNanos = int64(24 * 3600 * 1_000_000_000)
-		newLocalNanos = ((newLocalNanos % dayNanos) + dayNanos) % dayNanos
+		// The stored clock is LOCAL time: go through UTC to the new offset and
+		// wrap into [0, 24h).
+		micros := pgTimeMicros(src.TimeValue()) + int64(newOffsetSecs-oldOffsetSecs)*1_000_000
+		micros = ((micros % usecsPerDay) + usecsPerDay) % usecsPerDay
 		result := src
-		result.Int = newLocalNanos
+		result.Int = timeToCarrier(pgTimeFromMicros(micros))
 		result.Scale = int16(newOffsetSecs / 60)
+		result.Hi = uint64(int64(newOffsetSecs))
 		return result, nil
 	case "pg_get_viewdef":
 		// pg_get_viewdef(view [, …]) → text: the view's defining SELECT.
@@ -12574,6 +12258,13 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		return evalJustify(name, x, slot, ctx)
 	case "date_bin":
 		return evalDateBin(x, slot, ctx)
+	case "date_add", "date_subtract":
+		return evalDateAdd(x, name == "date_subtract", slot, ctx)
+	case "mul_d_interval":
+		return evalMulDInterval(x, slot, ctx)
+	case "time_pl_interval", "time_mi_interval", "timetz_pl_interval", "timetz_mi_interval",
+		"time_mi_time", "datetime_pl", "datetimetz_pl":
+		return evalTimeOperator(name, x, slot, ctx)
 	case "set_config":
 		// set_config(setting_name, new_value, is_local) → text
 		// vacuumdb calls SELECT pg_catalog.set_config('search_path', '', false)
@@ -13078,6 +12769,19 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 					return NullDatum, nil
 				}
 			}
+			// oidvector / int2vector are 0-based arrays whose text form is
+			// space-separated (pg_proc.proargtypes, pg_index.indkey): the
+			// planner stamps their element type. M0149-0001h1a22.
+			if (x.ReturnType == "oid" || x.ReturnType == "int2") && (len(sv) == 0 || sv[0] != '{') {
+				f := strings.Fields(sv)
+				if n < 0 || int(n) >= len(f) {
+					return NullDatum, nil
+				}
+				if iv, perr := strconv.ParseInt(f[n], 10, 64); perr == nil {
+					return NewIntDatum(iv), nil
+				}
+				return NullDatum, nil
+			}
 			if len(sv) < 2 || sv[0] != '{' {
 				// Not an array literal: a fixed-length pseudo-array type — most
 				// importantly `name` — is being subscripted. PostgreSQL indexes
@@ -13103,7 +12807,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			// kind instead of text — otherwise compareDatum never reaches the
 			// interval_cmp_value / numeric ladders and `c[1] = c[2]` compares the
 			// two element SPELLINGS. M0119-0006.
-			if d, ok := arraySubscriptElemDatum(x.ReturnType, elem); ok {
+			if d, ok := arraySubscriptElemDatumCtx(x.ReturnType, elem, ctx); ok {
 				return d, nil
 			}
 			// Try to infer element type: if the element looks like a plain integer
@@ -13334,6 +13038,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		// Used to evaluate ARRAY[e1, e2, ...] constructors. M0097-0042.
 		var sb strings.Builder
 		sb.WriteByte('{')
+		hasDatetime := false
 		for i, arg := range x.Args {
 			if i > 0 {
 				sb.WriteByte(',')
@@ -13342,6 +13047,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil {
 				return NullDatum, err
 			}
+			hasDatetime = hasDatetime || v.Kind == KindTime || v.Kind == KindInterval
 			switch {
 			case v.IsNull():
 				sb.WriteString("NULL")
@@ -13358,6 +13064,13 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			}
 		}
 		sb.WriteByte('}')
+		if hasDatetime {
+			text, err := normalizeConstructedDatetimeArray(x, sb.String(), ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			return NewStringDatum(text), nil
+		}
 		return NewStringDatum(sb.String()), nil
 
 	case "row":
@@ -13451,6 +13164,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			switch t {
 			case "bool", "boolean":
 				return NewBoolDatum(isValidBoolInput(v)), nil
+			case "money":
+				// Sibling of pg_input_error_info's money arm: cash_in. M0149-0001k1.
+				_, err := moneyCents(NewStringDatum(v))
+				return NewBoolDatum(err == nil), nil
 			case "int2", "smallint":
 				_, err := parseIntegerInput(v, "smallint", 16)
 				return NewBoolDatum(err == nil), nil
@@ -13479,6 +13196,14 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				return NewBoolDatum(msg == ""), nil
 			case "uuid":
 				return NewBoolDatum(isValidUUIDStr(v)), nil
+			case "aclitem":
+				_, aerr := aclitemIn(v, ctx) // aclitemin (M0149-0001h1a9)
+				return NewBoolDatum(aerr == nil), nil
+			case "regclass", "regtype", "regrole", "regnamespace", "regcollation", "regproc", "regprocedure", "regoper", "regoperator":
+				// the reg* input functions with a soft error context
+				// (M0149-0001h1a13)
+				d, rerr := regIdentifierInput(NewStringDatum(v), t, ctx, 0)
+				return NewBoolDatum(rerr == nil && d.Kind == KindInt), nil
 			case "tid":
 				_, _, ok := parseTidInput(v)
 				return NewBoolDatum(ok), nil
@@ -13609,7 +13334,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				return NullDatum, ivErr
 			}
 			if iv.Kind == KindInterval {
-				shifted, aerr := addTimeInterval(NewTimeDatum(ctx.Now), iv, false, x.Pos())
+				shifted, aerr := addTimeInterval(NewTimeDatum(ctx.Now), iv, false, x.Pos(), ctx)
 				if aerr != nil {
 					return NullDatum, aerr
 				}
@@ -14592,11 +14317,32 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				n, _ := strconv.ParseUint(oidDatum.StringValue(), 10, 32)
 				objOID = uint32(n)
 			}
-			if im, ok := ctx.Catalog.(*catalog.InMemory); ok && objOID != 0 {
-				// classoid 1259 = pg_class
-				if desc, found := im.GetComment(1259, objOID, 0); found {
-					return NewStringDatum(desc), nil
+			im, ok := ctx.Catalog.(*catalog.InMemory)
+			if !ok || objOID == 0 {
+				return NullDatum, nil
+			}
+			// obj_description(oid, name): system_functions.sql keys classoid on
+			// (SELECT oid FROM pg_class WHERE relname = $2 AND relnamespace =
+			// PGNSP); an unknown catalog name matches nothing → NULL. psql's
+			// \dn+ / \dT+ / \dL+ and pg_dump pass e.g. 'pg_namespace'. The
+			// one-argument form keeps the pg_class lookup.
+			classoid := uint32(1259)
+			if len(x.Args) >= 2 {
+				catArg, err := evalExprSlot(x.Args[1], slot, ctx)
+				if err != nil {
+					return Datum{}, err
 				}
+				if catArg.IsNull() {
+					return NullDatum, nil
+				}
+				oid, found := im.SystemCatalogOID(catArg.StringValue())
+				if !found {
+					return NullDatum, nil
+				}
+				classoid = oid
+			}
+			if desc, found := im.GetComment(classoid, objOID, 0); found {
+				return NewStringDatum(desc), nil
 			}
 		}
 		return NullDatum, nil
@@ -14946,6 +14692,59 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 	case "pg_sequence_parameters":
 		// SRF returning sequence parameters — stub returns NULL.
 		return NullDatum, nil
+	case "pg_sequence_last_value":
+		// pg_sequence_last_value(regclass) → int8 (sequence.c): last_value
+		// when is_called, else NULL. NULL as well for another session's
+		// temporary sequence and for an unlogged sequence during recovery,
+		// for the benefit of the pg_sequences view. M0149-0077.
+		if len(x.Args) != 1 || ctx == nil || ctx.Catalog == nil {
+			return NullDatum, nil
+		}
+		v, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || v.IsNull() {
+			return NullDatum, err
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		tbl, ok := verifyHeapamResolveTable(v, im, ctx.CurrentDatabaseOid)
+		if !ok {
+			return NullDatum, nil
+		}
+		if !tbl.IsSequence {
+			// sequence_open → validate_relation_kind (sequence.c):
+			// errdetail_relkind_not_supported.
+			kind := "tables"
+			switch {
+			case tbl.IsMatView:
+				kind = "materialized views"
+			case tbl.View != nil:
+				kind = "views"
+			case tbl.PartitionKey != nil:
+				kind = "partitioned tables"
+			}
+			return Datum{}, &ExecError{Code: "42809", Message: fmt.Sprintf("cannot open relation \"%s\"", tbl.Name),
+				Detail: fmt.Sprintf("This operation is not supported for %s.", kind)}
+		}
+		if tbl.Temp && tbl.TempOwner != "" && tbl.TempOwner != sessionTempOwner(ctx) {
+			return NullDatum, nil
+		}
+		if tbl.Unlogged && ctx.IsStandby {
+			return NullDatum, nil
+		}
+		if tbl.VirtualRows == nil {
+			return NullDatum, nil
+		}
+		rows := tbl.VirtualRows()
+		if len(rows) == 0 || len(rows[0]) < 3 || rows[0][2] != "t" {
+			return NullDatum, nil
+		}
+		n, perr := strconv.ParseInt(rows[0][0], 10, 64)
+		if perr != nil {
+			return NullDatum, nil
+		}
+		return NewIntDatum(n), nil
 
 	// ── Partition metadata functions (M0097-0015) ─────────────────────────
 	case "pg_partition_tree", "pg_partition_ancestors":
@@ -14968,47 +14767,25 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		if !ok {
 			return NullDatum, nil
 		}
-		relName := partitionResolveRegclass(v, im)
-		if relName == "" {
+		oid, ok := partitionResolveRegclass(v, ctx)
+		if !ok {
 			return NullDatum, nil
 		}
-		// Try table first.
-		if tbl, ok2 := im.LookupTable(parser.ObjectName{Name: relName}); ok2 {
-			// Non-partitioned table (no PartitionKey) and not a partition child → NULL.
-			if len(tbl.PartitionKey) == 0 && tbl.PartitionParentOID == 0 {
-				return NullDatum, nil
-			}
-			// Walk up to root.
-			cur := tbl
-			visited := map[uint32]bool{}
-			for cur.PartitionParentOID != 0 && !visited[cur.OID] {
-				visited[cur.OID] = true
-				parent, ok3 := im.LookupTableByOID(cur.PartitionParentOID)
-				if !ok3 {
-					break
-				}
-				cur = parent
-			}
-			return NewStringDatum(cur.Name), nil
+		// OID-based walk shared with pg_partition_ancestors (M0149-0001h1a31):
+		// the root is the last ancestor; NULL outside any partition tree.
+		pt := partitionTree{im: im, dbOid: catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)}
+		var chain []Row
+		if tbl, found := im.LookupTableByOID(oid, pt.dbOid); found {
+			chain = pt.tableAncestors(tbl)
+		} else if idx, found := im.LookupIndexByOID(oid, pt.dbOid); found {
+			chain = pt.indexAncestors(idx)
 		}
-		// Try index.
-		if idx, ok2 := im.LookupIndex(parser.ObjectName{Name: relName}); ok2 {
-			if idx.PartitionParentOID == 0 && len(im.IndexPartitionChildren(idx.OID)) == 0 {
-				return NullDatum, nil
-			}
-			cur := idx
-			visited := map[uint32]bool{}
-			for cur.PartitionParentOID != 0 && !visited[cur.OID] {
-				visited[cur.OID] = true
-				parent, ok3 := im.LookupIndexByOID(cur.PartitionParentOID)
-				if !ok3 {
-					break
-				}
-				cur = parent
-			}
-			return NewStringDatum(cur.Name), nil
+		if len(chain) == 0 {
+			return NullDatum, nil
 		}
-		return NullDatum, nil
+		rootOID := uint32(chain[len(chain)-1][0].Int)
+		render := RegOutRendererVisible(ctx.Catalog, func(s string) bool { return RegObjectSchemaVisible(ctx, s) }, pt.dbOid)
+		return NewStringDatum(render("regclass", rootOID)), nil
 	case "satisfies_hash_partition":
 		// satisfies_hash_partition(tableoid, modulus, remainder, val...) → bool
 		// Full implementation: Jenkins Bob hash + hash_combine64. M0097-0027.
@@ -15148,6 +14925,13 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				}
 			}
 			if r == nil {
+				// A built-in function: PG 18.3's own definition text
+				// (M0149-0001h1a24).
+				if oidArg.Kind == KindInt {
+					if d, ok := catalog.LookupBuiltinFunctionDef(uint32(oidArg.Int)); ok {
+						return NewStringDatum(d), nil
+					}
+				}
 				return NullDatum, nil
 			}
 			return NewStringDatum(buildFunctionDef(r)), nil
@@ -15159,6 +14943,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
 				if r := routineOrAggregateArgs(ctx.Catalog, uint32(oidArg.Int)); r != nil {
 					return NewStringDatum(buildFunctionArguments(r, true)), nil
+				}
+				// A built-in function: PG 18.3's own text (M0149-0001h1a23).
+				if sig, ok := catalog.LookupBuiltinFunctionSignature(uint32(oidArg.Int)); ok {
+					return NewStringDatum(sig.Arguments), nil
 				}
 			}
 		}
@@ -15175,6 +14963,9 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
 				if r := routineOrAggregateArgs(ctx.Catalog, uint32(oidArg.Int)); r != nil {
 					return NewStringDatum(buildFunctionArguments(r, false)), nil
+				}
+				if sig, ok := catalog.LookupBuiltinFunctionSignature(uint32(oidArg.Int)); ok {
+					return NewStringDatum(sig.Identity), nil
 				}
 			}
 		}
@@ -15215,15 +15006,35 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 						return NewStringDatum(ret), nil
 					}
 				}
+				// A built-in function: PG 18.3's own text; NULL for a
+				// procedure (M0149-0001h1a23).
+				if sig, ok := catalog.LookupBuiltinFunctionSignature(uint32(oidArg.Int)); ok {
+					if !sig.HasResult {
+						return NullDatum, nil
+					}
+					return NewStringDatum(sig.Result), nil
+				}
 			}
 		}
 		return NewStringDatum(""), nil
-	// pg_function_is_visible(oid) → bool: always true (no schema visibility model in v0).
+	// pg_*_is_visible(oid) → bool. Relations, types, functions and
+	// statistics objects follow namespace.c's *IsVisible rule
+	// (pg_is_visible.go, M0149-0001h1a32); the operator / opclass /
+	// opfamily / conversion / text-search kinds still answer true.
 	case "pg_function_is_visible", "pg_table_is_visible", "pg_type_is_visible",
 		"pg_operator_is_visible", "pg_opfamily_is_visible", "pg_opclass_is_visible",
 		"pg_conversion_is_visible", "pg_aggregate_is_visible", "pg_ts_parser_is_visible",
 		"pg_ts_dict_is_visible", "pg_ts_template_is_visible", "pg_ts_config_is_visible",
 		"pg_statistics_obj_is_visible":
+		if len(x.Args) == 1 {
+			arg, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if d, handled := pgObjectIsVisible(name, arg, ctx); handled {
+				return d, nil
+			}
+		}
 		return NewBoolDatum(true), nil
 	case "pg_relation_is_publishable":
 		// pg_relation_is_publishable(regclass) → bool (pg_publication.c):
@@ -15263,13 +15074,11 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			!tbl.Temp && !tbl.Unlogged && tbl.OID >= 16384), nil
 	case "pg_proc":
 		return NullDatum, nil
-	case "regproc", "regprocedure", "regclass", "regtype", "regnamespace":
-		// Type cast functions. For regclass specifically, resolve a
-		// text relation name to the table's numeric OID via the
-		// catalog (matches PG semantics post M0103-0008 rung 16,
-		// after pg_class.oid was flipped from text-name to numeric).
-		// Numeric inputs pass through. Other reg* casts remain
-		// stubs returning the argument as-is.
+	case "regproc", "regprocedure", "regclass", "regtype", "regnamespace", "regrole", "regcollation", "regoper", "regoperator":
+		// A one-argument call named after a type is a cast
+		// (func_get_detail's FUNCDETAIL_COERCION): regrole('x') is
+		// 'x'::regrole. Text goes through the shared reg* input port, with
+		// the error position at the argument. M0149-0001h1a13.
 		if len(x.Args) != 1 {
 			return NullDatum, nil
 		}
@@ -15277,22 +15086,8 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		if err != nil || v.IsNull() {
 			return v, err
 		}
-		if name == "regclass" && v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
-			s := v.StringValue()
-			// Shared SplitIdentifierString port (sibling of the CastExpr arm and
-			// regIdentifierInput): a quoted relation name unquotes before the
-			// lookup, a syntax error raises regclassin's 42602. M0119-0006
-			// (72nd slice).
-			schema, rel, nameOK := splitRegQualifiedName(s)
-			if !nameOK {
-				return NullDatum, &ExecError{Code: "42602", Pos: x.Pos(), Message: "invalid name syntax"}
-			}
-			// Scoped to the connection's own dbOid — see the CastExpr
-			// regclass arm's identical fix (M0122-0007 4e follow-up 33).
-			tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Schema: schema, Name: rel}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
-			if ok && tbl != nil {
-				return NewIntDatum(int64(tbl.OID)), nil
-			}
+		if v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
+			return regIdentifierInput(v, name, ctx, x.Args[0].Pos())
 		}
 		return v, nil
 
@@ -15781,6 +15576,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || v.IsNull() {
 				continue
 			}
+			v = regArgText(arg, v, ctx)
 			buf.WriteString(v.Format())
 		}
 		return NewStringDatum(buf.String()), nil
@@ -15821,6 +15617,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				if verr != nil || v.IsNull() {
 					continue
 				}
+				v = regArgText(arg, v, ctx)
 				parts = append(parts, v.Format())
 			}
 			return NewStringDatum(strings.Join(parts, sep)), nil
@@ -16176,7 +15973,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 					if e != nil {
 						return Datum{}, e
 					}
-					args = append(args, v)
+					args = append(args, regArgText(a, v, ctx))
 				}
 			}
 
@@ -16434,6 +16231,35 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				return Datum{Kind: KindInt, Int: -1}, nil
 			}
 			return Datum{Kind: KindInt, Int: 0}, nil
+		}
+	case "scale":
+		// numeric_scale: the display scale of a numeric, NULL for NaN and the
+		// infinities. Integers reach it through the implicit cast to numeric;
+		// any other argument type has no scale function.
+		if len(x.Args) == 1 {
+			if t, ok := optimizer.ExprResultType(x.Args[0]); ok && !t.IsArray {
+				switch strings.ToLower(t.Name) {
+				case "numeric", "decimal", "int2", "int4", "int8", "smallint", "integer", "bigint", "unknown", "":
+				default:
+					return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(),
+						Message: fmt.Sprintf("function scale(%s) does not exist", pgFormatTypeName(t.Name)),
+						Hint:    "No function matches the given name and argument types. You might need to add explicit type casts."}
+				}
+			}
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			if v.IsNull() {
+				return NullDatum, nil
+			}
+			switch v.Kind {
+			case KindInt:
+				return Datum{Kind: KindInt, Int: 0}, nil
+			case KindNumeric:
+				return Datum{Kind: KindInt, Int: int64(v.Scale)}, nil
+			}
+			return NullDatum, nil // NaN and the infinities
 		}
 	case "trim_scale", "min_scale":
 		// trim_scale(numeric) reduces the value's display scale to the
@@ -17097,6 +16923,33 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			}
 			_ = parseTextArray(arrD.StringValue())
 			return NewIntDatum(1), nil
+		}
+
+	case "string_to_array":
+		// string_to_array(string, delimiter [, null_string]) → text[]:
+		// text_to_array / text_to_array_null (varlena.c split_text). Not
+		// strict: a NULL string is a NULL result, a NULL delimiter splits
+		// into characters, and a NULL null_string matches nothing.
+		// M0149-0001h1a78c.
+		if len(x.Args) == 2 || len(x.Args) == 3 {
+			args := make([]Datum, len(x.Args))
+			for i, a := range x.Args {
+				d, err := evalExprSlot(a, slot, ctx)
+				if err != nil {
+					return NullDatum, err
+				}
+				args[i] = d
+			}
+			if args[0].IsNull() {
+				return NullDatum, nil
+			}
+			var nullStr *string
+			if len(args) == 3 && !args[2].IsNull() {
+				v := args[2].StringValue()
+				nullStr = &v
+			}
+			elems, nulls := splitTextToArray(args[0].StringValue(), args[1], nullStr)
+			return NewStringDatum(formatTextArrayWithNulls(elems, nulls)), nil
 		}
 
 	case "regexp_split_to_array":
@@ -18057,6 +17910,17 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		}
 		return Datum{Kind: KindInt, Int: int64(cnt)}, nil
 	case "pg_typeof":
+		if len(x.Args) == 2 {
+			// Folded with a set-returning argument kept for its row count
+			// (foldPgTypeof); only the type name is read.
+			if sc, ok := x.Args[0].(*optimizer.StringConst); ok {
+				var cat catalog.Catalog
+				if ctx != nil {
+					cat = ctx.Catalog
+				}
+				return NewIntDatum(int64(pgTypeofOIDForName(cat, sc.Value))), nil
+			}
+		}
 		if len(x.Args) == 1 {
 			var cat catalog.Catalog
 			if ctx != nil {
@@ -18120,6 +17984,13 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				}
 			}
 			name := formatTypeOID(typeOID, typmod)
+			if name == "???" && typmod < 0 {
+				// format_type_be over the full pg_catalog type set
+				// (M0149-0001h1a21); the switch above is a hand list.
+				if n, ok := catalog.BuiltinFormatTypeName(uint32(typeOID)); ok {
+					name = n
+				}
+			}
 			if name == "???" && ctx != nil && ctx.Catalog != nil {
 				// A user-defined type's pg_type OID is dynamically allocated,
 				// so formatTypeOID (built-ins only) returns the unknown
@@ -18328,8 +18199,8 @@ case "pg_char_to_encoding":
 		// see the current_time case above, M0134-0084: the previous
 		// floor-via-integer-division here is what made
 		// `now()::time(N)::text = localtime(N)::text` (expressions.sql) flaky).
-		t := ctx.Now.UTC()
-		d := NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC))
+		clock, _ := sessionClock(ctx.Now, ctx)
+		d := NewTimeOfDayDatum(clock)
 		if len(x.Args) > 0 {
 			prec, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err == nil && prec.Kind == KindInt {
@@ -18350,8 +18221,53 @@ case "pg_char_to_encoding":
 		return NewTimeDatum(misc.TimestampTZToTimestamp(ctx.Now, timeZoneFromCtx(ctx))), nil
 	case "pg_is_in_recovery":
 		return NewBoolDatum(ctx.IsStandby), nil
+	// pg_switch_wal() → pg_lsn (xlogfuncs.c): XLOG_SWITCH, the end of the
+	// switch record. M0149-0076.
+	case "pg_switch_wal":
+		return evalPgSwitchWAL(ctx)
+	case "pg_create_restore_point":
+		return evalPgCreateRestorePoint(x, slot, ctx)
+	case "pg_wal_replay_pause", "pg_wal_replay_resume", "pg_get_wal_replay_pause_state":
+		return evalPgWalReplayPause(x.Name, ctx)
 	case "pg_current_wal_lsn", "pg_current_wal_insert_lsn", "pg_current_wal_flush_lsn":
 		return evalPgCurrentWALLSN(name, ctx)
+	case "pg_wal_lsn_diff":
+		// pg_wal_lsn_diff(lsn1 pg_lsn, lsn2 pg_lsn) → numeric: lsn1 - lsn2,
+		// the same function as the pg_lsn - pg_lsn operator (pg_lsn_mi).
+		// STRICT. M0149-0019a.
+		if len(x.Args) != 2 {
+			return Datum{}, &ExecError{Code: "42883", Message: "function pg_wal_lsn_diff does not exist"}
+		}
+		a, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || a.IsNull() {
+			return NullDatum, err
+		}
+		b, err := evalExprSlot(x.Args[1], slot, ctx)
+		if err != nil || b.IsNull() {
+			return NullDatum, err
+		}
+		lu, lerr := parsePgLSN(a.StringValue())
+		ru, rerr := parsePgLSN(b.StringValue())
+		if lerr != nil {
+			return Datum{}, &ExecError{Code: "22P02", Message: fmt.Sprintf("invalid input syntax for type pg_lsn: \"%s\"", a.StringValue())}
+		}
+		if rerr != nil {
+			return Datum{}, &ExecError{Code: "22P02", Message: fmt.Sprintf("invalid input syntax for type pg_lsn: \"%s\"", b.StringValue())}
+		}
+		if lu >= ru {
+			return NewStringDatum(strconv.FormatUint(lu-ru, 10)), nil
+		}
+		return NewStringDatum("-" + strconv.FormatUint(ru-lu, 10)), nil
+	case "pg_walfile_name":
+		// pg_walfile_name(pg_lsn) → text (xlogfuncs.c). M0149-0017.
+		if len(x.Args) != 1 {
+			return Datum{}, &ExecError{Code: "42883", Message: "function pg_walfile_name does not exist"}
+		}
+		d, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || d.IsNull() {
+			return NullDatum, err
+		}
+		return evalPgWalfileName(d, ctx)
 	case "pg_last_wal_receive_lsn", "pg_last_wal_replay_lsn":
 		return evalPgLastWALLSN(name, ctx), nil
 	case "pg_promote":
@@ -18382,6 +18298,14 @@ case "pg_char_to_encoding":
 		return evalPgLogicalEmitMessage(x, slot, ctx)
 	case "pg_drop_replication_slot":
 		return evalPgDropReplicationSlot(x, slot, ctx)
+	case "pg_replication_slot_advance":
+		return evalPgReplicationSlotAdvance(x, slot, ctx)
+	// Session-level online backups (xlogfuncs.c). See session_backup.go.
+	// M0149-0077k.
+	case "pg_backup_start":
+		return evalPgBackupStart(x, slot, ctx)
+	case "pg_backup_stop":
+		return evalPgBackupStop(x, slot, ctx)
 	// currtid2(relname text, tid tid) → tid: returns the latest visible TID
 	// for a row in the named relation. M0097-0038.
 	case "currtid2":
@@ -18392,6 +18316,45 @@ case "pg_char_to_encoding":
 	// against the stored *acl column. M0110-0001 / DU-002 slice 2.
 	case "acldefault":
 		return evalAclDefault(x, slot, ctx)
+	case "to_regtypemod":
+		// to_regtypemod(text): parseTypeString's typmod, NULL when the type
+		// does not resolve. The grammar's implicit lengths apply to the
+		// unquoted keywords: bit is bit(1), char / character is character(1).
+		// M0149-0001h1a13.
+		if len(x.Args) != 1 {
+			return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: "function to_regtypemod requires 1 argument"}
+		}
+		v, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || v.IsNull() {
+			return NullDatum, err
+		}
+		return toRegTypmod(v.StringValue(), ctx), nil
+	case "to_regclass", "to_regtype", "to_regrole", "to_regcollation", "to_regproc", "to_regprocedure", "to_regnamespace", "to_regoper", "to_regoperator":
+		// to_reg*(text): the type's input function with a soft error context
+		// — NULL instead of an error, for a missing object and (PG 16+) for
+		// bad syntax alike (regproc.c to_regclass & co). M0149-0001h1a12.
+		if len(x.Args) != 1 {
+			return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %s requires 1 argument", name)}
+		}
+		v, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || v.IsNull() {
+			return NullDatum, err
+		}
+		out, rerr := regIdentifierInput(NewStringDatum(v.StringValue()), strings.TrimPrefix(name, "to_"), ctx, x.Pos())
+		if rerr != nil || out.Kind != KindInt {
+			return NullDatum, nil
+		}
+		return out, nil
+	case "makeaclitem":
+		args := make([]Datum, 0, len(x.Args))
+		for _, a := range x.Args {
+			v, err := evalExprSlot(a, slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			args = append(args, v)
+		}
+		return evalMakeAclItem(args, ctx, x.Pos())
 	// pg_get_userbyid(oid) → name: resolves a role OID to its name, or PG's
 	// literal fallback "unknown (OID=n)" when no such role exists
 	// (pg_get_userbyid, ruleutils.c). pg_dumpall's dumpRoleGUCPrivs calls it
@@ -18426,9 +18389,33 @@ case "pg_char_to_encoding":
 	// (and other sessions) observe them. The `stats` isolation spec calls it
 	// between mutating and observing steps. Design 0118-0124 (M0118-0009 rung 2).
 	case "pg_stat_force_next_flush":
-		funcStats.flush(sessionStatsID(ctx))
-		relStats.flush(sessionStatsID(ctx))
+		funcs := funcStats.flush(sessionStatsID(ctx))
+		rels := relStats.flush(sessionStatsID(ctx))
+		dbStats.noteFlush(ctx.CurrentDatabaseOid, rels, funcs)
 		return NewStringDatum(""), nil
+	// pg_stat_have_stats(kind text, dboid oid, objid int8) → boolean: whether
+	// the cumulative statistics system holds an entry (pgstatfuncs.c,
+	// pgstat_have_entry). STRICT. M0149-0007.
+	case "pg_stat_have_stats":
+		if len(x.Args) != 3 {
+			return NullDatum, nil
+		}
+		var args [3]Datum
+		for i := range args {
+			d, err := evalExprSlot(x.Args[i], slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			if d.IsNull() {
+				return NullDatum, nil
+			}
+			args[i] = d
+		}
+		have, err := haveStats(args[0].StringValue(), uint32(args[1].Int), uint64(args[2].Int))
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewBoolDatum(have), nil
 	// pg_stat_get_function_calls(oid) → bigint: number of times the function has
 	// been called (flushed), or NULL when no stats exist for it. Design 0118-0124.
 	case "pg_stat_get_function_calls":
@@ -18515,6 +18502,23 @@ case "pg_char_to_encoding":
 		return evalPgRestoreAttributeStats(x, slot, ctx)
 	case "pg_restore_relation_stats":
 		return evalPgRestoreRelationStats(x, slot, ctx)
+	// pg_stat_reset_shared([target text]) → void (pgstatfuncs.c). NULL or no
+	// argument resets every shared kind. M0149-0007.
+	case "pg_stat_reset_shared":
+		target, isNull := "", true
+		if len(x.Args) > 0 {
+			d, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			if !d.IsNull() {
+				target, isNull = d.StringValue(), false
+			}
+		}
+		if err := pgStatResetShared(target, isNull); err != nil {
+			return Datum{}, err
+		}
+		return NewStringDatum(""), nil
 	case "pg_stat_reset":
 		funcStats.resetAll()
 		relStats.resetAll()
@@ -19723,8 +19727,9 @@ func formatTextArray(elems []string) string {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
-		// Quote the element if it contains special chars, spaces, commas, braces, or backslashes.
-		needsQuote := len(e) == 0
+		// Quote the element if it contains special chars, spaces, commas, braces, or backslashes,
+		// or spells NULL (array_out quotes it so it reads back as text, not a null).
+		needsQuote := len(e) == 0 || strings.EqualFold(e, "NULL")
 		if !needsQuote {
 			for _, c := range e {
 				if c == '"' || c == ',' || c == '{' || c == '}' || c == '\\' || c == ' ' || c == '\t' {
@@ -19767,8 +19772,9 @@ func formatTextArrayWithNulls(elems []string, nulls []bool) string {
 			sb.WriteString("NULL")
 			continue
 		}
-		// Quote the element if it contains special chars, spaces, commas, braces, or backslashes.
-		needsQuote := len(e) == 0
+		// Quote the element if it contains special chars, spaces, commas, braces, or backslashes,
+		// or spells NULL (array_out quotes it so it reads back as text, not a null).
+		needsQuote := len(e) == 0 || strings.EqualFold(e, "NULL")
 		if !needsQuote {
 			for _, c := range e {
 				if c == '"' || c == ',' || c == '{' || c == '}' || c == '\\' || c == ' ' || c == '\t' {
@@ -20374,6 +20380,26 @@ type textArrayElem struct {
 // parseTextArrayElems is parseTextArray's quoted-ness-preserving twin; the two
 // must stay in sync because they are the same scan.
 func parseTextArrayElems(s string) []textArrayElem {
+	return parseTextArrayElemsDelim(s, ',')
+}
+
+// parseTextArrayDelim is parseTextArray for an element type whose typdelim
+// is delim (';' for box). An unquoted element ends at delim; after a quoted
+// element either delim or ',' is accepted, because goopg's own array
+// constructor joins quoted elements with ','. M0149-0001k3.
+func parseTextArrayDelim(s string, delim byte) []string {
+	elems := parseTextArrayElemsDelim(s, delim)
+	if elems == nil {
+		return nil
+	}
+	out := make([]string, len(elems))
+	for i, e := range elems {
+		out[i] = e.Text
+	}
+	return out
+}
+
+func parseTextArrayElemsDelim(s string, delim byte) []textArrayElem {
 	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
 		return []textArrayElem{{Text: s}}
 	}
@@ -20416,14 +20442,14 @@ func parseTextArrayElems(s string) []textArrayElem {
 			}
 			elems = append(elems, textArrayElem{Text: sb.String(), Quoted: true})
 		} else {
-			// Unquoted element: read until comma or end.
+			// Unquoted element: read until the delimiter or end.
 			start := i
-			for i < len(inner) && inner[i] != ',' {
+			for i < len(inner) && inner[i] != delim {
 				i++
 			}
 			elems = append(elems, textArrayElem{Text: inner[start:i]})
 		}
-		if i < len(inner) && inner[i] == ',' {
+		if i < len(inner) && (inner[i] == delim || inner[i] == ',') {
 			i++
 		}
 	}
@@ -20676,6 +20702,70 @@ func pgFormatTypeName(t string) string {
 	return t
 }
 
+// checkDomainInValues enforces a domain's CHECK (VALUE IN (...)) constraints on
+// a cast result. A domain may carry several; each must admit the value. Format()
+// (not StringValue(), which only extracts KindString's Buf payload) renders every
+// Kind's canonical text form. DU-002 slice 385, M0122-0005.
+func checkDomainInValues(result Datum, dom *catalog.Domain, pos int) error {
+	label := result.Format()
+	for _, ck := range dom.Checks {
+		if len(ck.InValues) == 0 {
+			continue
+		}
+		found := false
+		for _, allowed := range ck.InValues {
+			if strings.EqualFold(label, allowed) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return &ExecError{
+				Code:    "23514",
+				Pos:     pos,
+				Message: fmt.Sprintf("value for domain %s violates check constraint %q", strings.ToLower(dom.Name), ck.Name),
+			}
+		}
+	}
+	return nil
+}
+
+// domainCastWithTypmod reports a cast to a domain whose base type has a typmod,
+// with the equivalent cast to that base type. Built-in target names return at
+// once, so ordinary casts pay no catalog lookup.
+func domainCastWithTypmod(ctx *Context, x *optimizer.CastExpr) (*catalog.Domain, *optimizer.CastExpr) {
+	if x.Typmod != 0 || ctx == nil || ctx.Catalog == nil || x.TargetType == "" ||
+		catalog.TypeNameToOID(x.TargetType) != catalog.OIDText || strings.EqualFold(x.TargetType, "text") {
+		return nil, nil
+	}
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil, nil
+	}
+	dom, ok := im.LookupDomain(x.TargetType, ctx.CurrentDatabaseOid)
+	if !ok {
+		return nil, nil
+	}
+	base, ok := im.DomainBaseType(x.TargetType, ctx.CurrentDatabaseOid)
+	if !ok || len(base.Args) == 0 {
+		return nil, nil
+	}
+	// Input to the base type first, then the explicit length coercion, as PG
+	// coerces to a domain: an over-long bit string is truncated, not rejected.
+	input := *x
+	input.TargetType = base.Name
+	cast := *x
+	cast.Operand = &input
+	cast.TargetType = base.Name
+	cast.SourceType = base.Name
+	cast.Explicit = true
+	cast.Typmod = optimizer.EncodeCastTypmod(base.Name, base.Args)
+	if len(base.Args) == 1 && (strings.EqualFold(base.Name, "numeric") || strings.EqualFold(base.Name, "decimal")) {
+		cast.Typmod = base.Args[0] << 16 // numeric(p) has scale 0
+	}
+	return dom, &cast
+}
+
 // userTypeNameForOID resolves a dynamically-allocated pg_type OID (one goopg
 // itself assigned to a user-defined enum/domain/composite/range/multirange
 // type, or one of their auto-generated array types) to its name. Shared by
@@ -20738,6 +20828,24 @@ func userTypeNameForOID(cat catalog.Catalog, oid uint32, qualify func(schema str
 	if rt, ok := cat.LookupRangeTypeByMultirangeArrayOID(oid); ok {
 		schema := cat.SchemaNameForOID(rt.NamespaceOID)
 		return regOutQualified(schema, rt.MultirangeName, regOutQualifySchema(schema, qualify)) + "[]", true
+	}
+	// A relation's rowtype / its array (M0149-0001h1a34).
+	if im, ok := cat.(*catalog.InMemory); ok {
+		if tbl, isArr, found := im.LookupTableByRowTypeOID(oid); found {
+			name := regOutQualified(tbl.Schema, tbl.Name, regOutQualifySchema(tbl.Schema, qualify))
+			if isArr {
+				name += "[]"
+			}
+			return name, true
+		}
+	}
+	// The information_schema domains and their arrays: format_type_be
+	// qualifies them off the search path. M0149-0001h1a85a.
+	if name, ok := catalog.InformationSchemaTypeName(oid); ok {
+		if qualify == nil || qualify("information_schema") {
+			return "information_schema." + name, true
+		}
+		return name, true
 	}
 	return "", false
 }
@@ -21276,21 +21384,7 @@ func formatTypeOID(typeOID, typmod int64) string {
 
 // uuidToBytes parses a UUID string (any PG-accepted format) into 16 bytes.
 func uuidToBytes(s string) ([16]byte, bool) {
-	s = strings.ToLower(s)
-	if len(s) == 38 && s[0] == '{' && s[37] == '}' {
-		s = s[1:37]
-	}
-	var clean string
-	if len(s) == 32 {
-		clean = s
-	} else if len(s) == 36 && s[8] == '-' && s[13] == '-' && s[18] == '-' && s[23] == '-' {
-		clean = s[0:8] + s[9:13] + s[14:18] + s[19:23] + s[24:36]
-	} else {
-		return [16]byte{}, false
-	}
-	var b [16]byte
-	_, err := hex.Decode(b[:], []byte(clean))
-	return b, err == nil
+	return parseUUIDText(s) // string_to_uuid, shared with isValidUUIDStr
 }
 
 // genUUIDv4 generates a random RFC 4122 version-4 UUID.
@@ -21418,7 +21512,7 @@ func parseTimezoneOffsetString(s string) (int, error) {
 	}
 
 	// Named timezone (America/New_York, Europe/London, etc.).
-	if loc, err := time.LoadLocation(s); err == nil {
+	if loc, ok := misc.ZoneByName(s); ok {
 		_, off := time.Now().In(loc).Zone()
 		return off, nil
 	}
@@ -22427,4 +22521,61 @@ func padOuterRow(row Row, pad int) Row {
 	}
 	copy(out[pad:], row)
 	return out
+}
+
+// toRegTypmod is to_regtypemod: resolve the type through regtypein and
+// encode its parenthesised modifiers with the type's typmodin (pgAttTypmod).
+func toRegTypmod(s string, ctx *Context) Datum {
+	base := strings.TrimSpace(s)
+	var args []int64
+	if open := strings.IndexByte(base, '('); open > 0 && strings.HasSuffix(base, ")") {
+		for _, a := range strings.Split(base[open+1:len(base)-1], ",") {
+			n, err := strconv.ParseInt(strings.TrimSpace(a), 10, 64)
+			if err != nil {
+				return NullDatum
+			}
+			args = append(args, n)
+		}
+	}
+	d, err := regIdentifierInput(NewStringDatum(s), "regtype", ctx, 0)
+	if err != nil || d.Kind != KindInt {
+		return NullDatum
+	}
+	oid := uint32(d.Int)
+	if len(args) == 0 {
+		switch strings.ToLower(base) {
+		case "bit":
+			args = []int64{1}
+		case "char", "character":
+			args = []int64{1}
+		}
+	}
+	return NewIntDatum(pgAttTypmod(oid, args))
+}
+
+// splitTextToArray is varlena.c's split_text for string_to_array: the fields
+// of input between occurrences of sep, or one field per character when sep is
+// NULL, with any field equal to nullStr reported as NULL
+// (split_text_accum_result). An empty input has no fields; an empty separator
+// makes the whole input one field. M0149-0001h1a78c.
+func splitTextToArray(input string, sep Datum, nullStr *string) ([]string, []bool) {
+	var fields []string
+	switch {
+	case sep.IsNull():
+		for _, r := range input {
+			fields = append(fields, string(r))
+		}
+	case input == "":
+	case sep.StringValue() == "":
+		fields = []string{input}
+	default:
+		fields = strings.Split(input, sep.StringValue())
+	}
+	nulls := make([]bool, len(fields))
+	if nullStr != nil {
+		for i, f := range fields {
+			nulls[i] = f == *nullStr
+		}
+	}
+	return fields, nulls
 }

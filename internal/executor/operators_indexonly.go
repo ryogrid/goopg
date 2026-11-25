@@ -5,7 +5,6 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
@@ -251,7 +250,52 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// value of the skipped key prefix, all materialised here as every
 	// other shape is.
 	var skip *btreeSkipEnum
+	// M0148-0001c3a4 (h): an index-only ScalarArrayOp probe — the same
+	// per-element windows as indexScanOp's (saopWindows: sorted,
+	// de-duplicated, bounds on the second column), each drained in order.
+	var saopWins []saopWindow
+	// skipRange checks a skip-range scan's entries (M0148-0001c3a4 (j)).
+	var skipRange *trailingKeyCheck
 	switch {
+	case len(o.plan.SAOPKeys) > 0:
+		// Keys, when set, is the equality prefix ahead of the array
+		// (M0148-0001c3a4 (i)).
+		if isHashIdx || o.plan.SkipPrefix > 0 || o.plan.Key != nil || len(o.plan.Keys)+1 > len(o.plan.Index.Columns) {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
+				"indexOnlyScanOp: ScalarArrayOp probe on index %q carries an incompatible probe shape", o.plan.Index.Name)}
+		}
+		wins, err := ctx.saopWindows(saopProbeSpec{
+			table: o.plan.Table, index: o.plan.Index, prefix: o.plan.Keys, elems: o.plan.SAOPKeys,
+			low: o.plan.LowKey, high: o.plan.HighKey, lowOp: o.plan.LowOp, highOp: o.plan.HighOp, pos: o.plan.Pos(),
+			op: o.plan.SAOPOp, colQuals: o.plan.SAOPColQuals,
+		}, tree, o.outerSlot)
+		if err != nil {
+			return err
+		}
+		if len(wins) == 0 {
+			return nil
+		}
+		saopWins = wins
+	case o.plan.SkipPrefix > 0 && len(o.plan.Keys) == 0:
+		// M0148-0001c3a4 (j): a skip scan's range on Columns[SkipPrefix],
+		// with nothing bound before it. The whole index is read in order and
+		// each entry's key column is checked against the bounds, before any
+		// heap fetch — the entries nbtree's skip arrays would visit, without
+		// its repositioning (ledgered).
+		if isHashIdx || o.plan.Key != nil || (o.plan.LowKey == nil && o.plan.HighKey == nil) || o.plan.SkipPrefix >= len(o.plan.Index.Columns) {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
+				"indexOnlyScanOp: skip-range scan on index %q carries an incompatible probe shape", o.plan.Index.Name)}
+		}
+		c, err := newIndexColumnCheck(ctx, o.plan.Table, o.plan.Index, o.plan.SkipPrefix, func(ref *optimizer.ColumnRef) optimizer.Expr {
+			return skipRangePred(ref, o.plan.LowKey, o.plan.HighKey, o.plan.LowOp, o.plan.HighOp)
+		})
+		if err != nil {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		skipRange = c
+		// Unbounded read: the LowOp/HighOp strictness belongs to the
+		// checked column, not to these (nil) scan bounds.
+		o.rangeLoExcl, o.rangeHiExcl, o.rangeBoundsSet = false, false, true
 	case o.plan.SkipPrefix > 0:
 		sp := o.plan.SkipPrefix
 		if isHashIdx || len(o.plan.Keys) == 0 || o.plan.Key != nil || o.plan.LowKey != nil ||
@@ -357,9 +401,47 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// column types, not of the row.
 	keyDecodable := o.indexKeyIsDecodable()
 
+	// M0148-0001c3a4 (i): the array on the second column behind the leading
+	// range, checked per entry like nbtree's non-leading array key.
+	trailing, err := o.trailingSAOPQual()
+	if err != nil {
+		return err
+	}
+	trailingAdmits := func(row Row) (bool, error) { return predAdmits(ctx, trailing, row) }
+
 	scanFn := func(key []byte, ptr storage.ItemPointer) (bool, error) {
+		if skipRange != nil {
+			ok, err := skipRange.admits(key)
+			if err != nil {
+				return false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+			}
+			if !ok {
+				return true, nil
+			}
+		}
+		allVisible := keyDecodable && ctx.VM != nil && ctx.VM.AllVisible(heapRel, ptr.Block)
+		if trailing != nil && (allVisible || keyDecodable) {
+			// The index qual is applied to the index entry before any heap
+			// fetch (Heap Fetches counts only entries that pass it).
+			row, err := o.decodeRowFromKey(key)
+			if err != nil {
+				return false, &ExecError{Code: "XX000", Pos: o.plan.Pos(),
+					Message: fmt.Sprintf("IOS decode: %v", err)}
+			}
+			ok, err := trailingAdmits(row)
+			if err != nil {
+				return false, err
+			}
+			if !ok {
+				return true, nil
+			}
+			if allVisible {
+				o.rows = append(o.rows, row)
+				return true, nil
+			}
+		}
 		// Fast path: ALL_VISIBLE → decode from key, zero heap reads.
-		if keyDecodable && ctx.VM != nil && ctx.VM.AllVisible(heapRel, ptr.Block) {
+		if allVisible {
 			row, err := o.decodeRowFromKey(key)
 			if err != nil {
 				return false, &ExecError{Code: "XX000", Pos: o.plan.Pos(),
@@ -449,6 +531,17 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		if err != nil {
 			return false, err
 		}
+		if trailing != nil && !keyDecodable {
+			// An undecodable key (interval's lossy span): the heap row
+			// carries the column.
+			ok, err := trailingAdmits(row)
+			if err != nil {
+				return false, err
+			}
+			if !ok {
+				return true, nil
+			}
+		}
 		o.rows = append(o.rows, row)
 		return true, nil
 	}
@@ -471,7 +564,13 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	if o.rangeBoundsSet {
 		loExcl, hiExcl = o.rangeLoExcl, o.rangeHiExcl
 	}
-	if skip != nil && skip.canWalk() {
+	if saopWins != nil {
+		for _, w := range saopWins {
+			if err := tree.RangeScanWithPosLeafFilter(w.lo, w.hi, w.loExcl, w.hiExcl, leafFilter, scanPosFn); err != nil {
+				return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+			}
+		}
+	} else if skip != nil && skip.canWalk() {
 		// M0145-0008af: the skip scan's leaf walk (btree_skip.go walkLeaf) —
 		// the index scan's sibling walks the same groups lazily.
 		for {
@@ -642,23 +741,7 @@ func (o *indexOnlyScanOp) Close() error {
 // decodeRowFromKey routes on that same descriptor, so the two agree on which
 // decode this predicate is judging.
 func (o *indexOnlyScanOp) indexKeyIsDecodable() bool {
-	if o.plan.Index == nil || o.ctx == nil || o.ctx.Catalog == nil {
-		return true
-	}
-	blobKey := o.ctx.pgIndexKeyDesc(o.plan.Index) == nil
-	for _, colName := range o.plan.Index.Columns {
-		col, ok := o.ctx.Catalog.LookupColumn(o.plan.Table, colName)
-		if !ok {
-			continue // the decode path reports this one itself
-		}
-		if !indexKeyColumnIsDecodable(*col) {
-			return false
-		}
-		if blobKey && !indexKeyColumnRendersHeapText(*col) {
-			return false
-		}
-	}
-	return true
+	return indexKeyDecodable(o.ctx, o.plan.Table, o.plan.Index)
 }
 
 // decodeRowFromKey extracts covered column values from a B-tree key.
@@ -824,23 +907,25 @@ func decodeIndexKeyColumnStyled(key []byte, col catalog.Column, st array.OutputS
 			return NullDatum, 0, fmt.Errorf("btree: timestamp key truncated, got %d bytes", len(key))
 		}
 		v, err := nbtree.DecodeTimestamp(key[:8])
-		ts := pgEpoch.Add(time.Duration(v) * time.Microsecond)
 		// The key form is shared but the TYPE is not: an index-only scan answers
 		// the column from the key, so this datum reaches the user in place of the
 		// heap's, and must carry the same subtype the heap decode assigns
 		// (decodeValuePG, codec.go). M0119-0006 (41st slice).
-		if isTimestamptzType(typeName) {
-			return NewTimestampTZDatum(ts), 8, err
-		}
-		return NewTimeDatum(ts), 8, err
+		return newTimestampDatumFromPGMicros(v, isTimestamptzType(typeName)), 8, err
 	case isDateType(typeName):
 		// date is encoded as int4 days since the PG epoch. M0118-0001.
 		if len(key) < 4 {
 			return NullDatum, 0, fmt.Errorf("btree: date key truncated, got %d bytes", len(key))
 		}
 		v, err := nbtree.DecodeInt4(key[:4])
-		ts := pgEpoch.Add(time.Duration(v) * 24 * time.Hour)
-		return NewDateDatum(ts), 4, err
+		if err != nil {
+			return NullDatum, 0, err
+		}
+		d, ok := newDateDatumFromPGDays(v)
+		if !ok {
+			return NullDatum, 0, fmt.Errorf("btree: date key %d out of range", v)
+		}
+		return d, 4, nil
 	case isNumericType(typeName):
 		// NUMERIC keys are variable-length but self-delimiting, so the
 		// composite walk can consume exactly this column. Value-preserving,
@@ -1078,14 +1163,10 @@ func decodeBTreeKeyToDatumStyled(key []byte, col catalog.Column, st array.Output
 		if err != nil {
 			return NullDatum, err
 		}
-		ts := pgEpoch.Add(time.Duration(v) * time.Microsecond)
 		// Sibling of decodeIndexKeyColumn's arm above — both must tag, or the
 		// same column decodes one way in a single-column index-only scan and
 		// another way in a composite one. M0119-0006 (41st slice).
-		if isTimestamptzType(typeName) {
-			return NewTimestampTZDatum(ts), nil
-		}
-		return NewTimeDatum(ts), nil
+		return newTimestampDatumFromPGMicros(v, isTimestamptzType(typeName)), nil
 
 	case isDateType(typeName):
 		// date is encoded as int4 days since the PG epoch. M0118-0001.
@@ -1093,8 +1174,11 @@ func decodeBTreeKeyToDatumStyled(key []byte, col catalog.Column, st array.Output
 		if err != nil {
 			return NullDatum, err
 		}
-		ts := pgEpoch.Add(time.Duration(v) * 24 * time.Hour)
-		return NewDateDatum(ts), nil
+		d, ok := newDateDatumFromPGDays(v)
+		if !ok {
+			return NullDatum, fmt.Errorf("btree: date key %d out of range", v)
+		}
+		return d, nil
 
 	default:
 		// Unknown type: attempt float8 decode for user-defined enums. M0097-0022.
@@ -1184,6 +1268,11 @@ func (o *indexOnlyScanOp) lookupKey() ([]byte, bool, error) {
 }
 
 func (o *indexOnlyScanOp) lookupRangeBounds() (lo, hi []byte, ok bool, err error) {
+	// M0148-0001c3a2: contradictory NullTest quals match nothing, as in
+	// indexRangeBounds (sibling paths).
+	if optimizer.NullTestsContradict(o.plan.LeadingNullTest, o.plan.ExtraNullTests) {
+		return nil, nil, false, nil
+	}
 	col, found := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[0])
 	if !found {
 		return nil, nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(),
@@ -1233,10 +1322,30 @@ func (o *indexOnlyScanOp) lookupRangeBounds() (lo, hi []byte, ok bool, err error
 		loExcl, hiExcl = hiExcl, loExcl
 	}
 	lo, hi = vLo, vHi
+	// M0148-0001c3a: the NullTest index qual, exactly as indexRangeBounds
+	// applies it for the plain index scan (sibling paths): IS NULL is the
+	// NULL group (empty beside a value bound), IS NOT NULL the NULL stop.
+	if o.plan.LeadingNullTest == optimizer.IndexNullTestIsNull {
+		if o.plan.LowKey != nil || o.plan.HighKey != nil {
+			return nil, nil, false, nil
+		}
+		k, _, stop, nerr := o.ctx.nullStopRangeBound(o.plan.Index, nil, col, 0)
+		if nerr != nil {
+			return nil, nil, false, nerr
+		}
+		if !stop {
+			return nil, nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
+				"index-only scan: IS NULL index qual on index %q, which stores no NULL-keyed entries", o.plan.Index.Name)}
+		}
+		o.rangeLoExcl, o.rangeHiExcl, o.rangeBoundsSet = false, false, true
+		return k, o.ctx.compositeUpperBound(o.plan.Index, k), true, nil
+	}
+	notNullOnly := o.plan.LeadingNullTest == optimizer.IndexNullTestIsNotNull && vLo == nil && vHi == nil
 	// Same open-end NULL stop as the index scan (nullStopRangeBound), and
-	// only for a one-sided range: a bound-less index-only scan is a full scan
-	// and keeps every entry.
-	if (vLo == nil) != (vHi == nil) {
+	// only for a one-sided range — or an IS NOT NULL index qual: a
+	// bound-less index-only scan is otherwise a full scan and keeps every
+	// entry.
+	if (vLo == nil) != (vHi == nil) || notNullOnly {
 		k, atHigh, stop, nerr := o.ctx.nullStopRangeBound(o.plan.Index, nil, col, 0)
 		if nerr != nil {
 			return nil, nil, false, nerr
@@ -1251,4 +1360,51 @@ func (o *indexOnlyScanOp) lookupRangeBounds() (lo, hi []byte, ok bool, err error
 	}
 	o.rangeLoExcl, o.rangeHiExcl, o.rangeBoundsSet = loExcl, hiExcl, true
 	return lo, hi, true, nil
+}
+
+// trailingSAOPQual is IndexOnlyScan.TrailingSAOP as a predicate over the
+// scan's output row (M0148-0001c3a4 (i)): `col = ANY (elems)` AND each
+// column qual. nil when the scan has none. The planner files the array only
+// when its column is covered.
+func (o *indexOnlyScanOp) trailingSAOPQual() (optimizer.Expr, error) {
+	if rc := o.plan.RowCompare; rc != nil {
+		// M0148-0001c3a12: the row comparison over the covered columns.
+		out := o.plan.Output()
+		bad := false
+		pred, ok := optimizer.CloneExprReplacingColumnRefs(rc, func(cr *optimizer.ColumnRef) optimizer.Expr {
+			for i, sc := range out {
+				if sc.Name == cr.Name {
+					return &optimizer.ColumnRef{Index: i, Name: cr.Name, Type: sc.Type}
+				}
+			}
+			bad = true
+			return nil
+		})
+		if !ok || bad {
+			return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
+				"indexOnlyScanOp: row comparison column not covered by index %q", o.plan.Index.Name)}
+		}
+		return pred, nil
+	}
+	ts := o.plan.TrailingSAOP
+	if ts == nil {
+		return nil, nil
+	}
+	if len(o.plan.Index.Columns) < 2 {
+		return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
+			"indexOnlyScanOp: trailing ScalarArrayOp on single-column index %q", o.plan.Index.Name)}
+	}
+	col := o.plan.Index.Columns[1]
+	var ref *optimizer.ColumnRef
+	for i, sc := range o.plan.Output() {
+		if sc.Name == col {
+			ref = &optimizer.ColumnRef{Index: i, Name: col, Type: sc.Type}
+			break
+		}
+	}
+	if ref == nil {
+		return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
+			"indexOnlyScanOp: trailing ScalarArrayOp column %q is not covered by index %q", col, o.plan.Index.Name)}
+	}
+	return trailingSAOPPred(ref, ts), nil
 }

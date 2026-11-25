@@ -223,7 +223,7 @@ func decodeRecordXLog(stream []byte) ([]byte, int, error) {
 }
 
 // FormatSegmentName generates a PG-compatible WAL segment filename for
-// the given absolute segment number (segNo * DefaultSegmentSize = first byte
+// the given absolute segment number (segNo * WALSegmentSize() = first byte
 // of the segment), using TLI=1 (the bootstrap timeline). For multi-timeline
 // naming, use FormatSegmentNameTLI.
 // Mirrors XLogFilePath() in postgres/src/include/access/xlog_internal.h.
@@ -234,10 +234,7 @@ func FormatSegmentName(segNo uint64) string {
 // FormatSegmentNameTLI returns a PG-compatible WAL segment filename with the
 // given timeline ID. Mirrors XLogFilePath() with the caller-supplied TLI.
 func FormatSegmentNameTLI(segNo uint64, tli uint32) string {
-	totalBytes := segNo * uint64(DefaultSegmentSize)
-	logNo := uint32(totalBytes >> 32)
-	segInLog := uint32((totalBytes & 0xFFFFFFFF) / uint64(DefaultSegmentSize))
-	return fmt.Sprintf("%08X%08X%08X", tli, logNo, segInLog)
+	return XLogFileName(tli, segNo, WALSegmentSize())
 }
 
 // formatSegmentName is the legacy internal name for callers that always use
@@ -249,7 +246,7 @@ func formatSegmentName(segNo uint64) string {
 
 // parseSegmentName parses a PG-compatible WAL segment filename
 // (24 hex chars: TLI + LOG + SEG, each 8 hex digits) and returns
-// the absolute segment number such that segNo*DefaultSegmentSize equals
+// the absolute segment number such that segNo*WALSegmentSize() equals
 // the segment's first byte position. Returns false for non-WAL filenames.
 func parseSegmentName(name string) (uint64, bool) {
 	_, segno, ok := ParseXLogFileName(name, 0)

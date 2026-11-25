@@ -921,6 +921,9 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		for _, k := range n.Keys {
 			walkExprTree(k, visit)
 		}
+		for _, k := range n.SAOPKeys {
+			walkExprTree(k, visit)
+		}
 		if n.LowKey != nil {
 			walkExprTree(n.LowKey, visit)
 		}
@@ -1023,6 +1026,9 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		if n.Step != nil {
 			walkExprTree(n.Step, visit)
 		}
+		if n.Zone != nil {
+			walkExprTree(n.Zone, visit)
+		}
 	case *FromUnnest:
 		walkExprTree(n.ArrExpr, visit)
 	case *PgInputErrorInfo:
@@ -1093,6 +1099,7 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 			walkExprTree(sc.Start, visit)
 			walkExprTree(sc.Stop, visit)
 			walkExprTree(sc.Step, visit)
+			walkExprTree(sc.Zone, visit)
 		}
 		for _, rc := range n.RegexpMatchesCols {
 			walkExprTree(rc.StringExpr, visit)
@@ -3682,7 +3689,7 @@ func liftResidualConjunctsWithOffset(residuals, innerOnly []Expr, outerSchema Sc
 			for i, a := range x.Args {
 				args[i] = rewriteIdx(a)
 			}
-			return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, ReturnType: x.ReturnType}
+			return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, ReturnType: x.ReturnType, Operator: x.Operator}
 		default:
 			return e
 		}

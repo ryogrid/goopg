@@ -74,7 +74,7 @@ func hashedSubPlanEnabled() bool { return !hashedSubPlanForceLinear.Load() }
 //     / row / array normalisations are ORDERING helpers that the
 //     equality path never reaches.
 //   - hashFamBytes / hashFamBool / hashFamTime: exact-value kinds whose
-//     datumKey is injective (Time uses UnixNano; compareEq uses
+//     datumKey is injective (Time uses the carrier; compareEq uses
 //     Time.Equal — same instant relation).
 //
 // Everything else (enum-vs-string label coercion, int-vs-string

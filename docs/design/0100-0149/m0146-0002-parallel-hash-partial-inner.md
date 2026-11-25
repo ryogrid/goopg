@@ -124,6 +124,16 @@ As designed, plus what the implementation surfaced:
   from the group, but the leader waits on its statement context. The barrier
   also selects on the group's `Done`, or a leader would wait forever on a
   worker that died.
+- **A completed build beats the group's end** \(2026\-11\-18,
+  AI\-20261115\-011812\-001\). The group's context ends on failure, on an early
+  Close, and also when `ParallelGroup.Wait` has joined workers that all
+  succeeded. A leader slower than the workers, or alone because no worker was
+  launched, reached `wait()` with both channels closed, and `select` chose at
+  random, so a healthy query could fail with `build abandoned`. `wait()` now
+  checks `done` first and again after seeing the group end. The abandoned error
+  remains for builds that cannot complete, and
+  `parallelLeaderOpenError` replaces it with the group's first failure, so the
+  client sees the worker's error.
 - **Deferred arrival.** An attached participant always calls `finish`, even
   when its build panics. Otherwise the others wait for an arrival that never
   comes.

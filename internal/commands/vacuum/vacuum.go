@@ -292,7 +292,7 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 				// (FPI) for test harnesses without WAL.
 				if logFrz := pool.LogHeapFreeze(); logFrz != nil {
 					if err := pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-						return logFrz(rel, blk, fs.FrozenSlots)
+						return logFrz(rel, blk, page, fs.FrozenSlots)
 					}); err != nil {
 						slot.Unlock()
 						pool.Unpin(slot)

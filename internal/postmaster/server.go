@@ -58,6 +58,7 @@ import (
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/port/gls"
 	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/utils/mmgr"
@@ -226,6 +227,9 @@ type Config struct {
 	// pg_last_wal_replay_lsn (0 = none, returned as NULL).
 	RecoveryLSNs func() (receive, replay uint64)
 
+	// RecoveryPause is the standby's replay pause control (M0149-0013).
+	RecoveryPause func(action string) (state string, promoteTriggered bool)
+
 	// OnStopImmediate, when set, is invoked by the control-plane
 	// STOPIMMEDIATE command (`goopg stop -mode immediate`) BEFORE the
 	// run context is cancelled. It must mark the runtime so the final
@@ -241,6 +245,14 @@ type Config struct {
 	// full_page_writes from the registry to the live runtime after a config
 	// reload (parity bundle D-2).
 	ApplyCheckpointGUCs func()
+	// ShutdownCheckpoint, when set, writes the final shutdown checkpoint.
+	// Run calls it on a non-immediate shutdown after the regular backends
+	// have exited and before the walsenders finish, so standbys receive
+	// the checkpoint record (M0149-0015).
+	ShutdownCheckpoint func()
+	// RecoveredPrepared are the prepared transactions the runtime restored
+	// at startup; COMMIT/ROLLBACK PREPARED can finish them (M0149-0015a).
+	RecoveredPrepared []initdb.RecoveredPrepared
 
 	// AutovacuumLauncher, when set, is started as a background
 	// goroutine during Run. nil disables autovacuum.
@@ -368,7 +380,18 @@ type Server struct {
 	addr     atomic.Pointer[net.TCPAddr]
 
 	connWG        sync.WaitGroup
-	nextPID       atomic.Uint32
+	// walsndConnWG counts connections that became walsenders: they leave
+	// connWG so a shutdown can wait for the regular backends, write the
+	// shutdown checkpoint, and only then let the walsenders finish
+	// (PM_SHUTDOWN → PM_SHUTDOWN_2). walsndStopping is closed after the
+	// shutdown checkpoint; walsndHardCtx is cancelled once they are done
+	// (or at once on an immediate stop) and closes their connections.
+	walsndConnWG     sync.WaitGroup
+	walsndStopping   chan struct{}
+	walsndStopOnce   sync.Once
+	walsndHardCtx    context.Context
+	walsndHardCancel context.CancelFunc
+	nextPID          atomic.Uint32
 	nextBackendID atomic.Uint32
 	closeOnce     sync.Once
 
@@ -448,6 +471,7 @@ func New(cfg Config) *Server {
 		roles:         map[string]struct{}{"postgres": {}},
 		notify:        newNotifyHub(),
 		preparedXacts: newPreparedXactStore(),
+		walsndStopping: make(chan struct{}),
 		logStmtLevel:  lvl,
 	}
 	if !ok {
@@ -544,6 +568,7 @@ func New(cfg Config) *Server {
 			WALSegmentSize: cfg.WALSegmentSize,
 			SystemID:       cfg.SystemID,
 			Timeline:       cfg.Timeline,
+			Stopping:       s.walsndStopping,
 		},
 		s.writeQueryError,
 		backup.NewHandler(backup.Config{
@@ -551,8 +576,13 @@ func New(cfg Config) *Server {
 			WAL:            cfg.WAL,
 			WALSegmentSize: cfg.WALSegmentSize,
 			Checkpointer:   cfg.Checkpointer,
+			IsStandby:      func() bool { return s.cfg.IsStandby != nil && s.cfg.IsStandby() },
 		}, s.writeQueryError),
 	)
+	for _, rp := range cfg.RecoveredPrepared {
+		s.preparedXacts.putRecovered(rp)
+	}
+	s.walsndHardCtx, s.walsndHardCancel = context.WithCancel(context.Background())
 	return s
 }
 
@@ -737,6 +767,8 @@ func (s *Server) Run(ctx context.Context) error {
 		s.connWG.Wait()
 	}
 
+	s.finishWalsenders()
+
 	s.cfg.Logger.Info("goopg listener stopped")
 	if errors.Is(runCtx.Err(), context.Canceled) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		return nil
@@ -793,6 +825,21 @@ func (s *Server) startControlPlane(runCtx context.Context, runCancel context.Can
 	cl.OnStopImmediate = func() error {
 		s.StopImmediate("control: immediate stop requested")
 		return nil
+	}
+	// The postmaster's PM status as canAcceptConnections sees it: a
+	// standby is "starting" until hot standby begins (PM_RECOVERY →
+	// PM_HOT_STANDBY at consistency, "database system is ready to accept
+	// read-only connections"), "standby" with hot_standby = off. M0149-0021a.
+	cl.PMStatus = func() string {
+		if s.cfg.IsStandby != nil && s.cfg.IsStandby() {
+			if s.cfg.HotStandbyDisabled {
+				return "standby"
+			}
+			if s.cfg.HotStandbyConsistent != nil && !s.cfg.HotStandbyConsistent() {
+				return "starting"
+			}
+		}
+		return "ready"
 	}
 	cl.OnReload = func() error {
 		s.cfg.Logger.Info("control: reload requested")
@@ -858,6 +905,7 @@ func (s *Server) StopImmediate(reason string) {
 	}
 	s.shutdownDeadline = 0
 	s.immediateStopping.Store(true)
+	s.walsndHardCancel()
 	if cancel := s.runCancel.Load(); cancel != nil {
 		(*cancel)()
 	}
@@ -1009,10 +1057,67 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) error {
 			return fmt.Errorf("accept: %w", err)
 		}
 		s.connWG.Add(1)
+		tr := &connTrack{s: s}
 		go func() {
-			defer s.connWG.Done()
-			s.serveConn(ctx, conn)
+			defer tr.done()
+			s.serveConn(context.WithValue(ctx, connTrackKey{}, tr), conn)
 		}()
+	}
+}
+
+// connTrack moves a connection from connWG to walsndConnWG once its
+// startup packet makes it a walsender. It rides on serveConn's context.
+type connTrack struct {
+	s         *Server
+	once      sync.Once
+	walsender atomic.Bool
+}
+
+type connTrackKey struct{}
+
+// becomeWalsender is a no-op on a nil tracker (a test calling serveConn
+// directly).
+func (t *connTrack) becomeWalsender() {
+	if t == nil {
+		return
+	}
+	t.once.Do(func() {
+		t.s.walsndConnWG.Add(1)
+		t.walsender.Store(true)
+		t.s.connWG.Done()
+	})
+}
+
+func (t *connTrack) done() {
+	if t.walsender.Load() {
+		t.s.walsndConnWG.Done()
+		return
+	}
+	t.once.Do(func() { t.s.connWG.Done() })
+}
+
+// finishWalsenders is the walsender half of a shutdown: after the regular
+// backends have gone, write the shutdown checkpoint (unless this is an
+// immediate stop), let the walsenders send it and confirm (WalSndDone),
+// then close their connections.
+func (s *Server) finishWalsenders() {
+	if !s.immediateStopping.Load() && s.cfg.ShutdownCheckpoint != nil {
+		s.cfg.ShutdownCheckpoint()
+	}
+	s.walsndStopOnce.Do(func() { close(s.walsndStopping) })
+	if s.replHandler != nil && !s.immediateStopping.Load() {
+		s.replHandler.WaitStreams(30 * time.Second)
+	}
+	s.walsndHardCancel()
+	done := make(chan struct{})
+	go func() {
+		s.walsndConnWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		s.cfg.Logger.Warn("walsender connections still open after shutdown")
 	}
 }
 
@@ -1052,15 +1157,31 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		}
 	}()
 
-	connCtx, cancel := context.WithCancel(ctx)
+	// connCtx does not inherit the server's cancellation directly: the
+	// watcher below forwards it, except for a walsender, which stays up
+	// until finishWalsenders releases it.
+	connCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancel()
 
 	// Cancel the connection context when the parent ctx is cancelled. Closing
 	// the conn nudges the goroutine out of any blocking read.
 	stopWatcher := make(chan struct{})
 	defer close(stopWatcher)
+	tr, _ := ctx.Value(connTrackKey{}).(*connTrack)
 	go func() {
 		select {
+		case <-ctx.Done():
+			// A walsender outlives the server's shutdown request: it ends
+			// once it has sent the shutdown checkpoint (finishWalsenders).
+			if tr != nil && tr.walsender.Load() {
+				select {
+				case <-s.walsndHardCtx.Done():
+				case <-stopWatcher:
+					return
+				}
+			}
+			cancel()
+			_ = raw.SetDeadline(time.Now().Add(50 * time.Millisecond))
 		case <-connCtx.Done():
 			_ = raw.SetDeadline(time.Now().Add(50 * time.Millisecond))
 		case <-stopWatcher:
@@ -1131,6 +1252,7 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	}
 	if isReplication {
 		logger = logger.With("replication", true)
+		tr.becomeWalsender()
 	}
 	logger = logger.With("user", user, "application_name", app)
 
@@ -1386,6 +1508,12 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	// dumping ALL subscriptions (DU-002 slice 423).
 	if isSuperuserRoleName(user) {
 		_ = sess.SetInternal("is_superuser", "on")
+	}
+	// in_hot_standby (GUC_REPORT): on while the server is a hot standby,
+	// which is what libpq's target_session_attrs reads from the startup
+	// ParameterStatus block to tell a standby from a primary. M0149-0077b.
+	if s.cfg.IsStandby != nil && s.cfg.IsStandby() {
+		_ = sess.SetInternal("in_hot_standby", "on")
 	}
 
 	// Apply generic startup-packet GUC settings. These values are the
@@ -1760,6 +1888,14 @@ func (s *Server) cleanupSessionTempObjects(sess *misc.SessionRegistry) {
 
 func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw net.Conn, r *libpq.FrameReader, w *libpq.FrameWriter, sess *misc.SessionRegistry, logger *slog.Logger, isReplication, replDatabase bool, appName, dbName string, sessCtx *mmgr.Context, pid uint32, procNum int32, loginUser string) {
 	extended := newExtendedState()
+	// do_pg_abort_backup at backend exit: a session that called
+	// pg_backup_start and disconnects without pg_backup_stop ends its backup
+	// (the ProcArray slot is reused by the next connection). M0149-0077k.
+	defer func() {
+		if executor.AbortSessionBackup(procNum) {
+			logger.Warn("aborting backup due to backend exiting before pg_backup_stop was called")
+		}
+	}()
 	// procNum is the connection-lifetime ProcArray slot acquired by
 	// serveConn via mvcc.AcquireConnSlot (M0107-0004; the slot is reused
 	// across all transactions on this connection; Begin clears and
@@ -1829,7 +1965,8 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 	// SHARE) held on the executor's tableLockMgr surface in pg_locks with a PID
 	// that joins pg_stat_activity (design 0118-0070). Dropped at teardown.
 	executor.RegisterLockBackendPID(connTx.LockBackendID, pid)
-	defer executor.UnregisterLockBackendPID(connTx.LockBackendID)
+	// A closure: PREPARE TRANSACTION gives the connection a new identity.
+	defer func() { executor.UnregisterLockBackendPID(connTx.LockBackendID) }()
 	// On connection teardown, release EVERY advisory lock this backend still
 	// holds — session-scoped as well as transaction-scoped. PostgreSQL frees all
 	// advisory locks at backend exit; without this a session-scoped
@@ -1946,7 +2083,21 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 				// connection's dbName down so the logical walsender can scope
 				// every catalog lookup to the slot's database instead of the
 				// DefaultDBOid fallback (DB 1).
-				handled, err := s.replHandler.HandleCommand(ctx, r, w, f.Payload, appName, dbName, replDatabase)
+				// exec_replication_command: pgstat_report_activity(STATE_RUNNING,
+				// cmd_string), so pg_stat_activity shows the walsender's
+				// command while it runs (M0149-0077l).
+				if reg := s.cfg.Activity; reg != nil {
+					if q, qerr := extractCString(f.Payload); qerr == nil {
+						if len(q) > 1024 {
+							q = q[:1024]
+						}
+						reg.UpdateState(procNum, "active", q)
+					}
+				}
+				handled, err := s.replHandler.HandleCommand(ctx, queryCtx, r, w, f.Payload, appName, dbName, replDatabase, procNum, int32(pid))
+				if reg := s.cfg.Activity; reg != nil && (handled || err != nil) {
+					reg.UpdateState(procNum, "idle", "")
+				}
 				if err != nil {
 					entry.clearQueryCancel()
 					queryCancel()
@@ -2010,6 +2161,18 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 				return
 			}
 			copyIn = nextCopyIn
+		case msgFunctionCall:
+			// Fast-path function call (PostgresMain's PqMsg_FunctionCall arm;
+			// libpq PQfn, used by the lo_* client API). See fastpath.go.
+			queryCtx, queryCancel := context.WithCancel(ctx)
+			entry.setQueryCancel(queryCancel)
+			ferr := s.handleFunctionCall(queryCtx, r, w, sess, f.Payload, connTx, prepStmts)
+			entry.clearQueryCancel()
+			queryCancel()
+			if ferr != nil {
+				logger.Info("function call write error", "err", ferr)
+				return
+			}
 		case libpq.MsgParse:
 			em := s.handleParseFrame(extended, f.Payload)
 			if em != nil {

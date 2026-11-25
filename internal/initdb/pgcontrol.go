@@ -29,6 +29,7 @@ import (
 
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/access/transam/control"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // pgControlFile is the path (relative to the data directory) for the
@@ -51,6 +52,15 @@ const (
 
 	// Bootstrap values from BootStrapXLOG (xlog.c:5115-5132).
 	pgFirstNormalXID = uint64(3)     // FirstNormalTransactionId
+	// pgInitdbNextXID is the NextXID a PG 18.3 initdb leaves in pg_control:
+	// BootStrapXLOG starts at FirstNormalTransactionId, and initdb's
+	// post-bootstrap steps commit transactions up to 751. goopg's init has no
+	// post-bootstrap transactions, but a cluster that has never assigned a
+	// normal xid is a state PG never runs in: its XLOG_RUNNING_XACTS would
+	// carry latestCompletedXid = nextXid - 1 = 2, which a PG 18.3 standby
+	// rejects (TransactionIdIsNormal assertion in
+	// ProcArrayApplyRecoveryInfo). M0149-0010b.
+	pgInitdbNextXID = uint64(752)
 	pgFirstGenbkiOID = uint32(10000) // FirstGenbkiObjectId
 	pgFirstMultiXact = uint32(1)     // FirstMultiXactId
 	pgTemplate1DbOID = uint32(1)     // Template1DbOid
@@ -175,16 +185,19 @@ func BackupControlImage(dataDir string, redoLSN, ckptRecordLSN uint64, tli uint3
 		cd.CheckPointCopyThisTLI = tli
 		cd.CheckPointCopyPrevTLI = tli
 		cd.CheckPointCopyFullPageWrites = true
-		// minRecoveryPoint must be non-zero so CheckRecoveryConsistency
-		// doesn't bail out immediately (XLogRecPtrIsInvalid(0) returns true).
-		// Its timeline must be the live one too, or PG FATALs "requested
-		// timeline %u does not contain minimum recovery point"
-		// (xlogrecovery.c:878-886).
-		cd.MinRecoveryPoint = 1
-		cd.MinRecoveryPointTLI = tli
-		// backupEndPoint = redo LSN so ReachedEndOfBackup() is satisfied
-		// after the first WAL record (the checkpoint) has been replayed.
-		cd.BackupEndPoint = lsn0
+		// No minimum recovery point and no backup end, as in the live
+		// pg_control basebackup.c sends: the restoring server raises
+		// minRecoveryPoint to the checkpoint's redo itself (InitWalRecovery,
+		// archive recovery), and backup_label's "BACKUP METHOD: streamed"
+		// makes it wait for the XLOG_BACKUP_END record BASE_BACKUP writes at
+		// stop (backupEndRequired). Pre-setting backupEndPoint = redo made a
+		// standby consistent before replaying anything, which a
+		// recovery_target = 'immediate' standby trips over (M0149-0023d).
+		cd.MinRecoveryPoint = 0
+		cd.MinRecoveryPointTLI = 0
+		cd.BackupEndPoint = 0
+		cd.BackupStartPoint = 0
+		cd.BackupEndRequired = false
 	})
 }
 
@@ -212,13 +225,13 @@ func buildPgControl(systemID uint64, now time.Time, cfg *misc.Registry, dataChec
 	le.PutUint64(hdr[24:], uint64(now.Unix()))
 	// checkPoint (XLogRecPtr): offset 32.
 	// Initial LSN is wal_segment_size + SizeOfXLogLongPHD = 0x01000028.
-	le.PutUint64(hdr[32:], pgInitCheckpointLSN)
+	le.PutUint64(hdr[32:], initCheckpointLSN())
 
 	// checkPointCopy (CheckPoint struct, 88 bytes): offset 40..128.
 	// Mirrors BootStrapXLOG (xlog.c:5115-5132).
 
 	// offset 40: CheckPoint.redo (XLogRecPtr)
-	le.PutUint64(hdr[40:], pgInitCheckpointLSN)
+	le.PutUint64(hdr[40:], initCheckpointLSN())
 	// offset 48: CheckPoint.ThisTimeLineID (uint32) — BootstrapTimeLineID=1
 	le.PutUint32(hdr[48:], 1)
 	// offset 52: CheckPoint.PrevTimeLineID (uint32) — BootstrapTimeLineID=1
@@ -228,8 +241,8 @@ func buildPgControl(systemID uint64, now time.Time, cfg *misc.Registry, dataChec
 	// offset 57-59: padding (zero)
 	// offset 60: CheckPoint.wal_level (int) — live GUC
 	le.PutUint32(hdr[60:], walLevelInt(cfg))
-	// offset 64: CheckPoint.nextXid (FullTransactionId=uint64) — FirstNormalTransactionId=3
-	le.PutUint64(hdr[64:], pgFirstNormalXID)
+	// offset 64: CheckPoint.nextXid (FullTransactionId=uint64) — PG 18.3 initdb's 752
+	le.PutUint64(hdr[64:], pgInitdbNextXID)
 	// offset 72: CheckPoint.nextOid (Oid=uint32) — FirstGenbkiObjectId=10000
 	le.PutUint32(hdr[72:], pgFirstGenbkiOID)
 	// offset 76: CheckPoint.nextMulti (MultiXactId=uint32) — FirstMultiXactId=1
@@ -297,8 +310,9 @@ func buildPgControl(systemID uint64, now time.Time, cfg *misc.Registry, dataChec
 	le.PutUint32(hdr[220:], 131072)
 	// xlog_blcksz (uint32): offset 224
 	le.PutUint32(hdr[224:], 8192)
-	// xlog_seg_size (uint32): offset 228 — 16 MiB
-	le.PutUint32(hdr[228:], 16*1024*1024)
+	// xlog_seg_size (uint32): offset 228 — wal_segment_size (initdb
+	// --wal-segsize; 16 MiB by default)
+	le.PutUint32(hdr[228:], uint32(xlog.WALSegmentSize()))
 	// nameDataLen (uint32): offset 232
 	le.PutUint32(hdr[232:], 64)
 	// indexMaxKeys (uint32): offset 236
@@ -334,4 +348,11 @@ func buildPgControl(systemID uint64, now time.Time, cfg *misc.Registry, dataChec
 	le.PutUint32(hdr[pgControlCRCOffset:], crc)
 
 	return file
+}
+
+// initCheckpointLSN is the bootstrap checkpoint's LSN at the cluster's
+// segment size: segment 1's first byte plus the long page header
+// (pgInitCheckpointLSN at the default 16 MiB).
+func initCheckpointLSN() uint64 {
+	return uint64(xlog.WALSegmentSize()) + 40
 }

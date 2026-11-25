@@ -1,7 +1,9 @@
 # M0148 — pg_regress coverage closure with prerequisite implementation
 
 **Filed:** 2026-10-29 (owner decision)
-**Status:** planned — banner item 10 after the already-filed M0122 queue
+**Status:** planned — banner item 10 after the already-filed M0122 queue and
+after M0149 (paused while M0149 has a selectable task; owner decision
+2026-11-15)
 **Coverage authority:** `docs/test-port/postgres-oracle-target-inventory.csv`
 **Readable roll-up:** `docs/test-port/upstream-regress-coverage.md`
 **Runner:** `scripts/pg-regress-runner.sh`

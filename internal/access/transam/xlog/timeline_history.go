@@ -23,6 +23,7 @@ package xlog
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -193,4 +194,98 @@ func parseHistoryLSN(s string) (uint64, error) {
 		return 0, fmt.Errorf("invalid LSN %q: %w", s, err)
 	}
 	return (hi << 32) | lo, nil
+}
+
+// ReplayTimelineAt is the timeline whose WAL recovery reads at lsn when it
+// started on base and pg_wal holds newer timelines' history files
+// (expectedTLEs with recovery_target_timeline = latest): the newest timeline
+// that has a segment covering lsn and whose history descends from base. A
+// standby that streamed onto a newer timeline, was restarted, and replayed
+// that timeline's segments from its own pg_wal is on that timeline even
+// though its timeline_id file still names base; base when no newer timeline
+// qualifies. M0149-0016.
+func ReplayTimelineAt(walDir string, lsn uint64, segSize int64, base uint32) uint32 {
+	if segSize <= 0 {
+		return base
+	}
+	segno := lsn / uint64(segSize)
+	for t := FindNewestTimeline(walDir, base); t > base; t-- {
+		if _, err := os.Stat(filepath.Join(walDir, XLogFileName(t, segno, segSize))); err != nil {
+			continue
+		}
+		hist, err := ReadHistory(walDir, t)
+		if err != nil {
+			continue
+		}
+		for _, e := range hist {
+			if e.TLI == base {
+				return t
+			}
+		}
+	}
+	return base
+}
+
+// LatestLocalTimeline is recoveryTargetTLI = latest for a standby's own
+// pg_wal at startup: the newest timeline that has at least one segment there
+// and whose history descends from base. A standby that streamed onto its
+// primary's newer timeline before stopping resumes replay — and writes — on
+// that timeline, although its timeline_id file still names base. M0149-0016.
+func LatestLocalTimeline(walDir string, base uint32) uint32 {
+	entries, err := os.ReadDir(walDir)
+	if err != nil {
+		return base
+	}
+	has := map[uint32]bool{}
+	for _, e := range entries {
+		if tli, _, ok := ParseXLogFileName(e.Name(), 0); ok {
+			has[tli] = true
+		}
+	}
+	for t := FindNewestTimeline(walDir, base); t > base; t-- {
+		if !has[t] {
+			continue
+		}
+		hist, err := ReadHistory(walDir, t)
+		if err != nil {
+			continue
+		}
+		for _, e := range hist {
+			if e.TLI == base {
+				return t
+			}
+		}
+	}
+	return base
+}
+
+// FindNewestTimelineArchive is findNewestTimeLine under archive recovery
+// (timeline.c): starting after start, a timeline exists when its history
+// file can be restored from the archive into RECOVERYHISTORY
+// (existsTimeLineHistory → RestoreArchivedFile), or — restore_command unset
+// or the archive without it — when pg_wal has it. The newest one found is
+// returned; a promotion takes the next. Without the archive probe a
+// standby fed only from the archive could not see that a sibling had
+// already promoted onto start+1 and reused it (M0149-0018c).
+func FindNewestTimelineArchive(ctx context.Context, walDir, restoreCommand, lastRestartPointFname string, start uint32) uint32 {
+	newest := start
+	for probe := start + 1; probe != 0; probe++ {
+		name := TimelineHistoryFileName(probe)
+		exists := false
+		if restoreCommand != "" {
+			if err := RestoreArchivedFileTemp(ctx, restoreCommand, walDir, name, RecoveryHistoryName, lastRestartPointFname); err == nil {
+				exists = true
+			}
+		}
+		if !exists {
+			if _, err := os.Stat(filepath.Join(walDir, name)); err == nil {
+				exists = true
+			}
+		}
+		if !exists {
+			break
+		}
+		newest = probe
+	}
+	return newest
 }

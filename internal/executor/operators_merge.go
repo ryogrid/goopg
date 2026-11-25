@@ -84,6 +84,9 @@ func (o *mergeOp) Schema() optimizer.Schema { return o.plan.ReturningSchema }
 func (o *mergeOp) RowsAffected() int64   { return o.rowsAffected }
 
 func (o *mergeOp) Open(ctx *Context) error {
+	if err := preventCommandDuringRecovery(ctx, "MERGE"); err != nil {
+		return err
+	}
 	o.ctx = ctx
 	return nil
 }

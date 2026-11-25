@@ -133,6 +133,39 @@ func (s *SubtransSLRU) SetParent(xid, parent storage.TransactionID) error {
 	return f.Sync()
 }
 
+// ExtendForXID is subtrans.c ExtendSUBTRANS: when newestXact is the first
+// XID of a pg_subtrans page (or FirstNormalTransactionId), the page is
+// zeroed (ZeroSUBTRANSPage), extending the segment file to cover it.
+// GetNewTransactionId calls it for every XID it hands out, top-level or
+// subtransaction, so the SLRU always holds a page for every assigned XID
+// even when no subtransaction ever writes there. PG zeroes the page in a
+// shared buffer and writes it at the next checkpoint; goopg's SLRU is
+// write-through, so the page reaches the file at once. M0149-0016c.
+func (s *SubtransSLRU) ExtendForXID(newestXact storage.TransactionID) error {
+	if uint64(newestXact)%subtransXactsPerPage != 0 && newestXact != FirstNormalTransactionID {
+		return nil
+	}
+	segNo, _ := subtransLocate(newestXact)
+	pageInSeg := (uint64(newestXact) % subtransXactsPerSegment) / subtransXactsPerPage
+	pageOff := int64(pageInSeg) * int64(storage.BlockSize)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	segPath := filepath.Join(s.dir, fmt.Sprintf("%04X", segNo))
+	f, err := os.OpenFile(segPath, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return fmt.Errorf("subtrans slru: open %q: %w", segPath, err)
+	}
+	defer f.Close()
+	if _, err := f.WriteAt(make([]byte, storage.BlockSize), pageOff); err != nil {
+		return fmt.Errorf("subtrans slru: zero page %d of %q: %w", pageInSeg, segPath, err)
+	}
+	if s.fsyncDisabled.Load() {
+		return nil
+	}
+	return f.Sync()
+}
+
 // GetParent returns the recorded parent TransactionId for xid, or
 // storage.InvalidTransactionID (0) when xid has no entry (never registered,
 // out of range, or below FirstNormalTransactionID). Reads the 4-byte

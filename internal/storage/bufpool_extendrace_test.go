@@ -31,7 +31,7 @@ func TestPinNewLosingExtenderDoesNotKeepDuplicateSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rel := RelFileNode{DBOid: 1, RelOid: 7301, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 7301, Fork: MainFork} // not the postgres sentinel 1, which StorageDBOid maps to 5
 
 	// Block 0 first, so the raced extend produces the predictable block 1.
 	first, blk0, err := pool.PinNew(rel)

@@ -1034,15 +1034,21 @@ func assertNailedSystemViewsAreEvaluable(t *testing.T, pg *pgcluster.Cluster, go
 // it only via a folded ::regclass Const, so nothing resolves the name at run
 // time, and goopg has no large-object subsystem). It is a real PG catalog, so
 // it still distinguishes "goopg seeded it" from "a hosted PG resolves it
-// ambiently", and its absence is permanent — the tripwire now guards the
-// evaluability probe's non-vacuity rather than any future adoption.
+// ambiently". M0149-0001g slice 30 then bootstrapped pg_largeobject too, so
+// the probe asserts it readable and trips on a name that exists in neither
+// system — the tripwire now guards only the evaluability probe's non-vacuity.
 func assertNonCorpusSystemViewIsStillAbsent(t *testing.T, pg *pgcluster.Cluster) {
 	t.Helper()
-	// Re-pointed from information_schema.element_types (adopted by M0133-S4
-	// tranche 4) to pg_catalog.pg_largeobject (2613) — the one pg_catalog
-	// catalog goopg deliberately never bootstraps. No pg_class row is seeded
-	// for 2613, so it must fail QUIETLY with 42P01 "does not exist".
-	const view = "pg_catalog.pg_largeobject"
+	// M0149-0001g slice 30 bootstrapped pg_catalog.pg_largeobject (2613), the
+	// last PG catalog goopg had not seeded, so there is no genuinely-absent PG
+	// relation left. Its adoption is asserted positively here, and the
+	// tripwire re-points to a relation name that exists in neither system: a
+	// hosted PG must still fail it QUIETLY with 42P01, which keeps the
+	// evaluability probe above non-vacuous.
+	if out, err := pgQueryScalarAllowError(pg, "SELECT count(*) FROM pg_catalog.pg_largeobject"); err != nil || strings.TrimSpace(out) != "0" {
+		t.Errorf("hosted PG cannot read the bootstrapped, empty pg_catalog.pg_largeobject (slice 30): err=%v out=%q", err, out)
+	}
+	const view = "pg_catalog.pg_goopg_absent_relation"
 	out, err := pgQueryScalarAllowError(pg, "SELECT * FROM "+view+" LIMIT 0")
 	if err == nil {
 		t.Errorf("hosted PG evaluated %s, which is NOT in the on-disk corpus "+

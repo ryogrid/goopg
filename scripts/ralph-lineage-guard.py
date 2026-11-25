@@ -120,9 +120,12 @@ NEWID_RE = re.compile(r"^(M01(3[7-9]|4[0-7])|P0-)")
 # regress-suite diff lines are a real measured instrument — correctness
 # families whose work moves only regress diffs were tripping Rule A as
 # structural `none`s). `lever-count` (scripts/lever-count.sh) is the M0147
-# lever-retirement instrument (owner decision 2026-10-21).
+# lever-retirement instrument (owner decision 2026-10-21). `tap` is the M0149
+# TAP-port instrument: upstream assertions passing in the ported test's
+# all-goopg + mixed PG 18.3 runs, e.g. `tap 034_create_database 3/12→7/12`
+# (owner decision 2026-11-15).
 MOVE_YES_RE = re.compile(r"(?:^|\s)Movement:\s*yes", re.I)
-INSTRUMENT_RE = re.compile(r"\bmatch\b|CATEGORIES-EXCL-MATCH|\bea-ratchet\b|\bregress\b|\blever-count\b", re.I)
+INSTRUMENT_RE = re.compile(r"\bmatch\b|CATEGORIES-EXCL-MATCH|\bea-ratchet\b|\bregress\b|\blever-count\b|\btap\b", re.I)
 NUMBER_RE = re.compile(r"[0-9]")
 
 

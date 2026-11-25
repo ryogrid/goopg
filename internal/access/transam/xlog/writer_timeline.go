@@ -226,3 +226,53 @@ func (w *Writer) ReopenSegmentFiles() error {
 	clear(s.dirty)
 	return nil
 }
+
+// StartAt moves a writer that has written nothing to pos, a segment
+// boundary, so the next byte appended lands at pos. A data directory
+// restored from a low-level backup has an empty pg_wal: its WAL begins at
+// the backup's redo segment, which archive recovery restores, and the
+// writer must take those bytes at their own position rather than at 0.
+//
+// Precondition as SwitchTimeline's: nothing appends concurrently.
+func (w *Writer) StartAt(pos uint64) error {
+	s := w.stateRef
+	if s == nil {
+		return ErrClosed
+	}
+	if written := w.WrittenLSN(); written != 0 {
+		return fmt.Errorf("wal: start at %X: the writer has already written up to %X", pos, written)
+	}
+	if pos%uint64(s.cfg.SegmentSize) != 0 {
+		return fmt.Errorf("wal: start at %X: not a segment boundary", pos)
+	}
+	s.eagerWG.Wait()
+	s.writeMu.lock()
+	defer s.writeMu.release()
+	s.appendMu.Lock()
+	defer s.appendMu.Unlock()
+
+	s.writePos = int64(pos)
+	s.memRing.ResetToPos(int64(pos))
+	s.writeLSN, s.drainedLSN, s.flushedLSN = pos, pos, pos
+	if s.writeLSNMirror != nil {
+		s.writeLSNMirror.Store(pos)
+	}
+	if s.drainedLSNMirror != nil {
+		s.drainedLSNMirror.Store(pos)
+	}
+	if s.flushedLSNMirror != nil {
+		s.flushedLSNMirror.Store(pos)
+	}
+	if s.walBuf != nil {
+		s.walBuf.reset(int64(pos))
+	}
+	s.prevRecPtr = 0
+	s.core.resetPosition(pos, 0)
+	s.core.resetPublished(int64(pos))
+	for segNo, f := range s.files {
+		_ = f.Close()
+		delete(s.files, segNo)
+	}
+	clear(s.dirty)
+	return nil
+}

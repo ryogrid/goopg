@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/goopg/goopg/internal/access/nbtree"
@@ -2158,9 +2159,34 @@ func replayRecordsFrom(mgr *storage.Manager, records []Record, redoLSN uint64, i
 		return stats, err
 	}
 
+	legacyEnd := legacyLayoutWALEnd.Load()
+	if legacyEnd != 0 {
+		defer storage.SetLegacyRedoDBOidMap(false)
+	}
 	for i, r := range records[startIdx:] {
 		if interrupted != nil && interrupted() {
 			return stats, fmt.Errorf("wal: replay stopped before record %d lsn %d: %w", startIdx+i, r.StartLSN, ErrRecoveryShutdown)
+		}
+		if err := verifyOverwriteContrecord(r); err != nil {
+			return stats, err
+		}
+		if legacyEnd != 0 {
+			// A record written before the M0149-0001a1 S3 layout migration
+			// names the old database directories (storage.StorageDBOid).
+			legacy := r.StartLSN < legacyEnd
+			storage.SetLegacyRedoDBOidMap(legacy)
+			if !legacy {
+				// First post-migration record (only after a crash inside
+				// the migration window): template1's legacy redo is done,
+				// so move it to base/1 before a record names base/1.
+				if hook := legacyLayoutBoundary; hook != nil {
+					if err := hook(); err != nil {
+						return stats, fmt.Errorf("wal: legacy layout boundary at lsn %d: %w", r.StartLSN, err)
+					}
+				}
+				legacyEnd = 0
+				storage.SetLegacyRedoDBOidMap(false)
+			}
 		}
 		applied, err := ApplyRecord(mgr, r)
 		if err != nil {
@@ -2171,6 +2197,23 @@ func replayRecordsFrom(mgr *storage.Manager, records []Record, redoLSN uint64, i
 		}
 	}
 	return stats, nil
+}
+
+// legacyLayoutWALEnd is the end of the WAL that existed when this cluster's
+// M0149-0001a1 S3 layout migration ran (0 = no legacy WAL to map). Records
+// starting below it are replayed with storage's pre-S3 database-OID mapping.
+var legacyLayoutWALEnd atomic.Uint64
+
+// legacyLayoutBoundary runs when startup redo reaches the first record at or
+// past legacyLayoutWALEnd (initdb's template1 base/2 → base/1 copy).
+var legacyLayoutBoundary func() error
+
+// SetLegacyLayoutWALEnd records the pre-S3 WAL end for startup redo and the
+// hook to run at the boundary (initdb.Open, before replay). lsn 0 disables
+// the legacy mapping.
+func SetLegacyLayoutWALEnd(lsn uint64, boundary func() error) {
+	legacyLayoutWALEnd.Store(lsn)
+	legacyLayoutBoundary = boundary
 }
 
 // ExportedReplayStart returns the start index (first post-checkpoint record)
@@ -2589,17 +2632,23 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// (see the xlogXactCommit arm above), which is the message set
 			// that actually became visible.
 			return false, nil
-		case xlogXactPrepare, xlogXactCommitPrepared, xlogXactAbortPrepared:
-			// M0131-S21a: two-phase commit is out of scope — goopg's
-			// max_prepared_transactions BootVal is "0", so it can neither
-			// produce these records nor rebuild the pg_twophase state a
-			// PREPARED transaction needs. Refuse with a message that names
-			// the reason: replaying the COMMIT_PREPARED of a transaction
-			// whose PREPARE we skipped would stamp an XID committed whose
-			// heap changes were never applied.
-			return false, fmt.Errorf("%w: %s (two-phase commit recovery is not supported; "+
-				"max_prepared_transactions must be 0 on a cluster goopg starts)",
-				ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
+		case xlogXactPrepare:
+			// xact_redo's PREPARE arm (PrepareRedoAdd) records the prepared
+			// transaction's state; it changes no page. The transaction's heap
+			// changes arrive as their own records and are already applied.
+			// M0149-0012: replayed as a no-op; goopg keeps no pg_twophase state
+			// for a primary's prepared transaction on a standby (ledger).
+			return false, nil
+		case xlogXactCommitPrepared:
+			// xact_redo_commit for the prepared xid: same page work as a
+			// commit; the CLOG stamp is the stream replayer's / recovery
+			// pass's, for the record's twophase xid. M0149-0012.
+			if xactCommitCarriesInvals(xlog.Header.Info, xlog.MainData) {
+				_ = ProcessCommittedInvalidationMessages(mgr.DataDir(), defaultRecoveryDBOid)
+			}
+			return false, dropXactRelFiles(mgr, xlog)
+		case xlogXactAbortPrepared:
+			return false, dropXactRelFiles(mgr, xlog)
 		default:
 			return false, unsupportedDecodedXLogOpcode(r)
 		}
@@ -2608,7 +2657,11 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 		case xlogSeqLog:
 			// B1.3b: rebuild the 1-tuple sequence page from the logged
 			// tuple (seq_redo analog; whole-page replace = idempotent).
-			if err := replayDecodedXLogSeqLog(mgr, xlog.MainData); err != nil {
+			fork := storage.MainFork
+			if b, ok := xlogBlockRefByID(xlog, 0); ok {
+				fork = b.Rel.Fork
+			}
+			if err := replayDecodedXLogSeqLog(mgr, xlog.MainData, fork); err != nil {
 				return false, err
 			}
 			return true, nil
@@ -2750,11 +2803,11 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// real PG standby's tblspc_redo does the same from the ts_path;
 			// goopg's own dirs persist on disk across restart, so this is a
 			// defensive MkdirAll for the basebackup-restore edge.
-			oid, _, err := decodeXLogTblspcCreate(xlog.MainData)
+			oid, location, err := decodeXLogTblspcCreate(xlog.MainData)
 			if err != nil {
 				return false, err
 			}
-			if err := applyTblspcCreate(mgr, oid); err != nil {
+			if err := applyTblspcCreate(mgr, oid, location); err != nil {
 				return false, err
 			}
 			return true, nil
@@ -3212,6 +3265,18 @@ func replayXLogParameterChange(mgr *storage.Manager, xlog *XLogDecodedRecord) (b
 	if len(data) < minPayload {
 		return false, fmt.Errorf("wal: XLOG_PARAMETER_CHANGE payload too short: %d bytes", len(data))
 	}
+	le := binary.LittleEndian
+	walLvl := le.Uint32(data[20:])
+	// xlog_redo: WAL generated with wal_level=minimal cannot be used for
+	// archive recovery — it lacks the data needed to reconstruct relations
+	// created or rewritten while it was minimal (M0149-0020).
+	if archiveRecoveryRequested.Load() && walLvl < 1 {
+		return false, &RecoveryFatalError{
+			Msg:    `WAL was generated with "wal_level=minimal", cannot continue recovering`,
+			Detail: `This happens if you temporarily set "wal_level=minimal" on the server.`,
+			Hint:   `Use a backup taken after setting "wal_level" to higher than "minimal".`,
+		}
+	}
 	if mgr == nil {
 		// No storage manager means no pg_control to update (e.g. test stubs).
 		return false, nil
@@ -3220,13 +3285,11 @@ func replayXLogParameterChange(mgr *storage.Manager, xlog *XLogDecodedRecord) (b
 	if dataDir == "" {
 		return false, nil
 	}
-	le := binary.LittleEndian
 	maxConn := le.Uint32(data[0:])
 	maxWorker := le.Uint32(data[4:])
 	maxWalSnd := le.Uint32(data[8:])
 	maxPrepared := le.Uint32(data[12:])
 	maxLocks := le.Uint32(data[16:])
-	walLvl := le.Uint32(data[20:])
 	walLogHints := data[24] != 0
 	trackCommitTS := data[25] != 0
 	if err := control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
@@ -6427,7 +6490,28 @@ func writeBlockOrExtend(mgr *storage.Manager, rel storage.RelFileNode, blk stora
 		}
 		return nil
 	default:
-		return fmt.Errorf("wal: replay gap block=%d nblocks=%d", blk, nblocks)
+		// XLogReadBufferExtended (xlogutils.c) zero-extends the fork up to
+		// a block past its end — the relation was extended on the primary
+		// without WAL (a PG primary's FPI routinely lands there) — and then
+		// installs the page. M0149-0010b.
+		zero := make(storage.Page, storage.BlockSize)
+		for b := nblocks; b < blk; b++ {
+			got, err := mgr.Extend(rel, zero)
+			if err != nil {
+				return err
+			}
+			if got != b {
+				return fmt.Errorf("wal: zero-extend returned block %d, want %d", got, b)
+			}
+		}
+		got, err := mgr.Extend(rel, page)
+		if err != nil {
+			return err
+		}
+		if got != blk {
+			return fmt.Errorf("wal: extend returned block %d, want %d", got, blk)
+		}
+		return nil
 	}
 }
 
@@ -6656,6 +6740,12 @@ func decodeXLogSmgrCreate(mainData []byte) (storage.RelFileNode, error) {
 // Shared by the native replaySmgrCreate and the A9 decoded
 // RmgrStorage/XLOG_SMGR_CREATE arm.
 func applySmgrCreate(mgr *storage.Manager, rel storage.RelFileNode) error {
+	if rel.Fork == storage.InitFork {
+		// smgr_redo's XLOG_SMGR_CREATE only creates the file: an unlogged
+		// heap's init fork is empty, and the pages of an index's or a
+		// sequence's init fork arrive in their own records (M0149-0003).
+		return mgr.CreateFile(rel)
+	}
 	n, err := mgr.NBlocks(rel)
 	if err != nil {
 		return fmt.Errorf("wal: smgr-create replay NBlocks: %w", err)
@@ -6770,19 +6860,19 @@ func decodeXLogTblspcDrop(mainData []byte) (uint32, error) {
 // persist on disk across a restart, so this MkdirAll is a defensive no-op in
 // the common case and only materializes the directory when replaying onto a
 // basebackup that lacks it. B4.1d.
-func applyTblspcCreate(mgr *storage.Manager, oid uint32) error {
-	dir := filepath.Join(mgr.DataDir(), "pg_tblspc", strconv.FormatUint(uint64(oid), 10))
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("wal: tblspc-create replay MkdirAll %q: %w", dir, err)
+func applyTblspcCreate(mgr *storage.Manager, oid uint32, location string) error {
+	// tblspc_redo: create_tablespace_directories(location, oid) in recovery
+	// mode — the symlink for an external location (M0149-0003).
+	if err := storage.CreateTablespaceDirectories(mgr.DataDir(), oid, location, true); err != nil {
+		return fmt.Errorf("wal: tblspc-create replay: %w", err)
 	}
 	return nil
 }
 
 // applyTblspcDrop removes the pg_tblspc/<oid> directory (idempotent). B4.1d.
 func applyTblspcDrop(mgr *storage.Manager, oid uint32) error {
-	dir := filepath.Join(mgr.DataDir(), "pg_tblspc", strconv.FormatUint(uint64(oid), 10))
-	if err := os.RemoveAll(dir); err != nil {
-		return fmt.Errorf("wal: tblspc-drop replay RemoveAll %q: %w", dir, err)
+	if err := storage.DestroyTablespaceDirectories(mgr.DataDir(), oid); err != nil {
+		return fmt.Errorf("wal: tblspc-drop replay: %w", err)
 	}
 	return nil
 }

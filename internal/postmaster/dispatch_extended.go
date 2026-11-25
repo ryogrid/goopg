@@ -545,13 +545,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 	if schema != nil {
 		res.Fields = make([]libpq.FieldDescription, len(schema))
 		for i, sc := range schema {
-			res.Fields[i] = libpq.FieldDescription{
-				Name:         sc.Name,
-				TypeOID:      typeOIDFor(sc.Type),
-				TypeSize:     -1,
-				TypeModifier: -1,
-				Format:       0,
-			}
+			res.Fields[i] = wireFieldDescription(s.cfg.Catalog, connDBOid, sc.Name, sc.Type)
 		}
 	}
 
@@ -697,7 +691,11 @@ func (s *Server) tryHandleDatabaseOrRoleDDLExtended(query, dbName, actingRole st
 	})
 	if handled, notice, herr := s.tryHandleDatabaseDDL(query, dbName, actingRole, resolveCurrentGUC); handled {
 		if herr != nil {
-			return nil, &extendedQueryError{Code: databaseDDLErrorSQLState(herr), Message: herr.Error()}, true
+			hint := ""
+			if de, ok := herr.(*databaseDDLError); ok {
+				hint = de.hint
+			}
+			return nil, &extendedQueryError{Code: databaseDDLErrorSQLState(herr), Message: herr.Error(), Hint: hint}, true
 		}
 		return &extendedQueryResult{CommandTag: databaseDDLCommandTag(query), Notice: notice}, nil, true
 	}

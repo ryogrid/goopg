@@ -88,7 +88,7 @@ func lowerTraverseNodeHooked(n Node, fx lowerExprFn, hook lowerNodeHook) bool {
 		if !one(&x.Key) || !one(&x.LowKey) || !one(&x.HighKey) || !one(&x.Cond) {
 			return false
 		}
-		return rewriteAll(x.Keys)
+		return rewriteAll(x.Keys) && rewriteAll(x.SAOPKeys)
 	case *BitmapHeapScan:
 		// Same statement as the IndexScan arm's, one node family over:
 		// `Cond` holds relation-local quals when the scan is an NLI inner,

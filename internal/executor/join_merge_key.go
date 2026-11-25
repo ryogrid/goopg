@@ -51,6 +51,7 @@ import (
 // slots would make an accidental cross-read compile.
 func (o *joinOp) initMergeKeys() {
 	o.mergeKeys = nil
+	o.mergeKeyDesc = nil
 	o.mergeResidual = nil
 	o.mergeCompiled = false
 	if o.plan == nil {
@@ -59,6 +60,7 @@ func (o *joinOp) initMergeKeys() {
 	}
 	plan := o.plan.ExecMergeKeyPlan()
 	o.mergeKeys = plan.Keys
+	o.mergeKeyDesc = plan.Desc
 	o.mergeResidual = plan.Residual
 	if len(o.mergeKeys) == 0 {
 		// No key plan at all (a Join with no LeftKey). Keep the single-pair
@@ -142,7 +144,10 @@ func (o *joinOp) mergeSideKeyExprs(isLeft bool) []optimizer.Expr {
 // and the equality that closes a group cannot disagree.
 //
 // text flags the key pairs that compare as plain text (joinOp.mergeKeyText).
-func compareMergeKeys(a, b []Datum, pos int, text []bool) (int, error) {
+//
+// desc marks the keys compared descending (M0148-0001c3a3 slice 4, PG's
+// MJCompare negating a BTGreaterStrategyNumber key); nil is all ascending.
+func compareMergeKeys(a, b []Datum, pos int, text, desc []bool) (int, error) {
 	for i := range a {
 		// The sort comparator's fast path (sortOp.lessKeyVals):
 		// compareDatumPlain is compareDatum for every non-string pair.
@@ -160,6 +165,9 @@ func compareMergeKeys(a, b []Datum, pos int, text []bool) (int, error) {
 			}
 		}
 		if cmp != 0 {
+			if i < len(desc) && desc[i] {
+				return -cmp, nil
+			}
 			return cmp, nil
 		}
 	}

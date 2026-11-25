@@ -154,7 +154,9 @@ func TestUserCreateTableEmitsPG18CanonicalPgAttributeRows(t *testing.T) {
 			if err != nil {
 				continue
 			}
-			if row.AttRelID != tbl.OID {
+			// System attributes (attnum < 0, M0149-0001e) are covered by their own
+			// tests; this one pins the user columns.
+			if row.AttRelID != tbl.OID || row.AttNum < 0 {
 				continue
 			}
 			byAttNum[row.AttNum] = row
@@ -2573,5 +2575,47 @@ func TestPgAttTypmodEveryTypmodCarryingType(t *testing.T) {
 			t.Errorf("%s: pgAttTypmod(%d, %v) = %d, want %d (PG 18.3)",
 				tc.sql, tc.oid, tc.args, got, tc.want)
 		}
+	}
+}
+
+// TestUserPGTypeRowSupportProcs pins the typanalyze / typsubscript that
+// TypeCreate's callers give user types (M0149-0001h1a15): every array type
+// gets array_typanalyze and array_subscript_handler, a range
+// range_typanalyze, a multirange multirange_typanalyze, an enum or
+// composite base type neither, and a domain its base type's.
+func TestUserPGTypeRowSupportProcs(t *testing.T) {
+	const (
+		typsubscriptIdx = 12
+		typanalyzeIdx   = 21
+	)
+	cat := catalog.NewInMemory()
+	rt, err := cat.RegisterRangeType("myrange", "int4", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct {
+		row             Row
+		analyze, subscr int64
+	}{
+		"range":            {buildUserPGTypeRowForRange(rt), 3916, 0},
+		"multirange":       {buildUserPGTypeRowForMultirange(rt), 4242, 0},
+		"range array":      {buildUserPGTypeRowForRangeArray(rt), 3816, 6179},
+		"multirange array": {buildUserPGTypeRowForMultirangeArray(rt), 3816, 6179},
+	} {
+		if got := tc.row[typanalyzeIdx].Int; got != tc.analyze {
+			t.Errorf("%s typanalyze = %d, want %d", name, got, tc.analyze)
+		}
+		if got := tc.row[typsubscriptIdx].Int; got != tc.subscr {
+			t.Errorf("%s typsubscript = %d, want %d", name, got, tc.subscr)
+		}
+	}
+	if got := domainTypanalyze(1007, catalog.Type{Name: "int4", IsArray: true}); got != 3816 {
+		t.Errorf("domain over int4[] typanalyze = %d", got)
+	}
+	if got := domainTypsubscript(catalog.Type{Name: "int4", IsArray: true}); got != 6179 {
+		t.Errorf("domain over int4[] typsubscript = %d", got)
+	}
+	if got := domainTypanalyze(23, catalog.Type{Name: "int4"}); got != 0 {
+		t.Errorf("domain over int4 typanalyze = %d", got)
 	}
 }

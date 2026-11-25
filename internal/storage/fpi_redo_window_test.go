@@ -37,7 +37,7 @@ func TestFPIRedoPublicationClosesWindow(t *testing.T) {
 	}
 	defer pool.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 601, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 601, Fork: MainFork}
 	s, _, err := pool.PinNew(rel)
 	if err != nil {
 		t.Fatal(err)
@@ -125,7 +125,7 @@ func TestPublishRedoBarrierWaitsForInFlightDecision(t *testing.T) {
 	}
 	defer pool.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 602, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 602, Fork: MainFork}
 	s, _, err := pool.PinNew(rel)
 	if err != nil {
 		t.Fatal(err)
@@ -200,7 +200,7 @@ func TestFPIWatermarkSurvivesEviction(t *testing.T) {
 	}
 	defer pool.Close()
 
-	rel := RelFileNode{DBOid: 1, RelOid: 603, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 603, Fork: MainFork}
 	s, _, err := pool.PinNew(rel)
 	if err != nil {
 		t.Fatal(err)

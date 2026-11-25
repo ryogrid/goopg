@@ -1,13 +1,22 @@
-# Working Set — loop end 2026-11-01 (loop #17: M0148-0001c slice (b) LANDED; census consumed)
+# Working Set — loop end 2026-11-15 (census routing-20261115f IDENTICAL; M0148-0001c3a10 slice 3 LANDED 3167621c3)
 
-- Task: M0148-0001c slice (b) (item 10 suite) — multi-target scalar group agg `select max(unique2), generate_series(1,3) as g from tenk1 order by g desc` plans `Sort → (InitPlan 1: Limit → IOS Backward) → ProjectSet → childless Result`; hunks 29 → 28 (1016 closed byte-exact, none added). Code `e1f19ff73`, records `d36d05876`, census `be2248839`, baton `610e83572`+this; HEAD pushed, code tree clean.
-- Files: `internal/optimizer/planner.go` (gate `aggIdx` scan + `strictMinMaxTarget` + `minmaxTListSurvivor`; assembly = childless Result over the surviving tlist + `ProjectSet{SrfCols, OtherExprs}` above; `wrapMinMaxOrderByDistinct` re-scan/label/raw-name fallback/ordinal decline); `internal/executor/operators_explain.go` (new `*optimizer.ProjectSet` arm in `resolveKeySourceDepth`); pins `minmax_distinct_orderby_test.go` + `explain_correlated_minmax_test.go`; doc 0148-0001c + README row; fix_plan 0001c; 3 ledger rows; `analysis/m0146/m0146-0014/routing-20261101f/`.
-- Key symbols: `rewriteMinMaxAggregates` (gate ~12618, assembly ~13030); `strictMinMaxTarget` (= can_minmax_aggs shape); `minmaxTListSurvivor` dispatches on `*FuncCall` FIRST — `isConstantExpr` reads a 0-arg call (`count(*)`) as constant (the pin caught it); `SrfCol` + `OtherExprs` nil-slot marker; `openSelectSrfMode` zip executor (unchanged); the ProjectSet chase arm (synth `FuncCall{generate_series}` → S18 parens); `LevelInitPlansOf` descends the ProjectSet, so `InitPlan 1` prints on the Sort.
-- Findings: planagg gates per-AGG, not on tlist length; `create_minmaxagg_plan` = `make_result(tlist, quals, NULL)` keeps every non-agg entry; `build_minmax_path` EMPTIES the main jointree (the RTE moves into the InitPlan subquery) — why extras must be Var/sublink/agg-free. TPC-DS/TPC-H carry no multi-target min/max tlist ⇒ fires=none.
-- Next step: **M0148-0001c slice (c)** — inheritance/appendrel min/max (hunk 1066, 72→38 lines): planagg accepts a single RangeTblRef that is an appendrel (planagg.c:121-137), builds a path per child, and `create_minmaxagg_plan` puts Merge Append of the per-child index paths under the Limit.
-  Lift goopg's declines: planner.go ~12649 `len(tbl.PartitionKey) > 0`, ~12652 `AccessibleInheritanceChildren`. Then (d) hunk 1145 (correlated `distinct min` shares InitPlan 1 + SubPlan 2; M0146-0114 declines it today).
-- Top-residual: aggregates 28 hunks; largest single block = parallel-agg 7 hunks 1667-1756 (=0001i). Census EXHAUSTED at routing-20261101f (fires=none, 99/99+99/99+22/22, all cats 0).
-- Skip-rationale (bypassed items 0-9; item 10 selected): 0 channel (P0-E8 `[x]`), 1/2/2a discharged, 3 channel (`M0146-0005dp` banner mention has no filed entry; 0229/0229a `[x]`), 4-8 channel, 9 M0147 channel + 2 owner-gated `[!]`, 10: M0122-0015h self-records `Rank: below item 10` (S7 carve-out) → live M0148 queue head 0001c. Slice (c) over the 1667-1756 block: the suite queue advances in expected-line order; 1066 is the next queued hunk.
-  Five open M-NIGHTLY P0-E9/E10/E11/E13/E15 = ESCALATION, OWNER PLACEMENT NEEDED (no `[ ]` item ranked 0-9 is selectable).
-- Gates run: optimizer+executor units PASS (only the DST `timetz` flake — a pure COPY-decode test past the 2026-11-01 DST transition); runner 29→28; spotcheck Q12=2/Q13=35; sf025 sweep 99/99 plans; acceptance arm off 24 MATCH; fireset SF0.25+SF1 PASS fires=none (G9 IN-SCOPE: optimizer staged); pgbench smoke via hook; census consumed (routing-20261101f, fireset stamp code_tree 1f1ba3af18a3).
-- In-flight: none.
+- Anomaly: none (prev-loop check OK).
+- Nightly triage: AI-20261115-011812-001 already filed. Nothing new.
+- S9: DUE → routing-20261115f (s9dj, BASELINE_REV=eefb34976) IDENTICAL ×3, committed 530ed7b3d.
+  - 3167621c3 touches internal/optimizer, so the next census is likely DUE (BASELINE_REV=5d57b11f4, the head consumed by routing-20261115f).
+- Task: M0148-0001c3a10 slice 3 landed as 3167621c3.
+  - addChildIndexOnlyPaths: the index-only producer on partition child rels.
+  - addOrderedAppendRelChildPath: a partitions_are_ordered Append over child rels (RANGE, no default, partition key leads the ORDER BY; bound order, reversed/Backward for DESC).
+  - Per-partition min/max and ORDER BY … LIMIT now plan PG's Append of Index Only Scan [Backward] (NOT NULL keys).
+- Files: internal/optimizer/partitionwisejoin.go; internal/executor/partitionwise_join_test.go (TestOrderedAppendRelChildPaths); design doc slice 3 + README row.
+- Findings:
+  - With a nullable ordering column, min/max adds `a IS NOT NULL`. indexOnlyLeafClauses has no equality-prefix + trailing NullTest shape, so the child IOS declines and the plain Index Scan Backward wins (PG: Index Only Scan Backward … (c = 3) AND (a IS NOT NULL)). Ledgered.
+  - inherit's parted_minmax witness has one partition and already matched; no regress line moved (Movement none).
+  - The executor fixture needs NOT NULL key columns for index paths (no NULL-keyed index entries in-process).
+- Next step: run the census if DUE, then c3a10 slice 4: indexOnlyLeafClauses accepts an equality prefix followed by a NullTest on the next index column (pathindexonly.go; mirror restrictionNullTestOnColumn handling in the plain producer). Witness: nullable `pa` max(a) where c = 3.
+- Top-residual: M0148 residues. Open: c3a10 (slice 4+: NullTest IOS, Merge Append, joins), c3a9 (slice 5 blocked-on P0-E30; patch tmp/c3a9-slice5-outer.patch), c3a8, c3a7, c3a11 (parked), c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
+- Skip-rationale (bypassed items 0-9; item 10 selected):
+  - Items 0-9: M0146-0014(channel; census routing-20261115f done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Item 10: M-NIGHTLY open items are below-item-10 or S2 awaiting owner (P0-E9..E16, E24..E30). Then M0148 in file order → c3a10.
+- Gates run (all PASS): census s9dj IDENTICAL; units, tpch-spotcheck, sf025 99 PASS same=99, fire-set c3a10s3 fires=none ×3, acceptance PASS, 12 partition isolation tests; regress same-suite A/B identical.
+- In-flight: none. Scratch PG (5545) RUNNING. goopg probe server (5533) stopped.

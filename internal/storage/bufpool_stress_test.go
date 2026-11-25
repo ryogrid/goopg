@@ -39,7 +39,7 @@ func TestPoolHighConcurrencyPinUnpinStress(t *testing.T) {
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	t.Cleanup(func() { _ = mgr.Close() })
 
-	rel := RelFileNode{DBOid: 1, RelOid: 7, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 7, Fork: MainFork}
 	seed := make(Page, BlockSize)
 	if err := InitPage(seed); err != nil {
 		t.Fatal(err)
@@ -138,7 +138,7 @@ func TestPoolPinNewVsPinStress(t *testing.T) {
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	t.Cleanup(func() { _ = mgr.Close() })
 
-	rel := RelFileNode{DBOid: 1, RelOid: 11, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 11, Fork: MainFork}
 	seed := make(Page, BlockSize)
 	if err := InitPage(seed); err != nil {
 		t.Fatal(err)

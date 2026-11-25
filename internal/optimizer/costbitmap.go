@@ -33,13 +33,24 @@ import (
 // `costBitmapHeapScan` where it belongs. On TPC-H Q2's `supplier` probe the
 // index side is PG's 7.77 and goopg was charging ~874, which is the bulk of the
 // 1786 vs 43 gap that kept the bitmap losing.
-func costBitmapIndexScan(cp costParams, in indexScanInputs) Cost {
+//
+// `path->rows` is the INDEX PATH's row count, which cost_index sets to the
+// relation's estimated rows (baserel->rows; ppi_rows when parameterised) —
+// not the tuples the index returns. pathRows carries it. This used to charge
+// the fetched-tuple count, so a bitmap leaf over a wide range paid 100x the
+// manipulation charge PG does (3000 tuples against the rel's 30 rows on
+// `hundred = 42 AND unique2 < 3000`) and a BitmapAnd never beat its
+// cheapest input (M0148-0001c3a2).
+//
+// amTotal is indextotalcost alone: the Bitmap Index Scan plan node's total
+// (create_bitmap_subplan, M0148-0001c3a4 (g)) — the tree-node charge belongs
+// to the parent that costs it.
+func costBitmapIndexScan(cp costParams, in indexScanInputs, pathRows float64) (c Cost, amTotal float64) {
 	idxStartup, idxTotal := btreeIndexAMCost(cp, in)
-	tuplesFetched := clampRowEst(in.selectivity * in.relTuples)
 	return Cost{
 		Startup: idxStartup,
-		Total:   idxTotal + 0.1*cp.cpuOperatorCost*tuplesFetched,
-	}
+		Total:   idxTotal + 0.1*cp.cpuOperatorCost*pathRows,
+	}, idxTotal
 }
 
 // costBitmapHeapScan costs a complete BitmapHeapScan: index access (startup) plus
@@ -263,9 +274,12 @@ const bitmapWords = 256
 func costBitmapTree(cp costParams, p *Path) (cost float64, selec float64) {
 	switch p.Kind {
 	case PathBitmapIndexScan:
+		// The leaf's Cost.Total is already cost_bitmap_tree_node's
+		// `indextotalcost + 0.1 * cpu_operator_cost * path->rows`
+		// (costBitmapIndexScan); adding the charge again here double-counted
+		// it on every chooseBitmapAnd comparison (M0148-0001c3a2).
 		cost = p.Cost.Total
 		selec = p.BitmapSelectivity
-		cost += 0.1 * cp.cpuOperatorCost * p.Rows
 		return
 	case PathBitmapAnd, PathBitmapOr:
 		cost = p.Cost.Total
@@ -306,7 +320,8 @@ func costBitmapAndCost(cp costParams, paths []*Path) (Cost, float64) {
 // multiple bitmap paths. It is PG's cost_bitmap_or_node (costsize.c:1208-1253):
 // selectivities are summed (non-overlapping assumption, clamped to 1.0),
 // costs are summed, and each union after the first charges
-// 100 * cpu_operator_cost.
+// 100 * cpu_operator_cost — except where the input is a Bitmap Index Scan,
+// whose union PG optimises out (`!IsA(subpath, IndexPath)`).
 func costBitmapOrCost(cp costParams, paths []*Path) (Cost, float64) {
 	var totalCost float64
 	selec := 0.0
@@ -314,7 +329,7 @@ func costBitmapOrCost(cp costParams, paths []*Path) (Cost, float64) {
 		subCost, subSelec := costBitmapTree(cp, sub)
 		selec += subSelec
 		totalCost += subCost
-		if i > 0 {
+		if i > 0 && sub.Kind != PathBitmapIndexScan {
 			totalCost += 100.0 * cp.cpuOperatorCost
 		}
 	}

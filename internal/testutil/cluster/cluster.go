@@ -19,6 +19,7 @@ import (
 
 	_ "github.com/lib/pq"
 
+	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/testutil/util"
 )
 
@@ -81,15 +82,22 @@ type Cluster struct {
 	initArgs     []string
 	syncInit     bool
 	syncRuntime  bool
+	startArgs    []string
 
-	mu  sync.Mutex
-	cmd *exec.Cmd
+	mu     sync.Mutex
+	cmd    *exec.Cmd
+	exited chan struct{} // closed when the last started process has exited
 }
 
 // BackgroundPSQL is a long-lived psql session started by StartPSQL.
 type BackgroundPSQL struct {
 	cmd *exec.Cmd
 }
+
+// SetStartArgs sets extra `goopg start` arguments for every later Start —
+// e.g. Cluster.pm's `--cluster-name=<node>`, which it passes on the command
+// line so a base backup does not carry it to standbys.
+func (c *Cluster) SetStartArgs(args ...string) { c.startArgs = append([]string(nil), args...) }
 
 // New builds a cluster handle.
 func New(name string, opts Options) (*Cluster, error) {
@@ -162,6 +170,9 @@ func New(name string, opts Options) (*Cluster, error) {
 func (c *Cluster) Name() string       { return c.name }
 func (c *Cluster) DataDir() string    { return c.dataDir }
 func (c *Cluster) ListenAddr() string { return c.listenAddr }
+
+// User is the role the cluster's psql and lib/pq helpers connect as.
+func (c *Cluster) User() string { return c.user }
 func (c *Cluster) LogPath() string    { return c.logPath }
 
 // DSN returns a lib/pq connection string for the cluster's user/database.
@@ -240,6 +251,7 @@ func (c *Cluster) Start() error {
 		return err
 	}
 	args := append(append([]string{}, c.goopgCommand[1:]...), "start", "-D", c.dataDir, "-listen", c.listenAddr)
+	args = append(args, c.startArgs...)
 	cmd := exec.Command(c.goopgCommand[0], args...)
 	cmd.Dir = c.repoRoot
 	cmd.Stdout = f
@@ -270,11 +282,12 @@ func (c *Cluster) Start() error {
 		close(exited)
 	}()
 	c.cmd = cmd
+	c.exited = exited
 
 	deadline := time.Now().Add(c.startupWait)
 	for time.Now().Before(deadline) {
 		status, _, err := c.Status()
-		if err == nil && status == 0 {
+		if err == nil && status == 0 && c.pmStatus() != "starting" {
 			return nil
 		}
 		select {
@@ -531,6 +544,41 @@ func (c *Cluster) Kill() error {
 	return nil
 }
 
+// pmStatus is pg_ctl start -w's view of postmaster.pid's status line: the
+// server's PMSTATUS reply ("starting" while a hot standby has not reached
+// consistency). Anything unreadable counts as "ready", so a server without
+// the command behaves as before.
+func (c *Cluster) pmStatus() string {
+	pf, err := control.ParsePIDFile(c.dataDir)
+	if err != nil {
+		return "ready"
+	}
+	reply, err := control.Send(pf.SocketPath, "PMSTATUS", 2*time.Second)
+	if err != nil || strings.HasPrefix(reply, "ERR") {
+		return "ready"
+	}
+	return reply
+}
+
+// WaitExit waits up to timeout for the last started server process to exit
+// on its own — a server that stops itself with a FATAL removes
+// postmaster.pid before its process is gone — and reports whether it did.
+// It is true at once when no server was ever started.
+func (c *Cluster) WaitExit(timeout time.Duration) bool {
+	c.mu.Lock()
+	exited := c.exited
+	c.mu.Unlock()
+	if exited == nil {
+		return true
+	}
+	select {
+	case <-exited:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 // Restart performs stop+start.
 func (c *Cluster) Restart(mode ShutdownMode) error {
 	if err := c.Stop(mode); err != nil {
@@ -614,6 +662,13 @@ func (c *Cluster) libpqEnv() string {
 
 // PSQL runs a foreground psql command against this cluster.
 func (c *Cluster) PSQL(args ...string) (util.CommandResult, error) {
+	return c.PSQLTimeout(30*time.Second, args...)
+}
+
+// PSQLTimeout is PSQL with a caller-chosen time limit — the TAP harness
+// passes PostgreSQL::Test::Utils' $timeout_default (180 s), which upstream's
+// psql calls run under.
+func (c *Cluster) PSQLTimeout(timeout time.Duration, args ...string) (util.CommandResult, error) {
 	host, port, err := splitHostPort(c.listenAddr)
 	if err != nil {
 		return util.CommandResult{}, err
@@ -625,7 +680,7 @@ func (c *Cluster) PSQL(args ...string) (util.CommandResult, error) {
 		Args:    base,
 		Dir:     c.repoRoot,
 		Env:     []string{"PGPASSWORD=", c.libpqEnv()},
-		Timeout: 30 * time.Second,
+		Timeout: timeout,
 	})
 }
 

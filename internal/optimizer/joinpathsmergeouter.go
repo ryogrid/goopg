@@ -151,7 +151,7 @@ func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, j
 // generateMergeJoinPaths is `generate_mergejoin_paths` (joinpath.c:1564) for one
 // already-ordered outer path.
 func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapestTotal *Path, cp costParams, jt parser.JoinType, innerUnique bool, groups []mergeKeyGroup, outerRelids RelSet, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) mergeScanSel, paramSrc RelSet, uniqueInner bool) {
-	matched := findMergeClausesForOuterPathkeys(outerPath.Pathkeys, groups, relUsefulKeys(outerPath.Rel))
+	matched := findMergeClausesForOuterPathkeys(outerPath.Pathkeys, groups, relUsefulKeys(outerPath.Rel), jt)
 	if len(matched) == 0 {
 		return
 	}
@@ -168,6 +168,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 	if len(innerSortKeys) == 0 {
 		return
 	}
+	mergeDesc := mergeDescFor(matched)
 
 	// `merge_pathkeys` = `build_join_pathkeys(..., outerpath->pathkeys)`
 	// (:1932). The outer's FULL ordering, which behaviour 3 in the file header
@@ -202,7 +203,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 	// evaluated nowhere — the truncation demotion only ever re-adds clauses cut
 	// from the ALREADY-trimmed list.
 	fullResidual := demoteUnmatchedGroupClauses(residual, groups, mergeClauses)
-	tryMergeJoinPath(joinrel, outerPath, innerCheapestTotal, outerRelids, inner.Relids, cp, jt, innerUnique, resultKeys, nil, innerSortKeys, mergeClauses, fullResidual, mergeTuplesFor, scanSelFor, paramSrc)
+	tryMergeJoinPath(joinrel, outerPath, innerCheapestTotal, outerRelids, inner.Relids, cp, jt, innerUnique, resultKeys, nil, innerSortKeys, mergeClauses, mergeDesc, fullResidual, mergeTuplesFor, scanSelFor, paramSrc)
 
 	// "Can't do anything else if inner path needs to be unique'd"
 	// (:1636-1638): the presorted inners below are the raw rel's paths.
@@ -243,7 +244,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 				// construction and this inner was SELECTED for already being
 				// ordered, so neither side is sorted here.
 				tryMergeJoinPath(joinrel, outerPath, ip, outerRelids, inner.Relids, cp, jt, innerUnique, resultKeys, nil, nil,
-					newClauses, demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor, scanSelFor, paramSrc)
+					newClauses, mergeDescPrefix(mergeDesc, len(newClauses)), demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor, scanSelFor, paramSrc)
 			}
 			cheapestTotalInner = ip
 		}
@@ -260,7 +261,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 				}
 				if len(newClauses) > 0 {
 					tryMergeJoinPath(joinrel, outerPath, ip, outerRelids, inner.Relids, cp, jt, innerUnique, resultKeys, nil, nil,
-						newClauses, demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor, scanSelFor, paramSrc)
+						newClauses, mergeDescPrefix(mergeDesc, len(newClauses)), demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor, scanSelFor, paramSrc)
 				}
 			}
 			cheapestStartupInner = ip
@@ -338,7 +339,7 @@ func matchUnsortedOuterMergePartial(s *searchCtx, joinrel, outer, inner *RelOptI
 			tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M9", cand+" param")
 			continue
 		}
-		matched := findMergeClausesForOuterPathkeys(op.Pathkeys, groups, relUsefulKeys(op.Rel))
+		matched := findMergeClausesForOuterPathkeys(op.Pathkeys, groups, relUsefulKeys(op.Rel), jt)
 		if len(matched) == 0 {
 			tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M2", cand+" matched=0")
 			continue
@@ -370,7 +371,7 @@ func matchUnsortedOuterMergePartial(s *searchCtx, joinrel, outer, inner *RelOptI
 			continue
 		}
 		tryPartialMergeJoinPath(s, joinrel, op, i, outer.Relids, inner.Relids, cp, jt, innerUnique, "mergeu", op.Pathkeys, nil, innerSortKeys,
-			mergeClauses, fullResidual, mergeTuplesFor, scanSelFor, paramSrc)
+			mergeClauses, mergeDescFor(matched), fullResidual, mergeTuplesFor, scanSelFor, paramSrc)
 	}
 }
 
@@ -437,10 +438,21 @@ func demoteDroppedMergeClauses(residual, all, kept []*restrictInfo) []*restrictI
 // ordering, so a descending outer is perfectly usable and the direction is
 // propagated to the inner (`mergeInnerSortKeys`) rather than required of the
 // clause.
-func findMergeClausesForOuterPathkeys(outerPathkeys []PathKey, groups []mergeKeyGroup, u *pathkeyUsefulness) []mergeOuterMatch {
+func findMergeClausesForOuterPathkeys(outerPathkeys []PathKey, groups []mergeKeyGroup, u *pathkeyUsefulness, jt parser.JoinType) []mergeOuterMatch {
 	var out []mergeOuterMatch
 	used := make(map[int]bool, len(groups))
 	for _, pk := range outerPathkeys {
+		if pk.NullsFirst && !mergeNullsFirstDeliverable(jt) {
+			// M0148-0001c3a3 slice 4: the merge compares each key in the
+			// outer pathkey's direction (Path.MergeDesc), but files
+			// NULL-keyed rows after every real key (mergeSortedSource.less).
+			// That is the NULLS FIRST order too whenever no NULL-keyed outer
+			// row is emitted; a join that null-extends the outer would emit
+			// them last, against the claimed ordering, so the matched prefix
+			// ends here (PG places them per the pathkey, MJExamineQuals'
+			// nulls_first).
+			break
+		}
 		g := indexOfOuterKey(groups, pk.Expr)
 		if g < 0 {
 			// M0146-0214 slice 4: PG matches a pathkey to a mergeclause by
@@ -594,4 +606,48 @@ func demoteUnmatchedGroupClauses(residual []*restrictInfo, groups []mergeKeyGrou
 	out = append(out, residual...)
 	out = append(out, extra...)
 	return out
+}
+
+// mergeDescFor is the per-clause merge direction of a matched outer ordering
+// (M0148-0001c3a3 slice 4): each group's clauses compare in the direction of
+// the outer pathkey that selected the group, as PG's mergeclauses take
+// their strategy from the outer pathkey (find_mergeclauses_for_outer_pathkeys
+// and create_mergejoin_plan's mergestrategies). Nil when every key is
+// ascending — the shape every other producer files.
+func mergeDescFor(matched []mergeOuterMatch) []bool {
+	var desc []bool
+	n := 0
+	for _, m := range matched {
+		for range m.group.clauses {
+			if !m.outerKey.SortAsc && desc == nil {
+				desc = make([]bool, n)
+			}
+			if desc != nil {
+				desc = append(desc, !m.outerKey.SortAsc)
+			}
+			n++
+		}
+	}
+	return desc
+}
+
+// mergeDescPrefix is the direction list for a truncated clause list, which is
+// always a prefix of the clauses mergeDescFor described.
+func mergeDescPrefix(desc []bool, n int) []bool {
+	if n < len(desc) {
+		return desc[:n]
+	}
+	return desc
+}
+
+// mergeNullsFirstDeliverable reports whether a merge of this join type
+// delivers a NULLS FIRST outer ordering: true unless the join emits
+// NULL-keyed outer rows (null-extending them), which goopg's merge files
+// after every real key.
+func mergeNullsFirstDeliverable(jt parser.JoinType) bool {
+	switch jt {
+	case parser.JoinLeft, parser.JoinFull, parser.JoinAnti:
+		return false
+	}
+	return true
 }

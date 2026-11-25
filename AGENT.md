@@ -169,6 +169,9 @@ a specific feature area:
 scripts/pg-regress-runner.sh                   # default ~40 quick type tests
 scripts/pg-regress-runner.sh --all             # all 232 upstream tests (slow)
 scripts/pg-regress-runner.sh -v int4 float8    # specific tests, show diff on fail
+scripts/pg-regress-runner.sh --update-inventory --case-timeout 300 int4 float8
+#   ↑ also records mismatch/expected lines of `failed` cases in the inventory
+#     CSV and regenerates upstream-regress-coverage.md (docs/test-port/README.md)
 # Reports parity % and writes diffs to tmp/regress-diffs/.
 # Re-run after any SQL surface change; rising pass rate = converging PG compat.
 
@@ -634,7 +637,9 @@ remains below is filing/completion discipline, not rank.
   moved beyond ±3, or `make ea-ratchet` findings decreased, or a `regress`
   suite's diff count moved (e.g. `regress join 14868 -> 14730`), or — for M0147
   lever-retirement tasks only — `lever-count` decreased (`scripts/lever-count.sh`,
-  e.g. `lever-count 34 -> 33`). `Movement: yes`
+  e.g. `lever-count 34 -> 33`), or — for M0149 TAP-port tasks only — the
+  ported test's passing upstream assertions moved in its all-goopg + mixed
+  PG 18.3 runs (`tap 034_create_database 3/12 -> 7/12`). `Movement: yes`
   must cite one of those instruments **with a number** on the same line;
   anything else (a unit test now passing, a feature now working) is
   `Movement: none` — real work, but not movement toward this goal.

@@ -398,7 +398,7 @@ func ProcessRollbackUndos(ctx *Context, sess *BasicSession) {
 		}
 	}
 	for _, sr := range sess.TakePendingSeqRestores() {
-		SetSequenceCurrentValue(sr.Name, sr.OldCurr, sr.DBOid)
+		SetSequenceCurrentValue(sr.Name, sr.OldCurr, sr.OldCalled, sr.DBOid)
 	}
 	// Restore catalog entries for any DROP TABLEs that happened inside savepoints.
 	// On full ROLLBACK these are all being undone (the top-level transaction aborts).
@@ -472,6 +472,14 @@ func ProcessRollbackUndos(ctx *Context, sess *BasicSession) {
 	// leaves the inheritance state untouched (and clears the catalog pending-change
 	// marks that bypass the plan cache). M0118-0008 (alter-table-4).
 	DiscardPendingInheritanceChanges(ctx, sess)
+	// Changes whose undo is keyed by savepoint depth (SET TABLESPACE), all of
+	// them. M0149-0006.
+	sess.RunSavepointUndosToDepth(0)
+	// In-memory catalog changes (pg_default_acl entries), newest first.
+	undos := sess.TakePendingCatalogUndos()
+	for i := len(undos) - 1; i >= 0; i-- {
+		undos[i]()
+	}
 }
 
 func (o *transactionOp) clearCtxTransaction() {
@@ -649,6 +657,7 @@ func (o *transactionOp) execRollbackTo() error {
 	// savepoint. Their storage was only scheduled for removal under the
 	// now-aborted sub-XID, so it is kept (dropRelationStorage). M0097-0023.
 	newDepth := sess.SavepointDepth()
+	sess.RunSavepointUndosToDepth(newDepth)
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 		for _, drop := range sess.RollbackDDLDropsToDepth(newDepth) {

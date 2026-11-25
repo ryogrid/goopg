@@ -87,7 +87,7 @@ func TestEvictionDrainsBufferedWALBeforeWritingPage(t *testing.T) {
 	// 2. Mutate a heap page and stamp its pd_lsn to endLSN. The
 	// pool's eviction path will see this LSN and call
 	// FlushUpTo(endLSN) before WriteBlock.
-	rel := storage.RelFileNode{DBOid: 1, RelOid: 9001, Fork: storage.MainFork}
+	rel := storage.RelFileNode{DBOid: 16384, RelOid: 9001, Fork: storage.MainFork}
 	s0, _, err := pool.PinNew(rel)
 	if err != nil {
 		t.Fatal(err)
@@ -167,7 +167,7 @@ func TestFlushAllPacedDrainsBufferedWAL(t *testing.T) {
 	}
 	defer pool.Close()
 
-	rel := storage.RelFileNode{DBOid: 1, RelOid: 9002, Fork: storage.MainFork}
+	rel := storage.RelFileNode{DBOid: 16384, RelOid: 9002, Fork: storage.MainFork}
 
 	payloads := [][]byte{
 		[]byte("redo-page-0"),

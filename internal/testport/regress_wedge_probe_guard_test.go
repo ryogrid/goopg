@@ -38,10 +38,11 @@ func TestPort_RegressWedgeProbeNamesTheStuckStatement(t *testing.T) {
 		t.Skip("psql not in PATH or postgres/local_install/bin")
 	}
 
-	pprofAddr := reserveLoopbackPort(t)
-	t.Setenv("GOOPG_PPROF_ADDR", pprofAddr)
-
 	c := newCluster(t, "regress_wedge_probe")
+	// Reserved after the cluster has its listen port, and never that port
+	// (AI-20261112-000028-001): GOOPG_PPROF_ADDR is read at server start.
+	pprofAddr := reserveLoopbackPortExcept(t, c.ListenAddr())
+	t.Setenv("GOOPG_PPROF_ADDR", pprofAddr)
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 

@@ -424,6 +424,9 @@ func applyRoleAttrOptions(sql, norm, role string, attrs *catalog.RoleAttrs, reso
 		attrs.ConnLimit = n
 	}
 	if v, ok := extractRoleValidUntil(sql, norm); ok {
+		if v != "" {
+			v = executor.NormalizeValidUntilText(v)
+		}
 		attrs.ValidUntil = v
 	}
 	if pw, isNull, ok := extractRolePassword(sql, norm); ok {
@@ -951,7 +954,7 @@ func (s *Server) applyAlterRoleConfig(op alterRoleConfigOp, liveDBName string, r
 		if !strings.EqualFold(strings.Trim(op.dbName, `"`), liveDBName) {
 			return true, nil
 		}
-		dbOid = catalog.FirstUserOID
+		dbOid = catalog.PostgresDBOid
 	}
 	if op.fromCurrent {
 		// Resolve the live session's CURRENT effective value now — see
@@ -1229,12 +1232,23 @@ func extractFirstSQLIdent(_ string, rest string) string {
 	// Double-quoted identifier: preserves internal case after lower-casing
 	// by normalizeCompatSQL, so "RegresS" becomes "regress".
 	if rest[0] == '"' {
-		// Find closing quote.
-		end := strings.Index(rest[1:], "\"")
-		if end < 0 {
-			return rest[1:] // unbalanced quote — take the rest
+		// A quoted identifier ends at the first '"' not followed by
+		// another; a doubled "" is one literal quote (scan.l xdinside /
+		// xddouble). Stopping at the first '"' cut "regress_""quoted" to
+		// "regress_". M0149-0001h1a10.
+		var b strings.Builder
+		for i := 1; i < len(rest); i++ {
+			if rest[i] == '"' {
+				if i+1 < len(rest) && rest[i+1] == '"' {
+					b.WriteByte('"')
+					i++
+					continue
+				}
+				return b.String()
+			}
+			b.WriteByte(rest[i])
 		}
-		return rest[1 : end+1]
+		return b.String() // unbalanced quote — take the rest
 	}
 	// Unquoted identifier: take up to first space/semicolon.
 	end := strings.IndexAny(rest, " \t\n\r;,")

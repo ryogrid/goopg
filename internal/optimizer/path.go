@@ -164,6 +164,11 @@ const (
 	// carries the leaf's UNION ALL the plan rebuilds around them
 	// (paramappend.go, M0146-0049).
 	PathParamAppend
+	// PathPartitionwiseAppend is the AppendPath generate_partitionwise_join_paths
+	// (allpaths.c) builds over a partitioned join's child joins: Children are
+	// the cheapest path of each partition pair's child join, in PartitionDesc
+	// order (partitionwisejoin.go, M0148-0001c3a9).
+	PathPartitionwiseAppend
 )
 
 // Path is one way to produce a relation, with a cost and an ordering. It is kept
@@ -174,6 +179,17 @@ type Path struct {
 
 	// paramAppend is a PathParamAppend's member carrier (paramappend.go).
 	paramAppend *paramAppendInfo
+	// pwParents is a PathPartitionwiseAppend's two parent appendrels
+	// (partitionwisejoin.go).
+	pwParents []*SetOp
+	// pwFills, per child join, are the parent-layout columns the child's
+	// bare scans do not emit (tableoid) and the constant each takes.
+	pwFills []map[int]Expr
+	// pwMerge makes a PathPartitionwiseAppend a Merge Append over its
+	// children in Pathkeys order (M0148-0001c3a10 slice 5,
+	// addMergeAppendRelChildPaths); children that do not deliver the
+	// ordering are PathSort paths.
+	pwMerge bool
 	// paramSink is set, only while a nested loop lowers a parameterised join
 	// inner (createNestLoopParamJoinPlan, M0146-0049d3), on every
 	// parameterised path of that inner; createPlanNode records each
@@ -476,6 +492,12 @@ type Path struct {
 	// expressions and its residual predicate.
 	HashKeys []*restrictInfo
 	Residual []*restrictInfo
+	// MergeDesc marks, per HashKeys clause of a merge path, a descending
+	// merge — PG's per-mergeclause sort strategy (MergePath's
+	// path_mergeclauses with the outer pathkey's pk_cmptype). Nil is all
+	// ascending. M0148-0001c3a3 slice 4: an outer ordered DESC (a backward
+	// index scan, a DESC index) merges in its own direction.
+	MergeDesc []bool
 
 	// IndexInfo / IndexScanDir are `IndexPath.indexinfo` and
 	// `IndexPath.indexscandir` (pathnodes.h:1845/1849), the two facts
@@ -533,6 +555,20 @@ type Path struct {
 	// Set by costBitmapIndexScan for leaves and costBitmapAnd/costBitmapOr
 	// for combinators.
 	BitmapSelectivity float64
+
+	// IndexPathTotalCost is a Bitmap Index Scan leaf's PG `IndexPath`
+	// total_cost: cost_index's whole-scan cost (index and heap side), which
+	// build_index_paths gives every index path, bitmap ones included —
+	// distinct from Cost, the index-side indextotalcost a bitmap tree is
+	// costed from. make_bitmap_paths_for_or_group compares candidate arms by
+	// it (M0148-0001c3a2). Zero on every other path.
+	IndexPathTotalCost float64
+
+	// BitmapIndexAMTotal is a Bitmap Index Scan leaf's indextotalcost alone
+	// (Cost.Total less cost_bitmap_tree_node's 0.1 * cpu_operator_cost *
+	// rows): the total its plan node prints (create_bitmap_subplan,
+	// M0148-0001c3a4 (g)). Zero on every other path.
+	BitmapIndexAMTotal float64
 
 	// PartialPredicate is the resolved planner expression for a partial
 	// index's WHERE predicate (PG's indpred). It is nil when the index is not

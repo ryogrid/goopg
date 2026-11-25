@@ -113,6 +113,9 @@ func (s *Slot) getPinCount() int32 { return int32(statePin(s.state.Load())) }
 
 // Pool is the buffer manager. It is goroutine-safe.
 type Pool struct {
+	// unloggedRels holds the main-fork RelFileNodes of UNLOGGED relations,
+	// whose changes are not WAL-logged (RelationNeedsWAL). M0149-0003.
+	unloggedRels sync.Map
 	mgr   *Manager
 	arena *arena
 	slots []Slot
@@ -822,7 +825,9 @@ type BtreeMarkPageHalfDeadRequest struct {
 type LogBtreeMarkPageHalfDeadFunc func(rel RelFileNode, req BtreeMarkPageHalfDeadRequest) (LSN, error)
 
 // LogHeapFreezeFunc emits the M0080-0001 heap-freeze redo record.
-type LogHeapFreezeFunc func(rel RelFileNode, blk BlockNumber, frozenSlots []uint16) (LSN, error)
+// page is the page after the freeze: the PG record's freeze plans carry the
+// frozen tuples' header fields (M0149-0002).
+type LogHeapFreezeFunc func(rel RelFileNode, blk BlockNumber, page Page, frozenSlots []uint16) (LSN, error)
 
 // LogHeapHotUpdateFunc emits one atomic HOT-update redo record. newSlot is the
 // line-pointer slot the new tuple version landed at (PG's xl_heap_update
@@ -908,11 +913,73 @@ func (p *Pool) LogBtreeSplit() LogBtreeSplitFunc { return p.logBtreeSplit }
 
 // LogPageImage returns the configured full-page-image hook.
 func (p *Pool) LogPageImage() func(rel RelFileNode, blk BlockNumber, page Page) (LSN, error) {
-	return p.logFPI
+	if p.logFPI == nil {
+		return nil
+	}
+	return func(rel RelFileNode, blk BlockNumber, page Page) (LSN, error) {
+		if p.relSkipsWAL(rel) {
+			return 0, nil
+		}
+		return p.logFPI(rel, blk, page)
+	}
+}
+
+// SetRelUnlogged marks rel (any fork; the relation is meant) as UNLOGGED, or
+// clears the mark. Its main, FSM and VM forks are then written without WAL,
+// as PG does for a relation whose RelationNeedsWAL is false; its init fork is
+// still logged, because a crash restart rebuilds the relation from it.
+// M0149-0003.
+func (p *Pool) SetRelUnlogged(rel RelFileNode, on bool) {
+	if p == nil {
+		return
+	}
+	key := rel.Canonical()
+	key.Fork = MainFork
+	if on {
+		p.unloggedRels.Store(key, struct{}{})
+	} else {
+		p.unloggedRels.Delete(key)
+	}
+}
+
+// SetRelTemp marks rel as a temporary relation of backend: its files are
+// named t<backend>_<relfilenode> (Manager.SetRelTemp) and, as
+// RelationNeedsWAL is false for RELPERSISTENCE_TEMP, its changes are written
+// without WAL. Call it before the relation's first file is created.
+// M0149-0006a.
+func (p *Pool) SetRelTemp(rel RelFileNode, backend uint32) {
+	if p == nil {
+		return
+	}
+	p.Manager().SetRelTemp(rel, backend, true)
+	p.SetRelUnlogged(rel, true)
+}
+
+// relSkipsWAL reports whether a change to rel is written without WAL: any
+// fork but the init fork of an UNLOGGED relation.
+func (p *Pool) relSkipsWAL(rel RelFileNode) bool {
+	if rel.Fork == InitFork {
+		return false
+	}
+	key := rel.Canonical()
+	key.Fork = MainFork
+	_, ok := p.unloggedRels.Load(key)
+	return ok
 }
 
 // LogHeapInsert returns the configured heap-insert change-record hook.
 func (p *Pool) LogHeapInsert() LogHeapInsertFunc { return p.logHeapInsert }
+
+// LogSmgrCreate emits XLOG_SMGR_CREATE for rel (its fork included), for a
+// caller that creates a fork file without pinning a new block, such as an
+// unlogged heap's empty init fork (heap_create_init_fork). No-op without a
+// hook. M0149-0003.
+func (p *Pool) LogSmgrCreate(rel RelFileNode, xid TransactionID) error {
+	if p == nil || p.logSmgrCreate == nil {
+		return nil
+	}
+	return p.logSmgrCreate(rel.Canonical(), xid)
+}
 
 // LogChangeRecord appends a pre-encoded WAL change record.
 func (p *Pool) LogChangeRecord(payload []byte) (LSN, error) {
@@ -1149,6 +1216,7 @@ func (p *Pool) Close() error {
 
 // NBlocks reports the number of blocks currently in rel.
 func (p *Pool) NBlocks(rel RelFileNode) (BlockNumber, error) {
+	rel = rel.Canonical()
 	return p.mgr.NBlocks(rel)
 }
 
@@ -1157,22 +1225,26 @@ func (p *Pool) NBlocks(rel RelFileNode) (BlockNumber, error) {
 // CachedNBlocks reports an already-open fork's size without a file-system
 // call (see Manager.CachedNBlocks).
 func (p *Pool) CachedNBlocks(rel RelFileNode) (BlockNumber, bool) {
+	rel = rel.Canonical()
 	return p.mgr.CachedNBlocks(rel)
 }
 
 func (p *Pool) Exists(rel RelFileNode) bool {
+	rel = rel.Canonical()
 	return p.mgr.Exists(rel)
 }
 
 // CreateFile eagerly creates rel's main-fork file on disk with zero blocks
 // (mirrors smgrcreate). See Manager.CreateFile.
 func (p *Pool) CreateFile(rel RelFileNode) error {
+	rel = rel.Canonical()
 	return p.mgr.CreateFile(rel)
 }
 
 // RelPath returns rel's fork path relative to the data directory (e.g.
 // "base/5/16407"), for building the upstream-verbatim missing-file message.
 func (p *Pool) RelPath(rel RelFileNode) string {
+	rel = rel.Canonical()
 	return p.mgr.RelPath(rel)
 }
 
@@ -1435,6 +1507,7 @@ func (p *Pool) flushBatchSize() int {
 // range, then the physical smgr truncate. Idempotent when the relation is
 // already <= keep blocks.
 func (p *Pool) TruncateRelationTail(rel RelFileNode, keep BlockNumber) error {
+	rel = rel.Canonical()
 	oldN, err := p.NBlocks(rel)
 	if err != nil {
 		return err
@@ -1442,7 +1515,7 @@ func (p *Pool) TruncateRelationTail(rel RelFileNode, keep BlockNumber) error {
 	if keep >= oldN {
 		return nil
 	}
-	if p.logSmgrTruncateTo != nil {
+	if p.logSmgrTruncateTo != nil && !p.relSkipsWAL(rel) {
 		if err := p.logSmgrTruncateTo(rel, keep); err != nil {
 			return err
 		}
@@ -1454,6 +1527,7 @@ func (p *Pool) TruncateRelationTail(rel RelFileNode, keep BlockNumber) error {
 }
 
 func (p *Pool) InvalidateRel(rel RelFileNode) {
+	rel = rel.Canonical()
 	p.invalidateRel(rel, false)
 }
 
@@ -1465,6 +1539,7 @@ func (p *Pool) InvalidateRel(rel RelFileNode) {
 // InvalidateRel keeps skipping pinned slots: its other callers (rewrites,
 // rollback, index builds) may hold a pin of their own.
 func (p *Pool) InvalidateRelForTruncate(rel RelFileNode) {
+	rel = rel.Canonical()
 	p.invalidateRel(rel, true)
 }
 
@@ -1562,6 +1637,7 @@ func (p *Pool) bumpSlotGen(s *Slot, st uint64) bool {
 // InvalidateBlock evicts the slot bound to tag if it exists and is unpinned
 // (retrying a CAS that loses a race; an in-flight slot is told to discard).
 func (p *Pool) InvalidateBlock(tag BufferTag) {
+	tag.Rel = tag.Rel.Canonical()
 	slotIdx, _ := p.bm.Lookup(tag)
 	if slotIdx < 0 {
 		return
@@ -1894,6 +1970,7 @@ func (p *Pool) DumpEventsForTag(tag BufferTag) []string {
 // xid=0; transactional relfile creation should use PinNewWithXID so the
 // record is PG-faithful and routes to decoded replay (A9).
 func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
+	rel = rel.Canonical()
 	return p.pinNewXID(rel, InvalidTransactionID)
 }
 
@@ -1901,10 +1978,12 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 // block-0 smgr-create WAL record. Callers that create a fresh relfile inside a
 // transaction (heap/index/TOAST creation) pass ctx.Tx.XID here.
 func (p *Pool) PinNewWithXID(rel RelFileNode, createXID TransactionID) (*Slot, BlockNumber, error) {
+	rel = rel.Canonical()
 	return p.pinNewXID(rel, createXID)
 }
 
 func (p *Pool) pinNewXID(rel RelFileNode, createXID TransactionID) (*Slot, BlockNumber, error) {
+	rel = rel.Canonical()
 	p.pinMu.Lock()
 
 	victimIdx, wasDirty, oldTag, claimGen, err := p.claimVictim()
@@ -1948,7 +2027,7 @@ func (p *Pool) pinNewXID(rel RelFileNode, createXID TransactionID) (*Slot, Block
 	p.pinMu.Lock()
 
 	// Emit SmgrCreate WAL record on first block creation.
-	if blk == 0 && p.logSmgrCreate != nil {
+	if blk == 0 && p.logSmgrCreate != nil && !p.relSkipsWAL(rel) {
 		if emitErr := p.logSmgrCreate(rel, createXID); emitErr != nil {
 			p.logger.Error("SmgrCreate WAL emission failed", "rel", rel, "err", emitErr)
 		}
@@ -2016,12 +2095,14 @@ func (p *Pool) pinNewXID(rel RelFileNode, createXID TransactionID) (*Slot, Block
 // the executor consumer (`selectInsertPage`) lands after the third
 // foundation (`Pool.SlotPinCount`, blocked on M0107-0006).
 func (p *Pool) ExtendRelationBatch(rel RelFileNode, n int) (BlockNumber, error) {
+	rel = rel.Canonical()
 	return p.ExtendRelationBatchWithXID(rel, n, InvalidTransactionID)
 }
 
 // ExtendRelationBatchWithXID is ExtendRelationBatch with the creating
 // transaction's xid stamped onto the block-0 smgr-create WAL record (A9).
 func (p *Pool) ExtendRelationBatchWithXID(rel RelFileNode, n int, createXID TransactionID) (BlockNumber, error) {
+	rel = rel.Canonical()
 	if n <= 0 {
 		return InvalidBlockNumber, fmt.Errorf("ExtendRelationBatch: n=%d must be > 0", n)
 	}
@@ -2035,7 +2116,7 @@ func (p *Pool) ExtendRelationBatchWithXID(rel RelFileNode, n int, createXID Tran
 	if err != nil {
 		return InvalidBlockNumber, err
 	}
-	if first == 0 && p.logSmgrCreate != nil {
+	if first == 0 && p.logSmgrCreate != nil && !p.relSkipsWAL(rel) {
 		if emitErr := p.logSmgrCreate(rel, createXID); emitErr != nil {
 			p.logger.Error("SmgrCreate WAL emission failed",
 				"rel", rel, "err", emitErr)
@@ -2054,6 +2135,7 @@ func (p *Pool) ExtendRelationBatchWithXID(rel RelFileNode, n int, createXID Tran
 // Fast path (cache hit): lock-free Lookup + CAS, no mutex.
 // Slow path (cache miss / IO wait): acquires pinMu.
 func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
+	tag.Rel = tag.Rel.Canonical()
 	for {
 		// Fast path: tag is cached and valid (no IO in flight).
 		slotIdx, gen := p.bm.Lookup(tag)
@@ -2236,6 +2318,7 @@ func (p *Pool) Capacity() int { return len(p.slots) }
 // TryPin returns the pool slot for tag if it is already cached.
 // Returns (nil, false) when the tag is not in the pool.
 func (p *Pool) TryPin(tag BufferTag) (*Slot, bool) {
+	tag.Rel = tag.Rel.Canonical()
 	slotIdx, gen := p.bm.Lookup(tag)
 	if slotIdx < 0 {
 		return nil, false
@@ -2271,6 +2354,7 @@ func (p *Pool) TryPin(tag BufferTag) (*Slot, bool) {
 // avoidance in selectInsertPage) use this helper to avoid inlining
 // slotState bit-mask arithmetic.
 func (p *Pool) SlotPinCount(tag BufferTag) int32 {
+	tag.Rel = tag.Rel.Canonical()
 	slotIdx, gen := p.bm.Lookup(tag)
 	if slotIdx < 0 {
 		return 0
@@ -2571,8 +2655,11 @@ func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error
 	// redo publication cannot land between them (PublishRedoBarrier).
 	p.fpiPublishMu.RLock()
 	err := func() error {
-		needFPI := p.needsImage(s)
 		tag := s.tag
+		if p.relSkipsWAL(tag.Rel) {
+			return nil // RelationNeedsWAL is false: no record (M0149-0003)
+		}
+		needFPI := p.needsImage(s)
 
 		if needFPI {
 			if p.logFPI != nil && p.fullPageWrites.Load() {
@@ -2634,8 +2721,11 @@ func (p *Pool) MarkDirtyLogicalChange(s *Slot, emitter func() (LSN, error)) erro
 	// RLock spans decision + both appends (see MarkDirtyChangeRecord).
 	p.fpiPublishMu.RLock()
 	err := func() error {
-		needFPI := p.needsImage(s)
 		tag := s.tag
+		if p.relSkipsWAL(tag.Rel) {
+			return nil // RelationNeedsWAL is false: no record (M0149-0003)
+		}
+		needFPI := p.needsImage(s)
 
 		lsn, err := emitter()
 		if err != nil {
@@ -2676,7 +2766,7 @@ func (p *Pool) MarkDirtyLogicalChange(s *Slot, emitter func() (LSN, error)) erro
 // maybeEmitFPI runs the FPI side-effect of MarkDirty for the first
 // mutation of a page since the published redo pointer.
 func (p *Pool) maybeEmitFPI(s *Slot) {
-	if p.logFPI == nil || !p.fullPageWrites.Load() {
+	if p.logFPI == nil || !p.fullPageWrites.Load() || p.relSkipsWAL(s.tag.Rel) {
 		return
 	}
 	// RLock spans decision + append (see MarkDirtyChangeRecord).
@@ -2721,6 +2811,7 @@ func (p *Pool) FlushAll() error {
 // Callers still need InvalidateRel afterward to drop the now-clean cached
 // slots so the next access re-resolves rel's (possibly changed) tag.
 func (p *Pool) FlushRel(rel RelFileNode) error {
+	rel = rel.Canonical()
 	type pending struct {
 		idx int
 		tag BufferTag

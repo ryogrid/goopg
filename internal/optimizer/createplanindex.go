@@ -67,6 +67,7 @@ package optimizer
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -330,8 +331,20 @@ func createIndexScanPlan(p *Path) Node {
 	if p.IndexInfo == nil {
 		panic(fmt.Sprintf("createPlan: PathIndexScan over relset %#08x names no index", uint32(p.Rel.Relids)))
 	}
-	if p.IndexScanDir != ForwardScanDirection {
-		panic(fmt.Sprintf("createPlan: PathIndexScan with %s; goopg's *IndexScan has no direction to set", p.IndexScanDir))
+	backward := p.IndexScanDir == BackwardScanDirection
+	if p.IndexScanDir != ForwardScanDirection && !backward {
+		panic(fmt.Sprintf("createPlan: PathIndexScan with %s", p.IndexScanDir))
+	}
+	// M0148-0001c3a4 (i): a trailing array rides the plain range probe, which
+	// walks backward.
+	_, trailingSAOP := clausesTrailingSAOP(p.IndexClauses)
+	if backward && (p.IndexSkipPrefix > 0 || (!p.IndexOnly && !trailingSAOP && indexClausesHaveSAOP(p.IndexClauses))) {
+		// M0148-0001c3a3: the executor walks backward only the plain
+		// probe path (indexScanOp's nbtree.ReverseScanCursor, and
+		// indexOnlyScanOp's reversed materialisation); the producers
+		// emit no skip or plain ScalarArrayOp probe backward (an index-only
+		// one is reversed with the rest of its materialised rows).
+		panic(fmt.Sprintf("createPlan: backward PathIndexScan on %s with a skip or ScalarArrayOp probe", p.IndexInfo.Name))
 	}
 	// M0134-0187: an index-only path emits only the columns its index covers,
 	// so it builds a different node with a NARROWER schema. It carries either
@@ -350,12 +363,152 @@ func createIndexScanPlan(p *Path) Node {
 		// composite index's bounds carry no `local` and stay the Filter.
 		var ioLow, ioHigh Expr
 		var ioLowOp, ioHighOp parser.OpCode
-		ioRange := len(p.IndexClauses) > 0 && p.IndexClauses[0].op != parser.OpUnknown
-		for i, c := range p.IndexClauses {
+		ioRange := hasRangeClause(p.IndexClauses)
+		// M0148-0001c3a4 (j): a skip scan's range on a later column — the
+		// bounds sit on Columns[ioSkipCol], which IndexOnlyScan.SkipPrefix
+		// names (no Keys).
+		ioSkipCol := clausesSkipRange(p.IndexClauses)
+		var ioNullTest IndexNullTest
+		ioNullTestAfter := false
+		var ioExtraNullTests []ExtraIndexNullTest
+		var ioExtraBounds []ExtraIndexBound
+		var ioRowCompare *BinaryOp
+		ioRowCompareLow := false
+		var ioCondOrder []IndexCondItem
+		// M0148-0001c3a4 (h): a leading-column ScalarArrayOp, optionally
+		// bounded on the second column — IndexOnlyScan.SAOPKeys.
+		var ioSAOP []Expr
+		ioSAOPOp := parser.OpUnknown
+		var ioColQuals []SAOPColQual
+		loopClauses := p.IndexClauses
+		var ioTrailing *TrailingSAOP
+		if at, ok := clausesTrailingSAOP(p.IndexClauses); ok {
+			// M0148-0001c3a4 (i): an array on the second column behind the
+			// leading range — the range lowers as usual, the array onto
+			// TrailingSAOP.
+			c := p.IndexClauses[at]
+			if at != len(p.IndexClauses)-1 || c.indexCol != 1 || c.saopOp != parser.OpUnknown || c.local == nil ||
+				p.RequiredOuter != 0 || p.IndexSkipPrefix != 0 || !columnCovered(p.IndexOnlyCovered, p.IndexInfo.Columns[1]) {
+				panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s: the array behind the leading range must be the last clause, a covered second-column `= ANY`", p.IndexInfo.Name))
+			}
+			ioDrop[c.local] = true
+			ioTrailing = &TrailingSAOP{Elems: append([]Expr(nil), c.saop...), ColQuals: trailingClauseColQuals(c, ioDrop)}
+			loopClauses = p.IndexClauses[:at]
+		} else if at >= 0 {
+			// M0148-0001c3a4 (i): an equality prefix ahead of the array
+			// lowers onto Keys (the bitmap SAOP carrier's shape).
+			for i, r := range p.IndexClauses[:at] {
+				if r.indexCol != i || r.key == nil || r.op == parser.OpLt || r.op == parser.OpLe || r.op == parser.OpGt || r.op == parser.OpGe || len(r.saop) > 0 || r.nullTest != IndexNullTestNone || r.local == nil {
+					panic(fmt.Sprintf("createPlan: index-only SAOP PathIndexScan on %s: clause %d is not an equality-prefix clause", p.IndexInfo.Name, i))
+				}
+				ioKeys = append(ioKeys, r.key)
+				ioDrop[r.local] = true
+			}
+			c0 := p.IndexClauses[at]
+			if c0.indexCol != at || c0.local == nil || p.RequiredOuter != 0 || p.IndexSkipPrefix != 0 {
+				panic(fmt.Sprintf("createPlan: index-only SAOP PathIndexScan on %s must be one array behind its equality prefix on an unparameterised scan", p.IndexInfo.Name))
+			}
+			ioSAOP, ioSAOPOp = c0.saop, c0.saopOp
+			ioDrop[c0.local] = true
+			ioColQuals = lowerSAOPColQuals(c0, ioDrop)
+			for i, r := range p.IndexClauses[at+1:] {
+				if r.indexCol != at+1 || r.key == nil || len(r.saop) > 0 || r.nullTest != IndexNullTestNone {
+					panic(fmt.Sprintf("createPlan: index-only SAOP PathIndexScan on %s: clause %d is not a bound on the column after the array", p.IndexInfo.Name, at+1+i))
+				}
+				if r.redundantBound {
+					continue // implied by the tighter bound; its conjunct stays a Filter
+				}
+				switch r.op {
+				case parser.OpGt, parser.OpGe:
+					if ioLow != nil {
+						panic(fmt.Sprintf("createPlan: index-only SAOP PathIndexScan on %s carries two lower bounds", p.IndexInfo.Name))
+					}
+					ioLow, ioLowOp = r.key, r.op
+				case parser.OpLt, parser.OpLe:
+					if ioHigh != nil {
+						panic(fmt.Sprintf("createPlan: index-only SAOP PathIndexScan on %s carries two upper bounds", p.IndexInfo.Name))
+					}
+					ioHigh, ioHighOp = r.key, r.op
+				default:
+					panic(fmt.Sprintf("createPlan: index-only SAOP PathIndexScan on %s: clause %d is not a range bound", p.IndexInfo.Name, at+1+i))
+				}
+				if r.local != nil {
+					ioDrop[r.local] = true
+				}
+			}
+			loopClauses = nil
+		}
+		// M0148-0001c3a10 slice 4: an equality prefix followed by one
+		// NullTest on the next column (indexOnlyLeafClauses) — the prefix
+		// lowers onto Keys, the NullTest onto Cond (a per-entry check the
+		// executor already applies, printed in Index Cond after the keys).
+		var ioPrefixNullCond Expr
+		if n := len(loopClauses); n >= 2 && ioTrailing == nil && ioSAOP == nil && p.RequiredOuter == 0 && p.IndexSkipPrefix == 0 {
+			last := loopClauses[n-1]
+			shape := last.nullTest != IndexNullTestNone && last.indexCol == n-1 && last.local != nil
+			for i, r := range loopClauses[:n-1] {
+				if r.indexCol != i || r.key == nil || r.op != parser.OpUnknown || r.nullTest != IndexNullTestNone || len(r.saop) > 0 {
+					shape = false
+				}
+			}
+			if shape {
+				for _, r := range loopClauses[:n-1] {
+					ioKeys = append(ioKeys, r.key)
+					if r.local != nil {
+						ioDrop[r.local] = true
+					}
+				}
+				ioPrefixNullCond = last.local
+				ioDrop[last.local] = true
+				loopClauses = nil
+				ioRange = false
+			}
+		}
+		for i, c := range loopClauses {
+			if ioRange && c.nullTest != IndexNullTestNone {
+				ioCondOrder = append(ioCondOrder, IndexCondNullTest)
+				// M0148-0001c3a: the leading column's NullTest index qual.
+				if c.indexCol != 0 || p.RequiredOuter != 0 || p.IndexSkipPrefix != 0 {
+					panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries a misplaced NullTest clause", p.IndexInfo.Name))
+				}
+				if ioNullTest != IndexNullTestNone {
+					// M0148-0001c3a2: a further NullTest on the column.
+					ioExtraNullTests = append(ioExtraNullTests, ExtraIndexNullTest{Kind: c.nullTest, AfterBounds: ioLow != nil || ioHigh != nil})
+				} else {
+					ioNullTest, ioNullTestAfter = c.nullTest, ioLow != nil || ioHigh != nil
+				}
+				if c.local != nil {
+					ioDrop[c.local] = true
+				}
+				continue
+			}
 			if ioRange {
-				if c.indexCol != 0 || c.key == nil || p.RequiredOuter != 0 || p.IndexSkipPrefix != 0 {
+				if c.indexCol != ioSkipCol || c.key == nil || p.RequiredOuter != 0 || p.IndexSkipPrefix != 0 {
 					panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s: clause %d is not a leading-column bound",
 						p.IndexInfo.Name, i))
+				}
+				if c.redundantBound {
+					ioExtraBounds = append(ioExtraBounds, ExtraIndexBound{Op: c.op, Key: c.key})
+					ioCondOrder = append(ioCondOrder, IndexCondExtraBound)
+					if c.local != nil {
+						ioDrop[c.local] = true
+					}
+					continue
+				}
+				if c.rowCompare {
+					bin, ok := c.local.(*BinaryOp)
+					if !ok || ioSkipCol != 0 || ioTrailing != nil {
+						panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries a malformed row comparison", p.IndexInfo.Name))
+					}
+					if c.op == parser.OpGe {
+						ioLow, ioLowOp, ioRowCompareLow = c.key, c.op, true
+					} else {
+						ioHigh, ioHighOp = c.key, c.op
+					}
+					ioRowCompare = bin
+					ioCondOrder = append(ioCondOrder, IndexCondRowCompare)
+					ioDrop[c.local] = true
+					continue
 				}
 				switch c.op {
 				case parser.OpGt, parser.OpGe:
@@ -363,11 +516,13 @@ func createIndexScanPlan(p *Path) Node {
 						panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries two lower bounds", p.IndexInfo.Name))
 					}
 					ioLow, ioLowOp = c.key, c.op
+					ioCondOrder = append(ioCondOrder, IndexCondLow)
 				case parser.OpLt, parser.OpLe:
 					if ioHigh != nil {
 						panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries two upper bounds", p.IndexInfo.Name))
 					}
 					ioHigh, ioHighOp = c.key, c.op
+					ioCondOrder = append(ioCondOrder, IndexCondHigh)
 				default:
 					panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s mixes an equality clause into its bounds", p.IndexInfo.Name))
 				}
@@ -390,11 +545,11 @@ func createIndexScanPlan(p *Path) Node {
 			}
 		}
 		if p.IndexSkipPrefix < 0 || (p.IndexSkipPrefix > 0 && p.RequiredOuter == 0) ||
-			(!ioRange && p.IndexSkipPrefix+len(p.IndexClauses) > len(p.IndexInfo.Columns)) {
+			(!ioRange && ioSAOP == nil && p.IndexSkipPrefix+len(p.IndexClauses) > len(p.IndexInfo.Columns)) {
 			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s skips %d columns then binds %d clauses",
 				p.IndexInfo.Name, p.IndexSkipPrefix, len(p.IndexClauses)))
 		}
-		if !ioRange && len(p.IndexClauses) > len(p.IndexInfo.Columns) {
+		if !ioRange && ioSAOP == nil && len(p.IndexClauses) > len(p.IndexInfo.Columns) {
 			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s binds %d clauses to a %d-column index",
 				p.IndexInfo.Name, len(p.IndexClauses), len(p.IndexInfo.Columns)))
 		}
@@ -426,14 +581,47 @@ func createIndexScanPlan(p *Path) Node {
 			Index:                 p.IndexInfo,
 			Covered:               append([]catalog.Column(nil), p.IndexOnlyCovered...),
 			schema:                schema,
+			Backward:              backward,
 			PrivilegeCheckRole:    id.privilegeCheckRole,
 			PrivilegeCheckRoleSet: id.privilegeCheckRoleSet,
+		}
+		if ioPrefixNullCond != nil {
+			// Cond reads the scan's output row: re-point the NullTest's
+			// column at the covered column of the same name.
+			cond, ok := CloneExprReplacingColumnRefs(ioPrefixNullCond, func(cr *ColumnRef) Expr {
+				for i, sc := range schema {
+					if strings.EqualFold(sc.Name, cr.Name) {
+						return &ColumnRef{pos: cr.pos, Index: i, Name: sc.Name, Type: sc.Type, SourceTableIdx: sc.SourceTableIdx}
+					}
+				}
+				return nil
+			})
+			if !ok || cond == nil {
+				panic(fmt.Sprintf("createPlan: index-only scan on %s: NullTest column not covered", p.IndexInfo.Name))
+			}
+			ios.Cond = cond
 		}
 		// Key vs Keys as on the plain scan below; the executor pads a short
 		// prefix (operators_indexonly.go lookupKeys).
 		switch {
+		case ioSAOP != nil:
+			ios.SAOPKeys = append([]Expr(nil), ioSAOP...)
+			ios.SAOPOp, ios.SAOPColQuals = ioSAOPOp, ioColQuals
+			if len(ioKeys) > 0 {
+				ios.Keys = ioKeys
+			}
+			ios.LowKey, ios.LowOp, ios.HighKey, ios.HighOp = ioLow, ioLowOp, ioHigh, ioHighOp
 		case ioRange:
 			ios.LowKey, ios.LowOp, ios.HighKey, ios.HighOp = ioLow, ioLowOp, ioHigh, ioHighOp
+			ios.TrailingSAOP = ioTrailing
+			ios.SkipPrefix = ioSkipCol
+			ios.LeadingNullTest, ios.NullTestAfterBounds = ioNullTest, ioNullTestAfter
+			ios.ExtraNullTests = ioExtraNullTests
+			ios.ExtraBounds = ioExtraBounds
+			ios.RowCompare, ios.RowCompareLow = ioRowCompare, ioRowCompareLow
+			if len(ioCondOrder) > 1 {
+				ios.IndexCondOrder = ioCondOrder
+			}
 		case len(ioKeys) == 0:
 		case p.IndexSkipPrefix > 0:
 			ios.SkipPrefix = p.IndexSkipPrefix
@@ -483,8 +671,16 @@ func createIndexScanPlan(p *Path) Node {
 	// fills, which the executor and EXPLAIN already read.
 	// M0145-0029 slice 4: a ScalarArrayOp path — one clause on the leading
 	// column, lowered onto SAOPKeys (the executor's multi-descent arm).
-	if len(p.IndexClauses) >= 1 && len(p.IndexClauses[0].saop) > 0 {
-		return createSAOPIndexScanPlan(p, id, rewrap)
+	// M0148-0001c3a4 (b): the array may follow an equality prefix.
+	// M0148-0001c3a4 (i): an array behind a leading range is the range
+	// scan's TrailingSAOP.
+	if _, ok := clausesTrailingSAOP(p.IndexClauses); ok {
+		return createRangeIndexScanPlan(p, id, rewrap)
+	}
+	for _, ic := range p.IndexClauses {
+		if len(ic.saop) > 0 {
+			return createSAOPIndexScanPlan(p, id, rewrap)
+		}
 	}
 	if hasRangeClause(p.IndexClauses) {
 		return createRangeIndexScanPlan(p, id, rewrap)
@@ -515,6 +711,8 @@ func createIndexScanPlan(p *Path) Node {
 	is := &IndexScan{
 		pos:   id.pos,
 		Table: id.table,
+		// M0148-0001c3a3: the path's scan direction.
+		Backward: p.IndexScanDir == BackwardScanDirection,
 		// The alias, the schema and the small-dimension answer are the leaf's,
 		// not re-derived — see the file header for what each one's loss costs.
 		Alias:      id.alias,
@@ -596,10 +794,12 @@ func createIndexScanPlan(p *Path) Node {
 	return rewrap(is)
 }
 
-// hasRangeClause reports whether any clause is a range bound.
+// hasRangeClause reports whether any clause is a range bound — or a
+// NullTest, which bounds the same leading column (M0148-0001c3a) and lowers
+// through the same range arm.
 func hasRangeClause(clauses []indexPathClause) bool {
 	for _, c := range clauses {
-		if c.op != parser.OpUnknown {
+		if c.op != parser.OpUnknown || c.nullTest != IndexNullTestNone {
 			return true
 		}
 	}
@@ -620,6 +820,7 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 		Alias:                 id.alias,
 		RTID:                  id.rtid,
 		Index:                 p.IndexInfo,
+		Backward:              p.IndexScanDir == BackwardScanDirection,
 		schema:                id.schema,
 		SmallDim:              id.smallDim,
 		UniqueKeys:            id.uniqueKeys,
@@ -627,11 +828,23 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 		PrivilegeCheckRoleSet: id.privilegeCheckRoleSet,
 	}
 	drop := map[Expr]bool{}
+	rangeClauses := p.IndexClauses
+	if at, ok := clausesTrailingSAOP(p.IndexClauses); ok {
+		// M0148-0001c3a4 (i): the array on the second column behind the
+		// leading range, checked per entry by the scan.
+		c := p.IndexClauses[at]
+		if at != len(p.IndexClauses)-1 || c.indexCol != 1 || c.saopOp != parser.OpUnknown || c.local == nil {
+			panic(fmt.Sprintf("createPlan: range PathIndexScan on %s: the array behind the leading range must be the last clause, a second-column `= ANY`", p.IndexInfo.Name))
+		}
+		drop[c.local] = true
+		is.TrailingSAOP = &TrailingSAOP{Elems: append([]Expr(nil), c.saop...), ColQuals: trailingClauseColQuals(c, drop)}
+		rangeClauses = p.IndexClauses[:at]
+	}
 	// Slice 2b: equality clauses first (index columns 0..n-1, in order) form
 	// RangePrefix; every bound then sits on column n.
 	var prefix []Expr
-	for _, c := range p.IndexClauses {
-		if c.op != parser.OpUnknown {
+	for _, c := range rangeClauses {
+		if c.op != parser.OpUnknown || c.nullTest != IndexNullTestNone {
 			break
 		}
 		if c.indexCol != len(prefix) || c.key == nil || len(c.saop) > 0 {
@@ -645,12 +858,69 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 	if len(prefix) > 0 {
 		is.RangePrefix = prefix
 	}
-	for i, c := range p.IndexClauses[len(prefix):] {
-		if c.indexCol != len(prefix) || c.key == nil {
-			panic(fmt.Sprintf("createPlan: range clause %d of %s does not bound index column %d", i, p.IndexInfo.Name, len(prefix)))
+	var condOrder []IndexCondItem
+	// M0148-0001c3a4 (j): a skip scan's bounds sit on a later column,
+	// which IndexScan.SkipPrefix names (no Keys).
+	rangeCol := len(prefix)
+	if sc := clausesSkipRange(rangeClauses); sc > 0 && len(prefix) == 0 {
+		rangeCol, is.SkipPrefix = sc, sc
+	}
+	for i, c := range rangeClauses[len(prefix):] {
+		if c.nullTest != IndexNullTestNone {
+			condOrder = append(condOrder, IndexCondNullTest)
+			// M0148-0001c3a: the NullTest index qual on the range column —
+			// the leading one, or (slice 3) the column after the equality
+			// prefix. It is exact either way, so its conjunct leaves the
+			// Filter.
+			if c.indexCol != len(prefix) {
+				panic(fmt.Sprintf("createPlan: range PathIndexScan on %s carries a misplaced NullTest clause", p.IndexInfo.Name))
+			}
+			afterBounds := is.LowKey != nil || is.HighKey != nil
+			if is.LeadingNullTest != IndexNullTestNone {
+				// M0148-0001c3a2: a further NullTest on the column.
+				is.ExtraNullTests = append(is.ExtraNullTests, ExtraIndexNullTest{Kind: c.nullTest, AfterBounds: afterBounds})
+			} else {
+				is.LeadingNullTest = c.nullTest
+				is.NullTestAfterBounds = afterBounds
+			}
+			if c.local != nil {
+				drop[c.local] = true
+			}
+			continue
 		}
-		if len(prefix) > 0 && c.local != nil {
-			panic(fmt.Sprintf("createPlan: range clause %d of %s behind an equality prefix must stay a Filter recheck", i, p.IndexInfo.Name))
+		if c.indexCol != rangeCol || c.key == nil {
+			panic(fmt.Sprintf("createPlan: range clause %d of %s does not bound index column %d", i, p.IndexInfo.Name, rangeCol))
+		}
+		if c.redundantBound {
+			is.ExtraBounds = append(is.ExtraBounds, ExtraIndexBound{Op: c.op, Key: c.key})
+			condOrder = append(condOrder, IndexCondExtraBound)
+			if c.local != nil {
+				drop[c.local] = true
+			}
+			continue
+		}
+		if c.rowCompare {
+			// M0148-0001c3a12: the comparison's lossy leading bound, the
+			// comparison itself checked per entry and printed whole.
+			bin, ok := c.local.(*BinaryOp)
+			if !ok || rangeCol != 0 || is.TrailingSAOP != nil {
+				panic(fmt.Sprintf("createPlan: range PathIndexScan on %s carries a malformed row comparison", p.IndexInfo.Name))
+			}
+			if c.op == parser.OpGe {
+				if is.LowKey != nil {
+					panic(fmt.Sprintf("createPlan: range PathIndexScan on %s carries two lower bounds", p.IndexInfo.Name))
+				}
+				is.LowKey, is.LowOp, is.RowCompareLow = c.key, c.op, true
+			} else {
+				if is.HighKey != nil {
+					panic(fmt.Sprintf("createPlan: range PathIndexScan on %s carries two upper bounds", p.IndexInfo.Name))
+				}
+				is.HighKey, is.HighOp = c.key, c.op
+			}
+			is.RowCompare = bin
+			condOrder = append(condOrder, IndexCondRowCompare)
+			drop[c.local] = true
+			continue
 		}
 		switch c.op {
 		case parser.OpGt, parser.OpGe:
@@ -658,17 +928,22 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 				panic(fmt.Sprintf("createPlan: range PathIndexScan on %s carries two lower bounds", p.IndexInfo.Name))
 			}
 			is.LowKey, is.LowOp = c.key, c.op
+			condOrder = append(condOrder, IndexCondLow)
 		case parser.OpLt, parser.OpLe:
 			if is.HighKey != nil {
 				panic(fmt.Sprintf("createPlan: range PathIndexScan on %s carries two upper bounds", p.IndexInfo.Name))
 			}
 			is.HighKey, is.HighOp = c.key, c.op
+			condOrder = append(condOrder, IndexCondHigh)
 		default:
 			panic(fmt.Sprintf("createPlan: range PathIndexScan on %s mixes an equality clause into its bounds", p.IndexInfo.Name))
 		}
 		if c.local != nil {
 			drop[c.local] = true
 		}
+	}
+	if len(condOrder) > 1 {
+		is.IndexCondOrder = condOrder
 	}
 	if len(drop) > 0 {
 		return rewrapLeafDropping(p.Rel.baseLeaf, is, drop)
@@ -680,17 +955,46 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 // (restrictionLeadingSAOP) onto IndexScan.SAOPKeys — exclusive of every other
 // probe shape, as the executor requires.
 func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) Node {
-	c := p.IndexClauses[0]
-	if p.IndexOnly || p.RequiredOuter != 0 || c.indexCol != 0 || c.key != nil || c.op != parser.OpUnknown {
-		panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s must be one leading-column clause on a plain unparameterised scan", p.IndexInfo.Name))
+	// M0148-0001c3a4 (b): an equality prefix may come first; the array then
+	// binds Columns[len(prefix)] and the bounds the column after it.
+	np := 0
+	for np < len(p.IndexClauses) && len(p.IndexClauses[np].saop) == 0 {
+		np++
 	}
+	if np >= len(p.IndexClauses) {
+		panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s carries no ScalarArrayOp clause", p.IndexInfo.Name))
+	}
+	c := p.IndexClauses[np]
+	if p.IndexOnly || p.RequiredOuter != 0 || c.indexCol != np || c.key != nil || c.op != parser.OpUnknown {
+		panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s must be an equality prefix and one ScalarArrayOp clause on a plain unparameterised scan", p.IndexInfo.Name))
+	}
+	drop := map[Expr]bool{}
+	var prefix []Expr
+	for i, e := range p.IndexClauses[:np] {
+		if e.indexCol != i || e.key == nil || e.op != parser.OpUnknown || e.nullTest != IndexNullTestNone || e.local == nil {
+			panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s: prefix clause %d is not a local equality on column %d", p.IndexInfo.Name, i, i))
+		}
+		prefix = append(prefix, e.key)
+		drop[e.local] = true
+	}
+	if c.local != nil {
+		drop[c.local] = true
+	}
+	colQuals := lowerSAOPColQuals(c, drop)
 	var low, high Expr
 	var lowOp, highOp parser.OpCode
-	for i, r := range p.IndexClauses[1:] {
-		// Bounds on the second column (restrictionRangeOnColumn(…, 1, …)):
-		// kept in the Filter, so they must carry no `local`.
-		if r.indexCol != 1 || r.key == nil || r.local != nil || len(r.saop) > 0 {
-			panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s: clause %d is not a second-column bound", p.IndexInfo.Name, i+1))
+	for i, r := range p.IndexClauses[np+1:] {
+		// Bounds on the column after the array (restrictionRangeBehindPrefix):
+		// exact index quals since M0148-0001c3a4 (c), so a bound's own
+		// conjunct leaves the Filter.
+		if r.local != nil {
+			drop[r.local] = true
+		}
+		if r.indexCol != np+1 || r.key == nil || len(r.saop) > 0 {
+			panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s: clause %d is not a bound on the column after the array", p.IndexInfo.Name, np+1+i))
+		}
+		if r.redundantBound {
+			continue // implied by the tighter bound; its conjunct stays a Filter
 		}
 		switch r.op {
 		case parser.OpGt, parser.OpGe:
@@ -704,7 +1008,7 @@ func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) N
 			}
 			high, highOp = r.key, r.op
 		default:
-			panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s: clause %d is not a range bound", p.IndexInfo.Name, i+1))
+			panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s: clause %d is not a range bound", p.IndexInfo.Name, np+1+i))
 		}
 	}
 	is := &IndexScan{
@@ -714,6 +1018,9 @@ func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) N
 		RTID:                  id.rtid,
 		Index:                 p.IndexInfo,
 		SAOPKeys:              append([]Expr(nil), c.saop...),
+		SAOPOp:                c.saopOp,
+		SAOPColQuals:          colQuals,
+		RangePrefix:           prefix,
 		LowKey:                low,
 		LowOp:                 lowOp,
 		HighKey:               high,
@@ -724,8 +1031,8 @@ func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) N
 		PrivilegeCheckRole:    id.privilegeCheckRole,
 		PrivilegeCheckRoleSet: id.privilegeCheckRoleSet,
 	}
-	if c.local != nil {
-		return rewrapLeafDropping(p.Rel.baseLeaf, is, map[Expr]bool{c.local: true})
+	if len(drop) > 0 {
+		return rewrapLeafDropping(p.Rel.baseLeaf, is, drop)
 	}
 	return rewrap(is)
 }
@@ -786,4 +1093,43 @@ func indexClausesAllLocal(clauses []indexPathClause) bool {
 		}
 	}
 	return true
+}
+
+// indexClausesSAOPAt is the position of the ScalarArrayOp clause among
+// clauses, or -1 when there is none.
+func indexClausesSAOPAt(clauses []indexPathClause) int {
+	for i, c := range clauses {
+		if len(c.saop) > 0 {
+			return i
+		}
+	}
+	return -1
+}
+
+// indexClausesHaveSAOP reports whether any index clause is a ScalarArrayOp
+// (an array may follow an equality prefix, M0148-0001c3a4 (b)).
+func indexClausesHaveSAOP(clauses []indexPathClause) bool {
+	for _, c := range clauses {
+		if len(c.saop) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// lowerSAOPColQuals is a ScalarArrayOp clause's column quals as plan
+// SAOPColQuals (M0148-0001c3a4 (i)); each one's conjunct joins drop, since
+// the probe applies it.
+func lowerSAOPColQuals(c indexPathClause, drop map[Expr]bool) []SAOPColQual {
+	if len(c.saopColQuals) == 0 {
+		return nil
+	}
+	out := make([]SAOPColQual, 0, len(c.saopColQuals))
+	for _, q := range c.saopColQuals {
+		out = append(out, SAOPColQual{Op: q.op, Key: q.key, Array: q.array, BeforeArray: q.before, ArrayText: q.arrayText})
+		if q.local != nil {
+			drop[q.local] = true
+		}
+	}
+	return out
 }

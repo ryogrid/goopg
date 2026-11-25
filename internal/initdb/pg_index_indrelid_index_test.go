@@ -126,7 +126,7 @@ func TestPgIndexIndrelidSeedsCoverNailedCatalogs(t *testing.T) {
 		name  string
 		want  int
 	}{
-		{1259, "pg_class", 2},     // 2662 oid, 2663 relname_nsp
+		{1259, "pg_class", 3},     // 2662 oid, 2663 relname_nsp, 3455 tblspc_relfilenode (M0149-0001g; PG 18.3 has these three)
 		{1249, "pg_attribute", 2}, // 2658 relid_attnam, 2659 relid_attnum
 		{2610, "pg_index", 2},     // 2678 indrelid, 2679 indexrelid
 		{2604, "pg_attrdef", 2},   // 2656 adrelid_adnum, 2657 oid

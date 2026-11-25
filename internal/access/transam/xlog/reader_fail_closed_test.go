@@ -553,38 +553,44 @@ func TestReplayRecognisesPGOnlyNoOpOpcodes(t *testing.T) {
 	}
 }
 
-// TestReplayRefusesTwoPhaseCommitOpcodes: the three 2PC opcodes are the
-// counterweight to the no-op set above. goopg's max_prepared_transactions
-// BootVal is "0", so it has no pg_twophase state to rebuild — and quietly
-// no-opping a COMMIT_PREPARED would stamp an XID committed whose PREPARE (and
-// therefore whose heap changes) were never applied. Refusal must be explicit,
-// and the message must say why so an operator is not left guessing.
-func TestReplayRefusesTwoPhaseCommitOpcodes(t *testing.T) {
+// TestReplayTwoPhaseCommitOpcodes pins the two-phase records a PG 18.3
+// primary streams to a goopg standby (M0149-0012): XLOG_XACT_PREPARE changes
+// no page (the prepared transaction's heap changes are their own records,
+// already replayed), and COMMIT/ABORT PREPARED finish the record's twophase
+// xid (xl_xact_twophase), not the header xid, which the stream replayer
+// stamps in the commit log.
+func TestReplayTwoPhaseCommitOpcodes(t *testing.T) {
+	// xact_time (8) + xinfo (4, XACT_XINFO_HAS_TWOPHASE) + twophase xid (4).
+	mainData := make([]byte, 16)
+	binary.LittleEndian.PutUint32(mainData[8:], xactXinfoHasTwophase)
+	binary.LittleEndian.PutUint32(mainData[12:], 1234)
 	cases := []struct {
-		name string
-		info uint8
+		name      string
+		info      uint8
+		data      []byte
+		finishes  bool
+		committed bool
 	}{
-		{"XLOG_XACT_PREPARE", xlogXactPrepare},
-		{"XLOG_XACT_COMMIT_PREPARED", xlogXactCommitPrepared},
-		{"XLOG_XACT_ABORT_PREPARED", xlogXactAbortPrepared},
+		{"XLOG_XACT_PREPARE", xlogXactPrepare, nil, false, false},
+		{"XLOG_XACT_COMMIT_PREPARED", xlogXactCommitPrepared | xlogXactHasInfo, mainData, true, true},
+		{"XLOG_XACT_ABORT_PREPARED", xlogXactAbortPrepared | xlogXactHasInfo, mainData, true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := Record{XLog: &XLogDecodedRecord{
-				Header: XLogRecord{Rmid: RmgrXact, Info: tc.info},
+				Header:   XLogRecord{Rmid: RmgrXact, Info: tc.info, XID: 99},
+				MainData: tc.data,
 			}}
 			applied, err := replayDecodedXLogRecord(nil, rec)
-			if err == nil {
-				t.Fatalf("replay err = nil (applied=%v), want refusal", applied)
+			if err != nil || applied {
+				t.Fatalf("replay = (%v, %v), want a page-wise no-op", applied, err)
 			}
-			if !errors.Is(err, ErrUnsupportedRecord) {
-				t.Fatalf("replay err = %v, want ErrUnsupportedRecord", err)
+			xid, committed, ok := replayedXactInfo(rec)
+			if ok != tc.finishes {
+				t.Fatalf("replayedXactInfo ok = %v, want %v", ok, tc.finishes)
 			}
-			if applied {
-				t.Fatal("applied = true alongside error")
-			}
-			if !strings.Contains(err.Error(), "two-phase commit") {
-				t.Fatalf("refusal message %q does not name two-phase commit", err.Error())
+			if ok && (xid != 1234 || committed != tc.committed) {
+				t.Fatalf("replayedXactInfo = (%d, %v), want (1234, %v)", xid, committed, tc.committed)
 			}
 		})
 	}

@@ -360,3 +360,22 @@ func TestBatchExtendAndRegisterFSMSecondCallContinuesAndRegisters(t *testing.T) 
 		}
 	}
 }
+
+// TestSelectFSMCandidatePageSkipsBlockPastEOF is freespace.c's
+// fsm_does_block_exist: an FSM entry naming a block past the end of the
+// relation is zeroed and never returned. A goopg node started from a PG
+// base backup read such an entry out of pg_type's FSM (block 4069 of a
+// 15-block heap) and CREATE TABLE failed with "short read at block".
+// M0149-0016g.
+func TestSelectFSMCandidatePageSkipsBlockPastEOF(t *testing.T) {
+	_, pool, fsm, rel := newSelectFixture(t, 2, []uint16{10, 10})
+	fsm.RecordFreeSpace(rel, 4069, 8000)
+	if blk, ok := selectFSMCandidatePage(fsm, pool, rel, 100); ok {
+		t.Fatalf("got block %d past EOF, want (0, false)", blk)
+	}
+	for _, c := range fsm.GetCandidates(rel, 100, 4) {
+		if c == 4069 {
+			t.Errorf("FSM entry for block 4069 was not zeroed")
+		}
+	}
+}

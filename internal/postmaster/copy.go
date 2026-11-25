@@ -270,6 +270,22 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *libpq.FrameWrit
 		})
 		_ = w.Flush()
 	}
+	ectx.NoticeFieldsFlush = func(code, msg, detail, hint string) {
+		fields := []libpq.ErrorField{
+			{Code: libpq.FieldSeverity, Value: "NOTICE"},
+			{Code: libpq.FieldSeverityNonLocal, Value: "NOTICE"},
+			{Code: libpq.FieldSQLState, Value: code},
+			{Code: libpq.FieldMessage, Value: msg},
+		}
+		if detail != "" {
+			fields = append(fields, libpq.ErrorField{Code: libpq.FieldDetail, Value: detail})
+		}
+		if hint != "" {
+			fields = append(fields, libpq.ErrorField{Code: libpq.FieldHint, Value: hint})
+		}
+		_ = w.WriteNoticeResponse(fields)
+		_ = w.Flush()
+	}
 	streaming := false
 	defer func() {
 		if !streaming {

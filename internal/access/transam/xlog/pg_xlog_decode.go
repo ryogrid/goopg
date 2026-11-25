@@ -44,6 +44,12 @@ const (
 	// xact-stamp pass in internal/initdb. (M0106-0013)
 	XlogXactCommit = xlogXactCommit
 	XlogXactAbort  = xlogXactAbort
+	// XlogXactCommitPrepared / XlogXactAbortPrepared finish a prepared
+	// transaction; its xid is the record's twophase xid. M0149-0012.
+	XlogXactCommitPrepared = xlogXactCommitPrepared
+	XlogXactAbortPrepared  = xlogXactAbortPrepared
+	// XlogXactPrepare is XLOG_XACT_PREPARE (M0149-0015a).
+	XlogXactPrepare = xlogXactPrepare
 	// XlogXactOpMask masks the opcode bits from XLogRecord.Info for RmgrXact.
 	XlogXactOpMask = xlogXactOpMask
 	// XlogClogTruncate is exported for the initdb clog-recovery scan (A9).

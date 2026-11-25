@@ -76,9 +76,11 @@ import (
 
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/libpq"
 	"github.com/goopg/goopg/internal/utils/errcodes"
+	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
@@ -99,6 +101,10 @@ type Config struct {
 	// location patched into the shipped pg_control. nil skips the
 	// checkpoint, matching the v0 in-process default.
 	Checkpointer executor.Checkpointer
+	// IsStandby reports whether the server is in recovery: a backup taken
+	// there writes no XLOG_BACKUP_END record (do_pg_backup_stop's
+	// backup_stopped_in_recovery arm). nil means a primary.
+	IsStandby func() bool
 }
 
 // WriteQueryErrorFunc writes an ErrorResponse plus a trailing ReadyForQuery on
@@ -242,7 +248,12 @@ func isExcludedFile(base string) bool {
 // exec_replication_command reaching basebackup.c's SendBaseBackup). `args` is
 // the suffix after `BASE_BACKUP ` (possibly empty for a bare `BASE_BACKUP`
 // command, which upstream also accepts).
-func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, args string) error {
+//
+// pid is the walsender's backend pid: the backup's pg_stat_progress_basebackup
+// row is keyed by it. ctx is the statement's context, so a CancelRequest
+// (pg_cancel_backend) ends the backup with "canceling statement due to user
+// request" and the session stays usable (M0149-0077l).
+func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, args string, pid int32) error {
 	if s.cfg.DataDir == "" {
 		return s.writeQueryError(w, errcodes.FeatureNotSupported,
 			"BASE_BACKUP requires Config.DataDir to be set")
@@ -255,6 +266,17 @@ func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, arg
 		return s.writeQueryError(w, errcodes.FeatureNotSupported,
 			fmt.Sprintf("BASE_BACKUP: unsupported manifest checksum type %q", opts.ManifestChecksums))
 	}
+	if opts.MaxRateSet && (opts.MaxRate < maxRateLower || opts.MaxRate > maxRateUpper) {
+		return s.writeQueryError(w, errcodes.NumericValueOutOfRange,
+			fmt.Sprintf("%d is outside the valid range for parameter \"%s\" (%d .. %d)",
+				opts.MaxRate, "MAX_RATE", maxRateLower, maxRateUpper))
+	}
+
+	// pgstat_progress_start_command(PROGRESS_COMMAND_BASEBACKUP): the row
+	// lives until the command ends, however it ends.
+	progress := activity.StartBaseBackupProgress(pid)
+	defer progress.End()
+	progress.SetPhase(activity.BaseBackupPhaseWaitCheckpoint)
 
 	// Force a synchronous IMMEDIATE checkpoint so the start-LSN we
 	// report names a record whose redo image is on disk. Upstream's
@@ -285,6 +307,23 @@ func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, arg
 		// standby reads the record AT that LSN and rejects anything that
 		// is not an RM_XLOG checkpoint.
 		ckptRecLSN = s.cfg.Checkpointer.LastCheckpointRecordLSN()
+	}
+	// No checkpoint or restartpoint has completed in this process — a
+	// standby that has not adopted a restartpoint yet. do_pg_backup_start
+	// then starts at pg_control's checkpoint (ControlFile->checkPoint /
+	// checkPointCopy.redo, the base backup's own checkpoint on a fresh
+	// standby), whose WAL the node still keeps. Falling back to the end of
+	// WAL started the backup where no WAL exists yet: pg_basebackup -X
+	// stream received nothing and the label named a redo point that was
+	// never written, so a cascading standby built from it could not start
+	// (M0149-0077f). pg_control stores PG byte LSNs; these are 1-based.
+	if redoLSN == 0 && s.cfg.DataDir != "" {
+		if cd, err := control.ReadControlFile(s.cfg.DataDir); err == nil && cd != nil && cd.CheckPointCopyRedo != 0 {
+			redoLSN = cd.CheckPointCopyRedo + 1
+			if cd.CheckPoint != 0 {
+				ckptRecLSN = cd.CheckPoint + 1
+			}
+		}
 	}
 	if redoLSN == 0 && s.cfg.WAL != nil {
 		redoLSN = s.cfg.WAL.WrittenLSN()
@@ -367,14 +406,19 @@ func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, arg
 	// --- stream tar bytes through CopyData 'd' frames ---
 	segSize := s.cfg.WALSegmentSize
 	if segSize <= 0 {
-		segSize = xlog.DefaultSegmentSize
+		segSize = xlog.WALSegmentSize()
 	}
 	streamer := &baseBackupStreamer{
 		w:                w,
 		bytesDone:        0,
 		nextProgressMark: baseBackupProgressInterval,
 		ctx:              ctx,
+		progress:         progress,
+		maxRateBytes:     opts.MaxRate * 1024,
+		start:            time.Now(),
 	}
+	progress.SetTablespacesTotal(int64(len(tblspcs) + 1))
+	progress.SetPhase(activity.BaseBackupPhaseStreamBackup)
 	wantManifest := opts.Manifest == "yes" || opts.Manifest == "force-encode"
 	mck, _ := parseManifestChecksumKind(opts.ManifestChecksums) // validated at entry
 
@@ -384,30 +428,58 @@ func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, arg
 	// 0-based redo point (baseLSN0); endptr is the 0-based stop LSN sampled
 	// now (emitBaseBackupTar reads files but writes no WAL, so WrittenLSN
 	// is stable across the call).
-	var walStartSeg, walEndSeg uint64
-	if opts.IncludeWAL {
-		walStartSeg = baseLSN0 / uint64(segSize)
-		endLSN0 := baseLSN0
-		if s.cfg.WAL != nil {
-			if wlsn := s.cfg.WAL.WrittenLSN(); wlsn > 0 {
-				endLSN0 = wlsn - 1
-			}
+	//
+	// do_pg_backup_stop runs after the data files are sent and before the
+	// WAL is (perform_base_backup), so the stop — XLOG_BACKUP_END on a
+	// primary — is inside the fetched range: stopBackup is called once the
+	// files are in the tar, and again (a no-op) before the result sets.
+	// M0149-0023d.
+	var stopLSN uint64
+	stopped := false
+	stopBackup := func() (uint64, error) {
+		if stopped {
+			return stopLSN, nil
 		}
-		if endLSN0 == 0 {
-			walEndSeg = walStartSeg
-		} else {
+		stopped = true
+		stopLSN = startLSN
+		if s.cfg.WAL != nil {
+			stopLSN = s.cfg.WAL.WrittenLSN()
+		}
+		if s.cfg.WAL != nil && redoLSN > 0 && (s.cfg.IsStandby == nil || !s.cfg.IsStandby()) {
+			end, err := s.writeBackupEnd(baseLSN0, ckptLSN0, startTLI, segSize, opts.Label)
+			if err != nil {
+				return 0, err
+			}
+			stopLSN = end
+		}
+		return stopLSN, nil
+	}
+	walStartSeg := baseLSN0 / uint64(segSize)
+	walEnd := func() (uint64, error) {
+		end, err := stopBackup()
+		if err != nil {
+			return 0, err
+		}
+		endLSN0 := baseLSN0
+		if end > 0 {
+			endLSN0 = end - 1
+		}
+		walEndSeg := walStartSeg
+		if endLSN0 != 0 {
 			walEndSeg = (endLSN0 - 1) / uint64(segSize)
 		}
-		if walEndSeg < walStartSeg {
-			walEndSeg = walStartSeg
-		}
+		return max(walEndSeg, walStartSeg), nil
 	}
 
-	entries, err := emitBaseBackupTar(ctx, streamer, s.cfg.DataDir, opts.Label, baseLSN0, ckptLSN0, startTLI, segSize, mck, opts.IncludeWAL, walStartSeg, walEndSeg, pgControlImage)
+	entries, err := emitBaseBackupTar(ctx, streamer, s.cfg.DataDir, opts.Label, baseLSN0, ckptLSN0, startTLI, segSize, mck, opts.IncludeWAL, walStartSeg, walEnd, pgControlImage)
 	if err != nil {
+		if ctx.Err() != nil {
+			return s.writeStreamingError(w, errcodes.QueryCanceled, "canceling statement due to user request")
+		}
 		return s.writeStreamingError(w, errcodes.InternalError,
 			fmt.Sprintf("BASE_BACKUP: tar: %v", err))
 	}
+	progress.TablespaceDone()
 
 	// --- per-tablespace archives: one <oid>.tar per in-place tablespace,
 	// streamed after base.tar. Each begins with its own 'n' (new-archive)
@@ -420,11 +492,18 @@ func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, arg
 		}
 		tsEntries, err := emitTablespaceTar(ctx, streamer, ts, mck)
 		if err != nil {
+			if ctx.Err() != nil {
+				return s.writeStreamingError(w, errcodes.QueryCanceled, "canceling statement due to user request")
+			}
 			return s.writeStreamingError(w, errcodes.InternalError,
 				fmt.Sprintf("BASE_BACKUP: tablespace %d: %v", ts.oid, err))
 		}
 		entries = append(entries, tsEntries...)
+		progress.TablespaceDone()
 	}
+	// do_pg_backup_stop: PROGRESS_BASEBACKUP_PHASE_WAIT_WAL_ARCHIVE, then
+	// TRANSFER_WAL while the WAL range is handed over.
+	progress.SetPhase(activity.BaseBackupPhaseWaitWALArchive)
 
 	// Final progress report at end-of-archive (upstream parity).
 	if err := writeProgressFrame(w, streamer.bytesDone); err != nil {
@@ -436,9 +515,12 @@ func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, arg
 	// The 'm' frame announces the manifest; its bytes then flow through
 	// the same CopyData 'd' framing as the tar. stopLSN is the WAL-range
 	// end the manifest records, so compute it before building.
-	stopLSN := startLSN
-	if s.cfg.WAL != nil {
-		stopLSN = s.cfg.WAL.WrittenLSN()
+	// do_pg_backup_stop on a primary: XLOG_BACKUP_END with the backup's
+	// start point — a restored node is consistent once it replays it
+	// (backupEndRequired, from the label's "BACKUP METHOD: streamed") —
+	// whose end is the stop point. Already done when the WAL was fetched.
+	if _, err := stopBackup(); err != nil {
+		return s.writeStreamingError(w, errcodes.InternalError, fmt.Sprintf("BASE_BACKUP: %v", err))
 	}
 	if wantManifest {
 		sysID, err := initdb.LoadOrCreateSystemID(s.cfg.DataDir)
@@ -562,6 +644,13 @@ type baseBackupStreamer struct {
 	bytesDone        uint64
 	nextProgressMark uint64
 	ctx              context.Context
+	// progress receives the streamed byte count (backup_streamed).
+	progress *activity.BaseBackupProgress
+	// maxRateBytes is MAX_RATE in bytes per second (0 = unthrottled); the
+	// streamer sleeps so the average since start stays at or below it, as
+	// bbsink_throttle does, and wakes early on cancel.
+	maxRateBytes int64
+	start        time.Time
 	// chunkBuf backs the CopyData payload. review/260831 NB-19: a fresh
 	// baseBackupChunkBytes buffer was allocated per chunk — one per 64 KiB of
 	// backup — even though WriteCopyData writes the bytes out synchronously
@@ -592,6 +681,10 @@ func (s *baseBackupStreamer) Write(p []byte) (int, error) {
 		s.bytesDone += uint64(n)
 		written += n
 		p = p[n:]
+		s.progress.AddStreamed(int64(n))
+		if err := s.throttle(); err != nil {
+			return written, err
+		}
 		if s.bytesDone >= s.nextProgressMark {
 			if err := writeProgressFrame(s.w, s.bytesDone); err != nil {
 				return written, err
@@ -600,6 +693,32 @@ func (s *baseBackupStreamer) Write(p []byte) (int, error) {
 		}
 	}
 	return written, nil
+}
+
+// MAX_RATE bounds in kB/s (basebackup_throttle.h MAX_RATE_LOWER/UPPER).
+const (
+	maxRateLower = 32
+	maxRateUpper = 1048576
+)
+
+// throttle sleeps until the bytes sent so far fit within MAX_RATE.
+func (s *baseBackupStreamer) throttle() error {
+	if s.maxRateBytes <= 0 {
+		return nil
+	}
+	due := s.start.Add(time.Duration(float64(s.bytesDone) / float64(s.maxRateBytes) * float64(time.Second)))
+	wait := time.Until(due)
+	if wait <= 0 {
+		return nil
+	}
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // castagnoliTable is the CRC-32C (Castagnoli) table used for backup
@@ -727,7 +846,7 @@ type manifestEntry struct {
 // the bytes on disk: BASE_BACKUP patches the checkpoint fields for the backup's
 // consumer only, and must leave the live cluster's control file alone
 // (M0131-S29).
-func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string, startLSN, ckptLSN uint64, tli uint32, segSize int64, mck manifestChecksumKind, includeWAL bool, walStartSeg, walEndSeg uint64, pgControlImage []byte) ([]manifestEntry, error) {
+func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string, startLSN, ckptLSN uint64, tli uint32, segSize int64, mck manifestChecksumKind, includeWAL bool, walStartSeg uint64, walEnd func() (uint64, error), pgControlImage []byte) ([]manifestEntry, error) {
 	tw := tar.NewWriter(out)
 
 	var manifest []manifestEntry
@@ -872,6 +991,10 @@ func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string
 	// including its contiguity sanity check. Appended WAL is intentionally
 	// NOT recorded in the manifest Files[] — PG tracks it via WAL-Ranges.
 	if includeWAL {
+		walEndSeg, err := walEnd()
+		if err != nil {
+			return nil, err
+		}
 		if err := appendWALSegments(tw, dataDir, tli, segSize, walStartSeg, walEndSeg); err != nil {
 			return nil, err
 		}
@@ -1124,20 +1247,8 @@ func buildBackupLabel(label string, startLSN, ckptLSN uint64, tli uint32, segSiz
 	if label == "" {
 		label = "goopg base backup"
 	}
-	if ckptLSN == 0 {
-		ckptLSN = startLSN
-	}
-	segno := startLSN / uint64(segSize)
-	walFile := xlog.XLogFileName(tli, segno, segSize)
-	var b bytes.Buffer
-	fmt.Fprintf(&b, "START WAL LOCATION: %s (file %s)\n", formatLSN(startLSN), walFile)
-	fmt.Fprintf(&b, "CHECKPOINT LOCATION: %s\n", formatLSN(ckptLSN))
-	fmt.Fprintf(&b, "BACKUP METHOD: streamed\n")
-	fmt.Fprintf(&b, "BACKUP FROM: primary\n")
-	fmt.Fprintf(&b, "START TIME: %s\n", time.Now().UTC().Format("2006-01-02 15:04:05 MST"))
-	fmt.Fprintf(&b, "LABEL: %s\n", label)
-	fmt.Fprintf(&b, "START TIMELINE: %d\n", tli)
-	return b.Bytes()
+	// Shared with pg_backup_stop's labelfile (M0149-0077k).
+	return executor.BuildBackupLabel(label, startLSN, ckptLSN, tli, segSize, time.Now())
 }
 
 // buildBackupManifest renders a PG-version-2 backup manifest (the JSON
@@ -1255,6 +1366,11 @@ type baseBackupOptions struct {
 	// appends the in-range pg_wal segments to the backup tar instead of
 	// relying on a concurrent `-X stream` walsender connection.
 	IncludeWAL bool
+	// MaxRate is MAX_RATE in kB/s (0 = unthrottled; basebackup_throttle.c).
+	// MaxRateSet records that the option was given, so an out-of-range value
+	// is reported with PG's range error.
+	MaxRate    int64
+	MaxRateSet bool
 }
 
 // parseBaseBackupOptions parses upstream PG17+ grammar
@@ -1312,7 +1428,13 @@ func parseBaseBackupOptionList(body string) (baseBackupOptions, error) {
 			// `-X fetch`. defGetBoolean treats a value-less option as true;
 			// honour an explicit false ('f'/'off'/'0') for completeness.
 			opts.IncludeWAL = parseOptionBool(val, true)
-		case "CHECKPOINT", "TABLESPACE_MAP", "VERIFY_CHECKSUMS", "MAX_RATE",
+		case "MAX_RATE":
+			n, err := strconv.ParseInt(strings.TrimSpace(trimSingleQuotes(val)), 10, 64)
+			if err != nil {
+				return opts, fmt.Errorf("MAX_RATE requires an integer value")
+			}
+			opts.MaxRate, opts.MaxRateSet = n, true
+		case "CHECKPOINT", "TABLESPACE_MAP", "VERIFY_CHECKSUMS",
 			"NOVERIFY_CHECKSUMS", "COMPRESSION",
 			"COMPRESSION_DETAIL", "INCREMENTAL":
 			// Accept but ignore — they don't affect what the v0
@@ -1449,4 +1571,36 @@ func tokenizeLegacyOptions(raw string) []string {
 	}
 	flush()
 	return out
+}
+
+// writeBackupEnd is the primary arm of do_pg_backup_stop for BASE_BACKUP: it
+// writes XLOG_BACKUP_END (main data: the backup's start point), switches to a
+// new segment so the backup's last segment can be archived, and writes the
+// backup history file into pg_wal, announced to the archiver. It returns the
+// record's end, the backup's stop point. M0149-0023d.
+func (s *Handler) writeBackupEnd(start0, ckpt0 uint64, tli uint32, segSize int64, label string) (uint64, error) {
+	rec, err := xlog.EncodeBackupEndPG(start0)
+	if err != nil {
+		return 0, err
+	}
+	_, end, err := s.cfg.WAL.Append(rec)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := s.cfg.WAL.SwitchSegment(); err != nil {
+		return 0, err
+	}
+	if err := s.cfg.WAL.FlushUpTo(s.cfg.WAL.WrittenLSN()); err != nil {
+		return 0, err
+	}
+	if label == "" {
+		label = "goopg base backup"
+	}
+	hist := xlog.BackupHistoryFileName(tli, start0, segSize)
+	content := executor.BuildBackupHistory(label, start0, ckpt0, tli, end, s.cfg.WAL.TimelineID(), segSize, time.Now(), time.Now())
+	if err := os.WriteFile(filepath.Join(s.cfg.DataDir, "pg_wal", hist), content, 0o600); err != nil {
+		return 0, fmt.Errorf("could not write file \"%s\": %w", filepath.Join("pg_wal", hist), err)
+	}
+	s.cfg.WAL.Archiver().Notify(hist)
+	return end, nil
 }

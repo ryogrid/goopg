@@ -13,8 +13,8 @@ func TestVisibilityMapSaveLoadRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 
 	src := NewVisibilityMap()
-	relA := RelFileNode{DBOid: 1, RelOid: 16402, Fork: MainFork}
-	relB := RelFileNode{DBOid: 1, RelOid: 16405, Fork: MainFork}
+	relA := RelFileNode{DBOid: 16384, RelOid: 16402, Fork: MainFork}
+	relB := RelFileNode{DBOid: 16384, RelOid: 16405, Fork: MainFork}
 	src.SetAllVisible(relA, 0)
 	src.SetAllVisible(relA, 3)
 	src.SetAllVisible(relA, 5)
@@ -50,7 +50,7 @@ func TestVisibilityMapLoadMissingFileIsNoOp(t *testing.T) {
 	if err := vm.VMLoadForks(t.TempDir()); err != nil {
 		t.Fatalf("VMLoadForks of empty dir should return nil, got %v", err)
 	}
-	rel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
+	rel := RelFileNode{DBOid: 16384, RelOid: 1, Fork: MainFork}
 	if vm.AllVisible(rel, 0) {
 		t.Error("fresh VM should not advertise any AllVisible bits")
 	}
@@ -62,7 +62,7 @@ func TestVisibilityMapLoadMissingFileIsNoOp(t *testing.T) {
 func TestVisibilityMapLoadRejectsCorruptFork(t *testing.T) {
 	dir := t.TempDir()
 	// Write a corrupt _vm file that is not a multiple of BlockSize.
-	dbDir := filepath.Join(dir, "base", "1")
+	dbDir := filepath.Join(dir, "base", "16384")
 	if err := os.MkdirAll(dbDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -85,8 +85,8 @@ func TestVisibilityMapSaveDeterministicOrdering(t *testing.T) {
 
 	src := NewVisibilityMap()
 	for _, rel := range []RelFileNode{
-		{DBOid: 1, RelOid: 16405, Fork: MainFork},
-		{DBOid: 1, RelOid: 16402, Fork: MainFork},
+		{DBOid: 16384, RelOid: 16405, Fork: MainFork},
+		{DBOid: 16384, RelOid: 16402, Fork: MainFork},
 		{DBOid: 5, RelOid: 99, Fork: MainFork},
 	} {
 		src.SetAllVisible(rel, 1)
@@ -100,8 +100,8 @@ func TestVisibilityMapSaveDeterministicOrdering(t *testing.T) {
 
 	// Compare the fork files — same state should produce identical files.
 	for _, rel := range []RelFileNode{
-		{DBOid: 1, RelOid: 16405, Fork: VisibilityMapFork},
-		{DBOid: 1, RelOid: 16402, Fork: VisibilityMapFork},
+		{DBOid: 16384, RelOid: 16405, Fork: VisibilityMapFork},
+		{DBOid: 16384, RelOid: 16402, Fork: VisibilityMapFork},
 		{DBOid: 5, RelOid: 99, Fork: VisibilityMapFork},
 	} {
 		pathA := RelForkPath(dirA, rel)

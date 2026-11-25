@@ -109,14 +109,29 @@ func stampPlanCost(n Node, p *Path) {
 			}
 		}
 	}
-	setter.setPlanCost(PlanCost{
+	pc := PlanCost{
 		StartupCost: p.Cost.Startup,
 		TotalCost:   p.Cost.Total,
 		PlanRows:    p.Rows,
 		PlanWidth:   TupleWidth(n.Output()),
 		PerWorker:   p.ParallelWorkers > 0,
 		Disabled:    disabled,
-	})
+	}
+	// create_bitmap_subplan (createplan.c): a bitmap tree node returns a
+	// bitmap, not tuples — plan_width is 0 ("meaningless") on Bitmap Index
+	// Scan, BitmapAnd and BitmapOr, and a Bitmap Index Scan's startup_cost
+	// is 0.0 (M0148-0001c3a4 (g)).
+	switch p.Kind {
+	case PathBitmapIndexScan:
+		pc.StartupCost, pc.PlanWidth = 0, 0
+		// plan->total_cost = ipath->indextotalcost.
+		if p.BitmapIndexAMTotal > 0 {
+			pc.TotalCost = p.BitmapIndexAMTotal
+		}
+	case PathBitmapAnd, PathBitmapOr:
+		pc.PlanWidth = 0
+	}
+	setter.setPlanCost(pc)
 }
 
 // pathSelfDisabled is plan_is_disabled over the path a node was built from:
@@ -165,6 +180,12 @@ func DeriveLegacyDisplayCost(n Node, rows int64) PlanCost {
 		return out
 	}
 	out.PlanWidth = TupleWidth(n.Output())
+	if len(n.Output()) == 0 {
+		// An empty targetlist is width 0 to PG (the input Result of a
+		// FROM-less SELECT, `select count(*)`); tupleWidth's floor of 1 is a
+		// planner-side guard, not a displayed width (M0149-0001h1a78d).
+		out.PlanWidth = 0
+	}
 
 	childStartup, childTotal := 0.0, 0.0
 	for _, c := range legacyDisplayChildren(n) {
@@ -178,7 +199,35 @@ func DeriveLegacyDisplayCost(n Node, rows int64) PlanCost {
 	}
 
 	perRow := cp.cpuTupleCost * float64(rows)
+	if st, ok := functionScanStartup(cp, n); ok {
+		// M0149-0001h1a80: cost_functionscan — the call is evaluated once,
+		// as startup, before the per-row charge.
+		out.StartupCost = st
+		out.TotalCost = st + perRow
+		return out
+	}
 	switch x := n.(type) {
+	case *Project:
+		// M0149-0001h1a78a: a Project returning a SELECT-list ProjectSet's
+		// columns unchanged is the ProjectSet's own target list to PG — no
+		// projection node and no cpu_tuple_cost.
+		if ps, ok := x.Child.(*ProjectSet); ok && isSelectListProjectSet(ps) && projectIsPositionalIdentity(x) {
+			pc := projectSetDisplayCost(cp, ps)
+			pc.CostSet = false
+			return pc
+		}
+		out.StartupCost = childStartup
+		out.TotalCost = childTotal + perRow
+	case *ProjectSet:
+		if isSelectListProjectSet(x) {
+			// M0149-0001h1a78a: create_set_projection_path, plus the Result
+			// above when PG plans one (projectset_cost.go).
+			pc := projectSetDisplayCost(cp, x)
+			pc.CostSet = false
+			return pc
+		}
+		out.StartupCost = childStartup
+		out.TotalCost = childTotal + perRow
 	case *CTEScan:
 		if !x.Inlined() {
 			// cost_ctescan (M0146-0005az): cpu_tuple_cost per tuple for the
@@ -231,6 +280,16 @@ func DeriveLegacyDisplayCost(n Node, rows int64) PlanCost {
 		out.StartupCost = childStartup
 		out.TotalCost = childTotal + perRow
 	case *Filter:
+		if st, ok := functionScanStartup(cp, x.Child); ok {
+			// M0149-0001h1a80: the qual of a function scan is its
+			// baserestrictinfo — cost_functionscan charges it with
+			// cpu_tuple_cost on every tuple the function returns.
+			qs, qp := qualEvalOps(x.Predicate)
+			in := float64(EstimateRows(x.Child))
+			out.StartupCost = st + qs*cp.cpuOperatorCost
+			out.TotalCost = out.StartupCost + (cp.cpuTupleCost+qp*cp.cpuOperatorCost)*in
+			break
+		}
 		if agg, ok := x.Child.(*Aggregate); ok {
 			// M0146-0214: a Filter over an Aggregate is its HAVING. cost_agg
 			// prices the quals inside the aggregate (costsize.c, "If there
@@ -337,6 +396,11 @@ func legacyDisplayChildren(n Node) []Node {
 	case *Memoize:
 		return []Node{p.Child}
 	case *Materialize:
+		return []Node{p.Child}
+	case *ProjectSet:
+		if p.Child == nil {
+			return nil
+		}
 		return []Node{p.Child}
 	case *Result:
 		if p.Child == nil {

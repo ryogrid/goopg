@@ -130,7 +130,7 @@ func TestPgStatisticIndexInitialEntries(t *testing.T) {
 	const (
 		oidOpsID  uint32 = 1981
 		int2OpsID uint32 = 1979
-		boolOpsID uint32 = 1984
+		boolOpsID uint32 = 10003
 	)
 	var got *pgIndexEntry
 	for _, e := range pgIndexInitialEntries() {

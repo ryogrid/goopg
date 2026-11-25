@@ -274,7 +274,17 @@ func planJoinlistSearch(jl joinlist, prob *joinlistProblem) (Node, *RelOptInfo, 
 	// nobody, taggable by nothing, and running the one-relation protocol on it
 	// panicked at plan time. Declining leaves it exactly as the short-circuit
 	// always left it.
-	if _, _, rebuildable := scanLeafFor(r.node); rebuildable && r.info.table != nil && jl.nrels() == 1 {
+	// M0148-0001c3a10: a partitioned table's appendrel is searched too —
+	// set_append_rel_pathlist plans its partitions as child rels, and the
+	// Append over their cheapest paths (index and bitmap included) must be
+	// able to win. SetOp embeds the searched-tree tag.
+	_, _, rebuildable := scanLeafFor(r.node)
+	if !rebuildable {
+		if so, _ := appendRelLeafNode(r.node); so != nil && so.partScheme != nil {
+			rebuildable = true
+		}
+	}
+	if rebuildable && r.info.table != nil && jl.nrels() == 1 {
 		r, err = prob.searchOneProblem([]joinlistRel{r}, prob.tupleFraction)
 		if err != nil {
 			return nil, nil, err

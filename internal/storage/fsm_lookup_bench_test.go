@@ -7,7 +7,7 @@ import "testing"
 // the steady state of an append-heavy relation.
 func fsmBenchFSM(npages int) (*FSM, RelFileNode) {
 	f := NewFSM()
-	rel := RelFileNode{DBOid: 1, RelOid: 16384}
+	rel := RelFileNode{DBOid: 16384, RelOid: 16384}
 	for blk := 0; blk < npages; blk++ {
 		free := uint16(0)
 		if blk >= npages-4 {

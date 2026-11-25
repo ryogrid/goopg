@@ -422,6 +422,15 @@ func (l *lexerState) next() lexResult {
 	// time/timestamp/interval are kwlist COL_NAME keywords (TIME/TIMESTAMP/
 	// INTERVAL terminals); date is a plain IDENT. Match on text either way.
 	lower := strings.ToLower(cur.str)
+	// gram.y's other typed-literal forms (AexprConst: ConstTypename Sconst,
+	// func_name Sconst, func_name '(' func_arg_list ')' Sconst): a type with
+	// modifiers, a pg_catalog-qualified type, DOUBLE PRECISION, and the types
+	// below. They become a cast of the string (typedLitExpr).
+	if cur.term > 0 {
+		if spec, strVal, strPos, ok := l.peekTypedLitForm(lower); ok {
+			return lexResult{term: termTYPEDLIT, str: spec + "\x1f" + strVal, pos: cur.pos, ival: strPos, text: cur.text}
+		}
+	}
 	if _, isKw := knownTypeNames[lower]; isKw {
 		// Match on TEXT, not on a fixed terminal set: most type names are
 		// col_name_keywords with terminals of their own (TEXT_P, JSON, ...),
@@ -436,8 +445,8 @@ func (l *lexerState) next() lexResult {
 		// col_name_keywords, so a `char_lit_name` nonterminal was 3
 		// reduce/reduce conflicts against col_name_keyword.
 		if cur.term > 0 && charTypmodFamily[lower] {
-			if s2, ok := l.peekCharTypmodLit(); ok {
-				return lexResult{term: termTYPEDLIT, str: knownTypeNames[lower] + "\x1f" + s2, pos: cur.pos, text: cur.text}
+			if s2, litPos, ok := l.peekCharTypmodLit(); ok {
+				return lexResult{term: termTYPEDLIT, str: knownTypeNames[lower] + "\x1f" + s2, pos: cur.pos, ival: litPos, text: cur.text}
 			}
 		}
 		if cur.term > 0 {
@@ -446,7 +455,7 @@ func (l *lexerState) next() lexResult {
 				// Fold to one synthetic terminal so c_expr can build a
 				// TypedStringLit (legacy parity) instead of a bare string —
 				// `date 'X' + interval 'Y'` needs the type for + resolution.
-				return lexResult{term: termTYPEDLIT, str: knownTypeNames[lower] + "\x1f" + nxt.str, pos: cur.pos, text: cur.text + " " + nxt.text}
+				return lexResult{term: termTYPEDLIT, str: knownTypeNames[lower] + "\x1f" + nxt.str, pos: cur.pos, ival: nxt.pos, text: cur.text + " " + nxt.text}
 			}
 		}
 	}
@@ -505,23 +514,145 @@ func (l *lexerState) checkFollowsWith() bool {
 // carry a typmod. Upstream restricts the form to bpchar/varchar the same way.
 var charTypmodFamily = map[string]bool{"char": true, "bpchar": true, "varchar": true}
 
+// castLitTypes are type names that make a typed literal beyond knownTypeNames.
+// Such a literal is a cast of the string, so the type's own input function
+// and error position apply.
+var castLitTypes = map[string]bool{
+	"uuid": true, "inet": true, "cidr": true, "macaddr": true, "macaddr8": true,
+	"money": true, "bytea": true, "bit": true, "varbit": true, "xml": true,
+	"tsvector": true, "tsquery": true, "jsonpath": true, "int": true, "float": true,
+	"character": true, "regclass": true, "regproc": true, "regprocedure": true,
+	"regoper": true, "regoperator": true, "regtype": true, "regnamespace": true,
+	"regrole": true, "regconfig": true, "regdictionary": true, "regcollation": true,
+	"xid": true, "xid8": true, "cid": true, "int2vector": true, "oidvector": true,
+	// tid is left out for now: brin.sql loops until `curtid > tid '(2, 0)'`,
+	// and INSERT ... RETURNING ctid yields NULL here (M0149-0001h1a84), so
+	// accepting the literal turns a syntax error into a loop without end.
+}
+
+// typmodLitTypes take modifiers before the string: `numeric(5,2) '3.14159'`.
+var typmodLitTypes = map[string]bool{
+	"numeric": true, "decimal": true, "time": true, "timetz": true, "timestamp": true,
+	"timestamptz": true, "bit": true, "varbit": true, "float": true, "character": true,
+}
+
+// peekTypedLitForm matches the typed-literal forms knownTypeNames does not
+// cover, starting after the type-name token just consumed (lower is its
+// text), and consumes them. spec is the type: "name", "name(a,b)" or
+// "schema.name".
+func (l *lexerState) peekTypedLitForm(lower string) (spec, val string, pos int, ok bool) {
+	i := l.i
+	tok := func(k int) (Token, bool) {
+		if i+k >= len(l.toks) {
+			return Token{}, false
+		}
+		return l.toks[i+k], true
+	}
+	isSym := func(t Token, s string) bool { return t.Kind == TokenSymbol && t.Value == s }
+	// DOUBLE PRECISION 'x'
+	if lower == "double" {
+		if p, ok1 := tok(0); ok1 && strings.EqualFold(p.Value, "precision") {
+			if s, ok2 := tok(1); ok2 && s.Kind == TokenStringLit {
+				l.i = i + 2
+				return "float8", s.Value, s.Pos, true
+			}
+		}
+		return "", "", 0, false
+	}
+	// schema.name 'x' — gram.y func_name Sconst with a qualified name. A
+	// qualified name directly followed by a string is a typed literal
+	// wherever it appears (option names are never qualified), so any schema
+	// folds; pg_catalog keeps its known-type list. M0149-0001h1a85.
+	if lower != "pg_catalog" {
+		dot, ok1 := tok(0)
+		name, ok2 := tok(1)
+		s, ok3 := tok(2)
+		if ok1 && ok2 && ok3 && isSym(dot, ".") && s.Kind == TokenStringLit &&
+			(name.Kind == TokenIdent || name.Kind == TokenQuotedIdent) {
+			n := name.Value
+			if name.Kind != TokenQuotedIdent {
+				n = strings.ToLower(n)
+			}
+			l.i = i + 3
+			return lower + "." + n, s.Value, s.Pos, true
+		}
+	}
+	// pg_catalog.name 'x'
+	if lower == "pg_catalog" {
+		dot, ok1 := tok(0)
+		name, ok2 := tok(1)
+		s, ok3 := tok(2)
+		if ok1 && ok2 && ok3 && isSym(dot, ".") && s.Kind == TokenStringLit &&
+			(name.Kind == TokenIdent || name.Kind == TokenKeyword || name.Kind == TokenQuotedIdent) {
+			n := name.Value
+			if name.Kind != TokenQuotedIdent {
+				n = strings.ToLower(n)
+			}
+			if _, known := knownTypeNames[n]; known || castLitTypes[n] {
+				l.i = i + 3
+				return "pg_catalog." + n, s.Value, s.Pos, true
+			}
+		}
+		return "", "", 0, false
+	}
+	// name ( n [, m] ) 'x'
+	if typmodLitTypes[lower] {
+		if open, ok1 := tok(0); ok1 && isSym(open, "(") {
+			var args []string
+			k := 1
+			for {
+				n, okn := tok(k)
+				if !okn || n.Kind != TokenIntLit {
+					return "", "", 0, false
+				}
+				args = append(args, n.Value)
+				sep, oks := tok(k + 1)
+				if !oks {
+					return "", "", 0, false
+				}
+				if isSym(sep, ",") && len(args) < 2 {
+					k += 2
+					continue
+				}
+				if !isSym(sep, ")") {
+					return "", "", 0, false
+				}
+				k += 2
+				break
+			}
+			if s, ok2 := tok(k); ok2 && s.Kind == TokenStringLit {
+				l.i = i + k + 1
+				return lower + "(" + strings.Join(args, ",") + ")", s.Value, s.Pos, true
+			}
+		}
+	}
+	// name 'x' for the types knownTypeNames leaves out
+	if castLitTypes[lower] {
+		if s, ok1 := tok(0); ok1 && s.Kind == TokenStringLit {
+			l.i = i + 1
+			return lower, s.Value, s.Pos, true
+		}
+	}
+	return "", "", 0, false
+}
+
 // peekCharTypmodLit matches `( ICONST ) SCONST` after a type name and consumes
 // it, returning the string. The typmod itself is discarded: legacy stores only
 // the raw literal.
-func (l *lexerState) peekCharTypmodLit() (string, bool) {
+func (l *lexerState) peekCharTypmodLit() (string, int, bool) {
 	i := l.i
 	if i+3 >= len(l.toks) {
-		return "", false
+		return "", 0, false
 	}
 	open, num, close_, str := l.toks[i], l.toks[i+1], l.toks[i+2], l.toks[i+3]
 	if open.Kind != TokenSymbol || open.Value != "(" ||
 		num.Kind != TokenIntLit ||
 		close_.Kind != TokenSymbol || close_.Value != ")" ||
 		str.Kind != TokenStringLit {
-		return "", false
+		return "", 0, false
 	}
 	l.i = i + 4
-	return str.Value, true
+	return str.Value, str.Pos, true
 }
 
 // peek maps the next raw token WITHOUT consuming it (a pure function of the

@@ -225,12 +225,12 @@ func TestTryHandleRoleDDLAlterRoleConfig(t *testing.T) {
 	}
 
 	// IN DATABASE matching the connection's own live database: recorded
-	// under FirstUserOID.
+	// under PostgresDBOid.
 	if handled, err := s.tryHandleRoleDDL("ALTER ROLE foo IN DATABASE postgres SET search_path TO public", "postgres", nil); !handled || err != nil {
 		t.Fatalf("ALTER ROLE foo IN DATABASE postgres SET: handled=%v err=%v", handled, err)
 	}
-	if got := im.RoleConfigEntries(roleOid, catalog.FirstUserOID); len(got) != 1 || got[0] != "search_path=public" {
-		t.Errorf("RoleConfigEntries(foo, FirstUserOID) = %v, want [search_path=public]", got)
+	if got := im.RoleConfigEntries(roleOid, catalog.PostgresDBOid); len(got) != 1 || got[0] != "search_path=public" {
+		t.Errorf("RoleConfigEntries(foo, PostgresDBOid) = %v, want [search_path=public]", got)
 	}
 
 	// IN DATABASE naming a DIFFERENT database than the live connection is a
@@ -250,7 +250,7 @@ func TestTryHandleRoleDDLAlterRoleConfig(t *testing.T) {
 	if got := im.RoleConfigEntries(roleOid, 0); len(got) != 0 {
 		t.Errorf("RoleConfigEntries(foo, 0) after RESET = %v, want empty", got)
 	}
-	if got := im.RoleConfigEntries(roleOid, catalog.FirstUserOID); len(got) != 1 {
+	if got := im.RoleConfigEntries(roleOid, catalog.PostgresDBOid); len(got) != 1 {
 		t.Errorf("IN DATABASE entry should survive an unrelated cluster-wide RESET: %v", got)
 	}
 
@@ -258,8 +258,8 @@ func TestTryHandleRoleDDLAlterRoleConfig(t *testing.T) {
 	if handled, err := s.tryHandleRoleDDL("ALTER ROLE foo IN DATABASE postgres RESET ALL", "postgres", nil); !handled || err != nil {
 		t.Fatalf("ALTER ROLE foo IN DATABASE postgres RESET ALL: handled=%v err=%v", handled, err)
 	}
-	if got := im.RoleConfigEntries(roleOid, catalog.FirstUserOID); len(got) != 0 {
-		t.Errorf("RoleConfigEntries(foo, FirstUserOID) after RESET ALL = %v, want empty", got)
+	if got := im.RoleConfigEntries(roleOid, catalog.PostgresDBOid); len(got) != 0 {
+		t.Errorf("RoleConfigEntries(foo, PostgresDBOid) after RESET ALL = %v, want empty", got)
 	}
 
 	// A nonexistent role errors 42704 (undefined_object), matching
@@ -341,13 +341,13 @@ func TestTryHandleRoleDDLAlterRoleAll(t *testing.T) {
 	}
 
 	// IN DATABASE matching the connection's own live database: recorded
-	// under (roleOid=0, FirstUserOID) — the "setdatabase=<db>, setrole=0"
+	// under (roleOid=0, PostgresDBOid) — the "setdatabase=<db>, setrole=0"
 	// row, distinct from the plain cluster-wide (0,0) row above.
 	if handled, err := s.tryHandleRoleDDL("ALTER ROLE ALL IN DATABASE postgres SET search_path TO public", "postgres", nil); !handled || err != nil {
 		t.Fatalf("ALTER ROLE ALL IN DATABASE postgres SET: handled=%v err=%v", handled, err)
 	}
-	if got := im.RoleConfigEntries(0, catalog.FirstUserOID); len(got) != 1 || got[0] != "search_path=public" {
-		t.Errorf("RoleConfigEntries(0, FirstUserOID) = %v, want [search_path=public]", got)
+	if got := im.RoleConfigEntries(0, catalog.PostgresDBOid); len(got) != 1 || got[0] != "search_path=public" {
+		t.Errorf("RoleConfigEntries(0, PostgresDBOid) = %v, want [search_path=public]", got)
 	}
 	if got := im.RoleConfigEntries(0, 0); len(got) != 1 || got[0] != "work_mem=64MB" {
 		t.Errorf("cluster-wide (0,0) entry mutated by an IN DATABASE ALTER ROLE ALL: %v", got)

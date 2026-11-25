@@ -13,6 +13,8 @@ import (
 	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/utils/adt/array"
+	"github.com/goopg/goopg/internal/utils/adt/cash"
+	"github.com/goopg/goopg/internal/utils/adt/fixedgeo"
 	"github.com/goopg/goopg/internal/utils/adt/datetime"
 	"github.com/goopg/goopg/internal/access/common/pglz"
 	"github.com/goopg/goopg/internal/nodes"
@@ -657,7 +659,7 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 	case "timestamp", "timestamptz":
 		if d.Kind == KindString {
 			// 'infinity' / '-infinity' / 'today' / ... (#5(d-iv), M0134-0182).
-			if inf, ok := parseTimestampSpecialLiteral(d.StringValue(), nowFromCtx(ctx), isTimestampTZTypeName(t.Name)); ok {
+			if inf, ok := parseTimestampSpecialLiteral(d.StringValue(), nowFromCtx(ctx), isTimestampTZTypeName(t.Name), timeZoneFromCtx(ctx)); ok {
 				d = inf
 			} else {
 				// A zone in the text belongs to the value only for timestamptz;
@@ -685,9 +687,9 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 				// either way. The real INSERT/UPDATE row encoder
 				// (operators_storage.go's EncodeRowPGCtx call sites) DOES pass
 				// a live session ctx.
-				ts, err := parseCopyTimestampZoneSession(d.StringValue(), tsZoneModeForType(t.Name), timeZoneFromCtx(ctx))
+				ts, _, err := decodeTimestampText(d.StringValue(), tsZoneModeForType(t.Name), dateInputFromCtx(ctx))
 				if err != nil {
-					return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type timestamp: %q", d.StringValue())}
+					return nil, dateTimeInputError(err, timestampInputTypeName(isTimestampTZTypeName(t.Name)), d.StringValue(), 0)
 				}
 				d = NewTimeDatum(ts.UTC())
 			}
@@ -706,7 +708,10 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 		case d.IsTimestampNegInf():
 			micros = math.MinInt64
 		default:
-			micros = d.TimeValue().UnixMicro() - pgEpochUnixMicros
+			micros = d.Int // the carrier is PG's on-disk value
+			if prec := timeColumnPrecision(t); prec >= 0 {
+				micros = datetime.AdjustTimestampForTypmod(micros, int32(prec))
+			}
 		}
 		var buf [8]byte
 		binary.LittleEndian.PutUint64(buf[:], uint64(micros))
@@ -714,15 +719,15 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 	case "date":
 		if d.Kind == KindString {
 			// 'infinity' / '-infinity' / 'today' / ... (#5(d-iv), M0134-0182).
-			if inf, ok := parseDateSpecialLiteral(d.StringValue(), nowFromCtx(ctx)); ok {
+			if inf, ok := parseDateSpecialLiteral(d.StringValue(), nowFromCtx(ctx), timeZoneFromCtx(ctx)); ok {
 				d = inf
 			} else {
 				// date_in never looks at the decoded zone, nor at an hour-24 /
 				// leap-second day carry, so the wall clock as written picks the
 				// day (parseDateInputText).
-				ts, err := parseDateInputText(d.StringValue())
+				ts, err := decodeDateText(d.StringValue(), dateInputFromCtx(ctx))
 				if err != nil {
-					return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type date: %q", d.StringValue())}
+					return nil, dateTimeInputError(err, "date", d.StringValue(), 0)
 				}
 				d = NewTimeDatum(ts.UTC())
 			}
@@ -740,9 +745,7 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 		case d.IsTimestampNegInf():
 			days = math.MinInt32
 		default:
-			t := d.TimeValue()
-			micros := t.UnixMicro() - pgEpochUnixMicros
-			days = int32(micros / (24 * 3600 * 1000000))
+			days = pgDaysOfDatum(d)
 		}
 		var buf [4]byte
 		binary.LittleEndian.PutUint32(buf[:], uint32(days))
@@ -753,7 +756,7 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 			if err != nil {
 				return nil, err
 			}
-			d = NewTimeDatum(ts)
+			d = NewTimeOfDayDatum(ts)
 		}
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
@@ -959,13 +962,15 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 		}
 		return varlenaBytes(body), nil
 	case "aclitem[]", "_aclitem":
-		// PG binary empty ArrayType, elemtype = aclitem (1033).
-		// PG's deconstruct_array asserts on ARR_ELEMTYPE; a text varlena
-		// "{}" is not a valid ArrayType*. Match construct_empty_array.
+		// A text "{}" is not a valid ArrayType*; encode PG's empty ACL,
+		// allocacl(0) — one dimension of length 0 — which check_acl accepts
+		// (the generic ndim-0 empty array is rejected: "ACL arrays must be
+		// one-dimensional"). Writers that mean "no GRANT yet" must store
+		// NULL instead (M0149-0001g slice 12).
 		if d.Kind == KindBytes {
 			return d.BytesValue(), nil
 		}
-		return emptyArrayTypeBytes(1033), nil
+		return emptyACLBytes(), nil
 	case "text[]", "_text":
 		// PG binary empty ArrayType, elemtype = text (25). M0106-0010
 		// Step 3dk lets callers (initdb pg_proc seed) pass a pre-built
@@ -1129,6 +1134,45 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 			return nil, ee
 		}
 		return varlenaTextBytes(s), nil
+	case "aclitem":
+		// AclItem (16 bytes) in a cluster with the fixed_length_aclitem
+		// capability; otherwise the older varlena text. M0149-0001k2.
+		s, err := coerceTextLikeDatum(t, d)
+		if err != nil {
+			return nil, err
+		}
+		if catalog.FixedLengthAclItem() {
+			return encodeAclItemScalar(s, ctx)
+		}
+		return varlenaTextBytes(s), nil
+	case "money":
+		// Cash: int64 cents, 8 bytes by value in a cluster with the
+		// fixed_length_money capability; otherwise goopg's older varlena text,
+		// now written as cash_out's canonical form. Either way the input goes
+		// through cash_in / the numeric and integer casts. M0149-0001k1.
+		c, err := moneyCents(d)
+		if err != nil {
+			return nil, err
+		}
+		if catalog.FixedLengthMoney() {
+			var b [8]byte
+			binary.LittleEndian.PutUint64(b[:], uint64(c))
+			return b[:], nil
+		}
+		return varlenaTextBytes(cash.Out(c)), nil
+	case "point", "lseg", "box", "line", "circle", "tid":
+		// PG's fixed-length struct images (fixedgeo) in a cluster with the
+		// fixed_length_geometric_tid capability; otherwise the varlena text of
+		// the default arm below. The Datum stays the canonical text either way.
+		// M0149-0001k.
+		s, err := coerceTextLikeDatum(t, d)
+		if err != nil {
+			return nil, err
+		}
+		if catalog.FixedLengthGeoTid() {
+			return fixedgeo.Encode(strings.ToLower(t.Name), s)
+		}
+		return varlenaTextBytes(s), nil
 	default:
 		// text, varchar, char, bpchar, unknown, numeric, etc.
 		// Use PG varlena format (LE): 1-byte header for short values,
@@ -1210,16 +1254,6 @@ func varlenaTextBytes(s string) []byte {
 // the PG timestamp encoding).
 var pgEpochUnixMicros = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro()
 
-// maxDateDaysForMicros / minDateDaysForMicros bound the days-since-2000 range
-// whose conversion to Unix microseconds still fits in int64. PG's date type
-// reaches far past this (5874897 AD); the sentinels aside, a date beyond the
-// bound cannot be represented as micros at all (review/260831-2 EC-5).
-const (
-	microsPerDay         = int64(24 * 3600 * 1000000)
-	maxDateDaysForMicros = int32((math.MaxInt64 - 946684800000000) / microsPerDay)
-	minDateDaysForMicros = int32((math.MinInt64 + 946684800000000) / microsPerDay)
-)
-
 // pgTimeMicros extracts the microseconds-since-midnight that PG's TimeADT holds
 // from the time.Time carrier of a `time`/`timetz` Datum.
 //
@@ -1276,7 +1310,18 @@ func roundTimeDatumToPrecision(d Datum, prec int64) Datum {
 	if d.TimeSub == TimeSubTimeTZ {
 		return NewTimeTZDatum(tv, d.TimeTZOffsetSecs())
 	}
-	return NewTimeDatum(tv)
+	return NewTimeOfDayDatum(tv)
+}
+
+// roundTimestampDatumToPrecision rounds a timestamp or timestamptz Datum to the
+// declared precision (AdjustTimestampForTypmod). The infinities and a precision
+// outside [0,6] pass through; the Datum's timestamp subtype is preserved.
+func roundTimestampDatumToPrecision(d Datum, prec int64) Datum {
+	if d.Kind != KindTime || prec < 0 || prec > 6 || d.IsTimestampPosInf() || d.IsTimestampNegInf() {
+		return d
+	}
+	d.Int = datetime.AdjustTimestampForTypmod(d.Int, int32(prec))
+	return d
 }
 
 // timeColumnPrecision returns the declared fractional-second precision of a
@@ -1826,49 +1871,33 @@ func decodePhysicalPGValueLowered(t *catalog.Type, tname string, data []byte, sc
 		// literal in the type-agnostic paths (Datum.Format(), CAST-to-text,
 		// string concat). The wire path re-derives the type from the column and
 		// is unaffected either way.
-		ts := time.UnixMicro(micros + pgEpochUnixMicros).UTC()
 		// tname, not isTimestampTZTypeName(t.Name): this arm is only reached
 		// via `case "timestamp", "timestamptz"`, so tname is already exactly
 		// one of those two literals and the general predicate — which
 		// TrimSpaces and ToLowers the raw name on every value — can only
 		// return the same answer. Removing it is the last of the three
 		// per-value string scans colTypeInfo exists to eliminate.
+		// The on-disk value is the carrier.
 		if tname == "timestamptz" {
-			return NewTimestampTZDatum(ts), 8, nil
+			return Datum{Kind: KindTime, Int: micros, TimeSub: TimeSubTimestampTZ}, 8, nil
 		}
-		return NewTimeDatum(ts), 8, nil
+		return Datum{Kind: KindTime, Int: micros}, 8, nil
 	case "date":
 		// encodeValuePG stores 4-byte LE days since the PG epoch. M0111-0004.
 		if len(data) < 4 {
 			return Datum{}, 0, fmt.Errorf("truncated date")
 		}
 		days := int32(binary.LittleEndian.Uint32(data[:4]))
-		// PG's DATEVAL_NOEND / DATEVAL_NOBEGIN sentinels (PG_INT32_MAX /
-		// PG_INT32_MIN days) decode to the ±infinity DATE carrier; the epoch
-		// arithmetic below would overflow, so intercept first. (#5(d-iv))
-		switch days {
-		case math.MaxInt32:
-			return NewDateInfinity(true), 4, nil
-		case math.MinInt32:
-			return NewDateInfinity(false), 4, nil
-		}
-		// Outside the sentinels PG still spans 4714 BC .. 5874897 AD, and the
-		// micros arithmetic below overflows int64 well before that upper end
-		// (~year 294247), wrapping a far-future date into a garbage near-past
-		// one. goopg's own date input already refuses anything outside Go's
-		// time range, so this only guards a heap written by real PG — but
-		// silently decoding it wrong is worse than saying so
-		// (review/260831-2 EC-5).
-		if days > maxDateDaysForMicros || days < minDateDaysForMicros {
+		// PG's dates run to 5874897 AD, past what the carrier holds. goopg's own
+		// input refuses those, so this only guards a heap written by real PG, and
+		// decoding it wrongly would be worse than saying so (review/260831-2 EC-5).
+		// A storage-decoded date is tagged DATE so it renders like a date literal
+		// in type-agnostic paths. M0003 / 0003-0013.
+		d, ok := newDateDatumFromPGDays(days)
+		if !ok {
 			return Datum{}, 0, fmt.Errorf("date out of range: %d days from 2000-01-01", days)
 		}
-		micros := int64(days)*24*3600*1000000 + pgEpochUnixMicros
-		// Tag as DATE (TimeSubDate) so a storage-decoded date renders identically
-		// to a date literal in type-agnostic paths (Datum.Format(): text casts,
-		// string concat, array/composite element rendering). The wire path
-		// (server dispatch) re-derives date formatting from the column type and
-		// is unaffected. M0003 / 0003-0013 KindDate carrier gap.
-		return NewDateDatum(time.UnixMicro(micros).UTC()), 4, nil
+		return d, 4, nil
 	case "time":
 		if len(data) < 8 {
 			return Datum{}, 0, fmt.Errorf("truncated time")
@@ -1878,7 +1907,7 @@ func decodePhysicalPGValueLowered(t *catalog.Type, tname string, data []byte, sc
 		if micros < 0 || micros > maxTimeMicros {
 			return Datum{}, 0, fmt.Errorf("invalid time micros")
 		}
-		return NewTimeDatum(pgTimeFromMicros(micros)), 8, nil
+		return NewTimeOfDayDatum(pgTimeFromMicros(micros)), 8, nil
 	case "timetz":
 		if len(data) < 12 {
 			return Datum{}, 0, fmt.Errorf("truncated timetz")
@@ -2191,6 +2220,56 @@ func decodePhysicalPGValueLowered(t *catalog.Type, tname string, data []byte, sc
 			elem = "oid"
 		}
 		return decodeArrayValuePGStyled(catalog.Type{Name: elem, IsArray: true}, data, st)
+	case "aclitem":
+		// Sibling of encodeValuePG's "aclitem" arm: the AclItem rendered by
+		// aclitemout through the session's role renderer. M0149-0001k2.
+		if catalog.FixedLengthAclItem() {
+			txt, n, err := DecodeAclItemScalar(data, st.RegOut)
+			if err != nil {
+				return Datum{}, 0, err
+			}
+			return NewStringDatum(txt), n, nil
+		}
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, fmt.Errorf("decode aclitem as varlena: %w", err)
+		}
+		return NewStringDatum(string(payload)), n, nil
+	case "money":
+		// Sibling of encodeValuePG's "money" arm: the 8-byte Cash in a capable
+		// cluster, else the varlena text parsed by cash_in (older rows hold
+		// whatever text was inserted; one that no longer parses is returned as
+		// text, as before). M0149-0001k1.
+		if catalog.FixedLengthMoney() {
+			if len(data) < 8 {
+				return Datum{}, 0, fmt.Errorf("truncated money")
+			}
+			return moneyDatum(int64(binary.LittleEndian.Uint64(data[:8]))), 8, nil
+		}
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, fmt.Errorf("decode money as varlena: %w", err)
+		}
+		if c, cerr := cash.In(string(payload)); cerr == nil {
+			return moneyDatum(c), n, nil
+		}
+		return NewStringDatum(string(payload)), n, nil
+	case "point", "lseg", "box", "line", "circle", "tid":
+		// Sibling of encodeValuePG's arm: the fixed-length image rendered
+		// back to the canonical text, in a capable cluster; otherwise the
+		// varlena text of the default arm. M0149-0001k.
+		if catalog.FixedLengthGeoTid() {
+			txt, n, err := fixedgeo.Decode(tname, data)
+			if err != nil {
+				return Datum{}, 0, err
+			}
+			if sctx != nil {
+				moff, mlen := sctx.AllocBytes([]byte(txt))
+				return newStringArenaDatum(sctx, moff, mlen), n, nil
+			}
+			return NewStringDatum(txt), n, nil
+		}
+		fallthrough
 	default:
 		// Unknown type (e.g. "point", "path", custom types).  goopg's
 		// encodeValuePG stores them as PG varlena text (the default branch
@@ -2407,48 +2486,80 @@ func formatPgLSN(v uint64) string {
 //
 // M0097-0003.
 func isValidUUIDStr(s string) bool {
-	if len(s) == 38 && s[0] == '{' && s[37] == '}' {
-		s = s[1:37] // strip braces
+	_, ok := parseUUIDText(s)
+	return ok
+}
+
+// parseUUIDText is uuid_in's string_to_uuid (utils/adt/uuid.c): an optional
+// '{' ... '}' wrapper, then 16 hex byte pairs, each pair after an odd byte
+// index optionally followed by one '-' (not after the last). Every caller
+// that decides whether text is a uuid — input casts, storage, COPY,
+// comparisons — goes through here so they accept the same set.
+// M0149-0001h1a11.
+func parseUUIDText(src string) ([16]byte, bool) {
+	var out [16]byte
+	braces := false
+	if strings.HasPrefix(src, "{") {
+		src = src[1:]
+		braces = true
 	}
-	if len(s) == 32 {
-		// No-hyphen: all must be hex.
-		for _, c := range []byte(s) {
-			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-				return false
-			}
+	hexv := func(c byte) (byte, bool) {
+		switch {
+		case c >= '0' && c <= '9':
+			return c - '0', true
+		case c >= 'a' && c <= 'f':
+			return c - 'a' + 10, true
+		case c >= 'A' && c <= 'F':
+			return c - 'A' + 10, true
 		}
-		return true
+		return 0, false
 	}
-	if len(s) != 36 {
-		return false
-	}
-	for i, c := range []byte(s) {
-		switch i {
-		case 8, 13, 18, 23:
-			if c != '-' {
-				return false
-			}
-		default:
-			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-				return false
-			}
+	for i := 0; i < 16; i++ {
+		if len(src) < 2 {
+			return out, false
+		}
+		hi, ok1 := hexv(src[0])
+		lo, ok2 := hexv(src[1])
+		if !ok1 || !ok2 {
+			return out, false
+		}
+		out[i] = hi<<4 | lo
+		src = src[2:]
+		if len(src) > 0 && src[0] == '-' && i%2 == 1 && i < 15 {
+			src = src[1:]
 		}
 	}
-	return true
+	if braces {
+		if !strings.HasPrefix(src, "}") {
+			return out, false
+		}
+		src = src[1:]
+	}
+	return out, src == ""
+}
+
+// formatUUID is uuid_out: lowercase 8-4-4-4-12.
+func formatUUID(b [16]byte) string {
+	const h = "0123456789abcdef"
+	buf := make([]byte, 0, 36)
+	for i, v := range b {
+		if i == 4 || i == 6 || i == 8 || i == 10 {
+			buf = append(buf, '-')
+		}
+		buf = append(buf, h[v>>4], h[v&0xf])
+	}
+	return string(buf)
 }
 
 // normalizeUUIDStr converts a UUID in any accepted format to the canonical
 // lowercase xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx format. M0097-0003.
 func normalizeUUIDStr(s string) string {
-	s = strings.ToLower(s)
-	if len(s) == 38 && s[0] == '{' && s[37] == '}' {
-		s = s[1:37]
+	// Any form string_to_uuid accepts renders as uuid_out's canonical text;
+	// other input is returned lower-cased, as before (callers validate).
+	if b, ok := parseUUIDText(s); ok {
+		return formatUUID(b)
 	}
-	if len(s) == 32 {
-		// No-hyphen: insert hyphens at 8, 12, 16, 20.
-		return s[0:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:32]
-	}
-	return s
+	return strings.ToLower(s)
 }
 
 // uuidBytesFromCanonical packs the canonical lowercase-with-dashes rendering

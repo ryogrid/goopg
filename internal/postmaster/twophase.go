@@ -41,12 +41,16 @@ package postmaster
 // hand-off.
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/access/transam"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/libpq"
+	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/utils/errcodes"
 )
 
@@ -57,10 +61,14 @@ import (
 type preparedXactStore struct {
 	mu sync.Mutex
 	m  map[string]*connTxState
+	// recovered holds the prepared transactions a restart restored
+	// (RecoverPreparedTransactions): no session, only the xid's dedicated
+	// proc slot. M0149-0015a.
+	recovered map[string]initdb.RecoveredPrepared
 }
 
 func newPreparedXactStore() *preparedXactStore {
-	return &preparedXactStore{m: make(map[string]*connTxState)}
+	return &preparedXactStore{m: make(map[string]*connTxState), recovered: map[string]initdb.RecoveredPrepared{}}
 }
 
 // has reports whether a prepared transaction with this gid is registered.
@@ -68,7 +76,36 @@ func (p *preparedXactStore) has(gid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	_, ok := p.m[gid]
+	if !ok {
+		_, ok = p.recovered[gid]
+	}
 	return ok
+}
+
+// putRecovered registers a restored prepared transaction.
+func (p *preparedXactStore) putRecovered(r initdb.RecoveredPrepared) {
+	p.mu.Lock()
+	p.recovered[r.GID] = r
+	p.mu.Unlock()
+}
+
+// AddRecoveredPrepared registers prepared transactions restored after the
+// server started — a standby's promotion (RecoverPreparedTransactions).
+func (s *Server) AddRecoveredPrepared(list []initdb.RecoveredPrepared) {
+	for _, rp := range list {
+		s.preparedXacts.putRecovered(rp)
+	}
+}
+
+// takeRecovered removes and returns the restored prepared transaction gid.
+func (p *preparedXactStore) takeRecovered(gid string) (initdb.RecoveredPrepared, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	r, ok := p.recovered[gid]
+	if ok {
+		delete(p.recovered, gid)
+	}
+	return r, ok
 }
 
 // put registers a parked prepared transaction. The caller has already verified
@@ -154,6 +191,9 @@ func (s *Server) execPrepareTransaction(w *libpq.FrameWriter, ctx *executor.Cont
 				return s.abortForPrepareSSIFailure(w, ctx, connTx, explicitTx, ssiErr)
 			}
 		}
+		if err := s.logPrepare(ctx, connTx, explicitTx, st.Gid); err != nil {
+			return s.writeQueryError(w, errcodes.InternalError, err.Error())
+		}
 		// Keep the transaction open on its slot; record the gid. The connection
 		// stays "in a transaction block" from goopg's view (invisible to the
 		// isolation tester, which does not inspect the ReadyForQuery status byte)
@@ -174,6 +214,9 @@ func (s *Server) execPrepareTransaction(w *libpq.FrameWriter, ctx *executor.Cont
 		}
 		return w.WriteCommandComplete("PREPARE TRANSACTION")
 	}
+	if err := s.logPrepare(ctx, connTx, explicitTx, st.Gid); err != nil {
+		return s.writeQueryError(w, errcodes.InternalError, err.Error())
+	}
 	// READ COMMITTED / REPEATABLE READ: detach the transaction to a dedicated
 	// proc slot and park it in the registry so the originating connection is
 	// freed and a later COMMIT/ROLLBACK PREPARED (same OR different backend) can
@@ -193,6 +236,15 @@ func (s *Server) execPrepareTransaction(w *libpq.FrameWriter, ctx *executor.Cont
 		sess.RelocateTransaction(newTx)
 	}
 	px := connTx.DetachPrepared(st.Gid, newTx)
+	// The prepared transaction is the dummy PGPROC of PostgreSQL's
+	// MarkAsPreparing / PostPrepare_Locks: the locks it holds belong to it,
+	// not to the backend that prepared it. It keeps the lock identity they
+	// were taken under, and the connection gets a fresh one, so a later
+	// statement on this same connection waits for them like any other
+	// backend (037_invalid_database's DROP DATABASE). M0149-0005.
+	executor.UnregisterLockBackendPID(px.LockBackendID)
+	connTx.LockBackendID = lmgr.BackendID(s.nextBackendID.Add(1))
+	executor.RegisterLockBackendPID(connTx.LockBackendID, connTx.BackendPID)
 	s.preparedXacts.put(st.Gid, px)
 	// M0118-0009 (`stats`, rung 7; design 0118-0131): move the originating
 	// backend's staged relation-stat counters into a per-gid 2PC record so the
@@ -218,6 +270,59 @@ func (s *Server) execPrepareTransaction(w *libpq.FrameWriter, ctx *executor.Cont
 		*autoCommitPtr = false
 	}
 	return w.WriteCommandComplete("PREPARE TRANSACTION")
+}
+
+// logPrepare is EndPrepare's WAL half: the transaction gets an xid if it has
+// none (PrepareTransaction calls GetCurrentTransactionId), its two-phase
+// state — gid, committed subtransactions, relations to drop on commit or
+// abort — is written as an XLOG_XACT_PREPARE record and flushed, and the
+// manager remembers the xid so its eventual end record is COMMIT PREPARED /
+// ABORT PREPARED. A standby, PG's included, replays the record into a
+// prepared transaction it can finish after promotion. M0149-0015a.
+func (s *Server) logPrepare(ctx *executor.Context, connTx *connTxState, tx transam.Transaction, gid string) error {
+	if s.cfg.WAL == nil || s.cfg.TxnMgr == nil {
+		return nil
+	}
+	xid, err := s.cfg.TxnMgr.AssignXID(tx)
+	if err != nil {
+		return fmt.Errorf("PREPARE TRANSACTION: assign xid: %w", err)
+	}
+	var db uint32
+	if ctx != nil {
+		db = ctx.CurrentDatabaseOid
+	}
+	subxacts := s.cfg.TxnMgr.SubxidsOf(xid, true)
+	state := xlog.EncodeTwoPhaseState(xlog.TwoPhaseState{
+		XID:        xid,
+		Database:   db,
+		PreparedAt: xlog.TimestampTzNow(),
+		Owner:      s.resolveActingRoleOID(connTx.NonSuperuserRole),
+		GID:        gid,
+		Subxacts:   subxacts,
+		CommitRels: s.cfg.TxnMgr.PendingRelDeletes(xid),
+		AbortRels:  s.cfg.TxnMgr.PendingAbortRelDeletes(xid),
+	})
+	payload, err := xlog.EncodeXactPreparePG(xid, state)
+	if err != nil {
+		return err
+	}
+	_, end, err := s.cfg.WAL.Append(payload)
+	if err != nil {
+		return fmt.Errorf("PREPARE TRANSACTION: write prepare record: %w", err)
+	}
+	if err := s.cfg.WAL.FlushUpTo(end); err != nil {
+		return fmt.Errorf("PREPARE TRANSACTION: flush prepare record: %w", err)
+	}
+	s.cfg.TxnMgr.RegisterPrepared(transam.PreparedXact{
+		XID: xid, Subxacts: subxacts, GID: gid, State: state, PrepareEndLSN: end,
+	})
+	// EndPrepare → SyncRepWaitForLSN(prepare_end_lsn): PREPARE TRANSACTION
+	// returns only once the synchronous standbys have the record, so a
+	// standby promoted right after can still finish it (M0149-0016).
+	if ctx != nil && ctx.SyncRep != nil && ctx.SyncCommitMode != xlog.SyncRepOff && ctx.SyncRep.NeedsWait() {
+		_ = ctx.SyncRep.WaitForLSN(ctx.Ctx, end, ctx.SyncCommitMode)
+	}
+	return nil
 }
 
 // abortForPrepareSSIFailure rolls back the transaction whose PREPARE failed the
@@ -273,6 +378,33 @@ func (s *Server) execFinalizePrepared(w *libpq.FrameWriter, ctx *executor.Contex
 		// its side effect here. M0134-0057.
 		s.preparedXacts.take(gid)
 		return s.executeOneSimpleStmt(w, ctx, finalize, connTx, autoCommitPtr)
+	}
+	// A prepared transaction a restart restored has no session: finishing it
+	// is FinishPreparedTransaction's record + clog work alone, through the
+	// manager's commit/abort of its dedicated slot (the xact-marker hook
+	// writes COMMIT/ABORT PREPARED and drops the state file).
+	if rp, ok := s.preparedXacts.takeRecovered(gid); ok {
+		_, isCommit := finalize.(*parser.CommitStmt)
+		var ferr error
+		if isCommit {
+			ferr = s.cfg.TxnMgr.Commit(rp.Tx)
+		} else {
+			ferr = s.cfg.TxnMgr.Rollback(rp.Tx)
+		}
+		if ferr != nil {
+			s.preparedXacts.putRecovered(rp)
+			return s.writeQueryError(w, errcodes.InternalError, ferr.Error())
+		}
+		// FinishPreparedTransaction → SyncRepWaitForLSN: the finish record
+		// waits for the synchronous standbys like any commit (M0149-0016).
+		if ctx != nil && ctx.SyncRep != nil && ctx.WAL != nil &&
+			ctx.SyncCommitMode != xlog.SyncRepOff && ctx.SyncRep.NeedsWait() {
+			_ = ctx.SyncRep.WaitForLSN(ctx.Ctx, ctx.WAL.WrittenLSN(), ctx.SyncCommitMode)
+		}
+		if isCommit {
+			return w.WriteCommandComplete("COMMIT PREPARED")
+		}
+		return w.WriteCommandComplete("ROLLBACK PREPARED")
 	}
 	// Detached path (RC/RR): look the gid up in the process-wide registry and
 	// finalise the parked transaction through the canonical commit/rollback path,

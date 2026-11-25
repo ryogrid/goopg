@@ -5,21 +5,17 @@ import (
 	"strings"
 )
 
-// PostgreSQL's DEFACLOBJ_* object-type letters (pg_default_acl.h). goopg
-// tracks all six syntactically (ALTER DEFAULT PRIVILEGES parses every
-// defacl_privilege_target) but only stores/renders ACLs for the five that
-// have a real privilege set modeled elsewhere in this package
-// (DefaultACLObjTypeLargeObject has no backing pg_largeobject subsystem at
-// all — see the deferral ledger — so it is accepted and silently dropped by
-// the executor rather than materialized here). M0110-0001 (DU-002 slice 438
-// follow-up).
+// PostgreSQL's DEFACLOBJ_* object-type letters (pg_default_acl.h); all six
+// are stored and rendered. LARGE OBJECTS joined the other five once
+// pg_largeobject_metadata became real (M0149-0001h1a). M0110-0001 (DU-002
+// slice 438 follow-up).
 const (
 	DefaultACLObjTypeRelation    byte = 'r' // TABLES
 	DefaultACLObjTypeSequence    byte = 'S' // SEQUENCES
 	DefaultACLObjTypeFunction    byte = 'f' // FUNCTIONS / ROUTINES
 	DefaultACLObjTypeType        byte = 'T' // TYPES
 	DefaultACLObjTypeNamespace   byte = 'n' // SCHEMAS
-	DefaultACLObjTypeLargeObject byte = 'L' // LARGE OBJECTS (not modeled)
+	DefaultACLObjTypeLargeObject byte = 'L' // LARGE OBJECTS
 )
 
 // defaultACLKey identifies one pg_default_acl row: the target role, the
@@ -46,7 +42,7 @@ type DefaultACLEntry struct {
 // pg_namespace ACL rendering already uses (tableACLPrivOrder etc — a default
 // ACL for TABLES grants the identical privilege set a real table does, and
 // so on for the other four modeled object types). ok is false for an
-// unrecognized or unmodeled (large object) objType.
+// unrecognized objType.
 func defaultACLPrivInfo(objType byte) (privOrder []aclPrivLetter, ok bool) {
 	switch objType {
 	case DefaultACLObjTypeRelation:
@@ -59,6 +55,8 @@ func defaultACLPrivInfo(objType byte) (privOrder []aclPrivLetter, ok bool) {
 		return typeACLPrivOrder, true
 	case DefaultACLObjTypeNamespace:
 		return schemaACLPrivOrder, true
+	case DefaultACLObjTypeLargeObject:
+		return largeObjectACLPrivOrder, true
 	}
 	return nil, false
 }
@@ -89,7 +87,7 @@ func DefaultACLObjTypeFromParserObjType(objType string) (byte, bool) {
 // DefaultACLNormalizePriv maps a parsed ALTER DEFAULT PRIVILEGES privilege
 // keyword to its canonical form — "ALL"/"ALL PRIVILEGES" expands to every
 // right modeled for objType. An unrecognized keyword, or an objType this
-// package does not model (DefaultACLObjTypeLargeObject), yields nil; the
+// package does not model, yields nil; the
 // caller silently skips it, matching normalizeParameterPriv/
 // normalizeDatabasePriv's existing convention elsewhere in this codebase.
 func DefaultACLNormalizePriv(objType byte, priv string) []string {
@@ -129,6 +127,8 @@ func defaultACLOwnerString(objType byte) string {
 		return ownerTypeACLString
 	case DefaultACLObjTypeNamespace:
 		return ownerSchemaACLString
+	case DefaultACLObjTypeLargeObject:
+		return ownerLargeObjectACLString
 	}
 	return ""
 }
@@ -300,4 +300,154 @@ func (c *InMemory) DefaultACLEntries() []DefaultACLEntry {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
 	return out
+}
+
+// SnapshotACLEntry captures every per-OID ACL map entry for aclOID (the
+// privileges, their order, grantors and the owner-revoked / emptied flags)
+// and returns a function that puts them back. ALTER DEFAULT PRIVILEGES
+// records one before changing a pg_default_acl entry so a ROLLBACK restores
+// it, as PG's catalog update is transactional (M0149-0001h1a).
+func (c *InMemory) SnapshotACLEntry(aclOID uint32) func() {
+	c.mu.RLock()
+	var acls map[string]map[string]bool
+	if m, ok := c.tableACLs[aclOID]; ok {
+		acls = make(map[string]map[string]bool, len(m))
+		for role, privs := range m {
+			cp := make(map[string]bool, len(privs))
+			for p, v := range privs {
+				cp[p] = v
+			}
+			acls[role] = cp
+		}
+	}
+	var grantor map[string]string
+	if m, ok := c.tableACLGrantor[aclOID]; ok {
+		grantor = make(map[string]string, len(m))
+		for k, v := range m {
+			grantor[k] = v
+		}
+	}
+	order, hasOrder := c.tableACLOrder[aclOID]
+	order = append([]string(nil), order...)
+	emptied, hasEmptied := c.relACLEmptied[aclOID]
+	revoked, hasRevoked := c.relACLOwnerRevoked[aclOID]
+	c.mu.RUnlock()
+	return func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if acls != nil {
+			c.tableACLs[aclOID] = acls
+		} else {
+			delete(c.tableACLs, aclOID)
+		}
+		if grantor != nil {
+			c.tableACLGrantor[aclOID] = grantor
+		} else {
+			delete(c.tableACLGrantor, aclOID)
+		}
+		if hasOrder {
+			c.tableACLOrder[aclOID] = order
+		} else {
+			delete(c.tableACLOrder, aclOID)
+		}
+		if hasEmptied {
+			c.relACLEmptied[aclOID] = emptied
+		} else {
+			delete(c.relACLEmptied, aclOID)
+		}
+		if hasRevoked {
+			c.relACLOwnerRevoked[aclOID] = revoked
+		} else {
+			delete(c.relACLOwnerRevoked, aclOID)
+		}
+	}
+}
+
+// ApplyDefaultACL gives a newly created object relOID the ACL
+// get_user_default_acl (aclchk.c) computes for (ownerOID, schemaOID,
+// objType): the owner's global pg_default_acl entry — or acldefault when it
+// has none — merged with the schema-scoped entry (aclmerge). It reports
+// false, leaving relOID at its hardwired default, when neither entry exists.
+// Both entries live in the same per-OID ACL maps a table's relacl does, so
+// the global entry's state (grants, their order and grantors, and an
+// owner-side REVOKE) is copied over and the schema entry's grants are OR-ed
+// in.
+func (c *InMemory) ApplyDefaultACL(relOID, ownerOID, schemaOID uint32, objType byte) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	live := func(roleOID, nsp uint32) (uint32, bool) {
+		oid, ok := c.defaultACLOIDs[defaultACLKey{RoleOID: roleOID, SchemaOID: nsp, ObjType: objType}]
+		return oid, ok && len(c.tableACLs[oid]) > 0
+	}
+	gOID, gOK := live(ownerOID, 0)
+	var sOID uint32
+	sOK := false
+	if schemaOID != 0 {
+		sOID, sOK = live(ownerOID, schemaOID)
+	}
+	if !gOK && !sOK {
+		return false
+	}
+	delete(c.tableACLs, relOID)
+	delete(c.tableACLOrder, relOID)
+	delete(c.tableACLGrantor, relOID)
+	delete(c.relACLEmptied, relOID)
+	delete(c.relACLOwnerRevoked, relOID)
+	merge := func(src uint32) {
+		srcACL := c.tableACLs[src]
+		roles := append([]string(nil), c.tableACLOrder[src]...)
+		seen := map[string]bool{}
+		for _, r := range roles {
+			seen[r] = true
+		}
+		var rest []string
+		for r := range srcACL {
+			if !seen[r] {
+				rest = append(rest, r)
+			}
+		}
+		sort.Strings(rest)
+		roles = append(roles, rest...)
+		dst := c.tableACLs[relOID]
+		if dst == nil {
+			dst = make(map[string]map[string]bool)
+			c.tableACLs[relOID] = dst
+		}
+		for _, role := range roles {
+			privs, ok := srcACL[role]
+			if !ok {
+				continue
+			}
+			d := dst[role]
+			if d == nil {
+				d = make(map[string]bool, len(privs))
+				dst[role] = d
+				if role != aclOwnerRole {
+					c.tableACLOrder[relOID] = append(c.tableACLOrder[relOID], role)
+				}
+			}
+			for p, wgo := range privs {
+				d[p] = d[p] || wgo
+			}
+			if g, ok := c.tableACLGrantor[src][role]; ok {
+				if c.tableACLGrantor[relOID] == nil {
+					c.tableACLGrantor[relOID] = make(map[string]string)
+				}
+				c.tableACLGrantor[relOID][role] = g
+			}
+		}
+	}
+	if gOK {
+		merge(gOID)
+		if v, ok := c.relACLEmptied[gOID]; ok {
+			c.relACLEmptied[relOID] = v
+		}
+		if v, ok := c.relACLOwnerRevoked[gOID]; ok {
+			c.relACLOwnerRevoked[relOID] = v
+		}
+	}
+	if sOK {
+		merge(sOID)
+	}
+	return true
 }

@@ -10,8 +10,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/goopg/goopg/internal/access/common/blkreftable"
+	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/backup/walsummary"
 	"github.com/goopg/goopg/internal/optimizer"
 )
@@ -38,6 +40,14 @@ func (o *pgAvailableWalSummariesOp) Open(ctx *Context) error {
 	o.rows, o.pos = nil, 0
 	if o.plan.Func == "pg_get_wal_summarizer_state" {
 		o.rows = []Row{walSummarizerStateRow(ctx)}
+		return nil
+	}
+	if o.plan.Func == "pg_control_checkpoint" {
+		row, err := pgControlCheckpointRow(ctx)
+		if err != nil {
+			return err
+		}
+		o.rows = []Row{row}
 		return nil
 	}
 	if ctx == nil || ctx.DataDir == "" {
@@ -205,3 +215,41 @@ func (o *pgWalSummaryContentsOp) Next() (TupleSlot, error) {
 }
 
 func (o *pgWalSummaryContentsOp) Close() error { return nil }
+
+// pgControlCheckpointRow is pg_control_checkpoint() (misc/pg_controldata.c):
+// the last checkpoint as pg_control records it. M0149-0076.
+func pgControlCheckpointRow(ctx *Context) (Row, error) {
+	if ctx == nil || ctx.DataDir == "" {
+		return nil, &ExecError{Code: "58P01", Message: "could not read control file"}
+	}
+	cf, err := control.ReadControlFile(ctx.DataDir)
+	if err != nil {
+		return nil, &ExecError{Code: "58030", Message: err.Error()}
+	}
+	const segSize = 16 * 1024 * 1024
+	const segsPerXLogID = 0x100000000 / segSize
+	seg := cf.CheckPointCopyRedo / segSize
+	redoFile := fmt.Sprintf("%08X%08X%08X", cf.CheckPointCopyThisTLI, uint32(seg/segsPerXLogID), uint32(seg%segsPerXLogID))
+	nextXid := fmt.Sprintf("%d:%d", uint32(cf.CheckPointCopyNextXid>>32), uint32(cf.CheckPointCopyNextXid))
+	u := func(v uint32) Datum { return NewStringDatum(strconv.FormatUint(uint64(v), 10)) }
+	return Row{
+		NewStringDatum(pgLSNText(cf.CheckPoint)),
+		NewStringDatum(pgLSNText(cf.CheckPointCopyRedo)),
+		NewStringDatum(redoFile),
+		NewIntDatum(int64(cf.CheckPointCopyThisTLI)),
+		NewIntDatum(int64(cf.CheckPointCopyPrevTLI)),
+		NewBoolDatum(cf.CheckPointCopyFullPageWrites),
+		NewStringDatum(nextXid),
+		u(cf.CheckPointCopyNextOid),
+		u(cf.CheckPointCopyNextMulti),
+		u(cf.CheckPointCopyNextMultiOffset),
+		u(cf.CheckPointCopyOldestXid),
+		u(cf.CheckPointCopyOldestXidDB),
+		u(cf.CheckPointCopyOldestActiveXid),
+		u(cf.CheckPointCopyOldestMulti),
+		u(cf.CheckPointCopyOldestMultiDB),
+		u(cf.CheckPointCopyOldestCommitTsXid),
+		u(cf.CheckPointCopyNewestCommitTsXid),
+		NewTimestampTZDatum(time.Unix(cf.CheckPointCopyTime, 0)),
+	}, nil
+}

@@ -472,7 +472,19 @@ func (sb *sharedHashBuild) rowCount() int {
 // wait is BarrierArriveAndWait's waiting half. It returns once the build is
 // complete, or when the participant's context is cancelled (the Gather's
 // Close, or another participant's error cancelling the group).
+//
+// A completed build always wins. The group's context also ends when
+// ParallelGroup.Wait has joined workers that all succeeded: a leader slower
+// than the workers, or one running alone because no worker was launched, gets
+// here with both channels closed, and select would pick between them at
+// random. The table is intact until the Gather's Close, so such a leader
+// adopts it like any late participant.
 func (ph *parallelHashBuild) wait(ctx *Context) error {
+	select {
+	case <-ph.done:
+		return ph.err
+	default:
+	}
 	var cancelled <-chan struct{}
 	if ctx != nil && ctx.Ctx != nil {
 		cancelled = ctx.Ctx.Done()
@@ -483,6 +495,13 @@ func (ph *parallelHashBuild) wait(ctx *Context) error {
 	case <-cancelled:
 		return ctx.Ctx.Err()
 	case <-ph.groupDone:
+		// The last participant may have completed the build just as the group
+		// ended.
+		select {
+		case <-ph.done:
+			return ph.err
+		default:
+		}
 		return errParallelHashAbandoned
 	}
 }
@@ -556,7 +575,8 @@ func orMatched[K comparable](merged map[K][]bool, k K, bits []bool) {
 // errParallelHashAbandoned is returned to a participant whose Gather group
 // was cancelled while it waited at the build barrier — another participant
 // failed, or the Gather closed early. The group's own error is the one the
-// client sees; this one only stops the waiter from probing.
+// client sees (parallelLeaderOpenError); this one only stops the waiter from
+// probing.
 var errParallelHashAbandoned = errors.New("parallel hash join: build abandoned (parallel group cancelled)")
 
 // errParallelHashUnregistered is returned by a Parallel Hash join that reaches

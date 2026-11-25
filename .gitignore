@@ -167,3 +167,6 @@ tools/mermaid-validator/node_modules/
 # §"Plan-parity harness" → "Working-directory hygiene".
 /bak/
 /estimate-audit
+
+deepwiki/.dw4m/worktree
+

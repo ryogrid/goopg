@@ -27,6 +27,8 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -46,6 +48,21 @@ type StreamReplayer struct {
 	// abort. Used by the standby to advance the local MVCC manager's
 	// nextXID so replayed tuples become visible to queries.
 	onXactReplay func(xid storage.TransactionID, committed bool)
+	// onPrepareReplay / onPreparedFinish: two-phase replay (PrepareRedoAdd /
+	// PrepareRedoRemove). M0149-0015b.
+	onPrepareReplay  func(endLSN uint64, state []byte)
+	onPreparedFinish func(xid storage.TransactionID)
+	// onCatalogReplay / catalogDBs: the live catalog refresh (M0149-0010a).
+	onCatalogReplay func(dbOid uint32)
+	onSeqReplay     func(rel storage.RelFileNode) // M0149-0077a
+	catalogDBs      map[uint32]struct{}
+	// Recovery pause / apply delay (stream_replayer_pause.go). M0149-0013.
+	applyDelay       atomic.Pointer[func() time.Duration]
+	pauseState       atomic.Int32
+	promoteTriggered atomic.Bool
+	// target is the recovery target (stream_replayer_target.go), set before
+	// Run. M0149-0023b.
+	target *ReplayTarget
 
 	mu       sync.Mutex
 	applyLSN uint64
@@ -109,6 +126,50 @@ func NewStreamReplayer(mgr *storage.Manager, baselineLSN uint64) *StreamReplayer
 // Must be called before Run.
 func (sr *StreamReplayer) SetXactReplayHook(fn func(xid storage.TransactionID, committed bool)) {
 	sr.onXactReplay = fn
+}
+
+// SetTwoPhaseReplayHooks installs the two-phase replay callbacks: prepare
+// is called with each XLOG_XACT_PREPARE record's end LSN and state buffer
+// (xact_redo's PrepareRedoAdd), finish with the xid each COMMIT/ABORT
+// PREPARED record finishes (PrepareRedoRemove). Must be called before Run.
+func (sr *StreamReplayer) SetTwoPhaseReplayHooks(prepare func(endLSN uint64, state []byte), finish func(xid storage.TransactionID)) {
+	sr.onPrepareReplay = prepare
+	sr.onPreparedFinish = finish
+}
+
+// SetCatalogReplayHook installs a callback invoked, after a replayed commit,
+// for every database whose system catalogs the replayed WAL changed since the
+// previous commit. It is the standby's counterpart of the relcache
+// invalidation PG's commit records carry (XACT_XINFO_HAS_INVALS): the hook
+// refreshes the running standby's catalog so relations the primary created
+// become visible without a restart. Must be called before Run. M0149-0010a.
+// SetSequenceReplayHook installs fn, called after an XLOG_SEQ_LOG record
+// rebuilt the page of sequence relation rel (seq_redo), so the server's
+// sequence state follows the replayed page. M0149-0077a.
+func (sr *StreamReplayer) SetSequenceReplayHook(fn func(rel storage.RelFileNode)) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	sr.onSeqReplay = fn
+}
+
+func (sr *StreamReplayer) SetCatalogReplayHook(fn func(dbOid uint32)) {
+	sr.onCatalogReplay = fn
+}
+
+// noteCatalogBlocks records the databases of the system-catalog relations
+// (relfilenode below FirstNormalObjectId) rec changed.
+func (sr *StreamReplayer) noteCatalogBlocks(rec Record) {
+	if sr.onCatalogReplay == nil || rec.XLog == nil {
+		return
+	}
+	for _, b := range rec.XLog.Blocks {
+		if b.Rel.RelOid != 0 && b.Rel.RelOid < 16384 && b.Rel.DBOid != 0 {
+			if sr.catalogDBs == nil {
+				sr.catalogDBs = make(map[uint32]struct{})
+			}
+			sr.catalogDBs[b.Rel.DBOid] = struct{}{}
+		}
+	}
 }
 
 // ApplyLSN returns the LSN of the most recently applied record (or
@@ -187,6 +248,20 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 			}
 			return fmt.Errorf("wal: stream replay read: %w", err)
 		}
+		// The recovery loop checks for a requested pause before each record,
+		// and holds commit records for recovery_min_apply_delay
+		// (xlogrecovery.c PerformWalRecovery). M0149-0013.
+		sr.recoveryPausesHere(ctx)
+		sr.recoveryApplyDelay(ctx, rec)
+		sr.recoveryPausesHere(ctx)
+		// recoveryStopsBefore: the target ends replay before this record.
+		if ev, stop := sr.targetBefore(rec); stop {
+			sr.reachTarget(ctx, ev)
+			return nil
+		}
+		if err := verifyOverwriteContrecord(rec); err != nil {
+			return err
+		}
 		applied, err := ApplyRecord(sr.mgr, rec)
 		if err != nil {
 			return fmt.Errorf("wal: stream replay record lsn[%d,%d]: %w", rec.StartLSN, rec.EndLSN, err)
@@ -196,9 +271,42 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 		// visibility). The hook is called outside the replayer's mutex
 		// because the mvcc.Manager has its own lock; holding both would
 		// risk a deadlock with concurrent snapshot takers.
-		if sr.onXactReplay != nil {
-			if xid, committed, ok := replayedXactInfo(rec); ok {
+		sr.noteCatalogBlocks(rec)
+		if sr.onSeqReplay != nil && rec.XLog != nil && rec.XLog.Header.Rmid == RmgrSeq &&
+			rec.XLog.Header.Info&XLRRmgrInfoMask == xlogSeqLog {
+			if b, ok := xlogBlockRefByID(rec.XLog, 0); ok {
+				sr.onSeqReplay(b.Rel)
+			}
+		}
+		finishesPrepared := false
+		if rec.XLog != nil && rec.XLog.Header.Rmid == RmgrXact {
+			switch rec.XLog.Header.Info & xlogXactOpMask {
+			case xlogXactPrepare:
+				if sr.onPrepareReplay != nil {
+					sr.onPrepareReplay(rec.EndLSN, append([]byte(nil), rec.XLog.MainData...))
+				}
+			case xlogXactCommitPrepared, xlogXactAbortPrepared:
+				finishesPrepared = true
+			}
+		}
+		if xid, committed, ok := replayedXactInfo(rec); ok {
+			if sr.onXactReplay != nil {
+				// xact_redo_commit / xact_redo_abort mark the whole
+				// transaction tree: the record's subtransactions first, then
+				// the top-level xid (TransactionIdCommitTree). M0149-0010a.
+				for _, sub := range replayedSubxacts(rec) {
+					sr.onXactReplay(sub, committed)
+				}
 				sr.onXactReplay(xid, committed)
+			}
+			if finishesPrepared && sr.onPreparedFinish != nil {
+				sr.onPreparedFinish(xid)
+			}
+			if committed && sr.onCatalogReplay != nil && len(sr.catalogDBs) > 0 {
+				for db := range sr.catalogDBs {
+					sr.onCatalogReplay(db)
+				}
+				sr.catalogDBs = nil
 			}
 		}
 		// RecoveryRestartPoint (xlog.c): remember the checkpoint for the
@@ -219,11 +327,28 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 		if applied {
 			sr.applied++
 		}
-		if rec.EndLSN > sr.applyLSN {
-			sr.applyLSN = rec.EndLSN
+		end := rec.EndLSN
+		// XLogReadRecord: "Pretend it extends to end of segment" — after an
+		// XLOG_SWITCH record the replay position is the next segment
+		// boundary (lastReplayedEndRecPtr), so pg_last_wal_replay_lsn()
+		// reaches what pg_switch_wal() returned on the primary without
+		// waiting for the next segment (M0149-0019a).
+		if rec.XLog != nil && isXLogSwitchHeader(rec.XLog.Header) && iter.segSize > 0 {
+			seg := uint64(iter.segSize)
+			if off := end % seg; off != 0 {
+				end += seg - off
+			}
+		}
+		if end > sr.applyLSN {
+			sr.applyLSN = end
 			sr.lastStart = rec.StartLSN
 		}
 		sr.mu.Unlock()
+		// recoveryStopsAfter: the target ends replay after this record.
+		if ev, stop := sr.targetAfter(rec); stop {
+			sr.reachTarget(ctx, ev)
+			return nil
+		}
 	}
 }
 
@@ -246,7 +371,33 @@ func replayedXactInfo(rec Record) (storage.TransactionID, bool, bool) {
 		return storage.TransactionID(rec.XLog.Header.XID), true, true
 	case xlogXactAbort:
 		return storage.TransactionID(rec.XLog.Header.XID), false, true
+	case xlogXactCommitPrepared, xlogXactAbortPrepared:
+		// The finished transaction is the record's twophase xid, not the
+		// header xid of the backend that ran COMMIT/ROLLBACK PREPARED.
+		// M0149-0012.
+		parsed, err := ParseXactRecord(rec.XLog.Header.Info, rec.XLog.MainData)
+		if err != nil || parsed.TwophaseXid == 0 {
+			return 0, false, false
+		}
+		return storage.TransactionID(parsed.TwophaseXid), rec.XLog.Header.Info&xlogXactOpMask == xlogXactCommitPrepared, true
 	default:
 		return 0, false, false
 	}
+}
+
+// replayedSubxacts returns the subtransaction xids a PG commit or abort record
+// lists (XACT_XINFO_HAS_SUBXACTS), or nil.
+func replayedSubxacts(rec Record) []storage.TransactionID {
+	if rec.XLog == nil || rec.XLog.Header.Rmid != RmgrXact {
+		return nil
+	}
+	parsed, err := ParseXactRecord(rec.XLog.Header.Info, rec.XLog.MainData)
+	if err != nil || len(parsed.Subxacts) == 0 {
+		return nil
+	}
+	out := make([]storage.TransactionID, len(parsed.Subxacts))
+	for i, x := range parsed.Subxacts {
+		out[i] = storage.TransactionID(x)
+	}
+	return out
 }

@@ -1,14 +1,20 @@
 package executor
 
 // pg_partition_tree / pg_partition_ancestors multi-row SRF operators.
-// Both functions traverse the catalog partition hierarchy and return rows
-// sorted alphabetically by relation name. M0097-0023.
+// Both functions traverse the catalog partition hierarchy of a table or an
+// index. M0097-0023.
+//
+// The traversal is OID-based (M0149-0001h1a31): the argument is a regclass
+// (an OID, or text run through regclassin, which honours search_path), and
+// every hop resolves by OID — the earlier name-based walk looked relations up
+// by bare name, so anything outside the default schema produced no rows. A
+// table's parent is its PartitionParentOID or, for an ATTACHed partition (which
+// leaves that field 0), the live partition registry.
 
 import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
 )
 
@@ -38,16 +44,27 @@ func (o *pgPartitionTreeOp) Open(ctx *Context) error {
 		return nil
 	}
 
-	relName := partitionResolveRegclass(argVal, im)
-	if relName == "" {
+	oid, ok := partitionResolveRegclass(argVal, ctx)
+	if !ok {
 		return nil
 	}
+	pt := partitionTree{im: im, dbOid: catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)}
 
 	isTree := strings.EqualFold(o.plan.FuncName, "pg_partition_tree")
-	if isTree {
-		o.rows = partitionBuildTree(relName, im)
-	} else {
-		o.rows = partitionBuildAncestors(relName, im)
+	if tbl, found := im.LookupTableByOID(oid, pt.dbOid); found {
+		if isTree {
+			o.rows = pt.tableTree(tbl)
+		} else {
+			o.rows = pt.tableAncestors(tbl)
+		}
+		return nil
+	}
+	if idx, found := im.LookupIndexByOID(oid, pt.dbOid); found {
+		if isTree {
+			o.rows = pt.indexTree(idx)
+		} else {
+			o.rows = pt.indexAncestors(idx)
+		}
 	}
 	return nil
 }
@@ -61,86 +78,82 @@ func (o *pgPartitionTreeOp) Next() (TupleSlot, error) {
 	return SlotFromRow(nil, row), nil
 }
 
-func (o *pgPartitionTreeOp) Close() error                  { return nil }
-func (o *pgPartitionTreeOp) Schema() optimizer.Schema        { return o.plan.Output() }
+func (o *pgPartitionTreeOp) Close() error             { return nil }
+func (o *pgPartitionTreeOp) Schema() optimizer.Schema { return o.plan.Output() }
 
-// partitionResolveRegclass converts a KindInt OID or KindString name Datum to
-// a relation name, searching both tables and indexes.
-func partitionResolveRegclass(d Datum, im *catalog.InMemory) string {
+// partitionResolveRegclass turns the regclass argument into an OID: an
+// integer is the OID itself; text goes through regclassin (search_path,
+// schema qualification, quoted names).
+func partitionResolveRegclass(d Datum, ctx *Context) (uint32, bool) {
 	switch d.Kind {
 	case KindInt:
-		oid := uint32(d.Int)
-		if tbl, ok := im.LookupTableByOID(oid); ok {
-			return tbl.Name
-		}
-		if idx, ok := im.LookupIndexByOID(oid); ok {
-			return idx.Name
-		}
-		return ""
+		return uint32(d.Int), d.Int > 0
 	case KindString:
-		name := d.StringValue()
-		if tbl, ok := im.LookupTable(parser.ObjectName{Name: name}); ok {
-			return tbl.Name
+		r, err := regIdentifierInput(d, "regclass", ctx, 0)
+		if err != nil || r.Kind != KindInt || r.Int <= 0 {
+			return 0, false
 		}
-		if idx, ok := im.LookupIndex(parser.ObjectName{Name: name}); ok {
-			return idx.Name
-		}
-		return ""
-	default:
-		return ""
+		return uint32(r.Int), true
 	}
+	return 0, false
 }
 
-// partitionBuildTree builds all rows for pg_partition_tree starting at relName.
-// Looks up the name as both a table and an index.
-func partitionBuildTree(relName string, im *catalog.InMemory) []Row {
-	if tbl, ok := im.LookupTable(parser.ObjectName{Name: relName}); ok {
-		return partitionTableTree(tbl, im)
-	}
-	if idx, ok := im.LookupIndex(parser.ObjectName{Name: relName}); ok {
-		return partitionIndexTree(idx, im)
-	}
-	return nil
+type partitionTree struct {
+	im    *catalog.InMemory
+	dbOid uint32
 }
 
-// partitionTableTree returns pg_partition_tree rows for a table partition hierarchy.
-// Returns nil for non-partitioned tables (no PartitionKey), views, matviews,
-// and legacy-inheritance tables.
-func partitionTableTree(root *catalog.Table, im *catalog.InMemory) []Row {
-	isRootNode := root.PartitionParentOID == 0
-	if isRootNode && len(root.PartitionKey) == 0 {
-		// Not a partitioned table and not a partition child — emit nothing.
+// tableParent is the partition parent of t — PartitionParentOID, or the live
+// registry for an ATTACHed partition. A partition left in the incomplete-detach
+// state (DetachPendingEpoch != 0) has no parent for traversal: PG's
+// get_partition_ancestors stops at the detached boundary (M0118-0008).
+func (pt partitionTree) tableParent(t *catalog.Table) uint32 {
+	if t.DetachPendingEpoch != 0 {
+		return 0
+	}
+	if t.PartitionParentOID != 0 {
+		return t.PartitionParentOID
+	}
+	if p, ok := pt.im.PartitionParentOf(t.OID); ok {
+		return p
+	}
+	return 0
+}
+
+// isPartition reports whether t is linked to a partition parent at all,
+// whatever its detach state — pg_partition_tree / _ancestors answer for a
+// detach-pending partition as a one-node tree rooted at itself
+// (detach-partition-concurrently-3).
+func (pt partitionTree) isPartition(t *catalog.Table) bool {
+	if t.PartitionParentOID != 0 {
+		return true
+	}
+	_, ok := pt.im.PartitionParentOf(t.OID)
+	return ok
+}
+
+func oidDatum(oid uint32) Datum {
+	if oid == 0 {
+		return NullDatum
+	}
+	return NewIntDatum(int64(oid))
+}
+
+// tableTree is pg_partition_tree for a table: the hierarchy below t, BFS
+// order, (relid, parentrelid, isleaf, level). Nothing for a table that is
+// neither partitioned nor a partition.
+func (pt partitionTree) tableTree(root *catalog.Table) []Row {
+	if !pt.isPartition(root) && len(root.PartitionKey) == 0 {
 		return nil
 	}
-
-	type bfsItem struct {
-		tbl        *catalog.Table
-		level      int
-		parentName string
+	rootParent := pt.tableParent(root)
+	type item struct {
+		tbl    *catalog.Table
+		parent uint32
+		level  int
 	}
-	type entry struct {
-		name       string
-		parentName string
-		isLeaf     bool
-		level      int
-	}
-
-	// A partition left in the incomplete-detach state (DetachPendingEpoch != 0,
-	// e.g. a cancelled DETACH … CONCURRENTLY) is treated as fully detached for
-	// hierarchy traversal: it is omitted from its parent's child list and, when
-	// it is itself the queried root, reports a NULL parent. Mirrors PG's
-	// get_partition_ancestors stopping at the detached boundary and
-	// find_all_inheritors omitting inhdetachpending children. M0118-0008
-	// (detach-partition-concurrently-3).
-	startParentName := ""
-	if root.PartitionParentOID != 0 && root.DetachPendingEpoch == 0 {
-		if parentTbl, ok2 := im.LookupTableByOID(root.PartitionParentOID); ok2 {
-			startParentName = parentTbl.Name
-		}
-	}
-
-	var entries []entry
-	queue := []bfsItem{{tbl: root, level: 0, parentName: startParentName}}
+	var rows []Row
+	queue := []item{{tbl: root, parent: rootParent}}
 	visited := map[uint32]bool{}
 	for len(queue) > 0 {
 		cur := queue[0]
@@ -149,74 +162,31 @@ func partitionTableTree(root *catalog.Table, im *catalog.InMemory) []Row {
 			continue
 		}
 		visited[cur.tbl.OID] = true
-		children := im.PartitionChildren(cur.tbl.OID)
 		isLeaf := len(cur.tbl.PartitionKey) == 0
-		entries = append(entries, entry{
-			name:       cur.tbl.Name,
-			parentName: cur.parentName,
-			isLeaf:     isLeaf,
-			level:      cur.level,
-		})
-		for _, child := range children {
-			// Skip a detach-pending child — it is no longer part of this tree.
+		rows = append(rows, Row{oidDatum(cur.tbl.OID), oidDatum(cur.parent), NewBoolDatum(isLeaf), NewIntDatum(int64(cur.level))})
+		for _, child := range pt.im.PartitionChildren(cur.tbl.OID, pt.dbOid) {
+			// A detach-pending child is no longer part of this tree.
 			if child.DetachPendingEpoch != 0 {
 				continue
 			}
-			queue = append(queue, bfsItem{tbl: child, level: cur.level + 1, parentName: cur.tbl.Name})
+			queue = append(queue, item{tbl: child, parent: cur.tbl.OID, level: cur.level + 1})
 		}
-	}
-
-	rows := make([]Row, len(entries))
-	for i, e := range entries {
-		var parentRelid Datum
-		if e.parentName != "" {
-			if pt, ok := im.LookupTable(parser.ObjectName{Name: e.parentName}); ok {
-				parentRelid = NewIntDatum(int64(pt.OID))
-			} else {
-				parentRelid = NullDatum
-			}
-		} else {
-			parentRelid = NullDatum
-		}
-		var relOID Datum
-		if rt, ok := im.LookupTable(parser.ObjectName{Name: e.name}); ok {
-			relOID = NewIntDatum(int64(rt.OID))
-		} else {
-			relOID = NullDatum
-		}
-		rows[i] = Row{relOID, parentRelid, NewBoolDatum(e.isLeaf), NewIntDatum(int64(e.level))}
 	}
 	return rows
 }
 
-// partitionIndexTree returns pg_partition_tree rows for an index partition hierarchy.
-func partitionIndexTree(root *catalog.Index, im *catalog.InMemory) []Row {
-	// Index must be part of a partition tree (has children or a parent).
-	if root.PartitionParentOID == 0 && len(im.IndexPartitionChildren(root.OID)) == 0 {
+// indexTree is pg_partition_tree for a partitioned index hierarchy.
+func (pt partitionTree) indexTree(root *catalog.Index) []Row {
+	if root.PartitionParentOID == 0 && len(pt.im.IndexPartitionChildren(root.OID)) == 0 {
 		return nil
 	}
-
-	type bfsItem struct {
-		idx        *catalog.Index
-		level      int
-		parentName string
+	type item struct {
+		idx    *catalog.Index
+		parent uint32
+		level  int
 	}
-	type entry struct {
-		name       string
-		parentName string
-		isLeaf     bool
-		level      int
-	}
-
-	startParentName := ""
-	if root.PartitionParentOID != 0 {
-		if parentIdx, ok2 := im.LookupIndexByOID(root.PartitionParentOID); ok2 {
-			startParentName = parentIdx.Name
-		}
-	}
-
-	var entries []entry
-	queue := []bfsItem{{idx: root, level: 0, parentName: startParentName}}
+	var rows []Row
+	queue := []item{{idx: root, parent: root.PartitionParentOID}}
 	visited := map[uint32]bool{}
 	for len(queue) > 0 {
 		cur := queue[0]
@@ -225,119 +195,57 @@ func partitionIndexTree(root *catalog.Index, im *catalog.InMemory) []Row {
 			continue
 		}
 		visited[cur.idx.OID] = true
-		children := im.IndexPartitionChildren(cur.idx.OID)
 		isLeaf := cur.idx.Table == nil || len(cur.idx.Table.PartitionKey) == 0
-		entries = append(entries, entry{
-			name:       cur.idx.Name,
-			parentName: cur.parentName,
-			isLeaf:     isLeaf,
-			level:      cur.level,
-		})
-		for _, child := range children {
-			queue = append(queue, bfsItem{idx: child, level: cur.level + 1, parentName: cur.idx.Name})
-		}
-	}
-
-	rows := make([]Row, len(entries))
-	for i, e := range entries {
-		var parentRelid Datum
-		if e.parentName != "" {
-			if pi, ok := im.LookupIndex(parser.ObjectName{Name: e.parentName}); ok {
-				parentRelid = NewIntDatum(int64(pi.OID))
-			} else {
-				parentRelid = NullDatum
-			}
-		} else {
-			parentRelid = NullDatum
-		}
-		var relOID Datum
-		if ri, ok := im.LookupIndex(parser.ObjectName{Name: e.name}); ok {
-			relOID = NewIntDatum(int64(ri.OID))
-		} else {
-			relOID = NullDatum
-		}
-		rows[i] = Row{relOID, parentRelid, NewBoolDatum(e.isLeaf), NewIntDatum(int64(e.level))}
-	}
-	return rows
-}
-
-// partitionBuildAncestors returns the ancestor chain rows for relName.
-func partitionBuildAncestors(relName string, im *catalog.InMemory) []Row {
-	if tbl, ok := im.LookupTable(parser.ObjectName{Name: relName}); ok {
-		return partitionTableAncestors(tbl, im)
-	}
-	if idx, ok := im.LookupIndex(parser.ObjectName{Name: relName}); ok {
-		return partitionIndexAncestors(idx, im)
-	}
-	return nil
-}
-
-// partitionTableAncestors walks up the PartitionParentOID chain from start,
-// collecting the names, then returns rows sorted alphabetically.
-// Returns nil for non-partitioned tables (no parent, no PartitionKey).
-func partitionTableAncestors(start *catalog.Table, im *catalog.InMemory) []Row {
-	// Non-partitioned table → no rows.
-	if start.PartitionParentOID == 0 && len(start.PartitionKey) == 0 {
-		return nil
-	}
-
-	var names []string
-	cur := start
-	visited := map[uint32]bool{}
-	for cur != nil && !visited[cur.OID] {
-		visited[cur.OID] = true
-		names = append(names, cur.Name)
-		if cur.PartitionParentOID == 0 {
-			break
-		}
-		parent, ok := im.LookupTableByOID(cur.PartitionParentOID)
-		if !ok {
-			break
-		}
-		cur = parent
-	}
-
-	rows := make([]Row, len(names))
-	for i, name := range names {
-		if t, ok := im.LookupTable(parser.ObjectName{Name: name}); ok {
-			rows[i] = Row{NewIntDatum(int64(t.OID))}
-		} else {
-			rows[i] = Row{NullDatum}
+		rows = append(rows, Row{oidDatum(cur.idx.OID), oidDatum(cur.parent), NewBoolDatum(isLeaf), NewIntDatum(int64(cur.level))})
+		for _, child := range pt.im.IndexPartitionChildren(cur.idx.OID) {
+			queue = append(queue, item{idx: child, parent: cur.idx.OID, level: cur.level + 1})
 		}
 	}
 	return rows
 }
 
-// partitionIndexAncestors walks up the PartitionParentOID chain for indexes.
-func partitionIndexAncestors(start *catalog.Index, im *catalog.InMemory) []Row {
-	// Index not part of partition tree → no rows.
-	if start.PartitionParentOID == 0 && len(im.IndexPartitionChildren(start.OID)) == 0 {
+// tableAncestors is pg_partition_ancestors for a table: t itself, then each
+// parent up to the root. Nothing for a table outside any partition tree.
+func (pt partitionTree) tableAncestors(start *catalog.Table) []Row {
+	if !pt.isPartition(start) && len(start.PartitionKey) == 0 {
 		return nil
 	}
-
-	var names []string
-	cur := start
+	var rows []Row
 	visited := map[uint32]bool{}
-	for cur != nil && !visited[cur.OID] {
+	for cur := start; cur != nil && !visited[cur.OID]; {
 		visited[cur.OID] = true
-		names = append(names, cur.Name)
-		if cur.PartitionParentOID == 0 {
+		rows = append(rows, Row{NewIntDatum(int64(cur.OID))})
+		p := pt.tableParent(cur)
+		if p == 0 {
 			break
 		}
-		parent, ok := im.LookupIndexByOID(cur.PartitionParentOID)
+		next, ok := pt.im.LookupTableByOID(p, pt.dbOid)
 		if !ok {
 			break
 		}
-		cur = parent
+		cur = next
 	}
+	return rows
+}
 
-	rows := make([]Row, len(names))
-	for i, name := range names {
-		if idx, ok := im.LookupIndex(parser.ObjectName{Name: name}); ok {
-			rows[i] = Row{NewIntDatum(int64(idx.OID))}
-		} else {
-			rows[i] = Row{NullDatum}
+// indexAncestors is pg_partition_ancestors for an index.
+func (pt partitionTree) indexAncestors(start *catalog.Index) []Row {
+	if start.PartitionParentOID == 0 && len(pt.im.IndexPartitionChildren(start.OID)) == 0 {
+		return nil
+	}
+	var rows []Row
+	visited := map[uint32]bool{}
+	for cur := start; cur != nil && !visited[cur.OID]; {
+		visited[cur.OID] = true
+		rows = append(rows, Row{NewIntDatum(int64(cur.OID))})
+		if cur.PartitionParentOID == 0 {
+			break
 		}
+		next, ok := pt.im.LookupIndexByOID(cur.PartitionParentOID, pt.dbOid)
+		if !ok {
+			break
+		}
+		cur = next
 	}
 	return rows
 }

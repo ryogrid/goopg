@@ -11,6 +11,7 @@ import (
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/utils/adt/array"
+	"github.com/goopg/goopg/internal/utils/adt/fixedgeo"
 	"github.com/goopg/goopg/internal/nodes"
 )
 
@@ -68,7 +69,7 @@ func encodeArrayValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]by
 		// still round-trips (the executor never type-checks element contents).
 		oid, align, varlena = 25, 4, true
 	}
-	elems := parseTextArray(d.StringValue())
+	elems := parseTextArrayDelim(d.StringValue(), array.ElemDelim(t.Name))
 	if len(elems) == 0 {
 		return emptyArrayTypeBytes(oid), nil
 	}
@@ -167,7 +168,32 @@ func encodeArrayElem(elemName, e string, varlena bool, ctx *Context, pos int) ([
 		// parseTimeString, timetz through parseTimeTZString). The widths the
 		// element table declares (4/8/8/8/12) are exactly what those arms
 		// return, which is what keeps the array body self-describing.
+		// date and the timestamps need the session's zone and DateStyle, which the
+		// scalar encoder's text arm does not see, so array_in's element input runs
+		// here when a session is at hand.
+		if ctx != nil && (lower == "date" || lower == "timestamp" || lower == "timestamptz") {
+			v, err := evalCast(NewStringDatum(e), lower, pos, ctx)
+			if err != nil {
+				return nil, err
+			}
+			return encodeValuePG(catalog.Type{Name: lower}, v)
+		}
 		return encodeValuePG(catalog.Type{Name: lower}, NewStringDatum(e))
+	case "money":
+		// Element sibling of encodeValuePG's money arm (8-byte Cash; reached
+		// only in a fixed_length_money cluster). M0149-0001k5.
+		c, err := moneyCents(NewStringDatum(e))
+		if err != nil {
+			return nil, err
+		}
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(c))
+		return b[:], nil
+	case "point", "lseg", "box", "line", "circle", "tid":
+		// Element sibling of encodeValuePG's fixedgeo arm (reached only when
+		// pgarray.ElemTypeInfo admits the type, i.e. in a
+		// fixed_length_geometric_tid cluster). M0149-0001k3.
+		return fixedgeo.Encode(lower, e)
 	case "uuid":
 		// Sibling of encodeValuePG's "uuid" arm: pg_uuid_t, 16 raw bytes.
 		s := normalizeUUIDStr(strings.TrimSpace(e))
@@ -246,6 +272,16 @@ func encodeArrayElem(elemName, e string, varlena bool, ctx *Context, pos int) ([
 		default:
 			return []byte{0}, nil
 		}
+	case "name":
+		// Sibling of encodeValuePG's scalar "name" arm (and pgarray's decode
+		// arm): NameData, 64 bytes NUL-padded, the input truncated to
+		// NAMEDATALEN-1 = 63 bytes as namein does. M0149-0001j.
+		if len(e) > 63 {
+			e = e[:63]
+		}
+		b := make([]byte, 64)
+		copy(b, e)
+		return b, nil
 	case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation":
 		// Sibling of the scalar reg* arm in encodeValuePG (66th–68th slices,
 		// deferral 1306): an array element arrives as the text inside the array
@@ -346,7 +382,9 @@ func arrayRegOutRenderer(ctx *Context) func(typeName string, oid uint32) string 
 // lookup only for the relations that can actually render one.
 func colsHaveArray(cols []catalog.Column) bool {
 	for i := range cols {
-		if cols[i].Type.IsArray {
+		// A scalar aclitem column renders its role OIDs through the same
+		// session renderer (st.RegOut) the array elements use. M0149-0001k2.
+		if cols[i].Type.IsArray || strings.EqualFold(cols[i].Type.Name, "aclitem") {
 			return true
 		}
 	}

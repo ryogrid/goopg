@@ -115,6 +115,49 @@ func EncodeStandbyStatusUpdate(writeLSN, flushLSN, applyLSN uint64, sendTime tim
 	return out
 }
 
+// EncodeHotStandbyFeedback builds an 'h' hot-standby-feedback payload
+// (XLogWalRcvSendHSFeedback):
+//
+//	'h' | sendTime(8) | xmin(4) | xminEpoch(4) | catalogXmin(4) | catalogXminEpoch(4)
+//
+// An invalid (0) xmin and catalog_xmin tell the upstream to forget the
+// standby's horizon — what a standby sends once hot_standby_feedback is
+// turned off.
+func EncodeHotStandbyFeedback(sendTime time.Time, xmin, xminEpoch, catalogXmin, catalogXminEpoch uint32) []byte {
+	out := make([]byte, 0, 1+8+4*4)
+	out = append(out, ReplMsgHotStandbyFeedback)
+	out = appendUint64(out, uint64(PgTimestampMicros(sendTime)))
+	out = binary.BigEndian.AppendUint32(out, xmin)
+	out = binary.BigEndian.AppendUint32(out, xminEpoch)
+	out = binary.BigEndian.AppendUint32(out, catalogXmin)
+	out = binary.BigEndian.AppendUint32(out, catalogXminEpoch)
+	return out
+}
+
+// HotStandbyFeedback is the parsed shape of an 'h' payload
+// (ProcessStandbyHSFeedbackMessage).
+type HotStandbyFeedback struct {
+	SendTime         time.Time
+	Xmin             uint32
+	XminEpoch        uint32
+	CatalogXmin      uint32
+	CatalogXminEpoch uint32
+}
+
+func decodeHotStandbyFeedback(payload []byte) (*HotStandbyFeedback, error) {
+	if len(payload) != 1+8+4*4 {
+		return nil, fmt.Errorf("hot standby feedback: expected 25 bytes, got %d", len(payload))
+	}
+	body := payload[1:]
+	return &HotStandbyFeedback{
+		SendTime:         PgTimestampToTime(int64(binary.BigEndian.Uint64(body[0:8]))),
+		Xmin:             binary.BigEndian.Uint32(body[8:12]),
+		XminEpoch:        binary.BigEndian.Uint32(body[12:16]),
+		CatalogXmin:      binary.BigEndian.Uint32(body[16:20]),
+		CatalogXminEpoch: binary.BigEndian.Uint32(body[20:24]),
+	}, nil
+}
+
 // WALDataMessage is the parsed shape of a 'w' (WAL data) CopyData
 // payload. WALBytes references the original payload buffer — copy
 // before holding past the next FrameReader call.
@@ -172,6 +215,12 @@ func DecodeReplicationMessage(payload []byte) (any, byte, error) {
 			return nil, 0, err
 		}
 		return m, ReplMsgStandbyStatus, nil
+	case ReplMsgHotStandbyFeedback:
+		m, err := decodeHotStandbyFeedback(payload)
+		if err != nil {
+			return nil, 0, err
+		}
+		return m, ReplMsgHotStandbyFeedback, nil
 	default:
 		return nil, 0, fmt.Errorf("replication message: unknown inner type %q", payload[0])
 	}

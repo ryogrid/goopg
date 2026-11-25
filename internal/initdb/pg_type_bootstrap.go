@@ -612,6 +612,22 @@ func pgTypeRow(e pgTypeEntry) executor.Row {
 	if v, ok := pgTypeTypModOverlay[e.OID]; ok {
 		typtypmod = v
 	}
+	// typmodin / typmodout / typanalyze, typcollation, a typarray the
+	// elem/array triple lacks (record's _record) and typdefault come from a
+	// PG 18.3 initdb (pg_type_support_generated.go, M0149-0001h1a15): genbki
+	// gives every true array array_typanalyze and its element's typmod I/O.
+	sup := pgTypeInitdbSupport[e.OID]
+	typcollation := pgTypeCollationForOID(e.OID)
+	if sup.Collation != 0 {
+		typcollation = int64(sup.Collation)
+	}
+	if typarray == 0 {
+		typarray = int64(sup.Array)
+	}
+	typdefault := executor.NullDatum
+	if sup.HasDefault {
+		typdefault = executor.NewStringDatum(sup.Default)
+	}
 	return executor.Row{
 		executor.NewIntDatum(int64(e.OID)),                 // 1 oid
 		executor.NewStringDatum(e.Name),                    // 2 typname
@@ -623,7 +639,7 @@ func pgTypeRow(e pgTypeEntry) executor.Row {
 		executor.NewStringDatum(string(e.Category)),        // 8 typcategory
 		executor.NewBoolDatum(pgTypePreferredOverlay[e.OID]), // 9 typispreferred
 		executor.NewBoolDatum(true),                        // 10 typisdefined
-		executor.NewStringDatum(","),                       // 11 typdelim
+		executor.NewStringDatum(pgTypeDelim(e.OID)),        // 11 typdelim (M0149-0001k3)
 		executor.NewIntDatum(int64(pgTypeRelidOverlay[e.OID])), // 12 typrelid (M0131-S9.3g; 0 for every non-composite)
 		executor.NewIntDatum(typsubscript),                 // 13 typsubscript (M0131-S9.3c)
 		executor.NewIntDatum(typelem),                      // 14 typelem  (M0131-S9.3c)
@@ -632,18 +648,18 @@ func pgTypeRow(e pgTypeEntry) executor.Row {
 		executor.NewIntDatum(int64(e.Output)),              // 17 typoutput
 		executor.NewIntDatum(int64(e.Receive)),             // 18 typreceive
 		executor.NewIntDatum(int64(e.Send)),                // 19 typsend
-		executor.NewIntDatum(0),                            // 20 typmodin
-		executor.NewIntDatum(0),                            // 21 typmodout
-		executor.NewIntDatum(0),                            // 22 typanalyze
+		executor.NewIntDatum(int64(sup.ModIn)),             // 20 typmodin
+		executor.NewIntDatum(int64(sup.ModOut)),            // 21 typmodout
+		executor.NewIntDatum(int64(sup.Analyze)),           // 22 typanalyze
 		executor.NewStringDatum(string(e.Align)),           // 23 typalign  ← load-bearing
 		executor.NewStringDatum(string(e.Storage)),         // 24 typstorage
 		executor.NewBoolDatum(false),                       // 25 typnotnull
 		executor.NewIntDatum(int64(typbasetype)),           // 26 typbasetype
 		executor.NewIntDatum(typtypmod),                    // 27 typtypmod
 		executor.NewIntDatum(0),                            // 28 typndims
-		executor.NewIntDatum(pgTypeCollationForOID(e.OID)), // 29 typcollation (PG-canonical; must match attcollation, slice 188)
+		executor.NewIntDatum(typcollation),                 // 29 typcollation (PG-canonical; must match attcollation, slice 188)
 		executor.NullDatum,                                 // 30 typdefaultbin
-		executor.NullDatum,                                 // 31 typdefault
+		typdefault,                                         // 31 typdefault
 		executor.NullDatum,                                 // 32 typacl
 	}
 }
@@ -776,8 +792,21 @@ func bootstrapPgTypeTuples(dataDir string) (map[uint32]heapTID, error) {
 	}
 	sort.Slice(oids, func(i, j int) bool { return oids[i] < oids[j] })
 
+	// M0149-0001g slice 18: the system relations' composite rowtypes and
+	// their array types a PG initdb holds (pgTypeRowtypeRows), merged in OID
+	// order with goopg's own rows.
+	extra := pgTypeRowtypeRows()
+	for oid := range extra {
+		oids = append(oids, oid)
+	}
+	sort.Slice(oids, func(i, j int) bool { return oids[i] < oids[j] })
+
 	rows := make([]executor.Row, 0, len(oids))
 	for _, oid := range oids {
+		if r, ok := extra[oid]; ok {
+			rows = append(rows, pgTypeFullRowDatums(r))
+			continue
+		}
 		rows = append(rows, pgTypeRow(allMap[oid]))
 	}
 	rawTIDs, err := writeMultiPageHeapRows(dataDir, "1247", cols, rows)
@@ -789,4 +818,15 @@ func bootstrapPgTypeTuples(dataDir string) (map[uint32]heapTID, error) {
 		tidMap[oid] = rawTIDs[i]
 	}
 	return tidMap, nil
+}
+
+// pgTypeDelim is pg_type.typdelim: ';' for box (603) and its array _box
+// (1020) per pg_type.dat, ',' for every other type. A PG node splits and
+// joins box[] values on it (array_in / array_out); with ',' it mis-split
+// "{(1,1),(0,0)}" into "(1" and "1),(0,0)". M0149-0001k3.
+func pgTypeDelim(oid uint32) string {
+	if oid == 603 || oid == 1020 {
+		return ";"
+	}
+	return ","
 }

@@ -59,13 +59,12 @@ func TestDatabaseACLSurvivesRestartViaCatalogHeap(t *testing.T) {
 	if got, want := cat2.DatabaseACLText(cat2.DBOID()), want1; got != want {
 		t.Errorf("datacl after restart = %q, want %q", got, want)
 	}
-	// Paired control: a database whose row was never granted must still
-	// project as SQL NULL after the reload, so the pass above cannot come from
-	// the reload inventing an array for every row it scans. (goopg's initdb
-	// leaves template1's datacl NULL where PostgreSQL's seeds
-	// `{=c/postgres,postgres=CTc/postgres}` — a separate, ledgered divergence
-	// in initdb, not in this reload.)
-	if got := cat2.DatabaseACLText(1); got != "" {
-		t.Errorf("template1 datacl after restart = %q, want NULL projection", got)
+	// Paired control: template1 was never granted at runtime, so after the
+	// reload it must carry exactly what initdb seeded — PostgreSQL's
+	// `{=c/postgres,postgres=CTc/postgres}` (initdb's REVOKE CREATE,TEMPORARY
+	// … FROM public; seeded since M0149-0001h) — not the GRANT above and not
+	// an array the reload invented.
+	if got, want := cat2.DatabaseACLText(1), "{=c/postgres,postgres=CTc/postgres}"; got != want {
+		t.Errorf("template1 datacl after restart = %q, want %q", got, want)
 	}
 }

@@ -762,6 +762,44 @@ func buildIntervalLit(pos int, body string) Expr {
 
 // typedLitParts splits the adapter's folded TYPEDLIT payload "type\x1fvalue"
 // back into its type name and literal text.
+// typedLitExpr builds the node for a TYPEDLIT terminal. The original short
+// forms stay TypedStringLit; a qualified type, one with modifiers, and the
+// types in castLitTypes become a cast of the string, which is what gram.y's
+// makeStringConstCast builds. typePos is the type name's position, strPos the
+// string's, where PG reports a bad value.
+func typedLitExpr(l yyLexer, raw string, typePos, strPos int) Expr {
+	spec, val := typedLitParts(raw)
+	schema, name := "", spec
+	var args []int64
+	if open := strings.IndexByte(name, '('); open >= 0 && strings.HasSuffix(name, ")") {
+		for _, a := range strings.Split(name[open+1:len(name)-1], ",") {
+			n, err := strconv.ParseInt(strings.TrimSpace(a), 10, 64)
+			if err != nil {
+				return NewTypedStringLit(strPos, spec, val)
+			}
+			args = append(args, n)
+		}
+		name = name[:open]
+	}
+	if dot := strings.IndexByte(name, '.'); dot >= 0 {
+		schema, name = name[:dot], name[dot+1:]
+	}
+	if schema == "" && args == nil && !castLitTypes[name] {
+		return NewTypedStringLit(strPos, name, val)
+	}
+	if schema == "" && !isQuotedIdentAt(l, typePos) {
+		name, args = floatNormalized(l, name, args)
+	}
+	if name == "character" {
+		name = "bpchar"
+	}
+	if schema != "" && schema != "pg_catalog" && args == nil {
+		// A user schema's type: typenameType checks it exists (M0149-0001h1a85).
+		return newTypedLitCast(strPos, val, ObjectName{Schema: schema, Name: name}, typePos)
+	}
+	return NewCastExpr(strPos, NewStringConst(strPos, val), ObjectName{Schema: schema, Name: name}, args)
+}
+
 func typedLitParts(s string) (typ, val string) {
 	if i := strings.IndexByte(s, 0x1f); i >= 0 {
 		return s[:i], s[i+1:]
@@ -4163,7 +4201,9 @@ func castTo(l yyLexer, operand Expr, ct castType, extra []int64, pos, castPos in
 	if !quoted {
 		args = typmodsFor(name, args, len(args))
 	}
-	return NewCastExpr(castPos, operand, ObjectName{Schema: ct.schema, Name: name}, args)
+	ce := NewCastExpr(castPos, operand, ObjectName{Schema: ct.schema, Name: name}, args)
+	ce.typePos = pos
+	return ce
 }
 
 // partBoundValues turns the bare words MINVALUE and MAXVALUE in a range

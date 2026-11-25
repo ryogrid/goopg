@@ -165,6 +165,17 @@ func pgHashUint32(k uint32) uint32 {
 	return uint32(pgHashUint32Extended(k, 0))
 }
 
+// hashPartitionFallbackWord is the word hashed for a partition key type with no
+// PG-compatible hash here. A time value keeps the word it had when KindTime held
+// Unix nanoseconds, so rows already stored in hash partitions are still found.
+// PG hashes these types differently (M0149-0001h1a50).
+func hashPartitionFallbackWord(d Datum) uint32 {
+	if d.Kind == KindTime && !d.IsTimestampNotFinite() {
+		return uint32(d.TimeValue().UnixNano())
+	}
+	return uint32(d.Int)
+}
+
 // computeHashPartitionRowHash folds the hash of every non-NULL HASH partition
 // key column into a single 64-bit row hash, mirroring PG's
 // satisfies_hash_partition()/compute_partition_hash_value() in
@@ -236,7 +247,7 @@ func computeHashPartitionRowHash(tbl *catalog.Table, im *catalog.InMemory, ctx *
 			case colType == "text" || colType == "varchar" || colType == "bpchar" || valDatum.Kind == KindString:
 				h = pgHashBytesExtended([]byte(valDatum.StringValue()), hashPartitionSeed)
 			default:
-				h = pgHashUint32Extended(uint32(valDatum.Int), hashPartitionSeed)
+				h = pgHashUint32Extended(hashPartitionFallbackWord(valDatum), hashPartitionSeed)
 			}
 		}
 		rowHash = pgHashCombine64(rowHash, h)

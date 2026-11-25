@@ -130,6 +130,68 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		13465: {1, 2},     // pg_toast_13461_index : btree(chunk_id oid_ops, chunk_seq int4_ops) UNIQUE PRIMARY ← M0133-S3 (sql_implementation_info)
 		13470: {1, 2},     // pg_toast_13466_index : btree(chunk_id oid_ops, chunk_seq int4_ops) UNIQUE PRIMARY ← M0133-S3 (sql_parts)
 		13475: {1, 2},     // pg_toast_13471_index : btree(chunk_id oid_ops, chunk_seq int4_ops) UNIQUE PRIMARY ← M0133-S3 (sql_sizing)
+		// M0149-0001c: shared TOAST indexes and pg_shdepend / pg_shdescription's
+		// indexes (indkey checked against a PG 18.3 initdb).
+		4178: {1, 2},       // pg_toast_1262_index
+		2967: {1, 2},       // pg_toast_2964_index
+		4061: {1, 2},       // pg_toast_3592_index
+		2847: {1, 2},       // pg_toast_2396_index
+		4184: {1, 2},       // pg_toast_6100_index
+		4186: {1, 2},       // pg_toast_1213_index
+		6245: {1, 2},       // pg_toast_6243_index
+		1232: {1, 2, 3, 4}, // pg_shdepend_depender_index : btree(dbid, classid, objid, objsubid)
+		1233: {5, 6},       // pg_shdepend_reference_index : btree(refclassid, refobjid)
+		2397: {1, 2},       // pg_shdescription_o_c_index : btree(objoid, classoid) UNIQUE PRIMARY
+		// M0149-0001g: indexes the bootstrap image lacked (indkey from PG 18.3).
+		2187: {2},       // pg_inherits_parent_index : btree(inhparent)
+		2673: {1, 2, 3}, // pg_depend_depender_index : btree(classid, objid, objsubid)
+		2674: {4, 5, 6}, // pg_depend_reference_index : btree(refclassid, refobjid, refobjsubid)
+		2675: {1, 2, 3}, // pg_description_o_c_o_index : btree(objoid, classoid, objsubid) UNIQUE PRIMARY
+		2664: {2, 3},    // pg_constraint_conname_nsp_index : btree(conname, connamespace)
+		2579: {12},      // pg_constraint_conparentid_index : btree(conparentid)
+		// M0149-0001g slice 3.
+		2699: {11},         // pg_trigger_tgconstraint_index
+		2702: {1},          // pg_trigger_oid_index
+		2996: {1},          // pg_largeobject_metadata_oid_index
+		2683: {1, 2},       // pg_largeobject_loid_pn_index (slice 30)
+		3257: {1},          // pg_policy_oid_index
+		3258: {3, 2},       // pg_policy_polrelid_polname_index
+		3597: {1, 2, 3, 4}, // pg_seclabel_object_index
+		3395: {1, 2, 3},    // pg_init_privs_o_c_o_index
+		// M0149-0001g slice 4.
+		2651: {2},    // pg_am_name_index
+		2652: {1},    // pg_am_oid_index
+		2756: {1},    // pg_amop_oid_index
+		2757: {1},    // pg_amproc_oid_index
+		3455: {9, 8}, // pg_class_tblspc_relfilenode_index
+		// M0149-0001g slice 26: the 27 added DECLARE_TOAST indexes (chunk_id, chunk_seq).
+		4144: {1, 2}, // pg_toast_826_index
+		4172: {1, 2}, // pg_toast_1247_index
+		2837: {1, 2}, // pg_toast_1255_index
+		4152: {1, 2}, // pg_toast_1417_index
+		4174: {1, 2}, // pg_toast_1418_index
+		4150: {1, 2}, // pg_toast_2328_index
+		4160: {1, 2}, // pg_toast_2600_index
+		2831: {1, 2}, // pg_toast_2604_index
+		2833: {1, 2}, // pg_toast_2606_index
+		2835: {1, 2}, // pg_toast_2609_index
+		6352: {1, 2}, // pg_toast_2610_index
+		4158: {1, 2}, // pg_toast_2612_index
+		4164: {1, 2}, // pg_toast_2615_index
+		2841: {1, 2}, // pg_toast_2619_index
+		2337: {1, 2}, // pg_toast_2620_index
+		4148: {1, 2}, // pg_toast_3079_index
+		4154: {1, 2}, // pg_toast_3118_index
+		4168: {1, 2}, // pg_toast_3256_index
+		4166: {1, 2}, // pg_toast_3350_index
+		3440: {1, 2}, // pg_toast_3381_index
+		4156: {1, 2}, // pg_toast_3394_index
+		3431: {1, 2}, // pg_toast_3429_index
+		6176: {1, 2}, // pg_toast_3456_index
+		4146: {1, 2}, // pg_toast_3466_index
+		3599: {1, 2}, // pg_toast_3596_index
+		4170: {1, 2}, // pg_toast_3600_index
+		6229: {1, 2}, // pg_toast_6106_index
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {

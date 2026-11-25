@@ -75,6 +75,13 @@ type Slot struct {
 	// pg_replication_slots.catalog_xmin.
 	CatalogXmin uint64 `json:"catalog_xmin,omitempty"`
 
+	// Xmin is a physical slot's data xmin: the oldest xid the standby
+	// streaming from it still needs, set from its hot_standby_feedback
+	// messages (PhysicalReplicationSlotNewXmin). Zero is
+	// InvalidTransactionId. Maps to pg_replication_slots.xmin and holds the
+	// vacuum horizon back, as PG's replication_slot_xmin does. M0149-0077i.
+	Xmin uint64 `json:"xmin,omitempty"`
+
 	// DatabaseOID is the PG Oid of the database a logical slot is
 	// anchored in (0 = InvalidOid for physical slots). Stored in the
 	// binary state file but not in the JSON fallback format.
@@ -282,6 +289,58 @@ func (s *Slots) AdvanceConfirmedFlushLSN(name string, lsn uint64) error {
 	return s.writeSlotLocked(slot)
 }
 
+// ErrSlotNotReserved is pg_replication_slot_advance's "cannot be advanced":
+// the slot never reserved WAL or has been invalidated.
+var ErrSlotNotReserved = errors.New("replication slot cannot be advanced")
+
+// SlotAdvanceBelowMinimumError is pg_replication_slot_advance's refusal to
+// move a slot backward ("cannot advance replication slot to X, minimum is Y").
+type SlotAdvanceBelowMinimumError struct {
+	Target, Minimum uint64
+}
+
+func (e *SlotAdvanceBelowMinimumError) Error() string {
+	return fmt.Sprintf("cannot advance replication slot to %X/%X, minimum is %X/%X",
+		uint32(e.Target>>32), uint32(e.Target), uint32(e.Minimum>>32), uint32(e.Minimum))
+}
+
+// AdvancePhysical is pg_physical_replication_slot_advance under
+// pg_replication_slot_advance's checks (slotfuncs.c): the slot must exist,
+// be physical, not be held by a walsender (ReplicationSlotAcquire), and have
+// reserved WAL; moveto below restart_lsn is an error; otherwise restart_lsn
+// moves forward to moveto (staying put when it is already there). Returns
+// the slot's restart_lsn afterwards — the function's end_lsn. The new
+// position is persisted at once (PG marks the slot dirty and the next
+// checkpoint writes it; a clean shutdown always does). M0149-0077j.
+func (s *Slots) AdvancePhysical(name string, moveto uint64) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	slot, ok := s.m[name]
+	if !ok {
+		return 0, ErrSlotNotFound
+	}
+	if slot.Kind != SlotPhysical {
+		return 0, ErrSlotKindMismatch
+	}
+	if slot.Active {
+		return 0, ErrSlotInUse
+	}
+	if slot.RestartLSN == 0 || slot.Invalidated {
+		return 0, ErrSlotNotReserved
+	}
+	if moveto < slot.RestartLSN {
+		return 0, &SlotAdvanceBelowMinimumError{Target: moveto, Minimum: slot.RestartLSN}
+	}
+	if moveto == slot.RestartLSN {
+		return moveto, nil
+	}
+	slot.RestartLSN = moveto
+	if err := s.writeSlotLocked(slot); err != nil {
+		return 0, err
+	}
+	return moveto, nil
+}
+
 // SetActive marks a slot as owned (or released) by a walsender.
 // Returns ErrSlotNotFound if the slot doesn't exist and ErrSlotInUse
 // if attempting to acquire a slot already held.
@@ -346,6 +405,49 @@ func (s *Slots) MinCatalogXmin() uint64 {
 		}
 	}
 	return min
+}
+
+// MinXmin returns the oldest data xmin any valid slot holds (0 = none):
+// PG's ReplicationSlotsComputeRequiredXmin over effective_xmin, which
+// ProcArraySetReplicationSlotXmin folds into every xid horizon.
+func (s *Slots) MinXmin() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var min uint64
+	for _, slot := range s.m {
+		if slot.Invalidated || slot.Xmin == 0 {
+			continue
+		}
+		if min == 0 || slot.Xmin < min {
+			min = slot.Xmin
+		}
+	}
+	return min
+}
+
+// SetPhysicalXmins applies a standby's hot_standby_feedback to the physical
+// slot it streams from: PhysicalReplicationSlotNewXmin replaces both
+// data.xmin and data.catalog_xmin with the reported values (0 clears them,
+// which is what a standby sends after hot_standby_feedback is turned off).
+// Unlike the logical catalog_xmin, the values may move backward — the
+// standby reports its current horizon. The state file is rewritten only
+// when a value changes. Returns ErrSlotNotFound for an unknown slot.
+func (s *Slots) SetPhysicalXmins(name string, xmin, catalogXmin uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	slot, ok := s.m[name]
+	if !ok {
+		return ErrSlotNotFound
+	}
+	if slot.Kind != SlotPhysical {
+		return ErrSlotKindMismatch
+	}
+	if slot.Xmin == xmin && slot.CatalogXmin == catalogXmin {
+		return nil
+	}
+	slot.Xmin = xmin
+	slot.CatalogXmin = catalogXmin
+	return s.writeSlotLocked(slot)
 }
 
 // AdvanceCatalogXmin pins (or advances) the named slot's catalog_xmin to

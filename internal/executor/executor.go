@@ -100,6 +100,8 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		return maybeInstrument(p, newFromRegexpMatchesOp(p), scope), nil
 	case *optimizer.FromRegexpSplitToTable:
 		return maybeInstrument(p, newFromRegexpSplitToTableOp(p), scope), nil
+	case *optimizer.BuiltinSRFScan:
+		return maybeInstrument(p, newBuiltinSRFScanOp(p), scope), nil
 	case *optimizer.SubqueryScan:
 		// M0146-0005w: a labelling wrapper, not an operator — PG's
 		// SubqueryScan node forwards tuples unchanged, which the child

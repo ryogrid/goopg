@@ -42,7 +42,7 @@ func TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages(t *testing.T) {
 		2224, // pg_sequence (M0106-0010 step 3cb)
 		2328, // pg_foreign_data_wrapper (M0106-0010 step 3bb)
 		2604, 2608, 2609, 2611,
-		2613, 2614,
+		2613,
 		2619, 2620,
 		3079, // pg_extension (M0106-0010 step 3aw)
 		3118, // pg_foreign_table (M0106-0010 step 3bh)
@@ -57,9 +57,11 @@ func TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages(t *testing.T) {
 		3601, // pg_ts_parser (M0106-0010 step 3cn)
 		3602, // pg_ts_config (M0106-0010 step 3ck)
 		3603, // pg_ts_config_map (M0106-0010 step 3cj)
-		3764, 3765, 3766, 3767, 3768,
-		6003, 6101, 6102, 6104, 6106, 6137, 6237,
-		6245, 9400,
+		3764, // 3766/3767 are pg_ts_template's btree indexes (M0149-0001g slice 6)
+		6102, 6104, 6106, 6237,
+		// 6245 is the shared pg_parameter_acl TOAST index, not a local heap.
+		// M0149-0006: 2614/3765/3768/6003/6101/6137/9400 are not PG
+		// relfilenodes in base/<db> (018 orphan check) and are omitted.
 	}
 
 	for _, db := range []string{"base/1", "base/5"} {
@@ -85,7 +87,7 @@ func TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages(t *testing.T) {
 	// by bootstrapMappedLocalCatalogHeaps; their files should not be
 	// created by this call. The dedicated bootstrapper is responsible.
 	for _, db := range []string{"base/1", "base/5"} {
-		for _, oid := range []uint32{2600, 2605, 2606, 2607, 2617, 2753, 3541} {
+		for _, oid := range []uint32{2600, 2605, 2606, 2607, 2617, 2753, 3541, 2614, 3765, 3768, 6003, 6101, 6137, 9400} {
 			path := filepath.Join(dir, db, strconv.FormatUint(uint64(oid), 10))
 			if _, err := os.Stat(path); err == nil {
 				t.Errorf("OID %d in %s exists after bootstrapMappedLocalCatalogHeaps — must be omitted (clobbers dedicated bootstrapper)", oid, db)

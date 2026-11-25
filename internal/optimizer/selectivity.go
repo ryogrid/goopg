@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/utils/adt/cash"
 
 	"github.com/goopg/goopg/internal/catalog"
 )
@@ -75,6 +76,12 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 		// `IS NULL` had no arm at all and fell through to the generic default
 		// below, so the statistic was never read for its own predicate.
 		return nullTestSelectivity(e, child)
+	case *ColumnRef:
+		// boolvarsel (selfuncs.c): a bare boolean column as a qual
+		// (M0148-0001c3a5 (d)).
+		if !e.Type.IsArray && (strings.EqualFold(e.Type.Name, "bool") || strings.EqualFold(e.Type.Name, "boolean")) {
+			return boolVarSelectivity(e, child)
+		}
 	case *IsBoolExpr:
 		// booltestsel (selfuncs.c:1545) — take2 P1-14b. IS TRUE/FALSE had
 		// no arm at all and fell through to the generic default, so a
@@ -105,6 +112,19 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 				return 1 - sel
 			}
 			return sel
+		}
+		// M0148-0001c3a4 (i): a lone array literal (`< ANY ('{100,300}')`)
+		// is priced per element, as scalararraysel deconstructs the
+		// constant array; the probe splits it the same way
+		// (saopElementsFor).
+		if len(e.List) == 1 {
+			// An empty literal (`'{}'`) prices 0, as scalararraysel's merge
+			// over no elements does (M0148-0001c3a4 (i)).
+			if elems, ok := arrayLiteralElements(cr.Type, e.List); ok && (len(elems) != 1 || elems[0] != e.List[0]) {
+				split := *e
+				split.List = elems
+				e = &split
+			}
 		}
 		stats := columnStatsForChild(cr.Index, child)
 		sel := inListSelectivity(e, cr, stats, columnRawRowsForChild(cr.Index, child), child)
@@ -265,6 +285,14 @@ func rowCompareSelectivity(op parser.OpCode, left, right Expr, child Node) (floa
 	if !ok {
 		return 0, false
 	}
+	// eqsel / scalarineqsel: a NULL constant matches nothing (selfuncs.c
+	// `if (constisnull) return 0.0`) — `(a, b) > (NULL, 5)` (M0148-0001c3a12).
+	if _, isNull := r.(*NullConst); isNull && op != parser.OpNe {
+		return 0, true
+	}
+	if _, isNull := l.(*NullConst); isNull && op != parser.OpNe {
+		return 0, true
+	}
 	switch op {
 	case parser.OpEq:
 		return eqOpSelectivity(l, r, child), true
@@ -423,6 +451,13 @@ func statLiteralEqual(stamped, literal, typeName string) bool {
 // parse (numeric 'NaN', 'Infinity'), and the caller keeps the text compare.
 func statNumericEqual(a, b, typeName string) (eq, ok bool) {
 	switch strings.ToLower(typeName) {
+	case "money":
+		ca, errA := cash.In(a)
+		cb, errB := cash.In(b)
+		if errA != nil || errB != nil {
+			return false, false
+		}
+		return ca == cb, true
 	case "numeric", "decimal", "int2", "int4", "int8", "smallint", "integer", "int", "bigint":
 		ra, okA := new(big.Rat).SetString(strings.TrimSpace(a))
 		rb, okB := new(big.Rat).SetString(strings.TrimSpace(b))
@@ -875,6 +910,14 @@ func histCmp(a, b, typeName string) int {
 // byte-wise compare in histCmp.
 func numericValue(s, typeName string) (float64, bool) {
 	switch strings.ToLower(typeName) {
+	case "money":
+		// convert_numeric_to_scalar (selfuncs.c) covers CASHOID: the Cash
+		// count. Stats and literals are cash_out text. M0149-0001k5.
+		c, err := cash.In(s)
+		if err != nil {
+			return 0, false
+		}
+		return float64(c), true
 	case "int", "int2", "int4", "int8", "smallint", "integer", "bigint", "numeric", "decimal", "float", "float4", "float8", "real", "double precision":
 		v, err := strconv.ParseFloat(s, 64)
 		if err != nil {
@@ -928,6 +971,10 @@ func numericValue(s, typeName string) (float64, bool) {
 			"2006-01-02",
 		} {
 			if t, err := time.Parse(layout, padISODateLiteral(s)); err == nil {
+				// UnixNano wraps outside 1678..2261, so a far date uses seconds.
+				if y := t.Year(); y < 1678 || y > 2261 {
+					return float64(t.Unix()), true
+				}
 				return float64(t.UnixNano()) / 1e9, true
 			}
 		}
@@ -1122,7 +1169,110 @@ func normalizeColumnConst(l, r Expr) (*ColumnRef, Expr, bool) {
 	if cr, ok := r.(*ColumnRef); ok && isConstExpr(l) {
 		return cr, l, true
 	}
+	if cr, ok := l.(*ColumnRef); ok {
+		if ic, isInt := integerCastLiteral(r); isInt {
+			return cr, ic, true
+		}
+	}
+	if cr, ok := r.(*ColumnRef); ok {
+		if ic, isInt := integerCastLiteral(l); isInt {
+			return cr, ic, true
+		}
+	}
+	if cr, ok := l.(*ColumnRef); ok {
+		if nc, isName := nameCastLiteral(r); isName {
+			return cr, nc, true
+		}
+		if mc, isMoney := moneyCastLiteral(r); isMoney {
+			return cr, mc, true
+		}
+	}
+	if cr, ok := r.(*ColumnRef); ok {
+		if nc, isName := nameCastLiteral(l); isName {
+			return cr, nc, true
+		}
+		if mc, isMoney := moneyCastLiteral(l); isMoney {
+			return cr, mc, true
+		}
+	}
 	return nil, nil, false
+}
+
+// integerCastLiteral reads an explicit cast of an integer literal to an
+// integer type — `3::int8`, `-3::int8` (-(3::int8)), `1::int2` — as the
+// integer Const eval_const_expressions folds it to (M0148-0001c3a6 (i)), so
+// the selectivity code reads statistics through it as PG does.
+func integerCastLiteral(e Expr) (*IntegerConst, bool) {
+	neg := false
+	if u, ok := e.(*UnaryOp); ok && u.Op == parser.OpUnaryNeg {
+		neg, e = true, u.Operand
+	}
+	c, ok := e.(*CastExpr)
+	if !ok || !c.Explicit || c.Typmod != 0 {
+		return nil, false
+	}
+	ic, isInt := c.Operand.(*IntegerConst)
+	if !isInt {
+		return nil, false
+	}
+	switch strings.ToLower(c.TargetType) {
+	case "int2", "smallint", "int4", "int", "integer", "int8", "bigint":
+	default:
+		return nil, false
+	}
+	v := ic.Value
+	if neg {
+		v = -v
+	}
+	wide := strings.EqualFold(c.TargetType, "int8") || strings.EqualFold(c.TargetType, "bigint")
+	return &IntegerConst{pos: ic.pos, Value: v, Wide: wide}, true
+}
+
+// nameCastLiteral reads a string literal cast to name — the CastExpr the
+// resolver wraps around the non-name side of a comparison with a name column
+// (planner.go, M0097-0003), or an explicit 'x'::name — as the name Const
+// eval_const_expressions folds it to: namein truncates to NAMEDATALEN-1 = 63
+// bytes. Without it `relname = 'x'`-shaped quals missed the column's MCVs and
+// histogram and were priced as column = expression (1/ndistinct).
+// M0149-0001j.
+func nameCastLiteral(e Expr) (*StringConst, bool) {
+	c, ok := e.(*CastExpr)
+	if !ok || c.Typmod != 0 || !strings.EqualFold(c.TargetType, "name") {
+		return nil, false
+	}
+	sc, ok := c.Operand.(*StringConst)
+	if !ok {
+		return nil, false
+	}
+	v := sc.Value
+	if len(v) > 63 {
+		v = v[:63]
+	}
+	out := *sc
+	out.Value = v
+	return &out, true
+}
+
+// moneyCastLiteral reads a string literal cast to money (the resolver's
+// coercion of a literal compared with a money column, or an explicit
+// 'x'::money) as the money Const PG folds it to, rendered as cash_out text —
+// the form money statistics are stamped in. M0149-0001k5.
+func moneyCastLiteral(e Expr) (*StringConst, bool) {
+	c, ok := e.(*CastExpr)
+	if !ok || !strings.EqualFold(c.TargetType, "money") {
+		return nil, false
+	}
+	sc, ok := c.Operand.(*StringConst)
+	if !ok {
+		return nil, false
+	}
+	v, err := cash.In(sc.Value)
+	if err != nil {
+		return nil, false
+	}
+	out := *sc
+	out.Value = cash.Out(v)
+	return &out, true
 }
 
 // normalizeColumnConstRange is the same shape recogniser as
@@ -1134,6 +1284,32 @@ func normalizeColumnConstRange(l, r Expr) (*ColumnRef, Expr, bool, bool) {
 	}
 	if cr, ok := r.(*ColumnRef); ok && isConstExpr(l) {
 		return cr, l, true, true
+	}
+	if cr, ok := l.(*ColumnRef); ok {
+		if ic, isInt := integerCastLiteral(r); isInt {
+			return cr, ic, false, true
+		}
+	}
+	if cr, ok := r.(*ColumnRef); ok {
+		if ic, isInt := integerCastLiteral(l); isInt {
+			return cr, ic, true, true
+		}
+	}
+	if cr, ok := l.(*ColumnRef); ok {
+		if nc, isName := nameCastLiteral(r); isName {
+			return cr, nc, false, true
+		}
+		if mc, isMoney := moneyCastLiteral(r); isMoney {
+			return cr, mc, false, true
+		}
+	}
+	if cr, ok := r.(*ColumnRef); ok {
+		if nc, isName := nameCastLiteral(l); isName {
+			return cr, nc, true, true
+		}
+		if mc, isMoney := moneyCastLiteral(l); isMoney {
+			return cr, mc, true, true
+		}
 	}
 	return nil, nil, false, false
 }
@@ -1430,13 +1606,12 @@ const (
 // FALSE mass is whatever remains. Without MCV data the null fraction still
 // answers UNKNOWN, and TRUE/FALSE split the non-null mass 50/50.
 //
-// Two deliberate deviations, both recorded: (1) with NO statistics at all
-// the estimator declines to the pre-existing generic default rather than
-// following PG's recurse-into-the-argument rule — goopg has no bare-boolean
-// estimator for that recursion to land on, so PG's rule has no honest
-// target here; (2) a non-column operand likewise keeps the old default, as
-// does an MCV[0] whose rendered form is not recognisably boolean (which
-// falls through to the no-MCV rule).
+// With NO statistics (or a non-column operand) it follows PG's rule: IS
+// [NOT] UNKNOWN take DEFAULT_UNK_SEL / DEFAULT_NOT_UNK_SEL, IS TRUE / IS NOT
+// FALSE recurse into the argument's clause selectivity (boolvarsel's 0.5 for
+// a bare column, M0148-0001c3a5 (d)), IS FALSE / IS NOT TRUE its
+// complement. An MCV[0] whose rendered form is not recognisably boolean
+// falls through to the no-MCV rule.
 func boolTestSelectivity(e *IsBoolExpr, child Node) float64 {
 	est, _ := boolTestSelectivityInner(e, child)
 	return est
@@ -1482,12 +1657,26 @@ func isFalseMCVValue(v string) bool {
 
 func boolTestSelectivityInner(e *IsBoolExpr, child Node) (float64, bool) {
 	cr, ok := e.Operand.(*ColumnRef)
-	if !ok {
-		return defaultGenericSelectivity, false
+	var cs *catalog.ColumnStats
+	if ok {
+		cs = columnStatsForChild(cr.Index, child)
 	}
-	cs := columnStatsForChild(cr.Index, child)
 	if cs == nil {
-		return defaultGenericSelectivity, false
+		// booltestsel without statistics (M0148-0001c3a5 (d)): IS
+		// [NOT] UNKNOWN take the fixed defaults; IS TRUE / IS NOT FALSE
+		// are the argument's own clause selectivity (boolvarsel's 0.5 for a
+		// bare column), IS FALSE / IS NOT TRUE its complement.
+		switch boolTestKind(e) {
+		// A default, not a statistic: reported unreliable.
+		case "unknown":
+			return defaultUnknownSel, false
+		case "notunknown":
+			return 1 - defaultUnknownSel, false
+		case "true", "notfalse":
+			return clampProbability(clauseSelectivity(e.Operand, child)), false
+		default:
+			return clampProbability(1 - clauseSelectivity(e.Operand, child)), false
+		}
 	}
 	freqNull := cs.NullFrac
 	if freqNull < 0 {
@@ -1578,3 +1767,19 @@ func nullTestSelectivity(e *IsNullExpr, child Node) float64 {
 	}
 	return freqNull
 }
+
+// defaultUnknownSel is DEFAULT_UNK_SEL (selfuncs.h): `x IS UNKNOWN` without
+// statistics.
+const defaultUnknownSel = 0.005
+
+// boolVarSelectivity is boolvarsel (selfuncs.c): with statistics a boolean
+// column V is V = true (var_eq_const, the TRUE mass booltestsel's IS TRUE
+// reads off the MCV / null fraction); without them the default is 0.5.
+func boolVarSelectivity(cr *ColumnRef, child Node) float64 {
+	if columnStatsForChild(cr.Index, child) == nil {
+		return 0.5
+	}
+	sel, _ := boolTestSelectivityInner(&IsBoolExpr{pos: cr.pos, Operand: cr, TestTrue: true}, child)
+	return sel
+}
+

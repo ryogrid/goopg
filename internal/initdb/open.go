@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,6 +34,11 @@ import (
 // production entry point that constructs the four together against
 // a real data directory.
 type Runtime struct {
+	// RecoveredPrepared are the prepared transactions restored at startup
+	// (pg_twophase files and PREPARE records after redo), still waiting for
+	// COMMIT PREPARED or ROLLBACK PREPARED. M0149-0015a.
+	RecoveredPrepared []RecoveredPrepared
+
 	StorageMgr *storage.Manager
 	Pool       *storage.Pool
 	TxnMgr     *transam.Manager
@@ -108,6 +114,26 @@ type Runtime struct {
 	// immediate`), mirroring upstream's immediate (SIGQUIT) shutdown.
 	// (M0110-0004 / RW-002 b.)
 	immediateShutdown bool
+	// shutdownCheckpointDone records that ShutdownCheckpoint already wrote
+	// the final checkpoint, so Close does not write a second one.
+	shutdownCheckpointDone bool
+}
+
+// ShutdownCheckpoint writes the final shutdown checkpoint while the
+// walsenders are still connected, as PG's postmaster does: the checkpointer
+// writes it in PM_SHUTDOWN and only then do the walsenders send the rest of
+// the WAL — the checkpoint included — and exit (PM_SHUTDOWN_2, WalSndDone).
+// A standby so ends on the shutdown checkpoint, and the old primary can later
+// follow it on a new timeline. Close then skips its own (M0149-0015).
+func (r *Runtime) ShutdownCheckpoint() {
+	if r == nil || r.Checkpointer == nil || r.immediateShutdown || r.shutdownCheckpointDone {
+		return
+	}
+	if err := r.Checkpointer.CheckpointShutdown(); err != nil {
+		slog.Default().Warn("final shutdown checkpoint failed", "err", err,
+			"note", "data files may not be fully durable on disk")
+	}
+	r.shutdownCheckpointDone = true
 }
 
 // SetImmediateShutdown marks the runtime so the next Close() skips its
@@ -354,12 +380,39 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		features := readGoopgFeatures(abs)
 		catalog.SetNullKeyedIndexEntries(features[catalog.NullKeyedIndexEntriesFeature])
 		storage.SetHeapLinePointerLifecycle(features[storage.HeapLinePointerLifecycleFeature])
+		catalog.SetFixedLengthGeoTid(features[catalog.FixedLengthGeoTidFeature])
+		catalog.SetFixedLengthMoney(features[catalog.FixedLengthMoneyFeature])
+		catalog.SetFixedLengthAclItem(features[catalog.FixedLengthAclItemFeature])
 	}
 	if err != nil {
 		return nil, fmt.Errorf("goopg: resolve %q: %w", opts.DataDir, err)
 	}
 	if err := verifyInitialized(abs); err != nil {
 		return nil, err
+	}
+	// wal_segment_size comes from pg_control's xlog_seg_size
+	// (ReadControlFile), as initdb --wal-segsize recorded it (M0149-0022a).
+	if cd, cerr := control.ReadControlFile(abs); cerr == nil && cd != nil {
+		xlog.SetWALSegmentSize(int64(cd.XLogSegSize))
+	}
+	if opts.WALSegmentSize <= 0 {
+		opts.WALSegmentSize = xlog.WALSegmentSize()
+	}
+	// M0149-0001a1 S1: consolidate the postgres namespace's base/1 relation
+	// files into base/5 before any relation is opened or WAL replayed.
+	if err := migratePostgresCatalogsToBase5(abs); err != nil {
+		return nil, err
+	}
+	// M0149-0001a1 S3: template1 moves from base/2 to base/1 (namespace OIDs
+	// now equal PostgreSQL's database OIDs). Records of the WAL that existed
+	// when the migration started are replayed with the pre-S3 mapping; the
+	// copy runs after them (layout_template1_base1.go).
+	legacyLayoutWALEnd, template1MigrationPending, err := prepareTemplate1Migration(abs)
+	if err != nil {
+		return nil, err
+	}
+	if template1MigrationPending {
+		xlog.SetLegacyLayoutWALEnd(legacyLayoutWALEnd, func() error { return copyTemplate1ToBase1(abs) })
 	}
 
 	slots := opts.PoolSlots
@@ -462,9 +515,113 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// instead of being reconstructed by scanning the stream for a record
 	// goopg's own isCheckpointRecord recognises. The scan survives as the
 	// fallback for redo == 0 (fresh cluster / no control file).
+	// M0149-0003: StartupXLOG resets unlogged relations around redo when it
+	// is in recovery: ResetUnloggedRelations(UNLOGGED_RELATION_CLEANUP)
+	// removes every fork but _init before the first record replays, and
+	// UNLOGGED_RELATION_INIT copies each _init over its main fork once redo
+	// is done (storage/file/reinit.c).
+	// M0149-0006a: PostmasterMain's RemovePgTempFiles (storage/file/fd.c)
+	// deletes every temporary relation's file at startup; no backend that
+	// could use one survives a restart.
+	if abs != "" {
+		storage.RemovePgTempRelationFiles(abs)
+	}
+	// M0149-0007: StartupXLOG's pgstat_discard_stats / pgstat_restore_stats
+	// — a crash throws the cumulative statistics away, a clean start loads
+	// pg_stat/pgstat.stat (and removes it).
+	if abs != "" {
+		if recov.crashRecovery {
+			executor.DiscardPgStatFile(abs)
+		} else {
+			executor.RestorePgStatFile(abs)
+		}
+	}
+	inRecovery := abs != "" && (recov.crashRecovery || startStandby || startRecovery)
+	if inRecovery {
+		if err := storage.ResetUnloggedRelations(abs, storage.UnloggedRelationCleanup); err != nil {
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: reset unlogged relations (cleanup): %w", err)
+		}
+	}
+	// M0149-0017a: crash recovery that ends inside a record whose
+	// continuation never reached disk writes XLOG_OVERWRITE_CONTRECORD where
+	// the continuation should have begun, and WAL continues from there
+	// (xlog.c StartupXLOG: EndOfLog = missingContrecPtr,
+	// CreateOverwriteContrecordRecord). Not under archive recovery or as a
+	// standby (xlogrecovery.c). Written before replay: replay stops at the
+	// incomplete record either way, and the segment run stays contiguous for
+	// the reader and the WAL writer's resume scan.
+	//
+	// A standby's local WAL ends at a missing segment the same way: it
+	// replays up to the hole and streams the rest from the primary, whose WAL
+	// overwrites whatever stale files sit past the hole (026's cold copy has
+	// a pre-allocated segment there, and the standby started replay in it).
+	if abs != "" && (recov.crashRecovery || startStandby) && !startRecovery {
+		walDir := filepath.Join(abs, "pg_wal")
+		if removed, rerr := xlog.RemoveSegmentsAfterGap(walDir, opts.WALSegmentSize, recov.redoLSN); rerr != nil {
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: end of WAL at a missing segment: %w", rerr)
+		} else if len(removed) > 0 {
+			slog.Default().Info("WAL ends at a missing segment after the redo point; removed the segments past it", "removed", removed)
+		}
+	}
+	// The end-of-WAL message is xlogreader.c's error for the WAL as it was
+	// read during replay — before any overwrite record repairs the stream
+	// (StartupXLOG writes it only after recovery ends). Compute it first.
+	endOfWALMsg := ""
+	if abs != "" && recov.crashRecovery {
+		endOfWALMsg = xlog.PGEndOfWALMessage(filepath.Join(abs, "pg_wal"), 0)
+	}
+	if abs != "" && recov.crashRecovery && !startStandby && !startRecovery {
+		walDir := filepath.Join(abs, "pg_wal")
+		if mc, ok, ferr := xlog.FindMissingContrecord(walDir, opts.WALSegmentSize, recov.redoLSN); ferr != nil {
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: find missing contrecord: %w", ferr)
+		} else if ok {
+			if _, werr := xlog.WriteOverwriteContrecord(walDir, opts.WALSegmentSize, mc, xlog.TimestampTzNow()); werr != nil {
+				_ = mgr.Close()
+				return nil, fmt.Errorf("goopg: write overwrite contrecord: %w", werr)
+			}
+			slog.Default().Info(fmt.Sprintf("wrote XLOG_OVERWRITE_CONTRECORD at %X/%X for the missing continuation of the record at %X/%X",
+				uint32(mc.MissingContrecPtr>>32), uint32(mc.MissingContrecPtr), uint32(mc.AbortedRecPtr>>32), uint32(mc.AbortedRecPtr)))
+		}
+	}
 	if _, err := xlog.ReplayFromDirWithMgrAtInterruptible(mgr, filepath.Join(abs, "pg_wal"), 0, recov.redoLSN, opts.Interrupted); err != nil {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: wal replay: %w", err)
+	}
+	// M0149-0076: crash recovery ends where the WAL stops decoding, and
+	// PostgreSQL logs xlogreader.c's reason at LOG ("invalid record length at
+	// 0/...: expected at least 24, got 0" for an ordinary zero tail).
+	if recov.crashRecovery && endOfWALMsg != "" {
+		slog.Default().Info(endOfWALMsg)
+	}
+	// A standby keeps replaying; PG runs the init pass when recovery ends
+	// (promotion), which this startup path does not reach.
+	if inRecovery && !startStandby {
+		if err := mgr.CloseAllRelations(); err != nil {
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: reset unlogged relations: %w", err)
+		}
+		if err := storage.ResetUnloggedRelations(abs, storage.UnloggedRelationInit); err != nil {
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: reset unlogged relations (init): %w", err)
+		}
+	}
+	xlog.SetLegacyLayoutWALEnd(0, nil)
+	if template1MigrationPending {
+		if err := copyTemplate1ToBase1(abs); err != nil {
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: %w", err)
+		}
+		if !recov.crashRecovery {
+			// Clean start: no WAL past the checkpoint, so nothing to cover.
+			if err := finishTemplate1Migration(abs); err != nil {
+				_ = mgr.Close()
+				return nil, fmt.Errorf("goopg: %w", err)
+			}
+			template1MigrationPending = false
+		}
 	}
 
 	// Load (or generate) the cluster system identifier for WAL page headers.
@@ -492,6 +649,20 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// timeline_id. Skip in standby mode — finalizePromotion handles the bump.
 	if abs != "" {
 		isStby, _ := IsStandby(abs)
+		if isStby {
+			// A standby resumes on the newest timeline its own pg_wal
+			// carries (recovery_target_timeline = latest): after streaming
+			// onto the primary's new timeline, its next start must replay
+			// and write there, or a later promotion copies the switch
+			// segment's prefix from the older timeline's file (M0149-0016).
+			if t := xlog.LatestLocalTimeline(filepath.Join(abs, "pg_wal"), tli); t > tli {
+				if err := WriteTimelineID(abs, t); err != nil {
+					_ = mgr.Close()
+					return nil, fmt.Errorf("goopg: adopt standby timeline %d: %w", t, err)
+				}
+				tli = t
+			}
+		}
 		if !isStby {
 			walDir := filepath.Join(abs, "pg_wal")
 			if newTLI, wrote, tliErr := xlog.WriteHistoryAfterRecovery(walDir, tli, 0); tliErr != nil {
@@ -766,11 +937,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	// M0080-0001: heap-freeze logical record.
-	logHeapFreeze := func(rel storage.RelFileNode, blk storage.BlockNumber, frozenSlots []uint16) (storage.LSN, error) {
-		// A7: emit a PostgreSQL xl_heap_prune (RM_HEAP2) record with a single
-		// freeze plan covering all frozen slots. Recovery routes it to
+	logHeapFreeze := func(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page, frozenSlots []uint16) (storage.LSN, error) {
+		// A7: emit a PostgreSQL xl_heap_prune (RM_HEAP2) record whose freeze
+		// plans carry the frozen tuples' headers. Recovery routes it to
 		// replayDecodedXLogHeapPrune (PageFreezeBySlots).
-		payload, err := xlog.EncodeHeapFreezePG(rel, blk, frozenSlots)
+		payload, err := xlog.EncodeHeapFreezePG(rel, blk, page, frozenSlots)
 		if err != nil {
 			return 0, err
 		}
@@ -874,6 +1045,21 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return err
 	}
 
+	// M0149-0002: a relation tail truncation (VACUUM's lazy_truncate_heap) is
+	// RelationTruncate's XLOG_SMGR_TRUNCATE, flushed before the file shrinks
+	// so replay never meets pages the file no longer has.
+	logSmgrTruncateTo := func(rel storage.RelFileNode, keep storage.BlockNumber) error {
+		payload, err := xlog.EncodeSmgrTruncatePG(rel, keep, xlog.SmgrTruncateAll, storage.InvalidTransactionID)
+		if err != nil {
+			return err
+		}
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return err
+		}
+		return walWriter.FlushUpTo(end)
+	}
+
 	// Generic catalog-DDL WAL append (M0079-0001). The executor's
 	// CREATE / DROP INDEX paths use this to emit pre-encoded
 	// `RecordKindCreateIndex` / `RecordKindDropIndex` records
@@ -913,6 +1099,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogHeapPruneOpt:          logHeapPruneOpt,
 		LogHeapVacuumCleanup:     logHeapVacuumCleanup,
 		LogSmgrCreate:            logSmgrCreate,
+		LogSmgrTruncateTo:        logSmgrTruncateTo,
 		LogChangeRecord:          logChangeRecord,
 		FullPageWrites:           true,
 	})
@@ -1123,6 +1310,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// Installed on this catalog instance, not process-wide: a test binary
 	// starts several servers and each must see its own storage.
 	cat.SetRelationSizer(func(rfn storage.RelFileNode) (int64, bool) {
+		// A relation without storage (a function scan's or VALUES'
+		// pseudo-table, OID 0) has no file; NBlocks would create base/<db>/0
+		// through the smgr's O_CREATE open (018_wal_optimize
+		// check_orphan_relfilenodes). M0149-0006.
+		if rfn.RelOid == 0 {
+			return 0, false
+		}
 		n, err := pool.NBlocks(rfn)
 		if err != nil {
 			return 0, false
@@ -1130,6 +1324,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return int64(n), true
 	})
 	txnMgr := transam.NewManager()
+	txnMgr.SetTwoPhaseDir(filepath.Join(abs, transam.TwoPhaseDirName))
+	var recoveredPrepared []RecoveredPrepared
 	// M0130-S11.5d-3c: b-tree page deletion's recycle horizon. `next` is
 	// upstream's ReadNextFullTransactionId (stamped into the deleted page as
 	// its BTDeletedPageData.safexid); `oldestVisible` is the boundary
@@ -1260,21 +1456,41 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// (GetCurrentTransactionStopTimestamp), taken as its end record is
 		// written.
 		stopTime := xlog.TimestampTzNow()
+		finishedPrepared := false
+		var finishedSubs []storage.TransactionID
 		switch kind {
 		case transam.XactCommit:
 			// The relations the transaction dropped go into the commit record
 			// (XACT_XINFO_HAS_RELFILELOCATORS); their files are removed once
 			// the record is written (transam pending_rel_delete.go).
 			dropped := txnMgr.PendingRelDeletes(xid)
+			// The committed subtransactions go into the record
+			// (XACT_XINFO_HAS_SUBXACTS), so replay stamps them committed with
+			// their parent (TransactionIdCommitTree). Without them, catalog
+			// rows an ALTER wrote inside a SAVEPOINT were lost after a crash.
+			// M0149-0006.
 			// If the transaction wrote to a nailed catalog relation (pg_class,
 			// pg_attribute, pg_proc, or pg_type), emit a commit-with-inval
 			// record and unlink both pg_internal.init files so the next backend
 			// reloads fresh relcache descriptors. Mirrors PG's commit-path
 			// AtEOXact_Inval → RelationCacheInitFilePreInvalidate sequence.
 			// M0106-0010 batched-31.
+			// A prepared transaction finishes with COMMIT PREPARED: the
+			// record names it in xl_xact_twophase (RecordTransactionCommitPrepared).
+			prepEntry, twoPhase := txnMgr.TakeTwoPhaseEntry(xid)
+			finishedPrepared = twoPhase
+			commitSubs := txnMgr.SubxidsOf(xid, true)
+			if twoPhase {
+				commitSubs = mergeSubxids(prepEntry.Subxacts, commitSubs)
+				finishedSubs = commitSubs
+			}
 			if txnMgr.TakeRelcacheInvalPending() {
 				// A6: PG xl_xact_commit with HAS_INVALS (xid in the header).
-				payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, nil, dropped, true)
+				if twoPhase {
+					payload, perr = xlog.EncodeXactCommitPreparedPGAt(stopTime, xid, commitSubs, dropped, true)
+				} else {
+					payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, true)
+				}
 				_ = catalog.WithRelCacheInitLock(func() error {
 					if err := catalog.RelcacheInitFileUnlink(abs, catalog.DefaultDBOid); err != nil {
 						return err
@@ -1291,13 +1507,22 @@ func Open(opts OpenOptions) (*Runtime, error) {
 					// M0106-0010 batched-35.
 					return bootstrapRelcacheInitFiles(abs)
 				})
+			} else if twoPhase {
+				payload, perr = xlog.EncodeXactCommitPreparedPGAt(stopTime, xid, commitSubs, dropped, false)
 			} else {
-				payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, nil, dropped, false)
+				payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, false)
 			}
 		case transam.XactAbort:
 			// The relations the transaction created go into the abort record;
 			// their files are removed once it is written (XactLogAbortRecord).
-			payload, perr = xlog.EncodeXactAbortPGWithRelsAt(stopTime, xid, nil, txnMgr.PendingAbortRelDeletes(xid))
+			// A prepared transaction finishes with ABORT PREPARED.
+			if prepEntry, ok := txnMgr.TakeTwoPhaseEntry(xid); ok {
+				finishedPrepared = true
+				finishedSubs = mergeSubxids(prepEntry.Subxacts, txnMgr.SubxidsOf(xid, false))
+				payload, perr = xlog.EncodeXactAbortPreparedPGAt(stopTime, xid, finishedSubs, txnMgr.PendingAbortRelDeletes(xid))
+			} else {
+				payload, perr = xlog.EncodeXactAbortPGWithRelsAt(stopTime, xid, txnMgr.SubxidsOf(xid, false), txnMgr.PendingAbortRelDeletes(xid))
+			}
 		default:
 			return fmt.Errorf("goopg: unknown xact marker %v", kind)
 		}
@@ -1368,6 +1593,21 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// Persist commit/abort status in clog (M0030-0007). Non-fatal: the
 		// WAL XactCommit record is the primary durability mechanism (or, for
 		// an async commit, the CLOG write barrier — see above).
+		// RecordTransactionCommitPrepared / AbortPrepared stamp the whole
+		// tree (TransactionIdCommitTree / AbortTree): a prepared
+		// transaction's children were kept out of the startup sweep while it
+		// was prepared, and a restored one has no live subtransaction
+		// tracking to fall back on, so they get their clog status here
+		// (M0149-0016a).
+		if finishedPrepared {
+			for _, sub := range finishedSubs {
+				if kind == transam.XactCommit {
+					_ = clog.SetCommittedWithLSN(sub, endLSN)
+				} else {
+					_ = clog.SetAborted(sub)
+				}
+			}
+		}
 		switch kind {
 		case transam.XactCommit:
 			// C2 (S2..S4): sync and async commits stamp identically —
@@ -1380,6 +1620,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			_ = clog.SetCommittedWithLSN(xid, endLSN)
 		case transam.XactAbort:
 			_ = clog.SetAborted(xid)
+		}
+		// FinishPreparedTransaction: the state file goes once the
+		// COMMIT/ABORT PREPARED record is written (RemoveTwoPhaseFile).
+		if finishedPrepared {
+			txnMgr.RemoveTwoPhaseFile(xid)
 		}
 		return nil
 	})
@@ -1473,6 +1718,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			_ = mgr.Close()
 			return nil, fmt.Errorf("goopg: clog replay from WAL: %w", rerr)
 		}
+		// restoreTwoPhaseData + the PREPARE records after redo: prepared
+		// transactions come back in progress before the sweep below, which
+		// must not abort them (M0149-0015a).
+		sb, _ := IsStandby(abs)
+		restored, terr := restoreTwoPhaseData(abs, txnMgr, sb)
+		if terr != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: restore prepared transactions: %w", terr)
+		}
+		recoveredPrepared = restored
 		// (M0106-0011) Crash-recovery implicit abort: WAL replay
 		// restored the on-disk pg_class / pg_attribute heap pages,
 		// but the JSON catalog snapshot at last clean shutdown does
@@ -1500,7 +1757,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		if highXID >= txnMgr.NextXID() {
 			txnMgr.SetNextXID(highXID + 1)
 		}
-		if aerr := clog.MarkUnknownAsAborted(txnMgr.NextXID()); aerr != nil {
+		if aerr := clog.MarkUnknownAsAbortedExcept(txnMgr.NextXID(), txnMgr.IsPreparedXID); aerr != nil {
 			_ = pool.Close()
 			_ = walWriter.Close()
 			_ = mgr.Close()
@@ -1808,6 +2065,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			return nil, fmt.Errorf("goopg: sequence heap reload: %w", err)
 		}
 	}
+	// M0149-0003: the reloaded UNLOGGED relations write without WAL again
+	// (RelationNeedsWAL), as they did before the restart.
+	if cat != nil {
+		for _, rel := range cat.UnloggedRelFileNodes() {
+			pool.SetRelUnlogged(rel, true)
+		}
+	}
 
 	// B5 Slice B: column DEFAULT persistence via real pg_attrdef HEAP rows
 	// (base/<dbOid>/2604), replacing the retired goopg-private
@@ -2059,6 +2323,9 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// honour a logical decoder's catalog-tuple retention. See
 	// docs/design/0008-0001-logical-decoding-pipeline.md.
 	txnMgr.SetCatalogXminSource(slotsReg.MinCatalogXmin)
+	// Physical slots' hot_standby_feedback xmin floors every xid horizon
+	// (PG's replication_slot_xmin). M0149-0077i.
+	txnMgr.SetReplicationSlotXminSource(slotsReg.MinXmin)
 
 	// Replication monitoring registries. Senders are registered by
 	// each walsender goroutine on entry; the (single) Receivers
@@ -2267,6 +2534,35 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// a debugger. Column shape mirrors PG 18.x's view; the
 	// upstream-aligned columns we don't track in v0 (restartpoints*,
 	// buffers_written, slru_written) report literal 0.
+	// M0149-0007: the checkpointer's chunk of pg_stat/pgstat.stat — restored
+	// counters, the snapshot written at shutdown, and
+	// pg_stat_reset_shared('checkpointer').
+	if rs, ok := executor.RestoredCheckpointerStats(); ok {
+		cp.RestoreStats(xlog.Stats{
+			NumTimed:     uint64(rs.NumTimed),
+			NumRequested: uint64(rs.NumRequested),
+			NumDone:      uint64(rs.NumPerformed),
+			WriteTimeMs:  uint64(rs.WriteTime),
+			StatsResetAt: rs.StatResetTimestamp,
+		})
+	}
+	executor.PgStatCheckpointerSnapshot = func() executor.PgStatCheckpointer {
+		st := cp.Stats()
+		return executor.PgStatCheckpointer{
+			NumTimed:           int64(st.NumTimed),
+			NumRequested:       int64(st.NumRequested),
+			NumPerformed:       int64(st.NumDone),
+			WriteTime:          int64(st.WriteTimeMs),
+			StatResetTimestamp: st.StatsResetAt,
+		}
+	}
+	executor.PgStatResetCheckpointer = cp.ResetStats
+	installPgStatWal(cat, walWriter)
+	// The startup process's WAL reads (pg_stat_io startup/wal/normal): the
+	// pages from the redo point to the end of WAL. M0149-0007.
+	if abs != "" {
+		executor.RecordStartupWALReads(recov.redoLSN, walWriter.WrittenLSN())
+	}
 	if err := registerStatCheckpointerView(cat, cp); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
@@ -2277,6 +2573,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// the in-process Senders registry — walsender goroutines
 	// register themselves on entry and unregister on exit.
 	if err := registerStatReplicationView(cat, walSenders, walWriter, syncRep); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
+	// pg_prepared_xacts over the prepared-transaction registry (M0149-0016).
+	if err := registerPreparedXactsView(cat, txnMgr); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
@@ -2816,6 +3119,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// The promotion leaves recovery mode before its end-of-recovery
 	// checkpoint.
 	cp.SetRecoveryMode(standby || recovery)
+	cp.SetTwoPhaseCheckpointFn(txnMgr.CheckPointTwoPhase)
 
 	rt := &Runtime{
 		StorageMgr:     mgr,
@@ -2839,6 +3143,9 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		FSM:            storage.NewFSM(),
 		VM:             vm,
 	}
+	rt.RecoveredPrepared = recoveredPrepared
+	// M0149-0010b: FSM fork files carry pd_checksum on a checksummed cluster.
+	rt.FSM.SetChecksums(checksumsEnabled)
 
 	// M0130-S1: load persistent Visibility Map state from per-relation
 	// _vm fork files if present. A missing
@@ -3069,7 +3376,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// recovered cluster rather than the pre-crash one. No-op for a clean
 	// start (the common path pays nothing).
 	if recov.crashRecovery {
-		endOfRecoveryCheckpoint(rt.Checkpointer, abs)
+		if endOfRecoveryCheckpoint(rt.Checkpointer, abs) && template1MigrationPending {
+			// M0149-0001a1 S3: the checkpoint covers the copied template1.
+			if err := finishTemplate1Migration(abs); err != nil {
+				slog.Warn("template1 layout migration not finished; it resumes at the next start", "err", err)
+			}
+		}
 	}
 
 	// M0131-S17: the cluster is now live — say so in pg_control BEFORE the
@@ -3331,21 +3643,24 @@ func (a walAIOHandleAdapter) Wait() (int, error) {
 // `pg_catalog.pg_stat_checkpointer` virtual table backed by
 // `Checkpointer.Stats`. Column ordering matches upstream PG 18.x.
 func registerStatCheckpointerView(cat *catalog.InMemory, cp *xlog.Checkpointer) error {
+	// Column names and types follow system_views.sql's pg_stat_checkpointer
+	// (PG 18): bigint counters, double precision times in milliseconds, and a
+	// timestamptz stats_reset. M0149-0007.
 	tbl := &catalog.Table{
 		Schema: "pg_catalog",
 		Name:   "pg_stat_checkpointer",
 		Columns: []catalog.Column{
-			{Name: "num_timed", Type: catalog.Type{Name: "text"}},
-			{Name: "num_requested", Type: catalog.Type{Name: "text"}},
-			{Name: "restartpoints_timed", Type: catalog.Type{Name: "text"}},
-			{Name: "restartpoints_req", Type: catalog.Type{Name: "text"}},
-			{Name: "restartpoints_done", Type: catalog.Type{Name: "text"}},
-			{Name: "write_time", Type: catalog.Type{Name: "text"}},
-			{Name: "sync_time", Type: catalog.Type{Name: "text"}},
-			{Name: "total_time", Type: catalog.Type{Name: "text"}},
-			{Name: "buffers_written", Type: catalog.Type{Name: "text"}},
-			{Name: "slru_written", Type: catalog.Type{Name: "text"}},
-			{Name: "stats_reset", Type: catalog.Type{Name: "text"}},
+			{Name: "num_timed", Type: catalog.Type{Name: "int8"}},
+			{Name: "num_requested", Type: catalog.Type{Name: "int8"}},
+			{Name: "num_done", Type: catalog.Type{Name: "int8"}},
+			{Name: "restartpoints_timed", Type: catalog.Type{Name: "int8"}},
+			{Name: "restartpoints_req", Type: catalog.Type{Name: "int8"}},
+			{Name: "restartpoints_done", Type: catalog.Type{Name: "int8"}},
+			{Name: "write_time", Type: catalog.Type{Name: "float8"}},
+			{Name: "sync_time", Type: catalog.Type{Name: "float8"}},
+			{Name: "buffers_written", Type: catalog.Type{Name: "int8"}},
+			{Name: "slru_written", Type: catalog.Type{Name: "int8"}},
+			{Name: "stats_reset", Type: catalog.Type{Name: "timestamptz"}},
 		},
 		Virtual: true,
 	}
@@ -3354,15 +3669,15 @@ func registerStatCheckpointerView(cat *catalog.InMemory, cp *xlog.Checkpointer) 
 		return [][]string{{
 			fmt.Sprintf("%d", s.NumTimed),
 			fmt.Sprintf("%d", s.NumRequested),
-			"0", // restartpoints_timed (no replication in v0)
+			fmt.Sprintf("%d", s.NumDone),
+			"0", // restartpoints_timed (restartpoints are counted in num_requested)
 			"0", // restartpoints_req
 			"0", // restartpoints_done
 			fmt.Sprintf("%d", s.WriteTimeMs),
-			"0", // sync_time (not separated from write_time in v0)
-			fmt.Sprintf("%d", s.WriteTimeMs),
+			"0", // sync_time (not separated from write_time)
 			"0", // buffers_written (per-checkpoint counter not yet wired)
 			"0", // slru_written
-			s.StatsResetAt.UTC().Format("2006-01-02 15:04:05.000-07"),
+			s.StatsResetAt.UTC().Format("2006-01-02 15:04:05.999999-07"),
 		}}
 	}
 	return cat.RegisterVirtualTable(tbl)
@@ -3446,6 +3761,38 @@ func loadSystemCatalogsIfPresentForDB(dataDir string, cat *catalog.InMemory, hea
 		}
 		if err := cat.RegisterRealTable(t, nsDBOid); err != nil {
 			return fmt.Errorf("register pg_attribute (db %d): %w", nsDBOid, err)
+		}
+	}
+
+	// pg_largeobject_metadata (OID 2995) — large-object owner and ACL
+	// (M0149-0001h1a). A real MVCC heap like PG's, so lo_create / lo_unlink
+	// rows commit and roll back with their transaction and a PG node reads
+	// them; it replaces the empty virtual placeholder.
+	pgLOMetaFile := filepath.Join(base, fmt.Sprint(catalog.LargeObjectMetadataRelationId))
+	if heapFilePresent(pgLOMetaFile) {
+		t := &catalog.Table{
+			Schema:  "pg_catalog",
+			Name:    "pg_largeobject_metadata",
+			Columns: catalog.PGLargeObjectMetadataColumns(),
+			OID:     catalog.LargeObjectMetadataRelationId,
+		}
+		if err := cat.RegisterRealTable(t, nsDBOid); err != nil {
+			return fmt.Errorf("register pg_largeobject_metadata (db %d): %w", nsDBOid, err)
+		}
+	}
+
+	// pg_largeobject (OID 2613) — large-object data pages, a real MVCC heap
+	// like PG's (M0149-0001h1a slice 2).
+	pgLOFile := filepath.Join(base, fmt.Sprint(catalog.LargeObjectRelationId))
+	if heapFilePresent(pgLOFile) {
+		t := &catalog.Table{
+			Schema:  "pg_catalog",
+			Name:    "pg_largeobject",
+			Columns: catalog.PGLargeObjectColumns(),
+			OID:     catalog.LargeObjectRelationId,
+		}
+		if err := cat.RegisterRealTable(t, nsDBOid); err != nil {
+			return fmt.Errorf("register pg_largeobject (db %d): %w", nsDBOid, err)
 		}
 	}
 
@@ -3590,6 +3937,16 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *t
 // under CREATE DATABASE reloads into that database's namespace with its
 // data-file routing (Table.DBOid → base/<dbOid>/<relOid>) intact.
 func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid, nsDBOid uint32) error {
+	return loadUserTablesFromHeapForDBMode(mgr, cat, clog, heapDBOid, nsDBOid, false)
+}
+
+// loadUserTablesFromHeapForDBMode is loadUserTablesFromHeapForDB with
+// committedOnly: a running standby's refresh (RefreshCatalogAfterReplay) must
+// see a relation only once the transaction that created it has committed,
+// or a refresh between its pg_class and pg_attribute inserts would register
+// it without columns — and registration is idempotent, so it would stay that
+// way. Startup keeps the historical rules. M0149-0010b.
+func loadUserTablesFromHeapForDBMode(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid, nsDBOid uint32, committedOnly bool) error {
 	// B0.1: both scan passes ride the generic catalog-heap reload loop
 	// (catalog_heap_reload.go) — the per-tuple walk, xmin/xmax liveness and
 	// the M0030-0007/M0106-0010 CLOG rules (aborted-xmin filter for every
@@ -3632,12 +3989,17 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 					if reloptionsOrdinal < len(decoded) && !decoded[reloptionsOrdinal].IsNull() {
 						row.RelOptions = decoded[reloptionsOrdinal].StringValue()
 					}
+					// reltype (attnum 4): the rowtype CreateTable reserved.
+					// M0149-0001h1a34.
+					if len(decoded) > 3 && !decoded[3].IsNull() {
+						row.RelType = uint32(decoded[3].Int)
+					}
 				}
 			}
 			// Legacy-layout rows require a locally-committed xmin
 			// (requireCommittedXmin = !physicalRow); PG18-canonical rows
 			// keep the basebackup pass-through.
-			return recoveredPGClassRow{row: row, physical: physicalRow}, !physicalRow, nil
+			return recoveredPGClassRow{row: row, physical: physicalRow}, !physicalRow || committedOnly, nil
 		})
 	if err != nil {
 		return fmt.Errorf("loadUserTablesFromHeap: %w", err)
@@ -3676,14 +4038,20 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 	}
 	attrRows2, err := scanCatalogHeapRows(mgr, attrRel, clog, "pg_attribute",
 		func(ht storage.HeapTuple, _ storage.ItemPointer) (any, bool, error) {
-			row, err := catalog.DecodePGAttributeRow(ht.Data)
+			// PG-physical decoder first, as the executor's siblings
+			// (deleteCatalogRowsForOID and its attribute twin) do: the
+			// goopg logical decoder misreads a PG-physical row whose
+			// attrelid's first byte is 0x00 as its null-flag prefix and
+			// returns garbage without an error — a PG primary's column
+			// then vanished from a goopg standby's catalog. M0149-0010b.
+			row, err := catalog.DecodePGAttributePhysicalRow(ht.Data)
 			if err != nil {
-				row, err = catalog.DecodePGAttributePhysicalRow(ht.Data)
+				row, err = catalog.DecodePGAttributeRow(ht.Data)
 				if err != nil {
 					return nil, false, err
 				}
 			}
-			return row, false, nil
+			return row, committedOnly, nil
 		})
 	if err != nil {
 		return fmt.Errorf("loadUserTablesFromHeap: %w", err)
@@ -3795,6 +4163,10 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 		// reverted to defaults across every restart. M0119-0004.
 		if tr.RelOptions != "" {
 			catalog.ApplyTableReloptions(tbl, tr.RelOptions)
+		}
+		if tr.RelType >= catalog.FirstUserOID {
+			tbl.RowTypeOID = tr.RelType
+			cat.AdvanceNextOIDPast(tr.RelType)
 		}
 		if nsDBOid != 0 {
 			// Distinct-dbOid database (follow-up 39): register into the
@@ -3962,6 +4334,8 @@ func (r *Runtime) Close() error {
 		// upstream's immediate (SIGQUIT) shutdown. (M0110-0004 / RW-002 b.)
 		slog.Default().Info("immediate shutdown: skipping final checkpoint",
 			"note", "pg_control state left as it was; recovery on next start")
+	} else if r.Checkpointer != nil && r.shutdownCheckpointDone {
+		executor.WritePgStatFile(r.DataDir)
 	} else if r.Checkpointer != nil {
 		// Use the shutdown variant so pg_control's State lands on
 		// DB_SHUTDOWNED — this is the final durable checkpoint of a clean
@@ -3977,6 +4351,10 @@ func (r *Runtime) Close() error {
 				"note", "data files may not be fully durable on disk",
 			)
 		}
+		// M0149-0007: after the shutdown checkpoint the checkpointer writes
+		// the cumulative statistics (pgstat_before_server_shutdown →
+		// pgstat_write_statsfile).
+		executor.WritePgStatFile(r.DataDir)
 	}
 	// Stop the background page-writer before draining the pool (M0048-0003).
 	if r.bgwriter != nil {
@@ -4580,4 +4958,52 @@ func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 		cat.SetTableStats(tbl, stats)
 	}
 	return nil
+}
+
+// pgStatWalState is the WAL kind of the cumulative statistics: the counters
+// a clean shutdown saved (base) plus what this writer appended since startup
+// or the last pg_stat_reset_shared('wal') (live minus liveBase). M0149-0007.
+type pgStatWalState struct {
+	mu                         sync.Mutex
+	base                       executor.PgStatWal
+	liveBaseRecs, liveBaseByts int64
+}
+
+// installPgStatWal seeds the WAL stats from the restored chunk (or starts
+// them, with stats_reset now, after a crash or on a fresh cluster) and wires
+// pg_stat_wal, the shutdown snapshot and the reset.
+func installPgStatWal(cat *catalog.InMemory, w *xlog.Writer) {
+	st := &pgStatWalState{}
+	if rs, ok := executor.RestoredWalStats(); ok {
+		st.base = rs
+	}
+	if st.base.StatResetTimestamp.IsZero() {
+		st.base.StatResetTimestamp = time.Now()
+	}
+	st.liveBaseRecs, st.liveBaseByts = w.WalRecords(), w.WalBytes()
+	snapshot := func() executor.PgStatWal {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		out := st.base
+		out.Records += w.WalRecords() - st.liveBaseRecs
+		out.Bytes += w.WalBytes() - st.liveBaseByts
+		return out
+	}
+	executor.PgStatWalSnapshot = snapshot
+	executor.PgStatResetWal = func() {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		st.base = executor.PgStatWal{StatResetTimestamp: time.Now()}
+		st.liveBaseRecs, st.liveBaseByts = w.WalRecords(), w.WalBytes()
+	}
+	catalog.PgStatWalRowFunc = func() []string {
+		s := snapshot()
+		return []string{
+			strconv.FormatInt(s.Records, 10),
+			strconv.FormatInt(s.FPI, 10),
+			strconv.FormatInt(s.Bytes, 10),
+			strconv.FormatInt(s.BuffersFull, 10),
+			s.StatResetTimestamp.UTC().Format("2006-01-02 15:04:05.999999-07"),
+		}
+	}
 }

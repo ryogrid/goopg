@@ -144,7 +144,7 @@ func appendSysBtreePage(ctx *Context, rel storage.RelFileNode, page []byte) (uin
 
 // descendSysBtreeWithPath is descendSysBtreeToLeaf that also returns the
 // internal pages visited, root first (_bt_search's BTStack).
-func descendSysBtreeWithPath(ctx *Context, rel storage.RelFileNode, rootBlk uint32, level uint32, newKey []byte, cmp keyCompareFn) (uint32, []uint32, error) {
+func descendSysBtreeWithPath(ctx *Context, rel storage.RelFileNode, rootBlk uint32, level uint32, newKey []byte, cmp tupleCmpFn) (uint32, []uint32, error) {
 	var path []uint32
 	cur := rootBlk
 	for lvl := int(level); lvl >= 1; lvl-- {
@@ -161,7 +161,7 @@ func descendSysBtreeWithPath(ctx *Context, rel storage.RelFileNode, rootBlk uint
 			if len(it) <= sysIndexTupleHoff {
 				continue
 			}
-			if cmp(newKey, it[sysIndexTupleHoff:]) < 0 {
+			if cmp(newKey, it) < 0 {
 				break
 			}
 			next = decodeChildFromTID(it)
@@ -173,12 +173,18 @@ func descendSysBtreeWithPath(ctx *Context, rel storage.RelFileNode, rootBlk uint
 
 // insertSysBtreeMultiLevel inserts indexTuple into a multi-level catalog
 // btree, splitting the target leaf (and its ancestors) when it is full.
-func insertSysBtreeMultiLevel(ctx *Context, indexOID uint32, rel storage.RelFileNode, rootBlk, level uint32, indexTuple []byte, cmp keyCompareFn) error {
+// cmp compares NameData-layout keys; a non-nil conv says the index stores
+// cstring-layout keys (indexTuple is already in that layout).
+func insertSysBtreeMultiLevel(ctx *Context, indexOID uint32, rel storage.RelFileNode, rootBlk, level uint32, indexTuple []byte, cmp keyCompareFn, conv sysKeyConv) error {
 	meta, ok := keyMetaForSysBtree(indexOID)
 	if !ok {
 		return fmt.Errorf("split: unsupported system btree OID %d", indexOID)
 	}
-	leafBlk, path, err := descendSysBtreeWithPath(ctx, rel, rootBlk, level, indexTuple[sysIndexTupleHoff:], cmp)
+	descendCmp := pivotAwareCmp(indexOID, cmp, conv)
+	if conv != nil {
+		cmp = wrapCstringCmp(cmp, conv, int(meta.nkeyatts))
+	}
+	leafBlk, path, err := descendSysBtreeWithPath(ctx, rel, rootBlk, level, indexTuple[sysIndexTupleHoff:], descendCmp)
 	if err != nil {
 		return fmt.Errorf("descend: %w", err)
 	}

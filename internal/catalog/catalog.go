@@ -15,10 +15,14 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/parser/sqlkeywords"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/utils/activity"
+	"github.com/goopg/goopg/internal/utils/adt/datetime"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // Errors returned by database registration helpers (M0054-0001).
@@ -615,6 +619,12 @@ type Table struct {
 	Name    string
 	Columns []Column
 	OID     uint32
+	// RowTypeOID is pg_class.reltype: the relation's composite rowtype, whose
+	// array type is RowTypeOID-1. heap_create_with_catalog allocates the
+	// relation OID N, the array type N+1 (AssignTypeArrayOid) and the rowtype
+	// N+2 (AddNewRelationType); CreateTable does the same. 0 for a sequence
+	// and for a relation created before M0149-0001h1a34.
+	RowTypeOID uint32
 	// RelFileNodeOID overrides the on-disk relfile identity when it differs
 	// from the catalog OID. PostgreSQL physical backups use relfilenode for
 	// storage paths; when zero, goopg falls back to OID (its native layout).
@@ -1393,7 +1403,10 @@ func TableRelkind(t *Table) string {
 		return "v"
 	case t.IsMatView:
 		return "m"
-	case t.PartitionMethod != "" && t.PartitionParentOID == 0:
+	case t.PartitionMethod != "":
+		// A sub-partitioned table (PARTITION OF parent ... PARTITION BY) is
+		// RELKIND_PARTITIONED_TABLE too; PartitionMethod is only ever set from
+		// the table's own PARTITION BY clause. M0149-0001h1a28.
 		return "p"
 	case t.ForeignServerName != "":
 		return "f"
@@ -1410,7 +1423,9 @@ func (c *InMemory) IndexRelkind(idx *Index) string {
 	if len(c.indexPartitionChildren[idx.OID]) > 0 {
 		return "I"
 	}
-	return "i"
+	// An index on a partitioned table is 'I' before any child attaches
+	// (package-level IndexRelkind). M0149-0001h1a28.
+	return IndexRelkind(idx)
 }
 
 // RelfilenodeForRelkind renders the pg_class.relfilenode cell for a relation of
@@ -2870,6 +2885,11 @@ type InMemory struct {
 	namespaces map[uint32]*tableNamespace
 	nextOID    uint32
 	dbOid      uint32
+
+	// nextSystemViewOID counts down from FirstUserOID-1 for goopg-only
+	// system views (RegisterVirtualTable, M0149-0077f).
+	nextSystemViewOID uint32
+
 	// routines holds user-defined routines (M0015 Stage A step 2).
 	// Separate registry — not part of the table/index map space —
 	// so existing CRUD on those types stays untouched. Accessed
@@ -2916,21 +2936,18 @@ type InMemory struct {
 	// bootstrap postgres/template0/template1 rows) report 0 via DatabaseOid's
 	// comma-less lookup — pgDatabase.VirtualRows treats 0 as "no override,
 	// keep the legacy hardcoded placeholder", which is deliberate: the LIVE
-	// "postgres" database's displayed oid must stay the 16384 placeholder
-	// (see VirtualRows' own comment — CREATE SUBSCRIPTION's subdbid and the
-	// datacl heap resync both depend on it), and only a genuinely new
+	// "postgres" database displays PostgresDBOid (5) through
+	// databaseDisplayOID (M0149-0001a1 S2), and only a genuinely new
 	// CREATE DATABASE name is affected.
 	databaseOid map[string]uint32
 	// dbRoleSettings holds per-database `ALTER DATABASE name SET config =
 	// value` overrides (pg_db_role_setting, setrole=0 scope only — ALTER
 	// ROLE ... SET / ALTER ROLE ... IN DATABASE ... SET are a separate,
-	// unimplemented feature). Keyed by FirstUserOID (16384) — the SAME
-	// SQL-visible placeholder pg_database.VirtualRows displays for every
-	// non-template database (not c.DBOID(), the real on-disk physical OID
-	// used to key the datacl ACL store / heap resync: pg_db_role_setting is
-	// a pure virtual table with no heap to resync, and pg_dump's
-	// dumpDatabaseConfig cross-references setdatabase against the oid it
-	// already read from pg_database, so the two must agree). Each value is
+	// unimplemented feature). Keyed by PostgresDBOid (5) — the oid
+	// pg_database displays for the live postgres database (M0149-0001a1 S2;
+	// formerly the 16384 placeholder): pg_dump's dumpDatabaseConfig
+	// cross-references setdatabase against the oid it already read from
+	// pg_database, so the two must agree. Each value is
 	// an ordered list of "name=value" entries in PG's
 	// pg_db_role_setting.setconfig on-disk format (mirrors guc.c's
 	// flatten_set_variable_args output); SET replaces an existing
@@ -2943,9 +2960,9 @@ type InMemory struct {
 	// complement of dbRoleSettings' setrole=0 rows). Keyed by
 	// roleSettingKey{RoleOID, DBOid}: DBOid is 0 for a plain cluster-wide
 	// `ALTER ROLE ... SET` (setdatabase=0, applies in every database) or
-	// FirstUserOID for the `IN DATABASE` form scoped to goopg's single live
-	// database (mirrors dbRoleSettings' FirstUserOID keying — the same SQL
-	// -visible placeholder oid pg_database.VirtualRows displays). Entry
+	// PostgresDBOid for the `IN DATABASE` form scoped to goopg's single live
+	// database (mirrors dbRoleSettings' keying — the oid pg_database
+	// displays for postgres). Entry
 	// format matches dbRoleSettings (ordered "name=value" strings).
 	// M0119-0004-ACLHEAP (ALTER ROLE ... SET follow-up).
 	roleSettings map[roleSettingKey][]string
@@ -3247,6 +3264,12 @@ type InMemory struct {
 	// re-materializes the owner and clears the flag. Key: relOID → present.
 	// DU-002 slice 347.
 	relACLOwnerRevoked map[uint32]bool
+	// aclOwnerDisplay names the owner role an object's ACL renders when it is
+	// not the bootstrap superuser the ACL store assumes: schema public is
+	// owned by pg_database_owner (pg_namespace.dat). Grants recorded with the
+	// default grantor render it too — PG's select_best_grantor makes a
+	// superuser grant as the owner. M0149-0001g slice 23.
+	aclOwnerDisplay map[uint32]string
 
 	// attrACLs records column-level (pg_attribute.attacl) privileges granted to
 	// non-owner roles, keyed by (relOID, attnum) → lower-cased role name →
@@ -4340,10 +4363,13 @@ func IsSystemRelation(oid uint32) bool {
 	return oid < FirstUserOID
 }
 
-// DefaultDBOid is the v0 default database OID. Real multi-database
-// support (CREATE DATABASE) lives in milestone 7; until then every
-// catalog entry lives in this database.
-const DefaultDBOid uint32 = 1
+// DefaultDBOid is the catalog namespace of the `postgres` database — the
+// database every connection without a resolved database falls back to. Since
+// M0149-0001a1 S3 it equals PostgreSQL's postgres OID (PostgresDBOid, 5): a
+// namespace OID is the database's storage OID (base/<oid>), WAL dbOid and
+// displayed pg_database.oid. Before S3 it was the sentinel 1, which collided
+// with template1. Design: docs/design/0100-0149/0149-0001a1-database-oid-layout.md.
+const DefaultDBOid uint32 = 5
 
 // PostgresDBOid is the PG-canonical OID for the "postgres" database
 // (template_pg_database.h: Template1ObjectId=1, PostgresObjectId=5).
@@ -4355,19 +4381,13 @@ const DefaultDBOid uint32 = 1
 // CREATE TABLE sees the user-table row through its postgres-DB lens.
 const PostgresDBOid uint32 = 5
 
-// Template1NamespaceDBOid is template1's catalog-namespace AND storage oid
-// (base/2) — deliberately NOT its displayed pg_database.oid (1, rendered by
-// databaseDisplayOID). template1's real PostgreSQL oid 1 is also goopg's
-// DefaultDBOid sentinel, the namespace the postgres database reads and writes,
-// so a template1 connection used to share postgres' tables (a table created in
-// template1 was visible from postgres and vice versa, and pg_dumpall emitted
-// it under both). Owner decision 2026-09-25 (Option A): route template1 around
-// the sentinel to its own namespace; removing the sentinel (postgres at
-// namespace 5, one oid per database at every layer) is the real fix and stays
-// with M0122-0007 slices 4b-4e. 2 lies between the bootstrap oids (1, 4, 5)
-// and FirstUserOID, so no CREATE DATABASE can allocate it.
-// Design: docs/design/0100-0149/0119-0006bv-template1-namespace-collision.md.
-const Template1NamespaceDBOid uint32 = 2
+// Template1NamespaceDBOid is template1's catalog namespace, storage directory
+// (base/1) and pg_database.oid — PostgreSQL's Template1DbOid. Before
+// M0149-0001a1 S3 template1 was routed to namespace/storage 2 (owner Option A,
+// 2026-09-25, design 0119-0006bv) because 1 was postgres' namespace sentinel;
+// S3 made namespaces equal PostgreSQL's database OIDs and migrates an older
+// cluster's base/2 to base/1 at startup (initdb layout_template1_base1.go).
+const Template1NamespaceDBOid uint32 = 1
 
 // PgDatabaseRowOid maps a database's namespace/storage oid — what
 // ResolveDatabaseOid returns — to the oid of its pg_database row, which is
@@ -4559,6 +4579,7 @@ func NewInMemory() *InMemory {
 		roleACLDisplay:     make(map[string]string),
 		relACLEmptied:      make(map[uint32]bool),
 		relACLOwnerRevoked: make(map[uint32]bool),
+		aclOwnerDisplay:    map[uint32]string{publicSchemaOID: "pg_database_owner"},
 		attrACLs:           make(map[attrACLKey]map[string]map[string]bool),
 		attrACLOrder:       make(map[attrACLKey][]string),
 		attrACLGrantor:     make(map[attrACLKey]map[string]string),
@@ -4567,12 +4588,26 @@ func NewInMemory() *InMemory {
 		defaultACLOIDs:     make(map[defaultACLKey]uint32),
 		defaultACLKeys:     make(map[uint32]defaultACLKey),
 		defaultACLGlobal:   make(map[uint32]bool),
-		comments:           make(map[commentKey]string),
+		comments:           defaultInitdbComments(),
 		statisticsObjs:     make(map[string]*StatisticsObject),
 		extensions:         make(map[string]*extensionRow),
 		tablespaces:        make(map[string]*tablespaceRow),
 	}
+	// One OID counter for routines, relations and types (GetNewObjectId).
+	// M0148-0001j4.
+	c.routines.shareOIDCounter(c.AllocOID, c.AdvanceNextOIDPast)
 	c.registerSystemTables()
+	// initdb's setup_privileges() runs GRANT USAGE ON SCHEMA pg_catalog, public
+	// TO PUBLIC and information_schema.sql grants USAGE too, so a PG 18.3
+	// cluster's nspacl for pg_catalog / information_schema is {B=UC/B,=U/B},
+	// equal to their pg_init_privs rows; without the seed pg_dump diffs NULL
+	// against initprivs and emits REVOKE USAGE … FROM PUBLIC (M0149-0001g
+	// slice 22).
+	// public's ACL is {pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}
+	// (owner rendered through aclOwnerDisplay, slice 23).
+	for _, nsp := range []uint32{11, 13273, publicSchemaOID} {
+		c.GrantTablePrivilege(nsp, publicPseudoRole, "USAGE")
+	}
 	return c
 }
 
@@ -4974,6 +5009,59 @@ func (c *InMemory) SetComment(classoid, objoid uint32, objsubid int32, descripti
 }
 
 // GetComment retrieves a stored description, returning ("", false) when absent.
+// IsSharedCommentClass reports whether a comment on an object of classoid is
+// stored in pg_shdescription (a shared catalog) rather than the per-database
+// pg_description: databases (1262), roles (1260) and tablespaces (1213), the
+// classes CreateSharedComments handles (postgres/src/backend/commands/comment.c).
+func IsSharedCommentClass(classoid uint32) bool {
+	switch classoid {
+	case 1262, 1260, 1213:
+		return true
+	}
+	return false
+}
+
+// InitdbDescription is one pg_description / pg_shdescription row a PG 18.3
+// initdb leaves (objsubid is 0 for pg_shdescription, which has no such column).
+type InitdbDescription struct {
+	ObjOID, ClassOID uint32
+	ObjSubID         int32
+	Description      string
+}
+
+// defaultInitdbComments returns the comment store as PostgreSQL's initdb leaves
+// it: setup_description (postgres/src/bin/initdb/initdb.c) loads the
+// postgres.description / postgres.shdescription files — built-in functions,
+// operators, types, access methods, schemas, languages — plus the three
+// database descriptions, keyed by the objects' fixed OIDs. The rows are the
+// generated PGInitdbDescriptions / PGInitdbShdescriptions, the same tables
+// initdb writes to base/{1,5}/2609 and global/2396, so goopg's pg_description,
+// obj_description() and pg_dump's getComments agree with the on-disk catalog a
+// PG node reads. M0149-0001f (databases), M0149-0001g slice 23 (the rest). The
+// snowball text-search descriptions stay on disk only: goopg's SQL catalog has
+// no text-search objects.
+func defaultInitdbComments() map[commentKey]string {
+	m := make(map[commentKey]string, len(PGInitdbDescriptions)+len(PGInitdbShdescriptions))
+	for _, r := range PGInitdbDescriptions {
+		m[commentKey{ClassOID: r.ClassOID, ObjOID: r.ObjOID, ObjSubID: r.ObjSubID}] = r.Description
+	}
+	for _, r := range PGInitdbShdescriptions {
+		m[commentKey{ClassOID: r.ClassOID, ObjOID: r.ObjOID}] = r.Description
+	}
+	return m
+}
+
+// SystemCatalogOID resolves a pg_catalog relation name (e.g. "pg_namespace")
+// to its OID, the classoid obj_description(oid, name) keys pg_description on.
+func (c *InMemory) SystemCatalogOID(name string) (uint32, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if t, ok := c.ns(DefaultDBOid).tables["pg_catalog."+name]; ok && t.OID != 0 {
+		return t.OID, true
+	}
+	return 0, false
+}
+
 func (c *InMemory) GetComment(classoid, objoid uint32, objsubid int32) (string, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -6008,22 +6096,37 @@ func (c *InMemory) DatabaseOid(name string) uint32 {
 }
 
 // databaseDisplayOID returns the SQL-visible pg_database.oid that goopg
-// DISPLAYS for name: template1→1, template0→4, a CreateDatabase-allocated
-// database→its real distinct oid, and every other row (notably the live
-// "postgres" database — whose real on-disk oid is c.DBOID() but which is shown
-// as the legacy 16384 placeholder for CREATE SUBSCRIPTION / datacl compat)
-// →16384. This is deliberately the DISPLAY oid, not ResolveDatabaseOid's
+// DISPLAYS for name: template1→1, template0→4, postgres→5 (PostgresDBOid,
+// initdb's make_postgres oid — the value PG 18.3 shows and the oid of the
+// global/1262 heap row; M0149-0001a1 S2 retired the legacy 16384
+// placeholder), a CreateDatabase-allocated database→its real distinct oid.
+// This is deliberately the DISPLAY oid, not ResolveDatabaseOid's
 // physical oid: pg_stat_database.datid must join to pg_database.oid exactly as
 // goopg renders it, so both the pg_database VirtualRows closure and
 // PGStatDatabaseRows go through this single helper to stay in sync (resolving
 // the long-standing "keep this switch in sync" hazard noted on
 // ResolveDatabaseOid).
+// DatabaseNameByDisplayOID maps a SQL-visible pg_database.oid (what
+// has_database_privilege(oid, …) and friends receive) back to its name.
+// M0149-0001h.
+func (c *InMemory) DatabaseNameByDisplayOID(oid uint32) (string, bool) {
+	want := strconv.FormatUint(uint64(oid), 10)
+	for _, n := range c.ListDatabases() {
+		if c.databaseDisplayOID(n) == want {
+			return n, true
+		}
+	}
+	return "", false
+}
+
 func (c *InMemory) databaseDisplayOID(name string) string {
 	switch name {
 	case "template1":
 		return "1"
 	case "template0":
 		return "4"
+	case "postgres":
+		return strconv.FormatUint(uint64(PostgresDBOid), 10)
 	default:
 		if realOid := c.DatabaseOid(name); realOid != 0 {
 			return strconv.FormatUint(uint64(realOid), 10)
@@ -6117,9 +6220,9 @@ func (c *InMemory) PGStatDatabaseConflictsRows() [][]string {
 // the same oid that keys on-disk storage/ACLs (c.DBOID() for "postgres",
 // the fixed bootstrap oids for template1/template0, or the CreateDatabase-
 // allocated oid via DatabaseOid for any other registered database) — as
-// opposed to pg_database's VirtualRows column, which deliberately DISPLAYS
-// "postgres" as the legacy 16384 placeholder for CREATE SUBSCRIPTION/datacl
-// compat (see that closure's "oid, datallowconn, datistemplate" comment).
+// opposed to pg_database's displayed oid (databaseDisplayOID: postgres→5,
+// template1→1; they differ only for template1, whose namespace/storage oid is
+// Template1NamespaceDBOid).
 // Returns ok=false if name is not a database this catalog knows about.
 // M0122-0007 physical-storage-isolation slice 4a — see
 // docs/design/0122-0018-per-database-catalog-namespace.md. Keep this switch
@@ -6337,7 +6440,7 @@ func (c *InMemory) DatabaseConfigEntries(dbOid uint32) []string {
 }
 
 // roleSettingKey identifies one `ALTER ROLE ... SET` override row. See
-// InMemory.roleSettings' doc comment for the DBOid=0 vs FirstUserOID
+// InMemory.roleSettings' doc comment for the DBOid=0 vs PostgresDBOid
 // distinction.
 type roleSettingKey struct {
 	RoleOID uint32
@@ -7288,6 +7391,37 @@ func (c *InMemory) LookupTableByOID(oid uint32, dbOid ...uint32) (*Table, bool) 
 // (view/matview/column-default records key on TableOID only, with no dbOid
 // field) so state restores onto a table that reloaded into a distinct-dbOid
 // namespace, not just DefaultDBOid's. M0122-0007 4e follow-up 39.
+// UnloggedRelFileNodes returns the main-fork RelFileNodes of every UNLOGGED
+// relation in every database: tables, sequences and the indexes of
+// unlogged tables. Startup registers them with the buffer pool, whose
+// writes to them skip WAL (RelationNeedsWAL). M0149-0003.
+func (c *InMemory) UnloggedRelFileNodes() []storage.RelFileNode {
+	var tables []*Table
+	var indexes []*Index
+	c.mu.RLock()
+	for _, ns := range c.namespaces {
+		for _, t := range ns.tables {
+			if t.Unlogged {
+				tables = append(tables, t)
+			}
+		}
+		for _, idx := range ns.indexes {
+			if idx.Table != nil && idx.Table.Unlogged {
+				indexes = append(indexes, idx)
+			}
+		}
+	}
+	c.mu.RUnlock()
+	out := make([]storage.RelFileNode, 0, len(tables)+len(indexes))
+	for _, t := range tables {
+		out = append(out, c.RelFileNode(t))
+	}
+	for _, idx := range indexes {
+		out = append(out, c.IndexRelFileNode(idx))
+	}
+	return out
+}
+
 func (c *InMemory) LookupTableByOIDAllDBs(oid uint32) (*Table, uint32, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -7436,6 +7570,40 @@ func (c *InMemory) Routines() *Routines { return c.routines }
 // by CREATE SUBSCRIPTION's fetch_remote_table_info probe (M0103-0008
 // rung 16). The regclass cast handles the legacy "name as OID"
 // shape by resolving the bound text parameter through the catalog.
+// TimezoneAbbrevRows is the pg_timezone_abbrevs view under a session TimeZone:
+// the zone's own abbreviations (pg_timezone_abbrevs_zone), then the Default
+// set without those names (pg_timezone_abbrevs_abbrevs ... WHERE NOT EXISTS).
+// utc_offset is rendered as postgres_verbose, the style pg_regress runs with,
+// because goopg has no IntervalStyle output yet (M0149-0001h1a89).
+func TimezoneAbbrevRows(zone string, abbrevSet ...string) [][]string {
+	set := ""
+	if len(abbrevSet) > 0 {
+		set = abbrevSet[0]
+	}
+	now := time.Now()
+	var rows [][]string
+	inZone := map[string]bool{}
+	if loc, ok := misc.ZoneByName(zone); ok {
+		for _, r := range datetime.ZoneAbbrevRows(loc, now) {
+			inZone[r.Abbrev] = true
+			rows = append(rows, []string{r.Abbrev, verboseIntervalOffset(r.Offset), boolText(r.IsDST)})
+		}
+	}
+	for _, r := range datetime.AbbrevRows(set, now, misc.ZoneByName) {
+		if !inZone[r.Abbrev] {
+			rows = append(rows, []string{r.Abbrev, verboseIntervalOffset(r.Offset), boolText(r.IsDST)})
+		}
+	}
+	return rows
+}
+
+func boolText(b bool) string {
+	if b {
+		return "t"
+	}
+	return "f"
+}
+
 // verboseIntervalOffset renders a signed second count as a PostgreSQL
 // postgres_verbose interval string (e.g. -28378 → "@ 7 hours 52 mins 58 secs
 // ago", 3600 → "@ 1 hour", 0 → "@ 0"). The timezone system views store their
@@ -7557,7 +7725,11 @@ func (c *InMemory) PGTablesRowsForDBOid(dbOid uint32) [][]string {
 		if schema == "" {
 			schema = "public"
 		}
-		out = append(out, []string{schema, t.Name, "postgres"})
+		owner := "postgres"
+		if t.Owner != "" {
+			owner = t.Owner
+		}
+		out = append(out, []string{schema, t.Name, owner})
 	}
 	return out
 }
@@ -8098,6 +8270,7 @@ func (c *InMemory) PGIndexRowsForDBOid(dbOid uint32) [][]string {
 func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	partParents := c.partitionParentsLocked()
 	keys := make([]string, 0, len(c.ns(dbOid).tables))
 	for k := range c.ns(dbOid).tables {
 		keys = append(keys, k)
@@ -8125,9 +8298,13 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		// relam=HEAP_TABLE_AM_OID for heap verification, so relam=0 keeps the
 		// storage-less virtual sequence out of verify_heapam (which would fail).
 		// M0110-0001 (DU-002 slice 116).
-		relam := "2"
-		if t.IsSequence {
-			relam = "0"
+		// RELKIND_HAS_TABLE_AM (pg_class.h): only r / t / m carry the heap
+		// AM; views, sequences, composite types, foreign and partitioned
+		// tables (no explicit ACCESS METHOD) are InvalidOid. M0149-0001h1a16.
+		relam := "0"
+		switch relkind {
+		case "r", "t", "m":
+			relam = "2"
 		}
 		populated := "t"
 		if t.IsMatView && !t.IsPopulated {
@@ -8159,6 +8336,10 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		}
 		isPartition := "f"
 		if t.PartitionParentOID != 0 {
+			isPartition = "t"
+		} else if _, ok := partParents[t.OID]; ok {
+			// ATTACH PARTITION registers the link without setting
+			// PartitionParentOID. M0149-0001h1a29.
 			isPartition = "t"
 		}
 		// Build relpartbound: "FOR VALUES ..." string for partition children.
@@ -8260,6 +8441,15 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		// Hoisted to a local for the same reason as relOfType above — keeping
 		// the row literal's single-token column width. M0134-0164.
 		relFilenode := RelfilenodeForRelkind(relkind, t.OID)
+		// relowner: the creating role (heap_create_with_catalog's ownerId =
+		// GetUserId(), so SET ROLE counts) or ALTER ... OWNER TO's target.
+		// M0149-0001h1a26.
+		relOwner := "10"
+		if t.Owner != "" {
+			if oid, ok := c.roleOIDLocked(t.Owner); ok {
+				relOwner = strconv.Itoa(int(oid))
+			}
+		}
 		relacl := c.relaclTextLocked(t.OID)
 		if t.IsSequence {
 			relacl = c.relaclTextLockedSeq(t.OID)
@@ -8268,9 +8458,9 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 			strconv.Itoa(int(t.OID)),        // 0:  oid
 			t.Name,                          // 1:  relname
 			strconv.Itoa(int(nsOID)),        // 2:  relnamespace
-			"0",                             // 3:  reltype
+			strconv.Itoa(int(relTypeOf(t))), // 3:  reltype (the relation's rowtype, M0149-0001h1a34)
 			relOfType,                       // 4:  reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
-			"10",                            // 5:  relowner (bootstrap superuser)
+			relOwner,                        // 5:  relowner (Table.Owner; bootstrap superuser when unset, M0149-0001h1a26)
 			relam,                           // 6:  relam (heap=2; 0 for sequences)
 			relFilenode,                     // 7:  relfilenode (0 for storage-less kinds — view/foreign/partitioned, M0134-0164)
 			strconv.Itoa(int(t.Tablespace)), // 8:  reltablespace (0 = default; explicit CREATE TABLE ... TABLESPACE otherwise, M0122-0007)
@@ -8329,7 +8519,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 				"0",                    // 3:  reltype
 				"0",                    // 4:  reloftype
 				"10",                   // 5:  relowner
-				"0",                    // 6:  relam
+				"2",                    // 6:  relam (heap: RELKIND_TOASTVALUE has a table AM)
 				strconv.Itoa(toastOID), // 7:  relfilenode
 				"0",                    // 8:  reltablespace
 				"0",                    // 9:  relpages
@@ -8487,12 +8677,15 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 				idxPers = "t"
 			}
 		}
-		// 'I' = partitioned index (has partition children); 'i' = regular index.
+		// 'I' = partitioned index: any index on a partitioned table
+		// (index_create's relkind choice, RELKIND_PARTITIONED_INDEX), with or
+		// without attached children yet; 'i' otherwise. M0149-0001h1a26.
 		hasIdxChildren := len(c.indexPartitionChildren[idx.OID]) > 0
-		idxRelkind := "i"
-		if hasIdxChildren {
-			idxRelkind = "I"
+		idxIsPartition := "f"
+		if idx.PartitionParentOID != 0 {
+			idxIsPartition = "t"
 		}
+		idxRelkind := IndexRelkind(idx)
 		idxHasSubclass := "f"
 		if hasIdxChildren {
 			idxHasSubclass = "t"
@@ -8513,13 +8706,20 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		// (relkind 'I'), which has no storage of its own. Hoisted for the
 		// same column-width reason as idxTablespace. M0134-0164.
 		idxFilenode := RelfilenodeForRelkind(idxRelkind, idx.OID)
+		// relowner: an index is owned by its table's owner (index_create).
+		idxOwner := "10"
+		if idx.Table != nil && idx.Table.Owner != "" {
+			if oid, ok := c.roleOIDLocked(idx.Table.Owner); ok {
+				idxOwner = strconv.Itoa(int(oid))
+			}
+		}
 		out = append(out, []string{
 			strconv.Itoa(int(idx.OID)),  // 0:  oid
 			idx.Name,                    // 1:  relname
 			strconv.Itoa(int(idxNsOID)), // 2:  relnamespace
 			"0",                         // 3:  reltype
 			"0",                         // 4:  reloftype
-			"10",                        // 5:  relowner
+			idxOwner,                        // 5:  relowner (the table owner's, M0149-0001h1a28)
 			idxRelam,                    // 6:  relam
 			idxFilenode,                 // 7:  relfilenode (0 for a partitioned index, relkind 'I' — M0134-0164)
 			idxTablespace,               // 8:  reltablespace
@@ -8541,7 +8741,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 			"f",                         // 24: relforcerowsecurity
 			"t",                         // 25: relispopulated
 			"n",                         // 26: relreplident
-			"f",                         // 27: relispartition
+			idxIsPartition,              // 27: relispartition (M0149-0001h1a29)
 			"0",                         // 28: relrewrite
 			"0",                         // 29: relfrozenxid
 			"1",                         // 30: relminmxid
@@ -8612,7 +8812,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		"1259",     // 0:  oid
 		"pg_class", // 1:  relname
 		"11",       // 2:  relnamespace (pg_catalog OID=11)
-		"0",        // 3:  reltype
+		strconv.Itoa(int(BuiltinRelType(RelationRelationId))), // 3:  reltype
 		"0",        // 4:  reloftype
 		"10",       // 5:  relowner
 		"2",        // 6:  relam (heap)
@@ -8644,6 +8844,32 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		"",         // 32: reloptions (NULL)
 		"",         // 33: relpartbound
 	})
+	// Every system relation as a PG 18.3 initdb lists it (catalogs, their
+	// indexes and TOAST tables, system views). goopg models a few of them as
+	// live objects whose rows above are bootstrap facsimiles (relhasindex,
+	// relisshared, an index's namespace and relnatts were wrong), so the
+	// captured row replaces them; a live relacl is kept, as a GRANT on a
+	// system catalog changes it. M0149-0001h1a35.
+	seedIdx := make(map[string]int, len(seedPgClassRows))
+	for i, r := range seedPgClassRows {
+		seedIdx[r[0]] = i
+	}
+	have := make(map[string]bool, len(out))
+	for i, r := range out {
+		have[r[0]] = true
+		if si, ok := seedIdx[r[0]]; ok {
+			row := append([]string(nil), seedPgClassRows[si]...)
+			if r[31] != "" {
+				row[31] = r[31]
+			}
+			out[i] = row
+		}
+	}
+	for _, r := range seedPgClassRows {
+		if !have[r[0]] {
+			out = append(out, append([]string(nil), r...))
+		}
+	}
 	return out
 }
 
@@ -9352,11 +9578,10 @@ func (c *InMemory) registerSystemTables() {
 			// correctly omitted from --all while template1 is included.
 			// databaseDisplayOID renders the SQL-visible oid: template1→1,
 			// template0→4, a CreateDatabase-allocated database→its real distinct
-			// oid (M0122-0007 physical-storage-isolation slice 1), and every
-			// other row (notably the live "postgres" row, which never goes
-			// through CreateDatabase so DatabaseOid is 0)→the legacy 16384
-			// placeholder CREATE SUBSCRIPTION's subdbid and the datacl heap
-			// resync both key off (see the datacl comment below). Shared with
+			// oid (M0122-0007 physical-storage-isolation slice 1), and the
+			// live "postgres" row→PostgresDBOid (5), as in PG (M0149-0001a1
+			// S2 retired the legacy 16384 placeholder; CREATE SUBSCRIPTION's
+			// subdbid and pg_db_role_setting follow it). Shared with
 			// PGStatDatabaseRows so pg_stat_database.datid joins to this exactly.
 			oid := c.databaseDisplayOID(n)
 			datallowconn, datistemplate := "true", "false"
@@ -9378,11 +9603,8 @@ func (c *InMemory) registerSystemTables() {
 			// "oid" placeholder above. execDatabaseACLChange / resyncDatabaseACLHeapRow
 			// key the ACL store and the physical heap resync under c.DBOID() (the
 			// heap resync MUST match the real on-disk tuple's oid column), so this
-			// lookup mirrors that key rather than the legacy 16384
-			// firstNormalObjectOID placeholder other subsystems (e.g. CREATE
-			// SUBSCRIPTION's subdbid) already depend on for "the" connected
-			// database — changing the displayed oid to match broke pg_dump's
-			// subscription round-trip (subdbid join no longer matched). Only the
+			// lookup mirrors that key (which since M0149-0001a1 S2 also equals
+			// the displayed postgres oid, 5). Only the
 			// live "postgres" row could carry a granted ACL, because
 			// execDatabaseACLChange only ever wrote that one.
 			//
@@ -9445,16 +9667,13 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_database"] = pgDatabase
 
-	// pg_shdescription — stores COMMENT ON <shared object> descriptions (OID
-	// 3592, matches the placeholder heap file initdb bootstraps under
-	// global/3592 — bootstrapSharedCatalogPlaceholders,
-	// internal/initdb/initdb.go). goopg doesn't track shared-object comments
-	// yet (COMMENT ON DATABASE/ROLE/TABLESPACE is a no-op), so this is a
-	// permanently-empty stub — same rationale as pg_description above, but for
-	// the shared (cluster-wide, not per-database) comment catalog. Registered
-	// so `REINDEX TABLE pg_shdescription` and any plain `SELECT * FROM
-	// pg_shdescription` resolve instead of erroring "relation does not exist".
-	// M0134-0062 (reindex_catalog.sql regress parity).
+	// pg_shdescription (SharedDescriptionRelationId 2396, pg_shdescription.h)
+	// — comments on shared objects (databases, roles, tablespaces). Rows are
+	// the comment store's shared classes (IsSharedCommentClass), starting with
+	// the three database descriptions PostgreSQL's initdb writes
+	// (defaultInitdbComments). Registered so `REINDEX TABLE pg_shdescription`
+	// and plain SELECTs resolve (M0134-0062). M0149-0001f: OID was 3592
+	// (pg_shseclabel's), and the table was a permanently empty stub.
 	pgShdescription := &Table{
 		Schema: "pg_catalog", Name: "pg_shdescription", Virtual: true,
 		Columns: []Column{
@@ -9462,9 +9681,18 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "classoid", Type: Type{Name: "oid"}, Ordinal: 1},
 			{Name: "description", Type: Type{Name: "text"}, Ordinal: 2},
 		},
-		OID: 3592,
+		OID: 2396,
 	}
-	pgShdescription.VirtualRows = func() [][]string { return nil }
+	pgShdescription.VirtualRows = func() [][]string {
+		var out [][]string
+		for _, r := range c.AllComments() {
+			if !IsSharedCommentClass(r.ClassOID) || r.ObjSubID != 0 {
+				continue
+			}
+			out = append(out, []string{fmt.Sprintf("%d", r.ObjOID), fmt.Sprintf("%d", r.ClassOID), r.Description})
+		}
+		return out
+	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_shdescription"] = pgShdescription
 
 	// Nailed system index stubs — REINDEX INDEX <name> on a nailed catalog
@@ -9510,66 +9738,30 @@ func (c *InMemory) registerSystemTables() {
 	pgRoles := &Table{
 		Schema: "pg_catalog",
 		Name:   "pg_roles",
+		// system_views.sql's pg_roles view: pg_authid's columns in this
+		// order, rolpassword masked as '********', rolconfig from
+		// pg_db_role_setting (setdatabase = 0), oid last. psql's \du and
+		// \dg select rolinherit / rolcreaterole / rolconnlimit /
+		// rolvaliduntil / rolbypassrls by name; pg_dump's collectRoleNames
+		// reads `oid, rolname` (pg_dump.c:10548). Rows are pg_authid's
+		// (VirtualRows set below, once pgAuthid exists).
 		Columns: []Column{
-			// oid first: pg_dump's collectRoleNames issues
-			// `SELECT oid, rolname FROM pg_catalog.pg_roles ORDER BY 1`
-			// to build its role-oid → name map (pg_dump.c:10548).
-			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
-			{Name: "rolname", Type: Type{Name: "text"}, Ordinal: 1},
-			{Name: "rolsuper", Type: Type{Name: "text"}, Ordinal: 2},
-			{Name: "rolcanlogin", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "rolname", Type: Type{Name: "name"}, Ordinal: 0},
+			{Name: "rolsuper", Type: Type{Name: "bool"}, Ordinal: 1},
+			{Name: "rolinherit", Type: Type{Name: "bool"}, Ordinal: 2},
+			{Name: "rolcreaterole", Type: Type{Name: "bool"}, Ordinal: 3},
+			{Name: "rolcreatedb", Type: Type{Name: "bool"}, Ordinal: 4},
+			{Name: "rolcanlogin", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "rolreplication", Type: Type{Name: "bool"}, Ordinal: 6},
+			{Name: "rolconnlimit", Type: Type{Name: "int4"}, Ordinal: 7},
+			{Name: "rolpassword", Type: Type{Name: "text"}, Ordinal: 8},
+			{Name: "rolvaliduntil", Type: Type{Name: "timestamptz"}, Ordinal: 9},
+			{Name: "rolbypassrls", Type: Type{Name: "bool"}, Ordinal: 10},
+			{Name: "rolconfig", Type: Type{Name: "text", IsArray: true}, Ordinal: 11},
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 12},
 		},
 		OID:     1259102, // synthetic — upstream's pg_roles is a view, no fixed low OID (1260 is pg_authid's, see below)
 		Virtual: true,
-	}
-	pgRoles.VirtualRows = func() [][]string {
-		// OID 10 = BOOTSTRAP_SUPERUSERID (postgres superuser),
-		// per postgres/src/include/catalog/pg_authid.dat.
-		out := [][]string{{"10", "postgres", "t", "t"}}
-		// User-created roles (CREATE ROLE / CREATE USER) follow, each with the
-		// OID minted at registration time, sorted by name for deterministic
-		// output. pg_dump's getPolicies resolves pg_policy.polroles OIDs back to
-		// names through this view, so named-role policies round-trip. DU-002
-		// slice 330.
-		c.mu.RLock()
-		names := make([]string, 0, len(c.roles))
-		for name := range c.roles {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			// Report the recorded attributes (root-0021); a role with no
-			// sidecar entry keeps the historical 'f'/'t' defaults so
-			// pre-existing pg_dump policy-role resolution is unchanged.
-			rolsuper, rolcanlogin := "f", "t"
-			if a := c.roleAttrs[name]; a != nil {
-				if a.Superuser {
-					rolsuper = "t"
-				}
-				if !a.CanLogin {
-					rolcanlogin = "f"
-				}
-			}
-			out = append(out, []string{fmt.Sprintf("%d", c.roles[name]), name, rolsuper, rolcanlogin})
-		}
-		c.mu.RUnlock()
-		// PG18's 16 built-in "pg_*" predefined roles (pg_authid.dat) — always
-		// rolsuper='f'/rolcanlogin='f', matching SyncPgAuthidFile's frozen
-		// predefined rows (internal/executor/pg_authid_sync.go). Needed so
-		// pg_dumpall's dumpRoleMembership query (which LEFT JOINs pg_roles to
-		// resolve a membership row's role/member name) doesn't silently drop a
-		// `GRANT pg_read_all_data TO alice`-style row when ur.rolname/
-		// um.rolname come back NULL for a predefined grantee (0119-0004ch
-		// ledger discovery (a)).
-		predefinedNames := make([]string, 0, len(predefinedRoleSeeds))
-		for _, s := range predefinedRoleSeeds {
-			predefinedNames = append(predefinedNames, s.name)
-		}
-		sort.Strings(predefinedNames)
-		for _, name := range predefinedNames {
-			out = append(out, []string{fmt.Sprintf("%d", c.predefinedRoles[name]), name, "f", "f"})
-		}
-		return out
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_roles"] = pgRoles
 
@@ -9655,7 +9847,14 @@ func (c *InMemory) registerSystemTables() {
 		}
 		c.mu.RLock()
 		defer c.mu.RUnlock()
-		out := [][]string{rowFor("10", "postgres", c.roleAttrs["postgres"])}
+		// BOOTSTRAP_SUPERUSERID's pg_authid.dat shape when no attributes
+		// were recorded for it (a catalog that never loaded the heap).
+		bootstrap := c.roleAttrs["postgres"]
+		if bootstrap == nil {
+			bootstrap = &RoleAttrs{Superuser: true, CanLogin: true, Inherit: true, CreateRole: true,
+				CreateDB: true, Replication: true, BypassRLS: true, ConnLimit: -1}
+		}
+		out := [][]string{rowFor("10", "postgres", bootstrap)}
 		names := make([]string, 0, len(c.roles))
 		for name := range c.roles {
 			names = append(names, name)
@@ -9683,6 +9882,22 @@ func (c *InMemory) registerSystemTables() {
 		return out
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_authid"] = pgAuthid
+	// pg_roles projects pg_authid's rows (oid, rolname, rolsuper, rolinherit,
+	// rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolbypassrls,
+	// rolconnlimit, rolpassword, rolvaliduntil) into the view's column order.
+	// rolconfig is NULL: per-role settings (ALTER ROLE ... SET) are not
+	// recorded in a pg_db_role_setting goopg exposes here.
+	pgRoles.VirtualRows = func() [][]string {
+		src := pgAuthid.VirtualRows()
+		out := make([][]string, 0, len(src))
+		for _, r := range src {
+			out = append(out, []string{
+				r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[9],
+				"********", r[11], r[8], VirtualNull, r[0],
+			})
+		}
+		return out
+	}
 
 	// pg_auth_members — role membership (`GRANT <role> TO <role>`), sourced
 	// from the roleMembers registry GRANT/REVOKE ROLE maintains
@@ -9922,7 +10137,7 @@ func (c *InMemory) registerSystemTables() {
 		// locktype, database, relation, page, tuple, virtualxid, transactionid,
 		// classid, objid, objsubid, virtualtransaction, pid, mode, granted, fastpath, waitstart
 		rows := [][]string{
-			{"relation", "16384", "1259", "", "", "", "", "", "", "", "1/1", "0", "AccessShareLock", "t", "t", ""},
+			{"relation", "5", "1259", "", "", "", "", "", "", "", "1/1", "0", "AccessShareLock", "t", "t", ""},
 		}
 		if RelationLockRowsFunc != nil {
 			rows = append(rows, RelationLockRowsFunc()...)
@@ -10138,15 +10353,16 @@ func (c *InMemory) registerSystemTables() {
 	pgPrepStmts.VirtualRows = func() [][]string { return nil }
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_prepared_statements"] = pgPrepStmts
 
-	// pg_prepared_xacts — 0 rows is fine.
+	// pg_prepared_xacts — rows come from the transaction manager's
+	// prepared-transaction registry (initdb registerPreparedXactsView).
 	pgPrepXacts := &Table{
 		Schema: "pg_catalog", Name: "pg_prepared_xacts", Virtual: true,
 		Columns: []Column{
 			{Name: "transaction", Type: Type{Name: "xid"}, Ordinal: 0},
 			{Name: "gid", Type: Type{Name: "text"}, Ordinal: 1},
 			{Name: "prepared", Type: Type{Name: "timestamptz"}, Ordinal: 2},
-			{Name: "owner", Type: Type{Name: "text"}, Ordinal: 3},
-			{Name: "database", Type: Type{Name: "text"}, Ordinal: 4},
+			{Name: "owner", Type: Type{Name: "name"}, Ordinal: 3},
+			{Name: "database", Type: Type{Name: "name"}, Ordinal: 4},
 		},
 		OID: 3400,
 	}
@@ -10189,7 +10405,10 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_slru"] = pgStatSlru
 
-	// pg_stat_wal — exactly 1 row expected.
+	// pg_stat_wal — exactly 1 row. PG 18's shape (system_views.sql:
+	// pg_stat_get_wal()): wal_records, wal_fpi, wal_bytes, wal_buffers_full,
+	// stats_reset. The row comes from PgStatWalRowFunc, which initdb wires to
+	// the WAL writer's counters and the persisted WAL stats (M0149-0007).
 	pgStatWal := &Table{
 		Schema: "pg_catalog", Name: "pg_stat_wal", Virtual: true,
 		Columns: []Column{
@@ -10197,17 +10416,16 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "wal_fpi", Type: Type{Name: "int8"}, Ordinal: 1},
 			{Name: "wal_bytes", Type: Type{Name: "numeric"}, Ordinal: 2},
 			{Name: "wal_buffers_full", Type: Type{Name: "int8"}, Ordinal: 3},
-			{Name: "wal_write", Type: Type{Name: "int8"}, Ordinal: 4},
-			{Name: "wal_sync", Type: Type{Name: "int8"}, Ordinal: 5},
-			{Name: "wal_write_time", Type: Type{Name: "float8"}, Ordinal: 6},
-			{Name: "wal_sync_time", Type: Type{Name: "float8"}, Ordinal: 7},
-			{Name: "stats_reset", Type: Type{Name: "timestamptz"}, Ordinal: 8},
+			{Name: "stats_reset", Type: Type{Name: "timestamptz"}, Ordinal: 4},
 		},
 		OID: 3402,
 	}
 	pgStatWal.VirtualRows = func() [][]string {
+		if f := PgStatWalRowFunc; f != nil {
+			return [][]string{f()}
+		}
 		return [][]string{
-			{"0", "0", "0", "0", "0", "0", "0", "0", "2026-01-01 00:00:00+00"},
+			{"0", "0", "0", "0", "2026-01-01 00:00:00+00"},
 		}
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_wal"] = pgStatWal
@@ -10258,10 +10476,10 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3407,
 	}
+	// The counters come from the WAL archiver (activity.ReportArchived /
+	// ReportArchiveFailed, M0149-0018a).
 	pgStatArchiver.VirtualRows = func() [][]string {
-		return [][]string{
-			{"0", VirtualNull, VirtualNull, "0", VirtualNull, VirtualNull, "2026-01-01 00:00:00+00"},
-		}
+		return [][]string{activity.ArchiverStatsRow(VirtualNull, "2026-01-01 00:00:00+00")}
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_archiver"] = pgStatArchiver
 
@@ -10436,6 +10654,11 @@ func (c *InMemory) registerSystemTables() {
 		{"backup_streamed", "int8"}, {"tablespaces_total", "int8"},
 		{"tablespaces_streamed", "int8"},
 	})
+	// BASE_BACKUP does report progress: walsenders running it feed
+	// activity's BASEBACKUP registry (M0149-0077l).
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_progress_basebackup"].VirtualRows = func() [][]string {
+		return activity.BaseBackupProgressRows(VirtualNull)
+	}
 	mkProgressView("pg_stat_progress_copy", 9108, [][2]string{
 		{"pid", "int4"}, {"datid", "oid"}, {"datname", "name"}, {"relid", "oid"},
 		{"command", "text"}, {"type", "text"}, {"bytes_processed", "int8"},
@@ -10790,6 +11013,9 @@ func (c *InMemory) registerSystemTables() {
 		rows := c.AllComments()
 		out := make([][]string, 0, len(rows))
 		for _, r := range rows {
+			if IsSharedCommentClass(r.ClassOID) {
+				continue // pg_shdescription's (M0149-0001f)
+			}
 			out = append(out, []string{
 				fmt.Sprintf("%d", r.ObjOID),
 				fmt.Sprintf("%d", r.ClassOID),
@@ -11155,28 +11381,11 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3404,
 	}
 	pgTimezoneNames.VirtualRows = func() [][]string {
+		// pg_timezone_names(): the tz database's zones at the current time.
 		var rows [][]string
-		for i := -12; i <= 14; i++ {
-			var name, abbrev string
-			if i == 0 {
-				name = "UTC"
-				abbrev = "UTC"
-			} else if i > 0 {
-				name = fmt.Sprintf("Etc/GMT-%d", i)
-				abbrev = fmt.Sprintf("GMT-%d", i)
-			} else {
-				name = fmt.Sprintf("Etc/GMT+%d", -i)
-				abbrev = fmt.Sprintf("GMT+%d", -i)
-			}
-			rows = append(rows, []string{name, abbrev, verboseIntervalOffset(i * 3600), "f"})
+		for _, r := range misc.TimezoneNames(time.Now()) {
+			rows = append(rows, []string{r.Name, r.Abbrev, verboseIntervalOffset(r.Offset), boolText(r.IsDST)})
 		}
-		// Add fractional offsets for extra distinct utc_offsets.
-		rows = append(rows, []string{"Asia/Kolkata", "IST", verboseIntervalOffset(5*3600 + 30*60), "f"})
-		rows = append(rows, []string{"Asia/Kathmandu", "NPT", verboseIntervalOffset(5*3600 + 45*60), "f"})
-		rows = append(rows, []string{"Pacific/Marquesas", "MART", verboseIntervalOffset(-(9*3600 + 30*60)), "f"})
-		rows = append(rows, []string{"Pacific/Chatham", "CHAST", verboseIntervalOffset(12*3600 + 45*60), "f"})
-		// LMT historical local-mean-time for America/Los_Angeles.
-		rows = append(rows, []string{"America/Los_Angeles", "LMT", verboseIntervalOffset(-(7*3600 + 52*60 + 58)), "f"})
 		return rows
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_timezone_names"] = pgTimezoneNames
@@ -11191,30 +11400,7 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3405,
 	}
-	pgTimezoneAbbrevs.VirtualRows = func() [][]string {
-		var rows [][]string
-		for i := -12; i <= 14; i++ {
-			var abbrev string
-			if i == 0 {
-				abbrev = "UTC"
-			} else if i > 0 {
-				abbrev = fmt.Sprintf("GMT-%d", i)
-			} else {
-				abbrev = fmt.Sprintf("GMT+%d", -i)
-			}
-			rows = append(rows, []string{abbrev, verboseIntervalOffset(i * 3600), "f"})
-		}
-		// Fractional offsets.
-		rows = append(rows, []string{"IST", verboseIntervalOffset(5*3600 + 30*60), "f"})
-		rows = append(rows, []string{"NPT", verboseIntervalOffset(5*3600 + 45*60), "f"})
-		rows = append(rows, []string{"MART", verboseIntervalOffset(-(9*3600 + 30*60)), "f"})
-		rows = append(rows, []string{"CHAST", verboseIntervalOffset(12*3600 + 45*60), "f"})
-		// LMT entry required by sysviews.sql: select * from pg_timezone_abbrevs where abbrev = 'LMT'.
-		// PostgreSQL displays this offset as "@ 7 hours 52 mins 58 secs ago"
-		// because pg_regress forces intervalstyle=postgres_verbose.
-		rows = append(rows, []string{"LMT", verboseIntervalOffset(-(7*3600 + 52*60 + 58)), "f"})
-		return rows
-	}
+	pgTimezoneAbbrevs.VirtualRows = func() [][]string { return TimezoneAbbrevRows("UTC") }
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_timezone_abbrevs"] = pgTimezoneAbbrevs
 
 	// pg_am — access method catalog (OID 2601).
@@ -11256,10 +11442,11 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_am"] = pgAm
 
-	// pg_depend — dependency catalog (OID 2608).
-	// goopg does not maintain a general dependency graph (extension membership,
-	// function/type deps, etc. are not tracked), so this view is empty EXCEPT for
-	// the one dependency class pg_dump needs: a sequence's AUTO ('a') ownership of
+	// pg_depend — dependency catalog (OID 2608). It lists PG 18.3 initdb's
+	// bootstrap dependency rows (PGDependInitdb, M0149-0001g slice 34) followed
+	// by the runtime rows. goopg does not maintain a general dependency graph
+	// for user objects (function/type deps, etc. are not tracked); the one
+	// runtime class it records is the one pg_dump needs: a sequence's AUTO ('a') ownership of
 	// the column named by OWNED BY. pg_dump LEFT JOINs pg_depend in getTables
 	// (gated on relkind=RELKIND_SEQUENCE, objsubid=0, refclassid=pg_class,
 	// deptype IN ('a','i')) to discover owning_tab/owning_col, then dumpSequence
@@ -11340,9 +11527,8 @@ func (c *InMemory) registerSystemTables() {
 	// pip.initprivs` predicate degenerates to "dump the full ACL". Schema matches
 	// PG's pg_init_privs (objoid, classoid, objsubid, privtype, initprivs); like the
 	// upstream catalog it has NO oid system column. M0110-0001 (DU-002); rows added
-	// M0134-0132 (see PGInitPrivsRowsForDBOid — goopg has no bootstrap-time ACL
-	// snapshot mechanism, so the initprivs text is reconstructed on read rather than
-	// captured once at initdb; deferral recorded in .ralph/deferral_ledger.md).
+	// M0134-0132; since M0149-0001g slice 22 they are PG 18.3 initdb's own 229 rows
+	// (PGInitdbInitPrivs, the source of the on-disk 3394 heap too).
 	pgInitPrivs := &Table{
 		Schema: "pg_catalog", Name: "pg_init_privs", Virtual: true,
 		Columns: []Column{
@@ -11390,10 +11576,9 @@ func (c *InMemory) registerSystemTables() {
 	// `WITH FUNCTION <ns>.<signature>` clause. DU-002 slices 395, 397.
 	pgCast.VirtualRows = func() [][]string {
 		casts := c.ListCasts()
-		if len(casts) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(casts))
+		// Built-in rows from a PG 18.3 initdb first (M0149-0001h1a20).
+		out := make([][]string, 0, len(seedPgCastRows)+len(casts))
+		out = append(out, seedPgCastRows...)
 		for _, cs := range casts {
 			out = append(out, []string{
 				strconv.FormatUint(uint64(cs.OID), 10),                       // oid
@@ -11492,10 +11677,13 @@ func (c *InMemory) registerSystemTables() {
 	// lanname). DU-002 slice 163.
 	pgLanguage.VirtualRows = func() [][]string {
 		return [][]string{
-			{"12", "internal", "10", "f", "f", "0", "0", "0", ""},
-			{"13", "c", "10", "f", "f", "0", "0", "0", ""},
-			{"14", "sql", "10", "f", "t", "0", "2511", "0", ""},
-			{"13627", "plpgsql", "10", "f", "t", "0", "0", "0", ""},
+			// PG 18.3 initdb's rows, as goopg's bootstrap pg_language heap
+			// carries them (M0149-0001g slice 29): validators 2246/2247/2248,
+			// sql has no inline handler, plpgsql's handlers 13624-13626.
+			{"12", "internal", "10", "f", "f", "0", "0", "2246", ""},
+			{"13", "c", "10", "f", "f", "0", "0", "2247", ""},
+			{"14", "sql", "10", "f", "t", "0", "0", "2248", ""},
+			{"13627", "plpgsql", "10", "t", "t", "13624", "13625", "13626", ""},
 		}
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_language"] = pgLanguage
@@ -11528,18 +11716,21 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "oprresult", Type: Type{Name: "oid"}, Ordinal: 9},
 			{Name: "oprcom", Type: Type{Name: "oid"}, Ordinal: 10},
 			{Name: "oprnegate", Type: Type{Name: "oid"}, Ordinal: 11},
-			{Name: "oprcode", Type: Type{Name: "oid"}, Ordinal: 12},
-			{Name: "oprrest", Type: Type{Name: "oid"}, Ordinal: 13},
-			{Name: "oprjoin", Type: Type{Name: "oid"}, Ordinal: 14},
+			{Name: "oprcode", Type: Type{Name: "regproc"}, Ordinal: 12},
+			{Name: "oprrest", Type: Type{Name: "regproc"}, Ordinal: 13},
+			{Name: "oprjoin", Type: Type{Name: "regproc"}, Ordinal: 14},
 		},
 		OID: 2617,
 	}
 	pgOperator.VirtualRows = func() [][]string {
 		ops := c.ListUserOperators()
-		if len(ops) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(ops))
+		// Every pg_operator.dat row first (M0149-0001h1a19): the view used to
+		// hold only CREATE OPERATOR rows, so opr_sanity's catalog checks saw
+		// an empty pg_operator. oprcode / oprrest / oprjoin are regproc, as
+		// in PG, and render by name.
+		seed := seedOperatorViewRows()
+		out := make([][]string, 0, len(seed)+len(ops))
+		out = append(out, seed...)
 		for _, op := range ops {
 			// A shell operator (FuncOID==0) forward-declared purely to mint an
 			// OID for another operator's COMMUTATOR/NEGATOR clause is not yet
@@ -11618,24 +11809,10 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgOpclass.VirtualRows = func() [][]string {
 		classes := c.ListUserOperatorClasses()
-		var builtinRows [][]string
-		if rts := c.ListRangeTypes(); len(rts) > 0 {
-			seen := make(map[uint32]bool)
-			for _, rt := range rts {
-				if rt.OpclassOID == 0 || seen[rt.OpclassOID] {
-					continue
-				}
-				seen[rt.OpclassOID] = true
-				if row, ok := builtinOpclassRowByOID(rt.OpclassOID); ok {
-					builtinRows = append(builtinRows, row)
-				}
-			}
-		}
-		if len(classes) == 0 && len(builtinRows) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(classes)+len(builtinRows))
-		out = append(out, builtinRows...)
+		// Every built-in opclass from a PG 18.3 initdb (M0149-0001h1a20);
+		// the range-subtype subset this view used to surface is part of it.
+		out := make([][]string, 0, len(seedPgOpclassRows)+len(classes))
+		out = append(out, seedPgOpclassRows...)
 		for _, oc := range classes {
 			out = append(out, []string{
 				strconv.FormatUint(uint64(oc.OID), 10),    // oid
@@ -11676,10 +11853,9 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgOpfamily.VirtualRows = func() [][]string {
 		fams := c.ListUserOperatorFamilies()
-		if len(fams) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(fams))
+		// Built-in rows from a PG 18.3 initdb first (M0149-0001h1a20).
+		out := make([][]string, 0, len(seedPgOpfamilyRows)+len(fams))
+		out = append(out, seedPgOpfamilyRows...)
 		for _, f := range fams {
 			out = append(out, []string{
 				strconv.FormatUint(uint64(f.OID), 10),    // oid
@@ -12180,10 +12356,10 @@ func (c *InMemory) registerSystemTables() {
 	// sub-item (a)).
 	pgRange.VirtualRows = func() [][]string {
 		rts := c.ListRangeTypes()
-		if len(rts) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(rts))
+		// The six built-in range types from a PG 18.3 initdb first
+		// (M0149-0001h1a22); user range types follow.
+		out := make([][]string, 0, len(seedPgRangeRows)+len(rts))
+		out = append(out, seedPgRangeRows...)
 		for _, rt := range rts {
 			subtypeOID := TypeNameToOID(rt.SubtypeName)
 			out = append(out, []string{
@@ -12400,12 +12576,8 @@ func (c *InMemory) registerSystemTables() {
 	// oid, lomowner oid, lomacl aclitem[]. M0110-0001 (DU-002 slice 29).
 	pgLargeobjectMetadata := &Table{
 		Schema: "pg_catalog", Name: "pg_largeobject_metadata", Virtual: true,
-		Columns: []Column{
-			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
-			{Name: "lomowner", Type: Type{Name: "oid"}, Ordinal: 1},
-			{Name: "lomacl", Type: Type{Name: "aclitem[]"}, Ordinal: 2},
-		},
-		OID: 2995,
+		Columns: PGLargeObjectMetadataColumns(),
+		OID:     LargeObjectMetadataRelationId,
 	}
 	pgLargeobjectMetadata.VirtualRows = func() [][]string { return nil }
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_largeobject_metadata"] = pgLargeobjectMetadata
@@ -12440,10 +12612,9 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgAmop.VirtualRows = func() [][]string {
 		members := c.ListAmOpMembers()
-		if len(members) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(members))
+		// Built-in rows from a PG 18.3 initdb first (M0149-0001h1a20).
+		out := make([][]string, 0, len(seedPgAmopRows)+len(members))
+		out = append(out, seedPgAmopRows...)
 		for _, m := range members {
 			// amoppurpose: AMOP_ORDER ('o') when the entry has a resolved
 			// sort family, else AMOP_SEARCH ('s') — mirrors opclasscmds.c's
@@ -12492,10 +12663,9 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgAmproc.VirtualRows = func() [][]string {
 		members := c.ListAmProcMembers()
-		if len(members) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(members))
+		// Built-in rows from a PG 18.3 initdb first (M0149-0001h1a20).
+		out := make([][]string, 0, len(seedPgAmprocRows)+len(members))
+		out = append(out, seedPgAmprocRows...)
 		for _, m := range members {
 			out = append(out, []string{
 				strconv.FormatUint(uint64(m.OID), 10),
@@ -12560,6 +12730,28 @@ func (c *InMemory) registerSystemTables() {
 	pgShseclabel.VirtualRows = func() [][]string { return nil }
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_shseclabel"] = pgShseclabel
 
+	// pg_shdepend (SharedDependRelationId 1214, pg_shdepend.h) — dependencies
+	// of objects on shared objects (owners and ACL grantees that are roles,
+	// tablespaces). goopg records none (shdepend.c has no counterpart yet), so
+	// the table is empty, as on a freshly initialised PostgreSQL cluster.
+	// M0149-0001f.
+	pgShdepend := &Table{
+		Schema: "pg_catalog", Name: "pg_shdepend", Virtual: true,
+		Columns: []Column{
+			{Name: "dbid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "classid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "objid", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "objsubid", Type: Type{Name: "int4"}, Ordinal: 3},
+			{Name: "refclassid", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "refobjid", Type: Type{Name: "oid"}, Ordinal: 5},
+			{Name: "deptype", Type: Type{Name: "char"}, Ordinal: 6},
+		},
+		OID: 1214,
+	}
+	pgShdepend.VirtualRows = func() [][]string { return nil }
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_shdepend"] = pgShdepend
+
+
 	// pg_db_role_setting — per-database/per-role GUC override catalog
 	// (pg_db_role_setting.h, DbRoleSettingRelationId 2964). dumpDatabaseConfig
 	// (pg_dump.c, --create only) queries `SELECT unnest(setconfig) FROM
@@ -12570,11 +12762,11 @@ func (c *InMemory) registerSystemTables() {
 	// SET ...` clauses. `ALTER DATABASE ... SET`/`RESET` writes into
 	// SetDatabaseConfig/ResetDatabaseConfig (setrole=0 rows, v0 scope: only
 	// the live connected database, mirroring execDatabaseACLChange's datacl
-	// restriction), keyed by FirstUserOID (16384) to match the oid pg_dump
+	// restriction), keyed by PostgresDBOid (5) to match the oid pg_dump
 	// already read from the pg_database row. `ALTER ROLE ... SET`/`RESET`
 	// writes into SetRoleConfig/ResetRoleConfig (setrole != 0 rows), keyed by
 	// the role's real OID and either 0 (cluster-wide) or the same
-	// FirstUserOID (`IN DATABASE`, same v0 single-live-database scope
+	// PostgresDBOid (`IN DATABASE`, same v0 single-live-database scope
 	// restriction). M0119-0004-ACLHEAP (ALTER DATABASE/ROLE ... SET
 	// follow-up).
 	pgDbRoleSetting := &Table{
@@ -12588,7 +12780,7 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgDbRoleSetting.VirtualRows = func() [][]string {
 		var out [][]string
-		dbOid := FirstUserOID
+		dbOid := PostgresDBOid
 		if entries := c.DatabaseConfigEntries(dbOid); len(entries) > 0 {
 			out = append(out, []string{
 				strconv.FormatUint(uint64(dbOid), 10),
@@ -12598,7 +12790,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		// setrole != 0 rows: `ALTER ROLE ... [IN DATABASE ...] SET ...`
 		// (M0119-0004-ACLHEAP, ALTER ROLE ... SET follow-up). DBOid is 0 for
-		// a plain cluster-wide override (setdatabase=0) or FirstUserOID for
+		// a plain cluster-wide override (setdatabase=0) or PostgresDBOid for
 		// the IN DATABASE form.
 		for _, row := range c.AllRoleConfigRows() {
 			out = append(out, []string{
@@ -12858,6 +13050,19 @@ func (c *InMemory) registerSystemTables() {
 				"Sets the list of allowed TLSv1.3 cipher suites.", "An empty string means use the default cipher suites.",
 				"sighup", "string", "default", "", "", "", "", "", "", "", "f"},
 		}
+		// Preset options (guc_tables.c PGC_INTERNAL): compile-time constants
+		// of the build, so their rows are fixed. Values as PG 18.3 reports
+		// them with goopg's 8 kB blocks and 16 MB WAL segments. M0149-0076.
+		rows = append(rows,
+			[]string{"block_size", "8192", "", "Preset Options", "Shows the size of a disk block.", "",
+				"internal", "integer", "default", "8192", "8192", "", "8192", "8192", "", "", "f"},
+			[]string{"segment_size", "131072", "8kB", "Preset Options", "Shows the number of pages per disk file.", "",
+				"internal", "integer", "default", "131072", "131072", "", "131072", "131072", "", "", "f"},
+			[]string{"wal_block_size", "8192", "", "Preset Options", "Shows the block size in the write ahead log.", "",
+				"internal", "integer", "default", "8192", "8192", "", "8192", "8192", "", "", "f"},
+			[]string{"wal_segment_size", "16777216", "B", "Preset Options", "Shows the size of write ahead log segments.", "",
+				"internal", "integer", "default", "1048576", "1073741824", "", "16777216", "16777216", "", "", "f"},
+		)
 		// PostgreSQL's pg_settings view is backed by the alphabetically
 		// sorted GUC table, so callers that query it without ORDER BY (e.g.
 		// sysviews.sql's `... where name like 'enable%'`) still receive rows
@@ -13239,10 +13444,16 @@ func (c *InMemory) RegisterRealTable(t *Table, dbOid ...uint32) error {
 	ns := c.getOrCreateNS(resolved)
 	k := key(parser.ObjectName{Schema: t.Schema, Name: t.Name})
 	if existing, ok := ns.tables[k]; ok {
-		if existing.OID == t.OID {
+		if existing.OID == t.OID && !existing.Virtual {
 			return nil // already registered — idempotent
 		}
-		return fmt.Errorf("RegisterRealTable: %q already exists with OID %d (want %d)", k, existing.OID, t.OID)
+		if existing.OID == t.OID {
+			// A virtual placeholder for a catalog whose heap is now present
+			// (pg_largeobject_metadata, M0149-0001h1a): the heap wins.
+			delete(ns.tables, k)
+		} else {
+			return fmt.Errorf("RegisterRealTable: %q already exists with OID %d (want %d)", k, existing.OID, t.OID)
+		}
 	}
 	for i := range t.Columns {
 		t.Columns[i].Ordinal = i
@@ -13273,6 +13484,20 @@ func (c *InMemory) RegisterVirtualTable(t *Table) error {
 	if _, exists := c.ns(DefaultDBOid).tables[k]; exists {
 		return fmt.Errorf("relation %q already exists", k)
 	}
+	if t.OID == 0 && (t.Schema == "pg_catalog" || t.Schema == "information_schema") {
+		t.OID = builtinCatalogRelOID(t.Schema, t.Name)
+		if t.OID == 0 {
+			// A goopg-only system view (no PG counterpart): take an OID
+			// from the top of the FirstUnpinnedObjectId..FirstNormalObjectId
+			// band, counting down, so it can never equal a user object's
+			// OID — goopg's or a PG primary's.
+			if c.nextSystemViewOID == 0 {
+				c.nextSystemViewOID = FirstUserOID - 1
+			}
+			t.OID = c.nextSystemViewOID
+			c.nextSystemViewOID--
+		}
+	}
 	if t.OID == 0 {
 		t.OID = c.nextOID
 		c.nextOID++
@@ -13281,6 +13506,61 @@ func (c *InMemory) RegisterVirtualTable(t *Table) error {
 		t.Columns[i].Ordinal = i
 	}
 	c.ns(DefaultDBOid).tables[k] = t
+	return nil
+}
+
+// SystemRelOIDResolver, when set, returns PG 18.3's initdb-assigned OID for a
+// pg_catalog or information_schema system view (initdb's pinned view tables,
+// M0131-S8a / M0133-S4), or 0. initdb installs it; catalog cannot import
+// initdb.
+var SystemRelOIDResolver func(schema, name string) uint32
+
+var (
+	builtinRelOIDOnce sync.Once
+	builtinRelOIDs    map[string]uint32
+)
+
+// builtinCatalogRelOID is PG's own OID for a pg_catalog relation: the seeded
+// pg_class row for a system catalog, else the pinned system-view OID. A
+// virtual relation registered without an OID used to take the next
+// user-range OID (>= FirstNormalObjectId), which collides with the OIDs a PG
+// primary assigns to user objects: on a goopg standby of a PG primary,
+// pg_subscription_rel held 16397, the OID PG gave a user sequence, and the
+// standby's OID lookups found the catalog instead of the sequence
+// (M0149-0077f). 0 when the name is not a PG system relation.
+func builtinCatalogRelOID(schema, name string) uint32 {
+	builtinRelOIDOnce.Do(func() {
+		builtinRelOIDs = make(map[string]uint32, len(seedPgClassRows))
+		for _, r := range seedPgClassRows {
+			if len(r) > 2 && r[2] == "11" { // relnamespace = pg_catalog
+				if oid, err := strconv.ParseUint(r[0], 10, 32); err == nil {
+					builtinRelOIDs[r[1]] = uint32(oid)
+				}
+			}
+		}
+	})
+	if schema == "pg_catalog" {
+		if oid, ok := builtinRelOIDs[name]; ok {
+			return oid
+		}
+	}
+	if SystemRelOIDResolver != nil {
+		return SystemRelOIDResolver(schema, name)
+	}
+	return 0
+}
+
+// SetVirtualRows replaces the row provider of a built-in virtual table
+// (pg_catalog stubs registered at catalog construction whose rows a runtime
+// subsystem supplies, e.g. pg_prepared_xacts from the transaction manager).
+func (c *InMemory) SetVirtualRows(schema, name string, rows func() [][]string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t, ok := c.ns(DefaultDBOid).tables[key(parser.ObjectName{Schema: schema, Name: name})]
+	if !ok || !t.Virtual {
+		return fmt.Errorf("SetVirtualRows: %s.%s is not a virtual table", schema, name)
+	}
+	t.VirtualRows = rows
 	return nil
 }
 
@@ -13481,6 +13761,40 @@ func (c *InMemory) CreateTable(name parser.ObjectName, cols []Column, dbOid ...u
 		DBOid:   resolveDBOid(dbOid),
 	}
 	c.nextOID++
+	c.reserveRowTypeLocked(t)
+	ns.tables[k] = t
+	return t, nil
+}
+
+// reserveRowTypeLocked allocates t's array type and rowtype OIDs right after
+// its relation OID, as heap_create_with_catalog does (M0149-0001h1a34).
+func (c *InMemory) reserveRowTypeLocked(t *Table) {
+	c.nextOID++ // array type (AssignTypeArrayOid)
+	t.RowTypeOID = c.nextOID
+	c.nextOID++
+}
+
+// CreateSequenceRelation is CreateTable for a sequence: PG 18 gives a
+// sequence no rowtype (reltype 0), so no type OIDs are reserved.
+func (c *InMemory) CreateSequenceRelation(name parser.ObjectName, cols []Column, dbOid ...uint32) (*Table, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ns := c.getOrCreateNS(resolveDBOid(dbOid))
+	k := key(name)
+	if _, exists := ns.tables[k]; exists {
+		return nil, fmt.Errorf("relation %q already exists", k)
+	}
+	for i := range cols {
+		cols[i].Ordinal = i
+	}
+	t := &Table{
+		Schema:  name.Schema,
+		Name:    name.Name,
+		Columns: append([]Column(nil), cols...),
+		OID:     c.nextOID,
+		DBOid:   resolveDBOid(dbOid),
+	}
+	c.nextOID++
 	ns.tables[k] = t
 	return t, nil
 }
@@ -13515,6 +13829,7 @@ func (c *InMemory) CreateTableReplacingPendingDrop(name parser.ObjectName, cols 
 		DBOid:   resolveDBOid(dbOid),
 	}
 	c.nextOID++
+	c.reserveRowTypeLocked(t)
 	ns.tables[k] = t
 	return t, nil
 }
@@ -13729,6 +14044,7 @@ func (c *InMemory) CreateView(name parser.ObjectName, cols []Column, aliases []s
 		DBOid: resolveDBOid(dbOid),
 	}
 	c.nextOID++
+	c.reserveRowTypeLocked(t)
 	ns.tables[k] = t
 	return t, nil
 }
@@ -14179,8 +14495,12 @@ func (c *InMemory) RegisterSchema(name string, dbOid ...uint32) {
 	}
 	n := c.getOrCreateNS(schemaDBOid(dbOid))
 	if _, ok := n.schemas[lc]; !ok {
-		c.nextOID++
-		n.schemas[lc] = c.nextOID
+		// allocOIDLocked (use, then advance): the old pre-increment left
+		// nextOID naming the schema's own OID, so the next object — e.g. the
+		// first table created in it — was minted the same OID, and the two
+		// shared one entry of every OID-keyed store (ACLs included).
+		// M0149-0001h1a8.
+		n.schemas[lc] = c.allocOIDLocked()
 	}
 }
 
@@ -14236,8 +14556,12 @@ func (c *InMemory) unregisterSchemaLocked(lc string, db uint32) {
 func (c *InMemory) SchemaOwnerOID(name string, dbOid ...uint32) uint32 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if oid, ok := c.ns(c.schemaOwnerDBLocked(strings.ToLower(name), dbOid)).schemaOwners[strings.ToLower(name)]; ok {
+	lc := strings.ToLower(name)
+	if oid, ok := c.ns(c.schemaOwnerDBLocked(lc, dbOid)).schemaOwners[lc]; ok {
 		return oid
+	}
+	if lc == "public" {
+		return pgDatabaseOwnerRoleOID // pg_namespace.dat: public is owned by pg_database_owner
 	}
 	return 10
 }
@@ -14268,6 +14592,11 @@ func (c *InMemory) SetSchemaOwner(name string, ownerOID uint32, dbOid ...uint32)
 		return false
 	}
 	c.getOrCreateNS(c.schemaOwnerDBLocked(lc, dbOid)).schemaOwners[lc] = ownerOID
+	if lc == "public" && ownerOID != pgDatabaseOwnerRoleOID {
+		// The ACL store renders a non-pg_database_owner owner as the bootstrap
+		// superuser (PG's aclnewowner rewrites the items for any new owner).
+		delete(c.aclOwnerDisplay, publicSchemaOID)
+	}
 	return true
 }
 
@@ -15136,10 +15465,10 @@ func (c *InMemory) FindDefaultConversionProc(forEnc, toEnc int32, dbOid ...uint3
 // M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
 func (c *InMemory) PGConversionRowsForDBOid(dbOid uint32) [][]string {
 	convs := c.ListUserConversionsForDBOid(dbOid)
-	if len(convs) == 0 {
-		return nil
-	}
-	out := make([][]string, 0, len(convs))
+	// The 128 built-in conversions from a PG 18.3 initdb first
+	// (M0149-0001h1a22); user conversions follow.
+	out := make([][]string, 0, len(seedPgConversionRows)+len(convs))
+	out = append(out, seedPgConversionRows...)
 	for _, cv := range convs {
 		condefault := "f"
 		if cv.Default {
@@ -16351,6 +16680,14 @@ func pgTextArrayLiteral(elems []string) string {
 // Standalone sequences have no OwnedBy and contribute no row. M0110-0001
 // (DU-002 slice 118).
 func (c *InMemory) PGDependRowsForDBOid(dbOid uint32) [][]string {
+	// M0149-0001g slice 34: PG 18.3 initdb's dependency rows come first, as
+	// in every database's heap; the runtime-recorded rows follow.
+	return append(initdbDependRows(), c.pgDependRuntimeRowsForDBOid(dbOid)...)
+}
+
+// pgDependRuntimeRowsForDBOid renders the dependency rows goopg records at
+// runtime (sequence OWNED BY); see PGDependRowsForDBOid.
+func (c *InMemory) pgDependRuntimeRowsForDBOid(dbOid uint32) [][]string {
 	if SequenceParamsFunc == nil {
 		return nil
 	}
@@ -16723,19 +17060,25 @@ func (c *InMemory) PGInheritsRowsForDBOid(dbOid uint32) [][]string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	var out [][]string
-	parentSeq := make(map[uint32]int)
+	partParentsInh := c.partitionParentsLocked()
 	for _, tbl := range c.ns(dbOid).tables {
 		if tbl.Virtual {
 			continue
 		}
-		// Partition children: one row per child → its partition parent.
-		if tbl.PartitionParentOID != 0 {
-			parentSeq[tbl.PartitionParentOID]++
-			seq := parentSeq[tbl.PartitionParentOID]
+		// Partition children: one row per child → its partition parent,
+		// whether created PARTITION OF or ATTACHed (M0149-0001h1a29).
+		parentOID := tbl.PartitionParentOID
+		if parentOID == 0 {
+			parentOID = partParentsInh[tbl.OID]
+		}
+		if parentOID != 0 {
+			// A partition has exactly one parent, so its inhseqno is 1
+			// (StoreCatalogInheritance1 numbers a child's own parents, not
+			// the parent's children). M0149-0001h1a30.
 			out = append(out, []string{
 				fmt.Sprintf("%d", tbl.OID),
-				fmt.Sprintf("%d", tbl.PartitionParentOID),
-				fmt.Sprintf("%d", seq),
+				fmt.Sprintf("%d", parentOID),
+				"1",
 				"f",
 			})
 			continue
@@ -16756,17 +17099,14 @@ func (c *InMemory) PGInheritsRowsForDBOid(dbOid uint32) [][]string {
 	// partition child of its parent index. These rows enable the join pattern:
 	//   pg_index LEFT JOIN pg_inherits ON (indexrelid = inhrelid)
 	// used by indexing.sql to discover partitioned-index parent/child chains.
-	idxParentSeq := make(map[uint32]int)
 	for _, idx := range c.ns(dbOid).indexes {
 		if idx.PartitionParentOID == 0 {
 			continue
 		}
-		idxParentSeq[idx.PartitionParentOID]++
-		seq := idxParentSeq[idx.PartitionParentOID]
 		out = append(out, []string{
 			fmt.Sprintf("%d", idx.OID),
 			fmt.Sprintf("%d", idx.PartitionParentOID),
-			fmt.Sprintf("%d", seq),
+			"1", // an index partition's single parent (IndexSetParentIndex)
 			"f",
 		})
 	}
@@ -17087,8 +17427,7 @@ func (c *InMemory) CreateTablespace(name, owner, location string) (uint32, error
 	if _, ok := c.tablespaces[lc]; ok {
 		return 0, fmt.Errorf("tablespace %q already exists", name)
 	}
-	c.nextOID++
-	oid := c.nextOID
+	oid := c.allocOIDLocked() // use-then-advance, like every other minting site (M0149-0001h1a8)
 	c.tablespaces[lc] = &tablespaceRow{
 		oid:      oid,
 		name:     name,
@@ -17338,9 +17677,9 @@ func (c *InMemory) PGNamespaceRowsForDBOid(dbOid uint32) [][]string {
 	sort.Slice(schemas, func(i, j int) bool { return schemas[i].oid < schemas[j].oid })
 	out := make([][]string, 0, len(schemas))
 	for _, s := range schemas {
-		if s.name == "pg_toast" {
-			continue // skip internal alias
-		}
+		// pg_toast (99) is listed like every other namespace, as in PG
+		// (pg_namespace.dat). It used to be skipped as an "internal alias"
+		// while its OID still collided with public's (M0149-0001g slice 24).
 		out = append(out, []string{
 			strconv.Itoa(int(s.oid)), // oid
 			s.name,                   // nspname
@@ -17350,6 +17689,11 @@ func (c *InMemory) PGNamespaceRowsForDBOid(dbOid uint32) [][]string {
 	}
 	return out
 }
+
+// PgStatWalRowFunc, when set, renders pg_stat_wal's single row
+// (wal_records, wal_fpi, wal_bytes, wal_buffers_full, stats_reset).
+// initdb installs it over the WAL writer's counters. M0149-0007.
+var PgStatWalRowFunc func() []string
 
 // tempNamespaceName renders the pg_temp_<id> namespace name for a temp-owner
 // token ("s<id>" → "pg_temp_<id>"). Mirrors PostgreSQL's pg_temp_N naming.
@@ -17720,12 +18064,42 @@ func (c *InMemory) RoleDropDependencyDescriptions(roleName string) []string {
 // role. Used by CREATE POLICY ... TO <role> to record role OIDs in
 // pg_policy.polroles. DU-002 slice 330.
 func (c *InMemory) RoleOID(name string) (uint32, bool) {
-	key := strings.ToLower(name)
-	if key == "postgres" {
+	if strings.ToLower(name) == "postgres" {
 		return 10, true
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	return c.roleOIDLocked(name)
+}
+
+// IndexRelkind is pg_class.relkind for an index: 'I' (partitioned index)
+// when its table is partitioned, 'i' otherwise. M0149-0001h1a26.
+func IndexRelkind(idx *Index) string {
+	if idx != nil && idx.Table != nil && TableRelkind(idx.Table) == "p" {
+		return "I"
+	}
+	return "i"
+}
+
+// partitionParentsLocked maps each partition (created PARTITION OF or
+// ATTACHed) to its parent, from the live partitionChildren registry. Caller
+// holds c.mu. M0149-0001h1a29.
+func (c *InMemory) partitionParentsLocked() map[uint32]uint32 {
+	rev := make(map[uint32]uint32)
+	for parent, kids := range c.partitionChildren {
+		for _, k := range kids {
+			rev[k] = parent
+		}
+	}
+	return rev
+}
+
+// roleOIDLocked is RoleOID for a caller already holding c.mu.
+func (c *InMemory) roleOIDLocked(name string) (uint32, bool) {
+	key := strings.ToLower(name)
+	if key == "postgres" {
+		return 10, true
+	}
 	// predefinedRoles is checked FIRST and always wins: it is a fixed,
 	// install-time fact (unlike `roles`, whose CREATE ROLE producer does not
 	// yet port PG's IsReservedName "pg_"-prefix rejection — a pre-existing,
@@ -18162,6 +18536,18 @@ func (c *InMemory) MaterializeOwnerACL(relOID uint32, owner string, ownerPrivs [
 	byRole[owner] = privs
 }
 
+// HoldsGrantOption reports whether role's own aclitem on oid carries priv
+// WITH GRANT OPTION (the stored flag GrantTablePrivilegeAs records). Used by
+// GRANT/REVOKE's restrict_and_check_grant for a non-owner grantor
+// (M0148-0001j3).
+func (c *InMemory) HoldsGrantOption(oid uint32, role, priv string) bool {
+	role = strings.ToLower(strings.TrimSpace(role))
+	priv = strings.ToUpper(strings.TrimSpace(priv))
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.tableACLs[oid][role][priv]
+}
+
 // HasTablePrivilege reports whether role holds priv on relOID. M0118-0008.
 //
 // This is goopg's aclmask() (postgres/src/backend/utils/adt/acl.c:1389), and
@@ -18328,6 +18714,13 @@ const (
 
 const publicPseudoRole = "public"
 
+// publicSchemaOID / pgDatabaseOwnerRoleOID: PG_PUBLIC_NAMESPACE (2200) and
+// ROLE_PG_DATABASE_OWNER (6171), pg_namespace.dat / pg_authid.dat.
+const (
+	publicSchemaOID        = 2200
+	pgDatabaseOwnerRoleOID = 6171
+)
+
 // schemaACLPrivOrder lists the schema (namespace) privileges in PostgreSQL's
 // canonical aclitemout bit order, taken from ACL_ALL_RIGHTS_STR ("arwdDxtXUCTc…"):
 // USAGE('U') precedes CREATE('C'). pg_dump diffs a namespace's nspacl against
@@ -18345,6 +18738,16 @@ var schemaACLPrivOrder = []aclPrivLetter{
 // default) so the owner's own entry produces no GRANT/REVOKE on round-trip.
 // DU-002 slice 335.
 const ownerSchemaACLString = "UC"
+
+// largeObjectACLPrivOrder lists the large-object privileges in aclitemout
+// order: SELECT ('r') and UPDATE ('w'), ACL_ALL_RIGHTS_LARGEOBJECT.
+var largeObjectACLPrivOrder = []aclPrivLetter{
+	{"SELECT", 'r'},
+	{"UPDATE", 'w'},
+}
+
+// ownerLargeObjectACLString is acldefault('L', owner)'s owner item, "rw".
+const ownerLargeObjectACLString = "rw"
 
 // functionACLPrivOrder lists the function (pg_proc) privileges in PostgreSQL's
 // canonical aclitemout order. A function has a single privilege, EXECUTE('X').
@@ -18608,58 +19011,6 @@ var attrACLPrivOrder = []aclPrivLetter{
 	{"REFERENCES", 'x'},
 }
 
-// PGInitPrivsRowsForDBOid renders pg_init_privs rows for every system-catalog
-// relation (schema pg_catalog/information_schema) that PostgreSQL's initdb
-// setup_privileges() seeds with a non-NULL relacl — RELKIND_RELATION,
-// RELKIND_VIEW, RELKIND_MATVIEW, RELKIND_SEQUENCE
-// (postgres/src/bin/initdb/initdb.c setup_privileges(), which UPDATEs
-// pg_class.relacl to `{=r/"postgres"} UNION acldefault(...)` for every such
-// relation that exists before the post-bootstrap SQL script runs, then INSERTs
-// a matching pg_init_privs row — objsubid=0, privtype='i' — for each). goopg
-// has no bootstrap-time ACL snapshot mechanism (tableACLs stays empty for
-// system catalogs until an explicit GRANT, see the SELECT-privilege carve-out
-// noted in .ralph/deferral_ledger.md M0097-0040), so this renders the SAME
-// synthetic "world-readable SELECT + owner-full" ACL text initdb would have
-// installed, keyed by each relation's real objoid/relkind, computed fresh on
-// every read rather than a captured once-at-initdb snapshot. Sufficient for
-// `SELECT count(*) > 0 FROM pg_init_privs` (init_privs.sql, M0134-0132) and
-// gives pg_dump's LEFT JOIN a real row to diff a later explicit GRANT/REVOKE
-// against; NOT a byte-faithful reconstruction of every relation's initprivs
-// (sequence text is an approximation of acldefault('s', owner), and a
-// genuinely revoked-then-regranted system catalog ACL is not distinguished
-// from its default). Caller must NOT hold c.mu (this takes its own RLock).
-func (c *InMemory) PGInitPrivsRowsForDBOid(dbOid uint32) [][]string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	keys := make([]string, 0, len(c.ns(dbOid).tables))
-	for k := range c.ns(dbOid).tables {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	out := make([][]string, 0, len(keys))
-	for _, k := range keys {
-		t := c.ns(dbOid).tables[k]
-		if t.OID == 0 {
-			continue
-		}
-		if t.Schema != "pg_catalog" && t.Schema != "information_schema" {
-			continue // only pre-existing initdb-time objects get an init_privs row
-		}
-		initprivs := "{=r/postgres,postgres=arwdDxtm/postgres}"
-		if t.IsSequence {
-			initprivs = "{=r/postgres,postgres=rwU/postgres}"
-		}
-		out = append(out, []string{
-			strconv.FormatUint(uint64(t.OID), 10),
-			"1259", // classoid = pg_class (RelationRelationId)
-			"0",    // objsubid
-			"i",    // privtype = initdb-time
-			initprivs,
-		})
-	}
-	return out
-}
-
 // relaclTextLocked renders the materialized pg_class.relacl text — an aclitem[]
 // array literal such as `{postgres=arwdDxtm/postgres,grantee_role=r/postgres}` —
 // for relOID from the in-memory GRANT store, or "" (SQL NULL) when no
@@ -18689,6 +19040,15 @@ func (c *InMemory) RelaclText(relOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.relaclTextLocked(relOID)
+}
+
+// SequenceRelaclText is RelaclText for a sequence (relkind 'S'), rendered with
+// the sequence privilege order and owner default (relaclTextLockedSeq). Used by
+// the pg_class heap row builder (M0149-0001g slice 12).
+func (c *InMemory) SequenceRelaclText(relOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLockedSeq(relOID)
 }
 
 // relaclTextLockedSeq is relaclTextLocked for a sequence (relkind 'S'): it
@@ -18889,7 +19249,11 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 		if ownerPrivs, ok := byRole[aclOwnerRole]; ok {
 			ownerLetters = renderACLLetters(ownerPrivs, privOrder)
 		}
-		items = append(items, "postgres="+ownerLetters+"/postgres")
+		owner := aclOwnerRole
+		if o, ok := c.aclOwnerDisplay[relOID]; ok {
+			owner = o
+		}
+		items = append(items, owner+"="+ownerLetters+"/"+owner)
 	}
 	// Render grantees in grant order (the order roles first appeared in a GRANT),
 	// matching PostgreSQL's append semantics for pg_class.relacl — NOT alphabetical
@@ -18962,6 +19326,9 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 		grantor := aclOwnerRole
 		if g, ok := c.tableACLGrantor[relOID][role]; ok && g != "" {
 			grantor = g
+		}
+		if o, ok := c.aclOwnerDisplay[relOID]; ok && grantor == aclOwnerRole {
+			grantor = o
 		}
 		if disp, ok := c.roleACLDisplay[grantor]; ok {
 			grantor = disp
@@ -19575,6 +19942,26 @@ func (c *InMemory) RegisterEventTriggerDuringRecovery(et *EventTrigger) {
 	out.Tags = append([]string(nil), et.Tags...)
 	c.eventTriggers[et.Name] = &out
 	c.advanceNextOIDLocked(et.OID)
+}
+
+// ReplaceEventTriggersDuringRecovery replaces the whole event trigger
+// registry and its heap TID cache with ets/tids — a running standby's
+// refresh from the replayed pg_event_trigger heap, which is the only source
+// of truth there (no local DDL runs during recovery). M0149-0077h.
+func (c *InMemory) ReplaceEventTriggersDuringRecovery(ets []EventTrigger, tids map[uint32]SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.eventTriggers = make(map[string]*EventTrigger, len(ets))
+	c.eventTriggerHeapTIDs = make(map[uint32]SchemaHeapTID, len(tids))
+	for i := range ets {
+		out := ets[i]
+		out.Tags = append([]string(nil), ets[i].Tags...)
+		c.eventTriggers[out.Name] = &out
+		c.advanceNextOIDLocked(out.OID)
+	}
+	for oid, tid := range tids {
+		c.eventTriggerHeapTIDs[oid] = tid
+	}
 }
 
 // DropEventTriggerDuringRecovery is the idempotent counterpart used for
@@ -24441,6 +24828,12 @@ func (e *RangeTypeOptionError) Error() string { return e.Message }
 // Matching is case-sensitive, mirroring real PostgreSQL identifier semantics
 // (`collation = "C"` requires the exact case; there is no unquoted `c`
 // built-in). DU-002 (M0110-0001, slice 429 follow-up sub-item (a)).
+// BuiltinCollationOIDByName is builtinCollationOIDByName for callers outside
+// the package (regcollationin's pg_catalog-qualified lookup).
+func BuiltinCollationOIDByName(name string) (uint32, bool) {
+	return builtinCollationOIDByName(name)
+}
+
 func builtinCollationOIDByName(name string) (uint32, bool) {
 	switch name {
 	case "default":
@@ -24551,6 +24944,20 @@ func defaultColumnOpclassNameForType(typeName string) (string, bool) {
 		return "inet_ops", true
 	case "bytea":
 		return "bytea_ops", true
+	// M0149-0001k5: types goopg can btree-index whose pg_index.indclass was
+	// written as 0, which a PG node rejects ("bogus pg_index tuple") for every
+	// query on the table. Default opclasses per pg_opclass.dat: cidr and the
+	// reg* family binary-coerce to inet_ops / oid_ops.
+	case "money":
+		return "money_ops", true
+	case "time", "time without time zone":
+		return "time_ops", true
+	case "timetz", "time with time zone":
+		return "timetz_ops", true
+	case "cidr":
+		return "inet_ops", true
+	case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation", "regnamespace", "regoper", "regoperator", "regconfig", "regdictionary":
+		return "oid_ops", true
 	}
 	return "", false
 }
@@ -26010,6 +26417,18 @@ func (c *InMemory) ResolveColumnType(typeName string) string {
 	return typeName
 }
 
+// DomainBaseType follows the domain name down to its non-domain base type and
+// returns that type with the typmod the innermost domain declared, as PG's
+// getBaseTypeAndTypmod does. ok is false when name is not a domain.
+func (c *InMemory) DomainBaseType(name string, dbOid ...uint32) (base Type, ok bool) {
+	d, found := c.LookupDomain(name, dbOid...)
+	for depth := 0; found && depth < 64; depth++ {
+		base, ok = d.Base, true
+		d, found = c.LookupDomain(d.Base.Name, dbOid...)
+	}
+	return base, ok
+}
+
 // resolveColumnTypeLocked is the lock-free recursive helper for ResolveColumnType.
 func (c *InMemory) resolveColumnTypeLocked(typeName string) string {
 	k := strings.ToLower(typeName)
@@ -26045,6 +26464,9 @@ type SearchPathCatalog struct {
 	// to drop other-session temp inheritance children during expansion
 	// (RELATION_IS_OTHER_TEMP). Design 0118-0036 (M0118-0008 inherit-temp).
 	TempOwnerToken string
+	// ParamTypes are the declared types of $1..$n when the statement is a SQL
+	// function body (see ParamDeclaredType); nil otherwise.
+	ParamTypes []Type
 	// SnapshotPartitionDetachEpoch is the querying statement's snapshot
 	// partition-detach epoch (mvcc.Snapshot.PartitionDetachEpoch). The planner
 	// reads it via CurrentPartitionDetachEpoch to drop partition children that
@@ -26097,6 +26519,20 @@ func WithSearchPath(cat Catalog, getSchemas func() []string) *SearchPathCatalog 
 // planner discovers it via a tempOwnerCarrier interface walk over the catalog
 // wrapper chain. Design 0118-0036.
 func (c *SearchPathCatalog) CurrentTempOwner() string { return c.TempOwnerToken }
+
+// ParamDeclaredType reports the declared type of parameter $n (1-based) for a
+// statement planned inside a SQL-language function body: PG's
+// sql_fn_parser_setup hands the parser each argument's declared type, so a
+// Param is typed from the start and `($1).f` resolves against the argument's
+// composite type (transformIndirection / ParseFuncOrColumn). ParamTypes is
+// nil for every other statement. M0148-0001j4 item (3).
+func (c *SearchPathCatalog) ParamDeclaredType(n int) (Type, bool) {
+	if n < 1 || n > len(c.ParamTypes) {
+		return Type{}, false
+	}
+	t := c.ParamTypes[n-1]
+	return t, t.Name != ""
+}
 
 // SeqScanDisabled reports the querying session's `enable_seqscan = off` GUC so
 // the planner can promote an ordered covering index scan to an IndexOnlyScan
@@ -26259,3 +26695,34 @@ func (c *SearchPathCatalog) IndexesOnTable(table *Table, dbOid ...uint32) []*Ind
 // Unwrap returns the underlying Catalog, allowing callers to peel the
 // search-path layer for type assertions (e.g., to *InMemory). M0097-0022.
 func (c *SearchPathCatalog) Unwrap() Catalog { return c.Catalog }
+
+// LargeObjectMetadataRelationId is pg_largeobject_metadata's OID
+// (pg_largeobject_metadata.h).
+const LargeObjectMetadataRelationId = 2995
+
+// PGLargeObjectMetadataColumns is pg_largeobject_metadata's row type: oid,
+// lomowner oid, lomacl aclitem[] (pg_largeobject_metadata.h). Without a
+// heap (an in-memory catalog) it backs an empty virtual placeholder; with
+// one, the real MVCC table (M0149-0001h1a).
+func PGLargeObjectMetadataColumns() []Column {
+	return []Column{
+		{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0, NotNull: true},
+		{Name: "lomowner", Type: Type{Name: "oid"}, Ordinal: 1, NotNull: true},
+		// "aclitem[]" (not IsArray) selects the codec's catalog-ACL arm: a
+		// PG-native _aclitem blob, rendered by the scan hook.
+		{Name: "lomacl", Type: Type{Name: "aclitem[]"}, Ordinal: 2},
+	}
+}
+
+// LargeObjectRelationId is pg_largeobject's OID (pg_largeobject.h).
+const LargeObjectRelationId = 2613
+
+// PGLargeObjectColumns is pg_largeobject's row type: loid oid, pageno int4,
+// data bytea, all NOT NULL (pg_largeobject.h). M0149-0001h1a slice 2.
+func PGLargeObjectColumns() []Column {
+	return []Column{
+		{Name: "loid", Type: Type{Name: "oid"}, Ordinal: 0, NotNull: true},
+		{Name: "pageno", Type: Type{Name: "int4"}, Ordinal: 1, NotNull: true},
+		{Name: "data", Type: Type{Name: "bytea"}, Ordinal: 2, NotNull: true},
+	}
+}

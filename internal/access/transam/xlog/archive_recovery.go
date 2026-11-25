@@ -17,9 +17,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"github.com/goopg/goopg/internal/access/transam/control"
@@ -36,6 +36,9 @@ type TimelineSpan struct {
 // ArchiveRecoveryResult is what archive recovery hands the promotion that
 // follows it.
 type ArchiveRecoveryResult struct {
+	// StartOfLog is the start of the first segment recovery read: the
+	// segment of backup_label's redo when there is a label.
+	StartOfLog uint64
 	// EndOfLog is the end of the last record replayed — PG's EndOfLog, the
 	// timeline switch point the promotion writes into the new timeline's
 	// history file (xlog.c StartupXLOG → writeTimeLineHistory) and where the
@@ -68,6 +71,8 @@ type ArchiveRecoveryResult struct {
 	StopXid      uint32
 	StopIsCommit bool
 	StopXactTime int64
+	// StopName is the restore point a recovery_target_name stop was at.
+	StopName string
 	// StopPoint is where the recovered WAL ends at the target, as a PG
 	// position: the stop record's start, or its end when StopAfter.
 	StopPoint uint64
@@ -133,7 +138,22 @@ func RunArchiveRecovery(mgr *storage.Manager, dataDir, restoreCommand string, se
 // in_restore_command); either way the result wraps ErrRecoveryShutdown and
 // recovery is left unfinished. A *RestoreFatalError from a fetch aborts
 // recovery instead of ending it, as upstream's FATAL does.
-func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir string, restoreCommand func() string, segmentSize int64, target TargetTimeline, stop RecoveryStop) (ArchiveRecoveryResult, error) {
+// ArchiveReplayHooks are optional callbacks archive recovery invokes as it
+// replays. Xact gets every replayed commit or abort, subtransactions first
+// and then the top-level xid — xact_redo_commit / xact_redo_abort's clog
+// stamping (TransactionIdCommitTree), which goopg keeps in the live
+// transaction manager rather than in page replay. M0149-0021.
+type ArchiveReplayHooks struct {
+	Xact func(xid storage.TransactionID, committed bool)
+	// Prepare gets each replayed XLOG_XACT_PREPARE's end LSN and state
+	// buffer (xact_redo's PrepareRedoAdd), so the prepared transaction
+	// survives recovery; PreparedFinish gets the xid a COMMIT PREPARED or
+	// ABORT PREPARED ends (PrepareRedoRemove). M0149-0024.
+	Prepare        func(endLSN uint64, state []byte)
+	PreparedFinish func(xid storage.TransactionID)
+}
+
+func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir string, restoreCommand func() string, segmentSize int64, target TargetTimeline, stop RecoveryStop, hooks ...ArchiveReplayHooks) (ArchiveRecoveryResult, error) {
 	var res ArchiveRecoveryResult
 	walDir := filepath.Join(dataDir, "pg_wal")
 
@@ -148,7 +168,7 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 		}
 		segmentSize = detectSegmentSizeAt(walDir, firstSeg)
 		if segmentSize <= 0 {
-			segmentSize = DefaultSegmentSize
+			segmentSize = WALSegmentSize()
 		}
 	}
 
@@ -157,14 +177,44 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 	// (GetOldestRestartPoint — pg_control's checkPointCopy). Start-time
 	// recovery takes no restartpoints, so it is fixed for the whole pass.
 	lastRestartPointFname := XLogFileName(0, 0, segmentSize)
-	// CheckPointLoc: the latest checkpoint record (pg_control; goopg reads
-	// no backup_label at recovery), which must lie on the start timeline
+	// CheckPointLoc: the latest checkpoint record (pg_control, or
+	// backup_label's CHECKPOINT LOCATION), which must lie on the start timeline
 	// in the target's history.
 	var checkPointLoc uint64
+	// redoLSN is where replay starts (InitWalRecovery: checkPoint.redo
+	// from pg_control) — not the last checkpoint record of the first
+	// segment, which would skip whatever the archive holds between the
+	// backup's redo and that checkpoint (an XLOG_PARAMETER_CHANGE, for
+	// one). 0 keeps the goopg scan fallback when there is no pg_control.
+	var redoLSN uint64
 	if cd, err := control.ReadControlFile(dataDir); err == nil && cd != nil && cd.CheckPointCopyThisTLI != 0 {
 		startTLI = cd.CheckPointCopyThisTLI
 		checkPointLoc = cd.CheckPoint
+		redoLSN = cd.CheckPointCopyRedo
 		lastRestartPointFname = XLogFileName(cd.CheckPointCopyThisTLI, cd.CheckPointCopyRedo/uint64(segmentSize), segmentSize)
+	}
+	// read_backup_label (InitWalRecovery): a backup_label overrides
+	// pg_control's checkpoint — a low-level backup copies pg_control last,
+	// so its checkpoint may be later than the backup's start, and replay
+	// must begin at the label's redo or everything in between is lost.
+	label, haveLabel, err := ReadBackupLabel(dataDir)
+	if err != nil {
+		return res, err
+	}
+	// consistentAt is where archive recovery is consistent for
+	// recovery_target = 'immediate': pg_control's minimum recovery point or
+	// backup end, and never before the redo point.
+	consistentAt := redoLSN
+	if cd, err := control.ReadControlFile(dataDir); err == nil && cd != nil {
+		consistentAt = max(consistentAt, cd.MinRecoveryPoint, cd.BackupEndPoint)
+	}
+	if haveLabel {
+		redoLSN, checkPointLoc = label.StartLSN, label.CheckpointLSN
+		consistentAt = max(consistentAt, label.StartLSN)
+		if label.TLI != 0 {
+			startTLI = label.TLI
+		}
+		slog.Info(label.StartingBackupRecoveryMessage())
 	}
 	// have reports whether name was restored from the archive or, failing
 	// that, is in pg_wal — XLogFileReadAnyTLI tries XLOG_FROM_ARCHIVE
@@ -336,6 +386,10 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 	if highestSeg >= 0 {
 		seg = uint64(highestSeg)
 	}
+	if haveLabel {
+		seg = label.StartLSN / uint64(segmentSize) // the backup's redo segment
+	}
+	res.StartOfLog = seg * uint64(segmentSize)
 	curTLI := startTLI
 	for {
 		chosen := uint32(0)
@@ -378,33 +432,19 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 		// never "greater": xids are assigned at start, not in completion
 		// order) — ends recovery, before it or after applying it.
 		stopped := false
-		if stop.Set || stop.XidSet {
+		if stop.Set || stop.XidSet || stop.NameSet || stop.TimeSet || stop.Immediate {
 			for i, r := range records {
 				readRecPtr := r.StartLSN - 1 // 1-based internal start -> PG ReadRecPtr
-				hit := false
-				if stop.Set && readRecPtr >= stop.LSN {
-					hit = true
-					res.StopKind = StopAtLSN
-					res.StopLSN = readRecPtr
-				} else if stop.XidSet && r.XLog != nil && r.XLog.Header.Rmid == RmgrXact {
-					op := r.XLog.Header.Info & xlogXactOpMask
-					if (op == xlogXactCommit || op == xlogXactAbort) && r.XLog.Header.XID == stop.Xid {
-						hit = true
-						res.StopKind = StopAtXid
-						res.StopXid = r.XLog.Header.XID
-						res.StopIsCommit = op == xlogXactCommit
-						if len(r.XLog.MainData) >= 8 {
-							res.StopXactTime = int64(binary.LittleEndian.Uint64(r.XLog.MainData[:8]))
-						}
-					}
-				}
+				ev, hit := EvaluateRecoveryStop(stop, r, r.EndLSN >= consistentAt)
 				if !hit {
 					continue
 				}
+				after := ev.After
+				ev.fill(&res)
 				stopped = true
-				res.ReachedTarget, res.StopAfter = true, stop.Inclusive
+				res.ReachedTarget, res.StopAfter = true, after
 				res.StopPoint = readRecPtr
-				if stop.Inclusive {
+				if after {
 					res.StopPoint = r.EndLSN
 					records = records[:i+1]
 				} else {
@@ -414,8 +454,37 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 			}
 		}
 		if len(records) > 0 {
-			if _, err := ReplayRecords(mgr, records); err != nil {
+			if _, err := ReplayRecordsFrom(mgr, records, redoLSN); err != nil {
 				return res, fmt.Errorf("wal: archive recovery: replay segment %s: %w", FormatSegmentNameTLI(seg, chosen), err)
+			}
+			for _, h := range hooks {
+				for _, r := range records {
+					if r.EndLSN <= redoLSN {
+						continue // before the redo point: already in pg_xact
+					}
+					finishesPrepared := false
+					if r.XLog != nil && r.XLog.Header.Rmid == RmgrXact {
+						switch r.XLog.Header.Info & xlogXactOpMask {
+						case xlogXactPrepare:
+							if h.Prepare != nil {
+								h.Prepare(r.EndLSN, append([]byte(nil), r.XLog.MainData...))
+							}
+						case xlogXactCommitPrepared, xlogXactAbortPrepared:
+							finishesPrepared = true
+						}
+					}
+					if xid, committed, ok := replayedXactInfo(r); ok {
+						if h.Xact != nil {
+							for _, sub := range replayedSubxacts(r) {
+								h.Xact(sub, committed)
+							}
+							h.Xact(xid, committed)
+						}
+						if finishesPrepared && h.PreparedFinish != nil {
+							h.PreparedFinish(xid)
+						}
+					}
+				}
 			}
 			if last := records[len(records)-1]; last.EndLSN > res.EndOfLog {
 				res.EndOfLog, res.LastStart, res.EndTLI = last.EndLSN, last.StartLSN, chosen
@@ -437,6 +506,11 @@ type RecoveryStop struct {
 	LSN       uint64 // PG LSN (0-based)
 	XidSet    bool
 	Xid       uint32
+	NameSet   bool   // recovery_target_name
+	Name      string // a restore point (pg_create_restore_point)
+	TimeSet   bool   // recovery_target_time
+	Time      int64  // TimestampTz: microseconds since 2000-01-01
+	Immediate bool   // recovery_target = 'immediate'
 	Inclusive bool
 }
 
@@ -446,6 +520,9 @@ type StopKind int
 const (
 	StopAtLSN StopKind = iota + 1
 	StopAtXid
+	StopAtTime
+	StopAtName
+	StopAtImmediate
 )
 
 // StopReason is getRecoveryStopReason's text, which the promotion writes
@@ -460,8 +537,15 @@ func (r ArchiveRecoveryResult) StopReason() string {
 	if r.StopAfter {
 		when = "after"
 	}
-	if r.StopKind == StopAtXid {
+	switch r.StopKind {
+	case StopAtXid:
 		return fmt.Sprintf("%s transaction %d", when, r.StopXid)
+	case StopAtTime:
+		return fmt.Sprintf("%s %s", when, pgTimestampTzString(r.StopXactTime))
+	case StopAtName:
+		return fmt.Sprintf("at restore point \"%s\"", r.StopName)
+	case StopAtImmediate:
+		return "reached consistency"
 	}
 	return fmt.Sprintf("%s LSN %X/%X\n", when, uint32(r.StopLSN>>32), uint32(r.StopLSN))
 }
@@ -475,14 +559,17 @@ func (r ArchiveRecoveryResult) StopMessage() string {
 	if r.StopAfter {
 		when = "after"
 	}
-	if r.StopKind == StopAtXid {
+	switch r.StopKind {
+	case StopAtXid, StopAtTime:
 		what := "abort"
 		if r.StopIsCommit {
 			what = "commit"
 		}
-		const pgEpochUnixMicros = 946684800 * 1000000
-		t := time.UnixMicro(r.StopXactTime + pgEpochUnixMicros)
-		return fmt.Sprintf("recovery stopping %s %s of transaction %d, time %s", when, what, r.StopXid, t.Format("2006-01-02 15:04:05.999999-07"))
+		return fmt.Sprintf("recovery stopping %s %s of transaction %d, time %s", when, what, r.StopXid, pgTimestampTzString(r.StopXactTime))
+	case StopAtName:
+		return fmt.Sprintf("recovery stopping at restore point \"%s\", time %s", r.StopName, pgTimestampTzString(r.StopXactTime))
+	case StopAtImmediate:
+		return "recovery stopping after reaching consistency"
 	}
 	return fmt.Sprintf("recovery stopping %s WAL location (LSN) \"%X/%X\"", when, uint32(r.StopLSN>>32), uint32(r.StopLSN))
 }
@@ -505,8 +592,10 @@ func highestLocalSegment(walDir string) (int, error) {
 		if len(name) != 24 {
 			continue
 		}
-		// Extract segment number (last 8 hex digits).
-		if segNo, err := strconv.ParseUint(name[16:24], 16, 64); err == nil {
+		// The absolute segment number: log and segment-in-log, at the
+		// cluster's segment size (the low 8 hex digits alone wrap every
+		// 4 GB of WAL).
+		if _, segNo, ok := ParseXLogFileName(name, WALSegmentSize()); ok {
 			if int(segNo) > highest {
 				highest = int(segNo)
 			}
@@ -530,4 +619,95 @@ func ReadSegmentRecords(walDir string, segNo uint64, segmentSize int64) ([]Recor
 	}
 	baseOffset := segNo * uint64(segmentSize)
 	return readAllPageAware(stream, segmentSize, baseOffset)
+}
+
+// pgTimestampTzString is timestamptz_to_str for a TimestampTz (microseconds
+// since 2000-01-01) in the server's local zone.
+func pgTimestampTzString(ts int64) string {
+	const pgEpochUnixMicros = 946684800 * 1000000
+	return time.UnixMicro(ts + pgEpochUnixMicros).Format("2006-01-02 15:04:05.999999-07")
+}
+
+// StopEval is one record's recovery-target verdict: which target it reaches,
+// whether recovery stops after applying it (else before), and what
+// StopMessage / StopReason report.
+type StopEval struct {
+	Kind     StopKind
+	After    bool
+	LSN      uint64 // the record's PG ReadRecPtr (LSN targets)
+	Xid      uint32
+	IsCommit bool
+	Time     int64 // xact_time, or the restore point's time
+	Name     string
+}
+
+func (ev StopEval) fill(res *ArchiveRecoveryResult) {
+	res.StopKind = ev.Kind
+	switch ev.Kind {
+	case StopAtLSN:
+		res.StopLSN = ev.LSN
+	case StopAtXid, StopAtTime:
+		res.StopXid, res.StopIsCommit, res.StopXactTime = ev.Xid, ev.IsCommit, ev.Time
+	case StopAtName:
+		res.StopName, res.StopXactTime = ev.Name, ev.Time
+	}
+}
+
+// Result is the ArchiveRecoveryResult view of a reached target, for its
+// StopMessage and StopReason texts.
+func (ev StopEval) Result() ArchiveRecoveryResult {
+	res := ArchiveRecoveryResult{ReachedTarget: true, StopAfter: ev.After}
+	ev.fill(&res)
+	return res
+}
+
+// EvaluateRecoveryStop is recoveryStopsBefore and recoveryStopsAfter for one
+// record (xlogrecovery.c), shared by archive recovery and a standby's
+// continuous replay:
+//   - an LSN target stops at the first record whose ReadRecPtr reaches it,
+//     after it when recovery_target_inclusive, else before;
+//   - an xid target at that transaction's COMMIT or ABORT, likewise;
+//   - a time target at a transaction end: inclusive stops after one at
+//     exactly the target and before a later one, exclusive before one at or
+//     past it;
+//   - a name target after the matching XLOG_RESTORE_POINT;
+//   - 'immediate' after the record that makes recovery consistent.
+//
+// consistent reports whether recovery is consistent once r is applied.
+func EvaluateRecoveryStop(stop RecoveryStop, r Record, consistent bool) (StopEval, bool) {
+	readRecPtr := r.StartLSN - 1 // 1-based internal start -> PG ReadRecPtr
+	isXactEnd, isCommit, xactTime := false, false, int64(0)
+	if r.XLog != nil && r.XLog.Header.Rmid == RmgrXact {
+		op := r.XLog.Header.Info & xlogXactOpMask
+		if op == xlogXactCommit || op == xlogXactAbort {
+			isXactEnd, isCommit = true, op == xlogXactCommit
+			if len(r.XLog.MainData) >= 8 {
+				xactTime = int64(binary.LittleEndian.Uint64(r.XLog.MainData[:8]))
+			}
+		}
+	}
+	ev := StopEval{After: stop.Inclusive}
+	switch {
+	case stop.Set && readRecPtr >= stop.LSN:
+		ev.Kind, ev.LSN = StopAtLSN, readRecPtr
+	case stop.XidSet && isXactEnd && r.XLog.Header.XID == stop.Xid:
+		ev.Kind = StopAtXid
+	case stop.TimeSet && isXactEnd && xactTime >= stop.Time:
+		ev.Kind = StopAtTime
+		ev.After = stop.Inclusive && xactTime == stop.Time
+	case stop.NameSet:
+		name, rpTime, ok := RestorePointOf(r)
+		if !ok || name != stop.Name {
+			return ev, false
+		}
+		ev.Kind, ev.After, ev.Name, ev.Time = StopAtName, true, name, rpTime
+	case stop.Immediate && consistent:
+		ev.Kind, ev.After = StopAtImmediate, true
+	default:
+		return ev, false
+	}
+	if ev.Kind == StopAtXid || ev.Kind == StopAtTime {
+		ev.Xid, ev.IsCommit, ev.Time = r.XLog.Header.XID, isCommit, xactTime
+	}
+	return ev, true
 }

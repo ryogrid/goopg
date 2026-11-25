@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -81,7 +82,7 @@ type nailedAttr struct {
 var nailedSharedRels = flattenRels([]nailedRel{
 	{1262, "pg_database", 1248, 'r', 18, true, pgDatabaseAttrs()},
 	{1260, "pg_authid", 2842, 'r', 12, true, pgAuthidAttrs()},
-	{1261, "pg_auth_members", 2843, 'r', 5, true, pgAuthMembersAttrs()},
+	{1261, "pg_auth_members", 2843, 'r', 7, true, pgAuthMembersAttrs()},
 	// pg_shseclabel reltype must equal SharedSecLabelRelation_Rowtype_Id
 	// (4066) from postgres/src/include/catalog/pg_shseclabel_d.h. PG's
 	// formrdesc("pg_shseclabel", ...) call in
@@ -161,6 +162,16 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// setdatabase/setrole/setconfig). The empty 8 KiB heap at
 	// `global/2964` is produced by `bootstrapSharedCatalogPlaceholders`.
 	{2964, "pg_db_role_setting", 83, 'r', 3, true, pgDbRoleSettingAttrs()},
+	// M0149-0001c: pg_shdepend and pg_shdescription. Every database's pg_class
+	// carries a row for each shared catalog (genbki BKI_SHARED_RELATION); a
+	// PG 18.3 node reading a goopg directory opens both — CREATE DATABASE's
+	// copyTemplateDependencies scans pg_shdepend, COMMENT ON DATABASE and
+	// \l+ read pg_shdescription — and without the rows relation_open FATALs
+	// "could not open relation with OID 1214". Row types per
+	// pg_shdepend.h / pg_shdescription.h (PG 18.3: reltype 10060 / 10062,
+	// verified on a scratch initdb).
+	{1214, "pg_shdepend", 10060, 'r', 7, true, pgShdependAttrs()},
+	{2396, "pg_shdescription", 10062, 'r', 3, true, pgShdescriptionAttrs()},
 }, []idxSpec{
 	// M0106-0010 Step 3dh: pg_database_datname_index (OID 2671) is a
 	// 1-column UNIQUE btree on pg_database.datname (name_ops) — same
@@ -175,6 +186,10 @@ var nailedSharedRels = flattenRels([]nailedRel{
 		{Name: "datname", TypeOID: 19, Num: 1, Len: 64, NotNull: true},
 	}},
 	{OID: 2672, Name: "pg_database_oid_index"},
+	// M0149-0001c: pg_shdepend's two indexes and pg_shdescription's primary key.
+	{OID: 1232, Name: "pg_shdepend_depender_index"},
+	{OID: 1233, Name: "pg_shdepend_reference_index"},
+	{OID: 2397, Name: "pg_shdescription_o_c_index"},
 	// M0106-0010 Step 3dg: pg_authid_rolname_index (OID 2676) is a
 	// 1-column UNIQUE btree on pg_authid.rolname (name_ops). The
 	// default oid-stamped descriptor (attlen=4, attbyval=1) was wrong:
@@ -306,17 +321,22 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	{2603, "pg_amproc", 83, 'r', 6, false, pgAmprocAttrs()},
 	{2618, "pg_rewrite", 83, 'r', 8, false, pgRewriteAttrs()},
 	{2620, "pg_trigger", 83, 'r', 19, false, pgTriggerAttrs()},
-	{2615, "pg_namespace", 83, 'r', 5, false, pgNamespaceAttrs()},
+	// M0149-0001g: relnatts 5→4 and 8→7 / 5→4 below — the extra goopg-only
+	// columns (nspblocked, objversion, shared) made PG 18.3 form a row with
+	// fewer values than the descriptor and SIGSEGV in heap_form_tuple
+	// (PG-side CREATE TABLE → pg_depend, CREATE SCHEMA → pg_namespace,
+	// COMMENT → pg_description).
+	{2615, "pg_namespace", 83, 'r', 4, false, pgNamespaceAttrs()},
 	{2604, "pg_attrdef", 83, 'r', 4, false, pgAttrdefAttrs()},
 	{2606, "pg_constraint", 83, 'r', 28, false, pgConstraintAttrs()},
 	{2601, "pg_am", 83, 'r', 4, false, pgAmAttrs()},
-	{2617, "pg_operator", 83, 'r', 10, false, pgOperatorAttrs()},
+	{2617, "pg_operator", 83, 'r', 15, false, pgOperatorAttrs()},
 	{3456, "pg_collation", 83, 'r', 12, false, pgCollationAttrs()},
-	{2611, "pg_inherits", 83, 'r', 3, false, pgInheritsAttrs()},
+	{2611, "pg_inherits", 83, 'r', 4, false, pgInheritsAttrs()},
 	{2612, "pg_language", 83, 'r', 9, false, pgLanguageAttrs()},
 	{2602, "pg_amop", 83, 'r', 9, false, pgAmopAttrs()},
-	{2609, "pg_description", 83, 'r', 5, false, pgDescriptionAttrs()},
-	{2608, "pg_depend", 83, 'r', 8, false, pgDependAttrs()},
+	{2609, "pg_description", 83, 'r', 4, false, pgDescriptionAttrs()},
+	{2608, "pg_depend", 83, 'r', 7, false, pgDependAttrs()},
 	// M0106-0010 step 3w: pg_aggregate is opened during InitPostgres'
 	// `find_inheritance_children → table_open(AggregateRelationId)` path.
 	// Without a pg_class row, PG FATALs with
@@ -702,6 +722,13 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	// a seq scan answers the view and nothing ever needs the index —
 	// ledgered, not assumed.
 	{3256, "pg_policy", 83, 'r', 8, false, pgPolicyAttrs()},
+	// M0149-0001g slice 3: pg_init_privs (InitPrivsRelationId 3394,
+	// pg_init_privs.h; reltype 10090 from a PG 18.3 initdb). Every DROP runs
+	// RemoveRoleFromInitPriv / recordExtObjInitPriv lookups through it, so a
+	// PG node over a goopg directory failed every DROP with "could not open
+	// relation with OID 3394". The heap starts empty (PG's initdb stores 229
+	// rows for built-in objects; ledgered).
+	{3394, "pg_init_privs", 10090, 'r', 5, false, pgInitPrivsAttrs()},
 	// M0131-S9.3f: pg_seclabel and pg_largeobject_metadata are S9.3e's
 	// construction repeated, and for the last view that needs it. The
 	// `pg_seclabels` view (12099) is a 13-branch UNION ALL whose local half
@@ -722,8 +749,8 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	// (relcache.c:4075-4083), so the Phase3 `rd_att->tdtypeid ==
 	// relp->reltype` assertion (relcache.c:4293) does not fire.
 	//
-	// pg_largeobject (2613) is deliberately NOT added even though the view
-	// names it: the reference is `l.classoid = 'pg_catalog.pg_largeobject'
+	// pg_largeobject (2613) was at first deliberately NOT added even though
+	// the view names it (it is now, M0149-0001g slice 30, below): the reference is `l.classoid = 'pg_catalog.pg_largeobject'
 	// ::regclass`, which upstream's CREATE VIEW already folded to a Const 2613
 	// inside the captured ev_action, so nothing resolves the name at run time.
 	// As with pg_policy, the declared companions are not bootstrapped either
@@ -737,6 +764,12 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	// freshly initdb'd PG 18.3's own pg_attribute.
 	{3596, "pg_seclabel", 83, 'r', 5, false, pgSecLabelAttrs()},
 	{2995, "pg_largeobject_metadata", 83, 'r', 3, false, pgLargeObjectMetadataAttrs()},
+	// M0149-0001g slice 30: pg_largeobject itself (LargeObjectRelationId 2613,
+	// pg_largeobject.h) with its index 2683. Without it a PG node's lo_create /
+	// lo_import / lo_put failed "could not open relation with OID 2613", and
+	// the bootstrap rowtype 10025 named a pg_class row that did not exist.
+	// The heap is empty, as on a fresh PG cluster.
+	{2613, "pg_largeobject", 83, 'r', 3, false, pgLargeObjectAttrs()},
 	// M0106-0010 Step 3dl: pg_stat_wal_receiver — first relkind='v' (view)
 	// entry seeded into the bootstrap pg_class heap. After Steps 3dj/3dk
 	// landed pg_proc OID 3317 (`pg_stat_get_wal_receiver`) with its 15
@@ -798,7 +831,12 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	{OID: 2678, Name: "pg_index_indrelid_index"},
 	{OID: 2679, Name: "pg_index_indexrelid_index"},
 	{OID: 2687, Name: "pg_opclass_oid_index"},
-	{OID: 2655, Name: "pg_amproc_oid_index"},
+	{OID: 2655, Name: "pg_amproc_fam_proc_index"}, // PG 18.3 name; 2757 is pg_amproc_oid_index (M0149-0001g slice 27)
+	// M0149-0001d: pg_rewrite_oid_index had a pg_index entry and a file but no
+	// pg_class row; once pg_rewrite carries relhasindex = true, PG's
+	// RelationGetIndexList opens it and failed "could not open relation with
+	// OID 2692".
+	{OID: 2692, Name: "pg_rewrite_oid_index"},
 	{OID: 2693, Name: "pg_rewrite_rel_rulename_index"},
 	{OID: 2701, Name: "pg_trigger_tgrelid_tgname_index"},
 	{OID: 2667, Name: "pg_constraint_oid_index"},
@@ -839,6 +877,28 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	{OID: 2656, Name: "pg_attrdef_adrelid_adnum_index"},
 	{OID: 2657, Name: "pg_attrdef_oid_index"},
 	{OID: 2680, Name: "pg_inherits_relid_seqno_index"},
+	// M0149-0001g: indexes the bootstrap image lacked.
+	{OID: 2187, Name: "pg_inherits_parent_index"},
+	{OID: 2673, Name: "pg_depend_depender_index"},
+	{OID: 2674, Name: "pg_depend_reference_index"},
+	{OID: 2675, Name: "pg_description_o_c_o_index"},
+	{OID: 2664, Name: "pg_constraint_conname_nsp_index"},
+	{OID: 2579, Name: "pg_constraint_conparentid_index"},
+	// M0149-0001g slice 3.
+	{OID: 2699, Name: "pg_trigger_tgconstraint_index"},
+	{OID: 2702, Name: "pg_trigger_oid_index"},
+	{OID: 2996, Name: "pg_largeobject_metadata_oid_index"},
+	{OID: 2683, Name: "pg_largeobject_loid_pn_index"}, // slice 30
+	{OID: 3257, Name: "pg_policy_oid_index"},
+	{OID: 3258, Name: "pg_policy_polrelid_polname_index"},
+	{OID: 3597, Name: "pg_seclabel_object_index"},
+	{OID: 3395, Name: "pg_init_privs_o_c_o_index"},
+	// M0149-0001g slice 4.
+	{OID: 2651, Name: "pg_am_name_index"},
+	{OID: 2652, Name: "pg_am_oid_index"},
+	{OID: 2756, Name: "pg_amop_oid_index"},
+	{OID: 2757, Name: "pg_amproc_oid_index"},
+	{OID: 3455, Name: "pg_class_tblspc_relfilenode_index"},
 	// M0106-0010 batched-36 loop 5: pg_namespace_nspname_index (OID 2684)
 	// is a 1-column UNIQUE btree on pg_namespace.nspname (name_ops) — same
 	// shape as pg_authid_rolname_index (Step 3dg) and pg_database_datname_index
@@ -2049,9 +2109,9 @@ func buildPgClassBlob(rel nailedRel) []byte {
 	copy(buf[4:4+pgNameDataLen], []byte(rel.RelName))
 	// relnamespace (offset 68): PGNSP=11
 	le.PutUint32(buf[68:72], 11)
-	// reltype (offset 72)
-	if rel.RelType != 0 {
-		le.PutUint32(buf[72:76], rel.RelType)
+	// reltype (offset 72): same value as the pg_class heap row (pgClassRelType).
+	if rt := pgClassRelType(rel); rt != 0 {
+		le.PutUint32(buf[72:76], rt)
 	}
 	// relowner (offset 80): bootstrap superuser = 10
 	le.PutUint32(buf[80:84], 10)
@@ -2093,10 +2153,13 @@ func buildPgClassBlob(rel nailedRel) []byte {
 	// relispopulated (offset 129): true
 	buf[129] = 1
 	// relispartition (offset 131): false
-	// relfrozenxid (offset 136): 3 (FirstNormalTransactionId)
-	le.PutUint32(buf[136:140], 3)
-	// relminmxid (offset 140): 1 (FirstMultiXactId)
-	le.PutUint32(buf[140:144], 1)
+	// relfrozenxid (offset 136) / relminmxid (offset 140): FirstNormal-
+	// TransactionId / FirstMultiXactId for heaps; InvalidTransactionId for
+	// indexes and views, as PG's heap_create leaves them (it must equal the
+	// on-disk pg_class row — executor.PGClassFrozenIDs).
+	fx, fm := executor.PGClassFrozenIDs(string(rune(rel.RelKind)))
+	le.PutUint32(buf[136:140], uint32(fx))
+	le.PutUint32(buf[140:144], uint32(fm))
 
 	return buf
 }
@@ -2140,7 +2203,7 @@ func buildPgAttributeBlob(a nailedAttr) []byte {
 		buf[86] = 1
 	}
 	buf[82] = pgTypeIsByVal(a.TypeOID) // attbyval
-	buf[83] = pgAlignChar(a.Len)         // attalign
+	buf[83] = pgAttrAlignChar(a)         // attalign
 	buf[84] = 'p'                       // attstorage = 'p' (plain)
 	buf[92] = 1                  // attislocal = true
 	if a.IsDropped {
@@ -2151,15 +2214,30 @@ func buildPgAttributeBlob(a nailedAttr) []byte {
 }
 
 // pgTypeIsByVal returns 1 if the PG type OID is pass-by-value, 0 otherwise.
+// pgTypeIsByVal is the init-file twin of pgTypeByVal and delegates to it, so
+// the relcache init file and the pg_attribute heap rows cannot disagree on
+// attbyval (they had: regproc, pg_lsn, timestamptz and others were by-value in
+// one and not the other). PG's fetchatt treats a by-reference 8-byte value as a
+// pointer, so this is a correctness property. M0149-0001g slice 17.
 func pgTypeIsByVal(oid uint32) byte {
-	switch oid {
-	case 16, 18, 21, 23, 26, 28, 700, 20, 701:
+	if pgTypeByVal(oid) {
 		return 1
 	}
 	return 0
 }
 
 // pgAlignChar returns the PG alignment character for a given attlen.
+// pgAttrAlignChar is a nailed attribute's attalign: the fixed-length rule of
+// pgAlignChar, but for a varlena the type's own typalign (pgTypeAlignChar) —
+// a varlena is not uniformly 'i': _aclitem, anyarray and _pg_statistic are 'd'
+// (M0149-0001g slice 13; the init-file descriptor must agree with pg_attribute).
+func pgAttrAlignChar(a nailedAttr) byte {
+	if a.Len == -1 {
+		return pgTypeAlignChar(a.TypeOID)[0]
+	}
+	return pgAlignChar(a.Len)
+}
+
 func pgAlignChar(l int16) byte {
 	switch {
 	case l == 1:
@@ -2233,6 +2311,11 @@ func pgAuthMembersAttrs() []nailedAttr {
 		{Name: "member", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
 		{Name: "grantor", TypeOID: 26, Num: 4, Len: 4, NotNull: true},
 		{Name: "admin_option", TypeOID: 16, Num: 5, Len: 1, NotNull: true},
+		// inherit_option / set_option (PG 16+): goopg's writer (executor
+		// sys_pg_auth_members.go) always stored them; the descriptor lacked
+		// them until M0149-0001g slice 9.
+		{Name: "inherit_option", TypeOID: 16, Num: 6, Len: 1, NotNull: true},
+		{Name: "set_option", TypeOID: 16, Num: 7, Len: 1, NotNull: true},
 	}
 }
 
@@ -2781,7 +2864,7 @@ func pgAmAttrs() []nailedAttr {
 	return []nailedAttr{
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
 		{Name: "amname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},
-		{Name: "amhandler", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
+		{Name: "amhandler", TypeOID: 24, Num: 3, Len: 4, NotNull: true}, // regproc (pg_am.h)
 		// M0106-0010 step 2: PG18 FormData_pg_am declares 4 columns.
 		// Heap-tuple seed in initdb writes a 1-byte char at the
 		// trailing slot; the init file's TupleDesc must agree.
@@ -2801,6 +2884,15 @@ func pgOperatorAttrs() []nailedAttr {
 		{Name: "oprleft", TypeOID: 26, Num: 8, Len: 4, NotNull: true},
 		{Name: "oprright", TypeOID: 26, Num: 9, Len: 4, NotNull: true},
 		{Name: "oprresult", TypeOID: 26, Num: 10, Len: 4, NotNull: true},
+		// oprcom … oprjoin: bootstrapPgOperatorTuples always wrote all 15
+		// columns, but the descriptor stopped at oprresult, so a PG node on a
+		// goopg directory reported `column "oprcode" does not exist`
+		// (M0149-0001g slice 9).
+		{Name: "oprcom", TypeOID: 26, Num: 11, Len: 4, NotNull: true},
+		{Name: "oprnegate", TypeOID: 26, Num: 12, Len: 4, NotNull: true},
+		{Name: "oprcode", TypeOID: 24, Num: 13, Len: 4, NotNull: true},
+		{Name: "oprrest", TypeOID: 24, Num: 14, Len: 4, NotNull: true},
+		{Name: "oprjoin", TypeOID: 24, Num: 15, Len: 4, NotNull: true},
 	}
 }
 
@@ -2809,6 +2901,7 @@ func pgInheritsAttrs() []nailedAttr {
 		{Name: "inhrelid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
 		{Name: "inhparent", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
 		{Name: "inhseqno", TypeOID: 23, Num: 3, Len: 4, NotNull: true},
+		{Name: "inhdetachpending", TypeOID: 16, Num: 4, Len: 1, NotNull: true}, // written by sys_pg_inherits.go; descriptor gained it in M0149-0001g slice 9
 	}
 }
 
@@ -2911,7 +3004,6 @@ func pgNamespaceAttrs() []nailedAttr {
 		{Name: "nspname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},
 		{Name: "nspowner", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
 		{Name: "nspacl", TypeOID: 1034, Num: 4, Len: -1},
-		{Name: "nspblocked", TypeOID: 16, Num: 5, Len: 1},
 	}
 }
 
@@ -2946,7 +3038,6 @@ func pgDescriptionAttrs() []nailedAttr {
 		{Name: "classoid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
 		{Name: "objsubid", TypeOID: 23, Num: 3, Len: 4, NotNull: true},
 		{Name: "description", TypeOID: 25, Num: 4, Len: -1, NotNull: true},
-		{Name: "shared", TypeOID: 16, Num: 5, Len: 1, NotNull: true},
 	}
 }
 
@@ -2959,7 +3050,6 @@ func pgDependAttrs() []nailedAttr {
 		{Name: "refobjid", TypeOID: 26, Num: 5, Len: 4, NotNull: true},
 		{Name: "refobjsubid", TypeOID: 23, Num: 6, Len: 4, NotNull: true},
 		{Name: "deptype", TypeOID: 18, Num: 7, Len: 1, NotNull: true},
-		{Name: "objversion", TypeOID: 28, Num: 8, Len: 4, NotNull: true},
 	}
 }
 
@@ -3288,6 +3378,17 @@ func pgSecLabelAttrs() []nailedAttr {
 // It DOES have an `oid` system column, so attnum 1 is oid. `lomacl` is
 // aclitem[] (1034) and is the only nullable column — a large object with
 // default privileges stores NULL there.
+// pgLargeObjectAttrs is FormData_pg_largeobject (pg_largeobject.h): loid,
+// pageno, data — all NOT NULL; data is bytea, stored inline or TOAST-less
+// ('x' storage, no TOAST table declared). M0149-0001g slice 30.
+func pgLargeObjectAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "loid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
+		{Name: "pageno", TypeOID: 23, Num: 2, Len: 4, NotNull: true},
+		{Name: "data", TypeOID: 17, Num: 3, Len: -1, NotNull: true},
+	}
+}
+
 func pgLargeObjectMetadataAttrs() []nailedAttr {
 	return []nailedAttr{
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},        // oid (system column)
@@ -3570,6 +3671,40 @@ func pgDbRoleSettingAttrs() []nailedAttr {
 		{Name: "setdatabase", TypeOID: 26, Num: 1, Len: 4, NotNull: true},   // oid (0 ⇒ role-specific)
 		{Name: "setrole", TypeOID: 26, Num: 2, Len: 4, NotNull: true},       // oid (0 ⇒ database-specific)
 		{Name: "setconfig", TypeOID: 1009, Num: 3, Len: -1, NotNull: false}, // text[] (CATALOG_VARLEN, nullable)
+	}
+}
+
+// pgInitPrivsAttrs is FormData_pg_init_privs (postgres/src/include/catalog/pg_init_privs.h).
+func pgInitPrivsAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "objoid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
+		{Name: "classoid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
+		{Name: "objsubid", TypeOID: 23, Num: 3, Len: 4, NotNull: true},
+		{Name: "privtype", TypeOID: 18, Num: 4, Len: 1, NotNull: true},
+		{Name: "initprivs", TypeOID: 1034, Num: 5, Len: -1, NotNull: true},
+	}
+}
+
+// pgShdependAttrs is FormData_pg_shdepend (postgres/src/include/catalog/pg_shdepend.h).
+func pgShdependAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "dbid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
+		{Name: "classid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
+		{Name: "objid", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
+		{Name: "objsubid", TypeOID: 23, Num: 4, Len: 4, NotNull: true},
+		{Name: "refclassid", TypeOID: 26, Num: 5, Len: 4, NotNull: true},
+		{Name: "refobjid", TypeOID: 26, Num: 6, Len: 4, NotNull: true},
+		{Name: "deptype", TypeOID: 18, Num: 7, Len: 1, NotNull: true},
+	}
+}
+
+// pgShdescriptionAttrs is FormData_pg_shdescription
+// (postgres/src/include/catalog/pg_shdescription.h).
+func pgShdescriptionAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "objoid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
+		{Name: "classoid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
+		{Name: "description", TypeOID: 25, Num: 3, Len: -1, NotNull: true, Collation: 950},
 	}
 }
 

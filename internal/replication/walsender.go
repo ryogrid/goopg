@@ -34,12 +34,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"log/slog"
 
 	"github.com/goopg/goopg/internal/backup"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/libpq"
 	"github.com/goopg/goopg/internal/utils/errcodes"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
@@ -53,6 +55,11 @@ import (
 type Config struct {
 	// Logger receives walsender lifecycle events. nil means slog.Default().
 	Logger *slog.Logger
+	// Stopping, when closed, tells physical walsenders the server is
+	// shutting down after its shutdown checkpoint: send the remaining WAL,
+	// wait for the standby to confirm its flush, end the stream
+	// (WalSndDone). nil never closes.
+	Stopping <-chan struct{}
 	// Catalog and PubSub scope the logical walsender's relation lookups and
 	// publication membership. nil PubSub disables logical replication.
 	Catalog catalog.Catalog
@@ -96,6 +103,25 @@ type Handler struct {
 	// bb serves the BASE_BACKUP verb. nil makes that one command report
 	// feature_not_supported while every other verb keeps working.
 	bb *backup.Handler
+	// streams counts physical walsenders currently streaming, so a shutdown
+	// can wait for them to finish sending (WaitStreams).
+	streams sync.WaitGroup
+}
+
+// WaitStreams waits up to timeout for every streaming physical walsender
+// to end its stream; it reports whether they all did.
+func (s *Handler) WaitStreams(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		s.streams.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // NewHandler returns a Handler. werr must be non-nil in production; see
@@ -149,8 +175,13 @@ func extractCString(buf []byte) (string, error) {
 // likely dead); SQLSTATE-level command failures are reported via
 // ErrorResponse and still return (true, nil).
 // dbBound reports a database-bound walsender (replication=database,
-// am_db_walsender); IDENTIFY_SYSTEM then names dbName.
-func (s *Handler) HandleCommand(ctx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, payload []byte, appName, dbName string, dbBound bool) (bool, error) {
+// am_db_walsender); IDENTIFY_SYSTEM then names dbName. procNum is the
+// connection's ProcArray slot, which keys its session-level backup state.
+// stmtCtx is the command's own context — cancelled by a CancelRequest
+// (pg_cancel_backend) — and pid the backend pid; BASE_BACKUP runs under
+// stmtCtx and reports progress under pid (M0149-0077l). Streaming commands
+// keep the connection ctx.
+func (s *Handler) HandleCommand(ctx, stmtCtx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, payload []byte, appName, dbName string, dbBound bool, procNum, pid int32) (bool, error) {
 	q, err := extractCString(payload)
 	if err != nil {
 		return false, nil // let the regular handler emit the error
@@ -179,7 +210,13 @@ func (s *Handler) HandleCommand(ctx context.Context, r *libpq.FrameReader, w *li
 			return true, s.writeQueryError(w, errcodes.FeatureNotSupported,
 				"BASE_BACKUP is not configured on this server")
 		}
-		return true, s.bb.ReplyBaseBackup(ctx, w, args)
+		// SendBaseBackup: a session that called pg_backup_start cannot also
+		// run BASE_BACKUP. M0149-0077k.
+		if executor.SessionBackupRunning(procNum) {
+			return true, s.writeQueryError(w, errcodes.ObjectNotInPrerequisiteState,
+				"a backup is already in progress in this session")
+		}
+		return true, s.bb.ReplyBaseBackup(stmtCtx, w, args, pid)
 	}
 	return false, nil
 }
@@ -620,7 +657,7 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 	}
 	segSize := s.cfg.WALSegmentSize
 	if segSize <= 0 {
-		segSize = xlog.DefaultSegmentSize
+		segSize = xlog.WALSegmentSize()
 	}
 
 	it, err := xlog.NewRecordIterator(s.cfg.WAL, walDir, segSize, args.StartLSN)
@@ -652,8 +689,17 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 	// connection drops so a disconnected standby no longer counts toward
 	// the FIRST/ANY quorum. Empty appName is harmless (ForgetStandby
 	// removes the "" key, which never matches any rule entry).
-	if s.cfg.SyncRep != nil && appName != "" {
-		defer s.cfg.SyncRep.ForgetStandby(appName)
+	s.streams.Add(1)
+	defer s.streams.Done()
+	// The walsender takes a SyncRep slot (WalSndCtl->walsnds) and frees it
+	// on exit, so a disconnected standby no longer counts toward
+	// synchronous_standby_names and the next one reuses the lowest slot.
+	if s.cfg.SyncRep != nil {
+		syncStandby := s.cfg.SyncRep.RegisterStandby(appName)
+		defer syncStandby.Release()
+		if senderHandle != nil {
+			senderHandle.SetSyncStandby(syncStandby)
+		}
 	}
 	defer func() {
 		if s.cfg.Logger == nil {
@@ -726,6 +772,8 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 				recErrCh <- err
 				return
 			}
+			// WALRead's pg_stat_io accounting (IOOP_READ on wal). M0149-0077d.
+			executor.CountWALSenderRead(int(chunk.EndLSN - chunk.StartLSN))
 			select {
 			case chunkCh <- chunk:
 			case <-streamCtx.Done():
@@ -735,8 +783,26 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 		}
 	}()
 
+	// Shutdown (WalSndInitStopping → WalSndDone): once the server has
+	// written its shutdown checkpoint it closes Stopping; the walsender then
+	// sends whatever WAL is left, waits for the standby to confirm it has
+	// flushed it, and ends the stream with CopyDone.
+	stopping := s.cfg.Stopping
+	draining := false
+	var drainExpired <-chan time.Time
+	sentPtr := args.StartLSN
 	for {
+		if draining && sentPtr >= s.cfg.WAL.FlushedLSN() {
+			return s.walSndDone(w, senderHandle, sentPtr, receiveDone, streamCancel)
+		}
 		select {
+		case <-stopping:
+			stopping = nil
+			draining = true
+			drainExpired = time.After(10 * time.Second)
+			continue
+		case <-drainExpired:
+			return s.walSndDone(w, senderHandle, sentPtr, receiveDone, streamCancel)
 		case <-streamCtx.Done():
 			<-receiveDone
 			if clientSentCopyDone {
@@ -781,6 +847,7 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 			if senderHandle != nil {
 				senderHandle.SetSentLSN(chunk.EndLSN)
 			}
+			sentPtr = max(sentPtr, chunk.EndLSN)
 			if hist.set && chunk.EndLSN >= hist.validUpto {
 				return s.finishHistoricCopy(w, hist, receiveDone, &clientSentCopyDone, streamCancel)
 			}
@@ -929,11 +996,67 @@ func (s *Handler) handleStandbyCopyData(slotName string, payload []byte, senderH
 		// M0102-0005: feed the SyncRep wait primitive so any commit
 		// blocking on this standby gets released as soon as the
 		// acknowledged LSN reaches the commit target.
-		if syncRep != nil && appName != "" {
+		if h := senderHandle.SyncStandby(); h != nil {
+			h.Update(st.WriteLSN, st.FlushLSN, st.ApplyLSN)
+		} else if syncRep != nil && appName != "" {
 			syncRep.UpdateStandbyProgress(appName, st.WriteLSN, st.FlushLSN, st.ApplyLSN)
 		}
 	}
+	if kind == libpq.ReplMsgHotStandbyFeedback {
+		hs := parsed.(*libpq.HotStandbyFeedback)
+		s.processHSFeedback(slotName, hs)
+	}
 	return nil
+}
+
+// processHSFeedback is ProcessStandbyHSFeedbackMessage for a physical slot:
+// the standby's reported xmin and catalog_xmin become the slot's
+// (PhysicalReplicationSlotNewXmin), so pg_replication_slots shows them and
+// the vacuum horizon (Slots.MinXmin via the transaction manager) keeps the
+// row versions the standby's queries still need. A value that is not a
+// normal xid (< FirstNormalTransactionId) is stored as invalid; both invalid
+// — the standby turned hot_standby_feedback off — clears the slot's
+// horizon. M0149-0077i.
+func (s *Handler) processHSFeedback(slotName string, hs *libpq.HotStandbyFeedback) {
+	if slotName == "" || s.cfg.Slots == nil {
+		return
+	}
+	normal := func(x uint32) uint64 {
+		if x < 3 { // FirstNormalTransactionId
+			return 0
+		}
+		return uint64(x)
+	}
+	_ = s.cfg.Slots.SetPhysicalXmins(slotName, normal(hs.Xmin), normal(hs.CatalogXmin))
+}
+
+// walSndDone is WalSndDone: with all WAL sent, wait (bounded, like
+// wal_sender_timeout) until the standby reports it has flushed up to
+// sentPtr, then end the COPY stream so the standby sees a clean end of
+// streaming rather than a dropped connection.
+func (s *Handler) walSndDone(w *libpq.FrameWriter, senderHandle *xlog.Sender, sentPtr uint64, receiveDone <-chan struct{}, streamCancel context.CancelFunc) error {
+	// WalSndDone asks for a reply (WalSndKeepalive(true, …)) so the standby
+	// reports its flush now instead of at its next status interval.
+	if senderHandle != nil && senderHandle.FlushLSN() < sentPtr {
+		if err := w.WriteCopyData(libpq.EncodeKeepalive(sentPtr, time.Now().UTC(), true)); err == nil {
+			_ = w.Flush()
+		}
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for senderHandle != nil && senderHandle.FlushLSN() < sentPtr && time.Now().Before(deadline) {
+		select {
+		case <-receiveDone:
+			streamCancel()
+			return nil
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	err := w.WriteCopyDone()
+	if err == nil {
+		err = w.Flush()
+	}
+	streamCancel()
+	return err
 }
 
 // walsenderClientAddr returns a best-effort `host:port` string for

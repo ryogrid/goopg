@@ -57,9 +57,11 @@ func TestPgRewriteInitialEntriesContainsPgStatWalReceiverReturn(t *testing.T) {
 	// and a rule with no view is an ev_class dangling into nothing.
 	// M0131-S9.1: the count is the pinned-view count (29 and growing), not
 	// the original literal 6. M0133-S4: plus the information_schema views.
-	if len(entries) != len(systemViewOIDPins())+len(informationSchemaViewOIDPins()) {
-		t.Fatalf("pgRewriteInitialEntries: %d rows, want %d (one per pinned view)",
-			len(entries), len(systemViewOIDPins())+len(informationSchemaViewOIDPins()))
+	// M0149-0001g slice 32: plus pg_settings' two non-_RETURN rules.
+	want := len(systemViewOIDPins()) + len(informationSchemaViewOIDPins()) + len(pgRewriteInitdbRules)
+	if len(entries) != want {
+		t.Fatalf("pgRewriteInitialEntries: %d rows, want %d (one _RETURN per pinned view + %d initdb rules)",
+			len(entries), want, len(pgRewriteInitdbRules))
 	}
 	// M0131-S9.0: the rows come from the manifest in capture order, so the
 	// wal_receiver entry is no longer index 0. Look it up by view instead of

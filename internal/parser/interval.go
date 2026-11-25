@@ -834,7 +834,9 @@ func ParseIntervalBodyWithDefault(body, defaultUnit string) (months, days int32,
 	if mo, d, mu, isInf := IntervalInfinitySentinel(body); isInf {
 		return mo, d, mu, true
 	}
-	if mo, d, mu, fok := decodeIntervalFields(body, defaultUnit); fok {
+	// ParseDateTime skips stray punctuation such as the `@` of the verbose output
+	// style, which may precede every field.
+	if mo, d, mu, fok := decodeIntervalFields(strings.ReplaceAll(body, "@", " "), defaultUnit); fok {
 		return mo, d, mu, true
 	}
 	// PostgreSQL feeds the ORIGINAL (untrimmed) string to DecodeISO8601Interval,
@@ -1131,6 +1133,25 @@ func decodeISO8601Interval(str string) (months, days int32, micros int64, ok boo
 //
 // Returns ok=false for any body that doesn't decompose cleanly.
 func decodeIntervalFields(body, defaultUnit string) (months, days int32, micros int64, ok bool) {
+	// "ago" negates every field and may only be the last one (DecodeInterval's
+	// AGO case and its final is_before block).
+	if words := strings.Fields(body); len(words) > 1 && strings.EqualFold(words[len(words)-1], "ago") {
+		rest := words[:len(words)-1]
+		// AGO leaves the field type at 0, so a bare number before it, or a
+		// second "ago", has no unit to take and is a bad format.
+		last := rest[len(rest)-1]
+		if strings.EqualFold(last, "ago") {
+			return 0, 0, 0, false
+		}
+		if _, err := strconv.ParseFloat(last, 64); err == nil {
+			return 0, 0, 0, false
+		}
+		months, days, micros, ok = decodeIntervalFields(strings.Join(rest, " "), defaultUnit)
+		if !ok || months == math.MinInt32 || days == math.MinInt32 || micros == math.MinInt64 {
+			return 0, 0, 0, false
+		}
+		return -months, -days, -micros, true
+	}
 	// Expand glued `<magnitude><unit>` fields (`2h30m`, `1.5h`, `1y2mon`) into
 	// separate tokens first, so the field loop below sees the same token stream
 	// whether the literal was written glued or spaced. expandIntervalFields

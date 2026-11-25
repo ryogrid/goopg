@@ -78,6 +78,8 @@
                                         # (change requires restart)
 #dynamic_shared_memory_type = posix     # posix | sysv | mmap; accepted,
                                         # goopg allocates no DSM segments
+#subtransaction_buffers = 0             # pg_subtrans buffers (0 = auto); accepted,
+                                        # goopg has no pg_subtrans SLRU pool
 #transaction_buffers = 0                # CLOG SLRU page-cache buffers;
                                         # 0 = auto from shared_buffers
                                         # (change requires restart)
@@ -125,6 +127,10 @@
 
 #wal_level = replica                    # minimal | replica | logical
                                         # (change requires restart)
+#wal_log_hints = off                    # also do full page writes of non-critical
+                                        # updates; accepted, goopg ignores it
+#wal_skip_threshold = 2MB               # in kB; accepted, goopg WAL-logs every
+                                        # relation change at every wal_level
 #wal_buffers = -1                       # min 32kB, -1 sets based on shared_buffers
                                         # (change requires restart)
                                         # (change requires restart)
@@ -161,6 +167,13 @@
 
 # - Archive Recovery -
 
+#recovery_target = ''		# 'immediate' to end recovery as soon as a
+				# consistent state is reached
+				# (change requires restart)
+#recovery_target_name = ''	# the named restore point to which recovery will proceed
+				# (change requires restart)
+#recovery_target_time = ''	# the time stamp up to which recovery will proceed
+				# (change requires restart)
 #recovery_target_xid = ''	# the transaction ID up to which recovery will proceed
 				# (change requires restart)
 #recovery_target_lsn = ''	# the WAL LSN up to which recovery will proceed
@@ -187,6 +200,8 @@
                                         # (change requires restart)
 #wal_sender_timeout = 60s               # 0-1073741824 ms; 0 disables timeout
                                         # (SIGHUP to apply)
+#wal_keep_size = 0                      # in megabytes; 0 disables
+                                        # (SIGHUP to apply)
 #max_slot_wal_keep_size = -1            # -1 to 2147483647 MB; -1 = no limit
                                         # (SIGHUP to apply)
 #synchronous_standby_names = ''         # standby selection grammar;
@@ -195,6 +210,20 @@
 #summarize_wal = off                    # toggles the WAL-summarizer worker
                                         # (SIGHUP to apply)
 #wal_summary_keep_time = 14400          # in minutes (10 days); 0 disables removal
+
+# - Archiving -
+
+#archive_mode = off                     # enables archiving; off, on, or always
+                                        # (change requires restart)
+#archive_library = ''                   # library to use to archive a WAL file
+                                        # (empty string indicates archive_command should
+                                        # be used)
+#archive_command = ''                   # command to use to archive a WAL file
+                                        # placeholders: %p = path of file to archive
+                                        #               %f = file name only
+                                        # e.g. 'test ! -f /mnt/server/archivedir/%f && cp %p /mnt/server/archivedir/%f'
+#archive_timeout = 0                    # force a WAL file switch after this
+                                        # number of seconds; 0 disables
 
 # - Standby Servers -
 
@@ -215,6 +244,13 @@
                                         # (SIGHUP to apply)
 #hot_standby = on                       # allow read-only queries during recovery
                                         # (change requires restart)
+#hot_standby_feedback = off             # send info from standby to prevent query conflicts
+                                        # (SIGHUP to apply)
+#wal_retrieve_retry_interval = 5000     # time to wait (ms) before retrying to
+                                        # retrieve WAL after a failed attempt
+                                        # (SIGHUP to apply)
+#recovery_min_apply_delay = 0           # minimum delay for applying changes during recovery
+                                        # (SIGHUP to apply)
 
 # - Subscribers -
 
@@ -306,6 +342,13 @@
 
 #log_error_verbosity = default          # terse | default | verbose; accepted,
                                         # goopg's log does not format by it
+#log_checkpoints = on                   # accepted; goopg logs checkpoints regardless
+#log_connections = ''                   # log aspects of connection setup:
+                                        # receipt, authentication, authorization,
+                                        # setup_durations, all; accepted, goopg
+                                        # logs every connection
+#log_disconnections = off               # accepted; goopg logs every
+                                        # disconnection
 #log_line_prefix = '%m [%p] '           # supported escapes: %m %p %u %d %a %x %%
 #log_timezone = 'GMT'                   # accepted; goopg log timestamps are
                                         # not zone-formatted
@@ -314,6 +357,8 @@
 
 # - Process Title / I/O Timing -
 
+#cluster_name = ''                      # walreceiver application_name fallback
+                                        # (change requires restart)
 #track_activities = on                  # collect info in pg_stat_activity
 #track_counts = on                      # collect per-relation row statistics
 #track_functions = none                 # none | pl | all
@@ -440,6 +485,7 @@
 #standard_conforming_strings = on
 #escape_string_warning = on            # accepted; goopg has no
                                         # deprecated-backslash-escape warning
+#lo_compat_privileges = off
 #default_with_oids = off               # removed in PG12; accepted as no-op
 
 

@@ -54,10 +54,10 @@ func TestIntervalLiteralForms(t *testing.T) {
 	}
 }
 
-// TestKeywordTypedLiterals pins the six keyword-tokenised typed-literal
-// prefixes legacy accepts that the lexer's fold was missing. Measured, not
-// guessed: legacy still REJECTS character, nchar, bit, int, float, double
-// precision and national character, so those stay out.
+// TestKeywordTypedLiterals pins the keyword-tokenised typed-literal
+// prefixes. gram.y accepts every ConstTypename before a string
+// (AexprConst), so character, bit, int and float are typed literals too
+// (M0149-0001h1a71); nchar and national character are not yet folded.
 func TestKeywordTypedLiterals(t *testing.T) {
 	for _, q := range []string{
 		"SELECT char 'c'",
@@ -67,17 +67,28 @@ func TestKeywordTypedLiterals(t *testing.T) {
 		"SELECT smallint '1'",
 		"SELECT bigint '1'",
 		"SELECT real '1'",
-	} {
-		assertParity(t, q)
-	}
-	for _, q := range []string{
 		"SELECT character 'c'",
-		"SELECT nchar 'c'",
 		"SELECT bit 'c'",
 		"SELECT int '1'",
 		"SELECT float '1'",
+		"SELECT double precision '1.5'",
+		"SELECT numeric(5,2) '3.14159'",
+		"SELECT pg_catalog.date '2020-01-01'",
+		"SELECT uuid 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'",
+		"SELECT interval 'x'",
 	} {
-		assertBothReject(t, q)
+		assertParity(t, q)
+	}
+	// NCHAR Sconst is gram.y ConstCharacter Sconst — PG 18.3 accepts it as a
+	// bpchar literal (M0149-0001h1a85), as it does user types and qualified
+	// names.
+	for _, q := range []string{
+		"SELECT nchar 'c'",
+		"SELECT national character 'c'",
+		"SELECT mood 'happy'",
+		"SELECT s1.color 'red'",
+	} {
+		assertParity(t, q)
 	}
 }
 

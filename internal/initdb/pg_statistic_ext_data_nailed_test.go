@@ -129,9 +129,9 @@ func TestPgStatisticExtDataStxoidInhIndexInitialEntry(t *testing.T) {
 		if len(e.IndKey) != 2 || e.IndKey[0] != 1 || e.IndKey[1] != 2 {
 			t.Errorf("IndKey=%v, want [1 2] (stxoid + stxdinherit)", e.IndKey)
 		}
-		// 1981 = oid_ops, 1984 = bool_ops (btree).
-		if len(e.IndClass) != 2 || e.IndClass[0] != 1981 || e.IndClass[1] != 1984 {
-			t.Errorf("IndClass=%v, want [1981 1984] (oid_ops + bool_ops)", e.IndClass)
+		// 1981 = oid_ops, 10003 = bool_ops (btree).
+		if len(e.IndClass) != 2 || e.IndClass[0] != 1981 || e.IndClass[1] != 10003 {
+			t.Errorf("IndClass=%v, want [1981 10003] (oid_ops + bool_ops)", e.IndClass)
 		}
 		if len(e.IndCollation) != 2 || e.IndCollation[0] != 0 || e.IndCollation[1] != 0 {
 			t.Errorf("IndCollation=%v, want [0 0]", e.IndCollation)

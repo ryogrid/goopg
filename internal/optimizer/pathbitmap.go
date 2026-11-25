@@ -69,7 +69,16 @@ func (s *searchCtx) addBaseRelBitmapPaths(cat catalog.Catalog) {
 			}
 		}
 
+		// M0148-0001c3a2: BitmapOr paths over the leaf's OR conjuncts
+		// (generate_bitmap_or_paths over rel->baserestrictinfo).
+		orPaths := s.bitmapOrHeapPaths(rel, tbl, cat.IndexesOnTable(tbl), relPages, relTuples, T, totalPages, maxEntries, rel.baseLeaf)
+		for _, p := range orPaths {
+			addPath(rel, p, "bitmap.orclause")
+		}
 		if len(singlePaths) == 0 {
+			if len(orPaths) > 0 {
+				setCheapest(rel)
+			}
 			continue
 		}
 
@@ -80,9 +89,12 @@ func (s *searchCtx) addBaseRelBitmapPaths(cat catalog.Catalog) {
 			added = true
 		}
 
-		// M0129-S5.1: combine into BitmapAnd when beneficial.
-		if len(singlePaths) >= 2 {
-			if andPath := s.chooseBitmapAnd(singlePaths, rel, tbl, relTuples, T, totalPages, maxEntries); andPath != nil {
+		// M0129-S5.1: combine into BitmapAnd when beneficial. The OR paths
+		// are candidates too: create_index_paths hands choose_bitmap_and
+		// every restriction bitmap path, generate_bitmap_or_paths' included
+		// (M0148-0001c3a2).
+		if cands := append(append([]*Path(nil), singlePaths...), orPaths...); len(cands) >= 2 {
+			if andPath := s.chooseBitmapAnd(cands, rel, tbl, relTuples, T, totalPages, maxEntries); andPath != nil {
 				addPath(rel, andPath, "bitmap.and")
 				added = true
 			}
@@ -108,6 +120,65 @@ func (s *searchCtx) buildOneBitmapPath(
 	relPages int64, relTuples, T, totalPages float64, maxEntries int,
 	leaf Node,
 ) *Path {
+	bitmapIdxPath := s.buildBitmapIndexChild(rel, tbl, idx, relPages, relTuples, totalPages, leaf, extractFilterConjuncts(leaf))
+	if bitmapIdxPath == nil {
+		return nil
+	}
+	// The index path's row count is the lossiness-corrected tuple count
+	// computeBitmapPages returns (the figure costBitmapTree charges the
+	// per-tuple bitmap manipulation against when chooseBitmapAnd compares
+	// paths).
+	_, bitmapIdxPath.Rows = computeBitmapPages(bitmapIdxPath.Rows, relTuples, T,
+		indexPagesForPath(s.cat, bitmapIdxPath, tbl, relTuples), totalPages, s.cp.effectiveCacheSize, maxEntries)
+	return s.bitmapHeapPathOver(rel, tbl, bitmapIdxPath, relTuples, T, totalPages, maxEntries, leaf)
+}
+
+// bitmapHeapPathOver wraps a bitmap qual path (a Bitmap Index Scan, or a
+// BitmapAnd / BitmapOr tree) in the BitmapHeapScan path that reads its heap
+// pages — create_bitmap_heap_path + cost_bitmap_heap_scan (pathnode.c,
+// costsize.c). The bitmap qual's own cost is the heap scan's startup cost.
+func (s *searchCtx) bitmapHeapPathOver(
+	rel *RelOptInfo, tbl *catalog.Table, bitmapqual *Path,
+	relTuples, T, totalPages float64, maxEntries int, leaf Node,
+) *Path {
+	tuplesFetched := clampRowEst(bitmapqual.BitmapSelectivity * relTuples)
+	// Compute how many distinct heap pages the bitmap visits.
+	indexPages := indexPagesForPath(s.cat, bitmapqual, tbl, relTuples)
+	pagesFetched, tuplesFetched := computeBitmapPages(tuplesFetched, relTuples, T, indexPages, totalPages, s.cp.effectiveCacheSize, maxEntries)
+
+	// Total cost: index access (startup) + heap fetch (run). R1
+	// (plan-parity-fix-take2): the heap side rechecks every local
+	// conjunct, so the count is the leaf's full conjunct list.
+	totalCost := costBitmapHeapScan(s.cp, bitmapqual.Cost, pagesFetched, tuplesFetched, T, localQualOpCount(leaf))
+
+	// Build the bitmap heap scan path (the outer container).
+	// B-17d: `cost_bitmap_heap_scan`'s own flag (costsize.c:1023), on top of
+	// the index child's count (normally zero — the child carries no flag of
+	// its own). The producer always runs.
+	return &Path{
+		Kind:          PathBitmapHeapScan,
+		Rel:           rel,
+		Rows:          rel.Rows, // the rel's post-restriction row count
+		Cost:          totalCost,
+		DisabledNodes: disabledNodesFor(!s.cp.enableBitmapScan, bitmapqual),
+		Children:      []*Path{bitmapqual},
+		// create_bitmap_heap_path (pathnode.c:1149): the rel's flag AND the
+		// bitmapqual's. C-19a.
+		ParallelSafe: parallelSafeWith(rel, bitmapqual),
+	}
+}
+
+// buildBitmapIndexChild builds the Bitmap Index Scan path of one index from
+// the restriction clauses in conjuncts — build_index_paths' ST_BITMAPSCAN
+// arm. conjuncts is the leaf's own conjunct list for a plain bitmap path, and
+// one OR arm's clauses plus the other restriction clauses for a BitmapOr arm
+// (build_paths_for_OR, M0148-0001c3a2). Returns nil when the index offers no
+// index clause and no proven partial predicate.
+func (s *searchCtx) buildBitmapIndexChild(
+	rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index,
+	relPages int64, relTuples, totalPages float64,
+	leaf Node, conjuncts []Expr,
+) *Path {
 	if idx == nil {
 		return nil
 	}
@@ -121,7 +192,7 @@ func (s *searchCtx) buildOneBitmapPath(
 	// (`onek2 WHERE unique1 = 50` over `onek2_u1_prtl ... WHERE stringu1 < 'B'`
 	// returned 0 rows, regress `portals_p2`). The proof is the narrow
 	// `Var op Const` prover the other producers use (M0134-0017b), checked
-	// against each of the leaf's conjuncts below.
+	// against each of the conjuncts below.
 	var partialPredicate Expr
 	if idx.HasPredicate {
 		resolved, err := ResolveIndexPredicateOf(idx, tbl)
@@ -137,16 +208,58 @@ func (s *searchCtx) buildOneBitmapPath(
 		return nil
 	}
 
-	// Extract local filter conjuncts from the leaf's Filter wrappers
-	// and match equality conjuncts against this index's columns.
-	// Matched conjuncts become index probe keys; their combined
-	// selectivity replaces the full-scan default of 1.0.
+	// Match the conjuncts against this index's columns. Matched conjuncts
+	// become index probe keys; their combined selectivity replaces the
+	// full-scan default of 1.0.
 	id, _, _ := scanLeafFor(leaf)
-	conjuncts := extractFilterConjuncts(leaf)
 	if partialPredicate != nil && !partialPredicateProvenBy(partialPredicate, conjuncts) {
 		return nil
 	}
-	indexClauses, qualSelectivity := matchBitmapIndexQuals(idx, tbl, conjuncts, id)
+	indexClauses, qualSelectivity := matchBitmapIndexQuals(s.cat, idx, tbl, conjuncts, id)
+	// M0148-0001c3a6 (i): an equality the leading array merges belongs to
+	// the array's clause set (one path per index in PG).
+	if equalityMergedIntoLeadingSAOP(s.cat, tbl, idx, conjuncts, indexClauses) {
+		indexClauses, qualSelectivity = nil, 1
+	}
+	// M0148-0001c3a2: a ScalarArrayOp qual — `col IN (…)`, or an OR of
+	// equalities on one column (match_orclause_to_indexcol) — on the column
+	// after the equality prefix (the leading column when there is none):
+	// one probe per element into the one bitmap, priced by scalararraysel
+	// and charged one descent per element (btcostestimate's num_sa_scans).
+	numSAScans := 0.0
+	saop := false
+	if n := len(indexClauses); n < len(idx.Columns) {
+		if sc, selExpr := bitmapSAOPOnColumn(s.cat, tbl, idx, n, conjuncts); sc != nil {
+			indexClauses = append(indexClauses, *sc)
+			qualSelectivity = clampSelectivity(qualSelectivity * clauseSelectivity(selExpr, leaf))
+			for _, q := range sc.saopColQuals {
+				qualSelectivity = clampSelectivity(qualSelectivity * clauseSelectivity(q.local, leaf))
+			}
+			numSAScans = saopDescents(*sc)
+			saop = true
+		}
+	}
+	// M0148-0001c3a1 / c3a2: on the column after the equality prefix, its
+	// bounds and its NullTest are index clauses too (build_index_paths binds
+	// every matching clause of each column). Exact — the probe bounds them
+	// through indexRangeBounds (restrictionRangeBehindPrefix) — so their
+	// conjuncts are the heap scan's recheck, not a Filter. Constant bounds
+	// only, as bitmapLeadingRange takes them.
+	if n := len(indexClauses); !saop && n > 0 && n < len(idx.Columns) {
+		var rng []indexPathClause
+		for _, c := range restrictionRangeBehindPrefix(s.cat, tbl, idx, n, conjuncts) {
+			if bitmapConstKey(c.key) && !c.redundantBound {
+				rng = append(rng, c)
+			}
+		}
+		if nts := restrictionNullTestsOnColumn(idx, n, conjuncts); len(nts) > 0 {
+			rng = withNullTestsInConjunctOrder(rng, nts, conjuncts)
+		}
+		if len(rng) > 0 {
+			indexClauses = append(indexClauses, rng...)
+			qualSelectivity = clampSelectivity(qualSelectivity * rangeIndexSelectivity(leaf, conjuncts, rng))
+		}
+	}
 	// M0146-0061: with no equality on the leading column, a range bound on it
 	// is still an index clause. match_clause_to_indexcol takes any btree
 	// operator of the column's opfamily, so build_index_paths gives PG a
@@ -155,9 +268,36 @@ func (s *searchCtx) buildOneBitmapPath(
 	// bound into one band (rangeIndexSelectivity), as the plain index arm
 	// prices them.
 	if len(indexClauses) == 0 {
-		if rng := bitmapLeadingRange(s.cat, tbl, idx, conjuncts); len(rng) > 0 {
+		rng := bitmapLeadingRange(s.cat, tbl, idx, conjuncts)
+		// M0148-0001c3a1: the leading column's NullTest, alone or beside the
+		// bounds, as the plain restriction producer files it.
+		if nts := restrictionNullTestsOnColumn(idx, 0, conjuncts); len(nts) > 0 {
+			rng = withNullTestsInConjunctOrder(rng, nts, conjuncts)
+		}
+		// M0148-0001c3a12: a row comparison over the leading columns.
+		if rc := restrictionRowCompare(s.cat, tbl, idx, conjuncts, rng); rc != nil {
+			rng = withRowCompareInConjunctOrder(rng, *rc, conjuncts)
+		}
+		if len(rng) > 0 {
 			indexClauses = rng
 			qualSelectivity = rangeIndexSelectivity(leaf, conjuncts, rng)
+		}
+	}
+	// M0148-0001c3a4 (j): a range on a later column, nothing bound before
+	// it — PG 18's skip scan; constant bounds only, as bitmapLeadingRange.
+	skipCol := 0
+	if len(indexClauses) == 0 {
+		if rng, skip := restrictionSkipRange(s.cat, tbl, idx, conjuncts); len(rng) > 0 {
+			allConst := true
+			for _, c := range rng {
+				if !bitmapConstKey(c.key) || c.redundantBound {
+					allConst = false
+				}
+			}
+			if allConst {
+				indexClauses, skipCol = rng, skip
+				qualSelectivity = rangeIndexSelectivity(leaf, conjuncts, rng)
+			}
 		}
 	}
 
@@ -186,6 +326,16 @@ func (s *searchCtx) buildOneBitmapPath(
 	indexPages, indexTuples, treeHeight := estimateIndexGeometry(s.cat, idx, tbl, relTuples)
 
 	selectivity := qualSelectivity
+	// The skip scan's descents and a reverted estimate's whole-index index
+	// side (btcostestimate's skip-array arm, as the plain skip path).
+	boundSel := 0.0
+	if skipCol > 0 {
+		var boundCounted bool
+		numSAScans, boundCounted = skipScanDescents(tbl, idx, skipCol, relTuples, indexPages)
+		if !boundCounted {
+			boundSel = 1
+		}
+	}
 	in := indexScanInputs{
 		relPages:        relPages,
 		relTuples:       relTuples,
@@ -199,52 +349,30 @@ func (s *searchCtx) buildOneBitmapPath(
 		// "the full freight for all the scan clauses" (assume-rechecked-
 		// always), so every local conjunct counts — not minus
 		// index-satisfied ones.
-		numQualOps:    localQualOpCount(leaf),
-		numIndexQuals: float64(len(indexClauses)),
+		numQualOps:       localQualOpCount(leaf),
+		numIndexQuals:    indexQualCount(indexClauses),
+		numSAScans:       numSAScans,
+		boundSelectivity: boundSel,
 	}
-	tuplesFetched := clampRowEst(selectivity * relTuples)
 
 	// Cost the index-access side (bitmap index scan).
-	idxCost := costBitmapIndexScan(s.cp, in)
+	idxCost, amTotal := costBitmapIndexScan(s.cp, in, rel.Rows)
 
-	// Compute how many distinct heap pages the bitmap visits.
-	pagesFetched, tuplesFetched := computeBitmapPages(tuplesFetched, relTuples, T, indexPages, totalPages, s.cp.effectiveCacheSize, maxEntries)
-
-	// Total cost: index access (startup) + heap fetch (run). R1
-	// (plan-parity-fix-take2): the heap side rechecks every local
-	// conjunct, so the count is the leaf's full conjunct list.
-	totalCost := costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T, localQualOpCount(leaf))
-
-	// Build the bitmap index path (the child of the heap scan).
-	bitmapIdxPath := &Path{
-		Kind:              PathBitmapIndexScan,
-		Rel:               rel,
-		Rows:              tuplesFetched,
-		Cost:              idxCost,
-		BitmapSelectivity: selectivity,
-		IndexInfo:         idx,
-		IndexScanDir:      NoMovementScanDirection,
-		IndexClauses:      indexClauses,
-		PartialPredicate:  partialPredicate,
-		RequiredOuter:     0,
+	return &Path{
+		Kind:               PathBitmapIndexScan,
+		BitmapIndexAMTotal: amTotal,
+		Rel:                rel,
+		Rows:               clampRowEst(selectivity * relTuples),
+		Cost:               idxCost,
+		IndexPathTotalCost: costIndexScan(s.cp, in).Total,
+		BitmapSelectivity:  selectivity,
+		IndexInfo:          idx,
+		IndexScanDir:       NoMovementScanDirection,
+		IndexClauses:       indexClauses,
+		PartialPredicate:   partialPredicate,
+		RequiredOuter:      0,
 		// create_bitmap_index_path: `rel->consider_parallel`. C-19a.
 		ParallelSafe: rel.ParallelSafeForPath(),
-	}
-
-	// Build the bitmap heap scan path (the outer container).
-	// B-17d: `cost_bitmap_heap_scan`'s own flag (costsize.c:1023), on top of
-	// the index child's count (normally zero — the child carries no flag of
-	// its own). The producer always runs.
-	return &Path{
-		Kind:     PathBitmapHeapScan,
-		Rel:      rel,
-		Rows:     rel.Rows, // the rel's post-restriction row count
-		Cost:     totalCost,
-		DisabledNodes: disabledNodesFor(!s.cp.enableBitmapScan, bitmapIdxPath),
-		Children: []*Path{bitmapIdxPath},
-		// create_bitmap_heap_path (pathnode.c:1149): the rel's flag AND the
-		// bitmapqual's. C-19a.
-		ParallelSafe: parallelSafeWith(rel, bitmapIdxPath),
 	}
 }
 
@@ -303,6 +431,7 @@ func flattenExprAnd(expr Expr) []Expr {
 // id is the scanIdentity extracted from the leaf (via scanLeafFor); its
 // table provides the column-name→position mapping.
 func matchBitmapIndexQuals(
+	cat catalog.Catalog,
 	idx *catalog.Index, tbl *catalog.Table,
 	conjuncts []Expr,
 	id *scanIdentity,
@@ -352,8 +481,20 @@ func matchBitmapIndexQuals(
 				}
 				// M0146-0012: that same-type probe is exact, so the conjunct
 				// is the heap scan's recheck rather than a Filter beside it
-				// (createBitmapHeapScanPlan). A literal key keeps its Filter:
-				// this arm does not run restrictionKeyUsable's cast checks.
+				// (createBitmapHeapScanPlan).
+				local = conj
+			} else if _, isIntCast := integerCastLiteral(val); isIntCast && !restrictionKeyUsable(cat, tbl.Columns[cr.Index], val) {
+				// M0148-0001c3a6 (i): an integer Const outside the column
+				// type's range cannot be encoded into the column's key (PG's
+				// cross-type compare finds no match); it stays a Filter.
+				continue
+			} else if restrictionKeyUsable(cat, tbl.Columns[cr.Index], val) {
+				// M0148-0001c3a1: a literal key the btree encoder takes
+				// exactly (restrictionKeyUsable — the plain restriction
+				// producer's test for dropping the conjunct from its Filter)
+				// is an exact probe too, so its conjunct joins the recheck
+				// list as PG's bitmapqualorig has it (create_bitmap_scan_plan):
+				// `Recheck Cond: (stringu1 = 'TVAAAA'::name)`, not a Filter.
 				local = conj
 			}
 			// Found an equality conjunct matching this index column.
@@ -396,117 +537,153 @@ func matchBitmapIndexQuals(
 func bitmapLeadingRange(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) []indexPathClause {
 	var out []indexPathClause
 	for _, c := range restrictionLeadingRange(cat, tbl, idx, conjuncts) {
-		if isConstExpr(c.key) {
+		if bitmapConstKey(c.key) && !c.redundantBound {
 			out = append(out, c)
 		}
 	}
 	return out
 }
 
-// chooseBitmapAnd ports PG's choose_bitmap_and (indxpath.c:1786-1988):
-// given a nonempty list of single-index bitmap heap scan paths, greedily
-// combine them into a BitmapAnd when the combined cost is lower than
-// individual scan costs. Returns nil when no AND combination beats the
-// best single path.
+// chooseBitmapAnd ports PG's choose_bitmap_and (indxpath.c): given bitmap
+// heap scan paths (single-index, BitmapOr), greedily AND their bitmap quals
+// when that is cheaper than the best single one. Returns nil when no AND
+// combination beats the best single path.
 //
-// The algorithm:
-//  1. Sort paths by tree cost (cheapest first).
-//  2. For each path as "group leader", try adding subsequent paths.
-//  3. Skip a candidate if its index columns overlap with already-chosen
-//     indexes (simplified redundancy check — goopg lacks PG's clause-level
-//     PathClauseUsage classification).
-//  4. If the AND cost is cheaper, keep the candidate; otherwise drop it.
-//  5. Return the cheapest group as a BitmapHeapScan over a BitmapAnd,
-//     or nil if the best group is a singleton (no AND needed).
+// M0148-0001c3a2 ported the redundancy model verbatim. Each candidate's
+// clause usage is classify_index_clause_usage: the clauses its index paths
+// use (an OR path's are its arms' clauses, find_indexpath_quals) plus its
+// partial-index predicates, numbered by equal() position in one shared list.
+// Candidates with the same clause set keep only the cheaper; the rest are
+// sorted by path_usage_comparator; and a candidate is skipped when it shares
+// any clause with the group so far, or when the group's quals imply one of
+// its predicates. This replaced an index-COLUMN overlap test that read
+// Children[0].IndexInfo — which a BitmapOr has not — and skipped every pair
+// of indexes sharing a column even when they used different clauses.
 func (s *searchCtx) chooseBitmapAnd(
 	singlePaths []*Path, rel *RelOptInfo, tbl *catalog.Table, relTuples, T, totalPages float64, maxEntries int,
 ) *Path {
 	if len(singlePaths) < 2 {
 		return nil
 	}
-
-	// Copy and sort by tree cost (cheapest first), matching PG's
-	// path_usage_comparator sort order.
-	//
-	// review/260831 OP2-14: the comparator used to call costBitmapTree on both
-	// sides of every comparison, so each candidate's cost was recomputed
-	// O(log n) times — and costBitmapTree walks the path's whole bitmap tree.
-	// The costs are computed once and the sort reads them.
-	paths := make([]*Path, len(singlePaths))
-	copy(paths, singlePaths)
-	treeCost := make(map[*Path]float64, len(paths))
-	for _, p := range paths {
-		c, _ := costBitmapTree(s.cp, p.Children[0])
-		treeCost[p] = c
+	type pathUsage struct {
+		heap           *Path
+		quals, preds   []Expr
+		ids            map[int]bool
+		unclassifiable bool
+		cost, selec    float64
 	}
-	sort.Slice(paths, func(i, j int) bool {
-		return treeCost[paths[i]] < treeCost[paths[j]]
+	var clauselist []Expr
+	position := func(e Expr) int {
+		for i, c := range clauselist {
+			if exprEqual(c, e) {
+				return i
+			}
+		}
+		clauselist = append(clauselist, e)
+		return len(clauselist) - 1
+	}
+	var infos []*pathUsage
+	for _, p := range singlePaths {
+		u := &pathUsage{heap: p}
+		u.cost, u.selec = costBitmapTree(s.cp, p.Children[0])
+		var ok bool
+		u.quals, u.preds, ok = findIndexpathQuals(p.Children[0])
+		if !ok || len(u.quals)+len(u.preds) > 100 {
+			u.unclassifiable = true
+			infos = append(infos, u)
+			continue
+		}
+		u.ids = make(map[int]bool, len(u.quals)+len(u.preds))
+		for _, q := range u.quals {
+			u.ids[position(q)] = true
+		}
+		for _, q := range u.preds {
+			u.ids[position(q)] = true
+		}
+		dup := -1
+		for i, o := range infos {
+			if !o.unclassifiable && sameIDSet(o.ids, u.ids) {
+				dup = i
+				break
+			}
+		}
+		if dup >= 0 {
+			if u.cost < infos[dup].cost {
+				infos[dup] = u
+			}
+			continue
+		}
+		infos = append(infos, u)
+	}
+	if len(infos) < 2 {
+		return nil
+	}
+	// path_usage_comparator: cost, then selectivity.
+	sort.SliceStable(infos, func(i, j int) bool {
+		if infos[i].cost != infos[j].cost {
+			return infos[i].cost < infos[j].cost
+		}
+		return infos[i].selec < infos[j].selec
 	})
 
-	// Pre-extract index column sets for redundancy checks.
-	indexCols := make([]map[string]bool, len(paths))
-	for i, p := range paths {
-		idx := p.Children[0].IndexInfo
-		indexCols[i] = make(map[string]bool)
-		for _, col := range idx.Columns {
-			indexCols[i][col] = true
-		}
-	}
-
 	var bestPaths []*Path
-	bestCost := Cost{Total: 1e30}
-
-	for i := 0; i < len(paths); i++ {
-		group := []*Path{paths[i]}
-		// Gather columns already covered by this group.
-		coveredCols := make(map[string]bool)
-		for col := range indexCols[i] {
-			coveredCols[col] = true
+	var bestCost Cost
+	for i := range infos {
+		lead := infos[i]
+		group := []*Path{lead.heap}
+		// bitmap_scan_cost_est / bitmap_and_cost_est price the candidate as
+		// cost_bitmap_heap_scan does: tuples fetched = selectivity *
+		// baserel->tuples. These used to pass rel.Rows — the rows AFTER the
+		// restriction — so a leader on `hundred = 42 AND unique2 < 3000`
+		// fetched 0.3 tuples, cost 9.06 against its real 143, and no AND
+		// could ever beat it (M0148-0001c3a2).
+		curCost := bitmapScanCostEst(s.cp, lead.heap, relTuples, T, indexPagesForPath(s.cat, lead.heap, tbl, relTuples), totalPages, maxEntries, relQualOpCount(rel))
+		qualsSoFar := append(append([]Expr(nil), lead.quals...), lead.preds...)
+		idsSoFar := make(map[int]bool, len(lead.ids))
+		for k := range lead.ids {
+			idsSoFar[k] = true
 		}
-		indexPages := indexPagesForPath(s.cat, paths[i], tbl, relTuples)
-		curCost := bitmapScanCostEst(s.cp, paths[i], rel.Rows, T, indexPages, totalPages, maxEntries, relQualOpCount(rel))
-
-		for j := i + 1; j < len(paths); j++ {
-			// Redundancy check: skip if the candidate index shares ANY
-			// key column with an already-chosen index.
+		for j := i + 1; j < len(infos); j++ {
+			cand := infos[j]
 			overlap := false
-			for col := range indexCols[j] {
-				if coveredCols[col] {
+			for k := range cand.ids {
+				if idsSoFar[k] {
 					overlap = true
 					break
 				}
 			}
 			if overlap {
-				continue
+				continue // consider it redundant
 			}
-
-			// Tentatively add this path and compute AND cost.
-			candidate := append(group, paths[j])
-			// Extract inner bitmap index paths for cost estimation.
-			inners := make([]*Path, len(candidate))
-			for k, cp := range candidate {
-				inners[k] = cp.Children[0]
-			}
-			// Sum index pages across the AND group for cache-aware estimate.
-			var andIP float64
-			for _, inner := range inners {
-				ip, _, _ := estimateIndexGeometry(s.cat, inner.IndexInfo, tbl, relTuples)
-				andIP += ip
-			}
-			newCost := bitmapAndScanCostEst(s.cp, inners, rel.Rows, T, andIP, totalPages, maxEntries, relQualOpCount(rel))
-
-			if newCost.Total < curCost.Total {
-				// Cheaper — keep the candidate.
-				group = candidate
-				curCost = newCost
-				for col := range indexCols[j] {
-					coveredCols[col] = true
+			redundant := false
+			for _, np := range cand.preds {
+				if len(qualsSoFar) > 0 && predicateImpliedBy(combineAnd(qualsSoFar), np) {
+					redundant = true
+					break
 				}
 			}
-			// else: drop the candidate (cost did not decrease).
+			if redundant {
+				continue
+			}
+			candidate := append(append([]*Path(nil), group...), cand.heap)
+			inners := make([]*Path, len(candidate))
+			var andIP float64
+			for k, hp := range candidate {
+				inners[k] = hp.Children[0]
+				andIP += indexPagesForPath(s.cat, inners[k], tbl, relTuples)
+			}
+			newCost := bitmapAndScanCostEst(s.cp, inners, relTuples, T, andIP, totalPages, maxEntries, relQualOpCount(rel))
+			if newCost.Total < curCost.Total {
+				group = candidate
+				curCost = newCost
+				qualsSoFar = append(qualsSoFar, cand.quals...)
+				qualsSoFar = append(qualsSoFar, cand.preds...)
+				for k := range cand.ids {
+					idsSoFar[k] = true
+				}
+			}
 		}
-
-		if curCost.Total < bestCost.Total {
+		if i == 0 || curCost.Total < bestCost.Total {
 			bestPaths = group
 			bestCost = curCost
 		}
@@ -520,7 +697,7 @@ func (s *searchCtx) chooseBitmapAnd(
 	// Build a BitmapAnd inner (combines the bitmap index scans).
 	inners := make([]*Path, len(bestPaths))
 	for k, bp := range bestPaths {
-		inners[k] = bp.Children[0] // extract BitmapIndexScan path
+		inners[k] = bp.Children[0] // extract the bitmap qual path
 	}
 	andCost, andSelec := costBitmapAndCost(s.cp, inners)
 	bitmapAndPath := &Path{
@@ -541,13 +718,64 @@ func (s *searchCtx) chooseBitmapAnd(
 	totalCost := costBitmapHeapScan(s.cp, andCost, pagesFetched, tuplesFetched, T, relQualOpCount(rel))
 
 	return &Path{
-		Kind:     PathBitmapHeapScan,
-		Rel:      rel,
-		Rows:     rel.Rows,
-		Cost:     totalCost,
-		Children: []*Path{bitmapAndPath},
-		ParallelSafe: parallelSafeWith(rel, bitmapAndPath),
+		Kind:          PathBitmapHeapScan,
+		Rel:           rel,
+		Rows:          rel.Rows,
+		Cost:          totalCost,
+		DisabledNodes: disabledNodesFor(!s.cp.enableBitmapScan, bitmapAndPath),
+		Children:      []*Path{bitmapAndPath},
+		ParallelSafe:  parallelSafeWith(rel, bitmapAndPath),
 	}
+}
+
+// findIndexpathQuals is find_indexpath_quals (indxpath.c): the clauses a
+// bitmap tree's index paths use (an IndexClause's original clause) and their
+// partial-index predicates (indpred, as AND items), gathered through
+// BitmapAnd and BitmapOr nodes alike. ok is false when an index clause has no
+// clause expression to identify it by (an inexact restriction key, whose
+// conjunct stays a Filter); the caller treats such a path as unclassifiable.
+func findIndexpathQuals(p *Path) (quals, preds []Expr, ok bool) {
+	switch p.Kind {
+	case PathBitmapAnd, PathBitmapOr:
+		for _, ch := range p.Children {
+			q, pr, ok := findIndexpathQuals(ch)
+			if !ok {
+				return nil, nil, false
+			}
+			quals = append(quals, q...)
+			preds = append(preds, pr...)
+		}
+		return quals, preds, true
+	case PathBitmapIndexScan:
+		for _, c := range p.IndexClauses {
+			switch {
+			case c.ri != nil && c.ri.clause != nil:
+				quals = append(quals, c.ri.clause)
+			case c.local != nil:
+				quals = append(quals, c.local)
+			default:
+				return nil, nil, false
+			}
+		}
+		if p.PartialPredicate != nil {
+			preds = append(preds, flattenExprAnd(p.PartialPredicate)...)
+		}
+		return quals, preds, true
+	}
+	return nil, nil, false
+}
+
+// sameIDSet is bms_equal over chooseBitmapAnd's clause-id sets.
+func sameIDSet(a, b map[int]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *searchCtx) addParameterizedBitmapPaths(cat catalog.Catalog) {
@@ -659,12 +887,15 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 	sel = clampSelectivity(sel)
 	tuplesFetched := clampRowEst(sel * relTuples)
 	indexPages, indexTuples, treeHeight := estimateIndexGeometry(s.cat, idx, tbl, relTuples)
-	idxCost := costBitmapIndexScan(s.cp, indexScanInputs{
+	// The probe's path rows are its parameterised row count (ppi_rows) —
+	// cost_bitmap_tree_node's per-row charge (costBitmapIndexScan).
+	paramRows := clampRowEst(parameterizedBaserelRows(rel, nil, sel, false) * s.movableNonEquiJoinSelectivity(rel, req))
+	idxCost, amTotal := costBitmapIndexScan(s.cp, indexScanInputs{
 		relPages: relPages, relTuples: relTuples, indexPages: indexPages,
 		indexTuples: indexTuples, treeHeight: treeHeight, selectivity: sel,
 		correlation: indexCorrelationFor(idx, leadingKeyStats(idx, tbl)), totalTablePages: totalPages,
 		numIndexQuals: float64(len(clauses)),
-	})
+	}, paramRows)
 	// `get_loop_count` (indxpath.c:2328): the smallest row count among the
 	// relations supplying the parameter. The path cost stays per-execution — PG
 	// pro-rates inside `compute_bitmap_pages` — so the join above still
@@ -672,14 +903,14 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 	pagesFetched, tuplesFetched := computeBitmapPagesLooped(tuplesFetched, relTuples, T, indexPages, totalPages,
 		s.cp.effectiveCacheSize, maxEntries, s.loopCountForKeys(rel, req, boundOuterKeys(bound)))
 	child := &Path{
-		Kind: PathBitmapIndexScan, Rel: rel, Rows: tuplesFetched, Cost: idxCost,
+		Kind: PathBitmapIndexScan, Rel: rel, Rows: tuplesFetched, Cost: idxCost, BitmapIndexAMTotal: amTotal,
 		BitmapSelectivity: sel, IndexInfo: idx, IndexScanDir: NoMovementScanDirection,
 		IndexClauses: clauses, RequiredOuter: req,
 		ParallelSafe: rel.ParallelSafeForPath(),
 	}
 	return &Path{
 		Kind: PathBitmapHeapScan, Rel: rel,
-		Rows:          clampRowEst(parameterizedBaserelRows(rel, nil, sel, false) * s.movableNonEquiJoinSelectivity(rel, req)),
+		Rows:          paramRows,
 		Cost:          costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T, relQualOpCount(rel)),
 		// B-17d: `cost_bitmap_heap_scan`'s own flag (costsize.c:1023), on
 		// top of the index child's count.
@@ -700,18 +931,23 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 	}
 }
 
-// partialPredicateProvenBy reports whether some restriction conjunct proves a
+// partialPredicateProvenBy reports whether the restriction conjuncts prove a
 // partial index's predicate — PG's `predOK` (`check_index_predicates`,
-// indxpath.c) at the narrow `provePartialIndexPredicate` fidelity. An unproven
-// partial index may not be scanned at all: its missing entries are rows the
-// query can still return.
+// indxpath.c): predicate_implied_by(indpred, the restriction list), the
+// conjuncts taken together as one AND. predicateImpliedBy is the
+// predicate_implied_by_recurse port (AND/OR rules, equal(), btree operator
+// inference), so `unique1 = 0` proves `unique1 < 20 OR unique1 > 980`
+// (M0148-0001c3a4 (e)). An unproven partial index may not be scanned at
+// all: its missing entries are rows the query can still return.
 func partialPredicateProvenBy(predicate Expr, conjuncts []Expr) bool {
-	for _, c := range conjuncts {
-		if provePartialIndexPredicate(predicate, c) {
-			return true
-		}
+	if predicate == nil || len(conjuncts) == 0 {
+		return false
 	}
-	return false
+	var clause Expr = conjuncts[0]
+	for _, c := range conjuncts[1:] {
+		clause = &BinaryOp{Op: parser.OpAnd, Left: clause, Right: c}
+	}
+	return predicateImpliedBy(clause, predicate)
 }
 
 // boundOuterKeys lists the outer values of a bitmap probe's bound clauses.
@@ -721,4 +957,15 @@ func boundOuterKeys(bound map[string]paramIndexClause) []Expr {
 		out = append(out, c.outerKey)
 	}
 	return out
+}
+
+// bitmapConstKey is a bound the bitmap producers take: a literal, or an
+// explicitly cast integer literal (`tenthous > 5000::int8`, a Const of the
+// cast's type in PG, M0148-0001c3a6 (i)).
+func bitmapConstKey(e Expr) bool {
+	if isConstExpr(e) {
+		return true
+	}
+	_, ok := integerCastLiteral(e)
+	return ok
 }

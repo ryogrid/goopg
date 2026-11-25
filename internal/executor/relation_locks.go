@@ -11,6 +11,7 @@ package executor
 // This mirrors the advisory-lock pattern (advisory.go / catalog.AdvisoryLockRowsFunc).
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"sync"
@@ -208,4 +209,57 @@ func ReleaseRelationLocks(identity any) {
 	case *BasicSession:
 		globalRelLockMgr.ReleaseSession(Session(v))
 	}
+}
+
+// sharedCatalogRelOIDs are PG 18's shared catalogs (pg_class.relisshared):
+// one relation for the whole cluster, so a lock on one is tagged with
+// database 0 (SET_LOCKTAG_RELATION), and conflicts across databases.
+var sharedCatalogRelOIDs = map[uint32]bool{
+	1213: true, // pg_tablespace
+	1214: true, // pg_shdepend
+	1260: true, // pg_authid
+	1261: true, // pg_auth_members
+	1262: true, // pg_database
+	2396: true, // pg_shdescription
+	2964: true, // pg_db_role_setting
+	3592: true, // pg_shseclabel
+	6000: true, // pg_replication_origin
+	6100: true, // pg_subscription
+	6243: true, // pg_parameter_acl
+}
+
+// lockTagDBOid is the database a relation lock tag carries: 0 for a shared
+// catalog, the session's database otherwise. M0149-0005.
+func lockTagDBOid(dbOID, relOID uint32) uint32 {
+	if sharedCatalogRelOIDs[relOID] {
+		return 0
+	}
+	return dbOID
+}
+
+// LockSharedCatalogForDDL takes a relation lock on a shared catalog for a
+// DDL command that runs outside the executor (DROP DATABASE in the
+// postmaster), under backend's lock identity, so the lock conflicts with
+// LOCK TABLE and prepared transactions and shows in pg_locks while it waits.
+// ctx is the statement's context: pg_cancel_backend cancels the wait with
+// 57014 "canceling statement due to user request". The returned release
+// function drops the lock. M0149-0005.
+func LockSharedCatalogForDDL(ctx context.Context, backend lmgr.BackendID, relOID uint32, mode lmgr.Mode) (release func(), err error) {
+	if backend == 0 {
+		return func() {}, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tag := lmgr.LockTag{DB: lockTagDBOid(0, relOID), Rel: relOID}
+	if aerr := tableLockMgr.AcquireWithTimeout(ctx, backend, tag, mode, lmgr.DefaultDeadlockTimeout); aerr != nil {
+		if ee := lockWaitCancelError(aerr); ee != nil {
+			return nil, ee
+		}
+		if aerr == lmgr.ErrDeadlockDetected {
+			return nil, &ExecError{Code: "40P01", Message: "deadlock detected"}
+		}
+		return nil, &ExecError{Code: "XX000", Message: aerr.Error()}
+	}
+	return func() { tableLockMgr.Release(backend, tag, mode) }, nil
 }

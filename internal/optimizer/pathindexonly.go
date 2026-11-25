@@ -27,6 +27,8 @@ package optimizer
 //     scan that drops a column the query reads returns wrong rows.
 
 import (
+	"sort"
+	"math"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -80,6 +82,7 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 		if s.hasUsefulPathkeys(rel) {
 			colExprs = mergeableColumnExprsFor(rel.Relids, s.clausesAll())
 			addQueryPathkeyColumnExprs(colExprs, s.queryPathkeys, s.relInfos[i].sourceIdx)
+			addConstEquatedColumns(colExprs, rel)
 		}
 		added := false
 		for _, idx := range cat.IndexesOnTable(tbl) {
@@ -221,17 +224,97 @@ func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, t
 		return nil, false
 	}
 	clauses := restrictionEqualityPrefix(cat, tbl, idx, conjuncts)
+	if equalityMergedIntoLeadingSAOP(cat, tbl, idx, conjuncts, clauses) {
+		clauses = nil
+	}
 	bound := len(clauses)
-	if !plainRestrictionBindsOnlyPrefix(cat, tbl, idx, conjuncts, len(clauses)) {
+	// M0148-0001c3a10 slice 4: a NullTest on the column behind the equality
+	// prefix — build_minmax_path's `a IS NOT NULL` under `WHERE c = 3` over
+	// (c, a), PG's `Index Cond: ((c = 3) AND (a IS NOT NULL))`. The prefix
+	// lowers onto Keys and the NullTest onto IndexOnlyScan.Cond, checked per
+	// entry (createplanindex.go). IS NOT NULL also excludes the column's
+	// NULL-keyed entries, so the column counts as bound for the NULL-key rule.
+	if n := len(clauses); n > 0 && n < len(idx.Columns) && columnCovered(covered, idx.Columns[n]) &&
+		len(restrictionRangeOnColumn(cat, tbl, idx, n, conjuncts)) == 0 &&
+		(idx.DeclaredHash || len(restrictionSAOPOnColumn(cat, tbl, idx, n, conjuncts)) == 0) {
+		if nt := restrictionNullTestOnColumn(idx, n, conjuncts); nt != nil {
+			clauses = append(clauses, *nt)
+			if nt.nullTest == IndexNullTestIsNotNull {
+				bound = n + 1
+			}
+		}
+	}
+	var saop []indexPathClause
+	if len(clauses) == 0 {
+		saop = restrictionLeadingSAOP(cat, tbl, idx, conjuncts)
+	} else if n := len(clauses); n < len(idx.Columns) && !idx.DeclaredHash && (prefixEqualitySAOP(cat, tbl, idx, n, conjuncts) ||
+		(len(restrictionRangeOnColumn(cat, tbl, idx, n, conjuncts)) == 0 && restrictionNullTestOnColumn(idx, n, conjuncts) == nil)) {
+		// M0148-0001c3a4 (i): an array behind the equality prefix, as the
+		// plain producer files it (addOneRestrictionIndexPath) — PG's Index
+		// Only Scan with `((hundred = 42) AND (unique1 = ANY (…)))`.
+		if sa := restrictionSAOPOnColumn(cat, tbl, idx, n, conjuncts); len(sa) > 0 {
+			clauses = append(clauses, sa...)
+			if n+1 < len(idx.Columns) && sa[0].saopOp == parser.OpUnknown {
+				clauses = append(clauses, restrictionRangeBehindPrefix(cat, tbl, idx, n+1, conjuncts)...)
+			}
+			bound = boundIndexColumns(clauses)
+		}
+	}
+	switch {
+	case indexClausesSAOPAt(clauses) > 0:
+		// The prefix-SAOP clauses above.
+	case len(saop) > 0:
+		// M0148-0001c3a4 (h): a leading-column ScalarArrayOp, bounded on the
+		// second column, in the plain producer's precedence (ahead of a
+		// leading range) — PG's Index Only Scan with
+		// `((thousand = ANY (…)) AND (tenthous > 7550))`.
+		clauses = saop
+		if len(idx.Columns) > 1 && saop[0].saopOp == parser.OpUnknown {
+			clauses = append(clauses, restrictionRangeBehindPrefix(cat, tbl, idx, 1, conjuncts)...)
+		}
+		bound = boundIndexColumns(clauses)
+	case !plainRestrictionBindsOnlyPrefix(cat, tbl, idx, conjuncts, len(clauses)):
 		// M0146-0061: with no equality on the leading column, the plain
 		// producer binds a leading range when there is no leading SAOP
 		// (addOneRestrictionIndexPath's order) — the same clauses the
 		// index-only scan carries as LowKey/HighKey.
 		rng := restrictionLeadingRange(cat, tbl, idx, conjuncts)
-		if len(clauses) > 0 || len(rng) == 0 || len(restrictionLeadingSAOP(cat, tbl, idx, conjuncts)) > 0 {
+		// M0148-0001c3a: with the leading column's NullTest index qual, as
+		// the plain producer files it.
+		if nts := restrictionNullTestsOnColumn(idx, 0, conjuncts); len(nts) > 0 && len(clauses) == 0 {
+			rng = withNullTestsInConjunctOrder(rng, nts, conjuncts)
+		}
+		// M0148-0001c3a12: a row comparison over the leading columns.
+		rc := restrictionRowCompare(cat, tbl, idx, conjuncts, rng)
+		if rc != nil {
+			rng = withRowCompareInConjunctOrder(rng, *rc, conjuncts)
+		}
+		if len(clauses) > 0 || len(rng) == 0 {
 			return nil, false
 		}
+		// bound stays 1 with a row comparison too: a later column decides
+		// only on a tie, so a NULL there still needs its entry stored.
 		clauses, bound = rng, 1
+		if rc != nil {
+			break
+		}
+		// M0148-0001c3a4 (i): an `= ANY` array on the second column behind
+		// the leading range is an index qual too (PG's `((thousand < 2) AND
+		// (tenthous = ANY (…)))`); the scan checks it per entry
+		// (IndexOnlyScan.TrailingSAOP), so its column must be covered.
+		if len(idx.Columns) > 1 && columnCovered(covered, idx.Columns[1]) {
+			if sa := trailingSAOPOnRange(cat, tbl, idx, conjuncts); len(sa) > 0 {
+				clauses = append(clauses, sa...)
+				bound = 2
+			}
+		}
+	}
+	if len(clauses) == 0 {
+		// M0148-0001c3a4 (j): nothing binds the leading column, but a range
+		// on a later column is an index qual of PG 18's skip scan.
+		if rng, skip := restrictionSkipRange(cat, tbl, idx, conjuncts); len(rng) > 0 {
+			clauses, bound = rng, skip+1
+		}
 	}
 	if !indexUnboundKeysNotNull(tbl, idx, bound) {
 		return nil, false
@@ -267,9 +350,15 @@ func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, t
 // lowering does not carry yet (ledgered); the plain path keeps those.
 func plainRestrictionBindsOnlyPrefix(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr, n int) bool {
 	if n > 0 {
-		return n >= len(idx.Columns) || len(restrictionRangeOnColumn(cat, tbl, idx, n, conjuncts)) == 0
+		// M0148-0001c3a4 (b): an array on column n is a clause the plain
+		// producer binds behind the prefix; the index-only lowering does not
+		// carry it yet (ledgered), so the plain path keeps it.
+		return n >= len(idx.Columns) || (len(restrictionRangeOnColumn(cat, tbl, idx, n, conjuncts)) == 0 &&
+			restrictionNullTestOnColumn(idx, n, conjuncts) == nil &&
+			(idx.DeclaredHash || len(restrictionSAOPOnColumn(cat, tbl, idx, n, conjuncts)) == 0))
 	}
-	if len(restrictionLeadingSAOP(cat, tbl, idx, conjuncts)) > 0 || len(restrictionLeadingRange(cat, tbl, idx, conjuncts)) > 0 {
+	if len(restrictionLeadingSAOP(cat, tbl, idx, conjuncts)) > 0 || len(restrictionLeadingRange(cat, tbl, idx, conjuncts)) > 0 ||
+		restrictionLeadingNullTest(idx, conjuncts) != nil || restrictionRowCompare(cat, tbl, idx, conjuncts, nil) != nil {
 		return false
 	}
 	skipClauses, _ := restrictionSkipRun(cat, tbl, idx, conjuncts)
@@ -331,10 +420,48 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 	// selectivity for an index path with no indexclauses is 1.0 ("An empty
 	// indexclauses list implies a full index scan", pathnodes.h:1817).
 	sel, unique := 1.0, false
+	numSAScans := 0.0
+	// boundSel, when set, is btcostestimate's indexBoundQuals selectivity
+	// where it differs from sel (the trailing-array arm below).
+	boundSel := 0.0
+	saopAt := indexClausesSAOPAt(clauses)
+	isSAOP := saopAt >= 0
+	trailingAt, trailing := clausesTrailingSAOP(clauses)
 	switch {
-	case len(clauses) > 0 && clauses[0].op != parser.OpUnknown:
-		// M0146-0061: leading-column bounds, priced as the plain range
-		// path prices them.
+	case trailing:
+		sel, boundSel, numSAScans = trailingSAOPSelectivity(cat, rel, tbl, idx, clauses, trailingAt, relTuples, extractFilterConjuncts(rel.baseLeaf))
+	case isSAOP:
+		// M0148-0001c3a4 (h): scalararraysel over the array, times the
+		// equality prefix ahead of it ((i)) and the bounds on the column
+		// after it, one descent per element — the plain producer's SAOP
+		// pricing.
+		sel = clampSelectivity(clauseSelectivity(saopPricedClause(cat, tbl, idx, clauses[saopAt]), rel.baseLeaf))
+		if saopAt > 0 {
+			eqSel, _ := restrictionIndexSelectivity(tbl, idx, clauses[:saopAt], relTuples)
+			sel = clampSelectivity(sel * eqSel)
+		}
+		if len(clauses) > saopAt+1 {
+			sel = clampSelectivity(sel * rangeIndexSelectivity(rel.baseLeaf, extractFilterConjuncts(rel.baseLeaf), clauses[saopAt+1:]))
+		}
+		numSAScans = saopDescents(clauses[saopAt])
+		for _, q := range clauses[saopAt].saopColQuals {
+			sel = clampSelectivity(sel * clauseSelectivity(q.local, rel.baseLeaf))
+		}
+	case clausesSkipRange(clauses) > 0:
+		// M0148-0001c3a4 (j): a skip scan's range on a later column —
+		// btcostestimate's skip arrays over the skipped prefix (one descent
+		// per distinct value plus one); a reverted estimate prices the index
+		// side over the whole index (boundSelectivity 1).
+		sel = rangeIndexSelectivity(rel.baseLeaf, extractFilterConjuncts(rel.baseLeaf), clauses)
+		pages, _, _ := estimateIndexGeometry(cat, idx, tbl, relTuples)
+		var boundCounted bool
+		numSAScans, boundCounted = skipScanDescents(tbl, idx, clausesSkipRange(clauses), relTuples, pages)
+		if !boundCounted {
+			boundSel = 1
+		}
+	case hasRangeClause(clauses):
+		// M0146-0061: leading-column bounds (and M0148-0001c3a's NullTest),
+		// priced as the plain range path prices them.
 		sel = rangeIndexSelectivity(rel.baseLeaf, extractFilterConjuncts(rel.baseLeaf), clauses)
 	case len(clauses) > 0:
 		sel, unique = restrictionIndexSelectivity(tbl, idx, clauses, relTuples)
@@ -360,8 +487,10 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 		// R1 (plan-parity-fix-take2): every local conjunct not consumed as an
 		// index qual is a qpqual, as the seq rival counts them
 		// (costsize.c:806-820).
-		numQualOps:    qpquals,
-		numIndexQuals: float64(len(clauses)),
+		numQualOps:       qpquals,
+		numIndexQuals:    indexQualCount(clauses),
+		numSAScans:       numSAScans,
+		boundSelectivity: boundSel,
 	}
 	cost := costIndexScan(s.cp, in)
 	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
@@ -408,7 +537,15 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 	// carries the index's ordering (addOneRestrictionIndexPath), so it carries
 	// it too — PG's build_index_paths computes one useful_pathkeys for the
 	// index whether the path is index-only or not.
-	if len(clauses) > 0 && clauses[0].op != parser.OpUnknown && len(colExprs) > 0 && indexIsOrderable(idx) {
+	// M0148-0001c3a10: and so does an equality probe — build_index_paths'
+	// useful_pathkeys do not depend on the clause kinds, and an index whose
+	// leading columns are equated to constants delivers its next column in
+	// order (`WHERE c = 3 ORDER BY a` over (c, a): PG's `Index Only Scan
+	// [Backward] … Index Cond: (c = 3)`), exactly as the plain restriction
+	// path already carries it (addOneRestrictionIndexPath).
+	if len(clauses) > 0 && len(colExprs) > 0 && indexIsOrderable(idx) {
+		// M0148-0001c3a4 (h): a SAOP probe delivers index order too (its
+		// elements descend sorted).
 		serial.Pathkeys, _ = indexPathOrdering(idx, colExprs, false)
 	}
 	// M0146-0188: the full-index shape carries the index's useful ordering as
@@ -424,6 +561,18 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 		}
 	}
 	addPath(rel, serial, "indexonly")
+	// M0148-0001c3a3 slice 4: build_index_paths step 5 for the index-only
+	// path — its backward twin when the reversed pathkeys are useful, at the
+	// same cost (cost_index is direction-blind). Only an ordered shape (a
+	// range probe or the full scan) carries pathkeys to reverse; no partial
+	// twin, as for the plain scan's.
+	if len(serial.Pathkeys) > 0 {
+		if bkeys := s.usefulBackwardIndexPathkeys(rel, idx, colExprs); len(bkeys) > 0 {
+			back := *serial
+			back.Pathkeys, back.IndexScanDir = bkeys, BackwardScanDirection
+			addPath(rel, &back, "indexonly.backward")
+		}
+	}
 	// C-19c: the partial twin, `create_index_path(..., index_only_scan,
 	// ..., partial_path = true)` — the same build_index_paths arm as the
 	// plain scan's; cost_index sizes it on index pages alone
@@ -534,3 +683,170 @@ func coveredAvgVarBytes(tbl *catalog.Table, covered []catalog.Column) float64 {
 	}
 	return sum
 }
+
+// columnCovered reports whether name is one of an index-only scan's covered
+// columns.
+func columnCovered(covered []catalog.Column, name string) bool {
+	for _, c := range covered {
+		if c.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// isInequalityOp reports a btree range operator (`<` `<=` `>` `>=`).
+func isInequalityOp(op parser.OpCode) bool {
+	switch op {
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		return true
+	}
+	return false
+}
+
+// trailingSAOPSelectivity prices a leading range followed by an `= ANY`
+// array on the second column (M0148-0001c3a4 (i)): btcostestimate's
+// skip-array arm (selfuncs.c:7399-7590). The range column becomes a skip
+// array, its ndistinct scaled by the range's own selectivity multiplying
+// num_sa_scans. When that fraction is under DEFAULT_RANGE_INEQ_SEL, the
+// ndistinct is a default, or the descents would exceed the index's pages,
+// PG stops building indexBoundQuals there: the array then neither narrows
+// numIndexTuples (boundSel = the range alone) nor adds descents, while it
+// still narrows indexSelectivity (sel, genericcostestimate's heap side).
+// Shared by the plain and index-only producers.
+func trailingSAOPSelectivity(cat catalog.Catalog, rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index, clauses []indexPathClause,
+	saopAt int, relTuples float64, conjuncts []Expr) (sel, boundSel, numSAScans float64) {
+	frac := rangeIndexSelectivity(rel.baseLeaf, conjuncts, clauses[:saopAt])
+	c := clauses[saopAt]
+	sel = clampSelectivity(frac * clauseSelectivity(saopPricedClause(cat, tbl, idx, c), rel.baseLeaf))
+	for _, q := range c.saopColQuals {
+		sel = clampSelectivity(sel * clauseSelectivity(q.local, rel.baseLeaf))
+	}
+	boundSel = frac
+	pages, _, _ := estimateIndexGeometry(cat, idx, tbl, relTuples)
+	nd, isDefault := getVariableNumDistinct(joinVarStats{stats: columnStatsByName(tbl, idx.Columns[0]), tuples: relTuples})
+	if !isDefault && frac >= defaultRangeIneqSel {
+		nd = math.Max(math.RoundToEven(nd*frac), 1)
+		if nd <= pages {
+			numSAScans = nd * saopDescents(c)
+			boundSel = sel
+		}
+	}
+	return sel, boundSel, numSAScans
+}
+
+// trailingSAOPOnRange is the `= ANY` array on the second column the
+// producers file behind a leading range (M0148-0001c3a4 (i)): none when the
+// range column carries a NullTest, the index is a hash, or the array is an
+// inequality one.
+func trailingSAOPOnRange(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) []indexPathClause {
+	if len(idx.Columns) < 2 || idx.DeclaredHash {
+		return nil
+	}
+	nullLead := len(restrictionNullTestsOnColumn(idx, 0, conjuncts)) > 0
+	// The scan decodes the two leading key columns from each entry; an
+	// interval key (a lossy comparison span) cannot be decoded.
+	for _, name := range idx.Columns[:2] {
+		col, ok := tableColumnByName(tbl, name)
+		if !ok || strings.EqualFold(col.Type.Name, "interval") {
+			return nil
+		}
+	}
+	sa := restrictionSAOPOnColumn(cat, tbl, idx, 1, conjuncts)
+	if len(sa) > 0 {
+		if nullLead || sa[0].saopOp != parser.OpUnknown {
+			return nil
+		}
+		return sa
+	}
+	// M0148-0001c3a5 (a): no array — the column's plain comparisons are
+	// index quals all the same, checked per entry like the array.
+	if tc := trailingColumnQuals(cat, tbl, idx, conjuncts); tc != nil {
+		return []indexPathClause{*tc}
+	}
+	return nil
+}
+
+// trailingColumnQuals is the plain constant comparisons (`=` `<` `<=` `>`
+// `>=`) on index column 1, in restriction order, as one trailingQuals
+// clause; nil when there are none.
+func trailingColumnQuals(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) *indexPathClause {
+	colName := idx.Columns[1]
+	if colName == "" {
+		return nil
+	}
+	var quals []saopColQual
+	for _, conj := range conjuncts {
+		bin, ok := conj.(*BinaryOp)
+		if !ok {
+			continue
+		}
+		switch bin.Op {
+		case parser.OpEq, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		default:
+			continue
+		}
+		cr, val, colOnRight, ok := normalizeColumnIndexKey(bin.Left, bin.Right)
+		if !ok || cr.Index < 0 || cr.Index >= len(tbl.Columns) || tbl.Columns[cr.Index].Name != colName ||
+			!bitmapConstKey(val) || !restrictionKeyUsable(cat, tbl.Columns[cr.Index], val) {
+			continue
+		}
+		op := bin.Op
+		if colOnRight {
+			op = swapInequalityOp(op)
+		}
+		quals = append(quals, saopColQual{op: op, key: val, local: conj})
+	}
+	if len(quals) == 0 {
+		return nil
+	}
+	sort.SliceStable(quals, func(i, j int) bool { return quals[i].local.Pos() < quals[j].local.Pos() })
+	return &indexPathClause{indexCol: 1, op: quals[0].op, key: quals[0].key, local: quals[0].local,
+		saopColQuals: quals[1:], trailingQuals: true}
+}
+
+// clausesTrailingSAOP reports the trailing-array shape: a leading range
+// followed by the array (saopAt > 0 behind an inequality on column 0).
+func clausesTrailingSAOP(clauses []indexPathClause) (saopAt int, ok bool) {
+	at := indexClausesSAOPAt(clauses)
+	if at < 0 {
+		// M0148-0001c3a5 (a): plain comparisons on column 1 (trailingQuals).
+		for i, c := range clauses {
+			if c.trailingQuals {
+				at = i
+				break
+			}
+		}
+	}
+	return at, at > 0 && (isInequalityOp(clauses[0].op) || clauses[0].nullTest != IndexNullTestNone)
+}
+
+// trailingClauseColQuals is a trailing clause's column quals as lowered:
+// a trailingQuals clause's own first comparison ahead of the rest.
+func trailingClauseColQuals(c indexPathClause, drop map[Expr]bool) []SAOPColQual {
+	rest := lowerSAOPColQuals(c, drop)
+	if !c.trailingQuals {
+		return rest
+	}
+	return append([]SAOPColQual{{Op: c.op, Key: c.key}}, rest...)
+}
+
+// clausesSkipRange is the skip-range shape's range column (M0148-0001c3a4
+// (j)): every clause a bound on one column after the leading one. 0 when the
+// clauses are any other shape.
+func clausesSkipRange(clauses []indexPathClause) int {
+	if len(clauses) == 0 {
+		return 0
+	}
+	col := clauses[0].indexCol
+	if col < 1 {
+		return 0
+	}
+	for _, c := range clauses {
+		if c.indexCol != col || !isInequalityOp(c.op) || len(c.saop) > 0 || c.nullTest != IndexNullTestNone {
+			return 0
+		}
+	}
+	return col
+}
+

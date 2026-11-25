@@ -27,8 +27,8 @@ func PGNamespaceColumnsPG18() []catalog.Column {
 	}
 }
 
-// buildPGNamespaceRow builds one pg_namespace row. nspacl is written as the
-// empty aclitem[] ("{}"), matching the initdb bootstrap rows; per-schema
+// buildPGNamespaceRow builds one pg_namespace row. nspacl is NULL, as
+// PostgreSQL's NamespaceCreate stores it (M0149-0001g slice 11); per-schema
 // GRANT rendering into the heap row is a follow-up that rides the ACL
 // store's NamespaceACLText (the virtual view already renders it).
 func buildPGNamespaceRow(oid uint32, name string, owner uint32) Row {
@@ -36,7 +36,7 @@ func buildPGNamespaceRow(oid uint32, name string, owner uint32) Row {
 		NewIntDatum(int64(oid)),   // oid
 		NewStringDatum(name),      // nspname (name, 63-byte clip in EncodeRowPG)
 		NewIntDatum(int64(owner)), // nspowner
-		NewStringDatum("{}"),      // nspacl (empty aclitem[]; initdb parity)
+		NullDatum,                 // nspacl NULL = acldefault (owner UC), as PG's CREATE SCHEMA stores; never "{}" (an explicit empty ACL denies the owner USAGE on a PG node)
 	}
 }
 

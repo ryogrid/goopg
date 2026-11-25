@@ -28,6 +28,7 @@ package optimizer
 // range or SAOP column is not built yet — ledgered.
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -68,6 +69,7 @@ func (s *searchCtx) addRestrictionIndexPaths(cat catalog.Catalog) {
 		if s.hasUsefulPathkeys(rel) {
 			colExprs = mergeableColumnExprsFor(rel.Relids, s.clausesAll())
 			addQueryPathkeyColumnExprs(colExprs, s.queryPathkeys, s.relInfos[i].sourceIdx)
+			addConstEquatedColumns(colExprs, rel)
 		}
 		added := false
 		for _, idx := range cat.IndexesOnTable(tbl) {
@@ -106,6 +108,12 @@ func restrictionEqualityPrefix(cat catalog.Catalog, tbl *catalog.Table, idx *cat
 func restrictionEqualityOn(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, pos int, conjuncts []Expr) *indexPathClause {
 	colName := idx.Columns[pos]
 	for _, conj := range conjuncts {
+		// M0148-0001c3a5 (d): match_boolean_index_clause — a boolean column
+		// alone, negated, or under IS TRUE / IS FALSE is the index qual
+		// `col = true` / `col = false` (the same rows: each rejects NULL).
+		if name, val, ok := booleanIndexQual(conj); ok && name == colName {
+			return &indexPathClause{indexCol: pos, key: &BooleanConst{pos: conj.Pos(), Value: val}, local: conj}
+		}
 		bin, ok := conj.(*BinaryOp)
 		if !ok || bin.Op != parser.OpEq {
 			continue
@@ -175,6 +183,52 @@ func restrictionSkipRun(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.In
 	return clauses, skip
 }
 
+// restrictionSkipRange is PG 18's skip scan with a RANGE on a non-leading
+// column (M0148-0001c3a4 (j)): `tenthous < 2` on (thousand, tenthous) is an
+// index qual, with a skip array over thousand (nbtpreprocesskeys.c
+// `_bt_skiparray`). It returns the first column skip (>= 1) that carries
+// bounds — only when no earlier column carries any qual this producer binds
+// (equality, range, array or NullTest) — and those bounds, each recording its
+// conjunct. The skipped prefix must be plain ascending columns and NULL-safe,
+// as restrictionSkipRun requires; the scan checks every entry's key column
+// against the bounds, so neither the skipped nor the range column may be an
+// interval (its key does not decode).
+func restrictionSkipRange(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) ([]indexPathClause, int) {
+	if !isBTreeIndex(idx) || idx.DeclaredHash || len(idx.Columns) < 2 {
+		return nil, 0
+	}
+	for pos := 0; pos < len(idx.Columns); pos++ {
+		if idx.Columns[pos] == "" {
+			return nil, 0
+		}
+		if col, ok := tableColumnByName(tbl, idx.Columns[pos]); !ok || strings.EqualFold(col.Type.Name, "interval") {
+			return nil, 0
+		}
+		if restrictionEqualityOn(cat, tbl, idx, pos, conjuncts) != nil ||
+			len(restrictionSAOPOnColumn(cat, tbl, idx, pos, conjuncts)) > 0 ||
+			restrictionNullTestOnColumn(idx, pos, conjuncts) != nil {
+			return nil, 0
+		}
+		rng := restrictionRangeOnColumnLocal(cat, tbl, idx, pos, conjuncts, true)
+		if len(rng) == 0 {
+			continue
+		}
+		if pos == 0 {
+			return nil, 0
+		}
+		for i := 0; i < pos; i++ {
+			if i < len(idx.ColDescending) && idx.ColDescending[i] {
+				return nil, 0
+			}
+		}
+		if !indexSkipNullSafe(tbl, idx, pos, 1) {
+			return nil, 0
+		}
+		return rng, pos
+	}
+	return nil, 0
+}
+
 // restrictionLeadingRange binds the index's LEADING column to the first local
 // lower bound (`col > c` / `col >= c`, either operand order) and the first
 // upper bound (`col < c` / `col <= c`) on it, returning up to two clauses with
@@ -194,16 +248,35 @@ func restrictionLeadingRange(cat catalog.Catalog, tbl *catalog.Table, idx *catal
 }
 
 // restrictionRangeOnColumn is restrictionLeadingRange for index column `pos`:
-// pos 0 is the leading-column range; pos > 0 follows an equality prefix
-// (slice 2b). Behind a prefix the bounds NEVER record `local`: the conjunct
-// stays in the Filter as a recheck, because an open-ended bound runs to the
-// prefix's padded upper bound, past entries whose bounded column is NULL.
+// pos 0 is the leading-column range; pos > 0 follows a leading ScalarArrayOp,
+// whose own per-element bounds (indexScanOp's SAOP descent) neither stop at
+// the column's NULL group nor swap for a DESC column, so those bounds record
+// no `local` and the conjunct stays in the Filter as a recheck. Bounds behind
+// an EQUALITY prefix are restrictionRangeBehindPrefix's.
 func restrictionRangeOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, pos int, conjuncts []Expr) []indexPathClause {
+	return restrictionRangeOnColumnLocal(cat, tbl, idx, pos, conjuncts, pos == 0)
+}
+
+// restrictionRangeBehindPrefix is restrictionRangeOnColumn for the column
+// after an equality prefix (IndexScan.RangePrefix, BitmapIndexScan Keys plus
+// bounds). Those probes bound through indexRangeBounds, which swaps a DESC
+// column and — with one open end — stops at the column's NULL group within
+// the prefix (nullStopRangeBound, M0148-0001c3a), and a cluster without
+// NULL-keyed entries stores none to run into. So the bounds are exact and
+// record `local`: PG prints `Index Cond: ((a = 3) AND (b < 200))` and no
+// Filter (M0148-0001c3a2). This rule used to keep them a Filter recheck,
+// written before the prefix-aware NULL stop existed.
+func restrictionRangeBehindPrefix(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, pos int, conjuncts []Expr) []indexPathClause {
+	return restrictionRangeOnColumnLocal(cat, tbl, idx, pos, conjuncts, true)
+}
+
+func restrictionRangeOnColumnLocal(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, pos int, conjuncts []Expr, withLocal bool) []indexPathClause {
 	if pos < 0 || pos >= len(idx.Columns) {
 		return nil
 	}
 	lead := idx.Columns[pos]
 	var lo, hi *indexPathClause
+	var los, his []*indexPathClause
 	for _, conj := range conjuncts {
 		bin, ok := conj.(*BinaryOp)
 		if !ok {
@@ -229,7 +302,7 @@ func restrictionRangeOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *cata
 			op = swapInequalityOp(op)
 		}
 		c := &indexPathClause{indexCol: pos, key: val, op: op}
-		if pos == 0 {
+		if withLocal {
 			c.local = conj
 		}
 		switch op {
@@ -237,10 +310,26 @@ func restrictionRangeOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *cata
 			if lo == nil {
 				lo = c
 			}
+			los = append(los, c)
 		default:
 			if hi == nil {
 				hi = c
 			}
+			his = append(his, c)
+		}
+	}
+	// M0148-0001c3a6 (i): PG makes every bound an index clause and
+	// _bt_preprocess_keys keeps the tightest per direction. When all of a
+	// direction's bounds are comparable integer Consts, the tightest drives
+	// the probe and the rest are redundant clauses (printed, implied).
+	// Otherwise the first stays the probe and the rest stay Filters.
+	var extra []indexPathClause
+	if withLocal {
+		if t, rest, ok := tightestIntBound(los, true); ok {
+			lo, extra = t, append(extra, rest...)
+		}
+		if t, rest, ok := tightestIntBound(his, false); ok {
+			hi, extra = t, append(extra, rest...)
 		}
 	}
 	var out []indexPathClause
@@ -250,7 +339,58 @@ func restrictionRangeOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *cata
 	if hi != nil {
 		out = append(out, *hi)
 	}
+	if len(extra) > 0 {
+		out = append(out, extra...)
+		sort.SliceStable(out, func(i, j int) bool {
+			return conjunctPrecedes(clauseSource(out[i], conjuncts), clauseSource(out[j], conjuncts), conjuncts)
+		})
+		return out
+	}
+	// M0148-0001c3a2: one column's clauses in restriction-list order, as
+	// PG's match_clauses_to_index files them (`((a < 50) AND (a > 10))`).
+	if lo != nil && hi != nil && conjunctPrecedes(clauseSource(*hi, conjuncts), clauseSource(*lo, conjuncts), conjuncts) {
+		out[0], out[1] = out[1], out[0]
+	}
 	return out
+}
+
+// clauseSource is an index clause's restriction conjunct: its `local`, or —
+// for a bound that records none — the conjunct holding its key.
+func clauseSource(c indexPathClause, conjuncts []Expr) Expr {
+	if c.local != nil {
+		return c.local
+	}
+	for _, conj := range conjuncts {
+		if bin, ok := conj.(*BinaryOp); ok && c.key != nil && (bin.Left == c.key || bin.Right == c.key) {
+			return conj
+		}
+	}
+	return nil
+}
+
+// conjunctPrecedes reports whether restriction conjunct a comes before b in
+// the relation's restriction list as written — baserestrictinfo order, which
+// PG's index clauses keep. goopg's leaf Filter is cost-sorted
+// (order_qual_clauses, local_filters.go) before the producers see it, so the
+// written order is read off the conjuncts' source positions, which the leaf
+// localization keeps; equal or unknown positions fall back to list order.
+func conjunctPrecedes(a, b Expr, conjuncts []Expr) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if pa, pb := a.Pos(), b.Pos(); pa > 0 && pb > 0 && pa != pb {
+		return pa < pb
+	}
+	ia, ib := len(conjuncts), len(conjuncts)
+	for i, c := range conjuncts {
+		if c == a {
+			ia = i
+		}
+		if c == b {
+			ib = i
+		}
+	}
+	return ia < ib
 }
 
 // restrictionLeadingSAOP binds the index's LEADING column to the first local
@@ -263,24 +403,36 @@ func restrictionRangeOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *cata
 // the union of the descents (the executor dedupes by TID), so it is recorded
 // in `local` and dropped from the Filter.
 func restrictionLeadingSAOP(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) []indexPathClause {
-	if len(idx.Columns) == 0 {
+	return restrictionSAOPOnColumn(cat, tbl, idx, 0, conjuncts)
+}
+
+// restrictionSAOPOnColumn is restrictionLeadingSAOP on index column pos: the
+// array of a probe behind an equality prefix on the columns before it
+// (M0148-0001c3a4 (b), PG `((thousand = 42) AND (tenthous = ANY (…)))`).
+func restrictionSAOPOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, pos int, conjuncts []Expr) []indexPathClause {
+	if pos < 0 || pos >= len(idx.Columns) {
 		return nil
 	}
-	lead := idx.Columns[0]
+	lead := idx.Columns[pos]
 	for _, conj := range conjuncts {
 		in, ok := conj.(*InExpr)
 		if !ok || in.Subquery != nil || in.Plan != nil || len(in.List) == 0 {
 			continue
 		}
-		if in.Negated || in.NotEqualAny || in.AllOp || (in.AnyOp != parser.OpUnknown && in.AnyOp != parser.OpEq) {
+		ineqOp, ineq := saopAnyInequality(in)
+		if in.Negated || in.NotEqualAny || in.AllOp || (in.AnyOp != parser.OpUnknown && in.AnyOp != parser.OpEq && !ineq) {
 			continue
 		}
 		cr, ok := in.Operand.(*ColumnRef)
 		if !ok || cr.Index < 0 || cr.Index >= len(tbl.Columns) || tbl.Columns[cr.Index].Name != lead {
 			continue
 		}
+		list, listOK := saopElementsFor(tbl.Columns[cr.Index], in.List)
+		if !listOK || len(list) == 0 {
+			continue
+		}
 		usable := true
-		for _, e := range in.List {
+		for _, e := range list {
 			// A NULL element matches nothing under `=` and the executor's
 			// multi-descent probe skips it (ScalarArrayOp semantics), so it
 			// does not stop the list from being an index qual — PG keeps
@@ -296,7 +448,27 @@ func restrictionLeadingSAOP(cat catalog.Catalog, tbl *catalog.Table, idx *catalo
 		if !usable {
 			continue
 		}
-		return []indexPathClause{{indexCol: 0, saop: in.List, local: conj}}
+		c := indexPathClause{indexCol: pos, saop: list, saopOp: ineqOp, local: conj}
+		if ineqOp == parser.OpUnknown {
+			c.saopColQuals = saopColumnQuals(cat, tbl, lead, conj, conjuncts)
+		}
+		return []indexPathClause{c}
+	}
+	// M0148-0001c3a2: an OR of equalities on the leading column is the same
+	// ScalarArrayOp probe (match_orclause_to_indexcol); the OR is its exact
+	// recheck and leaves the Filter like the IN does.
+	for _, conj := range conjuncts {
+		if idx.DeclaredHash {
+			// A hash index takes no ScalarArrayOp quals (amsearcharray).
+			break
+		}
+		if in, ok := orEqualitySAOP(cat, tbl, lead, conj); ok {
+			return []indexPathClause{{indexCol: pos, saop: in.List, local: conj}}
+		}
+		// M0148-0001c3a4 (a): an OR of one inequality operator.
+		if in, op, ok := orInequalitySAOP(cat, tbl, lead, conj); ok {
+			return []indexPathClause{{indexCol: pos, saop: in.List, saopOp: op, local: conj}}
+		}
 	}
 	return nil
 }
@@ -310,6 +482,19 @@ func restrictionLeadingSAOP(cat catalog.Catalog, tbl *catalog.Table, idx *catalo
 func rangeIndexSelectivity(leaf Node, conjuncts []Expr, clauses []indexPathClause) float64 {
 	var quals []Expr
 	for _, c := range clauses {
+		if c.rowCompare && c.local != nil {
+			// rowcomparesel over the comparison (M0148-0001c3a12).
+			quals = append(quals, c.local)
+			continue
+		}
+		if c.nullTest != IndexNullTestNone {
+			// The NullTest conjunct itself (nulltestsel through
+			// clauseSelectivity), M0148-0001c3a.
+			if c.local != nil {
+				quals = append(quals, c.local)
+			}
+			continue
+		}
 		for _, conj := range conjuncts {
 			bin, ok := conj.(*BinaryOp)
 			if ok && (bin.Left == c.key || bin.Right == c.key) {
@@ -322,6 +507,100 @@ func rangeIndexSelectivity(leaf Node, conjuncts []Expr, clauses []indexPathClaus
 		return 1
 	}
 	return clampSelectivity(conjunctionSelectivity(quals, leaf))
+}
+
+// restrictionLeadingNullTest is match_clause_to_indexcol's NullTest arm
+// (indxpath.c) for the leading index column: a `col IS [NOT] NULL` conjunct
+// on a plain key column becomes an index clause, since btree has
+// amsearchnulls. `IS NULL` needs an index that stores NULL-keyed entries
+// (catalog.IndexHasNullKeyedEntries) — in an older cluster the rows it asks
+// for are not in the index at all, so it stays a Filter there. `IS NOT NULL`
+// is always answerable: an index without NULL-keyed entries holds only
+// non-NULL keys. The first matching conjunct wins (PG would take a duplicate
+// too; it is redundant). M0148-0001c3a.
+func restrictionLeadingNullTest(idx *catalog.Index, conjuncts []Expr) *indexPathClause {
+	return restrictionNullTestOnColumn(idx, 0, conjuncts)
+}
+
+// restrictionNullTestOnColumn is restrictionLeadingNullTest for index column
+// pos, which follows an equality prefix when pos > 0 (slice 3). Unlike a
+// range bound there, the NullTest is exact behind the prefix — IS NULL is
+// the [prefix, NULL] group and IS NOT NULL stops at it — so its conjunct
+// leaves the Filter like the leading one.
+func restrictionNullTestOnColumn(idx *catalog.Index, pos int, conjuncts []Expr) *indexPathClause {
+	if idx == nil || pos < 0 || pos >= len(idx.Columns) || idx.Columns[pos] == "" || idx.DeclaredHash {
+		return nil
+	}
+	for _, conj := range conjuncts {
+		nt, ok := conj.(*IsNullExpr)
+		if !ok {
+			continue
+		}
+		cr, ok := nt.Operand.(*ColumnRef)
+		if !ok || cr.Name != idx.Columns[pos] {
+			continue
+		}
+		kind := IndexNullTestIsNull
+		if nt.Negated {
+			kind = IndexNullTestIsNotNull
+		} else if !catalog.IndexHasNullKeyedEntries(idx) {
+			continue
+		}
+		return &indexPathClause{indexCol: pos, local: conj, nullTest: kind}
+	}
+	return nil
+}
+
+// restrictionNullTestsOnColumn is every NullTest index clause on index column
+// pos, in restriction-list order (restrictionNullTestOnColumn's first is the
+// head): PG takes each as an index clause, duplicates and contradictions
+// included, and _bt_preprocess_keys merges them at scan time
+// (M0148-0001c3a2).
+func restrictionNullTestsOnColumn(idx *catalog.Index, pos int, conjuncts []Expr) []indexPathClause {
+	var out []indexPathClause
+	for len(conjuncts) > 0 {
+		nt := restrictionNullTestOnColumn(idx, pos, conjuncts)
+		if nt == nil {
+			break
+		}
+		out = append(out, *nt)
+		for i, c := range conjuncts {
+			if c == nt.local {
+				conjuncts = conjuncts[i+1:]
+				break
+			}
+		}
+	}
+	return out
+}
+
+// withNullTestsInConjunctOrder is withNullTestInConjunctOrder for each of
+// the column's NullTest clauses in turn.
+func withNullTestsInConjunctOrder(rng []indexPathClause, nts []indexPathClause, conjuncts []Expr) []indexPathClause {
+	for _, nt := range nts {
+		rng = withNullTestInConjunctOrder(rng, nt, conjuncts)
+	}
+	return rng
+}
+
+// withNullTestInConjunctOrder places the NullTest clause among the leading
+// column's range clauses in restriction-list order: PG lists one index
+// column's clauses in baserestrictinfo order, which is what Index Cond prints
+// (`((x IS NOT NULL) AND (x < 5))`).
+func withNullTestInConjunctOrder(rng []indexPathClause, nt indexPathClause, conjuncts []Expr) []indexPathClause {
+	out := make([]indexPathClause, 0, len(rng)+1)
+	placed := false
+	for _, c := range rng {
+		if src := clauseSource(c, conjuncts); !placed && src != nil && conjunctPrecedes(nt.local, src, conjuncts) {
+			out = append(out, nt)
+			placed = true
+		}
+		out = append(out, c)
+	}
+	if !placed {
+		out = append(out, nt)
+	}
+	return out
 }
 
 // restrictionKeyUsable admits the probe-key kinds the executor's btree key
@@ -348,7 +627,27 @@ func restrictionKeyUsable(cat catalog.Catalog, col catalog.Column, val Expr) boo
 	// already produce the column's own type, since the probe encodes the
 	// key's Datum against the column with no further coercion (M0146-0060).
 	if c, isCast := val.(*CastExpr); isCast {
-		return isConstantPlanExpr(c) && castTargetIsColumnType(c, col)
+		if isConstantPlanExpr(c) && castTargetIsColumnType(c, col) {
+			return true
+		}
+		// M0148-0001c3a6 (i): `int4col = 3::int8` meets integer_ops'
+		// cross-type operator (int48eq), an index qual in PG; the probe
+		// encodes the value against the column, so it must fit.
+		_, ok := crossIntCastKey(c, col.Type)
+		return ok
+	}
+	// `-3::int8` is -(3::int8), a Const '-3'::bigint after
+	// eval_const_expressions.
+	if u, isNeg := val.(*UnaryOp); isNeg && u.Op == parser.OpUnaryNeg {
+		if c, isCast := u.Operand.(*CastExpr); isCast {
+			if ic, isInt := c.Operand.(*IntegerConst); isInt {
+				neg := *c
+				neg.Operand = &IntegerConst{Value: -ic.Value}
+				if _, ok := crossIntCastKey(&neg, col.Type); ok {
+					return true
+				}
+			}
+		}
 	}
 	if t, isOuter := outerParamKeyType(val); isOuter {
 		// The probe encodes the key's runtime Datum against the column's
@@ -360,7 +659,9 @@ func restrictionKeyUsable(cat catalog.Catalog, col catalog.Column, val Expr) boo
 		return false
 	}
 	if _, isBool := val.(*BooleanConst); isBool {
-		return false
+		// `b = true` on a boolean column is an index qual
+		// (M0148-0001c3a5 (d)); on any other column it is not.
+		return !col.Type.IsArray && (strings.EqualFold(col.Type.Name, "bool") || strings.EqualFold(col.Type.Name, "boolean"))
 	}
 	// M0146-0061: a numeric literal against an integer column is
 	// `(col)::numeric op const` in PG — btree integer_ops has no numeric
@@ -447,6 +748,9 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		return false
 	}
 	clauses := restrictionEqualityPrefix(cat, tbl, idx, conjuncts)
+	if equalityMergedIntoLeadingSAOP(cat, tbl, idx, conjuncts, clauses) {
+		clauses = nil
+	}
 	// A `USING hash` index (goopg builds it on a btree, DeclaredHash) answers
 	// equality only: PG's hash AM has no ordering, so no range or skip qual,
 	// and amsearcharray is false, so no ScalarArrayOp qual (hashhandler,
@@ -459,27 +763,67 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	// may be followed by range bounds on the NEXT column (PG binds `b > 5`
 	// behind `a = 1` on `(a, b)`). The eq clauses become IndexScan.RangePrefix.
 	prefixRange := false
-	if n := len(clauses); n > 0 && n < len(idx.Columns) {
-		if rng := restrictionRangeOnColumn(cat, tbl, idx, n, conjuncts); len(rng) > 0 {
+	if n := len(clauses); n > 0 && n < len(idx.Columns) && !prefixEqualitySAOP(cat, tbl, idx, n, conjuncts) {
+		rng := restrictionRangeBehindPrefix(cat, tbl, idx, n, conjuncts)
+		// M0148-0001c3a slice 3: a NullTest on the column after the prefix
+		// (`a = 1 AND b IS NULL`), bounded at the prefix's NULL group.
+		if nts := restrictionNullTestsOnColumn(idx, n, conjuncts); len(nts) > 0 {
+			rng = withNullTestsInConjunctOrder(rng, nts, conjuncts)
+		}
+		if len(rng) > 0 {
 			clauses = append(clauses, rng...)
 			prefixRange = true
 		}
 	}
 	isSAOP := false
+	saopAt := 0
+	// M0148-0001c3a4 (b): no bound behind the equality prefix, but an array
+	// on the next column — build_index_paths takes the column's
+	// ScalarArrayOp clause behind the prefix's equalities, and the array may
+	// itself be followed by bounds on the column after it.
+	if n := len(clauses); n > 0 && n < len(idx.Columns) && !prefixRange && !idx.DeclaredHash {
+		if sa := restrictionSAOPOnColumn(cat, tbl, idx, n, conjuncts); len(sa) > 0 {
+			clauses = append(clauses, sa...)
+			isSAOP, saopAt = true, n
+			// An inequality array is a range on its column; the next
+			// column's quals stay in the Filter (M0148-0001c3a4 (a)).
+			if n+1 < len(idx.Columns) && sa[0].saopOp == parser.OpUnknown {
+				clauses = append(clauses, restrictionRangeBehindPrefix(cat, tbl, idx, n+1, conjuncts)...)
+			}
+		}
+	}
 	if len(clauses) == 0 {
 		clauses = restrictionLeadingSAOP(cat, tbl, idx, conjuncts)
 		isSAOP = len(clauses) > 0
 		// A SAOP on the leading column may be followed by bounds on the
-		// second (PG `Index Cond: ((a = ANY (...)) AND (b > 1))`). The bounds
-		// stay in the Filter as a recheck (restrictionRangeOnColumn records no
-		// `local` behind a leading column).
-		if isSAOP && len(idx.Columns) > 1 {
-			clauses = append(clauses, restrictionRangeOnColumn(cat, tbl, idx, 1, conjuncts)...)
+		// second (PG `Index Cond: ((a = ANY (...)) AND (b > 1))`).
+		// M0148-0001c3a4 (c): exact index quals, as behind an equality
+		// prefix — the executor bounds each element's descent with
+		// indexRangeBounds (NULL stop, DESC swap), so no Filter recheck.
+		if isSAOP && len(idx.Columns) > 1 && clauses[0].saopOp == parser.OpUnknown {
+			clauses = append(clauses, restrictionRangeBehindPrefix(cat, tbl, idx, 1, conjuncts)...)
 		}
 	}
 	if len(clauses) == 0 {
 		clauses = restrictionLeadingRange(cat, tbl, idx, conjuncts)
+		// M0148-0001c3a: a NullTest on the leading column is an index
+		// clause too (match_clause_to_indexcol's NullTest arm), on its own
+		// or beside the range bounds.
+		if nts := restrictionNullTestsOnColumn(idx, 0, conjuncts); len(nts) > 0 {
+			clauses = withNullTestsInConjunctOrder(clauses, nts, conjuncts)
+		}
 		isRange = true
+		// M0148-0001c3a12: a row comparison over the leading columns bounds
+		// the leading column and is checked per entry; it takes the scan's
+		// one entry check, so no trailing array beside it.
+		if rc := restrictionRowCompare(cat, tbl, idx, conjuncts, clauses); rc != nil {
+			clauses = withRowCompareInConjunctOrder(clauses, *rc, conjuncts)
+		} else if len(clauses) > 0 {
+			// M0148-0001c3a4 (i): an `= ANY` array on the second column
+			// behind the range is an index qual too, checked per entry
+			// (IndexScan.TrailingSAOP).
+			clauses = append(clauses, trailingSAOPOnRange(cat, tbl, idx, conjuncts)...)
+		}
 	}
 	// M0146-0005dg: nothing binds the leading column — an equality run on a
 	// later column still drives a btree skip scan.
@@ -487,6 +831,15 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	if len(clauses) == 0 {
 		clauses, skip = restrictionSkipRun(cat, tbl, idx, conjuncts)
 		isRange = false
+	}
+	// M0148-0001c3a4 (j): no equality run either, but a range on a later
+	// column — PG 18's skip scan with skip arrays over the columns before
+	// it (IndexScan.SkipPrefix with LowKey/HighKey, no Keys).
+	skipRangeCol := 0
+	if len(clauses) == 0 {
+		if rng, sc := restrictionSkipRange(cat, tbl, idx, conjuncts); len(rng) > 0 {
+			clauses, skipRangeCol, isRange = rng, sc, true
+		}
 	}
 	if len(clauses) == 0 {
 		return false
@@ -511,21 +864,35 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	var sel float64
 	var unique bool
 	numSAScans := 0.0
+	boundSel := 0.0
+	trailingAt, trailing := clausesTrailingSAOP(clauses)
 	switch {
+	case trailing:
+		sel, boundSel, numSAScans = trailingSAOPSelectivity(cat, rel, tbl, idx, clauses, trailingAt, relTuples, conjuncts)
 	case isSAOP:
 		// scalararraysel over the IN (clauseSelectivity's InExpr arm), and
 		// one descent per element (btcostestimate's num_sa_scans).
-		sel = clampSelectivity(clauseSelectivity(clauses[0].local, rel.baseLeaf))
-		if len(clauses) > 1 {
-			sel = clampSelectivity(sel * rangeIndexSelectivity(rel.baseLeaf, conjuncts, clauses[1:]))
+		sel = clampSelectivity(clauseSelectivity(saopPricedClause(cat, tbl, idx, clauses[saopAt]), rel.baseLeaf))
+		if saopAt > 0 {
+			// The equality prefix's own selectivity (clauselist_selectivity
+			// multiplies the independent quals).
+			eqSel, _ := restrictionIndexSelectivity(tbl, idx, clauses[:saopAt], relTuples)
+			sel = clampSelectivity(sel * eqSel)
 		}
-		numSAScans = float64(len(clauses[0].saop))
+		if len(clauses) > saopAt+1 {
+			sel = clampSelectivity(sel * rangeIndexSelectivity(rel.baseLeaf, conjuncts, clauses[saopAt+1:]))
+		}
+		numSAScans = saopDescents(clauses[saopAt])
+		// M0148-0001c3a4 (i): the column quals merged into the array.
+		for _, q := range clauses[saopAt].saopColQuals {
+			sel = clampSelectivity(sel * clauseSelectivity(q.local, rel.baseLeaf))
+		}
 	case isRange:
 		sel = rangeIndexSelectivity(rel.baseLeaf, conjuncts, clauses)
 	case prefixRange:
 		var eq, rng []indexPathClause
 		for _, c := range clauses {
-			if c.op == parser.OpUnknown {
+			if c.op == parser.OpUnknown && c.nullTest == IndexNullTestNone {
 				eq = append(eq, c)
 			} else {
 				rng = append(rng, c)
@@ -547,10 +914,10 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	// A skip probe descends once per distinct skipped prefix
 	// (btcostestimate's num_sa_scans); a reverted estimate prices the index
 	// side over the whole index (skipScanDescents, boundSelectivity 1).
-	boundSel := 0.0
-	if skip > 0 {
+	// (boundSel may already hold the trailing-array arm's value.)
+	if skip > 0 || skipRangeCol > 0 {
 		var boundCounted bool
-		numSAScans, boundCounted = skipScanDescents(tbl, idx, skip, relTuples, indexPages)
+		numSAScans, boundCounted = skipScanDescents(tbl, idx, max(skip, skipRangeCol), relTuples, indexPages)
 		if !boundCounted {
 			boundSel = 1
 		}
@@ -572,13 +939,13 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		// qpquals = baserestrictinfo minus the index quals (costsize.c:806-820):
 		// the consumed equalities are applied by the probe, not re-checked.
 		numQualOps:       qpquals,
-		numIndexQuals:    float64(len(clauses)),
+		numIndexQuals:    indexQualCount(clauses),
 		numSAScans:       numSAScans,
 		boundSelectivity: boundSel,
 	}
 	cost := costIndexScan(s.cp, in)
 	tgt, tgtKnown := scanPathTarget(rel)
-	addPath(rel, &Path{
+	fwd := &Path{
 		Kind:          PathIndexScan,
 		Rel:           rel,
 		ParallelSafe:  rel.ParallelSafeForPath(),
@@ -595,7 +962,18 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		TargetKnown:   tgtKnown,
 		// M0146-0005dg: clause i probes Columns[skip+i].
 		IndexSkipPrefix: skip,
-	}, "index.restrict")
+	}
+	addPath(rel, fwd, "index.restrict")
+	// M0148-0001c3a3: build_index_paths step 5, the backward twin, when the
+	// reversed order is useful. Not for a ScalarArrayOp or skip probe: the
+	// executor walks only the plain probe path backward.
+	if len(keys) > 0 && !isSAOP && skip == 0 {
+		if bkeys := s.usefulBackwardIndexPathkeys(rel, idx, colExprs); len(bkeys) > 0 {
+			back := *fwd
+			back.Pathkeys, back.IndexScanDir = bkeys, BackwardScanDirection
+			addPath(rel, &back, "index.restrict.backward")
+		}
+	}
 	return true
 }
 
@@ -772,6 +1150,10 @@ func isIndexKeyOperand(e Expr) bool {
 	if c, isCast := e.(*CastExpr); isCast && isConstantPlanExpr(c) {
 		return true
 	}
+	// `-3::int8` (M0148-0001c3a6 (i)): restrictionKeyUsable decides.
+	if _, isIntCast := integerCastLiteral(e); isIntCast {
+		return true
+	}
 	_, isOuter := outerParamKeyType(e)
 	return isOuter
 }
@@ -798,4 +1180,306 @@ func indexKeyEqSelectivity(stats *catalog.ColumnStats, key Expr, rawRows float64
 		return varEqNonConstSelectivity(stats, rawRows)
 	}
 	return eqSelectivityForColumn(stats, key, rawRows, typeName)
+}
+
+// saopColQual is one further qual on a ScalarArrayOp probe's column
+// (optimizer.SAOPColQual's path form).
+type saopColQual struct {
+	op     parser.OpCode
+	key    Expr
+	array  []Expr
+	// arrayText is a cross-type array literal's EXPLAIN text
+	// (SAOPColQual.ArrayText), "" when the literal is the column's type.
+	arrayText string
+	local  Expr
+	before bool
+}
+
+// saopColumnQuals collects the restriction's other constant quals on the
+// array's column — further `= ANY` lists and range bounds — which
+// _bt_preprocess_keys merges into the array (_bt_merge_arrays,
+// _bt_compare_array_scankey_args): PG prints them in the same Index Cond
+// (`((unique1 = ANY ('{1,42,7}')) AND (unique1 >= 42))`). before marks a
+// qual written ahead of the array, by source position (restriction order).
+func saopColumnQuals(cat catalog.Catalog, tbl *catalog.Table, colName string, primary Expr, conjuncts []Expr) []saopColQual {
+	var out []saopColQual
+	for _, conj := range conjuncts {
+		if conj == primary {
+			continue
+		}
+		before := conj.Pos() < primary.Pos()
+		switch x := conj.(type) {
+		case *InExpr:
+			if x.Subquery != nil || x.Plan != nil || len(x.List) == 0 || x.Negated || x.NotEqualAny || x.AllOp ||
+				(x.AnyOp != parser.OpUnknown && x.AnyOp != parser.OpEq) {
+				continue
+			}
+			cr, ok := x.Operand.(*ColumnRef)
+			if !ok || cr.Index < 0 || cr.Index >= len(tbl.Columns) || tbl.Columns[cr.Index].Name != colName {
+				continue
+			}
+			list, ok := saopElementsFor(tbl.Columns[cr.Index], x.List)
+			arrayText := ""
+			if !ok {
+				// M0148-0001c3a6 (i): `int4col = ANY ('{33,44}'::bigint[])`
+				// is an index qual through the integer btree family's
+				// cross-type `=` (int48eq); the elements narrow to the
+				// column's type when every one fits.
+				list, arrayText, ok = crossIntArrayLiteral(tbl.Columns[cr.Index].Type, x.List)
+				if !ok {
+					continue
+				}
+			}
+			usable := true
+			for _, e := range list {
+				if _, isNull := e.(*NullConst); isNull {
+					continue
+				}
+				if !isConstExpr(e) || !restrictionKeyUsable(cat, tbl.Columns[cr.Index], e) {
+					usable = false
+					break
+				}
+			}
+			if usable {
+				out = append(out, saopColQual{op: parser.OpEq, array: list, arrayText: arrayText, local: conj, before: before})
+			}
+		case *BinaryOp:
+			// M0148-0001c3a6 (i): `col = const` beside the array merges too
+			// (_bt_compare_array_scankey_args keeps the matching element):
+			// `((unique1 = ANY ('{1,42,7}'::integer[])) AND (unique1 = 1))`.
+			switch x.Op {
+			case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe, parser.OpEq:
+			default:
+				continue
+			}
+			cr, val, colOnRight, ok := normalizeColumnIndexKey(x.Left, x.Right)
+			if !ok || cr.Index < 0 || cr.Index >= len(tbl.Columns) || tbl.Columns[cr.Index].Name != colName ||
+				!bitmapConstKey(val) || !restrictionKeyUsable(cat, tbl.Columns[cr.Index], val) {
+				continue
+			}
+			op := x.Op
+			if colOnRight {
+				op = swapInequalityOp(op)
+			}
+			// A `col = const` is an EquivalenceClass member; PG regenerates
+			// it after the other quals (generate_base_implied_equalities),
+			// so it prints after the array whatever its source position.
+			if op == parser.OpEq {
+				before = false
+			}
+			out = append(out, saopColQual{op: op, key: val, local: conj, before: before})
+		}
+	}
+	// Index Cond lists a column's quals in restriction (source) order;
+	// conjuncts may arrive reordered.
+	// EquivalenceClass equalities come after every other qual.
+	sort.SliceStable(out, func(i, j int) bool {
+		ei, ej := out[i].op == parser.OpEq && out[i].array == nil, out[j].op == parser.OpEq && out[j].array == nil
+		if ei != ej {
+			return !ei
+		}
+		return out[i].local.Pos() < out[j].local.Pos()
+	})
+	return out
+}
+
+// prefixEqualitySAOP reports an `= ANY` array on index column n behind an
+// equality prefix (M0148-0001c3a4 (i)). PG makes every btree qual on the
+// column an index qual and _bt_preprocess_keys merges the column's bounds
+// into the array, so the array, not the bounds, is the column's probe: the
+// bounds ride along as its saopColQuals.
+func prefixEqualitySAOP(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, n int, conjuncts []Expr) bool {
+	if idx.DeclaredHash || n <= 0 || n >= len(idx.Columns) {
+		return false
+	}
+	sa := restrictionSAOPOnColumn(cat, tbl, idx, n, conjuncts)
+	return len(sa) > 0 && sa[0].saopOp == parser.OpUnknown
+}
+
+// booleanIndexQual is match_boolean_index_clause's shapes over a boolean
+// column: `col` and `col IS TRUE` are `col = true`, `NOT col` and `col IS
+// FALSE` are `col = false` (M0148-0001c3a5 (d)).
+func booleanIndexQual(conj Expr) (string, bool, bool) {
+	boolCol := func(e Expr) (string, bool) {
+		cr, ok := e.(*ColumnRef)
+		if !ok || cr.Name == "" || cr.Type.IsArray || !strings.EqualFold(cr.Type.Name, "bool") && !strings.EqualFold(cr.Type.Name, "boolean") {
+			return "", false
+		}
+		return cr.Name, true
+	}
+	switch x := conj.(type) {
+	case *ColumnRef:
+		if n, ok := boolCol(x); ok {
+			return n, true, true
+		}
+	case *UnaryOp:
+		if x.Op == parser.OpNot {
+			if n, ok := boolCol(x.Operand); ok {
+				return n, false, true
+			}
+		}
+	case *IsBoolExpr:
+		if !x.Negated && x.TestTrue != x.TestFalse {
+			if n, ok := boolCol(x.Operand); ok {
+				return n, x.TestTrue, true
+			}
+		}
+	}
+	return "", false, false
+}
+
+
+// tightestIntBound picks the tightest of one direction's bounds (lower:
+// the largest value, `>` over `>=` on a tie; upper: the smallest, `<` over
+// `<=`) when there are several and every key is an integer Const; the
+// others come back flagged redundantBound.
+func tightestIntBound(bounds []*indexPathClause, lower bool) (*indexPathClause, []indexPathClause, bool) {
+	if len(bounds) < 2 {
+		return nil, nil, false
+	}
+	val := func(c *indexPathClause) (int64, bool) {
+		if ic, ok := c.key.(*IntegerConst); ok {
+			return ic.Value, true
+		}
+		if ic, ok := integerCastLiteral(c.key); ok {
+			return ic.Value, true
+		}
+		return 0, false
+	}
+	best := -1
+	var bv int64
+	for i, c := range bounds {
+		v, ok := val(c)
+		if !ok {
+			return nil, nil, false
+		}
+		strict := c.op == parser.OpGt || c.op == parser.OpLt
+		if best < 0 {
+			best, bv = i, v
+			continue
+		}
+		bstrict := bounds[best].op == parser.OpGt || bounds[best].op == parser.OpLt
+		tighter := (lower && v > bv) || (!lower && v < bv) || (v == bv && strict && !bstrict)
+		if tighter {
+			best, bv = i, v
+		}
+	}
+	var rest []indexPathClause
+	for i, c := range bounds {
+		if i != best {
+			r := *c
+			r.redundantBound = true
+			rest = append(rest, r)
+		}
+	}
+	return bounds[best], rest, true
+}
+
+// equalityMergedIntoLeadingSAOP reports a one-column equality prefix whose
+// equality the leading `= ANY` array merges as a column qual: PG's single
+// path for the index carries both clauses (build_index_paths), the array
+// the probe and the equality merged into it (_bt_preprocess_keys), and
+// prints both — so the array path is the one to file (M0148-0001c3a6 (i)).
+func equalityMergedIntoLeadingSAOP(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr, prefix []indexPathClause) bool {
+	if len(prefix) != 1 || idx.DeclaredHash || prefix[0].local == nil {
+		return false
+	}
+	sa := restrictionLeadingSAOP(cat, tbl, idx, conjuncts)
+	if len(sa) == 0 || sa[0].saopOp != parser.OpUnknown {
+		return false
+	}
+	for _, q := range sa[0].saopColQuals {
+		if q.local == prefix[0].local {
+			return true
+		}
+	}
+	return false
+}
+
+// restrictionRowCompare is match_rowcompare_to_indexcol (indxpath.c) for a
+// restriction conjunct `(c0, …, ck) op (v0, …, vk)`: the left row's
+// columns are the index's leading columns in order, the right row's
+// elements constants (NULL included), op an inequality. The clause bounds
+// c0 (op's direction, inclusive — the lossy part nbtree's SK_ROW_HEADER key
+// starts the scan at) and carries the comparison for the per-entry check.
+// A row on the right is commuted. nil when no conjunct qualifies, or when
+// the column already has a bound of that direction (one probe bound per
+// direction).
+func restrictionRowCompare(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr, have []indexPathClause) *indexPathClause {
+	if idx.DeclaredHash || len(idx.Columns) < 2 {
+		return nil
+	}
+	for _, conj := range conjuncts {
+		bin, ok := conj.(*BinaryOp)
+		if !ok {
+			continue
+		}
+		op := bin.Op
+		switch op {
+		case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		default:
+			continue
+		}
+		lr, lok := bin.Left.(*RowExpr)
+		rr, rok := bin.Right.(*RowExpr)
+		if !lok || !rok {
+			continue
+		}
+		if _, colsRight := rr.Elems[0].(*ColumnRef); colsRight {
+			lr, rr, op = rr, lr, swapInequalityOp(op)
+		}
+		n := len(lr.Elems)
+		if n < 2 || n != len(rr.Elems) || n > len(idx.Columns) {
+			continue
+		}
+		match := true
+		for i := 0; i < n; i++ {
+			cr, isCol := lr.Elems[i].(*ColumnRef)
+			if !isCol || cr.Index < 0 || cr.Index >= len(tbl.Columns) || tbl.Columns[cr.Index].Name != idx.Columns[i] {
+				match = false
+				break
+			}
+			v := rr.Elems[i]
+			if _, isNull := v.(*NullConst); isNull {
+				continue
+			}
+			if !bitmapConstKey(v) || !restrictionKeyUsable(cat, tbl.Columns[cr.Index], v) {
+				match = false
+				break
+			}
+			// Every column ascending: a DESC column reverses the row order
+			// the lossy bound and the entry check assume.
+			if i < len(idx.ColDescending) && idx.ColDescending[i] {
+				match = false
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+		bound := parser.OpGe
+		if op == parser.OpLt || op == parser.OpLe {
+			bound = parser.OpLe
+		}
+		for _, h := range have {
+			if h.indexCol == 0 && ((bound == parser.OpGe) == (h.op == parser.OpGt || h.op == parser.OpGe)) {
+				match = false
+			}
+		}
+		if !match {
+			continue
+		}
+		return &indexPathClause{indexCol: 0, op: bound, key: rr.Elems[0], local: conj, rowCompare: true}
+	}
+	return nil
+}
+
+// withRowCompareInConjunctOrder places the row-comparison clause among the
+// leading column's clauses in restriction-list order.
+func withRowCompareInConjunctOrder(rng []indexPathClause, rc indexPathClause, conjuncts []Expr) []indexPathClause {
+	out := append(append([]indexPathClause(nil), rng...), rc)
+	sort.SliceStable(out, func(i, j int) bool {
+		return conjunctPrecedes(clauseSource(out[i], conjuncts), clauseSource(out[j], conjuncts), conjuncts)
+	})
+	return out
 }

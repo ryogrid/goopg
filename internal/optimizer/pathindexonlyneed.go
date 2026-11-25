@@ -711,6 +711,40 @@ func existsBodyForColumns(sub *parser.SelectStmt) *parser.SelectStmt {
 	return &cp
 }
 
+// neededBareStarOnlyKey marks a needed-column set published while
+// neededColsKnown is false: the statement's set is untrustworthy only because
+// of bare `*` targets, and the map holds every OTHER column name it reads
+// (system columns included). A consumer that can stand in for the star with
+// a relation's own full column list — a partition child rel's bare scan
+// (childNeededColumns, M0148-0001c3a10 slice 7) — may use it; every other
+// consumer gates on neededColsKnown and never reads the map.
+const neededBareStarOnlyKey = "\x00barestaronly"
+
+// addBareStarOnlyNeededColumns publishes the bare-star-only set: when the
+// needed set is unknown, the walk is retried with the statement's bare `*`
+// targets dropped (scalarBodyForColumns) and over every pulled-up body; only
+// when all of that walks is the set published, under neededBareStarOnlyKey.
+func addBareStarOnlyNeededColumns(ctx *resolveContext, s *parser.SelectStmt) {
+	if ctx == nil || ctx.neededColsKnown || s == nil {
+		return
+	}
+	stripped := scalarBodyForColumns(s)
+	if stripped == s {
+		return
+	}
+	m, ok := neededColumnNames(stripped)
+	if !ok {
+		return
+	}
+	for _, r := range ctx.pulledDerived {
+		if !collectStmtColumnNames(r.body, m) {
+			return
+		}
+	}
+	m[neededBareStarOnlyKey] = true
+	ctx.neededCols = m
+}
+
 // scalarBodyForColumns drops a scalar sublink's unqualified `*` targets before
 // the walk (M0146-0122). transformExpr expands such a star over the sublink's
 // OWN FROM list (ExpandColumnRefStar: the current level's namespace only), so

@@ -156,6 +156,13 @@ func syncSequenceDefinitionToCatalogHeap(ctx *Context, name string, p xlog.Seque
 		if err != nil {
 			return // parity surface only this phase — never fail the DDL
 		}
+		// A non-HOT update needs an entry for the new version in every
+		// index (heap_update + ExecInsertIndexTuples): without it a PG
+		// server's syscache lookup of the sequence through
+		// pg_sequence_seqrelid_index fails with "cache lookup failed for
+		// sequence" after any ALTER SEQUENCE. M0149-0003.
+		_ = insertCanonicalSysBtreeLeaf(ctx, pgSequenceSeqrelidIndexOID,
+			buildIndexTupleOidKey(uint32(newTID.Block), newTID.Offset, seqrelid), cmpKeyUint32)
 		seqHeapTIDs.Store(key, seqHeapEntry{tid: catalog.SchemaHeapTID{Block: uint32(newTID.Block), Offset: newTID.Offset}, defSig: sig})
 		_ = mirrorProcCatalogFiles(ctx)
 		return
@@ -255,6 +262,20 @@ func buildSequenceDataTuple(lastValue, logCnt int64, isCalled bool) ([]byte, err
 // A zero seqrelid (registry-only sequence in a pre-conversion dir, or a
 // temporary sequence) is a silent no-op.
 func WriteSequencePageAndLog(ctx *Context, name string, dbOid uint32, lastValue, logCnt int64, isCalled bool) {
+	writeSequenceForkAndLog(ctx, name, dbOid, storage.MainFork, lastValue, logCnt, isCalled)
+}
+
+// writeSequenceInitFork is fill_seq_with_data's INIT_FORKNUM half for an
+// unlogged sequence (sequence.c fill_seq_fork_with_data): the same page is
+// written to the init fork and logged as XLOG_SEQ_LOG, because PG logs the
+// init fork even though the relation is unlogged. A crash restart copies it
+// over the main fork (ResetUnloggedRelations), so the sequence starts again
+// from the state its last definition rewrite gave it. M0149-0003.
+func writeSequenceInitFork(ctx *Context, name string, dbOid uint32, lastValue int64, isCalled bool) {
+	writeSequenceForkAndLog(ctx, name, dbOid, storage.InitFork, lastValue, 0, isCalled)
+}
+
+func writeSequenceForkAndLog(ctx *Context, name string, dbOid uint32, fork storage.ForkNumber, lastValue, logCnt int64, isCalled bool) {
 	if ctx == nil || ctx.Pool == nil || ctx.Catalog == nil {
 		return
 	}
@@ -275,7 +296,12 @@ func WriteSequencePageAndLog(ctx *Context, name string, dbOid uint32, lastValue,
 	if physDBOid == 0 {
 		physDBOid = dbOid
 	}
-	rel := storage.RelFileNode{DBOid: physDBOid, RelOid: seqrelid, Fork: storage.MainFork}
+	rel := storage.RelFileNode{DBOid: physDBOid, RelOid: seqrelid, Fork: fork}
+	// An unlogged sequence's main page is written without WAL; its init fork
+	// is logged (fill_seq_fork_with_data). M0149-0003.
+	if sequenceIsUnlogged(ctx, name, dbOid) {
+		ctx.Pool.SetRelUnlogged(rel, true)
+	}
 	pageBytes, err := xlog.BuildSequencePage(tupleBytes)
 	if err != nil {
 		return
@@ -347,7 +373,16 @@ func syncSequenceOwnedByDependRow(ctx *Context, seqrelid uint32, p xlog.Sequence
 	}
 	for i := range tbl.Columns {
 		if strings.EqualFold(tbl.Columns[i].Name, colName) {
-			if writeSequenceOwnedByDependRow(ctx, seqrelid, tbl.OID, int32(i+1)) == nil {
+			// An identity column's sequence is an internal dependency of it
+			// ('i', DEPENDENCY_INTERNAL); a serial or OWNED BY sequence an
+			// auto one ('a'). getIdentitySequence looks only for 'i', so a
+			// PG server found no sequence for an identity column goopg
+			// created (M0149-0003).
+			deptype := "a"
+			if tbl.Columns[i].IdentityColumn {
+				deptype = "i"
+			}
+			if writeSequenceOwnedByDependRow(ctx, seqrelid, tbl.OID, int32(i+1), deptype) == nil {
 				mirrorDependCatalogFiles(ctx)
 			}
 			return

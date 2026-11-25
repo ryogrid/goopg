@@ -25,6 +25,11 @@ func (*IntegerConst) exprNode()  {}
 type StringConst struct {
 	pos   int
 	Value string
+	// BitString marks a B'...' / X'...' literal (decoded to '0'/'1' digits):
+	// PG types it bit (A_Const T_BitString → BITOID), not unknown. The value
+	// stays digit text; the planner reads the flag to type it and to resolve
+	// the bit operators. M0149-0001h1a1.
+	BitString bool `dump:"omitempty"`
 }
 
 func (e *StringConst) Pos() int { return e.pos }
@@ -63,7 +68,7 @@ func decodeBitStringLit(t Token) (Expr, error) {
 				}
 			}
 		}
-		return &StringConst{pos: t.Pos, Value: body}, nil
+		return &StringConst{pos: t.Pos, Value: body, BitString: true}, nil
 	}
 	var out strings.Builder
 	out.Grow(len(body) * 4)
@@ -91,7 +96,7 @@ func decodeBitStringLit(t Token) (Expr, error) {
 			}
 		}
 	}
-	return &StringConst{pos: t.Pos, Value: out.String()}, nil
+	return &StringConst{pos: t.Pos, Value: out.String(), BitString: true}, nil
 }
 
 // PartitionRangeBoundKeyword is the MINVALUE / MAXVALUE keyword in a RANGE
@@ -629,7 +634,22 @@ type CastExpr struct {
 	Operand Expr
 	Type    ObjectName
 	Typmods []int64 // optional `(N)` or `(N,M)` typmod arguments
+	// typedLiteral marks gram.y's `func_name Sconst` form (`mood 'happy'`);
+	// typePos is the position of the type name, where typenameType reports a
+	// type that does not exist (the goldens strip it like pos). typedLiteral
+	// is dumped omitempty so the other casts' goldens are unchanged.
+	// M0149-0001h1a85, M0149-0001h1a85a.
+	typedLiteral bool `dump:"omitempty"`
+	typePos      int
 }
+
+// IsTypedLiteral reports gram.y's `func_name Sconst` form.
+//
+// TypeNamePos (below) is 0 when the cast's builder did not record it.
+func (e *CastExpr) IsTypedLiteral() bool { return e.typedLiteral }
+
+// TypeNamePos is the position of a typed literal's type name.
+func (e *CastExpr) TypeNamePos() int { return e.typePos }
 
 func (e *CastExpr) Pos() int { return e.pos }
 func (*CastExpr) exprNode()  {}

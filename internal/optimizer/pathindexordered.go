@@ -73,6 +73,9 @@ func (s *searchCtx) addBaseRelIndexPaths(cat catalog.Catalog) {
 	// flattened UNION ALL leaf, built from member probes the base-rel
 	// producers above price (paramappend.go).
 	s.addParameterizedAppendPaths(cat)
+	// M0148-0001c3a10: a partitioned base rel's Append over its partitions'
+	// own cheapest paths (set_append_rel_pathlist), index paths included.
+	s.addAppendRelChildPaths(cat)
 	// M0134-0187: `create_index_path(..., indexonly=true)` for every index
 	// covering what the statement reads from the relation — generated here
 	// because it competes in the same rel's pathlist as the rest.
@@ -143,6 +146,7 @@ func (s *searchCtx) addOrderedIndexPaths(cat catalog.Catalog) {
 		if len(colExprs) == 0 {
 			continue
 		}
+		addConstEquatedColumns(colExprs, rel)
 		relTuples := float64(s.relInfos[i].baseRows)
 		if relTuples < 1 {
 			relTuples = 1
@@ -197,6 +201,16 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 	// nullable key column it would drop those rows (a merge LEFT JOIN lost
 	// its NULL-keyed outer rows). PG stores NULL keys and has no such rule.
 	if !indexUnboundKeysNotNull(tbl, idx, 0) {
+		return false
+	}
+	// build_index_paths builds ONE path per index from every restriction
+	// clause match_restriction_clauses_to_index finds; there is no
+	// full-scan twin that leaves a matchable clause as a Filter. When the
+	// index binds a local clause, the restriction / index-only producers
+	// file that path (with these pathkeys) — `Index Only Scan … Index Cond:
+	// (a IS NOT NULL)` — and an extra Filter-only full scan here could
+	// out-cost it (M0148-0001c3a5 (a), the parted_minmax witness).
+	if indexBindsLocalRestriction(s.cat, tbl, idx, extractFilterConjuncts(rel.baseLeaf)) {
 		return false
 	}
 
@@ -272,6 +286,16 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 		TargetKnown:   tgtKnown,
 	}
 	addPath(rel, serial, "index.ordered")
+	// M0148-0001c3a3: build_index_paths step 5 — the backward scan of the
+	// same index, when its reversed pathkeys are useful (ORDER BY … DESC, a
+	// merge key in the other direction). Same cost: cost_index prices both
+	// directions alike. No partial twin: the executor has no parallel
+	// backward scan yet.
+	if bkeys := s.usefulBackwardIndexPathkeys(rel, idx, colExprs); len(bkeys) > 0 {
+		back := *serial
+		back.Pathkeys, back.IndexScanDir = bkeys, BackwardScanDirection
+		addPath(rel, &back, "index.ordered.backward")
+	}
 
 	// C-19c: the PARTIAL twin — build_index_paths' "if (index->amcanparallel
 	// && rel->consider_parallel && outer_relids == NULL && scantype !=
@@ -482,4 +506,34 @@ func leadingKeyStats(idx *catalog.Index, tbl *catalog.Table) *catalog.ColumnStat
 		return nil
 	}
 	return columnStatsByName(tbl, idx.Columns[0])
+}
+
+// usefulBackwardIndexPathkeys is build_index_paths' backward arm
+// (indxpath.c, "5. If the index is ordered, a backwards scan might be
+// interesting"): the index's pathkeys built for BackwardScanDirection,
+// truncated to what the query can use (truncate_useless_pathkeys); empty when
+// the reversed order serves nothing, in which case PG builds no backward path.
+func (s *searchCtx) usefulBackwardIndexPathkeys(rel *RelOptInfo, idx *catalog.Index, colExprs map[string]Expr) []PathKey {
+	if !indexIsOrderable(idx) || len(colExprs) == 0 {
+		return nil
+	}
+	keys, _ := indexPathOrdering(idx, colExprs, true)
+	if len(keys) == 0 {
+		return nil
+	}
+	return truncateUselessPathkeys(s.pathkeyUsefulnessFor(rel.Relids), keys)
+}
+
+// indexBindsLocalRestriction reports whether the restriction producers bind
+// at least one of the leaf's local conjuncts as an index clause of idx:
+// an equality prefix, or a leading ScalarArrayOp, range or NullTest, or a
+// skip run (plainRestrictionBindsOnlyPrefix with no prefix).
+func indexBindsLocalRestriction(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) bool {
+	if len(conjuncts) == 0 {
+		return false
+	}
+	if len(restrictionEqualityPrefix(cat, tbl, idx, conjuncts)) > 0 {
+		return true
+	}
+	return !plainRestrictionBindsOnlyPrefix(cat, tbl, idx, conjuncts, 0)
 }

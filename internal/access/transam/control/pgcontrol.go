@@ -171,6 +171,9 @@ type ControlFileData struct {
 	// storage Manager reads it to decide whether to checksum/verify every
 	// block. See docs/design/0102-0019-initdb-data-checksums.md.
 	DataChecksumVersion uint32
+	// offset 228: xlog_seg_size (uint32), the cluster's WAL segment size
+	// (initdb --wal-segsize). Read-only: written once by initdb.
+	XLogSegSize uint32
 }
 
 // decodeControlFileData reads the mutable runtime fields from a raw
@@ -215,6 +218,7 @@ func decodeControlFileData(buf []byte) *ControlFileData {
 		MaxLocksPerXact:              le.Uint32(buf[196:]),
 		TrackCommitTimestamp:         buf[200] != 0,
 		DataChecksumVersion:          le.Uint32(buf[252:]),
+		XLogSegSize:                  le.Uint32(buf[228:]),
 	}
 }
 

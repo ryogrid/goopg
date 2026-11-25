@@ -21,6 +21,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+
+	"github.com/goopg/goopg/internal/storage"
 )
 
 const (
@@ -136,7 +138,7 @@ func replayDecodedXLogRelmapUpdate(dataDir string, mainData []byte) error {
 	if dbid == 0 {
 		dir = filepath.Join(dataDir, "global")
 	} else {
-		dir = filepath.Join(dataDir, "base", strconv.FormatUint(uint64(dbid), 10))
+		dir = filepath.Join(dataDir, "base", strconv.FormatUint(uint64(storage.StorageDBOid(dbid)), 10))
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err

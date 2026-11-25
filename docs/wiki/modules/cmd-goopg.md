@@ -15,7 +15,7 @@ control plane over a Unix socket, and run a streaming standby. Total package:
   `internal/postmaster`.
 - **`stop` / `reload` / `checkpoint` / `promote` / `status`** — operator control
   plane: read the pidfile and send a one-line command over the control socket.
-- **Standby** — walreceiver + WAL replay goroutines, promotion, `promote.signal`
+- **Standby** — walreceiver + WAL replay goroutines, promotion, the `promote` signal file (`<datadir>/promote`, PG `PROMOTE_SIGNAL_FILE`)
   watcher.
 
 ## Key Files
@@ -33,7 +33,7 @@ control plane over a Unix socket, and run a streaming standby. Total package:
 |---|---|---|
 | `drainPollInterval` | 10 ms | How often `Promote` checks the replayer's `ApplyLSN` during drain |
 | `drainTimeout` | 5 s | Max wait for the replayer to catch up during promotion |
-| `promoteSignalPollInterval` | 250 ms | How often the standby polls for `promote.signal` |
+| `promoteSignalPollInterval` | 250 ms | How often the standby polls for `<datadir>/promote` |
 
 ## Public API / CLI surface
 
@@ -208,8 +208,8 @@ sequenceDiagram
 
     S->>RCV: replication.StartWalReceiver (primary_conninfo GUCs)
     S->>RPL: startStandbyReplayer (continuous replay)
-    S->>S: remove stale promote.signal
-    S->>PS: poll promote.signal every 250ms
+    S->>S: remove stale promote file
+    S->>PS: poll promote file every 250ms
     PS-->>P: signal file seen (or control-plane PROMOTE)
     P->>RCV: cancel receiver, wait for exit
     P->>P: snapshot WrittenLSN as drain target
@@ -294,7 +294,7 @@ CLI->>SOCK: dial Unix socket, send 'STOP'/'RELOAD'/'CHECKPOINT'/'PROMOTE'/'PING'
 - **`min_wal_size`/`max_wal_size` unit mismatch** — stored in MB (matching upstream) but `wal.Config` wants bytes, so `runStart` multiplies by 1024².
 - **GUC→planner bridges are process-wide** — `SET enable_nestloop_index` etc. from any session flips the package-level `atomic.Bool`; the most-recent SET wins process-wide (matches the flag design).
 - **`gucFlag` defers `-c` errors** — a `-c` value lacking `=` records an error and surfaces it after parsing, matching initdb's "-c %s requires a value" wording rather than aborting flag parsing mid-stream.
-- **Stale `promote.signal` is cleared at standby startup** — `startStandby` removes any residual `promote.signal` before the watcher starts; a leftover file from a previous run would otherwise cause an immediate promote on the next start.
+- **Stale `promote` signal file is cleared at standby startup** — `startStandby` removes any residual `promote` file before the watcher starts; a leftover file from a previous run would otherwise cause an immediate promote on the next start.
 - **Promote retry after failure** — `Promote` uses `CAS(promoting, false, true)` as a guard. On failure, `promoting` is cleared (deferred `Store(false)`) so the operator can retry. On success, `promoted` is set to `true` and subsequent calls return nil (no-op).
 - **`startStandbyReplayer` anchors at WrittenLSN+1** — the `RecordIterator` start position is `writtenLSN + 1` because `WrittenLSN` is the last byte written, and the iterator expects the next record's first byte.
 

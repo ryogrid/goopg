@@ -7,7 +7,6 @@ import (
 	"io"
 	"math/big"
 	"os"
-	"time"
 
 	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/executor/hashsize"
@@ -480,8 +479,7 @@ func encodeDatum(d Datum, buf []byte) []byte {
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(d.BytesValue())))
 		buf = append(buf, d.BytesValue()...)
 	case KindTime:
-		n := d.TimeValue().UTC().UnixNano()
-		buf = binary.LittleEndian.AppendUint64(buf, uint64(n))
+		buf = binary.LittleEndian.AppendUint64(buf, uint64(d.Int))
 		// The SQL subtype travels WITH the value, because nothing downstream
 		// can re-derive it: a spilled row is read back as a bare `Row` with no
 		// column types in reach, and TimeSubDate is what `date + integer`
@@ -601,7 +599,7 @@ func decodeDatum(data []byte) (Datum, int, error) {
 			return Datum{}, 0, fmt.Errorf("truncated time at %d", pos)
 		}
 		n := int64(binary.LittleEndian.Uint64(data[pos:]))
-		d := NewTimeDatum(time.Unix(0, n).UTC())
+		d := Datum{Kind: KindTime, Int: n}
 		// The subtype byte and Scale the encoder wrote; see there for why they
 		// travel with the value. An out-of-range subtype is REJECTED rather
 		// than clamped: a frame written by a future encoder that knows a

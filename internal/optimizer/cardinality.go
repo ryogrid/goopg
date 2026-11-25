@@ -294,8 +294,121 @@ func EstimateRows(n Node) int64 {
 			return r
 		}
 		return estimateNLIndexJoin(x)
+	case *GenerateSeries:
+		return generateSeriesRows(x)
+	case *UserSrfScan:
+		// set_function_size_estimates: a routine without a support function
+		// returns its prorows (ROWS clause, else 1000). M0149-0001h1a80.
+		if x.Routine != nil && x.Routine.ReturnsSet {
+			return int64(routineProRows(x.Routine))
+		}
+	case *FromUnnest:
+		// string_to_table has no support function: set_function_size_estimates
+		// takes its prorows, 1000 (M0149-0001h1a78f). A plain unnest keeps
+		// its existing estimate.
+		if x.FuncName == "string_to_table" {
+			return 1000
+		}
+		// array_unnest_support: estimate_array_length of the argument; the
+		// multi-array form returns as many rows as its longest array.
+		// M0149-0001h1a80.
+		if x.ArrExpr != nil {
+			return int64(estimateArrayLength(x.ArrExpr))
+		}
+		longest := 0
+		for _, a := range x.ArrExprs {
+			if l := estimateArrayLength(a); l > longest {
+				longest = l
+			}
+		}
+		if longest > 0 {
+			return int64(longest)
+		}
+	case *ProjectSet:
+		// M0149-0001h1a78a: create_set_projection_path's rows.
+		if isSelectListProjectSet(x) {
+			return int64(clampRowEst(ProjectSetOwnCost(x).PlanRows))
+		}
 	}
 	return 0
+}
+
+// EstimateSeriesRows evaluates generate_series arguments at plan time and
+// returns the row count its planner support function computes
+// (generate_series_int4_support, _numeric_support, _timestamp_support), or
+// false when there is no estimate. The executor registers it, as it does
+// EvalConstFunc.
+var EstimateSeriesRows func(args []Expr) (float64, bool)
+
+// generateSeriesRows is set_function_size_estimates for generate_series: the
+// support function's count when every argument can be estimated, else
+// prorows, which is 1000 for every generate_series variant.
+func generateSeriesRows(x *GenerateSeries) int64 {
+	args := []Expr{x.Start, x.Stop}
+	if x.Step != nil {
+		args = append(args, x.Step)
+	}
+	if EstimateSeriesRows != nil && seriesArgsEstimable(args) {
+		if rows, ok := EstimateSeriesRows(args); ok {
+			return int64(clampRowEst(rows))
+		}
+	}
+	return 1000
+}
+
+// seriesArgsEstimable reports whether estimate_expression_value could reduce
+// every argument to a constant: literals, casts, operators and plain function
+// calls, with no column, parameter or subquery inside.
+func seriesArgsEstimable(args []Expr) bool {
+	for _, a := range args {
+		if !seriesArgEstimable(a) {
+			return false
+		}
+	}
+	return true
+}
+
+func seriesArgEstimable(e Expr) bool {
+	if e == nil {
+		return true
+	}
+	if _, ok := e.(*IntegerConst); ok {
+		return true
+	}
+	if _, ok := e.(*NumericConst); ok {
+		return true
+	}
+	if _, ok := e.(*StringConst); ok {
+		return true
+	}
+	if _, ok := e.(*TypedStringLit); ok {
+		return true
+	}
+	if _, ok := e.(*IntervalLit); ok {
+		return true
+	}
+	if _, ok := e.(*NullConst); ok {
+		return true
+	}
+	if c, ok := e.(*CastExpr); ok {
+		return seriesArgEstimable(c.Operand)
+	}
+	if u, ok := e.(*UnaryOp); ok {
+		return seriesArgEstimable(u.Operand)
+	}
+	if b, ok := e.(*BinaryOp); ok {
+		return seriesArgEstimable(b.Left) && seriesArgEstimable(b.Right)
+	}
+	if f, ok := e.(*FuncCall); ok {
+		// estimate_expression_value folds immutable and stable calls only;
+		// a volatile or user-defined one keeps prorows.
+		if f.Star || f.Distinct || !catalog.IsBuiltinProcName(f.Name) ||
+			catalog.BuiltinProcIsVolatile(f.Name) || catalog.BuiltinProcReturnsSet(f.Name) {
+			return false
+		}
+		return seriesArgsEstimable(f.Args)
+	}
+	return false
 }
 
 // probeIndexKeys returns the index and the bound equality keys of an index
@@ -635,7 +748,9 @@ func isLateralIndexProbe(n Node) bool {
 	case *IndexScan:
 		return x.Key != nil || len(x.Keys) > 0
 	case *IndexOnlyScan:
-		return x.Key != nil || len(x.Keys) > 0
+		// Keys ahead of SAOPKeys are a constant prefix, not a lateral probe
+		// (M0148-0001c3a4 (i)).
+		return len(x.SAOPKeys) == 0 && (x.Key != nil || len(x.Keys) > 0)
 	}
 	return false
 }
@@ -1082,6 +1197,17 @@ func estimateBaseRelInfo(binding rangeBinding, scan Node, local Expr) baseRelInf
 		hasLocalFilter: local != nil,
 		appendrel:      binding.appendrel,
 	}
+	// M0148-0001c3a5 (a): a partitioned table collapsed to its one leaf
+	// (planScanRangeVar) is that leaf's rel — its indexes, its size —
+	// as PG plans an appendrel's only member.
+	singleLeaf := false
+	if binding.singleLeafOID != 0 {
+		if leaf := singleLeafScanTable(scan, binding.singleLeafOID); leaf != nil {
+			binding.table = leaf
+			info.table = leaf
+			singleLeaf = true
+		}
+	}
 	// M0125-0043: the small-dimension answer lives on the leaf scan now.
 	// `smallDimensionSide` keeps the catalog-hint reading for the bindings
 	// the bushy DP hands us with no scan of their own.
@@ -1097,6 +1223,15 @@ func estimateBaseRelInfo(binding rangeBinding, scan Node, local Expr) baseRelInf
 		// empty inheritance parent or a storage-less partitioned one.
 		if fanOutAppendRel(binding.table, scan) {
 			info.baseRows = appendRelMemberRows(scan.(*SetOp))
+		}
+		// The one member is sized as set_append_rel_size sizes each member
+		// (appendRelMemberRows: the scan's own estimate_rel_size).
+		if singleLeaf {
+			if r := EstimateRows(scan); r >= 1 {
+				info.baseRows = r
+			} else {
+				info.baseRows = 1
+			}
 		}
 	}
 	info.filteredRows = applyLocalFilterSelectivity(info.baseRows, binding, scan, local)
@@ -2940,4 +3075,23 @@ func setOpArmGroups(arm Node, rows int64) int64 {
 		return 1
 	}
 	return g
+}
+
+// singleLeafScanTable is the leaf partition table the scan (under any
+// Filters) reads, when its OID is oid; nil otherwise.
+func singleLeafScanTable(scan Node, oid uint32) *catalog.Table {
+	for depth := 0; depth < 8 && scan != nil; depth++ {
+		switch x := scan.(type) {
+		case *Filter:
+			scan = x.Child
+		case *SeqScan:
+			if x.Table != nil && x.Table.OID == oid {
+				return x.Table
+			}
+			return nil
+		default:
+			return nil
+		}
+	}
+	return nil
 }

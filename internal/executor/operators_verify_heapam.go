@@ -102,6 +102,13 @@ func (o *verifyHeapamOp) Open(ctx *Context) error {
 				// relation cannot be opened.
 				return nil
 			}
+			if catalog.IsCapturedSystemRelation(uint32(argVal.Int)) {
+				// A system relation pg_class lists from PG 18.3's captured
+				// rows (M0149-0001h1a35) that goopg serves virtually, with no
+				// backing heap to read: nothing is stored there, so report no
+				// findings, as for the synthetic TOAST relation above.
+				return nil
+			}
 		}
 		return &ExecError{Code: "42P01", Pos: o.plan.Pos(),
 			Message: "could not open relation: relation does not exist"}

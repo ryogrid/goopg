@@ -784,13 +784,7 @@ func (s *Server) describeViaPlanner(query string, sess *misc.SessionRegistry, db
 	// empty slice signals that to describeExtendedQuery's callers.
 	fields := make([]libpq.FieldDescription, len(schema))
 	for i, sc := range schema {
-		fields[i] = libpq.FieldDescription{
-			Name:         sc.Name,
-			TypeOID:      typeOIDFor(sc.Type),
-			TypeSize:     -1,
-			TypeModifier: -1,
-			Format:       0,
-		}
+		fields[i] = wireFieldDescription(s.cfg.Catalog, connDBOid, sc.Name, sc.Type)
 	}
 	return fields, true
 }

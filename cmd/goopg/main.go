@@ -37,6 +37,7 @@ import (
 	"github.com/goopg/goopg/internal/postmaster/walsummarizer"
 	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
@@ -185,6 +186,8 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	dataChecksums := fs.Bool("k", true, "use data page checksums")
 	fs.BoolVar(dataChecksums, "data-checksums", true, "use data page checksums")
 	noDataChecksums := fs.Bool("no-data-checksums", false, "do not use data page checksums")
+	// --wal-segsize (initdb): the WAL segment size in megabytes.
+	walSegSize := fs.Int("wal-segsize", 0, "size of WAL segments, in megabytes")
 	// Authentication methods written into pg_hba.conf (upstream initdb
 	// -A/--auth, --auth-host, --auth-local) and the superuser password file
 	// (--pwfile). -A/--auth sets both host and local; the per-side flags
@@ -238,7 +241,7 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	// -k/--data-checksums enables; --no-data-checksums overrides it back off
 	// (and is the current goopg default).
 	useDataChecksums := *dataChecksums && !*noDataChecksums
-	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly, SyncMethod: *syncMethod, NoSyncDataFiles: *noSyncDataFiles, TextSearchConfig: *tsConfig, Encoding: *encoding, AllowGroupAccess: *allowGroupAccess, DataChecksums: useDataChecksums, AuthMethodHost: resolvedAuthHost, AuthMethodLocal: resolvedAuthLocal, PwFile: *pwFile, ExtraGUC: extraGUC.settings, LocaleProvider: *localeProvider, Locale: *locale, LCCollate: *lcCollate, LCCtype: *lcCtype, LCMessages: *lcMessages, LCMonetary: *lcMonetary, LCNumeric: *lcNumeric, LCTime: *lcTime, BuiltinLocale: *builtinLocale, ICULocale: *icuLocale, ICURules: *icuRules}); err != nil {
+	if err := initdb.Init(initdb.Options{DataDir: *dataDir, WALSegSizeMB: *walSegSize, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly, SyncMethod: *syncMethod, NoSyncDataFiles: *noSyncDataFiles, TextSearchConfig: *tsConfig, Encoding: *encoding, AllowGroupAccess: *allowGroupAccess, DataChecksums: useDataChecksums, AuthMethodHost: resolvedAuthHost, AuthMethodLocal: resolvedAuthLocal, PwFile: *pwFile, ExtraGUC: extraGUC.settings, LocaleProvider: *localeProvider, Locale: *locale, LCCollate: *lcCollate, LCCtype: *lcCtype, LCMessages: *lcMessages, LCMonetary: *lcMonetary, LCNumeric: *lcNumeric, LCTime: *lcTime, BuiltinLocale: *builtinLocale, ICULocale: *icuLocale, ICURules: *icuRules}); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}
@@ -257,11 +260,27 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	confPath := fs.String("config", "", "path to postgresql.conf (default: built-in defaults)")
 	addr := fs.String("listen", "127.0.0.1:5432", "TCP listen address (host:port)")
 	hbaPath := fs.String("hba", "", "path to pg_hba.conf (default: built-in loopback-trust policy)")
+	// postgres -c NAME=VALUE / --cluster-name=NAME: command-line settings,
+	// applied over postgresql.conf and postgresql.auto.conf (PGC_S_ARGV
+	// outranks PGC_S_FILE). Cluster.pm starts every node with
+	// --cluster-name=<node> (M0149-0014).
+	var argGUC gucFlag
+	fs.Var(&argGUC, "c", "set run-time parameter NAME=VALUE (may be repeated)")
+	fs.Func("cluster-name", "set cluster_name", func(v string) error {
+		argGUC.settings = append(argGUC.settings, initdb.GUCSetting{Name: "cluster_name", Value: v})
+		return nil
+	})
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	if argGUC.err != "" {
+		fmt.Fprintf(stderr, "goopg start: %s\n", argGUC.err)
+		return 2
+	}
 
-	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// serverLogLevel follows log_min_messages (applyLogMinMessages): a
+	// debugN setting enables the server's debug messages.
+	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: serverLogLevel}))
 
 	// M0054-0004: optional mutex / block profile activation. The
 	// goroutine, heap, and CPU profiles work without runtime
@@ -374,6 +393,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// for the whole of goopg start.
 	quit := newImmediateShutdown(logger, cancel)
 	defer quit.stop()
+	fatalShutdown = cancel
 
 	cfg := postmaster.Config{
 		Address: *addr,
@@ -441,6 +461,24 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			logger.Info("loaded "+misc.AutoConfFileName, "entries", len(autoEntries))
 		}
 	}
+	for _, g := range argGUC.settings {
+		if err := registry.Set(g.Name, g.Value, misc.SourceCommandLine); err != nil {
+			fmt.Fprintf(stderr, "goopg start: FATAL: %v\n", err)
+			return 1
+		}
+		cfg.Registry = registry
+	}
+	// --listen host:port is goopg's -h/-p: the port GUC (PGC_POSTMASTER) is
+	// the port the server listens on, set from the command line as
+	// postmaster's -p does (PGC_S_ARGV), so SHOW port and libpq's
+	// target_session_attrs probes see it. M0149-0077c.
+	if _, p, err := net.SplitHostPort(*addr); err == nil && p != "" && p != "0" {
+		if err := registry.Set("port", p, misc.SourceCommandLine); err != nil {
+			fmt.Fprintf(stderr, "goopg start: FATAL: %v\n", err)
+			return 1
+		}
+		cfg.Registry = registry
+	}
 	// CreateDataDirLockFile (PostmasterMain): postmaster.pid is created
 	// before the data directory is touched — before crash or archive
 	// recovery — so a second server on a directory a live one owns stops
@@ -498,6 +536,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		// EffectiveCLOGBuffers. Unit-less integer count of BLCKSZ buffers.
 		transactionBuffers := intGUC(registry, "transaction_buffers", 0)
 		var err error
+		// ArchiveRecoveryRequested: a standby.signal or recovery.signal
+		// makes every WAL record replayed from here on — local WAL at Open
+		// included — subject to archive recovery's checks (M0149-0020).
+		xlog.SetArchiveRecoveryRequested(fileExists(filepath.Join(*dataDir, "standby.signal")) ||
+			fileExists(filepath.Join(*dataDir, "recovery.signal")))
 		rt, err = initdb.Open(initdb.OpenOptions{
 			DataDir: *dataDir,
 			// A shutdown request (SIGTERM/SIGINT/SIGQUIT cancel ctx) stops
@@ -709,6 +752,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			cfg.Timeline = tli
 		}
 		cfg.SyncRep = rt.SyncRep
+		cfg.RecoveredPrepared = rt.RecoveredPrepared
 		// M0102-0005: prime the SyncRep rule from the GUC value so the
 		// first commit on a freshly-started cluster sees the configured
 		// synchronous_standby_names. A parse error is logged but does not
@@ -803,6 +847,14 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// this when the GUC changes — today the registry value is
 	// frozen at startup.
 	applyCheckpointGUCs := func() {
+		// synchronous_standby_names is PGC_SIGHUP: every walsender re-reads
+		// it on a reload (SyncRepInitConfig), so the sync priorities and the
+		// set of standbys commits wait for follow the new value (M0149-0014).
+		if rt != nil && rt.SyncRep != nil && cfg.Registry != nil {
+			if err := rt.SyncRep.SetStandbyNames(stringGUC(cfg.Registry, "synchronous_standby_names", "")); err != nil {
+				logger.Warn("invalid synchronous_standby_names; disabling sync replication", "err", err)
+			}
+		}
 		if rt == nil || rt.Checkpointer == nil {
 			return
 		}
@@ -873,7 +925,13 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		})
 	}
 	applyCheckpointGUCs()
-	cfg.ApplyCheckpointGUCs = applyCheckpointGUCs
+	cfg.ApplyCheckpointGUCs = func() {
+		applyCheckpointGUCs()
+		applyLogMinMessages(cfg.Registry)
+		// pgarch's SIGHUP sets its latch: a reload (a fixed archive_command)
+		// retries the ready files at once, not at the next minute's wakeup.
+		walArchiver.Wakeup()
+	}
 
 	// Slot-aware WAL retention. Wired here (rather than inside
 	// initdb.Open) because the GUC values that govern its
@@ -897,6 +955,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		if v, ok := cfg.Registry.Get("checkpoint_completion_target"); ok {
 			if f, err := strconv.ParseFloat(v.Display(), 64); err == nil {
 				retainer.CompletionTarget = f
+			}
+		}
+		if v, ok := cfg.Registry.Get("wal_keep_size"); ok {
+			if mb, err := strconv.Atoi(v.Display()); err == nil && mb > 0 {
+				retainer.KeepMB = int64(mb)
 			}
 		}
 		if v, ok := cfg.Registry.Get("max_slot_wal_keep_size"); ok {
@@ -1002,15 +1065,27 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "goopg start: FATAL: %v\n", err)
 		return 1
 	}
+	// The recovery-target settings are checked when the configuration loads
+	// (their assign hooks; validateRecoveryParameters' timestamptz_in), so a
+	// bad combination stops any server — a standby as much as archive
+	// recovery (M0149-0023a).
+	targetErr := checkSingleRecoveryTarget(registry)
+	if targetErr == nil {
+		targetErr = recoveryTargetTimeError(registry)
+	}
+	if targetErr != nil {
+		if rt != nil && rt.Recovery && !rt.Standby {
+			return endInterruptedArchiveRecovery(rt, targetErr, quit.Requested(), logger, stderr)
+		}
+		reportStartupFatal(targetErr, logger, stderr)
+		return 1
+	}
 	if rt != nil && rt.Recovery && !rt.Standby {
 		logger.Info("archive recovery starting", "restore_command", stringGUC(registry, "restore_command", ""))
 		// restore_command is PGC_SIGHUP: each fetch first processes a
 		// pending reload (ProcessStartupProcInterrupts), then reads it.
 		// ctx is the shutdown request (SIGTERM/SIGINT): it stops recovery
 		// at the next fetch or segment and cancels a running restore_command.
-		if err := checkSingleRecoveryTarget(registry); err != nil {
-			return endInterruptedArchiveRecovery(rt, err, quit.Requested(), logger, stderr)
-		}
 		stop := recoveryStop(registry)
 		// Crash replay in initdb.Open has already applied the local WAL; a
 		// stop point inside it cannot be honoured.
@@ -1021,12 +1096,25 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		recovered, err := xlog.RunArchiveRecoveryWith(ctx, rt.StorageMgr, rt.DataDir, func() string {
 			startupHup.process(registry, cfg.ConfigPath, *dataDir)
 			return stringGUC(registry, "restore_command", "")
-		}, 0, recoveryTargetTimeline(registry), stop)
+		}, 0, recoveryTargetTimeline(registry), stop, archiveReplayHooks(rt, logger))
 		if err == nil {
 			err = checkRecoveryTargetReached(stop, recovered, localEnd)
 		}
 		if err != nil {
 			return endInterruptedArchiveRecovery(rt, err, quit.Requested(), logger, stderr)
+		}
+		// Relations created after the backup started live only in the
+		// replayed catalog heaps (M0149-0021).
+		if rerr := rt.RefreshAllCatalogsAfterReplay(); rerr != nil {
+			logger.Warn("archive recovery: catalog refresh failed", "err", rerr)
+		}
+		// backup_label has done its job: it is renamed so a later start
+		// recovers from pg_control (StartupXLOG, BACKUP_LABEL_OLD).
+		if _, serr := os.Stat(filepath.Join(rt.DataDir, xlog.BackupLabelFile)); serr == nil {
+			if rerr := os.Rename(filepath.Join(rt.DataDir, xlog.BackupLabelFile), filepath.Join(rt.DataDir, xlog.BackupLabelOld)); rerr != nil {
+				fmt.Fprintf(stderr, "goopg start: FATAL:  could not rename file \"%s\" to \"%s\": %v\n", xlog.BackupLabelFile, xlog.BackupLabelOld, rerr)
+				return 1
+			}
 		}
 		if recovered.ReachedTarget {
 			logger.Info(recovered.StopMessage())
@@ -1036,7 +1124,13 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				return shutdownAtRecoveryTarget(rt, action, logger, stderr)
 			}
 		}
+		// RecoverPreparedTransactions: prepared transactions archive replay
+		// left open survive into the promoted server (M0149-0024).
+		cfg.RecoveredPrepared = append(cfg.RecoveredPrepared, restoreReplayedPrepared(rt, logger, cfg.RecoveredPrepared)...)
 		logger.Info("archive recovery complete; promoting to primary")
+		// The promotion's history file and the new timeline's segments are
+		// archived (M0149-0027).
+		attachWALArchiver(rt, registry, logger)
 		// Promote: bump TLI, write history, update pg_control,
 		// and remove recovery.signal. Mirrors finalizePromotion
 		// in standby.go but without the standby controller.
@@ -1046,6 +1140,15 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			WalLevel:           walLevelEnum(stringGUC(registry, "wal_level", "replica")),
 		}, logger); err != nil {
 			fmt.Fprintf(stderr, "goopg start: promote after recovery: %v\n", err)
+			return 1
+		}
+	}
+	// XLogReportParameters (end of StartupXLOG): a primary whose settings
+	// differ from pg_control's WAL-logs the change and updates pg_control
+	// (M0149-0020).
+	if rt != nil && !rt.Standby {
+		if err := reportParameters(rt, registry, logger); err != nil {
+			fmt.Fprintf(stderr, "goopg start: %v\n", err)
 			return 1
 		}
 	}
@@ -1075,17 +1178,65 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.IsStandby = func() bool { return sc.rt.Standby }
 		cfg.HotStandbyConsistent = sc.Consistent
 		cfg.RecoveryLSNs = sc.recoveryLSNs
+		cfg.RecoveryPause = sc.recoveryPause
 	}
+
+	// The WAL archiver (pgarch.c): completed segments and new timeline
+	// history files become .ready, and archive_command copies them out.
+	// With archive_mode = on it waits out recovery (M0149-0018a).
+	if rt != nil && rt.WAL != nil && rt.DataDir != "" {
+		attachWALArchiver(rt, registry, logger)
+		archCtx, archCancel := context.WithCancel(ctx)
+		archDone := make(chan struct{})
+		go func() {
+			defer close(archDone)
+			walArchiver.Run(archCtx)
+		}()
+		// The archiver's last pass and shutdown message happen before the
+		// server process exits, as pgarch exits before the postmaster.
+		stopArchiver = func() {
+			archCancel()
+			select {
+			case <-archDone:
+			case <-time.After(30 * time.Second):
+			}
+		}
+	}
+	applyLogMinMessages(registry)
 
 	// A reload that arrived during startup is applied before the server
 	// starts; the server's own SIGHUP handler takes over from here.
 	startupHup.process(registry, cfg.ConfigPath, *dataDir)
+	if rt != nil {
+		// A primary writes its shutdown checkpoint before its walsenders
+		// finish, so standbys receive it (M0149-0015). A standby keeps the
+		// restartpoint in Close, after its replay has stopped.
+		cfg.ShutdownCheckpoint = func() {
+			if !rt.Standby {
+				// ShutdownXLOG: with archiving active the last segment is
+				// rotated first, so all the remaining records are archived;
+				// the shutdown checkpoint goes to the next segment
+				// (RequestXLogSwitch, M0149-0027).
+				if walArchiver.Enabled() && rt.WAL != nil {
+					if _, err := rt.WAL.SwitchSegment(); err != nil {
+						logger.Warn("shutdown: could not switch WAL segment for archiving", "err", err)
+					}
+				}
+				rt.ShutdownCheckpoint()
+			}
+		}
+	}
 	srv := postmaster.New(cfg)
+	if sc != nil {
+		add := srv.AddRecoveredPrepared
+		sc.onRecoveredPrepared.Store(&add)
+	}
 	quit.setServer(srv)
 	if quit.Requested() {
 		return 0
 	}
 	runErr := srv.Run(ctx)
+	stopArchiver()
 	cpCancel()
 	if sc != nil {
 		sc.Close()
@@ -1115,7 +1266,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 // would compound the corruption. The goroutine also exits when the
 // supplied context is cancelled (clean shutdown) or the writer
 // closes (process tear-down).
-func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Runtime, logger *slog.Logger) *xlog.StreamReplayer {
+// opts configure the replayer before its goroutine starts (a recovery
+// target must be in place before the first record).
+func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Runtime, logger *slog.Logger, opts ...func(*xlog.StreamReplayer)) *xlog.StreamReplayer {
 	// WrittenLSN() is the LSN of the last byte already written. The
 	// iterator's startLSN argument is the LSN of the next record's
 	// first byte (= writer's "tail" position). Anchoring at WrittenLSN
@@ -1139,6 +1292,37 @@ func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Ru
 			txnMgr.ReplayXactAbort(xid)
 		}
 	})
+	// M0149-0015b: a replayed PREPARE leaves a prepared transaction the
+	// standby keeps (PrepareRedoAdd), so after promotion it can still be
+	// committed or rolled back; COMMIT/ABORT PREPARED replay drops it
+	// (PrepareRedoRemove). Its xid stays unknown in clog, so hot-standby
+	// snapshots keep treating it as in progress.
+	sr.SetTwoPhaseReplayHooks(func(endLSN uint64, state []byte) {
+		st, err := xlog.ParseTwoPhaseState(state)
+		if err != nil {
+			logger.Warn("standby replay: unreadable prepare record", "err", err)
+			return
+		}
+		txnMgr.RegisterPrepared(transam.PreparedXact{
+			XID: st.XID, Subxacts: st.Subxacts, GID: st.GID, State: state, PrepareEndLSN: endLSN,
+		})
+	}, func(xid storage.TransactionID) {
+		if txnMgr.TakeTwoPhase(xid) {
+			txnMgr.RemoveTwoPhaseFile(xid)
+		}
+	})
+	// M0149-0010a: a replayed commit that changed a database's system
+	// catalogs refreshes the standby's catalog (PG's relcache invalidation),
+	// so relations the primary creates become visible while it streams.
+	sr.SetSequenceReplayHook(rt.RefreshSequenceAfterReplay)
+	sr.SetCatalogReplayHook(func(dbOid uint32) {
+		if err := rt.RefreshCatalogAfterReplay(dbOid); err != nil {
+			logger.Warn("standby replay: catalog refresh failed", "db", dbOid, "err", err)
+		}
+	})
+	for _, o := range opts {
+		o(sr)
+	}
 	go func() {
 		defer close(done)
 		iter, err := xlog.NewRecordIterator(rt.WAL, walDir, 0, iterStartLSN)
@@ -1150,6 +1334,14 @@ func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Ru
 		logger.Info("standby mode: starting continuous WAL replay",
 			"start_lsn", iterStartLSN)
 		if err := sr.Run(ctx, iter); err != nil {
+			// A FATAL during replay stops the server, as the postmaster
+			// shuts down when the startup process fails (M0149-0020).
+			var fatal *xlog.RecoveryFatalError
+			if errors.As(err, &fatal) {
+				logger.Log(context.Background(), xlog.LogLevelFatal, fatal.Msg, "detail", fatal.Detail, "hint", fatal.Hint)
+				fatalShutdown()
+				return
+			}
 			logger.Error("standby replay: stopped on error",
 				"event", xlog.EventStandbyReplayError,
 				"apply_lsn", sr.ApplyLSN(), "err", err)
@@ -1185,6 +1377,40 @@ func boolGUC(registry *misc.Registry, name string, fallback bool) bool {
 // stringGUC reads a string-shaped GUC by name, returning fallback
 // when the registry is nil, the variable isn't registered, or its
 // Display value is empty.
+// attachWALArchiver constructs the WAL archiver and attaches it to the WAL
+// writer, once. Start-time archive recovery attaches it before its
+// promotion, so the new timeline's history file and the segments the new
+// timeline completes get their .ready (XLogArchiveNotify writes the status
+// file whether or not the archiver process runs yet); runStart starts it.
+func attachWALArchiver(rt *initdb.Runtime, registry *misc.Registry, logger *slog.Logger) {
+	if walArchiver != nil || rt == nil || rt.WAL == nil || rt.DataDir == "" {
+		return
+	}
+	walArchiver = xlog.NewArchiver(xlog.ArchiverConfig{
+		DataDir:    rt.DataDir,
+		WALDir:     walDirFor(rt),
+		Mode:       func() string { return stringGUC(registry, "archive_mode", "off") },
+		Command:    func() string { return stringGUC(registry, "archive_command", "") },
+		InRecovery: func() bool { return rt.Standby },
+		Logger:     logger,
+		// A pg_stat_activity row (backend_type archiver) while the
+		// archiver runs, as for the WAL summarizer's slot.
+		OnStart: func() {
+			if rt.Activity != nil {
+				rt.Activity.RegisterBackground(activity.ArchiverIdx, &activity.Backend{
+					PID: "archiver-0", BackendType: "archiver", State: "active",
+				})
+			}
+		},
+		OnStop: func() {
+			if rt.Activity != nil {
+				rt.Activity.ReleaseBackground(activity.ArchiverIdx, "archiver-0")
+			}
+		},
+	})
+	rt.WAL.SetArchiver(walArchiver)
+}
+
 func stringGUC(registry *misc.Registry, name string, fallback string) string {
 	if registry == nil {
 		return fallback
@@ -1214,10 +1440,20 @@ func recordClusterStateGUCs(registry *misc.Registry, dataDir string) {
 		return
 	}
 	checksums := "off"
-	if ctl, err := control.ReadControlFile(dataDir); err == nil && ctl != nil && ctl.DataChecksumVersion != 0 {
+	ctl, err := control.ReadControlFile(dataDir)
+	if err == nil && ctl != nil && ctl.DataChecksumVersion != 0 {
 		checksums = "on"
 	}
 	_ = registry.Set("data_checksums", checksums, misc.SourceDefault)
+	// wal_segment_size from pg_control's xlog_seg_size (ReadControlFile),
+	// shown in its largest whole unit as SHOW does (M0149-0022a).
+	if err == nil && ctl != nil && xlog.IsValidWalSegSize(int64(ctl.XLogSegSize)) {
+		size := fmt.Sprintf("%dMB", ctl.XLogSegSize>>20)
+		if ctl.XLogSegSize%(1<<30) == 0 {
+			size = fmt.Sprintf("%dGB", ctl.XLogSegSize>>30)
+		}
+		_ = registry.Set("wal_segment_size", size, misc.SourceDefault)
+	}
 	_ = registry.Set("huge_pages_status", "off", misc.SourceDefault)
 }
 
@@ -1248,7 +1484,7 @@ func resolveWALBuffers(registry *misc.Registry, sharedBufferSlots int) int64 {
 			nbuffers = 16384
 		}
 		n = nbuffers / 32
-		if segPages := int(xlog.DefaultSegmentSize / xlogBlockSize); n > segPages {
+		if segPages := int(xlog.WALSegmentSize() / xlogBlockSize); n > segPages {
 			n = segPages
 		}
 		if n < 8 {
@@ -1650,4 +1886,171 @@ func runVersion(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "goopg %s\n", version)
 	return 0
+}
+
+// walArchiver is the server's WAL archiver (nil before startup and in
+// tools); its methods tolerate nil. M0149-0018a.
+var walArchiver *xlog.Archiver
+
+// stopArchiver ends the WAL archiver and waits for its final pass; a no-op
+// until the archiver starts (M0149-0019a).
+var stopArchiver = func() {}
+
+// serverLogLevel is the server log's threshold.
+var serverLogLevel = new(slog.LevelVar)
+
+// applyLogMinMessages maps log_min_messages onto the server log's level:
+// debug5..debug1 show the server's debug messages (elog DEBUG1..5), anything
+// else keeps them hidden. goopg's INFO lines are PG's LOG messages, which
+// every non-debug setting shows. M0149-0019a.
+func applyLogMinMessages(registry *misc.Registry) {
+	if strings.HasPrefix(strings.ToLower(stringGUC(registry, "log_min_messages", "warning")), "debug") {
+		serverLogLevel.Set(slog.LevelDebug)
+		return
+	}
+	serverLogLevel.Set(slog.LevelInfo)
+}
+
+// fatalShutdown stops the server after a FATAL during standby replay, as the
+// postmaster shuts down when the startup process fails; set by goopg start.
+var fatalShutdown = func() {}
+
+// fileExists reports whether path names an existing file.
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// gucParameters reads the settings pg_control echoes.
+func gucParameters(registry *misc.Registry) xlog.GUCParameters {
+	return xlog.GUCParameters{
+		MaxConnections:       int32(intGUC(registry, "max_connections", 100)),
+		MaxWorkerProcesses:   int32(intGUC(registry, "max_worker_processes", 8)),
+		MaxWalSenders:        int32(intGUC(registry, "max_wal_senders", 10)),
+		MaxPreparedXacts:     int32(intGUC(registry, "max_prepared_transactions", 0)),
+		MaxLocksPerXact:      int32(intGUC(registry, "max_locks_per_transaction", 64)),
+		WalLevel:             walLevelEnum(stringGUC(registry, "wal_level", "replica")),
+		WalLogHints:          boolGUC(registry, "wal_log_hints", false),
+		TrackCommitTimestamp: boolGUC(registry, "track_commit_timestamp", false),
+	}
+}
+
+// reportParameters is XLogReportParameters (xlog.c): when the server's
+// settings differ from the ones pg_control records, the change is
+// WAL-logged as XLOG_PARAMETER_CHANGE — always when wal_level changed,
+// otherwise only when wal_level is above minimal (XLogIsNeeded) — and
+// pg_control is updated. Standbys and archive recovery read the record:
+// WAL generated with wal_level=minimal stops archive recovery. The
+// checkpointer echoes the same values at every checkpoint. M0149-0020.
+func reportParameters(rt *initdb.Runtime, registry *misc.Registry, logger *slog.Logger) error {
+	p := gucParameters(registry)
+	if rt.Checkpointer != nil {
+		rt.Checkpointer.SetGUCParams(p)
+	}
+	if rt.DataDir == "" || rt.WAL == nil {
+		return nil
+	}
+	cd, err := control.ReadControlFile(rt.DataDir)
+	if err != nil || cd == nil {
+		return nil
+	}
+	same := cd.WalLevel == uint32(p.WalLevel) && cd.WalLogHints == p.WalLogHints &&
+		cd.MaxConnections == uint32(p.MaxConnections) && cd.MaxWorkerProcesses == uint32(p.MaxWorkerProcesses) &&
+		cd.MaxWalSenders == uint32(p.MaxWalSenders) && cd.MaxPreparedXacts == uint32(p.MaxPreparedXacts) &&
+		cd.MaxLocksPerXact == uint32(p.MaxLocksPerXact) && cd.TrackCommitTimestamp == p.TrackCommitTimestamp
+	if same {
+		return nil
+	}
+	if cd.WalLevel != uint32(p.WalLevel) || p.WalLevel >= 1 {
+		rec, err := xlog.EncodeParameterChangePG(p)
+		if err != nil {
+			return fmt.Errorf("encode parameter change record: %w", err)
+		}
+		_, end, err := rt.WAL.Append(rec)
+		if err != nil {
+			return fmt.Errorf("write parameter change record: %w", err)
+		}
+		if err := rt.WAL.FlushUpTo(end); err != nil {
+			return fmt.Errorf("flush parameter change record: %w", err)
+		}
+	}
+	if err := control.UpdateControlFile(rt.DataDir, func(c *control.ControlFileData) {
+		c.WalLevel = uint32(p.WalLevel)
+		c.WalLogHints = p.WalLogHints
+		c.MaxConnections = uint32(p.MaxConnections)
+		c.MaxWorkerProcesses = uint32(p.MaxWorkerProcesses)
+		c.MaxWalSenders = uint32(p.MaxWalSenders)
+		c.MaxPreparedXacts = uint32(p.MaxPreparedXacts)
+		c.MaxLocksPerXact = uint32(p.MaxLocksPerXact)
+		c.TrackCommitTimestamp = p.TrackCommitTimestamp
+	}); err != nil {
+		return fmt.Errorf("update pg_control parameters: %w", err)
+	}
+	logger.Debug("parameter change WAL-logged", "wal_level", p.WalLevel)
+	return nil
+}
+
+// archiveReplayHooks is archive recovery's xact_redo side: commit/abort
+// stamping (archiveXactHook) and the two-phase bookkeeping the standby's
+// replayer does — a replayed PREPARE leaves a prepared transaction
+// (PrepareRedoAdd) that the promoted server can still commit or roll back,
+// and COMMIT/ABORT PREPARED replay drops it (PrepareRedoRemove). M0149-0024.
+func archiveReplayHooks(rt *initdb.Runtime, logger *slog.Logger) xlog.ArchiveReplayHooks {
+	h := xlog.ArchiveReplayHooks{Xact: archiveXactHook(rt)}
+	if rt == nil || rt.TxnMgr == nil {
+		return h
+	}
+	txnMgr := rt.TxnMgr
+	h.Prepare = func(endLSN uint64, state []byte) {
+		st, err := xlog.ParseTwoPhaseState(state)
+		if err != nil {
+			logger.Warn("archive recovery: unreadable prepare record", "err", err)
+			return
+		}
+		txnMgr.RegisterPrepared(transam.PreparedXact{
+			XID: st.XID, Subxacts: st.Subxacts, GID: st.GID, State: state, PrepareEndLSN: endLSN,
+		})
+	}
+	h.PreparedFinish = func(xid storage.TransactionID) {
+		if txnMgr.TakeTwoPhase(xid) {
+			txnMgr.RemoveTwoPhaseFile(xid)
+		}
+	}
+	return h
+}
+
+// archiveXactHook stamps archive recovery's replayed commits and aborts into
+// the live transaction manager, as the standby's replay hook does: initdb.Open
+// swept every xid below pg_control's nextXid it had no outcome for to aborted,
+// and a low-level backup's pg_control can be later than the WAL it replays
+// (M0149-0021).
+func archiveXactHook(rt *initdb.Runtime) func(xid storage.TransactionID, committed bool) {
+	if rt == nil || rt.TxnMgr == nil {
+		return nil
+	}
+	txnMgr := rt.TxnMgr
+	return func(xid storage.TransactionID, committed bool) {
+		if committed {
+			txnMgr.ReplayXactCommit(xid)
+		} else {
+			txnMgr.ReplayXactAbort(xid)
+		}
+	}
+}
+
+// reportStartupFatal logs a startup FATAL (with its DETAIL when it has one)
+// to the server log and stderr.
+func reportStartupFatal(err error, logger *slog.Logger, stderr io.Writer) {
+	msg, detail := err.Error(), ""
+	var fatal *xlog.RestoreFatalError
+	if errors.As(err, &fatal) {
+		msg, detail = fatal.Msg, fatal.Detail
+	}
+	if detail != "" {
+		logger.Log(context.Background(), xlog.LogLevelFatal, msg, "detail", detail)
+		fmt.Fprintf(stderr, "goopg start: FATAL:  %s\nDETAIL:  %s\n", msg, detail)
+		return
+	}
+	logger.Log(context.Background(), xlog.LogLevelFatal, msg)
+	fmt.Fprintf(stderr, "goopg start: FATAL:  %s\n", msg)
 }

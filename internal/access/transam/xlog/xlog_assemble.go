@@ -156,7 +156,9 @@ func assembleXLogRecordInto(prefix []byte, mainData []byte, blocks []BlockRef) (
 				spc = pgDefaultTableSpaceOID
 			}
 			header = binary.LittleEndian.AppendUint32(header, spc)
-			header = binary.LittleEndian.AppendUint32(header, b.Rel.DBOid)
+			// PG's database OID (storage.StorageDBOid): goopg's postgres
+			// catalog namespace 1 is PG's base/5 (M0149-0001a1 S1).
+			header = binary.LittleEndian.AppendUint32(header, storage.StorageDBOid(b.Rel.DBOid))
 			header = binary.LittleEndian.AppendUint32(header, b.Rel.RelOid)
 		}
 		header = binary.LittleEndian.AppendUint32(header, uint32(b.Block))

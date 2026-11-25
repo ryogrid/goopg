@@ -13,6 +13,7 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/pl/plpgsql"
+	"github.com/goopg/goopg/internal/utils/errcodes"
 )
 
 // wrapSQLFunctionContext wraps an error with CONTEXT showing the SQL function
@@ -85,20 +86,103 @@ func namedParamRE(name string) *regexp.Regexp {
 }
 
 func rewriteSQLNamedParams(body string, argNames []string) string {
+	return rewriteSQLNamedParamsFor(body, "", argNames)
+}
+
+// rewriteSQLNamedParamsFor is rewriteSQLNamedParams for the body of function
+// funcName, which also accepts PG's `funcname.param` qualification
+// (sql_fn_post_column_ref: a two- or three-part name whose first part is the
+// function's name and whose second part is a parameter).
+func rewriteSQLNamedParamsFor(body, funcName string, argNames []string) string {
 	for i, name := range argNames {
 		if name == "" {
 			continue
 		}
 		re := namedParamRE(name)
 		pos := i + 1 // 1-based
-		body = re.ReplaceAllStringFunc(body, func(m string) string {
-			if m[0] == '\'' {
-				return m // leave string literals unchanged
+		var b strings.Builder
+		last := 0
+		for _, loc := range re.FindAllStringIndex(body, -1) {
+			m := body[loc[0]:loc[1]]
+			start := loc[0]
+			if m[0] != '\'' && funcName != "" {
+				if q, ok := funcQualifierStart(body, loc[0], funcName); ok && q >= last {
+					start = q // `funcname.param`: drop the qualifier
+				}
 			}
-			return fmt.Sprintf("$%d", pos)
-		})
+			b.WriteString(body[last:start])
+			last = loc[1]
+			switch {
+			case m[0] == '\'':
+				b.WriteString(m) // leave string literals unchanged
+			case start == loc[0] && precededByDot(body, loc[0]):
+				// `x.name` is the second part of a qualified column
+				// reference, not the parameter (PG's
+				// sql_fn_post_column_ref binds a parameter only as the
+				// FIRST name, or second after the function's own name —
+				// handled above).
+				b.WriteString(m)
+			case followedByDot(body, loc[1]):
+				// `name.field`: a field of a composite parameter. `$1.field`
+				// is not valid syntax, so emit `($1).field` (PG's
+				// sql_fn_post_column_ref resolves the two-part name to a
+				// FieldSelect over the Param). M0148-0001j4 item (3).
+				fmt.Fprintf(&b, "($%d)", pos)
+			default:
+				fmt.Fprintf(&b, "$%d", pos)
+			}
+		}
+		b.WriteString(body[last:])
+		body = b.String()
 	}
 	return body
+}
+
+// funcQualifierStart reports where a `funcName.` qualifier directly before
+// the identifier at i begins, when there is one and it is itself the first
+// part of the name (not preceded by another `.`).
+func funcQualifierStart(s string, i int, funcName string) (int, bool) {
+	j := i
+	for j > 0 && (s[j-1] == ' ' || s[j-1] == '\t' || s[j-1] == '\n' || s[j-1] == '\r') {
+		j--
+	}
+	if j == 0 || s[j-1] != '.' {
+		return 0, false
+	}
+	j--
+	for j > 0 && (s[j-1] == ' ' || s[j-1] == '\t' || s[j-1] == '\n' || s[j-1] == '\r') {
+		j--
+	}
+	end := j
+	for j > 0 && isIdentByte(s[j-1]) {
+		j--
+	}
+	if j == end || !strings.EqualFold(s[j:end], funcName) {
+		return 0, false
+	}
+	if j > 0 && (isIdentByte(s[j-1]) || precededByDot(s, j)) {
+		return 0, false
+	}
+	return j, true
+}
+
+// precededByDot reports whether the identifier starting at i is directly
+// preceded by `.` (spaces allowed), i.e. it is a qualified name's later part.
+func precededByDot(s string, i int) bool {
+	for i > 0 && (s[i-1] == ' ' || s[i-1] == '\t' || s[i-1] == '\n' || s[i-1] == '\r') {
+		i--
+	}
+	return i > 0 && s[i-1] == '.'
+}
+
+// followedByDot reports whether the identifier ending at j is directly
+// followed by `.` and then an identifier or `*` (not `..`, nor a number).
+func followedByDot(s string, j int) bool {
+	if j >= len(s) || s[j] != '.' || j+1 >= len(s) {
+		return false
+	}
+	c := s[j+1]
+	return c == '*' || c == '"' || c == '_' || (c|0x20 >= 'a' && c|0x20 <= 'z')
 }
 
 // plpgsqlFrame is the local variable frame for one routine call.
@@ -677,13 +761,45 @@ func internalArityError(name string, want, got int, pos int) error {
 	return &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("function %s() does not exist: expected %d argument(s), got %d", name, want, got)}
 }
 
+// bindSQLRoutineParamTypes gives the statements of a SQL-language function
+// body the declared types of $1..$n, as PG's sql_fn_parser_setup does, so the
+// planner can resolve `($1).field` / `(param).field` against a composite
+// argument (catalog.SearchPathCatalog.ParamTypes). M0148-0001j4 item (3).
+//
+// child.PlanCatalog is inherited by nested calls, so a routine without
+// parameters clears the caller's types instead of keeping them.
+func bindSQLRoutineParamTypes(child *Context, types []catalog.Type) {
+	if len(types) == 0 {
+		if sp, ok := child.PlanCatalog.(*catalog.SearchPathCatalog); ok && sp.ParamTypes != nil {
+			cp := *sp
+			cp.ParamTypes = nil
+			child.PlanCatalog = &cp
+		}
+		return
+	}
+	declared := make([]catalog.Type, len(types))
+	for i, t := range types {
+		declared[i] = normalizeCatalogType(t)
+	}
+	base := ctxPlanCatalog(child)
+	if sp, ok := base.(*catalog.SearchPathCatalog); ok {
+		cp := *sp
+		cp.ParamTypes = declared
+		child.PlanCatalog = &cp
+		return
+	}
+	w := catalog.WithSearchPath(base, nil)
+	w.ParamTypes = declared
+	child.PlanCatalog = w
+}
+
 func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
 	// Call arguments, $n and parameter names refer to the input parameters
 	// only; OUT parameters and RETURNS TABLE columns are not arguments.
 	inTypes, inNames := routineInputParams(r)
 	body := r.Body
 	if len(inNames) > 0 {
-		body = rewriteSQLNamedParams(body, inNames)
+		body = rewriteSQLNamedParamsFor(body, r.Name, inNames)
 	}
 	stmts, err := parser.Parse(body)
 	if err != nil {
@@ -719,6 +835,7 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 		}
 		child.Params[i] = coerced
 	}
+	bindSQLRoutineParamTypes(child, inTypes)
 	// M0129-S8.3h: sync parent command counter after function body runs so
 	// the caller sees the higher command id and subsequent statements don't
 	// hide writes that happened inside the function (PG's CommandCounterIncrement
@@ -871,7 +988,7 @@ func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos
 	defer restore()
 	body := r.Body
 	if len(r.ArgNames) > 0 {
-		body = rewriteSQLNamedParams(body, r.ArgNames)
+		body = rewriteSQLNamedParamsFor(body, r.Name, r.ArgNames)
 	}
 	stmts, err := parser.Parse(body)
 	if err != nil {
@@ -894,6 +1011,7 @@ func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos
 		}
 		child.Params[i] = coerced
 	}
+	bindSQLRoutineParamTypes(child, r.ArgTypes)
 	// M0129-S8.3h: sync parent command counter after procedure body runs.
 	// Only cmdCounter is synced, NOT CmdID — see executeSQLRoutine.
 	defer func() {
@@ -964,7 +1082,7 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 	defer restore()
 	body := r.Body
 	if len(inNames) > 0 {
-		body = rewriteSQLNamedParams(body, inNames)
+		body = rewriteSQLNamedParamsFor(body, r.Name, inNames)
 	}
 	stmts, err := parser.Parse(body)
 	if err != nil {
@@ -996,6 +1114,7 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 		}
 		child.Params[i] = coerced
 	}
+	bindSQLRoutineParamTypes(child, inTypes)
 	// Execute all statements except the last as side effects; collect rows from last.
 	for i, stmt := range stmts {
 		stmtNum := i + 1
@@ -2116,46 +2235,11 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.RaiseStmt:
-		// RAISE EXCEPTION/ERROR: surface as an executor error.
-		// RAISE NOTICE/WARNING/INFO/LOG/DEBUG: queue via context so the server
-		// emits a NoticeResponse before the next CommandComplete. M0096-0012.
-		raiseMsgEval := func() (string, error) {
-			return evalRaiseMsg(s.Msg, frame, ctx)
-		}
-		if s.ConditionName != "" {
-			// RAISE condition_name [USING MESSAGE = 'text'] — raise named condition.
-			// Use condition name as error code for exception handler matching. M0097-0003.
-			code := conditionNameToSQLState(s.ConditionName)
-			msg, err := raiseMsgEval()
-			if err != nil {
-				return Datum{}, flowNone, err
-			}
-			if msg == "" {
-				msg = s.ConditionName
-			}
-			return Datum{}, flowNone, &ExecError{Code: code, Pos: s.Pos(), Message: msg, ConditionName: s.ConditionName}
-		}
-		switch strings.ToLower(s.Level) {
-		case "error", "exception":
-			msg, err := raiseMsgEval()
-			if err != nil {
-				return Datum{}, flowNone, err
-			}
-			return Datum{}, flowNone, &ExecError{Code: "P0001", Pos: s.Pos(), Message: msg}
-		}
-		if ctx != nil {
-			msg, err := raiseMsgEval()
-			if err != nil {
-				return Datum{}, flowNone, err
-			}
-			// RAISE WARNING surfaces at WARNING severity (vs NOTICE/INFO/LOG/DEBUG).
-			// The isolation runner echoes each message with its real protocol
-			// severity, so the level must be preserved. M0118-0009 (perm 10).
-			if strings.EqualFold(s.Level, "warning") {
-				ctx.AddWarning(msg)
-			} else {
-				ctx.AddNotice(msg)
-			}
+		// RAISE EXCEPTION/ERROR surfaces as an executor error; NOTICE / INFO /
+		// LOG / DEBUG are delivered inline, WARNING is queued. M0096-0012,
+		// M0149-0001h1a2 (USING options, exec_stmt_raise).
+		if err := execRaise(s, frame, ctx); err != nil {
+			return Datum{}, flowNone, err
 		}
 		return Datum{}, flowNone, nil
 
@@ -2647,101 +2731,54 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 	}
 }
 
-// conditionNameToSQLState maps a PL/pgSQL condition name to a SQLSTATE code.
-// Partial mapping covering common condition names. M0097-0003.
+// conditionNameToSQLState maps a RAISE condition name to its SQLSTATE:
+// plpgsql_recognize_err_condition (pl_comp.c) takes the FIRST plerrcodes.h
+// entry of that name (reading_sql_data_not_permitted is 2F004, not 38004).
+// An unknown name keeps the old P0001 fallback; PG rejects it at compile
+// time ("unrecognized exception condition"), see the deferral ledger.
 func conditionNameToSQLState(name string) string {
-	switch strings.ToLower(name) {
-	case "data_corrupted":
-		return "XX001"
-	case "reading_sql_data_not_permitted":
-		return "2F002"
-	case "modifying_sql_data_not_permitted":
-		return "2F003"
-	case "prohibited_sql_statement_attempted":
-		return "2F003"
-	case "division_by_zero":
-		return "22012"
-	case "unique_violation":
-		return "23505"
-	case "foreign_key_violation":
-		return "23503"
-	case "no_data_found":
-		return "P0002"
-	case "too_many_rows":
-		return "P0003"
-	case "syntax_error":
-		return "42601"
-	case "undefined_table":
-		return "42P01"
-	case "not_null_violation":
-		return "23502"
-	case "serialization_failure":
-		return "40001"
-	case "deadlock_detected":
-		return "40P01"
-	case "raise_exception":
-		return "P0001"
+	if codes := errcodes.PLpgSQLConditionCodes(strings.ToLower(name)); len(codes) > 0 {
+		return string(codes[0])
 	}
 	return "P0001" // default RAISE exception
 }
 
-// exceptionHandlerMatches reports whether any condition in the handler
-// matches the given SQLSTATE or condition name. M0097-0012.
+// exceptionHandlerMatches reports whether any condition of a WHEN clause
+// matches the error's SQLSTATE — exception_matches_conditions (pl_exec.c):
+// OTHERS matches everything except query_canceled and assert_failure; a
+// condition matches exactly or, when it names a whole class (xx000), by
+// category. A name stands for every SQLSTATE plerrcodes.h lists under it
+// (plpgsql_parse_err_condition). M0097-0012.
 func exceptionHandlerMatches(conditions []string, sqlstate string, conditionName ...string) bool {
 	raiseCondName := ""
 	if len(conditionName) > 0 {
 		raiseCondName = strings.ToLower(conditionName[0])
 	}
+	code := errcodes.Code(sqlstate)
+	matches := func(cond errcodes.Code) bool {
+		return code == cond || (errcodes.IsCategory(cond) && errcodes.Category(code) == cond)
+	}
 	for _, cond := range conditions {
+		if c, ok := strings.CutPrefix(cond, plpgsql.SQLStateConditionPrefix); ok {
+			if matches(errcodes.Code(c)) {
+				return true
+			}
+			continue
+		}
 		lower := strings.ToLower(cond)
-		// Direct condition-name match: RAISE reading_sql_data_not_permitted caught by WHEN reading_sql_data_not_permitted.
+		if lower == "others" {
+			if sqlstate != string(errcodes.QueryCanceled) && sqlstate != string(errcodes.AssertFailure) {
+				return true
+			}
+			continue
+		}
+		// A RAISE of an unknown condition name carries P0001; still let the
+		// same name catch it (the pre-table behaviour this keeps).
 		if raiseCondName != "" && lower == raiseCondName {
 			return true
 		}
-		switch strings.ToUpper(cond) {
-		case "OTHERS":
-			return true
-		case sqlstate:
-			return true
-		}
-		// Check common condition names.
-		switch lower {
-		case "others", "when others":
-			return true
-		case "division_by_zero":
-			if sqlstate == "22012" {
-				return true
-			}
-		case "unique_violation":
-			if sqlstate == "23505" {
-				return true
-			}
-		case "foreign_key_violation":
-			if sqlstate == "23503" {
-				return true
-			}
-		case "undefined_function", "undefined_object":
-			if sqlstate == "42883" || sqlstate == "42704" {
-				return true
-			}
-		case "no_data_found":
-			if sqlstate == "P0002" {
-				return true
-			}
-		case "too_many_rows":
-			if sqlstate == "P0003" {
-				return true
-			}
-		case "syntax_error":
-			if sqlstate == "42601" {
-				return true
-			}
-		case "undefined_table":
-			if sqlstate == "42P01" {
-				return true
-			}
-		case "not_null_violation":
-			if sqlstate == "23502" {
+		for _, c := range errcodes.PLpgSQLConditionCodes(lower) {
+			if matches(c) {
 				return true
 			}
 		}
@@ -3024,6 +3061,18 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (optimizer.Expr, error
 		return &optimizer.BooleanConst{Value: x.Value}, nil
 	case *parser.ParamRef:
 		return &optimizer.ParamRef{Number: x.Number}, nil
+	case *parser.FieldSelect:
+		// `(v).field` over a composite variable or parameter is the same
+		// reference as `v.field` (PG's plpgsql resolves both through
+		// plpgsql_post_column_ref / the parser's FieldSelect over the
+		// variable's datum), so route it through the qualified-name arm
+		// below. M0148-0001j4 item (3).
+		if cr, ok := x.Arg.(*parser.ColumnRef); ok && cr.Table == "" && cr.Schema == "" {
+			if _, isComposite := frame.compositeVarFields[strings.ToLower(cr.Column)]; isComposite {
+				return lowerPLpgSQLExpr(&parser.ColumnRef{Table: cr.Column, Column: x.Field}, frame)
+			}
+		}
+		return nil, &ExecError{Code: "0A000", Pos: e.Pos(), Message: fmt.Sprintf("unsupported PL/pgSQL expression %T", e)}
 	case *parser.ColumnRef:
 		// Handle OLD.col and NEW.col in trigger context by looking them up
 		// in the pre-injected trigger column variables. M0096-0012.
@@ -3826,37 +3875,53 @@ func substituteTriggerRefs(sql string, trig *plpgsqlTrigCtx) string {
 				vals[i] = datumToSQLLiteral(val)
 			}
 			replacement := strings.Join(vals, ", ")
-			// Case-insensitive replace.
-			sqlUpper := strings.ToUpper(sql)
-			starUpper := strings.ToUpper(star)
-			idx := strings.Index(sqlUpper, starUpper)
-			for idx != -1 {
-				sql = sql[:idx] + replacement + sql[idx+len(star):]
-				sqlUpper = strings.ToUpper(sql)
-				idx = strings.Index(sqlUpper, starUpper)
-			}
+			sql = replaceRecordRef(sql, star, replacement)
 		}
 		// Replace "OLD.colname" / "NEW.colname" with literal values.
 		for i, col := range trig.Cols {
 			ref := strings.ToUpper(which) + "." + strings.ToUpper(col.Name)
-			sqlUpper := strings.ToUpper(sql)
-			idx := strings.Index(sqlUpper, ref)
-			if idx == -1 {
+			if !strings.Contains(strings.ToUpper(sql), ref) {
 				continue
 			}
 			val := NullDatum
 			if i < len(row) {
 				val = row[i]
 			}
-			literal := datumToSQLLiteral(val)
-			for idx != -1 {
-				sql = sql[:idx] + literal + sql[idx+len(ref):]
-				sqlUpper = strings.ToUpper(sql)
-				idx = strings.Index(sqlUpper, ref)
-			}
+			sql = replaceRecordRef(sql, ref, datumToSQLLiteral(val))
 		}
 	}
 	return sql
+}
+
+// replaceRecordRef replaces every case-insensitive occurrence of ref
+// (NEW.col, OLD.*) that stands as a whole reference: not preceded by an
+// identifier character, and, unless ref ends in '*', not followed by one.
+// A bare substring match replaced NEW.id inside NEW.id2 and left "2"
+// behind (018_wal_optimize's ins_trig). M0149-0006.
+func replaceRecordRef(sql, ref, replacement string) string {
+	isIdent := func(b byte) bool {
+		return b == '_' || b == '$' || b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= 0x80
+	}
+	upperRef := strings.ToUpper(ref)
+	var out strings.Builder
+	i := 0
+	for {
+		j := strings.Index(strings.ToUpper(sql[i:]), upperRef)
+		if j < 0 {
+			out.WriteString(sql[i:])
+			return out.String()
+		}
+		start, end := i+j, i+j+len(ref)
+		before := start > 0 && isIdent(sql[start-1])
+		after := !strings.HasSuffix(ref, "*") && end < len(sql) && isIdent(sql[end])
+		out.WriteString(sql[i:start])
+		if before || after {
+			out.WriteString(sql[start:end])
+		} else {
+			out.WriteString(replacement)
+		}
+		i = end
+	}
 }
 
 // datumToSQLLiteral formats a Datum as a SQL literal string suitable for
@@ -3994,29 +4059,12 @@ func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) (string, err
 		if err != nil {
 			return "", err
 		}
-		lowered, _ := lowerPLpgSQLExpr(parsed, frame)
 		if val.IsNull() {
 			argVals = append(argVals, "<NULL>")
-		} else if val.Kind == KindInt && isRegtypeExpr(lowered) {
-			// pg_typeof(x) / x::regtype evaluate to a KindInt Datum holding the
-			// type's pg_type OID (M0122-0005), not display text — val.Format()
-			// would print the bare OID (e.g. "25") instead of the type name
-			// ("text") the wire-output layer renders for a plain SELECT. Mirror
-			// that resolution here so RAISE NOTICE / format-arg substitution
-			// matches PG's output.
-			var cat catalog.Catalog
-			if ctx != nil {
-				cat = ctx.Catalog
-			}
-			argVals = append(argVals, RegtypeName(cat, uint32(val.Int), func(s string) bool { return !RegObjectSchemaVisible(ctx, s) }))
-		} else {
-			// DATE/TIMESTAMP/TIMESTAMPTZ args must render per the session's
-			// datestyle GUC (M-NIGHTLY DateStyle follow-up), matching every
-			// other already-fixed output path (ANALYZE MCV/histogram, CAST,
-			// array_agg/string_agg). formatDatumDateStyle falls back to
-			// Format() for every other Kind.
-			argVals = append(argVals, formatDatumDateStyle(val, ctx))
+			continue
 		}
+		lowered, _ := lowerPLpgSQLExpr(parsed, frame)
+		argVals = append(argVals, raiseDatumText(val, lowered, ctx))
 	}
 
 	// Substitute: each % (not %%) is replaced by the next arg in order.
@@ -4040,6 +4088,155 @@ func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) (string, err
 		}
 	}
 	return result.String(), nil
+}
+
+// raiseDatumText renders a RAISE argument / USING option value as text
+// (convert_value_to_string).
+func raiseDatumText(val Datum, lowered optimizer.Expr, ctx *Context) string {
+	if val.Kind == KindInt && isRegtypeExpr(lowered) {
+		// pg_typeof(x) / x::regtype evaluate to a KindInt Datum holding the
+		// type's pg_type OID (M0122-0005): render the type name, as the
+		// wire-output layer does for a plain SELECT.
+		var cat catalog.Catalog
+		if ctx != nil {
+			cat = ctx.Catalog
+		}
+		return RegtypeName(cat, uint32(val.Int), func(s string) bool { return !RegObjectSchemaVisible(ctx, s) })
+	}
+	// DATE/TIMESTAMP/TIMESTAMPTZ render per the session's datestyle
+	// (formatDatumDateStyle falls back to Format() for other kinds).
+	return formatDatumDateStyle(val, ctx)
+}
+
+// raiseOptionError is a RAISE runtime error (exec_stmt_raise).
+func raiseOptionError(code, msg string, pos int) error {
+	return &ExecError{Code: code, Pos: pos, Message: msg}
+}
+
+// recognizeRaiseCondition is plpgsql_recognize_err_condition with
+// allow_sqlstate: a five-character [0-9A-Z] string is a SQLSTATE, anything
+// else must name a plerrcodes.h condition (42704 otherwise).
+func recognizeRaiseCondition(name string) (string, error) {
+	if len(name) == 5 && strings.Trim(name, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") == "" {
+		return name, nil
+	}
+	if codes := errcodes.PLpgSQLConditionCodes(name); len(codes) > 0 {
+		return string(codes[0]), nil
+	}
+	return "", &ExecError{Code: "42704", Message: fmt.Sprintf("unrecognized exception condition \"%s\"", name)}
+}
+
+// execRaise is exec_stmt_raise (pl_exec.c) for one RAISE statement: the
+// condition / SQLSTATE sets the error code, the format string the message,
+// and each USING option its field, an option given twice being an error.
+// Without a message the condition name, else the SQLSTATE, is the message.
+// The errors carry no cursor position: PG reports a RAISE through the
+// PL/pgSQL error context, never as a position in the calling query.
+func execRaise(s *plpgsql.RaiseStmt, frame *plpgsqlFrame, ctx *Context) error {
+	if s.ReRaise {
+		if frame.caughtErr == nil {
+			return &ExecError{Code: "0Z002", Message: "RAISE without parameters cannot be used outside an exception handler"}
+		}
+		return frame.caughtErr
+	}
+	var code, condname, msg, detail, hint string
+	haveMsg, haveDetail, haveHint := false, false, false
+	if s.SQLState != "" {
+		code = s.SQLState
+	} else if s.ConditionName != "" {
+		c, err := recognizeRaiseCondition(s.ConditionName)
+		if err != nil {
+			return err
+		}
+		code, condname = c, s.ConditionName
+	}
+	if s.Msg != "" {
+		m, err := evalRaiseMsg(s.Msg, frame, ctx)
+		if err != nil {
+			return err
+		}
+		msg, haveMsg = m, true
+	}
+	for _, o := range s.Options {
+		parsed, err := parser.ParseExpr(substitutePlpgsqlArraySubscripts(o.Expr, frame))
+		if err != nil {
+			return err
+		}
+		val, err := evalPLpgSQLExpr(parsed, frame, ctx)
+		if err != nil {
+			return err
+		}
+		if val.IsNull() {
+			return raiseOptionError("22004", "RAISE statement option cannot be null", 0)
+		}
+		lowered, _ := lowerPLpgSQLExpr(parsed, frame)
+		text := raiseDatumText(val, lowered, ctx)
+		dup := raiseOptionError("42601", fmt.Sprintf("RAISE option already specified: %s", o.Name), 0)
+		switch o.Name {
+		case "ERRCODE":
+			if code != "" {
+				return dup
+			}
+			c, err := recognizeRaiseCondition(text)
+			if err != nil {
+				return err
+			}
+			code, condname = c, text
+		case "MESSAGE":
+			if haveMsg {
+				return dup
+			}
+			msg, haveMsg = text, true
+		case "DETAIL":
+			if haveDetail {
+				return dup
+			}
+			detail, haveDetail = text, true
+		case "HINT":
+			if haveHint {
+				return dup
+			}
+			hint, haveHint = text, true
+		default:
+			// COLUMN / CONSTRAINT / DATATYPE / TABLE / SCHEMA: evaluated (so a
+			// NULL still errors) but not carried — ExecError has no
+			// object-name fields (deferral ledger 2026-11-17).
+		}
+	}
+	level := strings.ToLower(s.Level)
+	isError := level == "error" || level == "exception"
+	if code == "" && isError {
+		code = "P0001"
+	}
+	if !haveMsg {
+		if condname != "" {
+			msg = condname
+		} else if code != "" {
+			msg = code
+		} else {
+			msg = "00000"
+		}
+	}
+	if isError {
+		return &ExecError{Code: code, Message: msg, Detail: detail, Hint: hint, ConditionName: s.ConditionName}
+	}
+	if ctx == nil {
+		return nil
+	}
+	if level == "warning" {
+		if code != "" || hint != "" {
+			c := code
+			if c == "" {
+				c = "01000"
+			}
+			ctx.AddWarningWithHint(c, msg, hint)
+		} else {
+			ctx.AddWarning(msg)
+		}
+		return nil
+	}
+	ctx.AddNoticeFields(code, msg, detail, hint)
+	return nil
 }
 
 // splitTopLevelCommas splits s on commas not inside parentheses, brackets, or quotes.

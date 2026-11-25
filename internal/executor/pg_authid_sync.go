@@ -86,6 +86,17 @@ func buildAuthidUserRow(oid int64, rolname string, super, canLogin, inherit, cre
 // (reloadRolesFromAuthidHeap) to render a decoded rolvaliduntil back to text.
 func FormatValidUntilText(t time.Time) string { return formatValidUntilText(t) }
 
+// NormalizeValidUntilText renders a `VALID UNTIL '<literal>'` value the way
+// rolvaliduntil (timestamptz) reads back — `2030-01-01` becomes
+// `2030-01-01 00:00:00+00` — so the live catalog row and the heap-reloaded
+// one agree. A literal timestamptz input cannot parse (infinity) is kept.
+func NormalizeValidUntilText(lit string) string {
+	if t, err := parseCopyTimestamp(lit); err == nil {
+		return formatValidUntilText(t)
+	}
+	return lit
+}
+
 // formatValidUntilText renders a decoded rolvaliduntil timestamptz back into
 // the same "YYYY-MM-DD HH:MM:SS[.ffffff]+00" text form extractRoleValidUntil
 // captures from a `VALID UNTIL '...'` literal (goopg stores rolvaliduntil as

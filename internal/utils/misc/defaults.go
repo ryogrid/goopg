@@ -5,6 +5,8 @@ import (
 	"math"
 	"strconv"
 	"strings"
+
+	"github.com/goopg/goopg/internal/utils/adt/datetime"
 )
 
 // BuildDefaultRegistry returns a Registry seeded with every GUC the
@@ -119,6 +121,14 @@ func BuildDefaultRegistry() *Registry {
 		Name: "timezone_abbreviations", Type: TypeString, BootVal: "Default",
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
+		// check_timezone_abbreviations: the set must load (load_tzoffsets).
+		// M0149-0001h1a82.
+		CheckFn: func(v string) error {
+			if err := datetime.ValidAbbrevSet(v); err != nil {
+				return fmt.Errorf("invalid value for parameter %q: %q", "timezone_abbreviations", v)
+			}
+			return nil
+		},
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "integer_datetimes", Type: TypeBool, BootVal: "on",
@@ -248,6 +258,8 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name: "lc_messages", Type: TypeString, BootVal: "",
 		Context: ContextSuset, Scope: ScopeSession | ScopeTransaction,
+		// check_locale (pg_locale.c): setlocale must accept it. M0149-0001k5b.
+		CheckFn: localeCheck("lc_messages"),
 	}))
 	// session_replication_role decides which triggers fire (trigger.c
 	// TriggerEnabled): 'O' triggers fire in origin and local, 'R' only in
@@ -260,14 +272,20 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name: "lc_monetary", Type: TypeString, BootVal: "C",
 		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		// check_locale (pg_locale.c): setlocale must accept it. M0149-0001k5b.
+		CheckFn: localeCheck("lc_monetary"),
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "lc_numeric", Type: TypeString, BootVal: "C",
 		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		// check_locale (pg_locale.c): setlocale must accept it. M0149-0001k5b.
+		CheckFn: localeCheck("lc_numeric"),
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "lc_time", Type: TypeString, BootVal: "C",
 		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		// check_locale (pg_locale.c): setlocale must accept it. M0149-0001k5b.
+		CheckFn: localeCheck("lc_time"),
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "default_text_search_config", Type: TypeString, BootVal: "pg_catalog.simple",
@@ -395,6 +413,17 @@ func BuildDefaultRegistry() *Registry {
 	// SLRU_MAX_ALLOWED_BUFFERS = 1 GiB / BLCKSZ.
 	r.MustRegister(NewVariable(Variable{
 		Name: "transaction_buffers", Type: TypeInt, BootVal: "0",
+		MinVal: 0, MaxVal: (1 << 30) / 8192,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+	// subtransaction_buffers sizes the pg_subtrans SLRU (guc_tables.c:
+	// PGC_POSTMASTER, GUC_UNIT_BLOCKS, 0 = a fraction of shared_buffers,
+	// max SLRU_MAX_ALLOWED_BUFFERS). Accepted so a postgresql.conf that sets
+	// it loads; goopg's subtransaction map is not an SLRU of this size.
+	// M0149-0016.
+	r.MustRegister(NewVariable(Variable{
+		Name: "subtransaction_buffers", Type: TypeInt, BootVal: "0",
 		MinVal: 0, MaxVal: (1 << 30) / 8192,
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
@@ -639,6 +668,17 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 		Flags:   FlagListInput,
+	}))
+
+	// cluster_name (PGC_POSTMASTER, guc_tables.c) names the server. PG puts
+	// it in process titles; a standby's walreceiver also sends it as its
+	// fallback_application_name (libpqwalreceiver.c), so a primary sees the
+	// standby under that name in pg_stat_replication and
+	// synchronous_standby_names (M0149-0014).
+	r.MustRegister(NewVariable(Variable{
+		Name: "cluster_name", Type: TypeString, BootVal: "",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
 	}))
 
 	// wal_writer_delay sets the period (in milliseconds) of the
@@ -1060,6 +1100,14 @@ func BuildDefaultRegistry() *Registry {
 	// reindex-concurrently-toast enabler).
 	r.MustRegister(NewVariable(Variable{
 		Name: "allow_system_table_mods", Type: TypeBool, BootVal: "off",
+		Context: ContextSuset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	// lo_compat_privileges — skip large-object privilege checks (PG < 9.0
+	// behaviour); PGC_SUSET, default off (guc_tables.c). Consumed by the
+	// large-object functions and has_largeobject_privilege. M0149-0001h1a.
+	r.MustRegister(NewVariable(Variable{
+		Name: "lo_compat_privileges", Type: TypeBool, BootVal: "off",
 		Context: ContextSuset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
@@ -1510,6 +1558,29 @@ func BuildDefaultRegistry() *Registry {
 	// above. goopg's statement/duration log lines
 	// (internal/server/statement_log.go) expand the %m/%p/%u/%d/%a/%x subset
 	// of PG's escape set against it; BootVal mirrors upstream's own default.
+	// log_connections / log_disconnections (PG 18 guc_tables.c, both
+	// PGC_SU_BACKEND). log_connections became a list of connection-setup
+	// aspects in PG 18; check_log_connections still accepts the pre-18
+	// booleans, alone. goopg logs every connection regardless. M0149-0005.
+	r.MustRegister(NewVariable(Variable{
+		Name: "log_connections", Type: TypeString, BootVal: "",
+		Context: ContextSuBackend,
+		Scope:   ScopeServer | ScopeSession,
+		CheckFn: checkLogConnections,
+	}))
+	// log_checkpoints (PGC_SIGHUP, default on since PG 15) is accepted so a
+	// postgresql.conf that sets it loads; goopg's checkpointer logs its
+	// checkpoints regardless. M0149-0015.
+	r.MustRegister(NewVariable(Variable{
+		Name: "log_checkpoints", Type: TypeBool, BootVal: "on",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "log_disconnections", Type: TypeBool, BootVal: "off",
+		Context: ContextSuBackend,
+		Scope:   ScopeServer | ScopeSession,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "log_line_prefix", Type: TypeString, BootVal: "%m [%p] ",
 		Context: ContextSigHup,
@@ -1593,6 +1664,21 @@ func BuildDefaultRegistry() *Registry {
 		Context:     ContextPostmaster,
 		Scope:       ScopeServer,
 	}))
+	// wal_log_hints and wal_skip_threshold (guc_tables.c): accepted. goopg
+	// WAL-logs every relation change at every wal_level, so it never skips
+	// WAL for a relation created in the same transaction (the minimal-level
+	// optimisation wal_skip_threshold tunes). M0149-0006.
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_log_hints", Type: TypeBool, BootVal: "off",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_skip_threshold", Type: TypeInt, Unit: UnitKB, BootVal: "2MB",
+		MinVal: 0, MaxVal: 2147483647,
+		Context: ContextUserset,
+		Scope:   ScopeServer | ScopeSession | ScopeTransaction,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "max_wal_senders", Type: TypeInt, BootVal: "10",
 		MinVal: 0, MaxVal: 262143,
@@ -1621,6 +1707,14 @@ func BuildDefaultRegistry() *Registry {
 		Name: "wal_sender_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "60s",
 		MinVal: 0, MaxVal: math.MaxInt32,
 		Context: ContextUserset, // PGC_USERSET (guc_tables.c); the walsender has no timeout yet
+		Scope:   ScopeServer,
+	}))
+	// wal_keep_size: the minimum past WAL kept in pg_wal for standbys
+	// (xlog.c KeepLogSeg). PGC_SIGHUP, MB, 0 disables. M0149-0017.
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_keep_size", Type: TypeInt, Unit: UnitMB, BootVal: "0",
+		MinVal: 0, MaxVal: math.MaxInt32,
+		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
 	r.MustRegister(NewVariable(Variable{
@@ -1674,6 +1768,54 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
+	// recovery_min_apply_delay (guc_tables.c): a standby holds each replayed
+	// commit until its commit time plus this delay. M0149-0013.
+	r.MustRegister(NewVariable(Variable{
+		Name: "recovery_min_apply_delay", Type: TypeInt, Unit: UnitMs, BootVal: "0",
+		MinVal: 0, MaxVal: 2147483647,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	// The WAL archiver's settings (guc_tables.c, pgarch.c). M0149-0018a.
+	r.MustRegister(NewVariable(Variable{
+		Name: "archive_mode", Type: TypeEnum, BootVal: "off",
+		EnumOptions: []string{"always", "on", "off"},
+		Context:     ContextPostmaster,
+		Scope:       ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "archive_command", Type: TypeString, BootVal: "",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "archive_library", Type: TypeString, BootVal: "",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "archive_timeout", Type: TypeInt, Unit: UnitS, BootVal: "0",
+		MinVal: 0, MaxVal: 1073741823,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	// wal_retrieve_retry_interval (guc_tables.c): how long a standby waits
+	// before retrying to fetch WAL from any source (archive, pg_wal,
+	// stream) after a failure. M0149-0018a.
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_retrieve_retry_interval", Type: TypeInt, Unit: UnitMs, BootVal: "5000",
+		MinVal: 1, MaxVal: 2147483647,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	// hot_standby_feedback (guc_tables.c): a standby reports its xmin
+	// upstream so the primary's VACUUM keeps the rows its queries need.
+	// M0149-0077i.
+	r.MustRegister(NewVariable(Variable{
+		Name: "hot_standby_feedback", Type: TypeBool, BootVal: "off",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "wal_receiver_status_interval", Type: TypeInt, Unit: UnitS, BootVal: "10",
 		MinVal: 0, MaxVal: 2147483,
@@ -1686,12 +1828,27 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 		CheckFn: checkRecoveryTargetTimeline,
 	}))
-	// The recovery-target family (guc_tables.c WAL_RECOVERY_TARGET) that
-	// archive recovery honours: an LSN or xid target, whether the stop
-	// includes the target record, and what happens once it is reached. The
-	// name, time and 'immediate' targets are not registered — setting one
-	// is an unknown-parameter startup error rather than a target silently
-	// ignored.
+	// The recovery-target family (guc_tables.c WAL_RECOVERY_TARGET): the
+	// 'immediate', LSN, xid, name and time targets, whether the stop includes
+	// the target record, and what happens once it is reached (M0149-0023a).
+	r.MustRegister(NewVariable(Variable{
+		Name: "recovery_target", Type: TypeString, BootVal: "",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+		CheckFn: checkRecoveryTarget,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "recovery_target_name", Type: TypeString, BootVal: "",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+		CheckFn: checkRecoveryTargetName,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "recovery_target_time", Type: TypeString, BootVal: "",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+		CheckFn: checkRecoveryTargetTime,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "recovery_target_lsn", Type: TypeString, BootVal: "",
 		Context: ContextPostmaster,
@@ -1804,6 +1961,39 @@ func registerSSLGUCs(r *Registry) {
 func checkSSL(value string) error {
 	if value == "on" {
 		return &ValidationError{Msg: "SSL is not supported by this build"}
+	}
+	return nil
+}
+
+// checkLogConnections is check_log_connections (tcop/backend_startup.c): a
+// comma list of receipt, authentication, authorization, setup_durations and
+// all, or one of the pre-18 boolean spellings on its own.
+func checkLogConnections(v string) error {
+	var items []string
+	for _, it := range strings.Split(v, ",") {
+		it = strings.TrimSpace(it)
+		if it == "" {
+			if strings.TrimSpace(v) == "" {
+				return nil
+			}
+			return fmt.Errorf("invalid value for parameter \"log_connections\": \"%s\"", v)
+		}
+		items = append(items, strings.ToLower(strings.Trim(it, `"`)))
+	}
+	for _, b := range []string{"off", "false", "no", "0", "on", "true", "yes", "1"} {
+		if items[0] == b {
+			if len(items) > 1 {
+				return fmt.Errorf("invalid value for parameter \"log_connections\": \"%s\"", v)
+			}
+			return nil
+		}
+	}
+	for _, it := range items {
+		switch it {
+		case "receipt", "authentication", "authorization", "setup_durations", "all":
+		default:
+			return fmt.Errorf("invalid value for parameter \"log_connections\": \"%s\"", v)
+		}
 	}
 	return nil
 }

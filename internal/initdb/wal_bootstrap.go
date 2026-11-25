@@ -48,7 +48,7 @@ const (
 // long page header and the XLOG_CHECKPOINT_SHUTDOWN record.
 // Must be called before writePgControl.
 func WriteBootstrapWAL(dataDir string, sysID uint64, now time.Time) error {
-	name := xlog.XLogFileName(walBootstrapTLI, walBootstrapSegNo, xlog.DefaultSegmentSize)
+	name := xlog.XLogFileName(walBootstrapTLI, walBootstrapSegNo, xlog.WALSegmentSize())
 	segPath := filepath.Join(dataDir, "pg_wal", name)
 
 	// Allocate one 8 KiB page; only this page carries data.
@@ -61,7 +61,7 @@ func WriteBootstrapWAL(dataDir string, sysID uint64, now time.Time) error {
 	// xlp_pageaddr = wal_segment_size (0x01000000): absolute byte position
 	// of this page in the WAL stream.  Segment 1 page 0 starts at byte
 	// 1 * wal_segment_size.
-	pageAddr := uint64(xlog.DefaultSegmentSize) // 0x01000000
+	pageAddr := uint64(xlog.WALSegmentSize()) // 0x01000000 at 16 MiB
 	lph := xlog.XLogLongPageHeader{
 		Std: xlog.XLogPageHeader{
 			Magic:    xlog.XLOGPageMagic, // 0xD118
@@ -71,8 +71,8 @@ func WriteBootstrapWAL(dataDir string, sysID uint64, now time.Time) error {
 			RemLen:   0, // no continuation record
 		},
 		SysID:      sysID,
-		SegSize:    uint32(xlog.DefaultSegmentSize), // 16 MiB
-		XLogBlcksz: uint32(xlog.XLOGBlockSize),      // 8192
+		SegSize:    uint32(xlog.WALSegmentSize()), // wal_segment_size
+		XLogBlcksz: uint32(xlog.XLOGBlockSize),    // 8192
 	}
 	if err := xlog.EncodeXLogLongPageHeader(page[:xlog.SizeOfXLogLongPHD], lph); err != nil {
 		return fmt.Errorf("wal bootstrap: long page header: %w", err)
@@ -115,7 +115,7 @@ func WriteBootstrapWAL(dataDir string, sysID uint64, now time.Time) error {
 		_ = f.Close()
 		return fmt.Errorf("wal bootstrap: write page: %w", err)
 	}
-	if err := f.Truncate(xlog.DefaultSegmentSize); err != nil {
+	if err := f.Truncate(xlog.WALSegmentSize()); err != nil {
 		_ = f.Close()
 		return fmt.Errorf("wal bootstrap: truncate to segment size: %w", err)
 	}
@@ -135,7 +135,7 @@ func encodeCheckPointBody(dst []byte, now time.Time) {
 	le := binary.LittleEndian
 
 	// offset 0: redo (XLogRecPtr=uint64) — first usable WAL record LSN
-	le.PutUint64(dst[0:], pgInitCheckpointLSN) // 0x01000028
+	le.PutUint64(dst[0:], initCheckpointLSN()) // 0x01000028 at 16 MiB
 	// offset 8: ThisTimeLineID (uint32)
 	le.PutUint32(dst[8:], 1)
 	// offset 12: PrevTimeLineID (uint32)
@@ -145,8 +145,8 @@ func encodeCheckPointBody(dst []byte, now time.Time) {
 	// offset 17..19: 3-byte alignment padding (zero — dst pre-zeroed)
 	// offset 20: wal_level (int/uint32) — WAL_LEVEL_REPLICA = 1
 	le.PutUint32(dst[20:], 1)
-	// offset 24: nextXid (FullTransactionId=uint64) — FirstNormalTransactionId=3
-	le.PutUint64(dst[24:], pgFirstNormalXID)
+	// offset 24: nextXid (FullTransactionId=uint64) — PG 18.3 initdb's 752
+	le.PutUint64(dst[24:], pgInitdbNextXID)
 	// offset 32: nextOid (Oid=uint32) — FirstGenbkiObjectId=10000
 	le.PutUint32(dst[32:], pgFirstGenbkiOID)
 	// offset 36: nextMulti (MultiXactId=uint32) — FirstMultiXactId=1

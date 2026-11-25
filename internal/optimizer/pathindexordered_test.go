@@ -258,12 +258,27 @@ func TestAddOrderedIndexPathsHonoursDescendingKeys(t *testing.T) {
 	s := orderedCtx(t, tbl, 1000, ppiEquiClause(outer, "x", inner, "k"))
 	s.addOrderedIndexPaths(c)
 
+	// The merge clause makes either direction useful
+	// (pathkeys_useful_for_merging ignores it), so build_index_paths' step 5
+	// adds the backward twin too (M0148-0001c3a3): its key is the inverse.
 	paths := orderedPathsOf(s.findRel(inner))
-	if len(paths) != 1 {
-		t.Fatalf("got %d ordered index paths; want one", len(paths))
+	if len(paths) != 2 {
+		t.Fatalf("got %d ordered index paths; want the forward one and its backward twin", len(paths))
 	}
-	if k := paths[0].Pathkeys[0]; k.SortAsc || !k.NullsFirst {
-		t.Fatalf("pathkey = %+v; want DESC NULLS FIRST", k)
+	for _, p := range paths {
+		k := p.Pathkeys[0]
+		switch p.IndexScanDir {
+		case ForwardScanDirection:
+			if k.SortAsc || !k.NullsFirst {
+				t.Fatalf("forward pathkey = %+v; want DESC NULLS FIRST", k)
+			}
+		case BackwardScanDirection:
+			if !k.SortAsc || k.NullsFirst {
+				t.Fatalf("backward pathkey = %+v; want ASC NULLS LAST", k)
+			}
+		default:
+			t.Fatalf("ordered path with direction %s", p.IndexScanDir)
+		}
 	}
 }
 

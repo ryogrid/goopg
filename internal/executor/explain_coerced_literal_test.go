@@ -16,7 +16,7 @@ import (
 func TestLiteralPrintsAsCoercedConst(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	t.Cleanup(cleanup)
-	runSQL(t, ctx, "CREATE TABLE ll (a int, b int8, c char(5), d text, e numeric, f varchar(9), h int2, ts timestamp, g date)")
+	runSQL(t, ctx, "CREATE TABLE ll (a int, b int8, c char(5), d text, e numeric, f varchar(9), h int2, ts timestamp, g date, n name)")
 	ps := optimizer.DefaultPlannerSettings()
 	ps.MaxParallelWorkersPerGather = 0
 	for _, c := range []struct{ where, want string }{
@@ -31,6 +31,8 @@ func TestLiteralPrintsAsCoercedConst(t *testing.T) {
 		{"h = 3", "Filter: (h = 3)"},
 		{"c = 'TN'", "Filter: (c = 'TN'::bpchar)"},
 		{"d = 'x'", "Filter: (d = 'x'::text)"},
+		{"n = 'TVAAAA'", "Filter: (n = 'TVAAAA'::name)"},
+		{"n < 'B'", "Filter: (n < 'B'::name)"},
 		{"f = 'x'", "Filter: ((f)::text = 'x'::text)"},
 		{"g >= '2002-5-01'", "Filter: (g >= '2002-05-01'::date)"},
 		{"g = '2002-5-1'", "Filter: (g = '2002-05-01'::date)"},
@@ -38,6 +40,53 @@ func TestLiteralPrintsAsCoercedConst(t *testing.T) {
 		{"ts <= '2001-07-15'::timestamp", "Filter: (ts <= '2001-07-15 00:00:00'::timestamp without time zone)"},
 	} {
 		q := "SELECT * FROM ll WHERE " + c.where
+		var lines []string
+		for _, r := range drainPlanRows(t, ctx, planWithSettings(t, ctx, "EXPLAIN (COSTS OFF) "+q, ps)) {
+			if len(r) > 0 && r[0].Kind == KindString {
+				lines = append(lines, strings.TrimSpace(r[0].StringValue()))
+			}
+		}
+		found := false
+		for _, l := range lines {
+			if l == c.want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s\nwant line %q in:\n%s", q, c.want, strings.Join(lines, "\n"))
+		}
+	}
+}
+
+// TestIndexCondLiteralPrintsAsCoercedConst pins M0148-0001c3a1's Index Cond
+// labels: the probe key of an index qual prints as the Const parse analysis
+// coerced the literal to — the indexed column's type — exactly as the
+// Filter path prints it (PG 18.3: `(c = 'TN'::bpchar)`, `(n =
+// 'TVAAAA'::name)`, `(e = '5'::numeric)`; an int key stays bare).
+func TestIndexCondLiteralPrintsAsCoercedConst(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	runSQL(t, ctx, "CREATE TABLE li (a int, c char(5), d text, e numeric, n name, g date, v varchar(20))")
+	for _, col := range []string{"a", "c", "d", "e", "n", "g", "v"} {
+		runSQL(t, ctx, "CREATE INDEX li_"+col+" ON li ("+col+")")
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	ps.MaxParallelWorkersPerGather = 0
+	ps.EnableSeqScan, ps.EnableBitmapScan = false, false
+	for _, c := range []struct{ where, want string }{
+		{"a = 5", "Index Cond: (a = 5)"},
+		{"c = 'TN'", "Index Cond: (c = 'TN'::bpchar)"},
+		{"d = 'x'", "Index Cond: (d = 'x'::text)"},
+		{"e = 5", "Index Cond: (e = '5'::numeric)"},
+		{"n = 'TVAAAA'", "Index Cond: (n = 'TVAAAA'::name)"},
+		{"g >= '2002-5-01'", "Index Cond: (g >= '2002-05-01'::date)"},
+		// M0148-0001c3a2: varchar compares with text's operators, so PG
+		// relabels the column too.
+		{"v = 'v42'", "Index Cond: ((v)::text = 'v42'::text)"},
+		{"v = 'v42'::varchar", "Index Cond: ((v)::text = 'v42'::text)"},
+		{"v < 'v1000' AND v > 'v0'", "Index Cond: (((v)::text < 'v1000'::text) AND ((v)::text > 'v0'::text))"},
+	} {
+		q := "SELECT * FROM li WHERE " + c.where
 		var lines []string
 		for _, r := range drainPlanRows(t, ctx, planWithSettings(t, ctx, "EXPLAIN (COSTS OFF) "+q, ps)) {
 			if len(r) > 0 && r[0].Kind == KindString {

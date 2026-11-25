@@ -58,7 +58,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 	// DATABASE need no such pre-check because the parser has no grammar for
 	// them at all (parser.Parse always fails, hitting the bypass below).
 	if kind, _ := classifyDatabaseDDL(sql); kind == databaseDDLDrop {
-		if handled, err := s.handleDatabaseDDLBypass(sql, connTx.DBName, connTx.NonSuperuserRole, resolveCurrentGUC, w); handled {
+		if handled, err := s.handleDatabaseDDLBypass(&ddlCallState{ctx: ctx, lockBackend: connTx.LockBackendID}, sql, connTx.DBName, connTx.NonSuperuserRole, resolveCurrentGUC, w); handled {
 			return err
 		}
 	}
@@ -75,7 +75,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		// it, and (b) emit a WAL record so the registration survives a
 		// crash. Other commands fall through to the wire-protocol no-op
 		// tag handler.
-		if handled, err := s.handleDatabaseDDLBypass(sql, connTx.DBName, connTx.NonSuperuserRole, resolveCurrentGUC, w); handled {
+		if handled, err := s.handleDatabaseDDLBypass(&ddlCallState{ctx: ctx, lockBackend: connTx.LockBackendID}, sql, connTx.DBName, connTx.NonSuperuserRole, resolveCurrentGUC, w); handled {
 			return err
 		}
 		// A multi-statement batch whose FIRST statement is CREATE/DROP ROLE
@@ -589,6 +589,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		ectx.IsStandby = s.cfg.IsStandby()
 	}
 	ectx.RecoveryLSNs = s.cfg.RecoveryLSNs
+	ectx.RecoveryPause = s.cfg.RecoveryPause
 	// Wire inline-NOTICE delivery so RAISE NOTICE emitted before a row-level
 	// lock wait (e.g. from noisy_oper() in eval-plan-qual) reaches the client
 	// before blockDetectWait fires in the isolation runner.  Without this,
@@ -603,6 +604,22 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 			{Code: libpq.FieldSQLState, Value: "00000"},
 			{Code: libpq.FieldMessage, Value: msg},
 		})
+		_ = w.Flush()
+	}
+	ectx.NoticeFieldsFlush = func(code, msg, detail, hint string) {
+		fields := []libpq.ErrorField{
+			{Code: libpq.FieldSeverity, Value: "NOTICE"},
+			{Code: libpq.FieldSeverityNonLocal, Value: "NOTICE"},
+			{Code: libpq.FieldSQLState, Value: code},
+			{Code: libpq.FieldMessage, Value: msg},
+		}
+		if detail != "" {
+			fields = append(fields, libpq.ErrorField{Code: libpq.FieldDetail, Value: detail})
+		}
+		if hint != "" {
+			fields = append(fields, libpq.ErrorField{Code: libpq.FieldHint, Value: hint})
+		}
+		_ = w.WriteNoticeResponse(fields)
 		_ = w.Flush()
 	}
 
@@ -765,6 +782,9 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 					return s.writeQueryError(w, "42P05",
 						fmt.Sprintf("prepared statement %q already exists", ps.Name))
 				}
+				if lit := ctxPlannerSettings(ectx); lit.TimeZone != "" || lit.DateStyle != "" {
+					prepStmts.SetLiteralSettings(ps.Name, &executor.PreparedLiteralSettings{TimeZone: lit.TimeZone, DateStyle: lit.DateStyle, TimezoneAbbreviations: lit.TimezoneAbbreviations})
+				}
 				// Infer result column types and undeclared parameter types by planning/walking.
 				if ectx.Catalog != nil {
 					if plan, planErr := optimizer.PlanWithSettings(ps.Query, sessionPlanCatalog(sess, ectx.Catalog, ectx.CurrentDatabaseOid), sessionPlannerSettings(sess)); planErr == nil {
@@ -792,6 +812,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 			continue
 		}
 		restoreParams := ectx.Params
+		restoreLiterals := ectx.PreparedLiterals
 		if es, ok := stmt.(*parser.ExecuteStmt); ok {
 			if prepStmts != nil {
 				if prepDef, found := prepStmts.Lookup(es.Name); found {
@@ -878,6 +899,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 					}
 					stmt = prepDef.stmt
 					ectx.Params = params
+					ectx.PreparedLiterals = prepDef.literals
 					disablePlanCache = true
 				} else {
 					return s.writeQueryError(w, "26000", fmt.Sprintf("prepared statement %q does not exist", es.Name))
@@ -1150,6 +1172,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		}
 		ectx.Ctx = savedCtx
 		ectx.Params = restoreParams
+		ectx.PreparedLiterals = restoreLiterals
 		if err != nil {
 			if errors.Is(err, errQueryErrorSent) {
 				// Error + ReadyForQuery already sent to the client (M0097-0003).
@@ -1818,7 +1841,11 @@ func ctxPlannerSettings(ctx *executor.Context) optimizer.PlannerSettings {
 	if ctx == nil || ctx.GetSetting == nil {
 		return optimizer.DefaultPlannerSettings()
 	}
-	return plannerSettingsFrom(ctx.GetSetting)
+	ps := plannerSettingsFrom(ctx.GetSetting)
+	if lit := ctx.PreparedLiterals; lit != nil {
+		ps.TimeZone, ps.DateStyle, ps.TimezoneAbbreviations = lit.TimeZone, lit.DateStyle, lit.TimezoneAbbreviations
+	}
+	return ps
 }
 
 func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSettings {
@@ -1838,6 +1865,15 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readFloat("parallel_setup_cost", &ps.ParallelSetupCost)
 	readFloat("parallel_tuple_cost", &ps.ParallelTupleCost)
 	readFloat("hash_mem_multiplier", &ps.HashMemMultiplier)
+	if v, ok := get("timezone"); ok {
+		ps.TimeZone = v
+	}
+	if v, ok := get("datestyle"); ok {
+		ps.DateStyle = v
+	}
+	if v, ok := get("timezone_abbreviations"); ok {
+		ps.TimezoneAbbreviations = v
+	}
 
 	// take2 P2-05: the planner-method toggles. These were registered GUCs with
 	// no consumer anywhere outside the pg_settings view — `SET
@@ -1906,6 +1942,7 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readBool("enable_mergejoin", &ps.EnableMergeJoin)
 	readBool("enable_nestloop", &ps.EnableNestLoop)
 	readBool("enable_memoize", &ps.EnableMemoize)
+	readBool("enable_partitionwise_join", &ps.EnablePartitionwiseJoin)
 	readBool("enable_hashagg", &ps.EnableHashAgg)
 	readBool("enable_presorted_aggregate", &ps.EnablePresortedAggregate)
 	readBool("enable_group_by_reordering", &ps.EnableGroupByReordering)
@@ -2041,6 +2078,7 @@ func plannerCacheFingerprint(ps optimizer.PlannerSettings, disableSeqScan, disab
 		float(ps.GeqoSelectionBias),
 		float(ps.GeqoSeed),
 		bit(ps.EnableMemoize),
+		bit(ps.EnablePartitionwiseJoin),
 		float(ps.HashMemMultiplier),
 		// C-19g's remainder: the parallel block. It used to be excluded
 		// because `MaybeAddGather` ran post-cache and nothing parallel could
@@ -2053,6 +2091,9 @@ func plannerCacheFingerprint(ps optimizer.PlannerSettings, disableSeqScan, disab
 		strconv.FormatInt(ps.MinParallelIndexScanSize, 10),
 		bit(ps.ParallelLeaderParticipation),
 		bit(ps.EnableGatherMerge),
+		ps.TimeZone,
+		ps.DateStyle,
+		ps.TimezoneAbbreviations,
 		bit(disableSeqScan),
 		bit(disableIndexScan),
 		bit(disableBitmapScan),
@@ -2366,6 +2407,9 @@ func (s *Server) registerCompatNoopSchema(sql string, actingRole, sessionUser st
 		return nil
 	}
 	s.cfg.Catalog.RegisterSchema(schemaName, catalog.NamespaceDBOid(s.currentDatabaseOidForCompat()))
+	if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
+		executor.ApplySchemaDefaultACL(im, schemaName, s.currentDatabaseOidForCompat())
+	}
 	// B1.1: persist via a real pg_namespace heap row (frozen-xid variant —
 	// this branch handles CREATE SCHEMA forms the parser rejects and runs
 	// without a live transaction). The parsed CompatNoopStmt path journals
@@ -3570,7 +3614,7 @@ func subscriptionRowsForDBOid(ps *catalog.PubSub, dbOid uint32) [][]string {
 	for _, sub := range subs {
 		out = append(out, []string{
 			fmt.Sprintf("%d", sub.OID),
-			fmt.Sprintf("%d", catalog.FirstUserOID), // subdbid — matches pg_database.oid
+			fmt.Sprintf("%d", catalog.PostgresDBOid), // subdbid — matches pg_database.oid
 			sub.Name,
 			fmt.Sprintf("%d", sub.Owner), // subowner
 			boolToText(sub.Enabled),
@@ -3786,20 +3830,7 @@ func (s *Server) executeOneSimpleStmt(w *libpq.FrameWriter, ctx *executor.Contex
 	if schema != nil {
 		fields := make([]libpq.FieldDescription, len(schema))
 		for i, sc := range schema {
-			oid := typeOIDFor(sc.Type)
-			// Array column (e.g. `p int4[]`): advertise the array pg_type OID
-			// (_int4 = 1007) so the client parses the "{1,2}" text as an array
-			// rather than a scalar int4. M0118-0002.
-			if sc.Type.IsArray {
-				oid = catalog.ArrayOIDForBase(oid)
-			}
-			fields[i] = libpq.FieldDescription{
-				Name:         sc.Name,
-				TypeOID:      oid,
-				TypeSize:     -1,
-				TypeModifier: -1,
-				Format:       0,
-			}
+			fields[i] = wireFieldDescription(ctx.Catalog, ctx.CurrentDatabaseOid, sc.Name, sc.Type)
 		}
 		if err := w.WriteRowDescription(fields); err != nil {
 			_ = op.Close()
@@ -4054,6 +4085,8 @@ func ddlTag(stmt parser.Stmt) string {
 		return "ALTER STATISTICS"
 	case *parser.AlterSchemaStmt:
 		return "ALTER SCHEMA"
+	case *parser.AlterLargeObjectOwnerStmt:
+		return "ALTER LARGE OBJECT"
 	case *parser.AlterOpFamilyAddStmt, *parser.AlterOpFamilyDropStmt:
 		return "ALTER OPERATOR FAMILY"
 	case *parser.CreateOpClassStmt:
@@ -4245,6 +4278,16 @@ func rowsAffected(op executor.Operator) int64 {
 // bare-arglist behavior, so the ~30 direct-call test callers need no edit.
 func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.Type, getSetting func(name string) (string, bool), visible ...func(schema string) bool) []byte {
 	switch strings.ToLower(typ.Name) {
+	case "money":
+		// cash_out ("$1,234.56"): goopg's money Datum is a scale-2 numeric of
+		// the Cash value. M0149-0001k1.
+		monetary := "C"
+		if getSetting != nil {
+			if v, ok := getSetting("lc_monetary"); ok {
+				monetary = v
+			}
+		}
+		return append(dst, executor.MoneyTextLocale(d, monetary)...)
 	case "float4", "real":
 		// float4/real uses float32 precision (~7 significant digits).
 		// Use strconv bit=32 so the shortest float32 round-trip representation
@@ -4275,7 +4318,7 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 		// hardcoded ISO regardless of `SET datestyle`. M0097-0004,
 		// M-NIGHTLY (run 20260714-011651) DateStyle output-rendering
 		// follow-up.
-		if d.Kind == executor.KindTime {
+		if d.Kind == executor.KindTime && !d.IsTimestampNotFinite() {
 			style, order := "ISO", "MDY"
 			if getSetting != nil {
 				if v, ok := getSetting("datestyle"); ok {
@@ -4290,7 +4333,7 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 		// order), matching PostgreSQL's EncodeDateTime with print_tz=false.
 		// Previously hardcoded ISO regardless of `SET datestyle`. M-NIGHTLY
 		// (run 20260714-011651) DateStyle output-rendering follow-up.
-		if d.Kind == executor.KindTime {
+		if d.Kind == executor.KindTime && !d.IsTimestampNotFinite() {
 			style, order := "ISO", "MDY"
 			if getSetting != nil {
 				if v, ok := getSetting("datestyle"); ok {
@@ -4307,7 +4350,7 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 		// before that, goopg printed a timestamptz with no zone at all and
 		// never left UTC, so under `SET TimeZone` the text READ as a different
 		// instant than the one stored.
-		if d.Kind == executor.KindTime {
+		if d.Kind == executor.KindTime && !d.IsTimestampNotFinite() {
 			style, order := "ISO", "MDY"
 			zone := ""
 			if getSetting != nil {
@@ -4349,7 +4392,7 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 			return append(dst, array.ByteaOutStyled(d.BytesValue(), mode)...)
 		}
 		return d.AppendValueText(dst)
-	case "regclass", "regproc", "regprocedure", "regtype", "regrole", "regcollation":
+	case "regclass", "regproc", "regprocedure", "regtype", "regrole", "regcollation", "regnamespace", "regoper", "regoperator":
 		// OID values of the reg* family display as the object's name
 		// (regclassout/regprocout/regprocedureout/regtypeout/regroleout/
 		// regcollationout) — a direct SELECT of a reg* column, pg_authid.rolname,
@@ -4368,6 +4411,9 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 			var argVisible func(s string) bool
 			if len(visible) > 0 {
 				argVisible = visible[0]
+			}
+			if argVisible != nil {
+				return append(dst, executor.RegOutVisible(typ.Name, uint32(d.Int), s.cfg.Catalog, argVisible)...)
 			}
 			return append(dst, executor.RegOutArgVisible(typ.Name, uint32(d.Int),
 				s.cfg.Catalog, !publicSchemaVisible(getSetting), argVisible)...)
@@ -4548,7 +4594,7 @@ func appendTimeText(dst []byte, d executor.Datum, _ catalog.Type) []byte {
 }
 
 // appendTimeTZOffset appends the timezone offset to dst in PostgreSQL's format:
-// "+HH", "-HH", "+HH:MM", or "-HH:MM". offsetSecs is seconds east of UTC.
+// "+HH", "+HH:MM" or "+HH:MM:SS", and the same with "-". offsetSecs is seconds east of UTC.
 // UTC (0) is rendered as "+00".
 func appendTimeTZOffset(dst []byte, offsetSecs int) []byte {
 	if offsetSecs < 0 {
@@ -4559,16 +4605,21 @@ func appendTimeTZOffset(dst []byte, offsetSecs int) []byte {
 	}
 	h := offsetSecs / 3600
 	m := (offsetSecs % 3600) / 60
+	sec := offsetSecs % 60
 	dst = append(dst, byte('0'+h/10), byte('0'+h%10))
-	if m != 0 {
+	// EncodeTimezone: minutes when either part is nonzero, seconds when set.
+	if m != 0 || sec != 0 {
 		dst = append(dst, ':', byte('0'+m/10), byte('0'+m%10))
+	}
+	if sec != 0 {
+		dst = append(dst, ':', byte('0'+sec/10), byte('0'+sec%10))
 	}
 	return dst
 }
 
-// typeOIDFor maps a goopg type name to a pg_type.oid the wire
-// protocol can advertise. Unknown types fall back to text (25),
-// which is wire-compatible with libpq's text-format reader.
+// typeOIDFor maps a built-in goopg type name to the pg_type.oid the wire
+// protocol advertises. A name no built-in type carries falls back to text
+// (25); wireTypeOID resolves those against the user-defined types first.
 func typeOIDFor(t catalog.Type) uint32 {
 	switch strings.ToLower(t.Name) {
 	case "int2", "smallint", "smallserial":
@@ -4591,6 +4642,10 @@ func typeOIDFor(t catalog.Type) uint32 {
 		return 19
 	case "uuid":
 		return 2950
+	case "money":
+		// CASHOID: psql right-aligns it like the other numeric types
+		// (print.c column_type_alignment). M0149-0001k1.
+		return 790
 	case "date":
 		return 1082
 	case "time":
@@ -4626,7 +4681,7 @@ func typeOIDFor(t catalog.Type) uint32 {
 		// `<name>::regtype` casts. M0122-0005 pg_typeof()::oid follow-up.
 		return catalog.OIDRegtype
 	}
-	return 25
+	return builtinWireTypeOID(strings.ToLower(t.Name))
 }
 
 // executeFetch executes or resumes a cursor fetch. It materialises the cursor's
@@ -4645,20 +4700,7 @@ func (s *Server) executeFetch(_ context.Context, w *libpq.FrameWriter, ectx *exe
 	if schema != nil {
 		fields := make([]libpq.FieldDescription, len(schema))
 		for i, sc := range schema {
-			oid := typeOIDFor(sc.Type)
-			// Array column (e.g. `p int4[]`): advertise the array pg_type OID
-			// (_int4 = 1007) so the client parses the "{1,2}" text as an array
-			// rather than a scalar int4. M0118-0002.
-			if sc.Type.IsArray {
-				oid = catalog.ArrayOIDForBase(oid)
-			}
-			fields[i] = libpq.FieldDescription{
-				Name:         sc.Name,
-				TypeOID:      oid,
-				TypeSize:     -1,
-				TypeModifier: -1,
-				Format:       0,
-			}
+			fields[i] = wireFieldDescription(ectx.Catalog, ectx.CurrentDatabaseOid, sc.Name, sc.Type)
 		}
 		if err := w.WriteRowDescription(fields); err != nil {
 			return err

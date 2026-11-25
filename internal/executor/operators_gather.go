@@ -390,7 +390,7 @@ func (o *gatherOp) Open(ctx *Context) error {
 		o.attachAll(child)
 		if err := child.Open(ctx); err != nil {
 			_ = child.Close()
-			return err
+			return parallelLeaderOpenError(o.group, err)
 		}
 		o.leaderChild = child
 	}

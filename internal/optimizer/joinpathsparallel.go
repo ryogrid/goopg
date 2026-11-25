@@ -373,7 +373,7 @@ func addPartialMergeJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 		return
 	}
 	tryPartialMergeJoinPath(s, joinrel, o, i, outer.Relids, inner.Relids, cp, jt, innerUnique, "merge", resultKeys, outerSortKeys, innerSortKeys,
-		mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
+		mergeClauses, nil, residual, mergeTuplesFor, scanSelFor, paramSrc)
 }
 
 // tryPartialMergeJoinPath is `try_partial_mergejoin_path` proper over two
@@ -398,7 +398,7 @@ func addPartialMergeJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 // route, not just the refusal (R54 Step-1 H5).
 func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids RelSet, cp costParams, jt parser.JoinType, innerUnique bool,
 	site string,
-	resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo,
+	resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses []*restrictInfo, mergeDesc []bool, residual []*restrictInfo,
 	mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) mergeScanSel,
 	paramSrc RelSet) {
 
@@ -514,6 +514,7 @@ func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, oute
 		OuterRelids: outerRelids,
 		InnerRelids: innerRelids,
 		HashKeys:    mergeClauses,
+		MergeDesc:   mergeDesc,
 		Residual:    residual,
 		// `build_join_pathkeys` of the delivered ordering (joinpath.c:1932
 		// at the unsorted site; the loop's own ordering at site 1) — NOT

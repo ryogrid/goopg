@@ -72,12 +72,14 @@ func TestSyncTableInsertsSysCatalogIndexEntries(t *testing.T) {
 		t.Errorf("pg_class_relname_nsp_index slot 2: nsoid = %d, want %d", nsOid, catalog.PublicNamespaceOID)
 	}
 
-	// pg_attribute_relid_attnum_index: 2 new entries (one per column),
-	// each keyed by (tbl.OID, attnum=Ordinal+1).
+	// pg_attribute_relid_attnum_index: 8 new entries — one per column, keyed
+	// (tbl.OID, attnum=Ordinal+1), plus the six system attributes at attnum
+	// -1 … -6 (M0149-0001e), which sort first.
 	attTuples := readSysBtreeLeaf(t, ctx, pgAttributeRelidAttnumIndexOID)
-	if len(attTuples) != 2 {
-		t.Fatalf("pg_attribute_relid_attnum_index: got %d tuples, want 2", len(attTuples))
+	if len(attTuples) != 8 {
+		t.Fatalf("pg_attribute_relid_attnum_index: got %d tuples, want 8", len(attTuples))
 	}
+	attTuples = attTuples[6:] // the two user columns
 	for i, tup := range attTuples {
 		gotRelid := binary.LittleEndian.Uint32(tup[sysIndexTupleHoff : sysIndexTupleHoff+4])
 		gotAttnum := int16(binary.LittleEndian.Uint16(tup[sysIndexTupleHoff+4 : sysIndexTupleHoff+6]))

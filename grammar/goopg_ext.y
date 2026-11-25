@@ -3105,6 +3105,10 @@ comment_target:
 	| ACCESS METHOD qualified_name    { $$ = NewCommentOnStmt(0, "access method", objectNameFromQn($3), "") }
 	| FOREIGN TABLE qualified_name    { $$ = NewCommentOnStmt(0, "foreign table", objectNameFromQn($3), "") }
 	| FOREIGN DATA_P WRAPPER qualified_name { $$ = NewCommentOnStmt(0, "foreign data wrapper", objectNameFromQn($4), "") }
+	/* gram.y CommentStmt's LARGE_P OBJECT_P NumericOnly arm; the OID rides
+	   in ObjName.Name as decimal text (an integer OID, as ALTER LARGE OBJECT
+	   takes). M0149-0001h1a. */
+	| LARGE_P OBJECT_P ICONST         { $$ = NewCommentOnStmt(0, "large object", ObjectName{Name: strconv.FormatInt(int64($3), 10)}, "") }
 	/* COLUMN's name is split at the LAST dot: `COMMENT ON COLUMN t.c` records
 	   ObjName{Name:"t"} and SubName "c", while `s.t.c` keeps the schema. */
 	| COLUMN qualified_name           { $$ = commentColumn($2) }
@@ -3394,6 +3398,12 @@ alter_schema_stmt:
 			{ $$ = NewAlterSchemaStmt($<p>1, $3, "rename", $6, "") }
 	| ALTER SCHEMA ColId OWNER TO alter_fn_owner
 			{ $$ = NewAlterSchemaStmt($<p>1, $3, "owner", "", $6) }
+
+/* ALTER LARGE OBJECT <oid> OWNER TO role — gram.y AlterOwnerStmt's
+   OBJECT_LARGEOBJECT arm (NumericOnly; an integer OID here). M0149-0001h1a. */
+alter_large_object_stmt:
+		ALTER LARGE_P OBJECT_P ICONST OWNER TO alter_fn_owner
+			{ $$ = NewAlterLargeObjectOwnerStmt($<p>1, int64($4), $7) }
 
 /* CREATE ACCESS METHOD — gram.y:5991 CreateAmStmt, verbatim:
    `CREATE ACCESS METHOD name TYPE_P am_type HANDLER handler_name`.

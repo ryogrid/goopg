@@ -207,7 +207,7 @@ func (s *Service) maybeRemoveOld() {
 // oldest WAL segment file on disk for tli. ok is false when none exists.
 func oldestSegmentLSN(walDir string, tli uint32, segSize int64) (uint64, bool) {
 	if segSize <= 0 {
-		segSize = xlog.DefaultSegmentSize
+		segSize = xlog.WALSegmentSize()
 	}
 	ents, err := os.ReadDir(walDir)
 	if err != nil {

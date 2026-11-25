@@ -243,9 +243,11 @@ func TestRegCopyAndSelectSiblingArgQualifyAgree(t *testing.T) {
 	// search_path=''): the NAME qualifies (public off the path) AND each arg
 	// type whose schema is off the path qualifies.
 	emptyPath := func(name string) (string, bool) { return "", true }
-	// The production SELECT/COPY predicate: RegObjectSchemaVisible with offpath
-	// not on the effective path.
-	argVisible := func(s string) bool { return s != "offpath" }
+	// The production SELECT/COPY predicate: RegObjectSchemaVisible over that
+	// same empty path — only pg_catalog is visible. (It used to answer true
+	// for public while the path was empty; since M0149-0001h1a32 the SELECT
+	// path qualifies the NAME from this predicate, per object.)
+	argVisible := func(s string) bool { return s == "pg_catalog" }
 
 	routine, err := cat.Routines().Create(&catalog.Routine{
 		Name:           "argqual_sibling_udf",

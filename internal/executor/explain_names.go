@@ -341,6 +341,23 @@ func (nm *explainNames) scopeSources(n optimizer.Node) map[int16]int32 {
 				}
 			}
 		}
+		// A partitionwise / child-path Append stands for parent appendrels
+		// no plan node carries; they bind their sources in this scope as the
+		// parent SetOp would (M0148-0001c3a10).
+		if so, ok := x.(*optimizer.SetOp); ok {
+			for _, par := range so.PartitionwiseParents {
+				if rtid, ok := explainNodeRTID(par); ok {
+					if src := appendRelSourceIdx(par); src != 0 {
+						if _, claimed := m[src]; !claimed {
+							m[src] = rtid
+						}
+						if !belowSetOp {
+							all[src] = append(all[src], rtid)
+						}
+					}
+				}
+			}
+		}
 		if !top && explainLevelBoundary(x) {
 			return
 		}
@@ -412,6 +429,19 @@ func (nm *explainNames) collect(n optimizer.Node) {
 		}
 		if v, ok := node.(*optimizer.Values); ok && v.RowCount() > 1 {
 			valuesNodes = append(valuesNodes, node)
+		}
+		// A partitionwise join's Append names its parent appendrels
+		// (apprelids) before the child joins' members, as
+		// ExplainPreScanNode adds them to rels_used (M0148-0001c3a9).
+		if so, ok := node.(*optimizer.SetOp); ok {
+			for _, par := range so.PartitionwiseParents {
+				if base, ok := explainRelBaseName(par); ok {
+					if rtid, ok := explainNodeRTID(par); ok {
+						src, _ := explainSingleSourceIdx(par)
+						found = append(found, entry{rtid: rtid, src: src, base: base, node: par})
+					}
+				}
+			}
 		}
 		if base, ok := explainRelBaseName(node); ok {
 			if rtid, ok := explainNodeRTID(node); ok {
@@ -937,6 +967,20 @@ func (nm *explainNames) resolvedColumn(n optimizer.Node, idx int, requireSetOp b
 			// the parent deparses with the PARENT's refname — `t1.a`
 			// over `Seq Scan on t1 t1_1` — never the first member's
 			// (M0148-0001k, aggregates.out `Group Key: t1.a`).
+			// A partitionwise join's Append: the column belongs to one of
+			// the two parent appendrels, by its binding of origin, and
+			// deparses with that parent's name (M0148-0001c3a9).
+			if len(p.PartitionwiseParents) > 0 {
+				if out := p.Output(); idx < len(out) {
+					for _, par := range p.PartitionwiseParents {
+						if src := appendRelSourceIdx(par); src != 0 && src == out[idx].SourceTableIdx {
+							if name, ok := nm.bySource[par.RTID]; ok && name != "" {
+								return pgQuoteIdent(name) + "." + pgQuoteIdent(out[idx].Name)
+							}
+						}
+					}
+				}
+			}
 			if p.RTID != 0 && p.AppendRelName != "" && !p.IsUnionAllAppendRel() {
 				if name, ok := nm.bySource[p.RTID]; ok && name != "" {
 					if out := p.Output(); idx < len(out) {
@@ -1086,4 +1130,15 @@ func concatJoinSide(j, left, right optimizer.Node, idx int) (optimizer.Node, int
 		return left, idx
 	}
 	return right, idx - lw
+}
+
+// appendRelSourceIdx is the binding id an appendrel's columns carry (its
+// tableoid column may carry none), or 0.
+func appendRelSourceIdx(par *optimizer.SetOp) int16 {
+	for _, c := range par.Output() {
+		if c.SourceTableIdx != 0 {
+			return c.SourceTableIdx
+		}
+	}
+	return 0
 }

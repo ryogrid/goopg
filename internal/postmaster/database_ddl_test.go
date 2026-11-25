@@ -249,8 +249,8 @@ func TestTryHandleDatabaseDDLAlterDatabaseConfigFromCurrent(t *testing.T) {
 	if !handled || err != nil {
 		t.Fatalf("ALTER DATABASE postgres SET work_mem FROM CURRENT: handled=%v err=%v", handled, err)
 	}
-	if got := im.DatabaseConfigEntries(catalog.FirstUserOID); len(got) != 1 || got[0] != "work_mem=128MB" {
-		t.Errorf("DatabaseConfigEntries(FirstUserOID) = %v, want [work_mem=128MB]", got)
+	if got := im.DatabaseConfigEntries(catalog.PostgresDBOid); len(got) != 1 || got[0] != "work_mem=128MB" {
+		t.Errorf("DatabaseConfigEntries(PostgresDBOid) = %v, want [work_mem=128MB]", got)
 	}
 
 	// An unrecognised GUC name (resolver reports ok=false) errors.
@@ -823,7 +823,7 @@ func TestTryHandleDatabaseDDLCreateTemplateWithSequenceCopies(t *testing.T) {
 	// rows, and every real sequence's relation IS Virtual).
 	executor.RegisterSequence("s", 1, 1, 1, 9223372036854775807, false, srcOid)
 	executor.CreateSequenceCatalogRelation(im, parser.ObjectName{Name: "s"}, "s", srcOid)
-	if !executor.SetSequenceCurrentValue("s", 5, srcOid) {
+	if !executor.SetSequenceCurrentValue("s", 5, true, srcOid) {
 		t.Fatal("SetSequenceCurrentValue(s, 5) under seqsrc failed")
 	}
 
@@ -843,7 +843,7 @@ func TestTryHandleDatabaseDDLCreateTemplateWithSequenceCopies(t *testing.T) {
 		t.Fatalf("cloned sequence \"s\" current = %d, want 5 (the source's counter at copy time)", clonedPayload.Current)
 	}
 	// Advancing the clone must not alias the source's own counter.
-	if !executor.SetSequenceCurrentValue("s", 42, newOid) {
+	if !executor.SetSequenceCurrentValue("s", 42, true, newOid) {
 		t.Fatal("SetSequenceCurrentValue(s, 42) under foo failed")
 	}
 	srcPayload, ok := executor.SnapshotSequenceState("s", srcOid)

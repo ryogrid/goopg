@@ -238,9 +238,10 @@ type TruncateUndoEntry struct {
 
 // SeqRestoreEntry records the pre-restart sequence counter for rollback.
 type SeqRestoreEntry struct {
-	Name    string
-	OldCurr int64  // seqState.current value before RESTART
-	DBOid   uint32 // owning database oid (M0122-0007 4e)
+	Name      string
+	OldCurr   int64  // last_value before RESTART
+	OldCalled bool   // is_called before RESTART
+	DBOid     uint32 // owning database oid (M0122-0007 4e)
 }
 
 // OnCommitAction records one CREATE TEMP TABLE ... ON COMMIT {DELETE ROWS|DROP}
@@ -262,6 +263,7 @@ type BasicSession struct {
 	pendingTruncates    []TruncateUndoEntry        // heap/index page snapshots for TRUNCATE rollback
 	pendingSeqRestores  []SeqRestoreEntry          // sequence counter restores for RESTART IDENTITY rollback
 	savepointDDLDrops   []DDLDropUndoEntry         // DROP TABLE inside savepoints, for ROLLBACK TO (M0097-0023)
+	savepointUndos      []savepointUndo            // undo for ROLLBACK TO and ROLLBACK, by savepoint depth (M0149-0006)
 	pendingIndexDrops   []PendingIndexDrop         // DROP INDEX deferred to COMMIT (M0118-0008)
 	pendingPartAttaches []PendingPartitionAttach   // ATTACH PARTITION deferred to COMMIT (M0118-0008)
 	pendingInheritChng  []PendingInheritanceChange // ALTER TABLE {NO} INHERIT deferred to COMMIT (M0118-0008)
@@ -284,6 +286,7 @@ type BasicSession struct {
 	pendingAlterIndex   []AlterIndexUndoEntry      // ALTER TABLE ADD CONSTRAINT ... USING INDEX field mutations pending rollback (P0-E5/M0143-0008)
 	pendingNotNullAlter []NotNullUndoEntry         // PRIMARY KEY NOT-NULL synthesis pending rollback (P0-E5/M0143-0008)
 	pendingRelStats     []RelStatsUndoEntry        // pg_class reltuples/relpages UPDATEs pending rollback (M0146-0064)
+	pendingCatalogUndos []func()                // in-memory catalog changes to reverse on ROLLBACK, newest last (M0149-0001h1a)
 	pendingDropConstAlt []DropConstraintUndoEntry  // ALTER TABLE DROP CONSTRAINT (CHECK/FK/NOT NULL) field mutations pending rollback (M0143-0008b)
 }
 
@@ -430,7 +433,9 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.pendingTruncates = nil
 	s.pendingSeqRestores = nil
 	s.pendingRelStats = nil // committed (or already restored by ROLLBACK)
+	s.pendingCatalogUndos = nil
 	s.savepointDDLDrops = nil
+	s.savepointUndos = nil
 	s.pendingIndexDrops = nil
 	s.pendingPartAttaches = nil
 	s.pendingInheritChng = nil
@@ -892,6 +897,20 @@ func (s *BasicSession) RecordRelStatsUndo(e RelStatsUndoEntry) {
 	s.pendingRelStats = append(s.pendingRelStats, e)
 }
 
+// RecordCatalogUndo queues fn to run if the transaction rolls back: an
+// in-memory catalog change with no heap row of its own (a pg_default_acl
+// entry) whose PG counterpart would vanish with the aborted transaction.
+func (s *BasicSession) RecordCatalogUndo(fn func()) {
+	s.pendingCatalogUndos = append(s.pendingCatalogUndos, fn)
+}
+
+// TakePendingCatalogUndos drains the queued catalog undos.
+func (s *BasicSession) TakePendingCatalogUndos() []func() {
+	p := s.pendingCatalogUndos
+	s.pendingCatalogUndos = nil
+	return p
+}
+
 // TakePendingRelStatsUndos drains and returns the pending relation-stats undo
 // list (M0146-0064).
 func (s *BasicSession) TakePendingRelStatsUndos() []RelStatsUndoEntry {
@@ -942,6 +961,41 @@ func (s *BasicSession) TakePendingSeqRestores() []SeqRestoreEntry {
 // SavepointDepth returns the current number of active savepoint stack entries.
 func (s *BasicSession) SavepointDepth() int {
 	return s.subxactStack.Len()
+}
+
+// savepointUndo is a change ROLLBACK TO the savepoint level it was made at
+// (or a full ROLLBACK) must reverse.
+type savepointUndo struct {
+	depth int
+	fn    func()
+}
+
+// RecordSavepointUndo queues fn to run when the change it reverses is rolled
+// back: by ROLLBACK TO any savepoint at or above the current depth, or by
+// ROLLBACK. RELEASE keeps it, so an enclosing savepoint's rollback still runs
+// it, as a released subtransaction's changes belong to its parent.
+// M0149-0006.
+func (s *BasicSession) RecordSavepointUndo(fn func()) {
+	s.savepointUndos = append(s.savepointUndos, savepointUndo{depth: s.SavepointDepth(), fn: fn})
+}
+
+// RunSavepointUndosToDepth runs, newest first, the undos recorded at
+// savepoint depth >= depth (ROLLBACK TO), or all of them for depth 0
+// (ROLLBACK), and forgets them.
+func (s *BasicSession) RunSavepointUndosToDepth(depth int) {
+	var keep []savepointUndo
+	var run []savepointUndo
+	for _, u := range s.savepointUndos {
+		if u.depth >= depth {
+			run = append(run, u)
+		} else {
+			keep = append(keep, u)
+		}
+	}
+	s.savepointUndos = keep
+	for i := len(run) - 1; i >= 0; i-- {
+		run[i].fn()
+	}
 }
 
 // RecordDDLDrop records a DROP TABLE performed inside an active savepoint

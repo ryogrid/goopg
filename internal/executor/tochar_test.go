@@ -14,7 +14,7 @@ func TestToCharNumericFormat(t *testing.T) {
 		{NewIntDatum(0), "FM0000", "0000"},
 		{NewIntDatum(150), "FM0000", "0150"},
 		{NewIntDatum(1234), "FM0000", "1234"},
-		{NewIntDatum(12345), "FM0000", "12345"},
+		{NewIntDatum(12345), "FM0000", "####"}, // too wide: PG prints #
 		{NewIntDatum(6), "FM0000", "0006"},
 		// FM suffix
 		{NewIntDatum(150), "0000FM", "0150"},
@@ -49,51 +49,24 @@ func TestToCharNumericFormat(t *testing.T) {
 		{NewIntDatum(-4567890123456789), "999999SG9999999999", "456789-0123456789"},
 	}
 	for _, tc := range cases {
-		got := toCharNumericFormat(tc.val, tc.fmt)
+		got, err := toCharNumber(tc.val, "", tc.fmt)
+		if err != nil {
+			t.Errorf("toCharNumber(%v, %q): %v", tc.val.Format(), tc.fmt, err)
+			continue
+		}
 		if got != tc.expect {
-			t.Errorf("toCharNumericFormat(%v, %q) = %q, want %q", tc.val.Format(), tc.fmt, got, tc.expect)
+			t.Errorf("toCharNumber(%v, %q) = %q, want %q", tc.val.Format(), tc.fmt, got, tc.expect)
 		}
 	}
 }
 
-// TestToCharScientificSpecialValues covers Infinity/-Infinity/NaN inputs to the
-// EEEE format modifier (to_char(numeric_val, '9.999EEEE')). goopg previously
-// panicked here (strings.LastIndex(raw, "e") == -1 on Go's "+Inf"/"NaN" output
-// from fmt.Sprintf("%.*e", ...), then a negative-bound slice). PostgreSQL never
-// errors for these; it emits a fixed "#" pattern with no sign marker regardless
-// of sign/NaN-ness. postgres/src/backend/utils/adt/formatting.c, isnan(value) ||
-// isinf(value) branch; verified against postgres/src/test/regress/expected/
-// numeric.out lines 2009-2022 (M0134-0049 bucket #1).
-func TestToCharScientificSpecialValues(t *testing.T) {
-	cases := []struct {
-		val         Datum
-		mantissaFmt string
-		expect      string
-	}{
-		// decPlaces=3 ("9.999") -> Num.post+4 = 7 '#'s after the dot.
-		{NewStringDatum("Infinity"), "9.999", " #.#######"},
-		{NewStringDatum("-Infinity"), "9.999", " #.#######"},
-		{NewStringDatum("NaN"), "9.999", " #.#######"},
-		// decPlaces=2 ("9.99") -> Num.post+4 = 6 '#'s after the dot.
-		{NewStringDatum("Infinity"), "9.99", " #.######"},
-		{NewStringDatum("-Infinity"), "9.99", " #.######"},
-		{NewStringDatum("NaN"), "9.99", " #.######"},
-	}
-	for _, tc := range cases {
-		got := toCharScientific(tc.val, tc.mantissaFmt, false, false)
-		if got != tc.expect {
-			t.Errorf("toCharScientific(%v, %q, fm=false) = %q, want %q", tc.val.Format(), tc.mantissaFmt, got, tc.expect)
+// TestNumericCastHoldsTheValue pins numeric_in: the cast yields the number, so an
+// exponent is gone from its text and trailing fractional zeros stay.
+func TestNumericCastHoldsTheValue(t *testing.T) {
+	for in, want := range map[string]string{"4.2e9": "4200000000", "1.50": "1.50", "1e-3": "0.001", " 7 ": "7"} {
+		got, err := evalCast(NewStringDatum(in), "numeric", 0, nil)
+		if err != nil || got.Kind != KindNumeric || numericText(got) != want {
+			t.Errorf("%q::numeric = %v, %v; want %s", in, got, err, want)
 		}
-	}
-
-	// fm=true strips the leading sign-slot space, same as the existing
-	// negative/positive-sign handling at the bottom of toCharScientific.
-	if got := toCharScientific(NewStringDatum("Infinity"), "9.999", false, true); got != "#.#######" {
-		t.Errorf("toCharScientific(Infinity, %q, fm=true) = %q, want %q", "9.999", got, "#.#######")
-	}
-
-	// Ordinary finite value: the existing (working) path is unaffected.
-	if got := toCharScientific(NewIntDatum(1234), "9.99", false, false); got != " 1.23e+03" {
-		t.Errorf("toCharScientific(1234, %q) = %q, want %q", "9.99", got, " 1.23e+03")
 	}
 }

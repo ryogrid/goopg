@@ -301,7 +301,7 @@ func statsColumnValueText(text string, col catalog.Column, ctx *Context) (string
 			return "", err
 		}
 	}
-	return formatDatumDateStyle(v, ctx), nil
+	return statValueText(v, t, ctx), nil
 }
 
 // statsTypeHasLessThan reports whether a column type has a default btree

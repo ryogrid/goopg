@@ -92,7 +92,7 @@ func TestPgConversionVirtualRows(t *testing.T) {
 	if tbl == nil || tbl.VirtualRows == nil {
 		t.Fatal("pg_conversion virtual table missing")
 	}
-	rows := tbl.VirtualRows()
+	rows := userConversionRows(tbl.VirtualRows())
 	if len(rows) != 1 {
 		t.Fatalf("pg_conversion rows = %d, want 1", len(rows))
 	}
@@ -121,7 +121,7 @@ func TestPgConversionVirtualRows(t *testing.T) {
 	if !c.DropConversion("myconv", "public") {
 		t.Error("DropConversion returned false")
 	}
-	if rows := tbl.VirtualRows(); len(rows) != 0 {
+	if rows := userConversionRows(tbl.VirtualRows()); len(rows) != 0 {
 		t.Errorf("after drop, rows = %d, want 0", len(rows))
 	}
 }
@@ -180,7 +180,7 @@ func TestPgConversionVirtualRowsFuncOID(t *testing.T) {
 		t.Fatalf("CreateConversion: %v", err)
 	}
 	tbl := c.ns(DefaultDBOid).tables["pg_catalog.pg_conversion"]
-	row := tbl.VirtualRows()[0]
+	row := userConversionRows(tbl.VirtualRows())[0]
 	if row[6] != "public.myconv_func" {
 		t.Errorf("conproc = %q, want public.myconv_func (resolved via FuncOID)", row[6])
 	}
@@ -189,7 +189,7 @@ func TestPgConversionVirtualRowsFuncOID(t *testing.T) {
 	if err := c.Routines().RenameRoutine(routine, "myconv_func_renamed"); err != nil {
 		t.Fatalf("RenameRoutine: %v", err)
 	}
-	row = tbl.VirtualRows()[0]
+	row = userConversionRows(tbl.VirtualRows())[0]
 	if row[6] != "public.myconv_func_renamed" {
 		t.Errorf("conproc after rename = %q, want public.myconv_func_renamed", row[6])
 	}
@@ -208,8 +208,21 @@ func TestPgConversionVirtualRowsFuncOID(t *testing.T) {
 	if _, err := c.CreateConversion(uc2, "public"); err != nil {
 		t.Fatalf("CreateConversion: %v", err)
 	}
-	row = tbl.VirtualRows()[0]
+	row = userConversionRows(tbl.VirtualRows())[0]
 	if row[6] != "public.unresolved_func" {
 		t.Errorf("conproc fallback = %q, want public.unresolved_func", row[6])
 	}
+}
+
+// userConversionRows drops the 128 PG 18.3 built-in rows the pg_conversion
+// view leads with (M0149-0001h1a22); these tests inspect user conversions.
+func userConversionRows(rows [][]string) [][]string {
+	if len(rows) < len(seedPgConversionRows) {
+		return rows
+	}
+	return rows[len(seedPgConversionRows):]
+}
+
+func userConversionRowsFor(c *InMemory, dbOid uint32) [][]string {
+	return userConversionRows(c.PGConversionRowsForDBOid(dbOid))
 }
