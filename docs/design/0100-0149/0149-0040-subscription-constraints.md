@@ -41,6 +41,27 @@ the table's row triggers, and the apply worker runs with `session_replication_ro
   at the end of each applied change \(AfterTriggerEndQuery in apply\_handle\_\*\); for a single row the order is the
   same.
 
+## Landed — M0149\-0040b, real WAL positions on a goopg publisher
+
+The logical walsender numbered its 'w' frames with a byte counter started at START\_REPLICATION's position, kept its
+keepalive walEnd on that counter, and never registered in the walsender registry. A goopg publisher therefore had no
+`pg_stat_replication` row, and nothing a subscriber reported could be compared with `pg_current_wal_lsn()`.
+
+`runLogicalWalsender` now behaves as PG's walsender does in logical mode:
+
+- **Registration.** It registers in the walsender registry, which backs `pg_stat_replication`. `sent_lsn` follows
+  sentPtr; write/flush/replay follow the subscriber's 'r' replies \(ProcessStandbyReplyMessage\).
+- **Data frames.** A 'w' frame carries the write location as both dataStart and walEnd \(WalSndPrepareWrite\). goopg
+  decodes a whole transaction at its commit record, so Begin, changes and Commit all carry that record's end. PG
+  gives Begin the transaction's first LSN and each change its own LSN \(deferred\).
+  `SlotDecoder.SetRecordHooks` sets the location before each record and advances sentPtr after it.
+- **Keepalives.** A keepalive carries sentPtr, the end of the last record read. sentPtr starts at the slot's
+  `confirmed_flush_lsn` \(StartLogicalReplication\).
+- **Keepalive timing.** A keepalive goes out as soon as the subscriber's reported write and flush positions are both
+  behind sentPtr and no keepalive awaits a reply \(WalSndWaitForWal\), checked every 200 ms; otherwise every 10 s.
+  An idle subscriber then confirms the WAL end and `wait_for_catchup` passes.
+
 ## Remaining
-- M0149\-0040b: the logical walsender numbers its frames with synthetic byte\-counted LSNs and never registers in the
-  walsender registry, so a goopg publisher has no `pg_stat_replication` row to wait on.
+- M0149\-0040d / 0040e: for an UPDATE of the key, a goopg publisher sends the full old row \('O'\) where PG sends the
+  key \('K'\), and a goopg subscriber matches the old tuple on every column where PG searches the replica identity
+  index. 003's all\-goopg pairing then misses the row whose non\-key column differs locally.

@@ -17,10 +17,11 @@ import (
 // PG 18.3 publisher with a goopg subscriber, and a goopg publisher with a
 // PG 18.3 subscriber.
 //
-// Gated by GOOPG_TAP_003 until it passes (M0149-0040). The PG 18.3
-// publisher with a goopg subscriber passes (M0149-0040a/c); a goopg
-// publisher streams synthetic LSNs and lists no logical walsender in
-// pg_stat_replication (M0149-0040b).
+// Gated by GOOPG_TAP_003 until it passes (M0149-0040). Both pairings with a
+// PG 18.3 node pass (M0149-0040a/b/c). All-goopg fails the last check: a
+// goopg publisher sends the full old row ('O') for an UPDATE of the key, and
+// a goopg subscriber matches it on every column, so the row whose bid the
+// subscriber's trigger kept at 1 is not found (M0149-0040d/e).
 func TestPort_Subscription003Constraints(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")

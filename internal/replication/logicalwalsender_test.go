@@ -53,99 +53,84 @@ func TestParseStartReplicationArgsLogicalRequiresSlot(t *testing.T) {
 	}
 }
 
-// TestWalsenderPgoutputAdapterWrapsAsCopyData pins the wire-
-// format invariant: every Write call from a PgOutput plugin
-// becomes one `'w'` CopyData frame on the wire, with monotonic
-// startLSN/endLSN. The subscriber's LogicalReceiver expects
-// exactly this shape.
+// TestWalsenderPgoutputAdapterWrapsAsCopyData pins the wire format
+// (WalSndPrepareWrite, M0149-0040b): every Write call from a PgOutput
+// plugin becomes one 'w' CopyData frame whose dataStart and walEnd are
+// both the write location — the LSN of the WAL record being decoded — so
+// the subscriber's replies name real WAL positions.
 func TestWalsenderPgoutputAdapterWrapsAsCopyData(t *testing.T) {
 	var buf bytes.Buffer
 	fw := libpq.NewFrameWriter(&buf)
 
-	a := &walsenderPgoutputAdapter{w: fw, nextLSN: 100}
+	a := &walsenderPgoutputAdapter{w: fw}
+	a.setWriteLocation(0x1000)
 	if _, err := a.Write([]byte("first-message")); err != nil {
 		t.Fatal(err)
 	}
+	a.setWriteLocation(0x2000)
 	if _, err := a.Write([]byte("second")); err != nil {
 		t.Fatal(err)
 	}
 
-	// Read the framed bytes back.
 	fr := libpq.NewFrameReader(&buf)
-	f1, err := fr.ReadFrame()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if f1.Type != libpq.MsgCopyData {
-		t.Errorf("frame[0].Type=%q want CopyData", f1.Type)
-	}
-	parsed, kind, err := libpq.DecodeReplicationMessage(f1.Payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if kind != libpq.ReplMsgWALData {
-		t.Errorf("frame[0] inner kind=%q want w", kind)
-	}
-	m1 := parsed.(*libpq.WALDataMessage)
-	if string(m1.WALBytes) != "first-message" {
-		t.Errorf("frame[0] body=%q", m1.WALBytes)
-	}
-	if m1.StartLSN != 100 {
-		t.Errorf("frame[0] StartLSN=%d want 100", m1.StartLSN)
-	}
-	if m1.EndLSN != 100+uint64(len("first-message"))-1 {
-		t.Errorf("frame[0] EndLSN=%d", m1.EndLSN)
-	}
-
-	f2, err := fr.ReadFrame()
-	if err != nil {
-		t.Fatal(err)
-	}
-	parsed2, _, _ := libpq.DecodeReplicationMessage(f2.Payload)
-	m2 := parsed2.(*libpq.WALDataMessage)
-	if m2.StartLSN != m1.EndLSN+1 {
-		t.Errorf("frame[1] StartLSN=%d want %d (monotonic)", m2.StartLSN, m1.EndLSN+1)
-	}
-	if string(m2.WALBytes) != "second" {
-		t.Errorf("frame[1] body=%q", m2.WALBytes)
+	for _, want := range []struct {
+		lsn  uint64
+		body string
+	}{{0x1000, "first-message"}, {0x2000, "second"}} {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f.Type != libpq.MsgCopyData {
+			t.Fatalf("frame Type=%q want CopyData", f.Type)
+		}
+		parsed, kind, err := libpq.DecodeReplicationMessage(f.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if kind != libpq.ReplMsgWALData {
+			t.Fatalf("inner kind=%q want w", kind)
+		}
+		m := parsed.(*libpq.WALDataMessage)
+		if string(m.WALBytes) != want.body || m.StartLSN != want.lsn || m.EndLSN != want.lsn {
+			t.Errorf("frame %q start %#x walEnd %#x, want %q at %#x/%#x", m.WALBytes, m.StartLSN, m.EndLSN, want.body, want.lsn, want.lsn)
+		}
 	}
 }
 
-// TestWalsenderPgoutputAdapterKeepalive pins the rung-9 fix
-// (M0103-0008): the LOGICAL walsender path must emit periodic
-// keepalive frames so PG's apply worker doesn't trip
-// `wal_receiver_timeout` (default 60 s) during quiet periods. The
-// adapter's WriteKeepalive method must wrap the keepalive in the same
-// `'w'`-style CopyData frame the standby's libpqrcv consumes and
-// advertise walEnd = last-emitted synthetic LSN.
+// TestWalsenderPgoutputAdapterKeepalive pins WalSndKeepalive for the
+// LOGICAL walsender (M0103-0008, M0149-0040b): the keepalive's walEnd is
+// sentPtr, the end of the last WAL record read, so an idle subscriber
+// confirms up to the publisher's WAL end. A keepalive is due early while
+// the subscriber's reported write and flush positions are behind sentPtr
+// and none is awaiting a reply (WalSndWaitForWal).
 func TestWalsenderPgoutputAdapterKeepalive(t *testing.T) {
 	var buf bytes.Buffer
 	fw := libpq.NewFrameWriter(&buf)
 
-	a := &walsenderPgoutputAdapter{w: fw, nextLSN: 200}
-	// Ship a regular message first so nextLSN advances.
-	if _, err := a.Write([]byte("data")); err != nil {
-		t.Fatal(err)
+	a := &walsenderPgoutputAdapter{w: fw, sentPtr: 0x100}
+	a.advanceSent(0x500)
+	a.advanceSent(0x300) // never moves back
+	if !a.subscriberBehind() {
+		t.Fatal("subscriber that reported nothing must be behind sentPtr")
 	}
-	wantEnd := uint64(200 + len("data") - 1)
-
 	now := time.Unix(1_700_000_000, 0).UTC()
 	if err := a.WriteKeepalive(now); err != nil {
 		t.Fatal(err)
 	}
-
-	fr := libpq.NewFrameReader(&buf)
-	// Skip the data frame.
-	if _, err := fr.ReadFrame(); err != nil {
-		t.Fatal(err)
+	if a.subscriberBehind() {
+		t.Fatal("no second early keepalive while one awaits its reply")
+	}
+	reply := libpq.EncodeStandbyStatusUpdate(0x500, 0x500, 0x500, now, false)
+	a.noteReply(reply)
+	if a.subscriberBehind() {
+		t.Fatal("a subscriber that confirmed sentPtr is not behind")
 	}
 
+	fr := libpq.NewFrameReader(&buf)
 	kf, err := fr.ReadFrame()
 	if err != nil {
 		t.Fatal(err)
-	}
-	if kf.Type != libpq.MsgCopyData {
-		t.Fatalf("keepalive frame Type=%q want CopyData", kf.Type)
 	}
 	parsed, kind, err := libpq.DecodeReplicationMessage(kf.Payload)
 	if err != nil {
@@ -154,22 +139,18 @@ func TestWalsenderPgoutputAdapterKeepalive(t *testing.T) {
 	if kind != libpq.ReplMsgKeepalive {
 		t.Fatalf("inner kind=%q want k", kind)
 	}
-	k := parsed.(*libpq.KeepaliveMessage)
-	if k.WALEnd != wantEnd {
-		t.Errorf("WALEnd=%d want %d (last-emitted synthetic LSN)", k.WALEnd, wantEnd)
-	}
-	if k.ReplyRequested {
-		t.Errorf("ReplyRequested=true want false (idle keepalive)")
+	if k := parsed.(*libpq.KeepaliveMessage); k.WALEnd != 0x500 {
+		t.Errorf("WALEnd=%#x want 0x500 (sentPtr)", k.WALEnd)
 	}
 }
 
 // TestWalsenderPgoutputAdapterKeepaliveBeforeFirstWrite pins the
-// no-messages-yet behaviour: an adapter with nextLSN=0 must still
-// emit a well-formed keepalive without underflowing walEnd.
+// no-messages-yet behaviour: an adapter that has read nothing must still
+// emit a well-formed keepalive (walEnd = its start position, 0 here).
 func TestWalsenderPgoutputAdapterKeepaliveBeforeFirstWrite(t *testing.T) {
 	var buf bytes.Buffer
 	fw := libpq.NewFrameWriter(&buf)
-	a := &walsenderPgoutputAdapter{w: fw, nextLSN: 0}
+	a := &walsenderPgoutputAdapter{w: fw}
 
 	if err := a.WriteKeepalive(time.Unix(1_700_000_000, 0).UTC()); err != nil {
 		t.Fatal(err)
@@ -535,24 +516,20 @@ func TestWalsenderCatalogDBOidVar(t *testing.T) {
 }
 
 // TestWalsenderPgoutputAdapterEmptyWriteIsDropped pins review/260831-2 CP-4:
-// `endLSN := nextLSN + len(p) - 1` underflows to ~2^64 on a zero-length write,
-// so an empty payload used to put a frame on the wire whose EndLSN was garbage
-// and whose successor's startLSN was reset to 0 — a walEnd the subscriber can
-// never ack past. An empty write must emit nothing and leave nextLSN alone.
+// an empty payload carries nothing and must put no frame on the wire; the
+// next real write still goes out at the write location.
 func TestWalsenderPgoutputAdapterEmptyWriteIsDropped(t *testing.T) {
 	var buf bytes.Buffer
 	fw := libpq.NewFrameWriter(&buf)
 
-	a := &walsenderPgoutputAdapter{w: fw, nextLSN: 100}
+	a := &walsenderPgoutputAdapter{w: fw}
+	a.setWriteLocation(100)
 	n, err := a.Write(nil)
 	if err != nil {
 		t.Fatalf("Write(nil): %v", err)
 	}
 	if n != 0 {
 		t.Errorf("Write(nil) = %d, want 0", n)
-	}
-	if a.nextLSN != 100 {
-		t.Errorf("nextLSN moved to %d on an empty write, want 100", a.nextLSN)
 	}
 	if buf.Len() != 0 {
 		t.Errorf("empty write put %d bytes on the wire, want none", buf.Len())
@@ -572,7 +549,7 @@ func TestWalsenderPgoutputAdapterEmptyWriteIsDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := parsed.(*libpq.WALDataMessage)
-	if m.StartLSN != 100 || m.EndLSN != 102 {
-		t.Errorf("after the empty write: StartLSN=%d EndLSN=%d, want 100/102", m.StartLSN, m.EndLSN)
+	if m.StartLSN != 100 || m.EndLSN != 100 {
+		t.Errorf("after the empty write: StartLSN=%d EndLSN=%d, want 100/100", m.StartLSN, m.EndLSN)
 	}
 }

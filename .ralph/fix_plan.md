@@ -16802,10 +16802,27 @@ verify each at HEAD when the task starts.
   Parent: M0149-0040
   - 003's wait\_for\_catchup on a PG publisher never passed: goopg's logical receiver reported write = flush = apply = its last applied commit LSN, so on a quiet publisher the reply never reached pg\_current\_wal\_lsn\(\) and replay\_lsn stayed empty.
   - 2026\-11\-26 \(done\): LogicalReceiver now tracks last\_received \(a 'w' frame's start and walEnd, a keepalive's walEnd\) and whether a transaction is in progress \(Begin seen, Commit not yet\). The 'r' reply carries write = last received; flush and apply = last received when idle, the last applied commit otherwise \(worker.c send\_feedback / get\_flush\_position\). A keepalive that moved nothing sends no reply unless one is requested. Unit test TestLogicalReceiverFeedbackPositions; the pgoutput interop, replication and pubsubcluster tests pass.
-- [ ] **M0149-0040b — a goopg publisher streams real WAL LSNs and lists logical walsenders in pg\_stat\_replication**
+- [x] **M0149-0040b — a goopg publisher streams real WAL LSNs and lists logical walsenders in pg\_stat\_replication**
   Kind: impl
   Parent: M0149-0040
   - 003 with a goopg publisher: pg\_stat\_replication is empty while tap\_sub's slot is active \(plugin column empty; restart\_lsn / confirmed\_flush\_lsn one byte past the target, 0/10E90B1 vs 0/10E90B0\). runLogicalWalsender \(internal/replication/logicalwalsender.go\) never registers in s.cfg.WalSenders, and walsenderPgoutputAdapter numbers its 'w' frames with synthetic byte\-counted LSNs from START\_REPLICATION's position, with keepalive walEnd likewise synthetic. PG: WalSndWriteData sends each message at the decoded record's LSN, WalSndKeepalive sends the flushed WAL end, and the walsender's row shows the subscriber's write/flush/replay from its 'r' replies.
+  - 2026\-11\-26 \(done\), in runLogicalWalsender \(internal/replication/logicalwalsender.go\):
+    - The walsender registers in the walsender registry, so pg\_stat\_replication shows it. sent\_lsn follows sentPtr; write/flush/replay follow the subscriber's 'r' replies through handleStandbyCopyData with the sender handle.
+    - 'w' frames carry the write location as dataStart and walEnd \(WalSndPrepareWrite\): the end of the WAL record being decoded, set by the new SlotDecoder.SetRecordHooks before each record.
+    - Keepalives carry sentPtr, the end of the last record read; it starts at the slot's confirmed\_flush\_lsn \(StartLogicalReplication\). A keepalive goes out early while the subscriber's write and flush are both behind sentPtr and none awaits a reply \(WalSndWaitForWal\), otherwise every 10 s.
+  - Results: 003 goopg\-publisher\-pg18\-subscriber PASSES end to end; all\-goopg catches up and fails only the last check \(0040d/e\). Unit tests TestWalsenderPgoutputAdapterWrapsAsCopyData and TestWalsenderPgoutputAdapterKeepalive rewritten for the real positions; the pgoutput interop, subscription and pubsubcluster tests pass.
+- [ ] **M0149-0040d — a goopg publisher sends the old key \('K'\), not the full old row, for UPDATE/DELETE under REPLICA IDENTITY DEFAULT/INDEX**
+  Kind: impl
+  Parent: M0149-0040
+  - 003 all\-goopg, last check: UPDATE tab\_fk\_ref SET id = 6 WHERE id = 1 reaches the subscriber with OldTuple 'O' = \(id 1, bid 2, junk\), the publisher's full row. PG's logicalrep\_write\_update/delete write 'K' with only the replica\-identity columns \(the old key heap\_update logs, ExtractReplicaIdentity\) and 'O' only for REPLICA IDENTITY FULL. writeUpdate / writeDelete \(internal/access/transam/xlog/pgoutput.go\) always write 'O'; RelationDef.ReplIdent and ColumnDef.ReplIdent carry what is needed.
+- [ ] **M0149-0040e — a goopg apply worker locates UPDATE/DELETE rows by the local replica identity**
+  Kind: impl
+  Parent: M0149-0040
+  - Same check from the subscriber side: applyUpdate / applyDelete match the old tuple on every non\-null cell \(rowMatchesKey\), so a row whose non\-key column differs locally \(the trigger kept bid = 1\) is not found, and applyUpdateByKey then installs a new row. PG's FindReplTupleInLocalRel searches the local replica identity index \(or primary key\) on its key columns only, uses every column only for REPLICA IDENTITY FULL, and skips a change whose row is missing \(logging "logical replication did not find row to be updated"\). Either 0040d or 0040e unblocks 003; PG behaves as both.
+- [ ] **M0149-0040f — goopg logical slots report LSNs one byte past the record end and an empty plugin**
+  Kind: impl
+  Parent: none \(found while fixing M0149\-0040b; not on 003's path\)
+  - With a goopg publisher, pg\_replication\_slots showed restart\_lsn = confirmed\_flush\_lsn = 0/10E90B1 while pg\_current\_wal\_lsn\(\) was 0/10E90B0, and plugin empty \(PG: pgoutput\). SlotDecoder.Run advances confirmed\_flush to rec.EndLSN\+1, but Record.EndLSN already appears to be the exclusive end \(it equals the writer's position\). Check the reader's EndLSN convention and the plugin column of the slot view.
 - [x] **M0149-0040c — a goopg apply worker fires the table's triggers under session\_replication\_role = replica**
   Kind: impl
   Parent: M0149-0040

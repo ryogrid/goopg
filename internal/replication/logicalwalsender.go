@@ -95,9 +95,19 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 	// Adapter wraps each pgoutput message in a `'w'` CopyData
 	// frame so it lands on the wire in the shape the subscriber's
 	// LogicalReceiver consumes.
+	// sentPtr starts at the slot's confirmed_flush_lsn
+	// (StartLogicalReplication: "sentPtr = MyReplicationSlot->data.confirmed_flush"),
+	// so a keepalive on a quiet publisher already reports where the
+	// subscriber has confirmed up to. M0149-0040b.
+	startSent := args.StartLSN
+	if s.cfg.Slots != nil {
+		if sl, err := s.cfg.Slots.Get(args.SlotName); err == nil && sl.ConfirmedFlushLSN > startSent {
+			startSent = sl.ConfirmedFlushLSN
+		}
+	}
 	adapter := &walsenderPgoutputAdapter{
 		w:       w,
-		nextLSN: args.StartLSN + 1,
+		sentPtr: startSent,
 	}
 	plugin := xlog.NewPgOutput(snap, adapter)
 
@@ -127,6 +137,29 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 		return s.writeStreamingError(w, errcodes.InternalError, err.Error())
 	}
 	defer dec.Close()
+	// Logical decoding's positions (M0149-0040b): a pgoutput message
+	// goes out at the LSN of the record being decoded — goopg decodes a
+	// transaction at its commit record, so its Begin, changes and Commit
+	// all carry that record's end (txn->end_lsn for the Commit) — and
+	// sentPtr follows the end of each record read, which keepalives
+	// report (WalSndKeepalive).
+	dec.SetRecordHooks(func(rec xlog.Record) { adapter.setWriteLocation(rec.EndLSN) },
+		func(rec xlog.Record) { adapter.advanceSent(rec.EndLSN) })
+
+	// The walsender's pg_stat_replication row (WalSndCtl->walsnds):
+	// sent_lsn follows sentPtr, write/flush/replay the subscriber's 'r'
+	// replies (ProcessStandbyReplyMessage). M0149-0040b.
+	var senderHandle *xlog.Sender
+	if s.cfg.WalSenders != nil {
+		senderHandle = s.cfg.WalSenders.Register(xlog.SenderState{
+			SlotName:        args.SlotName,
+			ClientAddr:      walsenderClientAddr(r),
+			SentLSN:         startSent,
+			ApplicationName: appName,
+		})
+		defer s.cfg.WalSenders.Unregister(senderHandle)
+		adapter.sender = senderHandle
+	}
 	// logicalmsg_decode skips a message emitted from another database.
 	dec.SetDatabase(resolveConnDBOid(im, dbName))
 
@@ -155,7 +188,8 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 			}
 			switch f.Type {
 			case libpq.MsgCopyData:
-				_ = s.handleStandbyCopyData(args.SlotName, f.Payload, nil, s.cfg.SyncRep, appName)
+				_ = s.handleStandbyCopyData(args.SlotName, f.Payload, senderHandle, s.cfg.SyncRep, appName)
+				adapter.noteReply(f.Payload)
 			case libpq.MsgCopyDone, libpq.MsgTerminate:
 				streamCancel()
 				return
@@ -174,21 +208,34 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 	// path needs symmetric behaviour. The keepalive's walEnd advertises
 	// the adapter's last-emitted synthetic LSN so the subscriber's
 	// progress reporting matches the byte-stream LSNs it has seen.
+	//
+	// WalSndWaitForWal also sends a keepalive as soon as the subscriber's
+	// reported write and flush positions are behind sentPtr (and no ping
+	// is outstanding), so an idle subscriber learns the WAL end and
+	// confirms it without waiting for the interval. keepaliveCheck is
+	// that check's cadence. M0149-0040b.
 	const keepaliveInterval = 10 * time.Second
+	const keepaliveCheck = 200 * time.Millisecond
 	keepaliveDone := make(chan struct{})
 	go func() {
 		defer close(keepaliveDone)
-		ticker := time.NewTicker(keepaliveInterval)
+		ticker := time.NewTicker(keepaliveCheck)
 		defer ticker.Stop()
+		last := time.Now()
 		for {
 			select {
 			case <-streamCtx.Done():
 				return
 			case <-ticker.C:
-				if err := adapter.WriteKeepalive(time.Now().UTC()); err != nil {
+				now := time.Now()
+				if now.Sub(last) < keepaliveInterval && !adapter.subscriberBehind() {
+					continue
+				}
+				if err := adapter.WriteKeepalive(now.UTC()); err != nil {
 					streamCancel()
 					return
 				}
+				last = now
 			}
 		}
 	}()
@@ -259,31 +306,80 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 // exactly one Write so each Write maps to one pgoutput message
 // — that's what makes the wire framing work.
 //
-// nextLSN tracks the byte position the next WAL-data frame's
-// startLSN reports. The actual WAL position the publisher's WAL
-// writer is at is irrelevant for logical streams; subscribers
-// only care that each pgoutput message has a strictly-increasing
-// LSN so confirmed_flush_lsn advances monotonically.
+// Each frame carries real WAL positions, as PG's do: the LSN of the
+// record being decoded, and keepalives the end of the last record read.
+// A subscriber's replies therefore name WAL positions the publisher can
+// compare with pg_current_wal_lsn() (wait_for_catchup), and they advance
+// the slot's confirmed_flush_lsn to real record boundaries. Before
+// M0149-0040b the frames were numbered by a byte counter started at
+// START_REPLICATION's position.
 type walsenderPgoutputAdapter struct {
-	w       *libpq.FrameWriter
-	mu      sync.Mutex
-	nextLSN uint64
+	w  *libpq.FrameWriter
+	mu sync.Mutex
+	// writeLoc is logical decoding's ctx->write_location: the LSN the
+	// next message goes out at (WalSndPrepareWrite sends it as both
+	// dataStart and walEnd). sentPtr is the end of the last WAL record
+	// read, which keepalives report. M0149-0040b.
+	writeLoc uint64
+	sentPtr  uint64
+	// replyWrite / replyFlush are the subscriber's last 'r' positions;
+	// pingPending is WalSndKeepalive's waiting_for_ping_response.
+	replyWrite, replyFlush uint64
+	pingPending            bool
+	sender                 *xlog.Sender
+}
+
+// setWriteLocation sets the LSN the next pgoutput messages carry.
+func (a *walsenderPgoutputAdapter) setWriteLocation(lsn uint64) {
+	a.mu.Lock()
+	a.writeLoc = lsn
+	a.mu.Unlock()
+}
+
+// advanceSent raises sentPtr to lsn (the end of a record just read).
+func (a *walsenderPgoutputAdapter) advanceSent(lsn uint64) {
+	a.mu.Lock()
+	if lsn > a.sentPtr {
+		a.sentPtr = lsn
+	}
+	sent := a.sentPtr
+	a.mu.Unlock()
+	if a.sender != nil {
+		a.sender.SetSentLSN(sent)
+	}
+}
+
+// noteReply records a standby status update's write and flush
+// positions (ProcessStandbyReplyMessage); any reply answers a ping.
+func (a *walsenderPgoutputAdapter) noteReply(payload []byte) {
+	parsed, kind, err := libpq.DecodeReplicationMessage(payload)
+	if err != nil || kind != libpq.ReplMsgStandbyStatus {
+		return
+	}
+	st := parsed.(*libpq.StandbyStatusUpdate)
+	a.mu.Lock()
+	a.replyWrite, a.replyFlush = st.WriteLSN, st.FlushLSN
+	a.pingPending = false
+	a.mu.Unlock()
+}
+
+// subscriberBehind is WalSndWaitForWal's keepalive condition: the
+// subscriber's reported write and flush positions are both behind
+// sentPtr and no keepalive is awaiting its reply.
+func (a *walsenderPgoutputAdapter) subscriberBehind() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return !a.pingPending && a.replyWrite < a.sentPtr && a.replyFlush < a.sentPtr
 }
 
 func (a *walsenderPgoutputAdapter) Write(p []byte) (int, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if len(p) == 0 {
-		// endLSN below is `nextLSN + len(p) - 1`, which UNDERFLOWS to ~2^64 on
-		// an empty write and would advertise a garbage walEnd the subscriber
-		// can never ack past. An empty payload carries nothing, so drop it.
-		// (review/260831-2 CP-4)
+		// An empty payload carries nothing; drop it. (review/260831-2 CP-4)
 		return 0, nil
 	}
-	startLSN := a.nextLSN
-	endLSN := a.nextLSN + uint64(len(p)) - 1
-	a.nextLSN = endLSN + 1
-	frame := libpq.EncodeWALData(startLSN, endLSN, time.Now().UTC(), p)
+	frame := libpq.EncodeWALData(a.writeLoc, a.writeLoc, time.Now().UTC(), p)
 	if err := a.w.WriteCopyData(frame); err != nil {
 		return 0, fmt.Errorf("walsender pgoutput write: %w", err)
 	}
@@ -296,17 +392,13 @@ func (a *walsenderPgoutputAdapter) Write(p []byte) (int, error) {
 // WriteKeepalive emits a primary-keepalive (`'k'`) frame through the
 // same FrameWriter the pgoutput Write path uses, sharing the adapter's
 // mutex so the bytes never interleave with an in-flight `'w'` frame.
-// walEnd is advertised as the last-emitted synthetic LSN; subscribers
-// use it only as a status anchor (they ack against received-LSN, not
-// walEnd) so a never-advanced value is safe on a quiet publisher.
+// walEnd is sentPtr, the end of the last WAL record read
+// (WalSndKeepalive): an idle subscriber confirms up to it.
 func (a *walsenderPgoutputAdapter) WriteKeepalive(sendTime time.Time) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	walEnd := a.nextLSN
-	if walEnd > 0 {
-		walEnd--
-	}
-	frame := libpq.EncodeKeepalive(walEnd, sendTime, false)
+	a.pingPending = true
+	frame := libpq.EncodeKeepalive(a.sentPtr, sendTime, false)
 	if err := a.w.WriteCopyData(frame); err != nil {
 		return fmt.Errorf("walsender pgoutput keepalive write: %w", err)
 	}

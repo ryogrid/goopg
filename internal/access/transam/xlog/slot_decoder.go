@@ -46,6 +46,18 @@ type SlotDecoder struct {
 	// NewSlotDecoder leaves it zero-valued so existing tests
 	// stay green.
 	Snapshot SlotSnapshot
+
+	// beforeRecord / afterRecord run around each record's Classify.
+	// The logical walsender uses them as logical decoding's
+	// ctx->write_location (the LSN its pgoutput messages carry) and
+	// reader EndRecPtr (its sentPtr). M0149-0040b.
+	beforeRecord, afterRecord func(rec Record)
+}
+
+// SetRecordHooks installs callbacks run before and after each record
+// is classified (either may be nil). Must be called before Run.
+func (s *SlotDecoder) SetRecordHooks(before, after func(rec Record)) {
+	s.beforeRecord, s.afterRecord = before, after
 }
 
 // SetDatabase limits decoded logical messages to the slot's database
@@ -140,8 +152,14 @@ func (s *SlotDecoder) Run(ctx context.Context) error {
 			}
 			return fmt.Errorf("wal: slot %q decoder iterator: %w", s.slotName, err)
 		}
+		if s.beforeRecord != nil {
+			s.beforeRecord(rec)
+		}
 		if err := Classify(s.decoder, rec); err != nil {
 			return fmt.Errorf("wal: slot %q classify: %w", s.slotName, err)
+		}
+		if s.afterRecord != nil {
+			s.afterRecord(rec)
 		}
 		// Advance the slot on commit boundaries. EndLSN is the
 		// last byte of the commit record; resuming the iterator
