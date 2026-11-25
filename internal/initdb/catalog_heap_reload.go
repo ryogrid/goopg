@@ -1833,7 +1833,22 @@ func reloadUserRoutinesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clo
 // reloadUserRoutinesFromHeapForDB scans base/<heapDBOid>/1255 and registers
 // each live user routine in that database (NamespaceDBOid(heapDBOid)).
 func reloadUserRoutinesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
+	return reloadUserRoutinesFromHeapForDBMode(mgr, cat, clog, heapDBOid, false)
+}
+
+// reloadUserRoutinesFromHeapForDBMode is reloadUserRoutinesFromHeapForDB; with
+// replay set it is a running standby's catalog refresh (M0149-0032a): only
+// rows whose xmin committed count, routines already registered are left as
+// they are, a registered user routine of this database whose row is gone
+// (a replayed DROP FUNCTION / DROP SCHEMA CASCADE) is unregistered, and a
+// PostgreSQL primary's pg_proc row — which carries no goopg Routine JSON in
+// proargdefaults — is decoded from its real columns (pgProcRowRoutine).
+func reloadUserRoutinesFromHeapForDBMode(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32, replay bool) error {
 	rs := cat.Routines()
+	if rs == nil {
+		return nil
+	}
+	seen := map[uint32]bool{}
 	type procRow struct {
 		r   *catalog.Routine
 		tid storage.ItemPointer
@@ -1855,7 +1870,13 @@ func reloadUserRoutinesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory
 			body := decoded[25].StringValue() // prosrc
 			r, derr := executor.DecodePGProcArgMeta(meta, body)
 			if derr != nil {
-				return nil, false, derr
+				if !replay {
+					return nil, false, derr
+				}
+				var ok bool
+				if r, ok = pgProcRowRoutine(cat, decoded); !ok {
+					return nil, false, errSkipBuiltinRow
+				}
 			}
 			// B2.2 slice 2: prokind='a' rows are aggregates — they belong to
 			// the userAggregates registry (reloadUserAggregatesFromHeap),
@@ -1864,18 +1885,141 @@ func reloadUserRoutinesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory
 			if r.KindChar == "a" {
 				return nil, false, errSkipBuiltinRow
 			}
-			return procRow{r: r, tid: tid}, false, nil
+			return procRow{r: r, tid: tid}, replay, nil
 		})
 	if err != nil {
 		return err
 	}
+	dbOid := catalog.NamespaceDBOid(heapDBOid)
 	for _, raw := range rows {
 		pr := raw.(procRow)
-		pr.r.DBOid = catalog.NamespaceDBOid(heapDBOid)
+		seen[pr.r.OID] = true
+		if replay && rs.LookupByOID(pr.r.OID) != nil {
+			continue
+		}
+		pr.r.DBOid = dbOid
 		rs.CreateDuringRecovery(pr.r)
 		rs.SetHeapTID(pr.r.OID, catalog.SchemaHeapTID{Block: uint32(pr.tid.Block), Offset: pr.tid.Offset})
 	}
+	if replay {
+		for _, r := range rs.List() {
+			if r.OID >= catalog.FirstUserOID && r.DBOid == dbOid && !seen[r.OID] {
+				rs.DropByOIDDuringRecovery(r.OID)
+			}
+		}
+	}
 	return nil
+}
+
+// parseOIDVector reads an oidvector datum either as its text form ("23 25")
+// or as the raw array image a heap tuple holds (ArrayType: ndim, dataoffset,
+// elemtype, dims[ndim], lbounds[ndim], then the uint32 elements — oidvector
+// has no null bitmap and ndim 1). M0149-0032a.
+func parseOIDVector(v string) ([]uint32, bool) {
+	b := []byte(v)
+	if len(b) >= 12 && binary.LittleEndian.Uint32(b[8:12]) == 26 {
+		ndim := int(binary.LittleEndian.Uint32(b[0:4]))
+		if ndim == 0 {
+			return nil, true
+		}
+		if ndim != 1 || len(b) < 20 {
+			return nil, false
+		}
+		n := int(binary.LittleEndian.Uint32(b[12:16]))
+		data := b[20:]
+		if n < 0 || len(data) < 4*n {
+			return nil, false
+		}
+		out := make([]uint32, n)
+		for i := range out {
+			out[i] = binary.LittleEndian.Uint32(data[4*i:])
+		}
+		return out, true
+	}
+	var out []uint32
+	for _, f := range strings.Fields(v) {
+		oid, err := strconv.ParseUint(f, 10, 32)
+		if err != nil {
+			return nil, false
+		}
+		out = append(out, uint32(oid))
+	}
+	return out, true
+}
+
+// pgProcRowRoutine builds a Routine from a PostgreSQL pg_proc row's columns
+// (PGProcColumnsPG18 order), for routines a PG 18.3 primary created: name,
+// namespace, language, argument and result types by OID, volatility,
+// strictness, kind and the prosrc body. Rows it cannot represent — a
+// prosqlbody (BEGIN ATOMIC / RETURN) body, or a type goopg has no built-in
+// name for — are not registered (ok false). M0149-0032a.
+func pgProcRowRoutine(cat *catalog.InMemory, d executor.Row) (*catalog.Routine, bool) {
+	typeFor := func(oid uint32) (catalog.Type, bool) {
+		if oid >= catalog.FirstUserOID {
+			return catalog.Type{}, false
+		}
+		if oid == 2278 {
+			return catalog.Type{Name: "void"}, true
+		}
+		if name := catalog.OIDToTypeName(oid); name != "text" || oid == catalog.OIDText {
+			return catalog.Type{Name: name}, true
+		}
+		if name, ok := catalog.BuiltinFormatTypeName(oid); ok {
+			return catalog.Type{Name: name}, true
+		}
+		return catalog.Type{}, false
+	}
+	if len(d) < 28 || !d[27].IsNull() { // prosqlbody
+		return nil, false
+	}
+	r := &catalog.Routine{
+		OID:             uint32(d[0].Int),
+		Name:            d[1].StringValue(),
+		Schema:          cat.SchemaNameForOID(uint32(d[2].Int)),
+		KindChar:        d[9].StringValue(),
+		SecurityDefiner: d[10].BoolValue(),
+		Leakproof:       d[11].BoolValue(),
+		Strict:          d[12].BoolValue(),
+		ReturnsSet:      d[13].BoolValue(),
+		Volatile:        d[14].StringValue(),
+		Parallel:        d[15].StringValue(),
+		Body:            d[25].StringValue(),
+	}
+	if r.Schema == "" || r.Name == "" {
+		return nil, false
+	}
+	switch uint32(d[4].Int) { // prolang
+	case 14:
+		r.Language = "sql"
+	case 12:
+		r.Language = "internal"
+	case 13:
+		r.Language = "c"
+	case 13627:
+		r.Language = "plpgsql"
+	default:
+		return nil, false
+	}
+	r.IsProcedure = r.KindChar == "p"
+	r.IsWindow = r.KindChar == "w"
+	ret, ok := typeFor(uint32(d[18].Int))
+	if !ok {
+		return nil, false
+	}
+	r.ReturnType = ret
+	argOIDs, ok := parseOIDVector(d[19].StringValue()) // proargtypes
+	if !ok {
+		return nil, false
+	}
+	for _, oid := range argOIDs {
+		at, ok := typeFor(oid)
+		if !ok {
+			return nil, false
+		}
+		r.ArgTypes = append(r.ArgTypes, at)
+		r.ArgNames = append(r.ArgNames, "")
+	}
+	return r, true
 }
 
 // errSkipBuiltinRow marks reload rows filtered by policy (decode-level skip).
@@ -3804,10 +3948,17 @@ func (r *Runtime) RefreshCatalogAfterReplay(dbOid uint32) error {
 		if err := reloadUserEventTriggersFromHeapMode(r.StorageMgr, cat, clog, true); err != nil {
 			return err
 		}
+		// Routines the primary created or dropped (M0149-0032a).
+		if err := reloadUserRoutinesFromHeapForDBMode(r.StorageMgr, cat, clog, cat.DBOID(), true); err != nil {
+			return err
+		}
 		// Sequences the primary created register here, with their counters
 		// from the replayed pages (M0149-0077a); known ones are left to the
 		// sequence replay hook.
 		return reloadSequencesFromHeapMode(r.StorageMgr, cat, clog, true)
 	}
-	return loadUserTablesFromHeapForDBMode(r.StorageMgr, cat, clog, dbOid, dbOid, true)
+	if err := loadUserTablesFromHeapForDBMode(r.StorageMgr, cat, clog, dbOid, dbOid, true); err != nil {
+		return err
+	}
+	return reloadUserRoutinesFromHeapForDBMode(r.StorageMgr, cat, clog, heapDB, true)
 }

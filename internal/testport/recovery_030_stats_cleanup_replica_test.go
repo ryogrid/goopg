@@ -15,7 +15,12 @@ import (
 // pairings: all-goopg, a PG 18.3 primary with a goopg standby, and a goopg
 // primary with a PG 18.3 standby.
 //
-// Gated by GOOPG_TAP_030=1 until it passes (M0149-0032).
+// Gated by GOOPG_TAP_030=1 until it passes (M0149-0032, skipped as a
+// detour): goopg standbys create no stats for their own queries
+// (M0149-0032e) and do not register schemas the primary creates
+// (M0149-0032d); goopg commit records carry no dropped-stats items
+// (M0149-0032b) and standbys do not execute replayed stats drops
+// (M0149-0032c).
 func TestPort_Recovery030StatsCleanupReplica(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping recovery TAP port in short mode")

@@ -16663,10 +16663,20 @@ verify each at HEAD when the task starts.
   Likely prerequisites \(verify at start\): stats-drop items in xact commit/abort records and their replay \(`pgstat_execute_transactional_drops`\), stats on standby.
   - Path\-to\-TAP: 030 ← \(1\) M0149\-0032a a standby sees functions the primary creates ← \(2\) M0149\-0032b goopg commit records carry the stats\-drop items ← \(3\) M0149\-0032c a goopg standby executes replayed stats drops. 3 links: in scope, work them in order.
   - 2026\-11\-25 \(progress\): TestPort\_Recovery030StatsCleanupReplica written, gated GOOPG\_TAP\_030. First run: both goopg\-standby pairings stop at `'public.drop_func_test1()'::regprocedure` with "function … does not exist" \(link 1\). With a goopg primary, the PG 18.3 standby keeps the relation, function and database stats after every replayed drop \(link 2\). The initial standby stats creation and the restart checks are not reached yet on the goopg\-standby pairings.
-- [ ] **M0149-0032a — a goopg standby's catalog refresh registers routines created on the primary**
+  - 2026\-11\-25 \(skipped as detour after 0032a\): with 0032a landed, the remaining path is 0032d \+ 0032e \+ 0032b \+ 0032c — 4 links > 3. Resume when those are worked.
+- [x] **M0149-0032a — a goopg standby's catalog refresh registers routines created on the primary**
   Kind: impl
   Parent: M0149-0032
   - initdb RefreshCatalogAfterReplay reloads tables, event triggers and sequences, not pg\_proc. Add the routines reload in the committed\-only, only\-new mode \(as reloadSequencesFromHeapMode\). reloadUserRoutinesFromHeapForDB decodes only goopg rows \(Routine JSON in proargdefaults\); a PG 18.3 primary's pg\_proc row needs a decoder from the real columns \(proname, pronamespace, prolang, prorettype, proargtypes, provolatile, prosrc\). A replayed DROP FUNCTION should also unregister the routine.
+  - 2026\-11\-25 \(done\): RefreshCatalogAfterReplay runs reloadUserRoutinesFromHeapForDBMode\(replay\): committed rows only, new routines registered, a registered user routine whose row is gone is dropped. pgProcRowRoutine decodes a PG 18.3 primary's pg\_proc row \(name, namespace, language, types by OID, volatility, strictness, kind, prosrc\); parseOIDVector reads proargtypes' raw oidvector image \(the text parser had turned it into garbage\). Both goopg\-standby pairings now resolve `'public.drop_func_test1()'::regprocedure`. Unit test TestParseOIDVector.
+- [ ] **M0149-0032d — a goopg standby registers schemas the primary creates**
+  Kind: impl
+  Parent: M0149-0032
+  - 030 "schema creation": after a replayed CREATE SCHEMA drop\_schema\_test1 \+ CREATE TABLE in it, `'drop_schema_test1.drop_tab_test1'::regclass` fails on goopg standbys \(both pairings\). RefreshCatalogAfterReplay has no pg\_namespace reload \(ReloadUserDatabaseSchemasFromHeap exists for startup\).
+- [ ] **M0149-0032e — queries on a goopg hot standby create relation and function stats**
+  Kind: impl
+  Parent: M0149-0032
+  - 030 "initial": after `SELECT * FROM t` and `SELECT f()` on a goopg standby, pg\_stat\_have\_stats\('relation'/'function', …\) is f \(PG: t\). Check whether standby sessions record pending stats and flush them to the shared stats \(pgstat\_report\_stat\) with track\_functions = all inherited from the primary's conf.
 - [ ] **M0149-0032b — goopg commit/abort records carry xl\_xact\_stats\_items for dropped objects**
   Kind: impl
   Parent: M0149-0032
