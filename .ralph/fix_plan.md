@@ -16625,6 +16625,20 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/recovery/t/033_replay_tsp_drops.pl` — replay of tablespace/database create/drop incl. missing directories.
   Likely prerequisites \(verify at start\): `XLOG_TBLSPC_*` replay, `allow_in_place_tablespaces`, missing-directory tracking during `CREATE DATABASE` replay with PG log texts. Overlap: SET TABLESPACE copying files without WAL is the M0122-0009b finding \(deferral ledger 2026-10-13; no fix\_plan entry at filing — reference it if filed, else file it here\).
+  - Path\-to\-TAP: 033 missing\-directory ← \(1\) M0149\-0030a database default tablespaces ← \(2\) M0149\-0030b STRATEGY=FILE\_COPY emits XLOG\_DBASE\_CREATE\_FILE\_COPY ← \(3\) M0149\-0030c dbase\_redo creates a missing directory with PG's WARNING. \(1\) is architecture\-sized.
+  - 2026\-11\-25 \(skipped as detour\): TestPort\_Recovery033ReplayTspDrops written, gated GOOPG\_TAP\_033. The FILE\_COPY and WAL\_LOG sub\-tests pass on all three pairings \(the standby restarts after the drops\); missing\-directory fails on all three. With a goopg primary even a PG 18.3 standby never logs it: pg\_waldump shows goopg writes CREATE\_WAL\_LOG "create dir 1663/16386" for `CREATE DATABASE db2 WITH TABLESPACE ts1 STRATEGY=FILE_COPY`, where PG writes CREATE\_FILE\_COPY "copy dir 1663/1 to 16384/16385".
+- [ ] **M0149-0030a — CREATE DATABASE … TABLESPACE / ALTER DATABASE … SET TABLESPACE place the database in the tablespace**
+  Kind: impl
+  Parent: M0149-0030
+  - goopg ignores a database's tablespace: postmaster/database\_ddl.go writes the database under 1663 \(pg\_default\), and relations with no explicit tablespace never route to pg\_tblspc/<dattablespace>/PG\_18\_…/<db>. PG: createdb / movedb \(dbcommands.c\), GetDatabasePath, and a relation's reltablespace 0 meaning MyDatabaseTableSpace.
+- [ ] **M0149-0030b — CREATE DATABASE … STRATEGY=FILE\_COPY copies the template and writes XLOG\_DBASE\_CREATE\_FILE\_COPY**
+  Kind: impl
+  Parent: M0149-0030
+  - goopg always does WAL\_LOG \(CREATE\_WAL\_LOG \+ FPIs\). PG's FILE\_COPY strategy checkpoints, copies the template directory per tablespace and logs xl\_dbase\_create\_file\_copy\_rec \(CreateDatabaseUsingFileCopy\).
+- [ ] **M0149-0030c — dbase\_redo of CREATE\_FILE\_COPY creates a missing tablespace directory like recovery\_create\_dbdir**
+  Kind: impl
+  Parent: M0149-0030
+  - PG \(dbcommands.c recovery\_create\_dbdir\): a missing parent of the destination is created with WARNING "creating missing directory: <path>" once consistent and allow\_in\_place\_tablespaces is on \(PANIC "missing directory" otherwise, DEBUG1 before consistency\); a missing source dir is created empty. This alone fixes 033's PG\-primary pairing.
 - [ ] **M0149-0031 — port recovery/t/031_recovery_conflict.pl**
   Kind: impl
   Parent: none
