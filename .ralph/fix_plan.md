@@ -16642,10 +16642,11 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: M0149-0030
   - goopg always does WAL\_LOG \(CREATE\_WAL\_LOG \+ FPIs\). PG's FILE\_COPY strategy checkpoints, copies the template directory per tablespace and logs xl\_dbase\_create\_file\_copy\_rec \(CreateDatabaseUsingFileCopy\).
-- [ ] **M0149-0030c — dbase\_redo of CREATE\_FILE\_COPY creates a missing tablespace directory like recovery\_create\_dbdir**
+- [x] **M0149-0030c — dbase\_redo of CREATE\_FILE\_COPY creates a missing tablespace directory like recovery\_create\_dbdir**
   Kind: impl
   Parent: M0149-0030
   - PG \(dbcommands.c recovery\_create\_dbdir\): a missing parent of the destination is created with WARNING "creating missing directory: <path>" once consistent and allow\_in\_place\_tablespaces is on \(PANIC "missing directory" otherwise, DEBUG1 before consistency\); a missing source dir is created empty. This alone fixes 033's PG\-primary pairing.
+  - 2026\-11\-25 \(done\): goopg decoded XLOG\_DBASE\_CREATE\_FILE\_COPY as a WAL\_LOG body and only created base/<db> — the wrong place for a tablespace target, and empty, since no source files were copied. New applyDbaseCreateFileCopy \(xlog/dbase\_redo\_file\_copy.go\) follows dbase\_redo's FILE\_COPY arm: it decodes \{db, tablespace, src\_db, src\_tablespace\}, removes an existing target, and creates a missing parent \(only under pg\_tblspc\) and a missing source via recoveryCreateDBDir \(WARNING "creating missing directory: <path>" once consistent with allow\_in\_place\_tablespaces, DEBUG1 before, RecoveryFatalError "missing directory" when consistent without it\). It then copies the source directory's files \(copydir\). The standby supplies consistency and the GUC through xlog.SetDbaseRedoState. Unit test TestDbaseRedoFileCopy. 033's PG\-primary pairing passes all three sub\-tests; the goopg\-primary pairings still need 0030a/0030b.
 - [ ] **M0149-0031 — port recovery/t/031_recovery_conflict.pl**
   Kind: impl
   Parent: none

@@ -18,3 +18,22 @@ missing\-directory ← M0149\-0030a database default tablespaces \(architecture\
 relations with reltablespace 0, template copy into the tablespace, movedb\) ← M0149\-0030b STRATEGY=FILE\_COPY and
 XLOG\_DBASE\_CREATE\_FILE\_COPY ← M0149\-0030c dbase\_redo's recovery\_create\_dbdir. 0030c alone would fix the
 PG\-primary pairing.
+
+## M0149\-0030c — dbase\_redo's FILE\_COPY arm \(landed\)
+
+goopg read XLOG\_DBASE\_CREATE\_FILE\_COPY as a WAL\_LOG body and only created `base/<db>`. A PG primary's FILE\_COPY
+CREATE DATABASE therefore left the goopg standby with an empty database in the wrong place.
+`applyDbaseCreateFileCopy` \(`internal/access/transam/xlog/dbase_redo_file_copy.go`\) follows dbcommands.c:
+
+- It decodes xl\_dbase\_create\_file\_copy\_rec \{db\_id, tablespace\_id, src\_db\_id, src\_tablespace\_id\}.
+- Paths come from `databasePath` \(GetDatabasePath: global, base/<db>, or pg\_tblspc/<spc>/<version dir>/<db>\).
+- An existing target directory is removed first \(WARNING "some useless files may be left behind…" on failure\).
+- `recoveryCreateDBDir` is recovery\_create\_dbdir. A missing parent of the target is accepted only under pg\_tblspc/.
+  Once recovery is consistent it is created with WARNING "creating missing directory: <path>" when
+  allow\_in\_place\_tablespaces is on, and is a fatal "missing directory" when it is off; before consistency it is
+  created with DEBUG1. A missing source is created empty.
+- The source directory's regular files are copied \(copydir without recursion\). Replay writes through the storage
+  manager, so the files are current without a FlushDatabaseBuffers step.
+
+The standby supplies reachedConsistency and the GUC through `xlog.SetDbaseRedoState`. 033's PG\-primary pairing now
+passes all three sub\-tests.

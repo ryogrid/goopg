@@ -242,6 +242,12 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 	}
 	sc.consistentAt, sc.neverConsistent = recoveryConsistencyPoint(rt.DataDir)
 	scRef.Store(sc)
+	// dbase_redo's recovery_create_dbdir decides by reachedConsistency and
+	// allow_in_place_tablespaces (M0149-0030c).
+	xlog.SetDbaseRedoState(&xlog.DbaseRedoState{
+		Consistent:              sc.Consistent,
+		AllowInPlaceTablespaces: func() bool { return boolGUC(registry, "allow_in_place_tablespaces", false) },
+	})
 	// Clear any stale promote signal file left by a previous run before
 	// starting the watcher. Upstream's xlogrecovery.c initialises
 	// the trigger state in StartupXLOG before the replay loop ever

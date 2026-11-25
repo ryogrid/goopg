@@ -2825,7 +2825,16 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 		}
 	case RmgrDbase:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
-		case xlogDbaseCreateWalLog, xlogDbaseCreateFileCopy:
+		case xlogDbaseCreateFileCopy:
+			// dbase_redo's FILE_COPY arm: copy the source database's files
+			// into the target directory (M0149-0030c). Before this the record
+			// was read as a WAL_LOG body: only base/<db> was created, outside
+			// the target tablespace and empty.
+			if err := applyDbaseCreateFileCopy(mgr, xlog.MainData); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogDbaseCreateWalLog:
 			// B4.6 Stage 3: recreate base/<db_id> (idempotent). A real PG
 			// standby's dbase_redo does the same; goopg's own dirs persist
 			// across restart, so this is a defensive MkdirAll for the
