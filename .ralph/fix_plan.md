@@ -16822,10 +16822,15 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: M0149-0040
   - Same check from the subscriber side: applyUpdate / applyDelete match the old tuple on every non\-null cell \(rowMatchesKey\), so a row whose non\-key column differs locally \(the trigger kept bid = 1\) is not found, and applyUpdateByKey then installs a new row. PG's FindReplTupleInLocalRel searches the local replica identity index \(or primary key\) on its key columns only, uses every column only for REPLICA IDENTITY FULL, and skips a change whose row is missing \(logging "logical replication did not find row to be updated"\). Either 0040d or 0040e unblocks 003; PG behaves as both.
-- [ ] **M0149-0040f — goopg logical slots report LSNs one byte past the record end and an empty plugin**
+- [x] **M0149-0040f — goopg logical slots report LSNs one byte past the record end and an empty plugin**
   Kind: impl
   Parent: none \(found while fixing M0149\-0040b; not on 003's path — on 006's path since 2026\-11\-26: a reconnecting apply worker fails with "padding bytes nonzero" reading the slot from confirmed\_flush\)
   - With a goopg publisher, pg\_replication\_slots showed restart\_lsn = confirmed\_flush\_lsn = 0/10E90B1 while pg\_current\_wal\_lsn\(\) was 0/10E90B0, and plugin empty \(PG: pgoutput\). SlotDecoder.Run advances confirmed\_flush to rec.EndLSN\+1, but Record.EndLSN already appears to be the exclusive end \(it equals the writer's position\). Check the reader's EndLSN convention and the plugin column of the slot view.
+  - Path\-to\-TAP: 008 \(goopg\-publisher pairing\) ← M0149\-0040f. One link; also 006's 4th link.
+  - 2026\-11\-26 \(done\): goopg's record positions are 1\-based \(Record.StartLSN = 0\-based offset \+ 1, Record.EndLSN = PG's EndRecPtr\), and a logical slot stored the 1\-based next start \(EndLSN\+1, WrittenLSN\+1 at creation\). The values leave the server as 0\-based PG LSNs, though: consistent\_point, pg\_replication\_slots and the walsender's keepalives. A subscriber's 'r' replies confirm 0\-based positions back into the slot. Once a confirmed 0\-based position passed the slot \(e.g. a keepalive's walEnd\), RestartLSN pointed one byte before the next record, and a reconnecting decoder failed with "invalid record header: padding bytes nonzero".
+    - Fix: a logical slot now holds PG's 0\-based positions — created at WrittenLSN, advanced to the commit's EndLSN — and NewSlotDecoder opens the iterator at RestartLSN\+1. Physical slots are unchanged.
+    - Results: 006's and 008's goopg\-publisher → PG pairings pass; 003 and 007 still 3 pairings PASS; pg\_replication\_slots now shows positions equal to pg\_current\_wal\_lsn. Unit test TestSlotDecoderResumesFromConfirmedPosition; TestSlotDecoderRunDrivesPluginThroughCommit, TestSlotDecoderAdvancesOnPGFormatCommit and TestReplicationCreateLogicalSlotRestartLSNIsNextRecord updated to the 0\-based convention.
+    - Not done: the empty plugin column \(filed in this row's original scope; still open, ledger\).
 - [x] **M0149-0040c — a goopg apply worker fires the table's triggers under session\_replication\_role = replica**
   Kind: impl
   Parent: M0149-0040
@@ -16863,6 +16868,11 @@ verify each at HEAD when the task starts.
   - Path\-to\-TAP: 006 \(goopg\-publisher pairings\) ← M0149\-0041b \(landed\) ← M0149\-0042a table sync from a goopg publisher \(step 1 pg\_get\_replica\_identity\_index landed; step 2 the post\-copy catch\-up stall open\). 3 links.
   - 2026\-11\-26 \(progress\): TestPort\_Subscription006Rewrite written \(three pairings\), gated GOOPG\_TAP\_006. pg18\-publisher\-goopg\-subscriber PASSES. goopg\-publisher\-pg18\-subscriber: test1 reaches 'f' and stops. all\-goopg: the initial sync passes but the slot goes inactive \(pg\_stat\_replication empty\) and the first catch\-up times out.
   - 2026\-11\-26 \(skipped as detour, 4 links\): 0041b, 0042a step 1 \(pg\_get\_replica\_identity\_index\) and 0042a step 2 \(end\-of\-streaming reply\) landed; the goopg\-publisher pairings now fail at the post\-ALTER catch\-up because the reconnecting apply worker reads its slot from one byte past the record end \("wal: invalid record header: padding bytes nonzero"\) — M0149\-0040f, a 4th link. 0040f is now a proven blocker of 006 and of every reconnect after a table sync.
+  - 2026\-11\-26 \(update\): with 0040f, 006's goopg\-publisher → PG pairing passes. all\-goopg: after the goopg subscriber's table sync, its apply worker never resumes streaming \(publisher slot inactive, pg\_stat\_replication empty\) — filed M0149\-0042b.
+- [ ] **M0149-0042b — a goopg subscriber's apply worker resumes streaming after its table sync**
+  Kind: impl
+  Parent: M0149-0042
+  - 006 all\-goopg: the initial sync of test1 completes, then the publisher shows mysub's slot inactive and no walsender; the first catch\-up times out. Check the goopg apply launcher / worker restart after tablesync \(internal/postmaster/subscription\_refresh.go\) and what START\_REPLICATION it sends.
 - [x] **M0149-0042a — a subscriber's table sync from a goopg publisher completes**
   Kind: impl
   Parent: M0149-0042
@@ -16899,6 +16909,12 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/subscription/t/008_diff_schema.pl` — subscriber with a different table schema.
   Likely prerequisites \(verify at start\): attribute mapping by name, extra/missing-column errors with PG texts, Relation-message re-send after publisher ALTER.
+  - Path\-to\-TAP: 008 \(goopg\-publisher pairing\) ← M0149\-0040f \(landed\); 008 \(goopg\-subscriber pairings\) ← M0149\-0044a. One link each.
+  - 2026\-11\-26 \(progress\): TestPort\_Subscription008DiffSchema written \(three pairings\), gated GOOPG\_TAP\_008. goopg\-publisher\-pg18\-subscriber PASSES since 0040f. Both goopg\-subscriber pairings: after the sync test\_tab is empty \(0\|0\|0\), and the next replicated UPDATE installs 2 rows with NULL c/d/e \(no local DEFAULT / identity\), so the subscriber's own UPDATE then fails "null value in column e".
+- [ ] **M0149-0044a — a goopg subscriber's table sync copies into a table with extra local columns**
+  Kind: impl
+  Parent: M0149-0044
+  - 008: the subscriber's test\_tab \(a, b, c timestamptz DEFAULT now\(\), d bigint DEFAULT 999, e int GENERATED BY DEFAULT AS IDENTITY\) stays empty after the sync reports ready. PG's copy\_table copies only the publisher's columns \(COPY test\_tab \(a, b\) FROM the publisher's COPY \(a, b\) TO STDOUT\), so the subscriber's defaults and identity fill the rest. Also: applyUpdateByKey installs a row when the old one is not found, without the local defaults \(PG skips the change and logs "logical replication did not find row to be updated"\).
 - [ ] **M0149-0045 — port subscription/t/009_matviews.pl**
   Kind: impl
   Parent: none

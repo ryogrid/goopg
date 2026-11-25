@@ -17,10 +17,9 @@ import (
 // subscriber.
 //
 // Gated by GOOPG_TAP_006 until it passes (M0149-0042, skipped as a detour):
-// the PG 18.3 publisher with a goopg subscriber passes; with a goopg
-// publisher the table sync completes (M0149-0042a), but a reconnecting apply
-// worker fails reading its slot, whose confirmed position is one byte past
-// the record end ("padding bytes nonzero", M0149-0040f).
+// both pairings with a PG 18.3 node pass (M0149-0042a, M0149-0040f);
+// all-goopg: after the table sync the goopg subscriber's apply worker does
+// not resume streaming (slot inactive, M0149-0042b).
 func TestPort_Subscription006Rewrite(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")

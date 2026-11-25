@@ -85,8 +85,8 @@ func TestSlotDecoderAdvancesOnPGFormatCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ConfirmedFlushLSN != commitEnd+1 {
-		t.Errorf("ConfirmedFlushLSN=%d want %d (PG-format commit EndLSN+1, exclusive resume boundary); pre-fix it stayed at the slot's creation LSN",
-			got.ConfirmedFlushLSN, commitEnd+1)
+	if got.ConfirmedFlushLSN != commitEnd {
+		t.Errorf("ConfirmedFlushLSN=%d want %d (the PG-format commit's EndRecPtr, 0-based like PG; M0149-0040f); pre-fix it stayed at the slot's creation LSN",
+			got.ConfirmedFlushLSN, commitEnd)
 	}
 }

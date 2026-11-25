@@ -431,9 +431,15 @@ func TestReplicationCreateLogicalSlotRestartLSNIsNextRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("slots.Get: %v", err)
 	}
-	want := wrote + 1
+	// M0149-0040f: a logical slot holds PG's 0-based position — the end of
+	// the WAL written so far, where the next record starts — the value a
+	// subscriber later confirms and pg_replication_slots / consistent_point
+	// show. NewSlotDecoder resumes the iterator at its 1-based start
+	// (RestartLSN+1), which keeps the next-record guarantee this test was
+	// written for (TestSlotDecoderResumesFromConfirmedPosition).
+	want := wrote
 	if slot.RestartLSN != want {
-		t.Errorf("slot.RestartLSN = %d, want %d (= WrittenLSN+1, the next-record start LSN)",
+		t.Errorf("slot.RestartLSN = %d, want %d (= WrittenLSN, PG's 0-based next-record start)",
 			slot.RestartLSN, want)
 	}
 }

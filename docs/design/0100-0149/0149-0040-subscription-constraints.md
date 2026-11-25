@@ -77,3 +77,20 @@ identity columns keeps 'O', because PG would refuse to publish the change at all
 - M0149\-0040e \(not needed by 003\): a goopg subscriber matches an old tuple on every non\-null cell, where PG's
   FindReplTupleInLocalRel searches the local replica identity index and skips a change whose row is missing.
 - M0149\-0040f \(nearby\): goopg logical slots report LSNs one byte past the record end and an empty plugin column.
+
+## Landed — M0149\-0040f, 0\-based logical slot positions
+
+goopg's WAL reader numbers records 1\-based: `Record.StartLSN` is the 0\-based offset plus one, and `Record.EndLSN`
+is PG's EndRecPtr \(the 0\-based exclusive end\). A logical slot stored the 1\-based next start \(EndLSN\+1, and
+WrittenLSN\+1 at creation\). But slot positions leave the server as 0\-based PG LSNs:
+
+- CREATE\_REPLICATION\_SLOT's consistent\_point;
+- `pg_replication_slots`;
+- the walsender's keepalives;
+- a subscriber's 'r' replies, which confirm 0\-based positions back into the slot.
+
+Once a confirmed position passed the slot's own \(a keepalive's walEnd, for instance\), RestartLSN pointed one byte
+before the next record. A reconnecting decoder then failed with "invalid record header: padding bytes nonzero".
+
+A logical slot now holds PG's 0\-based positions: it is created at WrittenLSN and advanced to the commit's EndLSN.
+`NewSlotDecoder` opens the record iterator at RestartLSN \+ 1. Physical slots keep their convention.

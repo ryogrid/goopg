@@ -433,6 +433,16 @@ func (s *Handler) replyCreateReplicationSlot(w *libpq.FrameWriter, args string) 
 	var startLSN uint64
 	if s.cfg.WAL != nil {
 		startLSN = s.cfg.WAL.WrittenLSN() + 1
+		// A logical slot keeps PG's 0-based positions (restart_lsn /
+		// confirmed_flush_lsn = the end of the last record, which is
+		// where the next one starts) because they leave the server as
+		// such: consistent_point below, pg_replication_slots, and the
+		// subscriber's replies, which confirm 0-based positions back
+		// into the slot. NewSlotDecoder converts to the iterator's
+		// 1-based start. M0149-0040f.
+		if slotKind == xlog.SlotLogical {
+			startLSN = s.cfg.WAL.WrittenLSN()
+		}
 	}
 	slot, err := s.cfg.Slots.Create(name, slotKind, startLSN)
 	if err != nil {

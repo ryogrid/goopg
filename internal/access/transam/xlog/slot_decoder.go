@@ -85,7 +85,15 @@ func NewSlotDecoder(slots *Slots, slotName string, w *Writer, walDir string, seg
 		return nil, fmt.Errorf("%w: slot %q is %q, want %q",
 			ErrSlotKindMismatch, slotName, slot.Kind, SlotLogical)
 	}
-	it, err := NewRecordIterator(w, walDir, segSize, slot.RestartLSN)
+	// A logical slot's RestartLSN is a 0-based PG LSN — the end of the last
+	// record it covers, i.e. the next record's 0-based start — because a
+	// subscriber confirms 0-based positions into it (M0149-0040f). The
+	// iterator takes the record's 1-based start.
+	start := slot.RestartLSN
+	if start > 0 {
+		start++
+	}
+	it, err := NewRecordIterator(w, walDir, segSize, start)
 	if err != nil {
 		return nil, fmt.Errorf("wal: NewSlotDecoder iterator: %w", err)
 	}
@@ -161,22 +169,17 @@ func (s *SlotDecoder) Run(ctx context.Context) error {
 		if s.afterRecord != nil {
 			s.afterRecord(rec)
 		}
-		// Advance the slot on commit boundaries. EndLSN is the
-		// last byte of the commit record; resuming the iterator
-		// from EndLSN+1 (== the next record's StartLSN) is the
-		// correct restart anchor. Slots.AdvanceConfirmedFlushLSN
-		// rounds up so the on-disk state file always reflects
-		// the most recent acked commit.
+		// Advance the slot on commit boundaries. In PG's 0-based terms
+		// rec.EndLSN is the commit record's EndRecPtr — where the next
+		// record starts — which is what confirmed_flush_lsn holds
+		// (a subscriber confirms the same value after applying the
+		// commit). NewSlotDecoder turns it into the iterator's 1-based
+		// start; storing EndLSN+1 here, as goopg once did, put the slot
+		// one byte past the record end, so a resume from a position a
+		// subscriber had confirmed read a misaligned header ("padding
+		// bytes nonzero"). M0149-0040f.
 		if recordIsXactCommit(rec) {
-			// ConfirmedFlushLSN is an EXCLUSIVE boundary: it is
-			// the LSN the next START_REPLICATION resumes from, so
-			// it must be the first byte AFTER the flushed commit
-			// (rec.EndLSN is inclusive of the record's last byte).
-			// Storing EndLSN itself made a slot restart read its
-			// first record header one byte early — a
-			// "padding bytes nonzero" failure of every relaunched
-			// logical stream after a commit was flushed.
-			if err := s.slots.AdvanceConfirmedFlushLSN(s.slotName, rec.EndLSN+1); err != nil {
+			if err := s.slots.AdvanceConfirmedFlushLSN(s.slotName, rec.EndLSN); err != nil {
 				return fmt.Errorf("wal: slot %q advance confirmed_flush_lsn: %w", s.slotName, err)
 			}
 		}

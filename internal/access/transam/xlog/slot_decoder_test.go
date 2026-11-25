@@ -93,18 +93,16 @@ func TestSlotDecoderRunDrivesPluginThroughCommit(t *testing.T) {
 		t.Errorf("plugin calls=%v want %v", gotCalls, wantCalls)
 	}
 
-	// Slot's ConfirmedFlushLSN advanced to the EXCLUSIVE resume
-	// boundary: the first byte after the commit record's last byte
-	// (EndLSN is inclusive; a stream resuming from ConfirmedFlushLSN
-	// must land on the NEXT record's header, so storing EndLSN
-	// itself restarts one byte early — the padding-bytes decoder
-	// failure on relaunched logical streams).
+	// Slot's ConfirmedFlushLSN advanced to the commit record's
+	// EndRecPtr in PG's 0-based terms (where the next record starts),
+	// the value a subscriber confirms; NewSlotDecoder resumes the
+	// iterator one past it (its 1-based start). M0149-0040f.
 	got, err := slots.Get("logical1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ConfirmedFlushLSN != commitEnd+1 {
-		t.Errorf("ConfirmedFlushLSN=%d want %d (commit EndLSN+1, exclusive resume boundary)", got.ConfirmedFlushLSN, commitEnd+1)
+	if got.ConfirmedFlushLSN != commitEnd {
+		t.Errorf("ConfirmedFlushLSN=%d want %d (commit EndRecPtr, 0-based)", got.ConfirmedFlushLSN, commitEnd)
 	}
 }
 
