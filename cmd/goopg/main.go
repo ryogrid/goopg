@@ -896,7 +896,18 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				// FIRST then logs; OFF logs FIRST then flips — so a crash
 				// never leaves a logged state that disagrees with the flag
 				// for records assembled after it.
+				// UpdateFullPageWrites logs the record only when
+				// XLogStandbyInfoActive() && !RecoveryInProgress(): a server
+				// in recovery (standby.signal or recovery.signal) only flips
+				// the flag. A standby that appended it wrote its own record
+				// into the stream it was about to receive, so the walreceiver
+				// treated the primary's first bytes of that segment as already
+				// present and replay hit a spliced record (M0149-0029b,
+				// 032_relfilenode_reuse runs with full_page_writes = off).
 				payload, err := xlog.EncodeXLogFPWChangePG(want)
+				if !logFPWChange(rt.Standby, rt.DataDir, stringGUC(registry, "wal_level", "replica")) {
+					err = errSkipFPWChangeRecord
+				}
 				if err == nil {
 					appendFirst := !want // OFF: record first, then flip
 					if appendFirst {
@@ -1355,6 +1366,26 @@ func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Ru
 			"apply_lsn", sr.ApplyLSN())
 	}()
 	return sr
+}
+
+// errSkipFPWChangeRecord makes the full_page_writes startup arm flip the
+// flag without logging XLOG_FPW_CHANGE (in recovery, or wal_level minimal).
+var errSkipFPWChangeRecord = errors.New("XLOG_FPW_CHANGE not logged")
+
+// logFPWChange is UpdateFullPageWrites' condition for logging
+// XLOG_FPW_CHANGE: XLogStandbyInfoActive() (wal_level replica or logical)
+// and not RecoveryInProgress() — neither a standby (standby.signal) nor
+// archive recovery (recovery.signal). M0149-0029b.
+func logFPWChange(standby bool, dataDir, walLevel string) bool {
+	if standby || walLevelEnum(walLevel) < walLevelEnum("replica") {
+		return false
+	}
+	if dataDir != "" {
+		if _, err := os.Stat(filepath.Join(dataDir, initdb.RecoverySignalFile)); err == nil {
+			return false
+		}
+	}
+	return true
 }
 
 // boolGUC reads a boolean GUC by name, returning fallback when the

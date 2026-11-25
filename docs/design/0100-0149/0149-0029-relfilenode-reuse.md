@@ -31,3 +31,14 @@ TestPort\_Recovery032RelfilenodeReuse is written and gated \(`GOOPG_TAP_032`\).
 - M0149\-0029b: nonzero XLogRecord padding from a PG primary stops goopg standby replay.
 - `pg_prewarm` 'read' reads through shared buffers, and 'prefetch' only counts blocks. There is no SELECT privilege
   check and no autoprewarm.
+
+## M0149\-0029b — a standby must not write WAL at startup
+
+The filed symptom ("padding bytes nonzero" on a PG primary's WAL) was not a decoding bug: PG zeroes the padding
+\(InitXLogInsert: hdr\_scratch from MemoryContextAllocZero\). A byte comparison of segment 3 showed a 25\-byte
+XLOG\_FPW\_CHANGE record of the standby's own at 0/3000028. goopg's startup logged XLOG\_FPW\_CHANGE whenever
+full\_page\_writes differed from the buffer pool's flag, including on a standby. The walreceiver then trimmed the
+primary's first 0x48 bytes of the segment as already present, splicing the primary's record after the standby's.
+`logFPWChange` now applies UpdateFullPageWrites' condition: log only with wal\_level replica or logical, and only
+outside recovery \(neither standby.signal nor recovery.signal\). 032's PG\-primary pairing now replays; it next fails on
+M0149\-0029c \(pg\_prewarm finds a pg\_class row with no main\-fork file on the standby\).
