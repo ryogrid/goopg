@@ -23,7 +23,7 @@ func TestEncodePgoTuplePhysicalFixedGeoTid(t *testing.T) {
 		{Name: "t", Type: catalog.Type{Name: "tid"}},
 		{Name: "after", Type: catalog.Type{Name: "int4"}},
 	}
-	out, err := encodePgoTuplePhysical(cols, body, []byte{0x07}, 3, nil)
+	out, err := encodePgoTuplePhysical(cols, body, []byte{0x07}, 3, nil, false)
 	if err != nil {
 		t.Fatalf("encodePgoTuplePhysical: %v", err)
 	}

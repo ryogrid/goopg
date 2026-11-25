@@ -307,11 +307,11 @@ func (p *PgOutput) writeDelete(rel *RelationDef, oldTuple []byte) error {
 	buf = append(buf, pgoDelete)
 	buf = appendUint32(buf, rel.OID)
 	if len(oldTuple) > 0 {
-		body, err := encodePgoTuple(rel.Columns, oldTuple, p.snap.RegOut)
+		kind, body, err := encodePgoOldTuple(rel, oldTuple, p.snap.RegOut)
 		if err != nil {
 			return fmt.Errorf("pgoutput: encode delete old-tuple for %q: %w", rel.Name, err)
 		}
-		buf = append(buf, 'O') // full old tuple
+		buf = append(buf, kind)
 		buf = append(buf, body...)
 	} else {
 		// No pre-image available: emit an empty K body so the
@@ -342,11 +342,11 @@ func (p *PgOutput) writeUpdate(rel *RelationDef, oldTuple, newTuple []byte) erro
 	buf = append(buf, pgoUpdate)
 	buf = appendUint32(buf, rel.OID)
 	if len(oldTuple) > 0 {
-		oldBody, err := encodePgoTuple(rel.Columns, oldTuple, p.snap.RegOut)
+		kind, oldBody, err := encodePgoOldTuple(rel, oldTuple, p.snap.RegOut)
 		if err != nil {
 			return fmt.Errorf("pgoutput: encode update old-tuple for %q: %w", rel.Name, err)
 		}
-		buf = append(buf, 'O')
+		buf = append(buf, kind)
 		buf = append(buf, oldBody...)
 	}
 	buf = append(buf, 'N')
@@ -370,13 +370,52 @@ func encodePgoTuple(cols []ColumnDef, raw []byte, regOut func(string, uint32) st
 		return nil, err
 	}
 	natts := int(tup.Header.Infomask2 & storage.HeapNattsMask)
-	return encodePgoTuplePhysical(cols, tup.Data, tup.Bitmap, natts, regOut)
+	return encodePgoTuplePhysical(cols, tup.Data, tup.Bitmap, natts, regOut, false)
+}
+
+// encodePgoOldTuple is the old-tuple half of logicalrep_write_update /
+// logicalrep_write_delete (proto.c): under REPLICA IDENTITY FULL the
+// whole old row goes out as 'O'; otherwise the old key goes out as 'K' —
+// the tuple heap_update / heap_delete log for the replica identity
+// (ExtractReplicaIdentity), whose non-identity columns are NULL. A
+// subscriber locates the row by those key columns alone, so a row whose
+// other columns differ locally is still found. A relation with no
+// identity columns keeps 'O' (PG refuses to publish UPDATE/DELETE there
+// at all). M0149-0040d.
+func encodePgoOldTuple(rel *RelationDef, raw []byte, regOut func(string, uint32) string) (byte, []byte, error) {
+	keyOnly := rel.ReplIdent != 'f'
+	if keyOnly {
+		hasKey := false
+		for _, c := range rel.Columns {
+			if c.ReplIdent {
+				hasKey = true
+				break
+			}
+		}
+		keyOnly = hasKey
+	}
+	tup, err := storage.ParseHeapTuple(raw)
+	if err != nil {
+		return 0, nil, err
+	}
+	natts := int(tup.Header.Infomask2 & storage.HeapNattsMask)
+	body, err := encodePgoTuplePhysical(rel.Columns, tup.Data, tup.Bitmap, natts, regOut, keyOnly)
+	if err != nil {
+		return 0, nil, err
+	}
+	if keyOnly {
+		return 'K', body, nil
+	}
+	return 'O', body, nil
 }
 
 // encodePgoTuplePhysical walks a PG-physical body using the null bitmap and
 // per-type alignment, re-emitting each column as the canonical pgoutput text
 // the subscriber's apply worker parses. M0111-0002.
-func encodePgoTuplePhysical(cols []ColumnDef, body, bitmap []byte, storedNatts int, regOut func(string, uint32) string) ([]byte, error) {
+//
+// keyOnly emits every column outside the replica identity as NULL (the 'K'
+// old-key tuple); the walk still decodes it so later offsets stay right.
+func encodePgoTuplePhysical(cols []ColumnDef, body, bitmap []byte, storedNatts int, regOut func(string, uint32) string, keyOnly bool) ([]byte, error) {
 	out := make([]byte, 0, 2+len(cols)*8)
 	out = appendUint16(out, uint16(len(cols)))
 
@@ -404,6 +443,10 @@ func encodePgoTuplePhysical(cols []ColumnDef, body, bitmap []byte, storedNatts i
 			return nil, fmt.Errorf("col %q: %w", col.Name, derr)
 		}
 		off += n
+		if keyOnly && !col.ReplIdent {
+			out = append(out, pgoColNull)
+			continue
+		}
 		out = append(out, pgoColText)
 		out = appendUint32(out, uint32(len(val)))
 		out = append(out, val...)

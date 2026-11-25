@@ -233,7 +233,7 @@ func TestEncodePgoTuplePhysicalArrayDoesNotShiftFollowingColumn(t *testing.T) {
 		{Name: "a", Type: catalog.Type{Name: "int4", IsArray: true}},
 		{Name: "b", Type: catalog.Type{Name: "int4"}},
 	}
-	out, err := encodePgoTuplePhysical(cols, body, []byte{0x03}, 2, nil)
+	out, err := encodePgoTuplePhysical(cols, body, []byte{0x03}, 2, nil, false)
 	if err != nil {
 		t.Fatalf("encodePgoTuplePhysical: %v", err)
 	}

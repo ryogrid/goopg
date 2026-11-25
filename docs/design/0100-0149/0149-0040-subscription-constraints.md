@@ -1,6 +1,6 @@
 # M0149\-0040 — Port subscription/t/003\_constraints.pl
 
-Status: in progress. TestPort\_Subscription003Constraints is written and gated \(`GOOPG_TAP_003`\). It runs the
+Status: done. TestPort\_Subscription003Constraints is ungated and passes 3 of 3 runs in all three pairings \(M0149\-0040a–d\). It runs the
 upstream script with `tapnode` nodes in three pairings: all\-goopg, PG 18.3 publisher with a goopg subscriber, and
 goopg publisher with a PG 18.3 subscriber. `waitForSubCatchup` is Cluster.pm's `wait_for_catchup(appname)`: the
 publisher's `pg_current_wal_lsn()` is at or below the walsender row's `replay_lsn`.
@@ -61,7 +61,19 @@ keepalive walEnd on that counter, and never registered in the walsender registry
   behind sentPtr and no keepalive awaits a reply \(WalSndWaitForWal\), checked every 200 ms; otherwise every 10 s.
   An idle subscriber then confirms the WAL end and `wait_for_catchup` passes.
 
+## Landed — M0149\-0040d, the old key on a goopg publisher
+
+For an UPDATE of the key, or a DELETE, a goopg publisher sent the whole old row as 'O'. PG's
+`logicalrep_write_update` / `logicalrep_write_delete` send 'O' only under REPLICA IDENTITY FULL. Otherwise they send
+'K' with the old key, the tuple heap\_update / heap\_delete log for the replica identity \(ExtractReplicaIdentity\),
+whose other columns are NULL.
+
+In 003 the subscriber's trigger had kept `bid` at 1 while the publisher's row had 2. The full old row then matched
+nothing on a goopg subscriber, which compares every non\-null cell. `encodePgoOldTuple` now chooses between 'K' and
+'O' as PG does. Its key\-only walk still decodes every column, so later offsets stay right. A relation without
+identity columns keeps 'O', because PG would refuse to publish the change at all.
+
 ## Remaining
-- M0149\-0040d / 0040e: for an UPDATE of the key, a goopg publisher sends the full old row \('O'\) where PG sends the
-  key \('K'\), and a goopg subscriber matches the old tuple on every column where PG searches the replica identity
-  index. 003's all\-goopg pairing then misses the row whose non\-key column differs locally.
+- M0149\-0040e \(not needed by 003\): a goopg subscriber matches an old tuple on every non\-null cell, where PG's
+  FindReplTupleInLocalRel searches the local replica identity index and skips a change whose row is missing.
+- M0149\-0040f \(nearby\): goopg logical slots report LSNs one byte past the record end and an empty plugin column.

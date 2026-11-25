@@ -16790,13 +16790,14 @@ verify each at HEAD when the task starts.
   Upstream: `postgres/src/test/recovery/t/047_checkpoint_physical_slot.pl` — physical slot advanced during a checkpoint keeps a valid `restart_lsn` across a crash.
   Current shortcut \(audit\): `TestPort_Recovery047CheckpointPhysicalSlot` has no injection point, no `pg_replication_slot_advance`, no `advance_wal`, and no crash + restart check that the WAL at `restart_lsn` still exists. `restart_lsn` is only logged, never asserted. The slot is created offline through the Go API, and the upstream `enable_injection_points` / `check_extension` skip gates are absent.
   Likely prerequisites \(verify at start\): `injection_points` \(M0149-0034\) incl. `checkpoint-before-old-wal-removal` \(shared with M0149-0038\), `pg_replication_slot_advance`, slot `restart_lsn` vs old-WAL removal ordering. PG side: mixed runs use the PG 18.3 test-module toolchain \(`tmp/pg183-inj/`\) built by the one-time child under M0149-0034. Inventory row stays `port` until this closes.
-- [ ] **M0149-0040 — port subscription/t/003_constraints.pl**
+- [x] **M0149-0040 — port subscription/t/003_constraints.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/003_constraints.pl` — FKs and triggers on the subscriber.
   Likely prerequisites \(verify at start\): existing ports drive pgoutput in-process; verify the libpq apply path \(`internal/executor/applyworker.go`, `internal/postmaster/subscription_refresh.go`\) covers the test; `session_replication_role=replica` trigger rules, `ENABLE REPLICA/ALWAYS TRIGGER`. Overlap: M0122-0014 \(logical replication / decoding / subscription, open\) — reference it with `Prerequisite: M0122-0014` where its scope covers a gap.
   - Path\-to\-TAP: 003 \(PG publisher → goopg subscriber\) ← M0149\-0040a \(catch\-up\) and ← M0149\-0040c \(replica triggers\); 003 \(goopg publisher pairings\) ← M0149\-0040b. Each chain is one link.
   - 2026\-11\-26 \(progress\): TestPort\_Subscription003Constraints written \(tapnode, three pairings\), gated GOOPG\_TAP\_003. First run: every pairing timed out at the first wait\_for\_catchup. With 0040a, the PG\-publisher pairing catches up and passes the TOAST insert and FK\-ignored checks; its three trigger checks fail \(0040c\).
+  - 2026\-11\-26 \(done, closed by M0149\-0040d\): children 0040a–d landed; TestPort\_Subscription003Constraints is ungated and passes 3/3 in all three pairings; inventory row → port, pass\_required yes. Still open as filed PG\-fidelity items, not needed by 003: 0040e \(subscriber locates rows by the local replica identity\), 0040f \(slot LSN off by one, empty plugin\).
 - [x] **M0149-0040a — a goopg subscriber's status replies follow send\_feedback**
   Kind: impl
   Parent: M0149-0040
@@ -16811,10 +16812,12 @@ verify each at HEAD when the task starts.
     - 'w' frames carry the write location as dataStart and walEnd \(WalSndPrepareWrite\): the end of the WAL record being decoded, set by the new SlotDecoder.SetRecordHooks before each record.
     - Keepalives carry sentPtr, the end of the last record read; it starts at the slot's confirmed\_flush\_lsn \(StartLogicalReplication\). A keepalive goes out early while the subscriber's write and flush are both behind sentPtr and none awaits a reply \(WalSndWaitForWal\), otherwise every 10 s.
   - Results: 003 goopg\-publisher\-pg18\-subscriber PASSES end to end; all\-goopg catches up and fails only the last check \(0040d/e\). Unit tests TestWalsenderPgoutputAdapterWrapsAsCopyData and TestWalsenderPgoutputAdapterKeepalive rewritten for the real positions; the pgoutput interop, subscription and pubsubcluster tests pass.
-- [ ] **M0149-0040d — a goopg publisher sends the old key \('K'\), not the full old row, for UPDATE/DELETE under REPLICA IDENTITY DEFAULT/INDEX**
+- [x] **M0149-0040d — a goopg publisher sends the old key \('K'\), not the full old row, for UPDATE/DELETE under REPLICA IDENTITY DEFAULT/INDEX**
   Kind: impl
   Parent: M0149-0040
   - 003 all\-goopg, last check: UPDATE tab\_fk\_ref SET id = 6 WHERE id = 1 reaches the subscriber with OldTuple 'O' = \(id 1, bid 2, junk\), the publisher's full row. PG's logicalrep\_write\_update/delete write 'K' with only the replica\-identity columns \(the old key heap\_update logs, ExtractReplicaIdentity\) and 'O' only for REPLICA IDENTITY FULL. writeUpdate / writeDelete \(internal/access/transam/xlog/pgoutput.go\) always write 'O'; RelationDef.ReplIdent and ColumnDef.ReplIdent carry what is needed.
+  - 2026\-11\-26 \(done\): writeUpdate / writeDelete go through the new encodePgoOldTuple. REPLICA IDENTITY FULL sends 'O' with every column. Otherwise 'K' goes out with the identity columns valued and every other column NULL \(encodePgoTuplePhysical's keyOnly still decodes each column, so later offsets stay right\). A relation with no identity column keeps 'O' — PG refuses to publish its UPDATE/DELETE at all.
+  - Results: 003 all\-goopg passes; the port is ungated, 3/3 in all three pairings. Unit test TestPgoutputOldKeyTuple \(DEFAULT → K with bid NULL; FULL → O\).
 - [ ] **M0149-0040e — a goopg apply worker locates UPDATE/DELETE rows by the local replica identity**
   Kind: impl
   Parent: M0149-0040
