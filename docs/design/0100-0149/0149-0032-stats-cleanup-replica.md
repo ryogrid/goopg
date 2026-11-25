@@ -39,3 +39,13 @@ so a replayed CREATE DATABASE never refreshed anything. `noteCatalogBlocks` now 
 registered, and databases whose row is gone unregistered. This also closed M0149\-0033b: 048's "pg\_stat\_wal\_receiver
 is empty" was a refused connection to a database created after the backup. 048's PG\-primary → goopg\-standby pairing
 now passes end to end.
+
+## M0149\-0032e — pending stats flush at backend exit \(landed\)
+
+Not standby\-specific: goopg flushed a session's pending relation and function statistics only on
+`pg_stat_force_next_flush()`. A backend that just disconnected left the shared store untouched, and
+pg\_stat\_have\_stats stayed false on primaries too. `executor.FlushSessionStats`, called from the connection
+teardown in `postmaster/server.go`, is pgstat\_shutdown\_hook's flush. The defer is registered so it runs after the
+open\-transaction rollback has folded its staged counts. PG's rate\-limited idle flush \(pgstat\_report\_stat at
+ReadyForQuery\) is not done yet. Effects: 030's creation checks pass on goopg standbys, regress stats 235 → 234, and
+the isolation stats spec still passes.

@@ -1960,6 +1960,16 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 	connTx.BackendPID = pid
 	connTx.NotifySession = sess
 	defer s.notify.RemoveSession(sess)
+	// pgstat_shutdown_hook: the backend's pending statistics are flushed at
+	// exit. Registered early so it runs after the teardown defers below (the
+	// open-transaction rollback folds its staged counts first). M0149-0032e.
+	defer func() {
+		var dbOid uint32
+		if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok && im != nil {
+			dbOid = im.DatabaseOid(connTx.DBName)
+		}
+		executor.FlushSessionStats(sess.UniqueID(), dbOid)
+	}()
 	// Map this connection's transaction-scoped lock identity to its backend PID
 	// so transaction-scoped relation locks (LOCK TABLE / DDL / scan-read ACCESS
 	// SHARE) held on the executor's tableLockMgr surface in pg_locks with a PID

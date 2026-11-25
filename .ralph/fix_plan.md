@@ -16687,10 +16687,15 @@ verify each at HEAD when the task starts.
   Parent: M0149-0032
   - 030 "createdb": after a replayed CREATE DATABASE test, `psql -d test` on the goopg standby fails to connect \(both goopg\-standby pairings\). The standby's catalog does not learn databases from replayed pg\_database \(a shared catalog\) — check RefreshCatalogAfterReplay's dbOid 0 / global path and the database list.
   - 2026\-11\-25 \(done\): pg\_database is shared, so its blocks have DBOid 0 and StreamReplayer.noteCatalogBlocks skipped them. A replayed CREATE/DROP DATABASE refreshed nothing, and the standby rejected connections to the new database. Now a global/1262 block marks key 0, and RefreshCatalogAfterReplay\(0\) runs reloadDatabasesFromHeapMode\(replay\): committed rows only, new databases registered, vanished ones unregistered. Unit test TestNoteCatalogBlocksSharedPgDatabase. 030's createdb step connects; both goopg\-standby pairings now fail only on standby stats \(0032e\).
-- [ ] **M0149-0032e — queries on a goopg hot standby create relation and function stats**
+- [x] **M0149-0032e — queries on a goopg hot standby create relation and function stats**
   Kind: impl
   Parent: M0149-0032
   - 030 "initial": after `SELECT * FROM t` and `SELECT f()` on a goopg standby, pg\_stat\_have\_stats\('relation'/'function', …\) is f \(PG: t\). Check whether standby sessions record pending stats and flush them to the shared stats \(pgstat\_report\_stat\) with track\_functions = all inherited from the primary's conf.
+  - 2026\-11\-25 \(done\): not standby\-specific. goopg flushed a session's pending relation/function stats only on pg\_stat\_force\_next\_flush\(\), so a backend that disconnected left pg\_stat\_have\_stats false on primaries too. New executor.FlushSessionStats, called from the connection\-teardown defer \(postmaster/server.go\), is pgstat\_shutdown\_hook's flush at backend exit. Unit test TestFlushSessionStatsAtExit. 030's creation checks \(initial, schema creation, createdb, pre restart\) now pass on goopg standbys; the drop checks need 0032b/c, and stats across a clean standby restart need 0032c's pgstat\_restore\_stats part. Regress stats 235→234; isolation stats spec still passes.
+- [ ] **M0149-0032g — pg\_stat\_user\_tables seq\_scan / n\_tup\_ins and pg\_stat\_user\_functions calls stay 0 after a flushed session's SELECT / CTAS / function call**
+  Kind: impl
+  Parent: none \(found while fixing M0149\-0032e; not on 030's path\)
+  - After `CREATE TABLE t2 AS SELECT 1`, `SELECT * FROM t2` and `SELECT f1()` \(SQL, track\_functions = all\), each in its own session, pg\_stat\_have\_stats is t but pg\_stat\_user\_tables shows seq\_scan 0, n\_tup\_ins 0 and pg\_stat\_user\_functions has no row \(PG: 1, 1, 1 call\). Check recordRelScan / recordRelInsert call sites for these paths, and SQL\-function call accounting \(funcStats.record is only in plpgsql\_runtime\).
 - [ ] **M0149-0032b — goopg commit/abort records carry xl\_xact\_stats\_items for dropped objects**
   Kind: impl
   Parent: M0149-0032

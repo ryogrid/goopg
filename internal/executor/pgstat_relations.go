@@ -709,3 +709,19 @@ func ResetAnalyzeTriggers(oid uint32) { relStats.resetAnalyzeTriggers(oid) }
 func BumpTriggersForTest(oid uint32, dead, ins, mod int64) {
 	relStats.bumpTriggers(oid, dead, ins, mod)
 }
+
+// FlushSessionStats is pgstat_shutdown_hook's flush at backend exit: a
+// session's pending relation and function statistics reach the shared store
+// when its connection ends, so other sessions see them (pg_stat_user_tables,
+// pg_stat_have_stats). Before this goopg flushed pending stats only on
+// pg_stat_force_next_flush(), and a backend that disconnected without calling
+// it left the shared counters untouched (030_stats_cleanup_replica,
+// M0149-0032e). dbOid is the session's database (pgstat's dboid key).
+func FlushSessionStats(sessionID uint64, dbOid uint32) {
+	if sessionID == 0 {
+		return
+	}
+	funcs := funcStats.flush(sessionID)
+	rels := relStats.flush(sessionID)
+	dbStats.noteFlush(dbOid, rels, funcs)
+}
