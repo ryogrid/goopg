@@ -16610,6 +16610,16 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/recovery/t/032_relfilenode_reuse.pl` — relfilenode reuse after DROP/CREATE DATABASE without corrupting cached buffers.
   Likely prerequisites \(verify at start\): buffer invalidation on DB/relation drop replay, `CREATE DATABASE` both strategies, tablespaces, `background_psql`. Overlap: SET TABLESPACE copying files without WAL is the M0122-0009b finding \(deferral ledger 2026-10-13; no fix\_plan entry at filing — reference it if filed, else file it here\).
+  - Path\-to\-TAP: 032 ← \(A\) PG nodes need pg\_prewarm \(local\_install has no contrib\) ← \(B\) goopg CREATE EXTENSION pg\_prewarm \+ pg\_prewarm\(\) ← \(C\) pg\_relation\_filenode/filepath faithful for views and shared catalogs \(the eviction query prewarms every relation with a filenode\) ← \(D\) M0149\-0029a ← \(E\) M0149\-0029b.
+  - 2026\-11\-25 \(skipped as detour, chain of 5 links > 3\): A–C landed. scripts/build\-pg183\-toolchain.sh builds tmp/pg183\-inj \(PG 18.3 \+ pg\_prewarm, test\_decoding, injection\_points; the toolchain child prescribed under M0149\-0034\); tapnode.NewPGModules / InitFromBackupPGModules / ModulesBinDir. goopg pg\_prewarm\(regclass, mode, fork, first, last\) \(pg\_prewarm.c semantics and messages; extension pg\_prewarm 1.2\). relationStorageForOID consults the seeded pg\_class row for system OIDs: views have no storage \(pg\_relation\_filenode NULL\), shared catalogs live in global/ — alter\_table 672→652. TestPort\_Recovery032RelfilenodeReuse written, gated GOOPG\_TAP\_032. Resume when 0029a and 0029b are fixed.
+- [ ] **M0149-0029a — CREATE DATABASE … TEMPLATE refuses a template holding indexes**
+  Kind: impl
+  Parent: M0149-0029
+  - internal/postmaster/database\_ddl.go: "copying a template database containing indexes, typed tables, or temporary sequences is not yet supported" \(0A000\). 032's conflict\_db\_template has `large(id serial primary key, …)`. PG copies the template's files \(CREATEDB\_WAL\_LOG default, or FILE\_COPY\), indexes included.
+- [ ] **M0149-0029b — a goopg standby rejects PG XLogRecords whose header padding bytes are nonzero**
+  Kind: impl
+  Parent: M0149-0029
+  - internal/access/transam/xlog/xlog\_record.go:242 "invalid record header: padding bytes nonzero \(0x20 0xff\)" stops replay of a PG 18.3 primary's WAL \(032 pg18 pairing, at 0/3000048 right after CREATE DATABASE\). PG never initialises the 2 bytes after xl\_rmid \(XLogRecordAssemble builds the header in hdr\_scratch\) and ValidXLogRecordHeader does not check them. Check reader.go:148/211 notes before relaxing \(the check guards goopg's own frame detection\).
 - [ ] **M0149-0030 — port recovery/t/033_replay_tsp_drops.pl**
   Kind: impl
   Parent: none

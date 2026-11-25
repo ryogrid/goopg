@@ -18170,6 +18170,9 @@ func exprType(e Expr) catalog.Type {
 		case "bt_index_check", "bt_index_parent_check":
 			// amcheck verification functions RETURN void (slice S4 of 0110-0008).
 			return catalog.Type{Name: "void"}
+		case "pg_prewarm":
+			// contrib/pg_prewarm: the number of blocks processed.
+			return catalog.Type{Name: "int8"}
 		case "pg_sleep", "pg_sleep_for", "pg_sleep_until",
 			"pg_advisory_lock", "pg_advisory_lock_shared", "pg_advisory_unlock_all",
 			"pg_advisory_xact_lock", "pg_advisory_xact_lock_shared",

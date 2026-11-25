@@ -149,8 +149,22 @@ func (n *Node) PollQueryUntil(db, query, expected string) bool {
 // initArgs are extra initdb arguments (Cluster.pm's init extra).
 func NewPG(t testing.TB, repo, name string, initArgs ...string) *Node {
 	t.Helper()
+	return newPGAt(t, repo, BinDir(repo), name, initArgs...)
+}
+
+// NewPGModules is NewPG on the PG 18.3 test-module toolchain
+// (ModulesBinDir), for tests whose PG nodes CREATE EXTENSION a contrib or
+// test module that postgres/local_install lacks. M0149-0029.
+func NewPGModules(t testing.TB, repo, name string, initArgs ...string) *Node {
+	t.Helper()
+	return newPGAt(t, repo, ModulesBinDir(t, repo), name, initArgs...)
+}
+
+func newPGAt(t testing.TB, repo, binDir, name string, initArgs ...string) *Node {
+	t.Helper()
 	p, err := pgcluster.New(name, pgcluster.Options{
 		InitDBArgs:          initArgs,
+		BinDir:              binDir,
 		RepoRoot:            repo,
 		DataDir:             filepath.Join(t.TempDir(), name),
 		User:                "postgres",
@@ -163,7 +177,7 @@ func NewPG(t testing.TB, repo, name string, initArgs ...string) *Node {
 	if err != nil {
 		t.Fatalf("tapnode %s: pgcluster.New: %v", name, err)
 	}
-	n := &Node{t: t, name: name, flavor: PG, repo: repo, binDir: BinDir(repo), p: p}
+	n := &Node{t: t, name: name, flavor: PG, repo: repo, binDir: binDir, p: p}
 	t.Cleanup(n.cleanup)
 	return n
 }
@@ -172,12 +186,25 @@ func NewPG(t testing.TB, repo, name string, initArgs ...string) *Node {
 // PG 18.3 node. The backup may come from a goopg or a PG primary.
 func InitFromBackupPG(t testing.TB, repo, name string, root *Node, backupPath string, hasStreaming bool) *Node {
 	t.Helper()
+	return initFromBackupPGAt(t, repo, BinDir(repo), name, root, backupPath, hasStreaming)
+}
+
+// InitFromBackupPGModules is InitFromBackupPG on the PG 18.3 test-module
+// toolchain (ModulesBinDir). M0149-0029.
+func InitFromBackupPGModules(t testing.TB, repo, name string, root *Node, backupPath string, hasStreaming bool) *Node {
+	t.Helper()
+	return initFromBackupPGAt(t, repo, ModulesBinDir(t, repo), name, root, backupPath, hasStreaming)
+}
+
+func initFromBackupPGAt(t testing.TB, repo, binDir, name string, root *Node, backupPath string, hasStreaming bool) *Node {
+	t.Helper()
 	dataDir := filepath.Join(t.TempDir(), name)
 	if out, err := exec.Command("cp", "-a", backupPath, dataDir).CombinedOutput(); err != nil {
 		t.Fatalf("tapnode %s: copy backup %s: %v\n%s", name, backupPath, err, out)
 	}
 	_ = os.Chmod(dataDir, 0o700)
 	p, err := pgcluster.OpenExisting(name, pgcluster.Options{
+		BinDir:      binDir,
 		RepoRoot:    repo,
 		DataDir:     dataDir,
 		User:        "postgres",
@@ -186,7 +213,7 @@ func InitFromBackupPG(t testing.TB, repo, name string, root *Node, backupPath st
 	if err != nil {
 		t.Fatalf("tapnode %s: pgcluster.OpenExisting: %v", name, err)
 	}
-	n := &Node{t: t, name: name, flavor: PG, repo: repo, binDir: BinDir(repo), p: p}
+	n := &Node{t: t, name: name, flavor: PG, repo: repo, binDir: binDir, p: p}
 	t.Cleanup(n.cleanup)
 	if hasStreaming {
 		n.AppendConf("primary_conninfo='" + root.connstr() + "'")

@@ -7395,6 +7395,22 @@ func relationStorageForOID(cat *catalog.InMemory, oid uint32) (storage.RelFileNo
 	if oid == 0 { // InvalidOid has no pg_class row
 		return storage.RelFileNode{}, false
 	}
+	// A system relation's seeded pg_class row is the authority on its
+	// storage: goopg's catalog models system views and shared catalogs as
+	// ordinary tables of the current database, so they reported a
+	// base/<db>/<oid> file that does not exist — a view has no storage
+	// (RELKIND_HAS_STORAGE), and a shared catalog lives in global/
+	// (relpathbackend with GLOBALTABLESPACE_OID). M0149-0029.
+	if oid < catalog.FirstUserOID {
+		if fn, relkind, shared, ok := catalog.SeedRelationStorage(oid); ok {
+			if !catalog.RelkindHasStorage(relkind) {
+				return storage.RelFileNode{}, false
+			}
+			if shared {
+				return storage.RelFileNode{DBOid: 0, RelOid: fn}, true
+			}
+		}
+	}
 	if tbl, ok := cat.LookupTableByOID(oid); ok {
 		if !catalog.RelkindHasStorage(catalog.TableRelkind(tbl)) {
 			return storage.RelFileNode{}, false
@@ -14433,6 +14449,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 
 	case "pg_relation_filenode":
 		return evalPgRelationFilenode(x, slot, ctx)
+
+	case "pg_prewarm":
+		// contrib/pg_prewarm (M0149-0029).
+		return evalPgPrewarm(x, slot, ctx)
 
 	case "pg_relation_filepath":
 		return evalPgRelationFilepath(x, slot, ctx)

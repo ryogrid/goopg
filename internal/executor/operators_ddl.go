@@ -323,7 +323,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 // implements; CREATE EXTENSION of any other name errors as if the control
 // file were missing, mirroring PG. M0110-0003.
 var knownExtensions = map[string]string{
-	"amcheck": "1.4", // PG 18 contrib/amcheck default version
+	"amcheck":    "1.4", // PG 18 contrib/amcheck default version
+	"pg_prewarm": "1.2", // contrib/pg_prewarm (pg_prewarm function only; M0149-0029)
 }
 
 // execCreateExtension handles CREATE EXTENSION by inserting a pg_extension

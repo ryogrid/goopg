@@ -73,6 +73,21 @@ func Available(t testing.TB, repo string) {
 // BinDir is the PG 18.3 bin directory under repo.
 func BinDir(repo string) string { return filepath.Join(repo, "postgres", "local_install", "bin") }
 
+// ModulesBinDir is the bin directory of the PG 18.3 test-module toolchain,
+// tmp/pg183-inj: PG 18.3 built from the same source as postgres/local_install
+// with pg_prewarm, test_decoding and injection_points installed
+// (scripts/build-pg183-toolchain.sh). A missing toolchain fails the test with
+// the command that builds it — the TAP port needs those modules on its PG
+// nodes, so skipping would hide the pairing. M0149-0029.
+func ModulesBinDir(t testing.TB, repo string) string {
+	t.Helper()
+	bin := filepath.Join(repo, "tmp", "pg183-inj", "bin")
+	if _, err := os.Stat(filepath.Join(bin, "postgres")); err != nil {
+		t.Fatalf("tapnode: the PG 18.3 test-module toolchain is missing (%v); build it with scripts/build-pg183-toolchain.sh", err)
+	}
+	return bin
+}
+
 // NewGoopg is Cluster.pm's new() + init() for a goopg node. The cluster is
 // durable (synchronous initdb and fsync on), because ported recovery tests
 // assert the durable path itself (test-gate-speedups/02 §4). It is stopped
