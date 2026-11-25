@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -179,6 +180,13 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 	defer streamCancel()
 
 	receiveDone := make(chan struct{})
+	// clientCopyDone: the subscriber ended the stream itself (CopyDone) —
+	// a table-sync worker that caught up, an apply worker restarting. The
+	// walsender then answers with its own CopyDone and CommandComplete
+	// "COPY 0" (ProcessRepliesIfAny / StartLogicalReplication), and the
+	// connection returns to command mode; walrcv_endstreaming waits for
+	// both. M0149-0042a.
+	var clientCopyDone atomic.Bool
 	go func() {
 		defer close(receiveDone)
 		for {
@@ -190,7 +198,12 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 			case libpq.MsgCopyData:
 				_ = s.handleStandbyCopyData(args.SlotName, f.Payload, senderHandle, s.cfg.SyncRep, appName)
 				adapter.noteReply(f.Payload)
-			case libpq.MsgCopyDone, libpq.MsgTerminate:
+			case libpq.MsgCopyDone:
+				clientCopyDone.Store(true)
+				adapter.stopSending()
+				streamCancel()
+				return
+			case libpq.MsgTerminate:
 				streamCancel()
 				return
 			}
@@ -198,7 +211,12 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 	}()
 
 	runErr := make(chan error, 1)
-	go func() { runErr <- dec.Run(streamCtx) }()
+	runErrDone := make(chan struct{})
+	go func() {
+		err := dec.Run(streamCtx)
+		close(runErrDone)
+		runErr <- err
+	}()
 
 	// Periodic keepalive emission. Without it, PG's apply worker
 	// terminates the connection after `wal_receiver_timeout` (default
@@ -240,6 +258,14 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 		}
 	}()
 
+	// endStreaming answers the subscriber's CopyDone once the decoder and
+	// keepalive goroutines have stopped writing.
+	endStreaming := func() error {
+		<-runErrDone
+		<-keepaliveDone
+		return adapter.endStreaming()
+	}
+
 	select {
 	case <-streamCtx.Done():
 		// Session-level teardown (apply-worker stop during ALTER
@@ -258,6 +284,9 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 		slog.Debug("logical walsender: stream ctx done",
 			"slot", args.SlotName, "ctxErr", streamCtx.Err())
 		streamCancel()
+		if clientCopyDone.Load() {
+			return endStreaming()
+		}
 		return nil
 	case <-receiveDone:
 		// The client vanished (FIN/RST surfaced as a ReadFrame
@@ -274,6 +303,9 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 		// launcher poll. The physical replyStartReplication
 		// select already carries the symmetric arm.
 		streamCancel()
+		if clientCopyDone.Load() {
+			return endStreaming()
+		}
 		<-runErr
 		<-keepaliveDone
 		return nil
@@ -285,6 +317,9 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 		streamCancel()
 		<-keepaliveDone
 		if errors.Is(err, context.Canceled) || errors.Is(err, xlog.ErrClosed) {
+			if clientCopyDone.Load() {
+				return adapter.endStreaming()
+			}
 			return nil
 		}
 		// A real decode failure must reach the client (PG sends an
@@ -327,6 +362,19 @@ type walsenderPgoutputAdapter struct {
 	replyWrite, replyFlush uint64
 	pingPending            bool
 	sender                 *xlog.Sender
+	// doneSending is WalSndCtl's streamingDoneSending: once the
+	// subscriber's CopyDone is read, no further 'w' or 'k' frame goes
+	// out, so the walsender's CopyDone directly follows the stream the
+	// subscriber saw. M0149-0042a.
+	doneSending bool
+}
+
+// stopSending marks the stream finished: later Write and WriteKeepalive
+// calls send nothing.
+func (a *walsenderPgoutputAdapter) stopSending() {
+	a.mu.Lock()
+	a.doneSending = true
+	a.mu.Unlock()
 }
 
 // setWriteLocation sets the LSN the next pgoutput messages carry.
@@ -375,9 +423,10 @@ func (a *walsenderPgoutputAdapter) subscriberBehind() bool {
 func (a *walsenderPgoutputAdapter) Write(p []byte) (int, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if len(p) == 0 {
+	if len(p) == 0 || a.doneSending {
 		// An empty payload carries nothing; drop it. (review/260831-2 CP-4)
-		return 0, nil
+		// After the subscriber's CopyDone nothing more is streamed.
+		return len(p), nil
 	}
 	frame := libpq.EncodeWALData(a.writeLoc, a.writeLoc, time.Now().UTC(), p)
 	if err := a.w.WriteCopyData(frame); err != nil {
@@ -389,6 +438,27 @@ func (a *walsenderPgoutputAdapter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// endStreaming is the walsender's half of ending COPY BOTH after the
+// subscriber's CopyDone: CopyDone, CommandComplete "COPY 0"
+// (StartLogicalReplication's EndCommand), a second CommandComplete
+// "START_REPLICATION" (exec_replication_command: "dupe, but necessary per
+// libpqrcv_endstreaming", whose PQendcopy consumes the first) and
+// ReadyForQuery, so the connection takes commands again.
+func (a *walsenderPgoutputAdapter) endStreaming() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.w.WriteCopyDone(); err != nil {
+		return err
+	}
+	if err := a.w.WriteCommandComplete("COPY 0"); err != nil {
+		return err
+	}
+	if err := a.w.WriteCommandComplete("START_REPLICATION"); err != nil {
+		return err
+	}
+	return a.w.ReadyForQuery()
+}
+
 // WriteKeepalive emits a primary-keepalive (`'k'`) frame through the
 // same FrameWriter the pgoutput Write path uses, sharing the adapter's
 // mutex so the bytes never interleave with an in-flight `'w'` frame.
@@ -397,6 +467,9 @@ func (a *walsenderPgoutputAdapter) Write(p []byte) (int, error) {
 func (a *walsenderPgoutputAdapter) WriteKeepalive(sendTime time.Time) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.doneSending {
+		return nil
+	}
 	a.pingPending = true
 	frame := libpq.EncodeKeepalive(a.sentPtr, sendTime, false)
 	if err := a.w.WriteCopyData(frame); err != nil {

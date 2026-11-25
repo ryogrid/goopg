@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -551,5 +552,48 @@ func TestWalsenderPgoutputAdapterEmptyWriteIsDropped(t *testing.T) {
 	m := parsed.(*libpq.WALDataMessage)
 	if m.StartLSN != 100 || m.EndLSN != 100 {
 		t.Errorf("after the empty write: StartLSN=%d EndLSN=%d, want 100/100", m.StartLSN, m.EndLSN)
+	}
+}
+
+// TestWalsenderPgoutputAdapterEndStreaming pins the end of a logical stream
+// the subscriber closed (M0149-0042a): after the subscriber's CopyDone no
+// further 'w' or 'k' frame goes out, and the walsender answers with
+// CopyDone, CommandComplete "COPY 0" (StartLogicalReplication), a second
+// CommandComplete "START_REPLICATION" (exec_replication_command's dupe,
+// which libpqrcv_endstreaming reads after PQendcopy consumed the first) and
+// ReadyForQuery. A table-sync worker that caught up ends its stream this way
+// and stalled in state 'f' without the reply.
+func TestWalsenderPgoutputAdapterEndStreaming(t *testing.T) {
+	var buf bytes.Buffer
+	fw := libpq.NewFrameWriter(&buf)
+	a := &walsenderPgoutputAdapter{w: fw}
+	a.stopSending()
+	if _, err := a.Write([]byte("late")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.WriteKeepalive(time.Unix(1_700_000_000, 0).UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.endStreaming(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	fr := libpq.NewFrameReader(&buf)
+	var got []string
+	for {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			break
+		}
+		got = append(got, string(f.Type))
+		if f.Type == libpq.MsgCommandComplete {
+			got[len(got)-1] += ":" + strings.TrimRight(string(f.Payload), "\x00")
+		}
+	}
+	want := []string{"c", "C:COPY 0", "C:START_REPLICATION", "Z"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("frames %v, want %v (no data after the subscriber's CopyDone)", got, want)
 	}
 }

@@ -2,6 +2,7 @@ package testport
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/testutil/tapnode"
@@ -15,10 +16,11 @@ import (
 // publisher with a goopg subscriber, and a goopg publisher with a PG 18.3
 // subscriber.
 //
-// Gated by GOOPG_TAP_006 until it passes (M0149-0042): the PG 18.3 publisher
-// with a goopg subscriber passes; with a goopg publisher, a PG subscriber's
-// table sync stalls in state 'f' after the copy and a goopg subscriber's
-// slot goes inactive after the sync (M0149-0042a).
+// Gated by GOOPG_TAP_006 until it passes (M0149-0042, skipped as a detour):
+// the PG 18.3 publisher with a goopg subscriber passes; with a goopg
+// publisher the table sync completes (M0149-0042a), but a reconnecting apply
+// worker fails reading its slot, whose confirmed position is one byte past
+// the record end ("padding bytes nonzero", M0149-0040f).
 func TestPort_Subscription006Rewrite(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")
@@ -57,6 +59,18 @@ func runSubscriptionRewrite(t *testing.T, nodePublisher, nodeSubscriber *tapnode
 	}
 	nodePublisher.Start()
 	nodeSubscriber.Start()
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		for _, n := range []*tapnode.Node{nodeSubscriber, nodePublisher} {
+			for _, l := range strings.Split(fileTail(n.LogPath(), 2000), "\n") {
+				if strings.Contains(l, "ERROR") || strings.Contains(l, "FATAL") || strings.Contains(l, "level=ERROR") || strings.Contains(l, "level=WARN") {
+					t.Log(n.Name() + " log| " + l)
+				}
+			}
+		}
+	})
 
 	const ddl = "CREATE TABLE test1 (a int, b text);"
 	nodePublisher.SafePSQL("postgres", ddl)

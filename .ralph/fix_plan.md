@@ -16824,7 +16824,7 @@ verify each at HEAD when the task starts.
   - Same check from the subscriber side: applyUpdate / applyDelete match the old tuple on every non\-null cell \(rowMatchesKey\), so a row whose non\-key column differs locally \(the trigger kept bid = 1\) is not found, and applyUpdateByKey then installs a new row. PG's FindReplTupleInLocalRel searches the local replica identity index \(or primary key\) on its key columns only, uses every column only for REPLICA IDENTITY FULL, and skips a change whose row is missing \(logging "logical replication did not find row to be updated"\). Either 0040d or 0040e unblocks 003; PG behaves as both.
 - [ ] **M0149-0040f — goopg logical slots report LSNs one byte past the record end and an empty plugin**
   Kind: impl
-  Parent: none \(found while fixing M0149\-0040b; not on 003's path\)
+  Parent: none \(found while fixing M0149\-0040b; not on 003's path — on 006's path since 2026\-11\-26: a reconnecting apply worker fails with "padding bytes nonzero" reading the slot from confirmed\_flush\)
   - With a goopg publisher, pg\_replication\_slots showed restart\_lsn = confirmed\_flush\_lsn = 0/10E90B1 while pg\_current\_wal\_lsn\(\) was 0/10E90B0, and plugin empty \(PG: pgoutput\). SlotDecoder.Run advances confirmed\_flush to rec.EndLSN\+1, but Record.EndLSN already appears to be the exclusive end \(it equals the writer's position\). Check the reader's EndLSN convention and the plugin column of the slot view.
 - [x] **M0149-0040c — a goopg apply worker fires the table's triggers under session\_replication\_role = replica**
   Kind: impl
@@ -16862,12 +16862,17 @@ verify each at HEAD when the task starts.
   Likely prerequisites \(verify at start\): decoding DML after a table rewrite \(new relfilenode, `RelidByRelfilenumber`, rewrite mappings\).
   - Path\-to\-TAP: 006 \(goopg\-publisher pairings\) ← M0149\-0041b \(landed\) ← M0149\-0042a table sync from a goopg publisher \(step 1 pg\_get\_replica\_identity\_index landed; step 2 the post\-copy catch\-up stall open\). 3 links.
   - 2026\-11\-26 \(progress\): TestPort\_Subscription006Rewrite written \(three pairings\), gated GOOPG\_TAP\_006. pg18\-publisher\-goopg\-subscriber PASSES. goopg\-publisher\-pg18\-subscriber: test1 reaches 'f' and stops. all\-goopg: the initial sync passes but the slot goes inactive \(pg\_stat\_replication empty\) and the first catch\-up times out.
-- [ ] **M0149-0042a — a subscriber's table sync from a goopg publisher completes**
+  - 2026\-11\-26 \(skipped as detour, 4 links\): 0041b, 0042a step 1 \(pg\_get\_replica\_identity\_index\) and 0042a step 2 \(end\-of\-streaming reply\) landed; the goopg\-publisher pairings now fail at the post\-ALTER catch\-up because the reconnecting apply worker reads its slot from one byte past the record end \("wal: invalid record header: padding bytes nonzero"\) — M0149\-0040f, a 4th link. 0040f is now a proven blocker of 006 and of every reconnect after a table sync.
+- [x] **M0149-0042a — a subscriber's table sync from a goopg publisher completes**
   Kind: impl
   Parent: M0149-0042
   - PG subscriber: fetch\_remote\_table\_info failed with "function pg\_get\_replica\_identity\_index does not exist". 2026\-11\-26 \(step 1 done\): evalPgGetReplicaIdentityIndex \(RelationGetReplicaIndex: the primary key under DEFAULT, the USING INDEX index, NULL under FULL / NOTHING / no key; return type regclass\). Unit test TestPgGetReplicaIdentityIndex.
   - Open: the PG table\-sync worker then copies test1 and sets 'f', but never reports finishing \(no error logged\) — check the goopg walsender for the tablesync slot \(CREATE\_REPLICATION\_SLOT … LOGICAL pgoutput \(SNAPSHOT 'use'\) inside the copy transaction, then START\_REPLICATION from it\) and what keepalive / sentPtr the sync worker sees against the apply worker's relstate\_lsn \(process\_syncing\_tables\_for\_sync\). all\-goopg: after the goopg subscriber's sync, the slot is inactive — check the goopg apply worker's restart after tablesync.
 
+  - 2026\-11\-26 \(step 2 done\): the stall was the end of the sync worker's stream. After catching up it sends a status update and CopyDone \(walrcv\_endstreaming\), then waits for the walsender's CopyDone, CommandComplete "COPY 0", a second CommandComplete "START\_REPLICATION" \(exec\_replication\_command: "dupe, but necessary per libpqrcv\_endstreaming", because its PQendcopy consumes the first\) and ReadyForQuery. goopg's logical walsender just returned.
+    - It now answers exactly that \(walsenderPgoutputAdapter.endStreaming\), once the decoder and keepalive goroutines have stopped.
+    - After the subscriber's CopyDone it sends no further 'w' or 'k' frame \(stopSending, PG's streamingDoneSending\).
+  - Results: with a goopg publisher the PG subscriber's table sync completes \(test1 reaches r\). Unit test TestWalsenderPgoutputAdapterEndStreaming; the interop, subscription and pubsubcluster tests pass.
 - [ ] **M0149-0043 — port subscription/t/007_ddl.pl**
   Kind: impl
   Parent: none

@@ -15,9 +15,9 @@ import (
 // subscriber, and a goopg publisher with a PG 18.3 subscriber.
 //
 // Gated by GOOPG_TAP_005 until it passes (M0149-0041, skipped as a detour):
-// a goopg database is always UTF8 whatever goopg init -E names (M0149-0041a),
-// and a PG subscriber's table sync from a goopg publisher stalls after the
-// copy (M0149-0042a).
+// a goopg database is always UTF8 whatever goopg init -E names
+// (M0149-0041a); with a goopg publisher a reconnecting apply worker fails on
+// its slot's off-by-one position (M0149-0040f).
 func TestPort_Subscription005Encoding(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")
@@ -66,6 +66,17 @@ func waitForSubscriptionSync(t *testing.T, subscriber, publisher *tapnode.Node, 
 		}
 		if len(errs) > 8 {
 			errs = errs[len(errs)-8:]
+		}
+		ps, _, _ := publisher.PSQLExit("postgres", "SELECT application_name, state, sent_lsn, write_lsn, flush_lsn, replay_lsn FROM pg_stat_replication")
+		sl, _, _ := publisher.PSQLExit("postgres", "SELECT slot_name, active, restart_lsn, confirmed_flush_lsn FROM pg_replication_slots")
+		cur, _, _ := publisher.PSQLExit("postgres", "SELECT pg_current_wal_lsn()")
+		ss, _, _ := subscriber.PSQLExit("postgres", "SELECT relid, received_lsn, latest_end_lsn, last_msg_receipt_time FROM pg_stat_subscription")
+		t.Logf("replication state| cur=%q stat_replication=%q slots=%q sub_stat=%q", cur, ps, sl, ss)
+		for _, l := range strings.Split(fileTail(publisher.LogPath(), 3000), "\n") {
+			ll := strings.ToLower(l)
+			if strings.Contains(ll, "replication") || strings.Contains(ll, "walsender") || strings.Contains(ll, "slot") || strings.Contains(ll, "error") || strings.Contains(ll, "warn") {
+				t.Log("publisher log| " + l)
+			}
 		}
 		t.Fatalf("timed out waiting for subscriber to synchronize data; pg_subscription_rel: %q; subscriber log errors: %q", st, errs)
 	}
