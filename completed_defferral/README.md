@@ -7,5 +7,6 @@ Resolved rows moved out of `.ralph/deferral_ledger.md` to keep the live ledger s
 | [completed_deferral_001.md](completed_deferral_001.md) | 162 | 2026-06-13 → 2026-07-15 | 341 KB |
 | [completed_deferral_002.md](completed_deferral_002.md) | 118 | 2026-06-25 → 2026-07-04 | 339 KB |
 | [completed_deferral_003.md](completed_deferral_003.md) | 88 | 2026-07-04 → 2026-07-08 | 339 KB |
-| [completed_deferral_004.md](completed_deferral_004.md) | 96 | 2026-07-08 → 2026-07-18 | 273 KB |
+| [completed_deferral_004.md](completed_deferral_004.md) | 237 | 2026-07-08 → 2026-09-22 | 341 KB |
+| [completed_deferral_005.md](completed_deferral_005.md) | 23 | 2026-09-02 → 2026-11-17 | 32 KB |
 
