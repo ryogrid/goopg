@@ -455,7 +455,7 @@ S-004,subscription-tap,tap,postgres/src/test/subscription/t/004_sync.pl,port,yes
 ,subscription-tap,tap,postgres/src/test/subscription/t/021_twophase.pl,not-tried,no,-,,,
 ,subscription-tap,tap,postgres/src/test/subscription/t/022_twophase_cascade.pl,not-tried,no,-,,,
 ,subscription-tap,tap,postgres/src/test/subscription/t/023_twophase_stream.pl,not-tried,no,-,,,
-,subscription-tap,tap,postgres/src/test/subscription/t/024_add_drop_pub.pl,not-tried,no,-,,,
+,subscription-tap,tap,postgres/src/test/subscription/t/024_add_drop_pub.pl,port,yes,-,Ported as TestPort_Subscription024AddDropPub (internal/testport/subscription_024_add_drop_pub_test.go): three pairings (all-goopg; PG 18.3 publisher -> goopg subscriber; goopg publisher -> PG 18.3 subscriber) 3/3 each (M0149-0052),,
 ,subscription-tap,tap,postgres/src/test/subscription/t/025_rep_changes_for_schema.pl,not-tried,no,-,,,
 S-026,subscription-tap,tap,postgres/src/test/subscription/t/026_stats.pl,port,yes,-,Ported as TestPort_Subscription026Stats in internal/testport/subscription_port_test.go,,
 ,subscription-tap,tap,postgres/src/test/subscription/t/027_nosuperuser.pl,not-tried,no,-,,,

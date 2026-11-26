@@ -37,7 +37,11 @@ func registerStatReplicationView(cat *catalog.InMemory, senders *xlog.Senders, w
 		Schema: "pg_catalog",
 		Name:   "pg_stat_replication",
 		Columns: []catalog.Column{
-			{Name: "pid", Type: catalog.Type{Name: "text"}},
+			// pid is int4 as in PG (pg_stat_get_wal_senders' first OUT
+			// column): 024_add_drop_pub.pl polls `pid != <old pid>`, which
+			// a text column rejects (M0149-0052a). The other columns keep
+			// the v0 all-text shape (M0149-0052b).
+			{Name: "pid", Type: catalog.Type{Name: "int4"}},
 			{Name: "usesysid", Type: catalog.Type{Name: "text"}},
 			{Name: "usename", Type: catalog.Type{Name: "text"}},
 			{Name: "application_name", Type: catalog.Type{Name: "text"}},

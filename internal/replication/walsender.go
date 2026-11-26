@@ -198,7 +198,7 @@ func (s *Handler) HandleCommand(ctx, stmtCtx context.Context, r *libpq.FrameRead
 	case strings.HasPrefix(upper, "READ_REPLICATION_SLOT "):
 		return true, s.replyReadReplicationSlot(w, trimmed[len("READ_REPLICATION_SLOT "):])
 	case strings.HasPrefix(upper, "START_REPLICATION"):
-		return true, s.replyStartReplication(ctx, r, w, trimmed, appName, dbName)
+		return true, s.replyStartReplication(ctx, r, w, trimmed, appName, dbName, pid)
 	case strings.HasPrefix(upper, "TIMELINE_HISTORY "):
 		return true, s.replyTimelineHistory(w, trimmed[len("TIMELINE_HISTORY "):])
 	case upper == "BASE_BACKUP" || strings.HasPrefix(upper, "BASE_BACKUP "):
@@ -594,7 +594,7 @@ func (s *Handler) replyReadReplicationSlot(w *libpq.FrameWriter, args string) er
 // arrive. When absent the walsender streams without slot-backed WAL
 // retention — fine for one-shot test traffic, dangerous in
 // production. Upstream behaves identically.
-func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, raw string, appName, dbName string) error {
+func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, raw string, appName, dbName string, pid int32) error {
 	if s.cfg.WAL == nil {
 		return s.writeQueryError(w, errcodes.FeatureNotSupported,
 			"START_REPLICATION requires a configured WAL writer")
@@ -657,7 +657,7 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 	// pgoutput messages through `'w'` CopyData frames. See
 	// docs/design/0008-0004-apply-worker-and-tablesync.md.
 	if args.Mode == "LOGICAL" {
-		return s.runLogicalWalsender(ctx, r, w, args, appName, dbName)
+		return s.runLogicalWalsender(ctx, r, w, args, appName, dbName, pid)
 	}
 
 	walDir := s.cfg.WALDirPath
@@ -688,6 +688,7 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 	var senderHandle *xlog.Sender
 	if s.cfg.WalSenders != nil {
 		senderHandle = s.cfg.WalSenders.Register(xlog.SenderState{
+			PID:             uint32(pid),
 			SlotName:        args.SlotName,
 			ClientAddr:      walsenderClientAddr(r),
 			SentLSN:         args.StartLSN,

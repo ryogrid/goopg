@@ -17207,11 +17207,25 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: M0149-0051
   - Probe 2026\-11\-26: `CREATE_REPLICATION_SLOT s2 LOGICAL pgoutput` on a replication=database connection → pg\_replication\_slots shows `logical` with empty plugin and database, and the state file's NameData plugin / database oid are zero, so after a restart the slot loads as `physical` \(slots\_pg.go derives kind from the plugin\). PG keeps both. 020 does not restart. Nearby defect, not worked.
-- [ ] **M0149-0052 — port subscription/t/024_add_drop_pub.pl**
+- [x] **M0149-0052 — port subscription/t/024_add_drop_pub.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/024_add_drop_pub.pl` — ALTER SUBSCRIPTION ADD/DROP PUBLICATION.
   Likely prerequisites \(verify at start\): `REFRESH PUBLICATION` semantics, `pg_subscription_rel` states, publication created after the subscription.
+  - 2026\-11\-27 \(progress\): TestPort\_Subscription024AddDropPub written, gated GOOPG\_TAP\_024. The pg18\-publisher\-goopg\-subscriber pairing passes as is; the goopg\-publisher pairings pass the three ADD/DROP checks and stop at the missing\-publication part \(0052a\).
+  - 2026\-11\-27 \(done\): 0052a landed; 024 ungated, 3/3 x 3; inventory 024 → port.
+  Movement: yes — tap 024 all-goopg 3/4 -> 4/4, goopg-publisher-pg18-subscriber 3/4 -> 4/4 (3/3 x 3 pairings); 024 port
+- [x] **M0149-0052a — a goopg publisher: pg\_stat\_replication.pid, and LoadPublications' "skipped loading publication" warning**
+  Kind: impl
+  Parent: M0149-0052
+  - 024 \(goopg publisher\), after `ALTER SUBSCRIPTION tap_sub SET PUBLICATION tap_pub_3` \(missing\): \(1\) the poll `SELECT pid != <old> FROM pg_stat_replication …` fails — pg\_stat\_replication.pid is a text column \(42804 "operator <> has incompatible operand types text and int8"\), and both walsenders registered PID 0; \(2\) the publisher never logs pgoutput.c LoadPublications' `WARNING: skipped loading publication "tap_pub_3"` — buildPublicationFilter skipped unknown names silently.
+  - Path\-to\-TAP: 024 goopg\-publisher pairings ← 0052a \(1 link\).
+  - 2026\-11\-27 \(done\): HandleCommand's backend pid threaded through replyStartReplication into both walsenders' SenderState.PID; pg\_stat\_replication.pid typed int4; livePublicationFilter loads lazily \(get\_rel\_sync\_entry's publications\_valid\) and warns once per load for each missing name \(errdetail / errhint as attributes\). Test TestLivePublicationFilterWarnsMissingPublication.
+  Movement: yes — tap 024 all-goopg 3/4 -> 4/4, goopg-publisher-pg18-subscriber 3/4 -> 4/4
+- [ ] **M0149-0052b — pg\_stat\_replication column types match PG**
+  Kind: impl
+  Parent: M0149-0052
+  - Only pid is typed \(int4\); every other column of the virtual view is text \(PG: usesysid oid, client\_addr inet, client\_port int4, backend\_start / reply\_time timestamptz, backend\_xmin xid, \*\_lsn pg\_lsn, \*\_lag interval, sync\_priority int4\), so e.g. `sent_lsn >= '0/…'` compares as text. usesysid / usename / client\_port are empty strings. PG parity only.
 - [ ] **M0149-0053 — port subscription/t/025_rep_changes_for_schema.pl**
   Kind: impl
   Parent: none

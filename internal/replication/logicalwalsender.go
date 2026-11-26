@@ -32,7 +32,7 @@ import (
 // builds a SlotDecoder over the slot, plumbs its OutputPlugin into
 // a PgOutput writing through `walsenderPgoutputAdapter`, and runs
 // until the standby disconnects or ctx is cancelled.
-func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, args startReplicationArgs, appName, dbName string) error {
+func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, args startReplicationArgs, appName, dbName string, pid int32) error {
 	if s.cfg.WAL == nil {
 		return s.writeStreamingError(w, errcodes.FeatureNotSupported,
 			"START_REPLICATION LOGICAL requires a configured WAL writer")
@@ -152,7 +152,11 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 	// replies (ProcessStandbyReplyMessage). M0149-0040b.
 	var senderHandle *xlog.Sender
 	if s.cfg.WalSenders != nil {
+		// pg_stat_replication.pid is the walsender's backend pid
+		// (pg_stat_get_wal_senders: walsnd->pid); 024 waits for it to
+		// change after an apply-worker restart. M0149-0052a.
 		senderHandle = s.cfg.WalSenders.Register(xlog.SenderState{
+			PID:             uint32(pid),
 			SlotName:        args.SlotName,
 			ClientAddr:      walsenderClientAddr(r),
 			SentLSN:         startSent,
@@ -632,6 +636,12 @@ func resolveConnDBOid(cat catalog.Catalog, dbName string) uint32 {
 // rather than at slot start; v0 follows the lenient path so
 // startup doesn't fail when a publication has been dropped.
 func buildPublicationFilter(ps *catalog.PubSub, names []string, dbOid ...uint32) *publicationFilter {
+	return buildPublicationFilterMissing(ps, names, nil, dbOid...)
+}
+
+// buildPublicationFilterMissing is buildPublicationFilter that reports each
+// name with no publication to missing (when non-nil).
+func buildPublicationFilterMissing(ps *catalog.PubSub, names []string, missing func(name string), dbOid ...uint32) *publicationFilter {
 	out := &publicationFilter{
 		byTable: map[string]allowFlags{},
 	}
@@ -643,6 +653,9 @@ func buildPublicationFilter(ps *catalog.PubSub, names []string, dbOid ...uint32)
 		// that database, or the empty filter silently drops every change.
 		pub, ok := ps.LookupPublication(name, dbOid...)
 		if !ok {
+			if missing != nil {
+				missing(name)
+			}
 			continue
 		}
 		flags := allowFlags{
@@ -683,47 +696,53 @@ func buildPublicationFilter(ps *catalog.PubSub, names []string, dbOid ...uint32)
 // NAME, so a publication renamed away stops feeding the stream and one
 // renamed into a subscribed name starts. The filter is consulted from the
 // single decoder goroutine. M0149-0043b.
+//
+// The publications are loaded lazily, on the first change consulted after
+// the filter is made or the registry changes — get_rel_sync_entry's
+// `if (!publications_valid) LoadPublications(...)` — and each requested
+// name with no publication logs LoadPublications' WARNING "skipped loading
+// publication". 024_add_drop_pub.pl waits for that warning after SET
+// PUBLICATION names a publication that does not exist yet. M0149-0052a.
 type livePublicationFilter struct {
-	ps    *catalog.PubSub
-	names []string
-	dbOid []uint32
-	gen   uint64
-	cur   *publicationFilter
+	ps     *catalog.PubSub
+	names  []string
+	dbOid  []uint32
+	gen    uint64
+	loaded bool
+	cur    *publicationFilter
 }
 
 func newLivePublicationFilter(ps *catalog.PubSub, names []string, dbOid ...uint32) *livePublicationFilter {
-	f := &livePublicationFilter{ps: ps, names: names, dbOid: dbOid}
-	f.refresh()
-	return f
+	return &livePublicationFilter{ps: ps, names: names, dbOid: dbOid}
 }
 
-func (f *livePublicationFilter) refresh() {
-	f.gen = f.ps.PublicationGeneration()
-	f.cur = buildPublicationFilter(f.ps, f.names, f.dbOid...)
+// load (re)builds the filter when it has not been loaded yet or the
+// registry generation moved.
+func (f *livePublicationFilter) load() *publicationFilter {
+	if g := f.ps.PublicationGeneration(); !f.loaded || g != f.gen {
+		f.gen, f.loaded = g, true
+		f.cur = buildPublicationFilterMissing(f.ps, f.names, func(name string) {
+			slog.Warn(fmt.Sprintf("skipped loading publication \"%s\"", name),
+				"detail", "The publication does not exist at this point in the WAL.",
+				"hint", "Create the publication if it does not exist.")
+		}, f.dbOid...)
+	}
+	return f.cur
 }
 
 // Allows implements xlog.RelationFilter.
 func (f *livePublicationFilter) Allows(rel *xlog.RelationDef, kind xlog.ChangeKind) bool {
-	if g := f.ps.PublicationGeneration(); g != f.gen {
-		f.refresh()
-	}
-	return f.cur.Allows(rel, kind)
+	return f.load().Allows(rel, kind)
 }
 
 // ColumnList implements xlog.ColumnListFilter.
 func (f *livePublicationFilter) ColumnList(rel *xlog.RelationDef) ([]string, bool) {
-	if g := f.ps.PublicationGeneration(); g != f.gen {
-		f.refresh()
-	}
-	return f.cur.ColumnList(rel)
+	return f.load().ColumnList(rel)
 }
 
 // PublishesStoredGenerated implements xlog.GenColsFilter.
 func (f *livePublicationFilter) PublishesStoredGenerated(rel *xlog.RelationDef) bool {
-	if g := f.ps.PublicationGeneration(); g != f.gen {
-		f.refresh()
-	}
-	return f.cur.PublishesStoredGenerated(rel)
+	return f.load().PublishesStoredGenerated(rel)
 }
 
 // unionFlags ORs the publish-flag bitsets — a relation gets the
