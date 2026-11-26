@@ -21,8 +21,10 @@ import (
 func fakePublisherConn(t *testing.T, rows []string) *ConnPair {
 	t.Helper()
 	// fetch_remote_table_info's column query is answered first (one
-	// column, "a"), then the COPY (M0149-0044a).
-	pubBytes := append(columnQueryRespond(t, "a"), pubRespond(t, rows)...)
+	// column, "a"), then its relkind query (an ordinary table, "r";
+	// M0149-0057b), then the COPY (M0149-0044a).
+	pubBytes := append(columnQueryRespond(t, "a"), columnQueryRespond(t, "r")...)
+	pubBytes = append(pubBytes, pubRespond(t, rows)...)
 	return &ConnPair{
 		Reader: libpq.NewFrameReader(bytes.NewReader(pubBytes)),
 		Writer: libpq.NewFrameWriter(&bytes.Buffer{}),

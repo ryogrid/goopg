@@ -395,7 +395,8 @@ func quoteIdentifier(s string) string {
 // of relname in attnum order, kept when the set includes them. Generated
 // columns are no longer filtered by attgenerated — attrs already leaves out
 // the ones not published. gencolPublished reports whether a generated
-// column is among them, which makes copy_table use COPY (SELECT …).
+// column is among them, which makes copy_table use COPY (SELECT …) — as
+// does a remote relation that is not an ordinary table (relkind 'p').
 // pubs empty skips the column-list query. M0149-0044a, M0149-0048c.
 func FetchRemoteColumns(rd *libpq.FrameReader, wr *libpq.FrameWriter, relname string, pubs []string) (cols []string, gencolPublished bool, err error) {
 	relLit := quotePublicationLiteral(relname) + "::pg_catalog.regclass"
@@ -450,6 +451,17 @@ func FetchRemoteColumns(rd *libpq.FrameReader, wr *libpq.FrameWriter, relname st
 		if string(row[2]) == "t" {
 			gencolPublished = true
 		}
+	}
+	// fetch_remote_table_info's relkind: copy_table uses COPY rel (cols)
+	// only for an ordinary table; a partitioned one (published with
+	// publish_via_partition_root) is copied with COPY (SELECT cols FROM
+	// rel), which reads its partitions. M0149-0057b.
+	kind, err := queryRowsOn(rd, wr, "SELECT c.relkind FROM pg_catalog.pg_class c WHERE c.oid = "+relLit)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(kind) == 1 && len(kind[0]) > 0 && kind[0][0] != nil && string(kind[0][0]) != "r" {
+		gencolPublished = true
 	}
 	return cols, gencolPublished, nil
 }

@@ -70,6 +70,9 @@ type ApplyWorker struct {
 	// path that existing tests depend on.
 	pubsub  *catalog.PubSub
 	subName string
+	// ownerSuperuser records the subscription owner's superuser status at
+	// the last transaction start (applyCheckOwnerSuperuser). M0149-0057a.
+	ownerSuperuser, ownerSuperuserKnown bool
 
 	// stat is the pg_stat_subscription handle for this worker.
 	// When non-nil, every ApplyMessage records the receipt
@@ -137,6 +140,20 @@ func (w *ApplyWorker) dbOid() uint32 {
 func (w *ApplyWorker) SetSubscriptionContext(ps *catalog.PubSub, subName string) {
 	w.pubsub = ps
 	w.subName = subName
+	// The owner's superuser status as the worker starts (MySubscription's
+	// ownersuperuser), for maybe_reread_subscription. M0149-0057a.
+	w.ownerSuperuserKnown = false
+	_ = w.applyCheckOwnerSuperuser()
+}
+
+// CheckSubscription is maybe_reread_subscription between transactions: an
+// error means the worker must exit and be restarted (the subscription
+// owner lost superuser). M0149-0057a.
+func (w *ApplyWorker) CheckSubscription() error {
+	if w.inXact {
+		return nil
+	}
+	return w.applyCheckOwnerSuperuser()
 }
 
 // SetStatHandle attaches a pg_stat_subscription handle to this
@@ -216,8 +233,10 @@ func (w *ApplyWorker) ApplyMessage(m *xlog.DecodedMessage) (uint64, error) {
 	default:
 		err = fmt.Errorf("applyworker: unsupported pgoutput kind %q", m.Kind)
 	}
-	if ee, ok := isApplyConflictError(err); ok {
-		// ReportApplyConflict's ERROR, as PG's server log shows it.
+	var ee *ExecError
+	if errors.As(err, &ee) {
+		// The apply error as PG's server log shows it (ReportApplyConflict,
+		// the SET ROLE / privilege / RLS refusals, ...).
 		w.log().Error(pgServerLogText(ee))
 	}
 	if err != nil {
@@ -236,6 +255,9 @@ func (w *ApplyWorker) applyBegin(m *xlog.DecodedMessage) error {
 		// state consistent before opening the new one.
 		_ = w.txnMgr.Rollback(w.currentTx)
 		w.inXact = false
+	}
+	if err := w.applyCheckOwnerSuperuser(); err != nil {
+		return err
 	}
 	tx, err := w.txnMgr.Begin(transam.IsolationReadCommitted)
 	if err != nil {
@@ -364,6 +386,11 @@ func (w *ApplyWorker) applyInsert(m *xlog.DecodedMessage) error {
 		}
 	}
 
+	// SwitchToUntrustedUser + TargetPrivilegesCheck(ACL_INSERT). M0149-0057a.
+	if err := applyTableAccess(ctx, w, tgt, "insert"); err != nil {
+		return err
+	}
+
 	// ExecSimpleRelationInsert: BEFORE ROW triggers may replace the row
 	// or skip it (RETURN NULL). M0149-0040c.
 	trigCtx := w.triggerContext(ctx)
@@ -461,6 +488,12 @@ func (w *ApplyWorker) applyDelete(m *xlog.DecodedMessage) error {
 		return fmt.Errorf("applyworker: decode delete old-tuple for %q: %w", r.local.Name, err)
 	}
 	ctx := w.applyContext()
+	if len(r.local.PartitionKey) > 0 {
+		return w.applyDeletePartitioned(ctx, r, keyRow)
+	}
+	if err := applyTableAccess(ctx, w, r.local, "delete"); err != nil {
+		return err
+	}
 	rel := w.cat.RelFileNode(r.local)
 	// apply_handle_delete_internal: locate ONE row (FindReplTupleInLocalRel,
 	// through the identity / usable index when there is one), then delete
@@ -557,6 +590,12 @@ func (w *ApplyWorker) applyUpdate(m *xlog.DecodedMessage) error {
 		}
 	}
 	ctx := w.applyContext()
+	if len(r.local.PartitionKey) > 0 {
+		return w.applyUpdatePartitioned(ctx, r, oldKeyRow, newRow, newUnchanged, newMissing)
+	}
+	if err := applyTableAccess(ctx, w, r.local, "update"); err != nil {
+		return err
+	}
 	rel := w.cat.RelFileNode(r.local)
 	// apply_handle_update_internal: locate ONE row through the identity /
 	// usable index (or the heap), then update that row.

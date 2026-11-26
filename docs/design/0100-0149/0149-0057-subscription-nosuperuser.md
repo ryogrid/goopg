@@ -1,7 +1,7 @@
 # M0149\-0057 — Port subscription/t/027\_nosuperuser.pl
 
-Status: in progress. The goopg publisher → PG 18.3 subscriber pairing passes. The goopg\-subscriber pairings still
-need M0149\-0057a, 0057b and 0057e. TestPort\_Subscription027Nosuperuser is gated by GOOPG\_TAP\_027.
+Status: done. TestPort\_Subscription027Nosuperuser passes 3/3 in all three pairings \(all\-goopg; PG 18.3
+publisher → goopg subscriber; goopg publisher → PG 18.3 subscriber\).
 
 027's subscription is owned by a role whose superuser bit and role memberships the test changes. Replication
 must stop with PG's errors when the owner cannot act as the table owner, when the table forces row\-level
@@ -49,9 +49,57 @@ confirmed\_flush\), and a commit or non\-transactional message ending at or befo
 
 Tests: TestDecoderWriteLocationsAndSkip, TestRestartCapFor.
 
-## Open
+## Landed — M0149\-0057a, the apply worker acts as the table owner
 
-- M0149\-0057a: the apply worker runs each change as the table owner, with the SET ROLE check, the RLS refusal and
-  the table privilege checks, and restarts when the owner loses superuser.
-- M0149\-0057b: goopg tablesync copies a partitioned remote table with `COPY (SELECT …)`.
-- M0149\-0057e: apply routes UPDATE / DELETE for a partitioned local table.
+PG \(worker.c, usercontext.c\): with run\_as\_owner = false, every change runs as the table's owner.
+SwitchToUntrustedUser requires that the subscription owner may SET ROLE to the table owner, else
+`role "X" cannot SET ROLE to "Y"`; it stays the subscription owner when the table owner may SET ROLE back.
+TargetPrivilegesCheck requires the action's privilege — INSERT, UPDATE or DELETE, plus SELECT for the row lookup —
+else aclcheck\_error's `permission denied for table t`. It refuses a table whose row\-level security applies to that
+user, `user "Y" cannot replicate into relation with row-level security enabled: "t"`. maybe\_reread\_subscription
+LOGs `… will restart because the subscription owner's superuser privileges have been revoked` and restarts the
+worker.
+
+goopg \(applyworker\_privilege.go\):
+
+- `applyTableAccess` implements the SET ROLE check \(superuser, identity or membership\), the privilege checks
+  \(through `dmlPrivilegePermittedAs` as the acting role\) and check\_enable\_rls \(applies when FORCE ROW LEVEL
+  SECURITY is set for the owner, or for a non\-owner; never for BYPASSRLS\). It runs for INSERT, UPDATE and DELETE,
+  routed or not.
+- `applyCheckOwnerSuperuser` records the owner's superuser status at worker start and re\-checks it at each BEGIN
+  and on every keepalive between transactions \(`CheckSubscription`; PG also re\-reads while idle\).
+- Every apply `ExecError` is now logged in PG's server\-log form \(errmsg, then DETAIL\), not only as an escaped
+  attribute.
+
+## Landed — M0149\-0057b, table sync of a partitioned remote table
+
+`FetchRemoteColumns` reads the remote relkind \(fetch\_remote\_table\_info\). For anything but an ordinary table, it
+copies with `COPY (SELECT cols FROM rel)` \(copy\_table\), which a PG publisher accepts for a partitioned root
+published via the root.
+
+## Landed — M0149\-0057e, UPDATE / DELETE routing into partitions
+
+`applyDeletePartitioned` / `applyUpdatePartitioned` \(apply\_handle\_tuple\_routing\) route the remote old tuple to
+its leaf and look the row up there. An UPDATE stays in that leaf when the new tuple routes to it, and otherwise
+becomes a delete there plus an insert into the new leaf. Conflict checks and privilege checks run against the
+leaves.
+
+## Landed — M0149\-0057f, a partial REVOKE from a table's owner
+
+goopg keeps the owner's aclitem under the bookkeeping key "postgres". `IsOwnerACLRevoked` used to be true only when
+that entry was fully emptied, so after `REVOKE SELECT, INSERT … FROM owner` the owner still had every privilege.
+`HasOwnerPrivilege` also went through HasTablePrivilege's indirect step, where the bootstrap superuser "has
+privileges of" every grantee, so a GRANT to anyone reached the owner. Now a materialized owner entry is
+authoritative, `HasOwnerPrivilege` reads only it and PUBLIC, and the owner's real role adds what it reaches through
+its memberships.
+
+Tests: TestOwnerACLPartialRevoke, TestPort\_Subscription027Nosuperuser.
+
+## Open residuals
+
+- run\_as\_owner = true is not modelled; there is no subscription option.
+- member\_can\_set\_role ignores the membership's SET option \(RoleIsMemberOf\).
+- The owner reverts to the bootstrap superuser after a restart \(existing ledger row M0134\-0004\), and relacl
+  renders the owner entry as "postgres".
+- Triggers do not fire on routed UPDATE / DELETE.
+- The superuser re\-check runs on keepalives, not on a pg\_authid invalidation.

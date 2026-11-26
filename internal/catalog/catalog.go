@@ -18713,17 +18713,45 @@ func (c *InMemory) HasTablePrivilege(relOID uint32, role, priv string) bool {
 // IsOwnerACLRevoked reports whether relOID's owner has had its implicit
 // default ACL touched by an explicit REVOKE. Mirrors the inline check used by
 // MaterializeOwnerACL and relaclTextLockedFor. M0134-0069 bucket 7.
+//
+// It is also true once the owner's aclitem has been materialized (a partial
+// REVOKE from the owner leaves it holding only the remaining privileges):
+// the owner's implicit privileges are then exactly that entry. Before, only a
+// fully emptied entry counted, so after `REVOKE SELECT, INSERT ON t FROM
+// owner` the owner still had every privilege (pg_class_aclcheck never
+// special-cases the owner) — 027_nosuperuser, M0149-0057f.
 func (c *InMemory) IsOwnerACLRevoked(relOID uint32) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.relACLEmptied[relOID] || c.relACLOwnerRevoked[relOID]
+	if c.relACLEmptied[relOID] || c.relACLOwnerRevoked[relOID] {
+		return true
+	}
+	_, materialized := c.tableACLs[relOID][aclOwnerRole]
+	return materialized
 }
 
 // HasOwnerPrivilege reports whether relOID's materialized owner ACL entry
 // grants priv. Equivalent to HasTablePrivilege(relOID, aclOwnerRole, priv).
 // M0134-0069 bucket 7.
+//
+// Only the owner's own aclitem and PUBLIC count. The owner entry is kept
+// under the bookkeeping key "postgres", and HasTablePrivilege's indirect step
+// (has_privs_of_role) would let that key — the bootstrap superuser — inherit
+// every other grantee's privileges, so a role GRANTed SELECT made a revoked
+// owner hold SELECT again (027_nosuperuser, M0149-0057f). Privileges the
+// actual owner reaches through its memberships are checked by the caller
+// against the owner's real role.
 func (c *InMemory) HasOwnerPrivilege(relOID uint32, priv string) bool {
-	return c.HasTablePrivilege(relOID, aclOwnerRole, priv)
+	priv = strings.ToUpper(strings.TrimSpace(priv))
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	byRole := c.tableACLs[relOID]
+	for _, grantee := range [2]string{aclOwnerRole, publicPseudoRole} {
+		if _, ok := byRole[grantee][priv]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // DropTableACL forgets all privileges recorded for relOID. M0118-0008.

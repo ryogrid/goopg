@@ -2,7 +2,6 @@ package testport
 
 import (
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -24,13 +23,10 @@ import (
 // connects over TCP). Three pairings: all-goopg, a PG 18.3 publisher with a
 // goopg subscriber, a goopg publisher with a PG 18.3 subscriber.
 //
-// Gated by GOOPG_TAP_027 until it passes (M0149-0057).
+// Ported in M0149-0057.
 func TestPort_Subscription027Nosuperuser(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")
-	}
-	if os.Getenv("GOOPG_TAP_027") == "" {
-		t.Skip("027 port is not passing yet (M0149-0057); set GOOPG_TAP_027=1 to run")
 	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)
@@ -255,28 +251,14 @@ CREATE SUBSCRIPTION regression_sub CONNECTION '`+publisherConnstr+`' PUBLICATION
 	t.Log("skip: subscription password_required test cannot run without Unix-domain sockets")
 }
 
-// waitForLogOffset is Cluster.pm's wait_for_log returning the end offset of
-// the match, which 027's expect_failure carries forward.
+// waitForLogOffset is Cluster.pm's wait_for_log, returning an offset past
+// the match that 027's expect_failure carries forward. The log's size at the
+// time of the match stands in for the match's end: a goopg log line renders
+// to several lines when its message has a DETAIL, so mapping rendered lines
+// back to file bytes is not exact, and every later state change 027 waits on
+// happens after the match.
 func waitForLogOffset(t *testing.T, n *tapnode.Node, re *regexp.Regexp, offset int64) int64 {
 	t.Helper()
 	waitForLog(t, n, re, offset)
-	text := n.LogFrom(offset)
-	loc := re.FindStringIndex(text)
-	if loc == nil {
-		return offset
-	}
-	// LogFrom renders goopg lines; map the rendered match end back to a
-	// file offset by counting whole lines up to it.
-	lines := strings.Count(text[:loc[1]], "\n")
-	raw, _ := os.ReadFile(n.LogPath())
-	pos := offset
-	for i := 0; i < lines+1 && pos < int64(len(raw)); i++ {
-		nl := strings.IndexByte(string(raw[pos:]), '\n')
-		if nl < 0 {
-			pos = int64(len(raw))
-			break
-		}
-		pos += int64(nl) + 1
-	}
-	return pos
+	return n.LogSize()
 }

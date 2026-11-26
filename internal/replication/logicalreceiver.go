@@ -855,6 +855,14 @@ func (r *LogicalReceiver) handleCopyData(payload []byte) error {
 	case libpq.ReplMsgKeepalive:
 		ka := parsed.(*libpq.KeepaliveMessage)
 		r.noteReceived(ka.WALEnd)
+		// LogicalRepApplyLoop re-reads the subscription between
+		// transactions (maybe_reread_subscription): a lost owner
+		// superuser restarts the worker even while idle. M0149-0057a.
+		if !r.inXact.Load() {
+			if err := r.cfg.Apply.CheckSubscription(); err != nil {
+				return fmt.Errorf("logicalreceiver: %w", err)
+			}
+		}
 		// send_feedback(last_received, reply_requested, false): a
 		// requested reply is forced; otherwise one goes out only when
 		// the reported positions moved.

@@ -17353,27 +17353,38 @@ verify each at HEAD when the task starts.
   Upstream: `postgres/src/test/recovery/t/019_replslot_limit.pl` — `max_slot_wal_keep_size` WAL retention, `wal_status` / `safe_wal_size`, and slot invalidation.
   Current shortcut \(audit\): `TestPort_Recovery019ReplslotLimit` creates two slots offline through the Go API \(`xlog.OpenSlots`\) and checks only that they are listed after start \(2 of \~24 upstream assertions\). Missing: no standby, no `max_slot_wal_keep_size`, no `wal_status` reserved/extended/unreserved/lost transitions, no `safe_wal_size`, no "invalidating obsolete replication slot" log, no walsender STOP/CONT termination case. No PG 18.3 variant.
   Likely prerequisites \(verify at start\): `max_slot_wal_keep_size` retention and checkpoint-time invalidation \(`InvalidateObsoleteReplicationSlots`\) with PG log texts, `pg_replication_slots.wal_status` / `safe_wal_size`, standby on a slot, walsender termination on invalidation; wire subscription \(Tier 7\) for its `CREATE SUBSCRIPTION` / `wait_for_subscription_sync` steps. It `kill`s \(STOP/CONT\) the walsender and walreceiver pids read from `pg_stat_activity`: never `kill()` a synthetic goopg pid — without a faithful equivalent this needs the process-model escalation `[!] blocked-on owner: architecture`. Inventory row stays `port` until this closes.
-- [ ] **M0149-0057 — port subscription/t/027_nosuperuser.pl**
+- [x] **M0149-0057 — port subscription/t/027_nosuperuser.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/027_nosuperuser.pl` — logical replication respects permissions.
   Likely prerequisites \(verify at start\): non-superuser subscription owners \(`pg_create_subscription`, `password_required`\), apply privilege checks incl. RLS, owner change mid-stream.
   - 2026\-11\-27 \(progress\): TestPort\_Subscription027Nosuperuser written, gated GOOPG\_TAP\_027 \(the password\_required block is skipped like upstream without Unix sockets — tapnode is TCP\). goopg\-publisher\-pg18\-subscriber passes 6/6 after 0057c \+ 0057d; the goopg\-subscriber pairings need 0057a, 0057b, 0057e.
-- [ ] **M0149-0057a — the apply worker runs each change as the table owner \(SET ROLE check, RLS refusal, table privileges\) and restarts when the owner loses superuser**
+  - 2026\-11\-27 \(done\): 0057a/b/e/f landed; 027 ungated, 3/3 x 3; inventory 027 → port.
+  Movement: yes — tap 027 all-goopg and pg18-publisher-goopg-subscriber fail -> pass (3/3 x 3 pairings); 027 port
+- [x] **M0149-0057a — the apply worker runs each change as the table owner \(SET ROLE check, RLS refusal, table privileges\) and restarts when the owner loses superuser**
   Kind: impl
   Parent: M0149-0057
   - 027 \(goopg subscriber\): no "role \"regress\_admin\" cannot SET ROLE to \"regress\_alice\"" error — goopg applies as superuser regardless of owner. PG: worker.c apply\_handle\_\* → TargetPrivilegesCheck / SwitchToUntrustedUser \(run\_as\_owner = false: member\_can\_set\_role check, "cannot SET ROLE"\), check\_enable\_rls → "user \"%s\" cannot replicate into relation with row\-level security enabled: \"%s\"", pg\_class\_aclcheck INSERT / UPDATE / DELETE \+ SELECT for UPDATE/DELETE lookups \("permission denied for table %s"\), maybe\_reread\_subscription "will restart because the subscription owner's superuser privileges have been revoked".
   - Path\-to\-TAP: 027 goopg\-subscriber pairings ← 0057a \(1 link\).
-- [ ] **M0149-0057b — goopg tablesync copies a partitioned remote table with COPY \(SELECT …\)**
+  - 2026\-11\-27 \(done\): applyworker\_privilege.go — applyTableAccess \(SET ROLE check via superuser / identity / RoleIsMemberOf, user = table owner unless it can SET ROLE back, TargetPrivilegesCheck INSERT / UPDATE\+SELECT / DELETE\+SELECT through dmlPrivilegePermittedAs, check\_enable\_rls with FORCE / BYPASSRLS\), applyCheckOwnerSuperuser at worker start, each BEGIN and on idle keepalives \(CheckSubscription\) with PG's restart LOG; every apply ExecError is logged in PG's server\-log form.
+  Movement: yes — tap 027 goopg-subscriber pairings SET ROLE / RLS / privilege / restart checks fail -> pass
+
+- [x] **M0149-0057b — goopg tablesync copies a partitioned remote table with COPY \(SELECT …\)**
   Kind: impl
   Parent: M0149-0057
   - 027 pg18\-publisher\-goopg\-subscriber: "tablesync \(publisher rejected COPY\): \[42809\] cannot copy from partitioned table \"hashpart\"". PG 18 copy\_table: a partitioned remote relation \(relkind p, publish\_via\_partition\_root\) is copied with `COPY (SELECT cols FROM tab) TO STDOUT`.
   - Path\-to\-TAP: 027 goopg\-subscriber pairings ← 0057b \(1 link\).
-- [ ] **M0149-0057e — the apply worker routes UPDATE / DELETE for a partitioned local table**
+  - 2026\-11\-27 \(done\): FetchRemoteColumns reads the remote relkind; anything but 'r' uses COPY \(SELECT …\).
+  Movement: yes — tap 027 pg18-publisher-goopg-subscriber hashpart table sync fail -> pass
+
+- [x] **M0149-0057e — the apply worker routes UPDATE / DELETE for a partitioned local table**
   Kind: impl
   Parent: M0149-0057
   - 027 \(goopg subscriber, hashpart via root\): changes arrive for the partitioned root; only INSERT is routed \(M0149\-0056b\). PG: apply\_handle\_tuple\_routing \(find the leaf by the old tuple; cross\-partition UPDATE = delete \+ insert\).
   - Path\-to\-TAP: 027 goopg\-subscriber pairings ← 0057e \(1 link\).
+  - 2026\-11\-27 \(done\): applyworker\_partition.go — applyDeletePartitioned / applyUpdatePartitioned \(route the old tuple to its leaf, same\-leaf update or cross\-partition delete \+ insert, conflict checks in the target leaf\).
+  Movement: yes — tap 027 goopg-subscriber hashpart check fail -> pass
+
 - [x] **M0149-0057c — a goopg publisher re\-sends what the subscriber has not confirmed: feedback\-only slot advance, start\_decoding\_at skip, PG write locations, restart\_lsn at the oldest unfinished transaction** \(data loss, found by 027\)
   Kind: impl
   Parent: M0149-0057
@@ -17389,6 +17400,13 @@ verify each at HEAD when the task starts.
   - 2026\-11\-27 \(done\): Publication.PublishViaRoot \(option, ALTER SET, pubviaroot journal \+ reload, views\); table lists keep a partitioned member as itself and schema lists drop partitions \(PublicationSchemaTablesMode\); RelationDef.AncestorOIDs \+ filter PublishAsAncestor; PgOutput sends the change as the root's when the layouts match \(sameTupleLayout\).
   Movement: yes — tap 027 goopg-publisher-pg18-subscriber hashpart check fail -> pass
 
+- [x] **M0149-0057f — a partial REVOKE from a table's owner restricts the owner**
+  Kind: impl
+  Parent: M0149-0057
+  - 027 \(goopg subscriber\): after `REVOKE SELECT, INSERT ON alice.unpartitioned FROM regress_alice` \(the owner\), alice still inserted — dmlPrivilegePermittedAs let the owner through unless its aclitem was fully emptied, and the owner entry \(kept under the "postgres" key\) inherited every grantee's privileges through the bootstrap superuser's has\_privs\_of\_role. PG: pg\_class\_aclcheck / aclmask never special\-case the owner.
+  - Path\-to\-TAP: 027 goopg\-subscriber pairings ← 0057f \(1 link\).
+  - 2026\-11\-27 \(done\): IsOwnerACLRevoked is true once the owner entry is materialized; HasOwnerPrivilege reads only the owner entry and PUBLIC; the owner branch adds the owner role's own HasTablePrivilege. Test TestOwnerACLPartialRevoke.
+  Movement: yes — tap 027 goopg-subscriber privilege steps fail -> pass
 - [ ] **M0149-0058 — port subscription/t/033_run_as_table_owner.pl**
   Kind: impl
   Parent: none

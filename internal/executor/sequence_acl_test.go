@@ -335,21 +335,13 @@ func TestSequenceOwnerACLRevokedDeniesOwner(t *testing.T) {
 		t.Fatalf("lastval as owner after REVOKE ALL: expected 42501, got %v", err)
 	}
 
-	// A selective GRANT back to the owner (GRANT SELECT ON seq TO bob) is
-	// observed here to restore the FULL implicit owner bypass, not just
-	// SELECT-gated operations — a real PG-fidelity gap in
-	// GrantTablePrivilegeAs's pre-existing "role == aclOwnerRole clears
-	// relACLEmptied/relACLOwnerRevoked" behavior (catalog.go ~16270-16273,
-	// written for relacl *display* purposes, not privilege re-gating), out
-	// of scope for this brief (M0134-0069 bucket 7 only wires
-	// IsOwnerACLRevoked/HasOwnerPrivilege into the read path). Verified
-	// against real PG 18.3's sequence.sql fixture (REVOKE ALL ... FROM
-	// regress_seq_user; GRANT UPDATE ... TO regress_seq_user; SELECT
-	// currval(...) still ERRORs — UPDATE alone must NOT restore SELECT/
-	// USAGE-gated currval), which goopg does not yet match end-to-end; see
-	// the coordinator's M0134-0069 bucket 7 report for the full finding.
-	// This assertion pins the CURRENT (divergent) behavior as a regression
-	// guard, not as the PG-correct target.
+	// A selective GRANT back to the owner (GRANT SELECT ON seq TO bob)
+	// restores only SELECT-gated operations, as in PG (pg_class_aclcheck
+	// never special-cases the owner; PG 18.3's sequence.sql: REVOKE ALL …
+	// FROM regress_seq_user; GRANT UPDATE … TO regress_seq_user; currval
+	// still ERRORs). Since M0149-0057f a materialized owner aclitem is
+	// authoritative, so setval — which needs UPDATE — stays denied; it used
+	// to pass because any owner re-grant restored the full owner bypass.
 	im.GrantTablePrivilege(tbl.OID, "postgres", "SELECT")
 	if _, err := runSQLCtxErr(t, ctx, "SELECT currval('seq_owner_revoked_acl')"); err != nil {
 		t.Fatalf("currval as owner after selective SELECT re-grant: unexpected error: %v", err)
@@ -357,8 +349,8 @@ func TestSequenceOwnerACLRevokedDeniesOwner(t *testing.T) {
 	if _, err := runSQLCtxErr(t, ctx, "SELECT lastval()"); err != nil {
 		t.Fatalf("lastval as owner after selective SELECT re-grant: unexpected error: %v", err)
 	}
-	if _, err := runSQLCtxErr(t, ctx, "SELECT setval('seq_owner_revoked_acl', 5)"); err != nil {
-		t.Fatalf("setval as owner after selective SELECT re-grant: unexpected error (current, non-PG-faithful behavior: any owner re-grant restores full bypass): %v", err)
+	if _, err := runSQLCtxErr(t, ctx, "SELECT setval('seq_owner_revoked_acl', 5)"); err == nil || mustExecErr(t, err).Code != "42501" {
+		t.Fatalf("setval as owner after a SELECT-only re-grant: expected 42501 (setval needs UPDATE), got %v", err)
 	}
 
 	// The bootstrap superuser (no SET ROLE) always passes regardless of any

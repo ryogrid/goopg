@@ -2772,7 +2772,9 @@ func dmlPrivilegePermittedAs(ctx *Context, tbl *catalog.Table, priv, checkRole s
 		if !ctx.Catalog.IsOwnerACLRevoked(tbl.OID) {
 			return true
 		}
-		return ctx.Catalog.HasOwnerPrivilege(tbl.OID, priv)
+		// The owner's remaining aclitem, or a privilege the owner's own role
+		// reaches through PUBLIC / its memberships (aclmask over relacl).
+		return ctx.Catalog.HasOwnerPrivilege(tbl.OID, priv) || ctx.Catalog.HasTablePrivilege(tbl.OID, checkRole, priv)
 	}
 	return ctx.Catalog.HasTablePrivilege(tbl.OID, checkRole, priv)
 }
