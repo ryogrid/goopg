@@ -17026,11 +17026,17 @@ verify each at HEAD when the task starts.
     - Parity goldens regenerated; the only change is `Subscript=∅` plus the new pinned forms. Unit test TestUpdateSetArraySubscript.
   - 002's `SET b\[2\] = NULL` statement now parses and reaches 0046j's nested\-field error.
   Movement: yes — regress arrays 760 -> 750 mismatched lines (of 2651)
-- [ ] **M0149-0046j — nested composite field selection ((a).a).a**
+- [x] **M0149-0046j — nested composite field selection ((a).a).a**
   Kind: impl
   Parent: M0149-0046
   - 002 delete batch on a goopg node: `DELETE FROM tst\_comp\_mix\_array WHERE \(\(a\).a\).a = 1` fails with "column notation .a applied to type public . tst\_comp\_basic\_t, which is not a composite type". The inner field's type is the parser's token string with a schema qualifier; resolve it like compositeFieldBaseTypeName does.
   - Path\-to\-TAP: 002 goopg\-publisher pairings ← 0046j \(1 link\).
+  - 2026\-11\-26 \(done\): optimizer/fieldselect.go compositeFieldType strips the schema qualifier of a field type token string. Unit test TestCompositeFieldTypeStripsSchema. All of 002's statements now run on a goopg node; regress rowtypes unchanged \(438\).
+- [ ] **M0149-0046k — array equality with an unnormalised literal on a goopg node**
+  Kind: impl
+  Parent: M0149-0046
+  - 002 goopg\-publisher pairings: `UPDATE tst\_arrays … WHERE a = '\{1, 2, 3\}'`, `DELETE FROM tst\_one\_array WHERE b = '\{2, 3, 1\}'`, `DELETE FROM tst\_arrays WHERE a = '\{1, 2, 3\}'` and `DELETE FROM tst\_comp\_enum\_what WHERE \(b\[1\]\).b = '\{c, a, b\}'` match no row on the goopg publisher. The literal keeps its spaces and the comparison is textual. PG coerces the unknown literal to the array type \(array\_in\) and compares with array\_eq. Probably the unknown\-literal coercion for an array comparison, plus the index probe key path for array PKs.
+  - Path\-to\-TAP: 002 goopg\-publisher pairings ← 0046k \(1 link\).
 - [ ] **M0149-0047 — port subscription/t/010_truncate.pl**
   Kind: impl
   Parent: none

@@ -24,7 +24,8 @@ is one link from the TAP test:
 | M0149\-0046g \(done\) | a goopg subscriber's apply worker decodes an array column's replicated text as the element type: "int4 parse "\{1,2,3\}"" |
 | M0149\-0046h \(done\) | a goopg publisher's pgoutput misreads a stored hstore value as an external TOAST pointer |
 | M0149\-0046i \(done\) | `UPDATE … SET b[2] = NULL` \(array element assignment\) is a syntax error on a goopg node |
-| M0149\-0046j | `((a).a).a` on a nested composite field is refused: "column notation .a applied to type public . tst\_comp\_basic\_t, which is not a composite type" |
+| M0149\-0046j \(done\) | `((a).a).a` on a nested composite field is refused: "column notation .a applied to type public . tst\_comp\_basic\_t, which is not a composite type" |
+| M0149\-0046k | an array compared with an unnormalised literal \(`a = '\{1, 2, 3\}'`\) matches no row on a goopg node |
 
 ## Landed — M0149\-0046a, NULL array elements
 
@@ -213,3 +214,13 @@ The arrays regress case went from 760 to 750 mismatched lines.
 
 goopg arrays always have lower bound 1. Assigning `[3]` into a NULL array gives `{NULL,NULL,7}` where PG gives
 `[3:3]={7}`, and a subscript of 0 errors where PG extends the array \(deferral ledger\).
+
+## Landed — M0149\-0046j, nested composite field selection
+
+A composite field declared with a schema\-qualified type is stored as the parser's token string `public .
+tst_comp_basic_t`. `compositeFieldType` kept the qualifier, so the composite lookup for `((a).a).a` failed with 42809.
+It now strips the qualifier, as the executor's `compositeFieldBaseTypeName` does. Unit test
+TestCompositeFieldTypeStripsSchema.
+
+Every statement of 002 now runs on a goopg node. The remaining difference is in the goopg\-publisher pairings:
+`WHERE a = '{1, 2, 3}'` compares the stored array text with the literal's text, so it matches no row \(0046k\).

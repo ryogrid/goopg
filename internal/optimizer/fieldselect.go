@@ -321,6 +321,15 @@ func compositeFieldType(colType string) catalog.Type {
 	if i := strings.IndexByte(s, '('); i >= 0 {
 		s = s[:i]
 	}
+	// A schema-qualified field type ("public . tst_comp_basic_t", as the
+	// parser joins the tokens) names the type by its bare name for the
+	// lookups below — the sibling of the executor's
+	// compositeFieldBaseTypeName. Without it `((a).a).a` on a nested
+	// composite field was 42809 "… which is not a composite type"
+	// (subscription/t/002_types.pl, M0149-0046j).
+	if i := strings.LastIndexByte(s, '.'); i >= 0 {
+		s = s[i+1:]
+	}
 	return catalog.Type{Name: strings.Join(strings.Fields(s), " "), IsArray: isArray}
 }
 
