@@ -16965,10 +16965,16 @@ verify each at HEAD when the task starts.
   - 002 DDL: `CREATE TABLE tst_comps \(a tst_comp_basic_t PRIMARY KEY, …\)` fails with "btree v0 only supports int4 / numeric keys, got "tst\_comp\_basic\_t"", as do tst\_comp\_enum\_array, tst\_comp\_enum\_what and tst\_comp\_mix\_array. PG compares them with btrecordcmp \(record\_cmp\).
   - 2026\-11\-26 \(done\): record\_ops key \(btree\_record\_key.go\): per field, a present tag plus the field's own key or a NULL tag \(0xFF\, after every value\), then an end marker; recursive through encodeBTreeKeyForColumn. createBTreeIndex admits composite types. optimizer.indexCoversColumns refuses index\-only coverage of a composite key column \(no decode\). Unit test TestRecordBTreeKeyOrder.
   - Movement: 002's composite\-keyed tables are created and all 002 inserts succeed on a goopg node; the uniqueness check is by value \(ROW\(1,'a',1\) collides with \(1.0,a,1\)\).
-- [ ] **M0149-0046c — composite fields coerced to their column types**
+- [x] **M0149-0046c — composite fields coerced to their column types**
   Kind: impl
   Parent: M0149-0046
   - `INSERT … ROW\(1.0, 'a', 1\)` into a \(float8, text, int\) composite prints `\(1.0,a,1\)` \(PG: `\(1,a,1\)`\). An array field keeps its input spelling: `\(1.0,"\{a, b, c\}",1\)` \(PG: `\(1,"\{a,b,c\}",1\)`\). PG runs each field through its type's input/cast \(ExecEvalRow → coercion, record\_in\).
+  - 2026\-11\-26 \(done\): record\_in.go recordIn / typedFieldInput / arrayInElems; evalCast composite and composite\-array targets; coerceRowForConstraintChecks composite columns \(INSERT and UPDATE share it\). encodeBTreeKeyForColumn resolves a text enum label to its sort order, so composite and array keys with enum parts encode. Unit test TestRecordInNormalizesFields.
+  - Movement: 002's array, enum and composite tables all match PG on a goopg node; only ranges remain in the insert check, plus hstore.
+- [ ] **M0149-0098 — an index key that fails to encode silently drops the row from the index**
+  Kind: impl
+  Parent: none
+  - Nearby defect \(found by M0149\-0046c\), filed, not worked. Before the enum\-label fix, an INSERT into a table whose composite PK had an enum field succeeded, but the row was missing from the PK index: an ordered index scan returned 0 rows and uniqueness went unchecked. encodeIndexKeyFromCols returns the encode error, so a caller on the row\-insert path \(pgindex\_btree.go tuple\-format funnel or its caller\) treats the error as "no entry". PG raises the error and the INSERT fails.
 - [ ] **M0149-0046d — range input canonicalised**
   Kind: impl
   Parent: M0149-0046

@@ -16796,6 +16796,24 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 	if v.Kind == KindEnum {
 		return nbtree.EncodeFloat8(v.EnumSortOrder()), nil
 	}
+	// An enum label that arrives as text — a composite field or an array
+	// element, which no caller pre-converts — is resolved here (enum_in),
+	// so a record or enum[] key encodes its enum parts exactly like an enum
+	// column does. M0149-0046c.
+	if v.Kind == KindString && ctx != nil {
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			if et, isEnum := im.LookupEnum(col.Type.Name); isEnum {
+				label := v.StringValue()
+				for _, ev := range et.Values {
+					if ev.Label == label {
+						return nbtree.EncodeFloat8(ev.SortOrder), nil
+					}
+				}
+				return nil, &ExecError{Code: "22P02", Pos: pos,
+					Message: fmt.Sprintf("invalid input value for enum %s: %q", col.Type.Name, label)}
+			}
+		}
+	}
 	return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 cannot index column %q of type %q", col.Name, col.Type.Name)}
 }
 

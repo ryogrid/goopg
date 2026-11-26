@@ -2856,7 +2856,27 @@ func (o *insertOp) Close() error {
 // updateWithFrom — main path and EPQ retry); pattern_sibling_paths_must_agree.
 func coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i int) bool, ctx *Context, pos int) error {
 	for i, col := range cols {
-		if i >= len(row) || !include(i) || row[i].IsNull() || col.Type.IsArray {
+		if i >= len(row) || !include(i) || row[i].IsNull() {
+			continue
+		}
+		// A composite column (or an array of one) takes record_in per field
+		// (M0149-0046c): ROW(1.0,'a',1) into a (float8, text, int) column is
+		// stored as (1,a,1), as PG's assignment coercion stores it.
+		if row[i].Kind == KindString {
+			if _, ok := compositeCastTarget(ctx, col.Type.Name); ok {
+				target := col.Type.Name
+				if col.Type.IsArray {
+					target += "[]"
+				}
+				coerced, cerr := evalCast(row[i], target, pos, ctx)
+				if cerr != nil {
+					return cerr
+				}
+				row[i] = coerced
+				continue
+			}
+		}
+		if col.Type.IsArray {
 			continue
 		}
 		var coerced Datum

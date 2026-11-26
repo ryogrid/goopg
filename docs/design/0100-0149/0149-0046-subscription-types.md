@@ -17,7 +17,7 @@ is one link from the TAP test:
 |---|---|
 | M0149\-0046a \(done\) | NULL array elements were refused \("NULL array elements are not supported"\) |
 | M0149\-0046b \(done\) | btree keys on composite types: "btree v0 only supports int4 / numeric keys" for the four composite\-keyed tables |
-| M0149\-0046c | composite fields are not coerced to their column types: `ROW(1.0, 'a', 1)` into \(float8, text, int\) prints `(1.0,a,1)`, not `(1,a,1)`; an array field keeps its input spelling `{a, b, c}` |
+| M0149\-0046c \(done\) | composite fields are not coerced to their column types: `ROW(1.0, 'a', 1)` into \(float8, text, int\) prints `(1.0,a,1)`, not `(1,a,1)`; an array field keeps its input spelling `{a, b, c}` |
 | M0149\-0046d | range input is not canonicalised: int4range `'[1, 10]'` stays `[1, 10]`, not `[1,11)` |
 | M0149\-0046e | range output ignores the session TimeZone: tstzrange bounds print at \+00 under `SET timezone = '+2'` |
 | M0149\-0046f | no hstore extension |
@@ -69,3 +69,31 @@ Two gaps remain \(deferral ledger\):
   decode it.
 
 Unit test TestRecordBTreeKeyOrder. All of 002's DDL except hstore and all its inserts now succeed on a goopg node.
+
+## Landed — M0149\-0046c, composite fields coerced to their types
+
+PG's record\_in runs every field of a composite value through that field type's input function, and record\_out
+re\-renders the result. goopg kept a composite as the text it was built from, so `ROW(1.0, 'a', 1)` into a
+\(float8, text, int\) type stored and printed `(1.0,a,1)`, where PG has `(1,a,1)`. `record_in.go` adds the
+normalisation:
+
+- **Fields.** `recordIn` parses the record, runs each non\-NULL field through `typedFieldInput` and quotes it with
+  `recordFieldText`. A wrong field count is 22P02 "malformed record literal", DETAIL "Too few columns." or "Too
+  many columns.".
+- **Field kinds.** `typedFieldInput` handles three cases: an array field is re\-spelled element by element
+  \(`arrayInElems`, unquoted NULL kept\), a composite field recurses, and every other field goes through
+  `evalCast`.
+- **Casts.** `evalCast` applies it when the target names a composite type or an array of one.
+- **Assignment.** `coerceRowForConstraintChecks`, the INSERT / UPDATE assignment coercion shared by every new\-row
+  path, applies it to composite and composite\-array columns.
+
+A built\-in target name skips the catalog lookup. `TypeNameToOID` falls back to text for unknown names, so only a
+name that maps elsewhere, or text itself, counts as built\-in.
+
+**Enum fields in keys.** An enum label that reaches `encodeBTreeKeyForColumn` as text, from a composite field or an
+array element, is now resolved to its sort order \(enum\_in\). Before, such a key failed to encode, and the
+row\-insert path silently left the row out of the index. An ordered scan of `tst_comp_enum_array` returned nothing,
+and uniqueness was not enforced. The swallowed index\-insert error is filed as M0149\-0098.
+
+All of 002's array, enum and composite tables now read exactly as on PG on a goopg node. Ranges and hstore remain
+\(0046d–f\).

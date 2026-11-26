@@ -6112,6 +6112,27 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 	if d.IsNull() {
 		return NullDatum, nil
 	}
+	// Composite target (or an array of one): record_in per field, so the
+	// stored text is record_out's (M0149-0046c). A '{' value cast to the
+	// element type name is how an array-of-composite column assigns.
+	if d.Kind == KindString && ctx != nil {
+		elemTarget, isArrTarget := strings.CutSuffix(strings.TrimSpace(targetType), "[]")
+		if fields, ok := compositeCastTarget(ctx, elemTarget); ok {
+			sv := d.StringValue()
+			if isArrTarget || strings.HasPrefix(strings.TrimSpace(sv), "{") {
+				out, err := arrayInElems(ctx, elemTarget, sv, pos)
+				if err != nil {
+					return Datum{}, err
+				}
+				return NewStringDatum(out), nil
+			}
+			out, err := recordIn(ctx, elemTarget, sv, fields, pos)
+			if err != nil {
+				return Datum{}, err
+			}
+			return NewStringDatum(out), nil
+		}
+	}
 	if d.Kind == KindString && strings.HasSuffix(targetType, "]") {
 		if elem, ok := datetimeArrayElem(targetType); ok {
 			text, err := normalizeDatetimeArray(d.StringValue(), elem, pos, ctx)
