@@ -148,13 +148,15 @@ func (s *Server) logStatement(proto string, sql string, sess *misc.SessionRegist
 		return false
 	}
 	attrs := s.prefixAttr(sess, connTx)
-	attrs = append(attrs, "proto", proto, "statement", strings.TrimSpace(sql))
+	attrs = append(attrs, "proto", proto)
 	if connTx != nil && connTx.InExplicit() {
 		if tx := connTx.Tx(); tx.XID != 0 {
 			attrs = append(attrs, "xid", uint64(tx.XID))
 		}
 	}
-	s.cfg.Logger.Info("statement", attrs...)
+	// exec_simple_query's errmsg: `statement: %s` (postgres.c), so a log
+	// reader matching PG's "LOG:  statement: …" finds the same text.
+	s.cfg.Logger.Info("statement: "+strings.TrimSpace(sql), attrs...)
 	return true
 }
 

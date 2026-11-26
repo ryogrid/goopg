@@ -17150,6 +17150,32 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/subscription/t/014_binary.pl` — `binary = true` subscriptions.
   Likely prerequisites \(verify at start\): pgoutput `b` tuple data via type send/recv, binary initial COPY, mismatch errors with PG texts.
+  - 2026\-11\-26 \(progress\): TestPort\_Subscription014Binary written, gated GOOPG\_TAP\_014 \(log\_statement = all on both nodes, as Cluster.pm\). Path\-to\-TAP: each child below is one link from a failing 014 step.
+- [x] **M0149-0050a — a COPY statement is logged as PG logs it**
+  Kind: impl
+  Parent: M0149-0050
+  - 2026\-11\-26 \(done\): handleQueryOrCopy logStatement/logDuration for the COPY path; statement line msg `statement: <sql>`; tapnode renders the prefix attribute before the level and drops proto. Test TestPGStyleLogLine.
+  Movement: yes — tap 014 goopg-publisher-pg18-subscriber binary-COPY log wait fail -> pass (0/9 assertions; next stop test_arrays binary sync, 0050b)
+- [ ] **M0149-0050b — binary COPY of array columns \(array\_send\)**
+  Kind: impl
+  Parent: M0149-0050
+  - 014 goopg\-publisher\-pg18\-subscriber: the PG subscriber's `COPY … TO STDOUT WITH (FORMAT binary)` of test\_arrays fails with "binary COPY of array type integer\[\] is not supported". PG: arrayfuncs.c array\_send \(ndim, hasnull, elemtype, dims/lbounds, then per element length \+ elemtype send\).
+  - Path\-to\-TAP: 014 goopg\-publisher\-pg18\-subscriber ← 0050b \(1 link\).
+- [ ] **M0149-0050c — a goopg subscriber with binary = true: binary table sync and binary apply**
+  Kind: impl
+  Parent: M0149-0050
+  - 014 all\-goopg and pg18\-publisher\-goopg\-subscriber: no `COPY … WITH (FORMAT binary)` ever reaches the publisher. Needed: copy\_table's binary COPY \+ CopyFromExecutor binary input via typreceive; START\_REPLICATION `binary 'true'`; apply of `b` columns; "no binary input function available for type %s" / "incorrect binary data format" errors.
+  - Path\-to\-TAP: 014 ← 0050c \(1 link\).
+- [ ] **M0149-0050d — a goopg publisher writes binary pgoutput tuples when asked**
+  Kind: impl
+  Parent: M0149-0050
+  - 014 goopg\-publisher\-pg18\-subscriber after 0050b: the binary option must produce `b` columns via typsend \(proto.c logicalrep\_write\_tuple\).
+  - Path\-to\-TAP: 014 goopg\-publisher\-pg18\-subscriber ← 0050d \(1 link\).
+- [ ] **M0149-0050e — custom\-type DDL: shell type, LANGUAGE internal varchar I/O functions, ALTER TYPE SET \(send, receive\)**
+  Kind: impl
+  Parent: M0149-0050
+  - 014 \(all pairings with a goopg node\): `CREATE TYPE myvarchar; CREATE FUNCTION myvarcharin(cstring, oid, integer) RETURNS myvarchar LANGUAGE internal … AS 'varcharin'; … CREATE TYPE myvarchar (input = …, output = …); ALTER TYPE myvarchar SET (send = …, receive = …)` — to verify once 0050b/c let the test get there.
+  - Path\-to\-TAP: 014 ← 0050e \(1 link\).
 - [ ] **M0149-0051 — port subscription/t/020_messages.pl**
   Kind: impl
   Parent: none

@@ -44,6 +44,8 @@ func (n *Node) LogFrom(offset int64) string {
 var (
 	slogLine   = regexp.MustCompile(`^time=\S+ level=(\S+) msg=("(?:[^"\\]|\\.)*"|\S+)(.*)$`)
 	stdlogLine = regexp.MustCompile(`^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} (DEBUG|INFO|WARN|ERROR) (.*)$`)
+	prefixAttr = regexp.MustCompile(` prefix=("(?:[^"\\]|\\.)*")`)
+	protoAttr  = regexp.MustCompile(` proto=\S+`)
 )
 
 // pgLevel maps slog's level names onto PG's elevel words.
@@ -72,7 +74,18 @@ func pgStyleLogLine(l string) string {
 				msg = u
 			}
 		}
-		return pgLevel(m[1]) + ":  " + msg + m[3]
+		// The prefix attribute is goopg's rendered log_line_prefix, which
+		// PG writes before the level; proto is goopg-only metadata.
+		attrs := m[3]
+		prefix := ""
+		if pm := prefixAttr.FindStringSubmatch(attrs); pm != nil {
+			if u, err := strconv.Unquote(pm[1]); err == nil {
+				prefix = u
+			}
+			attrs = strings.Replace(attrs, pm[0], "", 1)
+		}
+		attrs = protoAttr.ReplaceAllString(attrs, "")
+		return prefix + pgLevel(m[1]) + ":  " + msg + attrs
 	}
 	if m := stdlogLine.FindStringSubmatch(l); m != nil {
 		return pgLevel(m[1]) + ":  " + m[2]

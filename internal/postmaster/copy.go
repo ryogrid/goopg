@@ -8,6 +8,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/executor"
@@ -79,6 +80,13 @@ func (s *Server) handleQueryOrCopy(ctx context.Context, r *libpq.FrameReader, w 
 	// configured. The planner does its own SQLSTATE-aligned errors
 	// (42P01, 42703, 42601, 0A000); the wire layer just forwards
 	// them.
+	// exec_simple_query logs a COPY like any other statement
+	// (log_statement), including one a logical-replication walsender's
+	// table sync runs (tablesync's copy_table).
+	stmtStart := time.Now()
+	wasLogged := s.logStatement("simple", strings.TrimSpace(q), sess, connTx)
+	defer s.logDuration(stmtStart, wasLogged, "simple", strings.TrimSpace(q), sess, connTx)
+
 	if s.cfg.hasStorage() {
 		st, err := s.dispatchCopyViaExecutor(ctx, w, matchable, connTx, sess)
 		if err != nil {
