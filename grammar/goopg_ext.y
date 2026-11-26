@@ -3598,6 +3598,21 @@ alter_type_action:
 	   join, like a composite field's: `numeric(3,1)` comes back as
 	   "numeric ( 3 , 1 )". */
 	| attr_cmd_list                        { $$ = altTypeAttrCmds($1) }
+	/* AlterType's base-type property list (gram.y: ALTER TYPE_P any_name SET
+	   '(' operator_def_list ')'): receive / send / typmod_in / typmod_out /
+	   analyze / subscript / storage. A pair list, key then value. */
+	| SET '(' type_set_list ')'            { $$ = altTypeSetOptions($3) }
+
+type_set_list:
+		type_set_elem                        { $$ = $1 }
+	| type_set_list ',' type_set_elem      { $$ = append($1, $3...) }
+
+type_set_elem:
+		ColLabel '=' type_set_arg            { $$ = []string{lowerIdent($1), $3} }
+
+type_set_arg:
+		ColId          { $$ = lowerIdent($1) }   /* NONE is a ColId */
+	| SCONST         { $$ = $1 }
 
 attr_cmd_list:
 		attr_cmd                       { $$ = []any{$1} }

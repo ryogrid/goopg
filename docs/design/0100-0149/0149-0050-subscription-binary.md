@@ -42,6 +42,22 @@ TestCopyBinaryArrayMatchesPG and TestCopyBinaryArrayElementTypes \(replacing the
 In TAP 014 goopg\-publisher\-pg18\-subscriber, the first six assertions now pass, including binary apply \(the PG
 subscriber accepts goopg's text tuple columns\). The pairing stops at the custom\-type DDL \(0050e\).
 
+## Landed — M0149\-0050e, ALTER TYPE … SET \(send, receive\)
+
+014's custom\-type DDL ran on goopg up to `ALTER TYPE myvarchar SET (send = myvarcharsend, receive = myvarcharrecv)`,
+which was a syntax error. The shell type, the `LANGUAGE internal` varchar I/O functions and `CREATE TYPE … (input,
+output)` were already accepted.
+
+- **Grammar.** goopg\_ext.y alter\_type\_action gains `SET '(' type_set_list ')'` \(gram.y's operator\_def\_list
+  subset: ColLabel = ColId \| Sconst; NONE is a ColId\). The hand\-written parseAlterType has the same arm. The
+  conflict pin stays at 61, and the goldens change only by the new `SetOptions` field.
+- **Executor.** `execAlterTypeSetOptions` is AlterType for a base type. It accepts receive / send / typmod\_in /
+  typmod\_out / analyze / subscript / storage, raises 42601 "type attribute … not recognized" otherwise, and records
+  send / receive on the type's registration \(`CompositeType.SendFunc` / `ReceiveFunc`; NONE clears them\).
+
+Tests: TestAlterTypeSetOptions \(parser\), TestAlterTypeSetSendReceive \(executor\). TAP 014
+goopg\-publisher\-pg18\-subscriber passes 9/9.
+
 ## Open
 
 - **M0149\\-0050b**: binary COPY of array columns. goopg's binary COPY TO refuses arrays with "binary COPY of array type

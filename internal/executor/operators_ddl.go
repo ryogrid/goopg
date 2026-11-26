@@ -27654,6 +27654,43 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 	return nil
 }
 
+// execAlterTypeSetOptions is AlterType (typecmds.c) for `ALTER TYPE name SET
+// (property = value, ...)` on a base type: the properties PG lets you change
+// after creation are checked by name (42601 "type attribute \"%s\" not
+// recognized", as AlterType does) and receive / send are recorded on the
+// type, so pg_type.typreceive / typsend and binary I/O can see them. goopg
+// models a user base type as an empty composite registration.
+func (o *ddlOp) execAlterTypeSetOptions(cat *catalog.InMemory, s *parser.AlterTypeStmt) error {
+	ct := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid)
+	if ct == nil {
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("type \"%s\" does not exist", s.Name)}
+	}
+	for name, value := range s.SetOptions {
+		switch strings.ToLower(name) {
+		case "receive":
+			ct.ReceiveFunc = alterTypeFuncValue(value)
+		case "send":
+			ct.SendFunc = alterTypeFuncValue(value)
+		case "typmod_in", "typmod_out", "analyze", "subscript", "storage":
+			// Accepted; goopg does not act on them.
+		default:
+			return &ExecError{Code: "42601", Pos: s.Pos(),
+				Message: fmt.Sprintf("type attribute \"%s\" not recognized", name)}
+		}
+	}
+	return nil
+}
+
+// alterTypeFuncValue is an ALTER TYPE SET function value: NONE (any case)
+// clears it.
+func alterTypeFuncValue(v string) string {
+	if strings.EqualFold(v, "none") {
+		return ""
+	}
+	return v
+}
+
 func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	cat, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
@@ -27667,6 +27704,9 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	// re-syncs the composite heap once.
 	if len(s.AttrCmds) > 1 {
 		return o.execAlterTypeAttrCmds(cat, s)
+	}
+	if s.SetOptions != nil {
+		return o.execAlterTypeSetOptions(cat, s)
 	}
 	// ADD ATTRIBUTE col_name type — append a field to a composite type so the
 	// new attribute round-trips through pg_dump's dumpCompositeType. DU-002

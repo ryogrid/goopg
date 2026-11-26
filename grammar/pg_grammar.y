@@ -105,6 +105,8 @@
 %type <node>	alter_view_action
 %type <node>	alter_seq_opt alter_type_action alter_domain_action opt_enum_pos attr_cmd
 %type <nodes>	attr_cmd_list
+%type <strs>	type_set_list type_set_elem
+%type <str>	type_set_arg
 %type <node>	ext_opt
 %type <expr>	opt_policy_using opt_policy_check
 %type <str>	drop_compat_kind opclass_or_family drop_arg_type op_run op_char

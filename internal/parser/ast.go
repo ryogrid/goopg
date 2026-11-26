@@ -4163,6 +4163,11 @@ type AlterTypeStmt struct {
 	// multi-subcommand case (len > 1) through execAlterTypeAttrCmds. DU-002
 	// slice 260.
 	AttrCmds []AlterTypeAttrCmd
+	// SetOptions is `ALTER TYPE name SET ( property = value [, ...] )`
+	// (gram.y AlterTypeStmt / operator_def_list): the base-type properties
+	// AlterType changes — receive, send, typmod_in, typmod_out, analyze,
+	// subscript, storage. nil when not a SET statement.
+	SetOptions map[string]string
 }
 
 // AlterTypeAttrCmd is one attribute subcommand of an ALTER TYPE statement.

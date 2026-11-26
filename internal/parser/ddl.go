@@ -10996,6 +10996,19 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 	}
 	stmt := &AlterTypeStmt{pos: pos, Name: name.Name, Schema: name.Schema}
 
+	// ALTER TYPE name SET ( property = value [, ...] ) — AlterType's base-type
+	// property list. Only SET followed by '(' (SET SCHEMA is elsewhere).
+	if (p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet || p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set")) &&
+		p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "(" {
+		p.advance()
+		opts, err := p.parsePubSubWithList(false)
+		if err != nil {
+			return nil, err
+		}
+		stmt.SetOptions = opts
+		return stmt, nil
+	}
+
 	// Attribute subcommand list: ADD/DROP/ALTER ATTRIBUTE …, optionally
 	// comma-combined. PG's ALTER TYPE grammar only allows these three actions to
 	// be combined in one statement (ADD VALUE / RENAME / OWNER TO are singular and

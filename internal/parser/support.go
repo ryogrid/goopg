@@ -3870,6 +3870,16 @@ func altTypeRenameTo(name string) alterTypeOp {
 	return func(a *AlterTypeStmt) { a.RenameTo = n }
 }
 
+// altTypeSetOptions is `ALTER TYPE name SET (key = value, ...)`; pairs is the
+// flattened key/value list.
+func altTypeSetOptions(pairs []string) alterTypeOp {
+	opts := make(map[string]string, len(pairs)/2)
+	for i := 0; i+1 < len(pairs); i += 2 {
+		opts[pairs[i]] = pairs[i+1]
+	}
+	return func(a *AlterTypeStmt) { a.SetOptions = opts }
+}
+
 func altTypeOwner(name string) alterTypeOp {
 	n := name
 	return func(a *AlterTypeStmt) { a.NewOwner = n }

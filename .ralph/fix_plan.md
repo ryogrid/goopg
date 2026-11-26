@@ -17174,11 +17174,13 @@ verify each at HEAD when the task starts.
   - 014 goopg\-publisher\-pg18\-subscriber after 0050b: the binary option must produce `b` columns via typsend \(proto.c logicalrep\_write\_tuple\).
   - Path\-to\-TAP: 014 goopg\-publisher\-pg18\-subscriber ← 0050d \(1 link\).
   - 2026\-11\-26: not a proven 014 blocker so far — the PG 18 subscriber applies goopg's text \(`t`\) tuple columns in binary mode, and the binary\-apply assertions pass. Re\-check once 0050e lets the run finish; otherwise PG parity only.
-- [ ] **M0149-0050e — custom\-type DDL: shell type, LANGUAGE internal varchar I/O functions, ALTER TYPE SET \(send, receive\)**
+- [x] **M0149-0050e — custom\-type DDL: shell type, LANGUAGE internal varchar I/O functions, ALTER TYPE SET \(send, receive\)**
   Kind: impl
   Parent: M0149-0050
   - 014 \(all pairings with a goopg node\): `CREATE TYPE myvarchar; CREATE FUNCTION myvarcharin(cstring, oid, integer) RETURNS myvarchar LANGUAGE internal … AS 'varcharin'; … CREATE TYPE myvarchar (input = …, output = …); ALTER TYPE myvarchar SET (send = …, receive = …)` — to verify once 0050b/c let the test get there.
   - Path\-to\-TAP: 014 ← 0050e \(1 link\).
+  - 2026\-11\-26 \(done\): only ALTER TYPE … SET was missing \(shell type, LANGUAGE internal functions and CREATE TYPE \(input, output\) already worked\). Grammar arm `SET '(' type_set_list ')'` \(conflicts stay 61\) \+ parseAlterType twin; execAlterTypeSetOptions records CompositeType.SendFunc / ReceiveFunc. Tests TestAlterTypeSetOptions, TestAlterTypeSetSendReceive. Regress create\_type unchanged \(112/405\).
+  Movement: yes — tap 014 goopg-publisher-pg18-subscriber 6/9 -> 9/9 assertions
 - [ ] **M0149-0051 — port subscription/t/020_messages.pl**
   Kind: impl
   Parent: none

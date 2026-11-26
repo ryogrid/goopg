@@ -3848,6 +3848,11 @@ type CompositeField struct {
 // and its array); the implicit relation + pg_attribute rows are a follow-up
 // (see fix_plan DU-002). DU-002 slice 242.
 type CompositeType struct {
+	// SendFunc / ReceiveFunc are a user base type's typsend / typreceive
+	// function names (ALTER TYPE … SET (send = …, receive = …)); empty when
+	// it has none, so binary I/O of the type is refused as in PG.
+	SendFunc, ReceiveFunc string
+
 	Name     string           // lower-case type name
 	OID      uint32           // pg_type.oid of the composite type
 	ArrayOID uint32           // OID of the auto-generated `_name` array type
