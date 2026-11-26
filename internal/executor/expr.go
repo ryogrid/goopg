@@ -6132,6 +6132,24 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			}
 			return NewStringDatum(out), nil
 		}
+		// Any other array of a scalar type: array_in per element, so the
+		// cast's text is array_out's ('{5, NULL, 3}'::int[] is {5,NULL,3})
+		// and an array compared with a literal compares normalised arrays.
+		// Date-time element arrays keep their own arm above. M0149-0046k.
+		// reg* element arrays (name → OID resolution) and multidimensional
+		// literals (refused further down) keep their own arms.
+		if sv := strings.TrimSpace(d.StringValue()); isArrTarget && d.Kind == KindString && strings.HasPrefix(sv, "{") &&
+			!isRegType(elemTarget) && !arrayLiteralHasNestedBrace(sv[1:len(sv)-1]) {
+			if _, isDT := datetimeArrayElem(targetType); !isDT {
+				if _, isComp := compositeCastTarget(ctx, elemTarget); !isComp {
+					out, err := arrayInElems(ctx, elemTarget, d.StringValue(), pos)
+					if err != nil {
+						return Datum{}, err
+					}
+					return NewStringDatum(out), nil
+				}
+			}
+		}
 		if fields, ok := compositeCastTarget(ctx, elemTarget); ok {
 			sv := d.StringValue()
 			if isArrTarget || strings.HasPrefix(strings.TrimSpace(sv), "{") {

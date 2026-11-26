@@ -391,8 +391,15 @@ func coerceDatetimeArrayOperands(l, r Expr) (Expr, Expr) {
 		switch n := commonTypeCanonical(strings.TrimSuffix(t.Name, "[]")); n {
 		case "date", "time", "timetz", "timestamp", "timestamptz", "interval":
 			return &CastExpr{pos: s.Pos(), Operand: s, TargetType: n + "[]", SourceType: "unknown"}
+		case "":
+			return lit
+		default:
+			// Any other element type: the unknown literal takes the array
+			// type (array_in), so `a = '{1, 2, 3}'` compares the
+			// normalised array, not the literal's spelling — EXPLAIN on PG
+			// shows `'{1,2,3}'::integer[]`. M0149-0046k.
+			return &CastExpr{pos: s.Pos(), Operand: s, TargetType: n + "[]", SourceType: "unknown"}
 		}
-		return lit
 	}
 	return cast(l, r), cast(r, l)
 }

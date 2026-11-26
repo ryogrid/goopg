@@ -1,8 +1,8 @@
 # M0149\-0046 — Port subscription/t/002\_types.pl
 
-Status: in progress. TestPort\_Subscription002Types is written \(three pairings\) and gated by GOOPG\_TAP\_002. Its
-SQL and expected output are 002\_types.pl's, extracted verbatim. The port passes with PG 18.3 on both sides, which
-checks the extraction.
+Status: done. TestPort\_Subscription002Types is ungated and passes 3 of 3 runs in all three pairings \(all\-goopg;
+PG 18.3 publisher with goopg subscriber; goopg publisher with PG 18.3 subscriber\), M0149\-0046a–k. Its SQL and
+expected output are 002\_types.pl's, extracted verbatim.
 
 The PG nodes come from the test\-module toolchain \(`tapnode.NewPGModules`, tmp/pg183\-inj\), because the test
 creates the hstore contrib type and postgres/local\_install has no contrib modules.
@@ -25,7 +25,7 @@ is one link from the TAP test:
 | M0149\-0046h \(done\) | a goopg publisher's pgoutput misreads a stored hstore value as an external TOAST pointer |
 | M0149\-0046i \(done\) | `UPDATE … SET b[2] = NULL` \(array element assignment\) is a syntax error on a goopg node |
 | M0149\-0046j \(done\) | `((a).a).a` on a nested composite field is refused: "column notation .a applied to type public . tst\_comp\_basic\_t, which is not a composite type" |
-| M0149\-0046k | an array compared with an unnormalised literal \(`a = '\{1, 2, 3\}'`\) matches no row on a goopg node |
+| M0149\-0046k \(done\) | an array compared with an unnormalised literal \(`a = '\{1, 2, 3\}'`\) matches no row on a goopg node |
 
 ## Landed — M0149\-0046a, NULL array elements
 
@@ -224,3 +224,21 @@ TestCompositeFieldTypeStripsSchema.
 
 Every statement of 002 now runs on a goopg node. The remaining difference is in the goopg\-publisher pairings:
 `WHERE a = '{1, 2, 3}'` compares the stored array text with the literal's text, so it matches no row \(0046k\).
+
+## Landed — M0149\-0046k, an array compared with an unnormalised literal
+
+PG coerces an unknown literal compared with an array column to the column's array type \(array\_in\); EXPLAIN shows
+`'{1,2,3}'::integer[]`. goopg compared the stored, canonical array text with the literal's spelling, so `a = '{1, 2,
+3}'` matched no row. Four changes fix it:
+
+- **Comparison coercion.** `coerceDatetimeArrayOperands` now casts an unknown literal opposite any array\-typed
+  operand, not only date\-time ones.
+- **DML index key.** `planIndexScanFromWhereShape` gives an array column's key literal the same cast, so the
+  UPDATE / DELETE recheck predicate compares normalised arrays.
+- **Array casts.** evalCast's general `[]` arm runs each element through array\_in and re\-renders it, so
+  `'{5, NULL, 3}'::int[]` is `{5,NULL,3}`. Date\-time, composite, range and reg\* element arrays, and
+  multidimensional literals, keep their own arms.
+- **Probe keys.** `indexProbeKey` normalises a still\-text probe for an array key column.
+
+TestArrayIndexQuotedBraceElement had pinned a 0A000 refusal of a 2\-D literal probe. It now pins PG's answer \(count
+0\). The arrays regress case went from 750 to 749.

@@ -1,7 +1,6 @@
 package testport
 
 import (
-	"os"
 	"strings"
 	"testing"
 
@@ -15,17 +14,11 @@ import (
 // It runs in three pairings: all-goopg, a PG 18.3 publisher with a goopg
 // subscriber, and a goopg publisher with a PG 18.3 subscriber.
 //
-// Gated by GOOPG_TAP_002 until it passes (M0149-0046). The PG 18.3
-// publisher with a goopg subscriber passes (M0149-0046a-g); with a goopg
-// publisher every statement runs (M0149-0046h-j), but an array compared with
-// an unnormalised literal ('{1, 2, 3}') matches no row on the goopg node, so
-// three updates / deletes do nothing (M0149-0046k).
+// Passes 3/3 in all three pairings (M0149-0046a-k). PG nodes come from the
+// test-module toolchain (tapnode.NewPGModules) for contrib/hstore.
 func TestPort_Subscription002Types(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")
-	}
-	if os.Getenv("GOOPG_TAP_002") == "" {
-		t.Skip("002 re-port is not passing yet (M0149-0046); set GOOPG_TAP_002=1 to run")
 	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)

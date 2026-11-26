@@ -12913,7 +12913,14 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 		// runtime and routes through EncodeVarchar/EncodeChar.
 		// For user-defined enum columns, wrap in CastExpr so the
 		// executor converts the string to KindEnum (sort order). M0097-0022.
-		if col2 := inMemoryCat(cat); col2 != nil {
+		if col.Type.IsArray {
+			// An array column's key literal takes the array type
+			// (array_in), as the comparison coercion does
+			// (coerceDatetimeArrayOperands): '{1, 2, 3}' must probe and
+			// recheck as {1,2,3}. M0149-0046k.
+			resolvedKey = &CastExpr{pos: keyExpr.Pos(), Operand: resolvedKey,
+				TargetType: strings.ToLower(col.Type.Name) + "[]", SourceType: "unknown"}
+		} else if col2 := inMemoryCat(cat); col2 != nil {
 			if _, isEnum := col2.LookupEnum(col.Type.Name); isEnum {
 				resolvedKey = &CastExpr{pos: keyExpr.Pos(), Operand: resolvedKey, TargetType: col.Type.Name}
 			}

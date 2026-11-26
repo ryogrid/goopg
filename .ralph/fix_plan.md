@@ -16947,13 +16947,14 @@ verify each at HEAD when the task starts.
   - 2026\-11\-26 \(done\): TestPort\_Subscription009Matviews passes 3/3 in all three pairings.
     - The first pass was luck. A probe showed that REFRESH MATERIALIZED VIEW on a goopg publisher streamed the matview's rows, and a goopg subscriber's apply worker then failed \("INSERT for relation public.testmv1 has no local table"\) and lost later changes.
     - RelationDef.NotPublishable = !catalog.IsPublishableTable\(t\); relationIsPublishable skips it \(is\_publishable\_class\). Unit test TestPgOutputSkipsMaterializedView.
-- [ ] **M0149-0046 — port subscription/t/002_types.pl**
+- [x] **M0149-0046 — port subscription/t/002_types.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/002_types.pl` — arrays, composites, enums, domains, ranges over logical replication.
   Likely prerequisites \(verify at start\): pgoutput Type \(`Y`\) messages, text I/O of every listed type on both sides, range/multirange, domain constraints at apply.
   - Path\-to\-TAP: 002 \(goopg\-node pairings\) ← 0046a…f; each blocker is one link \(the DDL / DML of 002 fails on any goopg node\).
   - 2026\-11\-26 \(progress\): TestPort\_Subscription002Types written and gated by GOOPG\_TAP\_002, with the SQL and expected output extracted verbatim from the .pl. It passes PG↔PG, which checks the port. PG nodes use tapnode.NewPGModules; scripts/build\-pg183\-toolchain.sh installs contrib/hstore.
+  - 2026\-11\-26 \(done\): TestPort\_Subscription002Types ungated, 3/3 runs in all three pairings \(0046a–k\); inventory 002 → port.
 - [x] **M0149-0046a — NULL array elements**
   Kind: impl
   Parent: M0149-0046
@@ -17032,11 +17033,18 @@ verify each at HEAD when the task starts.
   - 002 delete batch on a goopg node: `DELETE FROM tst\_comp\_mix\_array WHERE \(\(a\).a\).a = 1` fails with "column notation .a applied to type public . tst\_comp\_basic\_t, which is not a composite type". The inner field's type is the parser's token string with a schema qualifier; resolve it like compositeFieldBaseTypeName does.
   - Path\-to\-TAP: 002 goopg\-publisher pairings ← 0046j \(1 link\).
   - 2026\-11\-26 \(done\): optimizer/fieldselect.go compositeFieldType strips the schema qualifier of a field type token string. Unit test TestCompositeFieldTypeStripsSchema. All of 002's statements now run on a goopg node; regress rowtypes unchanged \(438\).
-- [ ] **M0149-0046k — array equality with an unnormalised literal on a goopg node**
+- [x] **M0149-0046k — array equality with an unnormalised literal on a goopg node**
   Kind: impl
   Parent: M0149-0046
   - 002 goopg\-publisher pairings: `UPDATE tst\_arrays … WHERE a = '\{1, 2, 3\}'`, `DELETE FROM tst\_one\_array WHERE b = '\{2, 3, 1\}'`, `DELETE FROM tst\_arrays WHERE a = '\{1, 2, 3\}'` and `DELETE FROM tst\_comp\_enum\_what WHERE \(b\[1\]\).b = '\{c, a, b\}'` match no row on the goopg publisher. The literal keeps its spaces and the comparison is textual. PG coerces the unknown literal to the array type \(array\_in\) and compares with array\_eq. Probably the unknown\-literal coercion for an array comparison, plus the index probe key path for array PKs.
   - Path\-to\-TAP: 002 goopg\-publisher pairings ← 0046k \(1 link\).
+  - 2026\-11\-26 \(done\):
+    - coerceDatetimeArrayOperands casts an unknown literal opposite any array operand.
+    - planIndexScanFromWhereShape casts an array column's key literal, so the DML recheck predicate is normalised.
+    - evalCast's general `\[\]` arm normalises scalar\-element array casts \(array\_in\).
+    - indexProbeKey normalises a text probe for an array key.
+  - Unit test TestArrayCastNormalisesScalarElements. TestArrayIndexQuotedBraceElement now pins PG's count 0 for a 2\-D literal probe instead of goopg's old 0A000.
+  Movement: yes — tap 002 3/3 pairings pass (goopg-publisher pairings 1/4 -> 4/4); regress arrays 750 -> 749
 - [ ] **M0149-0047 — port subscription/t/010_truncate.pl**
   Kind: impl
   Parent: none

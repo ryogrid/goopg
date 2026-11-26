@@ -166,3 +166,30 @@ func TestApplyWorkerTypedTextAndCatalogUnwrap(t *testing.T) {
 		}
 	}
 }
+
+// TestArrayCastNormalisesScalarElements pins array_in for casts to an
+// array of a scalar type (M0149-0046k): '{5, NULL, 3}'::int[] is {5,NULL,3},
+// '{2.50,1.0}'::float8[] is {2.5,1}, '{"a", b}'::text[] is {a,b}. The planner
+// casts an unknown literal compared with an array column to the column's
+// array type, so `a = '{1, 2, 3}'` compares normalised arrays; goopg kept
+// the literal's spelling and subscription/t/002_types.pl's UPDATE / DELETE
+// by an int[] key matched no row.
+func TestArrayCastNormalisesScalarElements(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	for _, tc := range []struct{ typ, in, want string }{
+		{"int4[]", "{5, NULL, 3}", "{5,NULL,3}"},
+		{"int4[]", "{1, 2, 3}", "{1,2,3}"},
+		{"float8[]", "{2.50,1.0}", "{2.5,1}"},
+		{"text[]", `{"a", b}`, "{a,b}"},
+		{"text[]", `{"x y",NULL,"NULL"}`, `{"x y",NULL,"NULL"}`},
+	} {
+		d, err := evalCast(NewStringDatum(tc.in), tc.typ, 0, ctx)
+		if err != nil {
+			t.Fatalf("%s::%s: %v", tc.in, tc.typ, err)
+		}
+		if d.StringValue() != tc.want {
+			t.Errorf("%s::%s = %s, want %s", tc.in, tc.typ, d.StringValue(), tc.want)
+		}
+	}
+}

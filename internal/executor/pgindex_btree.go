@@ -168,6 +168,21 @@ type indexProbeKeyPart struct {
 // they resolve to desc == nil and keep the blob path whole, which is the same
 // per-index dual-format property B2-c-ii asserted for the upper bound.
 func (ctx *Context) indexProbeKey(idx *catalog.Index, parts []indexProbeKeyPart) ([]byte, *ExecError) {
+	// A probe value for an ARRAY key column that is still the literal's text
+	// ('{1, 2, 3}' from `WHERE a = '{1, 2, 3}'`) is array_in'd first, as the
+	// unknown literal is coerced to the column's type in PG; the stored keys
+	// were built from canonical array text, so the raw spelling never
+	// matched and UPDATE / DELETE by an int[] key changed nothing
+	// (subscription/t/002_types.pl, M0149-0046k).
+	for i := range parts {
+		if p := parts[i]; p.col != nil && p.col.Type.IsArray && p.val.Kind == KindString {
+			if norm, err := evalCast(p.val, p.col.Type.Name+"[]", p.pos, ctx); err == nil {
+				parts[i].val = norm
+			} else if ee, ok := err.(*ExecError); ok {
+				return nil, ee
+			}
+		}
+	}
 	desc := ctx.pgIndexKeyDesc(idx)
 	if desc == nil {
 		var probe []byte

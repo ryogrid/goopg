@@ -29,10 +29,16 @@ func TestArrayIndexQuotedBraceElement(t *testing.T) {
 		t.Errorf("count = %v, want 1 (PG 18.3 returns 1)", rows)
 	}
 
-	// A real nested literal is still out of scope for the v0 key encoding.
-	if _, err := runSQLCtxErr(t, ctx, `SELECT count(*) FROM zbrace WHERE a = '{{1,2},{3,4}}'`); err == nil {
-		t.Error("a genuinely multidimensional literal should still be refused")
-	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "0A000" {
-		t.Errorf("nested literal: err = %v, want *ExecError{Code: 0A000}", err)
+	// A real nested (2-D) literal: PG 18.3 accepts it as a 2-D text[] and
+	// array_eq finds no 1-D row equal to it — count 0, no error. Since the
+	// unknown literal is cast to the column's array type (M0149-0046k) the
+	// one-row table is not probed through the index at all; the previous
+	// assertion pinned goopg's 0A000 refusal, not PG's answer.
+	rows, err = runSQLCtxErr(t, ctx, `SELECT count(*) FROM zbrace WHERE a = '{{1,2},{3,4}}'`)
+	if err != nil {
+		t.Fatalf("nested literal: %v (PG 18.3 returns count 0)", err)
+	}
+	if len(rows) != 1 || rows[0][0].Format() != "0" {
+		t.Errorf("nested literal count = %v, want 0 (PG 18.3)", rows)
 	}
 }
