@@ -17156,11 +17156,13 @@ verify each at HEAD when the task starts.
   Parent: M0149-0050
   - 2026\-11\-26 \(done\): handleQueryOrCopy logStatement/logDuration for the COPY path; statement line msg `statement: <sql>`; tapnode renders the prefix attribute before the level and drops proto. Test TestPGStyleLogLine.
   Movement: yes — tap 014 goopg-publisher-pg18-subscriber binary-COPY log wait fail -> pass (0/9 assertions; next stop test_arrays binary sync, 0050b)
-- [ ] **M0149-0050b — binary COPY of array columns \(array\_send\)**
+- [x] **M0149-0050b — binary COPY of array columns \(array\_send\)**
   Kind: impl
   Parent: M0149-0050
   - 014 goopg\-publisher\-pg18\-subscriber: the PG subscriber's `COPY … TO STDOUT WITH (FORMAT binary)` of test\_arrays fails with "binary COPY of array type integer\[\] is not supported". PG: arrayfuncs.c array\_send \(ndim, hasnull, elemtype, dims/lbounds, then per element length \+ elemtype send\).
   - Path\-to\-TAP: 014 goopg\-publisher\-pg18\-subscriber ← 0050b \(1 link\).
+  - 2026\-11\-26 \(done\): arraySendBinary / arrayRecvBinary \(copy\_binary\_array.go\), 1\-D, byte\-identical with PG 18.3 \(int4/numeric/text\[\] incl. NULL and empty\); encodeNumericBinary takes numeric text. Tests TestCopyBinaryArrayMatchesPG, TestCopyBinaryArrayElementTypes. Regress copydml 3/116 fails on HEAD and HEAD\~2 too \(NOTICE vs COPY\-row order; pre\-existing\).
+  Movement: yes — tap 014 goopg-publisher-pg18-subscriber 0/9 -> 6/9 assertions; regress copy2 248 -> 225
 - [ ] **M0149-0050c — a goopg subscriber with binary = true: binary table sync and binary apply**
   Kind: impl
   Parent: M0149-0050
@@ -17171,6 +17173,7 @@ verify each at HEAD when the task starts.
   Parent: M0149-0050
   - 014 goopg\-publisher\-pg18\-subscriber after 0050b: the binary option must produce `b` columns via typsend \(proto.c logicalrep\_write\_tuple\).
   - Path\-to\-TAP: 014 goopg\-publisher\-pg18\-subscriber ← 0050d \(1 link\).
+  - 2026\-11\-26: not a proven 014 blocker so far — the PG 18 subscriber applies goopg's text \(`t`\) tuple columns in binary mode, and the binary\-apply assertions pass. Re\-check once 0050e lets the run finish; otherwise PG parity only.
 - [ ] **M0149-0050e — custom\-type DDL: shell type, LANGUAGE internal varchar I/O functions, ALTER TYPE SET \(send, receive\)**
   Kind: impl
   Parent: M0149-0050

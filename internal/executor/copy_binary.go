@@ -160,8 +160,8 @@ func isValidJSONText(s string) bool {
 // --- type-specific binary encoders ---
 
 func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
-	if err := rejectBinaryCopyArray(t); err != nil {
-		return nil, err
+	if t.IsArray {
+		return arraySendBinary(t, d)
 	}
 	switch strings.ToLower(t.Name) {
 	case "point", "lseg", "box", "line", "circle", "tid":
@@ -463,7 +463,9 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 }
 
 // rejectBinaryCopyArray refuses an array column in BINARY COPY, loudly and by
-// name. Both halves of binary COPY dispatch on the element type name (an array
+// name, when its element type has no binary form here (array.ElemTypeInfo
+// does not know it); arraySendBinary / arrayRecvBinary handle the rest
+// (M0149-0050b). Both halves of binary COPY dispatch on the element type name (an array
 // column is catalog.Type{Name:<ELEMENT>, IsArray:true}), so before this guard an
 // int4[] column reported "expected int, got kind 3" while a text[] or bytea[]
 // column fell through to the default raw-bytes arm and SILENTLY shipped the
@@ -483,8 +485,8 @@ func rejectBinaryCopyArray(t catalog.Type) error {
 }
 
 func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
-	if err := rejectBinaryCopyArray(t); err != nil {
-		return Datum{}, err
+	if t.IsArray {
+		return arrayRecvBinary(t, payload)
 	}
 	switch strings.ToLower(t.Name) {
 	case "point", "lseg", "box", "line", "circle", "tid":
@@ -725,6 +727,10 @@ func encodeNumericBinary(d Datum) ([]byte, error) {
 		text = d.Format()
 	case KindInt:
 		text = fmt.Sprintf("%d", d.Int)
+	case KindString:
+		// numeric_out text, as an array element arrives (arraySendBinary
+		// parses array_out's text element by element).
+		text = strings.TrimSpace(d.StringValue())
 	default:
 		return nil, fmt.Errorf("cannot encode kind %d as numeric", d.Kind)
 	}

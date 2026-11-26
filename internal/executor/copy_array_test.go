@@ -138,20 +138,29 @@ func TestCopyTextArrayTextReachesTheEncoder(t *testing.T) {
 	}
 }
 
-// TestCopyBinaryRefusesArrayColumns pins the deliberate refusal (0A000) rather
-// than leaving the two pre-existing failure modes in place: int4[] reported a
-// confusing kind mismatch, while text[]/bytea[] fell through to the raw-bytes
-// arm and SILENTLY shipped "{a,b}" where upstream ships array_send's binary
-// shape. Delete this test when array_send/array_recv are ported.
-func TestCopyBinaryRefusesArrayColumns(t *testing.T) {
-	for _, name := range []string{"int4", "text", "bytea", "date", "numeric"} {
-		at := catalog.Type{Name: name, IsArray: true}
-		_, err := datumToCopyBinary(at, NewStringDatum(`{1}`))
-		assertBinaryArrayRefusal(t, name+"[] out", err)
-		_, err = copyBinaryToDatum(at, []byte{0, 0, 0, 1})
-		assertBinaryArrayRefusal(t, name+"[] in", err)
+// TestCopyBinaryArrayElementTypes: binary COPY of arrays (array_send /
+// array_recv, M0149-0050b) round-trips each element type through its own
+// send / receive; this replaced the 0A000 refusal pinned before the port.
+func TestCopyBinaryArrayElementTypes(t *testing.T) {
+	for _, tc := range []struct{ name, lit string }{
+		{"int4", "{1,2}"}, {"text", "{a,\"b c\"}"}, {"date", "{2026-11-26}"}, {"numeric", "{1.5,-2}"},
+	} {
+		at := catalog.Type{Name: tc.name, IsArray: true}
+		b, err := datumToCopyBinary(at, NewStringDatum(tc.lit))
+		if err != nil {
+			t.Errorf("%s[] out: %v", tc.name, err)
+			continue
+		}
+		d, err := copyBinaryToDatum(at, b)
+		if err != nil {
+			t.Errorf("%s[] in: %v", tc.name, err)
+			continue
+		}
+		if d.Format() != tc.lit {
+			t.Errorf("%s[] round trip = %q, want %q", tc.name, d.Format(), tc.lit)
+		}
 	}
-	// The scalar of the same name must be untouched — the guard keys on
+	// The scalar of the same name must be untouched — the arm keys on
 	// IsArray, not on the type name.
 	if _, err := datumToCopyBinary(catalog.Type{Name: "int4"}, Datum{Kind: KindInt, Int: 7}); err != nil {
 		t.Errorf("scalar int4 binary encode broke: %v", err)

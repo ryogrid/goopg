@@ -20,6 +20,28 @@ level, as PG writes it, and drops goopg's `proto` attribute. A statement line th
 
 Test: TestPGStyleLogLine \(new case\). In TAP 014 goopg\\-publisher\\-pg18\\-subscriber, the binary\\-COPY log wait now passes.
 
+## Landed — M0149\-0050b, binary COPY of array columns
+
+goopg refused an array column in binary COPY \("binary COPY of array type integer\[\] is not supported"\). A PG
+subscriber's binary table sync of test\_arrays therefore failed. `arraySendBinary` / `arrayRecvBinary`
+\(internal/executor/copy\_binary\_array.go\) port array\_send / array\_recv \(arrayfuncs.c\) for one\-dimensional arrays:
+
+- Layout: ndim, has\-nulls, element type OID, then per dimension the length and a lower bound of 1, then each element
+  as an int4 length \(\-1 for NULL\) plus its own send form. An empty array is ndim 0.
+- Send parses array\_out's text element by element through COPY's text input for the element type, then that type's
+  binary send. Receive checks the element type OID, decodes each element with its binary receive, and rebuilds
+  array\_out's text in ISO / hex styles.
+- Element types array.ElemTypeInfo does not know keep the 0A000 refusal. Multi\-dimensional or explicitly bounded
+  arrays are refused with 0A000.
+- encodeNumericBinary accepts numeric text, which is how an array element arrives.
+
+Measured byte\-identical with PG 18.3's COPY … WITH \(FORMAT binary\) of `int4[]`, `numeric[]` and `text[]` columns,
+including NULL elements and an empty array. PG's binary stream reloads into goopg. Tests:
+TestCopyBinaryArrayMatchesPG and TestCopyBinaryArrayElementTypes \(replacing the refusal test\).
+
+In TAP 014 goopg\-publisher\-pg18\-subscriber, the first six assertions now pass, including binary apply \(the PG
+subscriber accepts goopg's text tuple columns\). The pairing stops at the custom\-type DDL \(0050e\).
+
 ## Open
 
 - **M0149\\-0050b**: binary COPY of array columns. goopg's binary COPY TO refuses arrays with "binary COPY of array type
