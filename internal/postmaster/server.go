@@ -375,6 +375,11 @@ func (c *Config) defaults() {
 type Server struct {
 	cfg Config
 
+	// tableSyncRetry holds each subscription's pending tablesync retry
+	// timer (tablesync_retry.go); a newer refresh replaces it.
+	tableSyncRetryMu sync.Mutex
+	tableSyncRetry   map[string]*time.Timer
+
 	listener net.Listener
 	ready    chan struct{} // closed once listener is bound
 	addr     atomic.Pointer[net.TCPAddr]

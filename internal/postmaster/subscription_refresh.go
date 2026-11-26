@@ -133,6 +133,37 @@ func (s *Server) RefreshSubscriptionOnPublisher(subName, conninfo string, dbOid 
 	// Initial synchronization: one tablesync exchange per non-'r' row
 	// (upstream's tablesync workers; the command reports the workers'
 	// outcomes, so per-rel failures surface below).
+	syncErrs, failed := s.runSubscriptionTableSyncs(subName, conninfo, pubs, rels)
+	if failed {
+		// PG's failed tablesync worker exits and the apply worker
+		// relaunches it after wal_retrieve_retry_interval, logging the
+		// ERROR each time; goopg retries from a timer. M0149-0048f.
+		s.scheduleTableSyncRetry(subName, conninfo, dbOid, pubs, rels)
+	}
+	// Worker kill: the Publications snapshot the running worker
+	// dialed with is stale (and the slot must go ACTIVE→free before
+	// the relaunched worker re-acquires it). PG kills the worker
+	// inside AlterSubscription_refresh and relaunches it from the
+	// launcher after the catalog update commits; the executor's
+	// post-write launcher kick is goopg's twin of that relaunch, so
+	// only the kill happens here (documented eager-restart
+	// deviation). The kill runs even on sync failure — rows left at
+	// 'i'/'d' are picked up by the next refresh, as PG's failed
+	// tablesync workers leave them, and a stopped worker relaunches
+	// on the launcher's poll even when the statement aborts.
+	s.applyLauncher.StopWorker(subName)
+	if len(syncErrs) > 0 {
+		return &executor.ExecError{Code: "XX000",
+			Message: fmt.Sprintf("subscription %q refresh: table copy failed: %s", subName, strings.Join(syncErrs, "; "))}
+	}
+	return nil
+}
+
+// runSubscriptionTableSyncs runs one tablesync exchange per non-'r'
+// pg_subscription_rel row of rels (upstream's tablesync workers), logs each
+// failed rel as an ERROR, and promotes the completed ones to READY. It
+// returns the manager-level errors and whether any rel failed.
+func (s *Server) runSubscriptionTableSyncs(subName, conninfo string, pubs []string, rels map[uint32]*refreshRel) ([]string, bool) {
 	results, mgrErr := replication.RunTableSyncManager(context.Background(), replication.TableSyncManagerConfig{
 		PubSub:       s.cfg.PubSub,
 		SubName:      subName,
@@ -183,23 +214,13 @@ func (s *Server) RefreshSubscriptionOnPublisher(subName, conninfo string, dbOid 
 			continue
 		}
 	}
-	// Worker kill: the Publications snapshot the running worker
-	// dialed with is stale (and the slot must go ACTIVE→free before
-	// the relaunched worker re-acquires it). PG kills the worker
-	// inside AlterSubscription_refresh and relaunches it from the
-	// launcher after the catalog update commits; the executor's
-	// post-write launcher kick is goopg's twin of that relaunch, so
-	// only the kill happens here (documented eager-restart
-	// deviation). The kill runs even on sync failure — rows left at
-	// 'i'/'d' are picked up by the next refresh, as PG's failed
-	// tablesync workers leave them, and a stopped worker relaunches
-	// on the launcher's poll even when the statement aborts.
-	s.applyLauncher.StopWorker(subName)
-	if len(syncErrs) > 0 {
-		return &executor.ExecError{Code: "XX000",
-			Message: fmt.Sprintf("subscription %q refresh: table copy failed: %s", subName, strings.Join(syncErrs, "; "))}
+	failed := false
+	for _, r := range results {
+		if r.Err != nil {
+			failed = true
+		}
 	}
-	return nil
+	return syncErrs, failed
 }
 
 // refreshOpenWriter builds RunTableSyncManager's per-rel writer: a

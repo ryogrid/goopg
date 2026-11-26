@@ -1,7 +1,6 @@
 package testport
 
 import (
-	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -20,13 +19,13 @@ import (
 // all-goopg, a PG 18.3 publisher with a goopg subscriber, and a goopg
 // publisher with a PG 18.3 subscriber.
 //
-// Gated by GOOPG_TAP_011 until it passes (M0149-0048).
+// Landed by M0149-0048a-f: the publisher's generated-column and
+// column-list rule, PG 18's pg_get_publication_tables, the subscriber's own
+// generated columns and incompatible-column error, PG 18's tablesync column
+// set and a retried failed table sync.
 func TestPort_Subscription011Generated(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")
-	}
-	if os.Getenv("GOOPG_TAP_011") == "" {
-		t.Skip("011 port is not passing yet (M0149-0048); set GOOPG_TAP_011=1 to run")
 	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)
