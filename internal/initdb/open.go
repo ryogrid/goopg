@@ -1001,10 +1001,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// Atomic HOT-update change record (M0046-0001). Encodes the
 	// old-slot xmax stamp + new tuple bytes on the same page in one
 	// record so replay can reconstruct the HOT chain atomically.
-	logHeapHotUpdate := func(rel storage.RelFileNode, blk storage.BlockNumber, oldSlot, newSlot uint16, xmax storage.TransactionID, tupleBytes []byte) (storage.LSN, error) {
+	logHeapHotUpdate := func(rel storage.RelFileNode, blk storage.BlockNumber, oldSlot, newSlot uint16, xmax storage.TransactionID, tupleBytes, oldTuple []byte) (storage.LSN, error) {
 		// A4: emit a PostgreSQL xl_heap_update (HOT opcode) record instead of the
 		// goopg-native body. Recovery routes it to replayDecodedXLogHeapUpdate.
-		payload, err := xlog.EncodeHeapHotUpdatePGVis(rel, blk, oldSlot, newSlot, xmax, tupleBytes, visibleCleared(rel, blk))
+		// oldTuple (REPLICA IDENTITY FULL at wal_level = logical) rides in main
+		// data for logical decoding.
+		payload, err := xlog.EncodeHeapHotUpdatePGOld(rel, blk, oldSlot, newSlot, xmax, tupleBytes, oldTuple, visibleCleared(rel, blk))
 		if err != nil {
 			return 0, err
 		}

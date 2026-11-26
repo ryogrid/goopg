@@ -4276,7 +4276,7 @@ func markHeapHotUpdateDirty(
 	pool *storage.Pool, slot *storage.Slot,
 	rel storage.RelFileNode, blk storage.BlockNumber,
 	oldLineSlot, newLineSlot uint16, xmax storage.TransactionID,
-	tupleBytes []byte,
+	tupleBytes, oldTuple []byte,
 ) error {
 	// Adopt PG's self-pointing t_ctid for the HOT new version (the chain tail),
 	// matching what replay reconstructs (xl_heap_update carries no new t_ctid).
@@ -4295,7 +4295,7 @@ func markHeapHotUpdateDirty(
 	// MarkDirtyLogicalChange — see markHeapInsertDirty for the
 	// rationale.
 	return pool.MarkDirtyLogicalChange(slot, func() (storage.LSN, error) {
-		return logHot(rel, blk, oldLineSlot, newLineSlot, xmax, tupleBytes)
+		return logHot(rel, blk, oldLineSlot, newLineSlot, xmax, tupleBytes, oldTuple)
 	})
 }
 
@@ -4732,6 +4732,27 @@ func stampMovedPartitionOldTuple(ctx *Context, page storage.Page, slot uint16) e
 //
 // The caller must not hold the page's content lock — this function
 // acquires and releases it internally.
+// hotUpdateLogsOldTuple reports whether a HOT update of rel must log its
+// old tuple: RelationIsLogicallyLogged at wal_level = logical with REPLICA
+// IDENTITY FULL (heap_update → ExtractReplicaIdentity, heapam.c).
+func hotUpdateLogsOldTuple(ctx *Context, rel storage.RelFileNode) bool {
+	if ctx.GetSetting == nil || rel.RelOid < catalog.FirstNormalObjectId {
+		return false
+	}
+	if lvl, ok := ctx.GetSetting("wal_level"); !ok || !strings.EqualFold(lvl, "logical") {
+		return false
+	}
+	im, ok := underlyingInMemory(ctx.Catalog)
+	if !ok {
+		return false
+	}
+	tbl, found := im.LookupTableByOID(rel.RelOid, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
+	if !found || tbl == nil || tbl.Temp || tbl.Unlogged {
+		return false
+	}
+	return catalog.ReplIdentOrDefault(tbl.ReplicaIdentity)[0] == 'f'
+}
+
 func tryApplyHOTUpdate(
 	ctx *Context,
 	rel storage.RelFileNode,
@@ -4898,6 +4919,16 @@ func tryApplyHOTUpdate(
 	// recovery degrades to the single-xid stamp — correct, since the transient
 	// lockers do not survive a crash (multixact WAL persistence deferred; see
 	// docs/design/0118-0002).
+	// heap_update logs the old tuple for logical decoding when the
+	// relation's replica identity is FULL (ExtractReplicaIdentity); captured
+	// before the stamp below rewrites its xmax. A HOT update changes no key
+	// column, so DEFAULT / USING INDEX identities need none.
+	var oldImage []byte
+	if hotUpdateLogsOldTuple(ctx, rel) {
+		if t, terr := storage.PageGetHeapTuple(s.Page(), oldSlot); terr == nil {
+			oldImage, _ = t.MarshalBinary()
+		}
+	}
 	stampErr := func() error {
 		if oldHdrTup, herr := storage.PageGetHeapTuple(s.Page(), oldSlot); herr == nil {
 			// Carry the old tuple's non-conflicting lockers forward onto the new
@@ -4958,7 +4989,7 @@ func tryApplyHOTUpdate(
 		return false, stampErr
 	}
 
-	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, newSlot, effectiveWriterXID(ctx), tupleBytes)
+	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, newSlot, effectiveWriterXID(ctx), tupleBytes, oldImage)
 	// M0146-0063b: heap_update clears the page's visibility-map bits when it
 	// was all-visible, HOT or not — the new version's xmin is not yet visible
 	// to all, and an all-frozen bit would let VACUUM skip freezing it.

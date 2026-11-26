@@ -832,7 +832,7 @@ type LogHeapFreezeFunc func(rel RelFileNode, blk BlockNumber, page Page, frozenS
 // LogHeapHotUpdateFunc emits one atomic HOT-update redo record. newSlot is the
 // line-pointer slot the new tuple version landed at (PG's xl_heap_update
 // new_offnum).
-type LogHeapHotUpdateFunc func(rel RelFileNode, blk BlockNumber, oldSlot, newSlot uint16, xmax TransactionID, tupleBytes []byte) (LSN, error)
+type LogHeapHotUpdateFunc func(rel RelFileNode, blk BlockNumber, oldSlot, newSlot uint16, xmax TransactionID, tupleBytes, oldTuple []byte) (LSN, error)
 
 // LogHeapUpdateFunc emits one atomic NON-HOT heap-update redo record (B0.2,
 // catalog ALTERs): old version at (oldBlk, oldSlot) gets xmax + forward ctid,

@@ -282,6 +282,23 @@ func EncodeHeapHotUpdatePG(rel storage.RelFileNode, blk storage.BlockNumber, old
 // XLH_UPDATE_OLD_ALL_VISIBLE_CLEARED for the old page, and a HOT update has
 // no other page.
 func EncodeHeapHotUpdatePGVis(rel storage.RelFileNode, blk storage.BlockNumber, oldSlot, newSlot uint16, xmax storage.TransactionID, newTuple []byte, visCleared bool) ([]byte, error) {
+	return EncodeHeapHotUpdatePGOld(rel, blk, oldSlot, newSlot, xmax, newTuple, nil, visCleared)
+}
+
+// xlhUpdateContainsOldTuple is PG's XLH_UPDATE_CONTAINS_OLD_TUPLE
+// (heapam_xlog.h): main data carries the old tuple after xl_heap_update.
+const xlhUpdateContainsOldTuple uint8 = 0x04
+
+// xlhUpdateContainsOldKey is PG's XLH_UPDATE_CONTAINS_OLD_KEY: the old
+// tuple in main data holds only the replica identity key.
+const xlhUpdateContainsOldKey uint8 = 0x08
+
+// EncodeHeapHotUpdatePGOld is EncodeHeapHotUpdatePGVis carrying the old
+// tuple for logical decoding: log_heap_update appends ExtractReplicaIdentity's
+// old tuple to main data (xl_heap_header + the tuple bytes past the fixed
+// header) and sets XLH_UPDATE_CONTAINS_OLD_TUPLE when the relation's replica
+// identity is FULL at wal_level = logical. oldTuple nil omits it.
+func EncodeHeapHotUpdatePGOld(rel storage.RelFileNode, blk storage.BlockNumber, oldSlot, newSlot uint16, xmax storage.TransactionID, newTuple, oldTuple []byte, visCleared bool) ([]byte, error) {
 	if len(newTuple) < storage.SizeOfHeapTupleHeaderData {
 		return nil, fmt.Errorf("wal: heap-hot-update new tuple %d bytes < fixed header %d", len(newTuple), storage.SizeOfHeapTupleHeaderData)
 	}
@@ -295,6 +312,10 @@ func EncodeHeapHotUpdatePGVis(rel storage.RelFileNode, blk storage.BlockNumber, 
 	}
 	// new_xmax [8:12] stays 0 (the new tuple is not deleted).
 	binary.LittleEndian.PutUint16(mainData[12:14], newSlot) // new_offnum
+	if len(oldTuple) >= storage.SizeOfHeapTupleHeaderData {
+		mainData[7] |= xlhUpdateContainsOldTuple
+		mainData = append(mainData, heapHeaderPlusData(oldTuple)...)
+	}
 
 	return framedAssemble(RmgrHeap, xlogHeapHotUpdate, uint32(xmax), mainData, []BlockRef{{
 		ID: 0, Rel: rel, Block: blk, Data: heapHeaderPlusData(newTuple),

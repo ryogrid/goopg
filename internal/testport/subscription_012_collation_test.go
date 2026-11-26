@@ -1,7 +1,6 @@
 package testport
 
 import (
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -23,13 +22,12 @@ import (
 // publisher with a goopg subscriber, a goopg publisher with a PG 18.3
 // subscriber.
 //
-// Gated by GOOPG_TAP_012 until it passes (M0149-0049).
+// Landed by M0149-0049a (the apply row lookup compares by the
+// nondeterministic collation) and M0149-0049b (a goopg publisher logs the
+// old tuple of a REPLICA IDENTITY FULL HOT update).
 func TestPort_Subscription012Collation(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")
-	}
-	if os.Getenv("GOOPG_TAP_012") == "" {
-		t.Skip("012 port is not passing yet (M0149-0049); set GOOPG_TAP_012=1 to run")
 	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)

@@ -251,7 +251,7 @@ func classifyDecodedXLog(d *Decoder, r Record) error {
 			OldTuple: oldTuple,
 		})
 	case xlogHeapHotUpdate:
-		_, oldOffnum, _, _, _, newOffnum, err := decodeXLogHeapUpdateMainData(r.XLog.MainData)
+		_, oldOffnum, _, flags, _, newOffnum, err := decodeXLogHeapUpdateMainData(r.XLog.MainData)
 		if err != nil {
 			return err
 		}
@@ -260,6 +260,17 @@ func classifyDecodedXLog(d *Decoder, r Record) error {
 		if err != nil {
 			return err
 		}
+		// DecodeUpdate: XLH_UPDATE_CONTAINS_OLD (REPLICA IDENTITY FULL, or a
+		// changed key) puts the old tuple after xl_heap_update in main data.
+		// Without it — DEFAULT identity, key unchanged — OldTuple stays
+		// empty and the subscriber keys the row by the new tuple.
+		var oldTuple []byte
+		if flags&(xlhUpdateContainsOldTuple|xlhUpdateContainsOldKey) != 0 && len(r.XLog.MainData) > sizeOfXLogHeapUpdateData {
+			oldTuple, err = reconstructMarshaledTupleFromHeader(r.XLog.MainData[sizeOfXLogHeapUpdateData:])
+			if err != nil {
+				return err
+			}
+		}
 		d.ApplyChange(xid, Change{
 			Kind:     ChangeUpdate,
 			LSN:      r.EndLSN,
@@ -267,8 +278,7 @@ func classifyDecodedXLog(d *Decoder, r Record) error {
 			Block:    block.Block,
 			LineSlot: oldOffnum,
 			NewTuple: tuple,
-			// OldTuple empty — HOT update under REPLICA IDENTITY DEFAULT, matching
-			// the native RecordKindHeapHotUpdate classifier path.
+			OldTuple: oldTuple,
 		})
 	}
 	return nil

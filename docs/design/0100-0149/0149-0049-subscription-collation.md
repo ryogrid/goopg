@@ -1,11 +1,8 @@
 # M0149\-0049 — Port subscription/t/012\_collation.pl
 
-Status: in progress. TestPort\_Subscription012Collation is written \(three pairings\) and gated by GOOPG\_TAP\_012.
-
-- PG 18.3 publisher → goopg subscriber: passes 3/3.
-- goopg publisher → PG 18.3 subscriber: skips, as the .pl does without ICU. The PG 18.3 build is configured without
-  `--with-icu`, and the subscriber is the node that creates the ICU collation.
-- all\\-goopg: the replica identity index case passes; the REPLICA IDENTITY FULL case waits on M0149\\-0049b.
+Status: done. TestPort\_Subscription012Collation passes 3/3 in all\-goopg and in PG 18.3 publisher → goopg subscriber. The
+goopg publisher → PG 18.3 subscriber pairing skips, as the .pl does without ICU: the PG 18.3 build is configured without
+`--with-icu`, and the subscriber is the node that creates the ICU collation.
 
 ## Landed — M0149\\-0049a, the apply row lookup honours a nondeterministic collation
 
@@ -22,8 +19,19 @@ missed the row and installed a second one.
 
 Test: TestApplyKeyMatchNondeterministicCollation.
 
-## Open
+## Landed — M0149\-0049b, a goopg publisher logs the old tuple of a REPLICA IDENTITY FULL HOT update
 
-- **M0149\\-0049b**: a goopg publisher logs the old tuple of an UPDATE under REPLICA IDENTITY FULL
-  \(XLH\_UPDATE\_CONTAINS\_OLD\_TUPLE in xl\_heap\_update at wal\_level = logical; heap\_update → ExtractReplicaIdentity\).
-  Without it the subscriber has no pre\\-image and locates the row by the new values.
+heap\_update logs ExtractReplicaIdentity's old tuple in xl\_heap\_update's main data with XLH\_UPDATE\_CONTAINS\_OLD\_TUPLE
+when the relation's replica identity is FULL at wal\_level = logical, and DecodeUpdate passes it to the output plugin.
+goopg's HOT update record carried no old tuple, so a REPLICA IDENTITY FULL subscriber had no pre\-image and keyed the
+lookup by the new row. goopg's non\-HOT user UPDATE is a delete \+ insert pair whose delete already carries the old
+tuple.
+
+- `hotUpdateLogsOldTuple` gates on wal\_level = logical, a permanent user table and REPLICA IDENTITY FULL. A HOT update
+  changes no key column, so DEFAULT and USING INDEX need nothing.
+- tryApplyHOTUpdate captures the old tuple before stamping it. It travels through LogHeapHotUpdateFunc to
+  `EncodeHeapHotUpdatePGOld`, which appends xl\_heap\_header \+ tuple data to main data and sets the flag. Redo ignores
+  it, as heap\_xlog\_update does.
+- classifyDecodedXLog's HOT\-update arm decodes it into Change.OldTuple when CONTAINS\_OLD\_TUPLE or \_OLD\_KEY is set.
+
+Test: TestClassifyPGHeapHotUpdateOldTuple. TestPort\_Subscription012Collation is ungated.

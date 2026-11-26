@@ -17125,7 +17125,7 @@ verify each at HEAD when the task starts.
   - Path\-to\-TAP: 011 ← 0048e \(1 link\).
   - 2026\-11\-26 \(done\): parser TableColumns; publicationColumnList \(pub\_collist\_validate codes\); Publication.Columns \+ SetPublicationColumnLists; prattrs written and reloaded \(int2VectorDatumAttnums\) and shown in the virtual pg\_publication\_rel; attrs from the list; pgoutput ColumnListFilter arm. Restart verified on a scratch server \(attrs `1 3` before and after\).
   Movement: yes — tap 011 goopg-publisher-pg18-subscriber 7/12 -> 12/12, all-goopg 7/12 -> 11/12 assertions; regress publication 595 -> 576
-- [ ] **M0149-0049 — port subscription/t/012_collation.pl**
+- [x] **M0149-0049 — port subscription/t/012_collation.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/012_collation.pl` — nondeterministic ICU collations as replica identity.
@@ -17137,12 +17137,14 @@ verify each at HEAD when the task starts.
   Parent: M0149-0049
   - 2026\-11\-26 \(done\): nondeterministicCollators \+ rowMatchesKeyCollated \(internal/executor/collation\_nondet.go\) in applyDeleteByKey / applyScanFirstMatch. Test TestApplyKeyMatchNondeterministicCollation.
   Movement: yes — tap 012 pg18-publisher-goopg-subscriber 0/2 -> 2/2 (3/3), all-goopg 0/2 -> 1/2 assertions
-- [ ] **M0149-0049b — a goopg publisher logs the old tuple of an UPDATE under REPLICA IDENTITY FULL**
+- [x] **M0149-0049b — a goopg publisher logs the old tuple of an UPDATE under REPLICA IDENTITY FULL**
   Kind: impl
   Parent: M0149-0049
   - 012 all\-goopg: `UPDATE tab2 SET b = 'bar'` \(REPLICA IDENTITY FULL\) leaves the subscriber with `foo`/`bar`: the decoded U carries no old tuple \(classifyDecodedXLog's update arms set no OldTuple; only DELETE handles XLH\_DELETE\_CONTAINS\_OLD\_TUPLE\), so the subscriber keys the lookup by the new row. PG: heap\_update logs the ExtractReplicaIdentity old tuple with XLH\_UPDATE\_CONTAINS\_OLD\_TUPLE \(or \_OLD\_KEY\) at wal\_level = logical, and DecodeUpdate passes it as change->data.tp.oldtuple.
   - Path\-to\-TAP: 012 all\-goopg ← 0049b \(1 link\).
 
+  - 2026\-11\-26 \(done\): hotUpdateLogsOldTuple \+ old\-tuple capture in tryApplyHOTUpdate → LogHeapHotUpdateFunc\(…, oldTuple\) → xlog.EncodeHeapHotUpdatePGOld \(XLH\_UPDATE\_CONTAINS\_OLD\_TUPLE\); classifier HOT arm decodes OldTuple. Test TestClassifyPGHeapHotUpdateOldTuple. 012 ungated, 3/3; inventory 012 → port.
+  Movement: yes — tap 012 all-goopg 1/2 -> 2/2 (3/3); 012 port
 - [ ] **M0149-0050 — port subscription/t/014_binary.pl**
   Kind: impl
   Parent: none
