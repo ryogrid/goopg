@@ -23,7 +23,7 @@ is one link from the TAP test:
 | M0149\-0046f \(done\) | no hstore extension |
 | M0149\-0046g \(done\) | a goopg subscriber's apply worker decodes an array column's replicated text as the element type: "int4 parse "\{1,2,3\}"" |
 | M0149\-0046h \(done\) | a goopg publisher's pgoutput misreads a stored hstore value as an external TOAST pointer |
-| M0149\-0046i | `UPDATE … SET b[2] = NULL` \(array element assignment\) is a syntax error on a goopg node |
+| M0149\-0046i \(done\) | `UPDATE … SET b[2] = NULL` \(array element assignment\) is a syntax error on a goopg node |
 | M0149\-0046j | `((a).a).a` on a nested composite field is refused: "column notation .a applied to type public . tst\_comp\_basic\_t, which is not a composite type" |
 
 ## Landed — M0149\-0046a, NULL array elements
@@ -189,3 +189,27 @@ TestPgOutputTwelveByteTextIsNotToast.
 
 With a goopg publisher the insert check now passes. The update batch then fails on the goopg node itself \(0046i,
 0046j\).
+
+## Landed — M0149\-0046i, UPDATE SET array element
+
+`UPDATE … SET col[i] = expr` follows gram.y's set\_target with an opt\_indirection subscript. On PG it is
+transformAssignmentIndirection → array\_set\_element. Both goopg parsers rejected the form with "syntax error at or
+near "\["".
+
+**Parsing.** The yacc grammar \(`update_assign: ColId '[' a_expr ']' '=' a_expr`, no new conflicts\) and the
+hand\-written `parseAssign` now parse it into `UpdateAssign.Subscript`. The parity goldens gained `Subscript=∅` on
+every UPDATE / ON CONFLICT assignment and the new pinned forms.
+
+**Planning and execution.** `applyUpdateAssign` wraps the value in an internal
+`array_assign_subscript(col, i, value)` call. A non\-array target is 42804 "cannot subscript type". In the executor,
+`evalArrayAssignSubscript` keeps each element's array\_out quoting \(a composite element stays `"(…)"`\), pads with
+NULLs past the end and coerces the value through the element type's input. It also applies PG's rules:
+
+- a NULL subscript is 22004;
+- a subscript below 1 on a non\-empty array is 2202E;
+- growing past MaxArraySize is 54000.
+
+The arrays regress case went from 760 to 750 mismatched lines.
+
+goopg arrays always have lower bound 1. Assigning `[3]` into a NULL array gives `{NULL,NULL,7}` where PG gives
+`[3:3]={7}`, and a subscript of 0 errors where PG extends the array \(deferral ledger\).

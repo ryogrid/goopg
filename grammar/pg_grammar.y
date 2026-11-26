@@ -4032,6 +4032,14 @@ update_assign:
 			{ $$ = *NewUpdateAssignAt($<p>1, $1, "", nil, NewDefaultMarker($<p>3)) }
 	| ColId '.' ColId '=' a_expr
 			{ $$ = *NewUpdateAssignAt($<p>1, $3, $1, nil, $5) }
+	/* `col[i] = expr` — an array element target (gram.y set_target's
+	   opt_indirection subscript; transformAssignmentIndirection). M0149-0046i. */
+	| ColId '[' a_expr ']' '=' a_expr
+			{
+				ua := NewUpdateAssignAt($<p>1, $1, "", nil, $6)
+				ua.Subscript = $3
+				$$ = *ua
+			}
 	/* Multi-column form `(c1, c2) = (e1, e2)` / `= (subquery)` / `= ROW(...)`
 	   — gram.y set_clause's `'(' set_target_list ')' '=' a_expr`. The RHS is
 	   whatever the expression grammar makes of it: a RowExpr for `(1, 2)`, a

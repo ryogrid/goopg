@@ -17015,11 +17015,17 @@ verify each at HEAD when the task starts.
   - Path\-to\-TAP: 002 \(goopg\-publisher and all\-goopg pairings\) ← 0046h \(1 link\).
   - 2026\-11\-26 \(done\): the cause was not hstore. pgoDecodePhysicalValue tested the OLD TOAST marker 0x1B, which is also the 1\-byte header of every 12\-byte value; the heap codec had already moved to 0x01. Any 12\-character text from a goopg publisher stopped the walsender. It now tests 0x01. Unit test TestPgOutputTwelveByteTextIsNotToast.
   Movement: yes — tap 002 goopg-publisher-pg18-subscriber 0/4 -> 1/4 assertions (insert check passes); all-goopg likewise
-- [ ] **M0149-0046i — UPDATE … SET array element (b\[2\] = NULL)**
+- [x] **M0149-0046i — UPDATE … SET array element (b\[2\] = NULL)**
   Kind: impl
   Parent: M0149-0046
   - 002 update batch on a goopg publisher: `UPDATE tst\_comp\_mix\_array SET b\[2\] = NULL WHERE \(\(a\).a\).a = 1` fails with "syntax error at or near "\["". PG's set\_target accepts an indirection \(transformAssignmentIndirection → array\_set\_element\). Parser change \(read the playbook §12 first\) plus executor assignment.
   - Path\-to\-TAP: 002 goopg\-publisher pairings ← 0046i \(1 link\).
+  - 2026\-11\-26 \(done\):
+    - Both parsers \(yacc update\_assign arm, dml.go parseAssign\) parse `col\[i\] = expr` into UpdateAssign.Subscript.
+    - applyUpdateAssign wraps the value in array\_assign\_subscript; the executor's evalArrayAssignSubscript implements array\_set\_element: quote\-preserving, NULL padding, element\-type input, and PG's 22004 / 2202E / 54000 rules.
+    - Parity goldens regenerated; the only change is `Subscript=∅` plus the new pinned forms. Unit test TestUpdateSetArraySubscript.
+  - 002's `SET b\[2\] = NULL` statement now parses and reaches 0046j's nested\-field error.
+  Movement: yes — regress arrays 760 -> 750 mismatched lines (of 2651)
 - [ ] **M0149-0046j — nested composite field selection ((a).a).a**
   Kind: impl
   Parent: M0149-0046

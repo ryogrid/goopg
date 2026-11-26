@@ -183,3 +183,19 @@ func assertNotRouted(t *testing.T, q string) {
 		t.Errorf("%q is routed, but the grammar does not cover it", q)
 	}
 }
+
+// TestUpdateSetArraySubscript pins `UPDATE … SET col[i] = expr` (gram.y
+// set_target with an opt_indirection subscript), which both parsers
+// rejected with "syntax error at or near "["" — subscription/t/002_types.pl
+// runs `UPDATE tst_comp_mix_array SET b[2] = NULL` (M0149-0046i). The
+// subscript lands in UpdateAssign.Subscript; the hand-written parser and
+// the yacc parser must agree.
+func TestUpdateSetArraySubscript(t *testing.T) {
+	for _, q := range []string{
+		"UPDATE t SET b[2] = NULL",
+		"UPDATE t SET b[i + 1] = 5, c = 3 WHERE k = 1",
+		"INSERT INTO t VALUES (1) ON CONFLICT (k) DO UPDATE SET b[1] = 7",
+	} {
+		assertParity(t, q)
+	}
+}

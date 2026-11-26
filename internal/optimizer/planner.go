@@ -16060,6 +16060,27 @@ func applyUpdateAssign(a parser.UpdateAssign, tbl *catalog.Table, set []Expr, ct
 	if err != nil {
 		return err
 	}
+	if a.Subscript != nil {
+		// `col[i] = expr` (transformAssignmentIndirection →
+		// array_set_element): the new column value is the old array with
+		// element i replaced, extended with NULLs when i is past the end.
+		// The executor's array_assign_subscript evaluates it per row.
+		// M0149-0046i.
+		if !col.Type.IsArray {
+			return &PlanError{Pos: a.Pos(), Code: "42804",
+				Message: fmt.Sprintf("cannot subscript type %s because it does not support subscripting", col.Type.Name)}
+		}
+		cur, cerr := resolveExpr(parser.NewColumnRef(a.Pos(), []string{a.Column}), ctx)
+		if cerr != nil {
+			return cerr
+		}
+		sub, serr := resolveExpr(a.Subscript, ctx)
+		if serr != nil {
+			return serr
+		}
+		expr = &FuncCall{pos: a.Pos(), Name: "array_assign_subscript", Args: []Expr{cur, sub, expr},
+			ReturnType: col.Type.Name + "[]"}
+	}
 	set[col.Ordinal] = expr
 	return nil
 }

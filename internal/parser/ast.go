@@ -1141,6 +1141,10 @@ type UpdateAssign struct {
 	TableQualifier string   // non-empty when user wrote "table.col = expr" (illegal; rejected in semantic layer)
 	Columns        []string // multi-column form: "(c1, c2, …) = (e1, e2, …)"
 	Expr           Expr     // RHS: single expr, or *RowExpr for multi-column form
+	// Subscript is the array subscript of `col[i] = expr` (gram.y
+	// set_target's opt_indirection; transformAssignmentIndirection), nil
+	// for a plain column target. M0149-0046i.
+	Subscript Expr
 }
 
 func (a UpdateAssign) Pos() int { return a.pos }

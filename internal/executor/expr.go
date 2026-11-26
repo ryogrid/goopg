@@ -12787,6 +12787,8 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			return NewBoolDatum(a.BoolValue() || b.BoolValue()), nil
 		}
 
+	case "array_assign_subscript":
+		return evalArrayAssignSubscript(x, slot, ctx)
 	case "array_subscript":
 		// Array element access: arr[idx] (1-based). Used for SQL a[N] syntax. M0097-0003.
 		// Returns the element as its natural type (int for integer arrays, else text).

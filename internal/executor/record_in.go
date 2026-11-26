@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/utils/adt/array"
 )
 
@@ -147,4 +148,77 @@ func rangeColumnType(ctx *Context, typeName string) bool {
 	}
 	_, ok := lookupRangeTypeForIO(lower, ctx)
 	return ok
+}
+
+// evalArrayAssignSubscript is array_set_element for `UPDATE … SET col[i] =
+// v` (M0149-0046i): the old array with element i replaced, padded with
+// NULLs when i is past the end. Elements keep their array_out quoting (a
+// composite element stays "(…)"), a NULL v stores NULL, and a NULL array
+// assigned at i builds a fresh one. PG's out-of-range rules: a subscript
+// below 1 on a non-empty array is 2202E "array subscript out of range"
+// (goopg stores lower bound 1 only), and growing past MaxArraySize is
+// 54000.
+func evalArrayAssignSubscript(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
+	if len(x.Args) != 3 {
+		return NullDatum, &ExecError{Code: "XX000", Pos: x.Pos(), Message: "malformed array element assignment"}
+	}
+	arr, err := evalExprSlot(x.Args[0], slot, ctx)
+	if err != nil {
+		return NullDatum, err
+	}
+	subD, err := evalExprSlot(x.Args[1], slot, ctx)
+	if err != nil {
+		return NullDatum, err
+	}
+	val, err := evalExprSlot(x.Args[2], slot, ctx)
+	if err != nil {
+		return NullDatum, err
+	}
+	if subD.IsNull() {
+		return NullDatum, &ExecError{Code: "22004", Pos: x.Pos(), Message: "array subscript in assignment must not be null"}
+	}
+	if subD.Kind == KindString {
+		subD = tryParseStringAs(KindInt, subD.StringValue())
+	}
+	if subD.Kind != KindInt {
+		return NullDatum, &ExecError{Code: "42804", Pos: x.Pos(), Message: "array subscript must have type integer"}
+	}
+	elemType, _ := strings.CutSuffix(x.ReturnType, "[]")
+	var elems []string
+	if !arr.IsNull() {
+		for _, e := range parseTextArrayElemsDelim(arr.StringValue(), array.ElemDelim(elemType)) {
+			if !e.Quoted && strings.EqualFold(strings.TrimSpace(e.Text), "NULL") {
+				elems = append(elems, "NULL")
+			} else {
+				elems = append(elems, quoteArrayTextElem(e.Text))
+			}
+		}
+	}
+	const maxArraySize = 134217727
+	i := subD.Int
+	if i < 1 {
+		if len(elems) > 0 || i < -maxArraySize {
+			return NullDatum, &ExecError{Code: "2202E", Pos: x.Pos(), Message: "array subscript out of range"}
+		}
+		return NullDatum, &ExecError{Code: "0A000", Pos: x.Pos(),
+			Message: "array lower bounds other than 1 are not supported"}
+	}
+	if i > maxArraySize {
+		return NullDatum, &ExecError{Code: "54000", Pos: x.Pos(),
+			Message: fmt.Sprintf("array size exceeds the maximum allowed (%d)", maxArraySize)}
+	}
+	for int64(len(elems)) < i {
+		elems = append(elems, "NULL")
+	}
+	if val.IsNull() {
+		elems[i-1] = "NULL"
+	} else {
+		d, err := typedFieldInput(ctx, catalog.Type{Name: elemType}, string(val.AppendValueText(nil)), x.Pos())
+		if err != nil {
+			return NullDatum, err
+		}
+		elems[i-1] = quoteArrayTextElem(string(d.AppendValueText(nil)))
+	}
+	delim := string(array.ElemDelim(elemType))
+	return NewStringDatum("{" + strings.Join(elems, delim) + "}"), nil
 }

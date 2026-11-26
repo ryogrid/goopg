@@ -523,6 +523,20 @@ func (p *parser) parseAssign() (UpdateAssign, error) {
 		tableQualifier = identText(col)
 		col = subCol
 	}
+	// `col[i] = expr`: an array element target (gram.y set_target with an
+	// opt_indirection subscript). M0149-0046i.
+	var subscript Expr
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
+		p.advance() // consume '['
+		sub, serr := p.parseExpr()
+		if serr != nil {
+			return UpdateAssign{}, serr
+		}
+		if !p.acceptSymbol("]") {
+			return UpdateAssign{}, p.errAtCur("expected ']'")
+		}
+		subscript = sub
+	}
 	cur := p.cur()
 	if cur.Kind != TokenOperator || cur.Value != "=" {
 		return UpdateAssign{}, p.errAtCur("expected '='")
@@ -541,7 +555,7 @@ func (p *parser) parseAssign() (UpdateAssign, error) {
 	if err != nil {
 		return UpdateAssign{}, err
 	}
-	return UpdateAssign{pos: pos, Column: identText(col), TableQualifier: tableQualifier, Expr: expr}, nil
+	return UpdateAssign{pos: pos, Column: identText(col), TableQualifier: tableQualifier, Expr: expr, Subscript: subscript}, nil
 }
 
 // parseDelete: DELETE FROM target [WHERE expr] [RETURNING target_list].
