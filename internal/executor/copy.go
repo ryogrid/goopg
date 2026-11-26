@@ -867,6 +867,10 @@ func (c *CopyFromExecutor) PushBinaryData(chunk []byte) (done bool, err error) {
 
 	rows, trailerFound, consumed, parseErr := ParseCopyBinaryRows(c.binaryBuf, listedCols)
 	if parseErr != nil {
+		var ee *ExecError
+		if errors.As(parseErr, &ee) {
+			return false, parseErr
+		}
 		return false, &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: fmt.Sprintf("COPY BINARY: %v", parseErr)}
 	}
 	c.binaryBuf = c.binaryBuf[consumed:]

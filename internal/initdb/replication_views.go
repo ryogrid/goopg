@@ -602,7 +602,7 @@ func registerSubscriptionViews(cat *catalog.InMemory, ps *catalog.PubSub) error 
 				sub.Name,
 				fmt.Sprintf("%d", sub.Owner), // subowner
 				boolText(sub.Enabled),
-				"f",   // subbinary
+				boolText(sub.Binary), // subbinary
 				"f",   // substream
 				"d",   // subtwophasestate disabled
 				"f",   // subdisableonerr

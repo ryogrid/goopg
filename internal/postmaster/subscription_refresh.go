@@ -168,6 +168,7 @@ func (s *Server) runSubscriptionTableSyncs(subName, conninfo string, pubs []stri
 		PubSub:       s.cfg.PubSub,
 		SubName:      subName,
 		Publications: pubs,
+		Binary:       s.subscriptionBinary(subName, rels),
 		ResolveRel: func(relOID uint32) (string, bool) {
 			rr, ok := rels[relOID]
 			if !ok {
@@ -182,7 +183,7 @@ func (s *Server) runSubscriptionTableSyncs(subName, conninfo string, pubs []stri
 			}
 			return &replication.ConnPair{Reader: pc.Reader, Writer: pc.Writer, Close: pc.Close}, nil
 		},
-		OpenWriter: s.refreshOpenWriter(rels),
+		OpenWriter: s.refreshOpenWriter(subName, rels),
 	})
 	var syncErrs []string
 	if mgrErr != nil {
@@ -223,13 +224,25 @@ func (s *Server) runSubscriptionTableSyncs(subName, conninfo string, pubs []stri
 	return syncErrs, failed
 }
 
+// subscriptionBinary reads the subscription's binary option now, so a
+// retried table sync follows an ALTER SUBSCRIPTION ... SET (binary = ...).
+func (s *Server) subscriptionBinary(subName string, rels map[uint32]*refreshRel) bool {
+	for _, rr := range rels {
+		if sub, ok := s.cfg.PubSub.LookupSubscription(subName, rr.dbOid); ok {
+			return sub.Binary
+		}
+		break
+	}
+	return false
+}
+
 // refreshOpenWriter builds RunTableSyncManager's per-rel writer: a
 // per-table transaction (the auto-assign ProcArray slot — refresh runs
 // off-connection, so there is no connection slot to reuse, and PG's
 // tablesync workers commit one transaction per table) plus a
 // CopyFromExecutor bound to the local rel with every column in order
 // (the publisher's COPY stream is the full table).
-func (s *Server) refreshOpenWriter(rels map[uint32]*refreshRel) func(ctx context.Context, relOID uint32, remoteCols []string) (*replication.WriterPair, error) {
+func (s *Server) refreshOpenWriter(subName string, rels map[uint32]*refreshRel) func(ctx context.Context, relOID uint32, remoteCols []string) (*replication.WriterPair, error) {
 	return func(ctx context.Context, relOID uint32, remoteCols []string) (*replication.WriterPair, error) {
 		rr, ok := rels[relOID]
 		if !ok {
@@ -243,6 +256,15 @@ func (s *Server) refreshOpenWriter(rels map[uint32]*refreshRel) func(ctx context
 		colIdx, err := copyColumnIndex(tbl, remoteCols)
 		if err != nil {
 			return nil, err
+		}
+		if s.subscriptionBinary(subName, rels) {
+			cols := make([]catalog.Column, len(colIdx))
+			for i, j := range colIdx {
+				cols[i] = tbl.Columns[j]
+			}
+			if err := executor.BinaryInputUnavailable(s.cfg.Catalog, cols, rr.dbOid); err != nil {
+				return nil, err
+			}
 		}
 		tx, err := s.cfg.TxnMgr.Begin(transam.IsolationReadCommitted)
 		if err != nil {

@@ -1,7 +1,6 @@
 package testport
 
 import (
-	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -21,13 +20,12 @@ import (
 // pairings: all-goopg, a PG 18.3 publisher with a goopg subscriber, a goopg
 // publisher with a PG 18.3 subscriber.
 //
-// Gated by GOOPG_TAP_014 until it passes (M0149-0050).
+// Landed by M0149-0050a (COPY statement logging), 0050b (binary array
+// COPY), 0050e (ALTER TYPE SET send/receive) and 0050c (subscriber binary
+// mode and the READY-only apply gate).
 func TestPort_Subscription014Binary(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")
-	}
-	if os.Getenv("GOOPG_TAP_014") == "" {
-		t.Skip("014 port is not passing yet (M0149-0050); set GOOPG_TAP_014=1 to run")
 	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)

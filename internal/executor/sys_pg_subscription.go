@@ -68,7 +68,7 @@ func buildPGSubscriptionRow(sub *catalog.Subscription) Row {
 		NewStringDatum(sub.Name),      // subname
 		NewIntDatum(int64(owner)),     // subowner
 		NewBoolDatum(sub.Enabled),     // subenabled
-		NewBoolDatum(false),           // subbinary
+		NewBoolDatum(sub.Binary),      // subbinary
 		NewStringDatum("f"),           // substream — LOGICALREP_STREAM_OFF
 		NewStringDatum("d"),           // subtwophasestate — LOGICALREP_TWOPHASE_STATE_DISABLED
 		NewBoolDatum(false),           // subdisableonerr

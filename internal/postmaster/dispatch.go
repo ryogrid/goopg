@@ -3618,7 +3618,7 @@ func subscriptionRowsForDBOid(ps *catalog.PubSub, dbOid uint32) [][]string {
 			sub.Name,
 			fmt.Sprintf("%d", sub.Owner), // subowner
 			boolToText(sub.Enabled),
-			"f",   // subbinary
+			boolToText(sub.Binary), // subbinary
 			"f",   // substream
 			"d",   // subtwophasestate disabled
 			"f",   // subdisableonerr

@@ -76,6 +76,8 @@ type TableSyncManagerConfig struct {
 	// Publications are the subscription's publication names, which
 	// fetch_remote_table_info's column-list query filters on.
 	Publications []string
+	// Binary is the subscription's binary option at the time of the sync.
+	Binary bool
 
 	// ResolveRel turns a relOID into the qualified "schema.name"
 	// the publisher will see on its `COPY <name> TO STDOUT`
@@ -243,6 +245,8 @@ func syncOneRel(ctx context.Context, cfg TableSyncManagerConfig, relOID uint32, 
 		Logger:  cfg.Logger,
 
 		CopySelect: gencolPublished,
+		Binary:     cfg.Binary,
+		Commit:     closeWriter,
 	})
 	res.Rows = rows
 	if err != nil {

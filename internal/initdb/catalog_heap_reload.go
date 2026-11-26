@@ -1784,6 +1784,7 @@ func reloadSubscriptionsFromHeap(mgr *storage.Manager, pubsub *catalog.PubSub, c
 				Name:         decoded[3].StringValue(),
 				Owner:        uint32(decoded[4].Int),
 				Enabled:      decoded[5].BoolValue(),
+				Binary:       decoded[6].BoolValue(),
 				Conninfo:     decoded[13].StringValue(),
 				SlotName:     decoded[14].StringValue(),
 				Publications: executor.ParseTextArrayLiteral(decoded[16].StringValue()),

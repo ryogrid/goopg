@@ -1,7 +1,6 @@
 # M0149\-0050 — Port subscription/t/014\_binary.pl
 
-Status: in progress. TestPort\_Subscription014Binary is written \(three pairings\) and gated by GOOPG\_TAP\_014. The
-test mirrors Cluster.pm's `log_statement = all` on both nodes.
+Status: done. TestPort\_Subscription014Binary passes 3/3 in all three pairings.
 
 ## Landed — M0149\-0050a, a COPY statement is logged as PG logs it
 
@@ -57,6 +56,33 @@ output)` were already accepted.
 
 Tests: TestAlterTypeSetOptions \(parser\), TestAlterTypeSetSendReceive \(executor\). TAP 014
 goopg\-publisher\-pg18\-subscriber passes 9/9.
+
+## Landed — M0149\-0050c, a goopg subscriber in binary mode
+
+- **Option.** `Subscription.Binary` \(pg\_subscription.subbinary\) is set by CREATE SUBSCRIPTION … WITH \(binary = true\)
+  and by ALTER SUBSCRIPTION … SET \(binary = …\). It is journaled in the heap row, reloaded and shown in the views. The
+  apply launcher restarts a worker whose binary setting changed \(maybe\_reread\_subscription\).
+- **Streaming.** The receiver adds `"binary" 'true'` to START\_REPLICATION. The pgoutput decoder accepts `b` columns,
+  and the apply worker reads them with the type's receive \(copyBinaryToDatum\).
+- **Table sync.** copy\_table uses `… TO STDOUT WITH (FORMAT binary)` when the subscription is binary, read fresh on
+  each attempt so a retried sync follows an ALTER. The stream goes through CopyFromExecutor.PushBinaryData.
+  BinaryInputUnavailable raises 42883 "no binary input function available for type %s" for a user base type without
+  a receive function \(BeginCopyFrom's getTypeBinaryInputInfo\).
+- **Errors.** A fixed\-width field of the wrong length is 22P03 "incorrect binary data format" when it has bytes left
+  over, as CopyReadBinaryAttribute reports, and 08P01 "insufficient data left in message" when it is short
+  \(binaryLengthError\). A receive function's ExecError now reaches the client unwrapped.
+- **Apply gate.** should\_apply\_changes\_for\_rel: INSERT / UPDATE / DELETE apply only to a READY
+  pg\_subscription\_rel row. A relation the subscription does not track yet \(published before REFRESH PUBLICATION\)
+  is skipped; its rows arrive with the table sync. goopg applied such rows, so the later sync copied them a second
+  time. UPDATE and DELETE had no gate at all.
+- **Commit order.** RunTableSync commits the copied rows \(TableSyncConfig.Commit\) before advancing the rel to `s`.
+  Before, a reader could see the table synchronized before its rows were visible.
+
+Tests: TestApplyBinaryTupleColumns, TestBinaryInputUnavailable. TestPort\_Subscription014Binary is ungated and passes
+3/3 in all three pairings.
+
+M0149\-0050d \(binary tuples from a goopg publisher\) proved not to be a 014 requirement: a PG 18 subscriber in binary
+mode applies text columns. It stays open as PG parity.
 
 ## Open
 

@@ -17145,7 +17145,7 @@ verify each at HEAD when the task starts.
 
   - 2026\-11\-26 \(done\): hotUpdateLogsOldTuple \+ old\-tuple capture in tryApplyHOTUpdate → LogHeapHotUpdateFunc\(…, oldTuple\) → xlog.EncodeHeapHotUpdatePGOld \(XLH\_UPDATE\_CONTAINS\_OLD\_TUPLE\); classifier HOT arm decodes OldTuple. Test TestClassifyPGHeapHotUpdateOldTuple. 012 ungated, 3/3; inventory 012 → port.
   Movement: yes — tap 012 all-goopg 1/2 -> 2/2 (3/3); 012 port
-- [ ] **M0149-0050 — port subscription/t/014_binary.pl**
+- [x] **M0149-0050 — port subscription/t/014_binary.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/014_binary.pl` — `binary = true` subscriptions.
@@ -17163,17 +17163,20 @@ verify each at HEAD when the task starts.
   - Path\-to\-TAP: 014 goopg\-publisher\-pg18\-subscriber ← 0050b \(1 link\).
   - 2026\-11\-26 \(done\): arraySendBinary / arrayRecvBinary \(copy\_binary\_array.go\), 1\-D, byte\-identical with PG 18.3 \(int4/numeric/text\[\] incl. NULL and empty\); encodeNumericBinary takes numeric text. Tests TestCopyBinaryArrayMatchesPG, TestCopyBinaryArrayElementTypes. Regress copydml 3/116 fails on HEAD and HEAD\~2 too \(NOTICE vs COPY\-row order; pre\-existing\).
   Movement: yes — tap 014 goopg-publisher-pg18-subscriber 0/9 -> 6/9 assertions; regress copy2 248 -> 225
-- [ ] **M0149-0050c — a goopg subscriber with binary = true: binary table sync and binary apply**
+- [x] **M0149-0050c — a goopg subscriber with binary = true: binary table sync and binary apply**
   Kind: impl
   Parent: M0149-0050
   - 014 all\-goopg and pg18\-publisher\-goopg\-subscriber: no `COPY … WITH (FORMAT binary)` ever reaches the publisher. Needed: copy\_table's binary COPY \+ CopyFromExecutor binary input via typreceive; START\_REPLICATION `binary 'true'`; apply of `b` columns; "no binary input function available for type %s" / "incorrect binary data format" errors.
   - Path\-to\-TAP: 014 ← 0050c \(1 link\).
+  - 2026\-11\-26 \(done\): Subscription.Binary \(CREATE/ALTER, subbinary row \+ reload \+ views, launcher restart on change\); START\_REPLICATION binary option; decoder/apply `b` columns; tablesync COPY WITH \(FORMAT binary\) via PushBinaryData, re\-read per attempt; BinaryInputUnavailable \(42883\); binaryLengthError \(22P03/08P01\); shouldApplyChangesForRel \(READY\-only for INSERT/UPDATE/DELETE — untracked rels skipped\); RunTableSync commits before `s`. Tests TestApplyBinaryTupleColumns, TestBinaryInputUnavailable. 014 ungated, 3/3 x 3; inventory 014 → port.
+  Movement: yes — tap 014 all-goopg 0/9 -> 9/9, pg18-publisher-goopg-subscriber 0/9 -> 9/9 (3/3 x 3 pairings); 014 port
 - [ ] **M0149-0050d — a goopg publisher writes binary pgoutput tuples when asked**
   Kind: impl
   Parent: M0149-0050
   - 014 goopg\-publisher\-pg18\-subscriber after 0050b: the binary option must produce `b` columns via typsend \(proto.c logicalrep\_write\_tuple\).
   - Path\-to\-TAP: 014 goopg\-publisher\-pg18\-subscriber ← 0050d \(1 link\).
   - 2026\-11\-26: not a proven 014 blocker so far — the PG 18 subscriber applies goopg's text \(`t`\) tuple columns in binary mode, and the binary\-apply assertions pass. Re\-check once 0050e lets the run finish; otherwise PG parity only.
+  - 2026\-11\-26: confirmed not a 014 blocker \(014 passes 3/3 with goopg's text tuple columns\); now a PG\-parity item only, below the TAP queue.
 - [x] **M0149-0050e — custom\-type DDL: shell type, LANGUAGE internal varchar I/O functions, ALTER TYPE SET \(send, receive\)**
   Kind: impl
   Parent: M0149-0050

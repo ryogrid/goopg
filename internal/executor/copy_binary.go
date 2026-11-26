@@ -120,6 +120,12 @@ func ParseCopyBinaryRows(data []byte, cols []catalog.Column) (rows []Row, traile
 			pos += int(length)
 			d, err := copyBinaryToDatum(cols[i].Type, payload)
 			if err != nil {
+				var ee *ExecError
+				if errors.As(err, &ee) {
+					// A receive function's own SQLSTATE and message reach
+					// the client as PG reports them.
+					return nil, false, 0, err
+				}
 				return nil, false, 0, fmt.Errorf("column %q: %w", cols[i].Name, err)
 			}
 			row[i] = d
@@ -484,6 +490,18 @@ func rejectBinaryCopyArray(t catalog.Type) error {
 		Message: fmt.Sprintf("binary COPY of array type %s[] is not supported", t.Name)}
 }
 
+// binaryLengthError is what a fixed-width receive function reports for a
+// field of the wrong length: bytes left over after the value is PG's
+// CopyReadBinaryAttribute / logicalrep "incorrect binary data format"
+// (22P03, the attribute_buf cursor check); too few is pq_getmsgbytes's
+// "insufficient data left in message" (08P01).
+func binaryLengthError(got, want int) error {
+	if got > want {
+		return &ExecError{Code: "22P03", Message: "incorrect binary data format"}
+	}
+	return &ExecError{Code: "08P01", Message: "insufficient data left in message"}
+}
+
 func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 	if t.IsArray {
 		return arrayRecvBinary(t, payload)
@@ -504,7 +522,7 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 	case "money":
 		// cash_recv: pq_getmsgint64. M0149-0001k4.
 		if len(payload) != 8 {
-			return Datum{}, fmt.Errorf("money: expected 8 bytes, got %d", len(payload))
+			return Datum{}, binaryLengthError(len(payload), 8)
 		}
 		return moneyDatum(int64(binary.BigEndian.Uint64(payload))), nil
 	case "int2", "smallint", "smallserial", "serial2":
@@ -516,19 +534,19 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		// from the default as a STRING Datum — a smallint column silently held
 		// two raw bytes of text (Hard-won Rule #2: encode and decode are twins).
 		if len(payload) != 2 {
-			return Datum{}, fmt.Errorf("int2: expected 2 bytes, got %d", len(payload))
+			return Datum{}, binaryLengthError(len(payload), 2)
 		}
 		v := int16(binary.BigEndian.Uint16(payload))
 		return Datum{Kind: KindInt, Int: int64(v)}, nil
 	case "int4", "integer", "int", "serial", "serial4":
 		if len(payload) != 4 {
-			return Datum{}, fmt.Errorf("int4: expected 4 bytes, got %d", len(payload))
+			return Datum{}, binaryLengthError(len(payload), 4)
 		}
 		v := int32(binary.BigEndian.Uint32(payload))
 		return Datum{Kind: KindInt, Int: int64(v)}, nil
 	case "int8", "bigint", "bigserial", "serial8":
 		if len(payload) != 8 {
-			return Datum{}, fmt.Errorf("int8: expected 8 bytes, got %d", len(payload))
+			return Datum{}, binaryLengthError(len(payload), 8)
 		}
 		v := int64(binary.BigEndian.Uint64(payload))
 		return Datum{Kind: KindInt, Int: v}, nil
@@ -543,13 +561,13 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		// Format(), CAST-to-text and every type-agnostic path. Before this arm
 		// the default handed back the four raw bytes as a STRING Datum.
 		if len(payload) != 4 {
-			return Datum{}, fmt.Errorf("float4: expected 4 bytes, got %d", len(payload))
+			return Datum{}, binaryLengthError(len(payload), 4)
 		}
 		f4 := float64(math.Float32frombits(binary.BigEndian.Uint32(payload)))
 		return floatTextDatum(PGFloatOut(f4, 32)), nil
 	case "float8", "double precision", "double", "float":
 		if len(payload) != 8 {
-			return Datum{}, fmt.Errorf("float8: expected 8 bytes, got %d", len(payload))
+			return Datum{}, binaryLengthError(len(payload), 8)
 		}
 		f8 := math.Float64frombits(binary.BigEndian.Uint64(payload))
 		return floatTextDatum(PGFloatOut(f8, 64)), nil
@@ -564,19 +582,19 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		// INSERT. Before this arm the default handed back the raw bytes as a
 		// STRING Datum (Hard-won Rule #2).
 		if len(payload) != 4 {
-			return Datum{}, fmt.Errorf("%s: expected 4 bytes, got %d", strings.ToLower(t.Name), len(payload))
+			return Datum{}, binaryLengthError(len(payload), 4)
 		}
 		return NewIntDatum(int64(binary.BigEndian.Uint32(payload))), nil
 	case "xid":
 		// xidrecv (xid.c:56) — pq_getmsgint over sizeof(TransactionId).
 		if len(payload) != 4 {
-			return Datum{}, fmt.Errorf("xid: expected 4 bytes, got %d", len(payload))
+			return Datum{}, binaryLengthError(len(payload), 4)
 		}
 		return NewIntDatum(int64(binary.BigEndian.Uint32(payload))), nil
 	case "xid8":
 		// xid8recv (xid.c:215) — pq_getmsgint64 over the FullTransactionId.
 		if len(payload) != 8 {
-			return Datum{}, fmt.Errorf("xid8: expected 8 bytes, got %d", len(payload))
+			return Datum{}, binaryLengthError(len(payload), 8)
 		}
 		return NewIntDatum(int64(binary.BigEndian.Uint64(payload))), nil
 	case "uuid":
@@ -584,17 +602,17 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		// canonical lowercase-with-dashes KindString the heap decode produces —
 		// the engine has no uuid Kind and speaks that text everywhere else.
 		if len(payload) != 16 {
-			return Datum{}, fmt.Errorf("uuid: expected 16 bytes, got %d", len(payload))
+			return Datum{}, binaryLengthError(len(payload), 16)
 		}
 		return NewStringDatum(uuidCanonicalFromBytes(payload)), nil
 	case "bool", "boolean":
 		if len(payload) != 1 {
-			return Datum{}, fmt.Errorf("bool: expected 1 byte, got %d", len(payload))
+			return Datum{}, binaryLengthError(len(payload), 1)
 		}
 		return NewBoolDatum(payload[0] != 0), nil
 	case "timestamp", "timestamptz":
 		if len(payload) != 8 {
-			return Datum{}, fmt.Errorf("timestamp: expected 8 bytes, got %d", len(payload))
+			return Datum{}, binaryLengthError(len(payload), 8)
 		}
 		usec := int64(binary.BigEndian.Uint64(payload))
 		// The wire value is the carrier, DT_NOEND / DT_NOBEGIN included
@@ -615,7 +633,7 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		// rounding is NOT applied here: goopg truncates at display, ledgered
 		// under M0119-0006.)
 		if len(payload) != 8 {
-			return Datum{}, fmt.Errorf("time: expected 8 bytes, got %d", len(payload))
+			return Datum{}, binaryLengthError(len(payload), 8)
 		}
 		micros := int64(binary.BigEndian.Uint64(payload))
 		if micros < 0 || micros > usecsPerDay {
@@ -628,7 +646,7 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		// check (±16 h, postgres/src/include/datatype/timestamp.h) with its own
 		// 22009 code. Zone sign is flipped back to Datum.Scale's east-of-UTC.
 		if len(payload) != 12 {
-			return Datum{}, fmt.Errorf("timetz: expected 12 bytes, got %d", len(payload))
+			return Datum{}, binaryLengthError(len(payload), 12)
 		}
 		micros := int64(binary.BigEndian.Uint64(payload[:8]))
 		if micros < 0 || micros > usecsPerDay {
@@ -642,7 +660,7 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		return roundTimeDatumToPrecision(NewTimeTZDatum(pgTimeFromMicros(micros), int(-pgOffset)), timeColumnPrecision(t)), nil
 	case "date":
 		if len(payload) != 4 {
-			return Datum{}, fmt.Errorf("date: expected 4 bytes, got %d", len(payload))
+			return Datum{}, binaryLengthError(len(payload), 4)
 		}
 		days := int32(binary.BigEndian.Uint32(payload))
 		// date_recv accepts DATEVAL_NOEND / DATEVAL_NOBEGIN unchanged.
@@ -664,7 +682,7 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		// as a STRING Datum, which then made every runtime interval operation
 		// lexicographic (Hard-won Rule #2).
 		if len(payload) != 16 {
-			return Datum{}, fmt.Errorf("interval: expected 16 bytes, got %d", len(payload))
+			return Datum{}, binaryLengthError(len(payload), 16)
 		}
 		micros := int64(binary.BigEndian.Uint64(payload[:8]))
 		days := int32(binary.BigEndian.Uint32(payload[8:12]))

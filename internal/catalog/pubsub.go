@@ -79,6 +79,10 @@ type Subscription struct {
 	Owner        uint32
 	Publications []string
 	Enabled      bool
+	// Binary is pg_subscription.subbinary (WITH (binary = true)): table
+	// sync copies in binary format and the apply worker asks pgoutput for
+	// binary tuple columns.
+	Binary bool
 	// SlotName is pg_subscription.subslotname: "" is NULL, i.e.
 	// slot_name = NONE (no publisher-side slot — DROP SUBSCRIPTION then
 	// skips ReplicationSlotDropAtPubNode). The subscription-name default
@@ -593,6 +597,19 @@ func (p *PubSub) SetSubscriptionEnabled(name string, enabled bool, dbOid ...uint
 		return ErrSubscriptionNotFound
 	}
 	sub.Enabled = enabled
+	return nil
+}
+
+// SetSubscriptionBinary sets pg_subscription.subbinary. Returns
+// ErrSubscriptionNotFound when the subscription does not exist.
+func (p *PubSub) SetSubscriptionBinary(name string, binary bool, dbOid ...uint32) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	sub, ok := p.subscriptions[subMapKey(resolveDBOid(dbOid), name)]
+	if !ok {
+		return ErrSubscriptionNotFound
+	}
+	sub.Binary = binary
 	return nil
 }
 

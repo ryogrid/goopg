@@ -81,9 +81,18 @@ type TableSyncConfig struct {
 	// CopySelect is copy_table's COPY (SELECT cols FROM rel) form, used
 	// when a published column is generated (gencol_published).
 	CopySelect bool
-	From       LineWriter
-	Reader     *libpq.FrameReader
-	Writer     *libpq.FrameWriter
+	// Binary is copy_table's binary format (the subscription's binary
+	// option): COPY ... TO STDOUT WITH (FORMAT binary), the stream pushed
+	// through the writer's PushBinaryData.
+	Binary bool
+	// Commit, when set, commits the copied rows; RunTableSync calls it
+	// before advancing the rel to 's', so a reader that sees the table
+	// synchronized also sees its data (PG's table sync commits the copy
+	// before UpdateSubscriptionRelState).
+	Commit func() error
+	From   LineWriter
+	Reader *libpq.FrameReader
+	Writer *libpq.FrameWriter
 
 	// Stat is the optional pg_stat_subscription handle for this
 	// tablesync worker. When non-nil, RunTableSync stamps every
@@ -154,6 +163,9 @@ func RunTableSync(cfg TableSyncConfig) (int64, error) {
 			sql = fmt.Sprintf("COPY (SELECT %s FROM %s) TO STDOUT", strings.Join(quoted, ", "), cfg.Relname)
 		}
 	}
+	if cfg.Binary {
+		sql += " WITH (FORMAT binary)"
+	}
 	if err := cfg.Writer.WriteQuery(sql); err != nil {
 		return 0, fmt.Errorf("tablesync: write Query: %w", err)
 	}
@@ -209,7 +221,17 @@ func RunTableSync(cfg TableSyncConfig) (int64, error) {
 			if cfg.Stat != nil {
 				cfg.Stat.MarkMessage(time.Now(), 0)
 			}
-			if err := pushCopyDataLines(cfg.From, f.Payload); err != nil {
+			if cfg.Binary {
+				bw, ok := cfg.From.(interface {
+					PushBinaryData([]byte) (bool, error)
+				})
+				if !ok {
+					return cfg.From.RowsInserted(), errors.New("tablesync: writer takes no binary COPY data")
+				}
+				if _, err := bw.PushBinaryData(f.Payload); err != nil {
+					return cfg.From.RowsInserted(), fmt.Errorf("tablesync: apply row: %w", err)
+				}
+			} else if err := pushCopyDataLines(cfg.From, f.Payload); err != nil {
 				return cfg.From.RowsInserted(), fmt.Errorf("tablesync: apply row: %w", err)
 			}
 		case libpq.MsgCopyDone:
@@ -229,6 +251,11 @@ func RunTableSync(cfg TableSyncConfig) (int64, error) {
 			// caller's next query.
 			if err := drainCopyTrailer(cfg.Reader); err != nil {
 				return cfg.From.RowsInserted(), fmt.Errorf("tablesync: drain trailer: %w", err)
+			}
+			if cfg.Commit != nil {
+				if err := cfg.Commit(); err != nil {
+					return cfg.From.RowsInserted(), fmt.Errorf("tablesync: commit: %w", err)
+				}
 			}
 			if _, err := cfg.PubSub.AdvanceSubscriptionRel(cfg.SubName, cfg.RelOID,
 				catalog.SubRelStateSyncDone, 0); err != nil {

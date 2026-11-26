@@ -255,6 +255,25 @@ func (w *ApplyWorker) applyRelation(m *xlog.DecodedMessage) error {
 	return nil
 }
 
+// shouldApplyChangesForRel is should_apply_changes_for_rel (worker.c) for
+// the leader apply worker: a change applies only to a relation whose
+// pg_subscription_rel row is READY. Rows still in i / d / s are being (or
+// were just) copied by the table sync, and a relation the subscription does
+// not track yet — published before the next REFRESH PUBLICATION — is
+// SUBREL_STATE_UNKNOWN, so its changes are skipped too (its rows arrive
+// with the table sync the refresh starts). Without a subscription context
+// (direct ApplyWorker use) every change applies.
+func (w *ApplyWorker) shouldApplyChangesForRel(r *applyRel) bool {
+	if w.pubsub == nil || w.subName == "" {
+		return true
+	}
+	// Resolve the local rel's OID from the catalog so the gate keys off
+	// the same identifier the tablesync transport used to seed the row.
+	localOID := w.cat.RelFileNode(r.local).RelOid
+	sr, tracked := w.pubsub.LookupSubscriptionRel(w.subName, localOID)
+	return tracked && sr.State == catalog.SubRelStateReady
+}
+
 func (w *ApplyWorker) applyInsert(m *xlog.DecodedMessage) error {
 	if !w.inXact {
 		return errors.New("applyworker: INSERT outside transaction")
@@ -274,15 +293,8 @@ func (w *ApplyWorker) applyInsert(m *xlog.DecodedMessage) error {
 	// double-applying it. Skip silently — the row will reach
 	// the local table via the tablesync worker. State 'r'
 	// (ready) is the only state where streaming applies.
-	if w.pubsub != nil && w.subName != "" {
-		// Resolve the local rel's OID from the catalog so the
-		// gate keys off the same identifier the tablesync
-		// transport used to seed the row.
-		localOID := w.cat.RelFileNode(r.local).RelOid
-		if sr, tracked := w.pubsub.LookupSubscriptionRel(w.subName, localOID); tracked &&
-			sr.State != catalog.SubRelStateReady {
-			return nil
-		}
+	if !w.shouldApplyChangesForRel(r) {
+		return nil
 	}
 	row, unchanged, missing, err := r.decodeTuple(m.NewTuple)
 	if err != nil {
@@ -397,6 +409,9 @@ func (w *ApplyWorker) applyDelete(m *xlog.DecodedMessage) error {
 		return fmt.Errorf("applyworker: DELETE for relation %s.%s has no local table",
 			r.remote.Schema, r.remote.Name)
 	}
+	if !w.shouldApplyChangesForRel(r) {
+		return nil
+	}
 	// Empty old-tuple means we have no key to find the row — skip.
 	if len(m.OldTuple) == 0 {
 		return nil
@@ -448,6 +463,9 @@ func (w *ApplyWorker) applyUpdate(m *xlog.DecodedMessage) error {
 	if r.local == nil {
 		return fmt.Errorf("applyworker: UPDATE for relation %s.%s has no local table",
 			r.remote.Schema, r.remote.Name)
+	}
+	if !w.shouldApplyChangesForRel(r) {
+		return nil
 	}
 	newRow, newUnchanged, newMissing, err := r.decodeTuple(m.NewTuple)
 	if err != nil {
@@ -1119,6 +1137,14 @@ func decodePgoutputTupleAsRowWith(localIdx []int, claimed []bool, remoteCols []x
 				return nil, nil, nil, fmt.Errorf("col %q: %w", local.Name, err)
 			}
 			row[j] = d
+		case 'b':
+			// LOGICALREP_COLUMN_BINARY: the value in the type's binary send
+			// format, read with its receive function (slot_store_data).
+			d, err := copyBinaryToDatum(local.Type, col.Bytes)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			row[j] = d
 		case 'u':
 			row[j] = NullDatum
 			unchanged[j] = true
@@ -1203,4 +1229,32 @@ func IncompatibleGeneratedColumnsError(schema, rel string, names []string) error
 	return &ExecError{Code: "55000", Message: fmt.Sprintf(
 		"logical replication target relation \"%s.%s\" has incompatible generated %s: %s",
 		schema, rel, noun, strings.Join(quoted, ", "))}
+}
+
+// BinaryInputUnavailable is getTypeBinaryInputInfo's check for a binary COPY
+// into cols (BeginCopyFrom, copyfrom.c): a column whose type is a user base
+// type without a receive function is 42883 "no binary input function
+// available for type %s". goopg models a user base type as a composite
+// registration with no fields; ALTER TYPE … SET (receive = …) records its
+// receive function.
+func BinaryInputUnavailable(cat catalog.Catalog, cols []catalog.Column, dbOid uint32) error {
+	im, ok := underlyingInMemory(cat)
+	if !ok {
+		return nil
+	}
+	for _, c := range cols {
+		if c.Type.IsArray {
+			continue
+		}
+		ct := im.LookupCompositeType(c.Type.Name, dbOid)
+		if ct == nil || len(ct.Fields) > 0 || ct.ReceiveFunc != "" {
+			continue
+		}
+		name := ct.Name
+		if schema := im.SchemaNameForOID(ct.NamespaceOID); schema != "" {
+			name = schema + "." + name
+		}
+		return &ExecError{Code: "42883", Message: fmt.Sprintf("no binary input function available for type %s", name)}
+	}
+	return nil
 }

@@ -78,6 +78,9 @@ type LogicalReceiverConfig struct {
 	// publications" — matches upstream's
 	// `publication_names`-as-empty fallback.
 	Publications []string
+	// Binary asks pgoutput for binary tuple columns (the subscription's
+	// binary option; libpqrcv_startstreaming's "binary 'true'").
+	Binary bool
 
 	// StartLSN is the resume position. 0 maps to the slot's
 	// current `confirmed_flush_lsn`.
@@ -600,6 +603,9 @@ func (r *LogicalReceiver) startStreaming() error {
 		start = r.cfg.StartLSN
 	}
 	cmd := buildStartLogicalReplicationCommand(r.cfg.SlotName, start, r.cfg.ProtoVersion, r.cfg.Publications)
+	if r.cfg.Binary {
+		cmd = strings.TrimSuffix(cmd, ")") + ", \"binary\" 'true')"
+	}
 	if err := r.w.WriteQuery(cmd); err != nil {
 		return fmt.Errorf("logicalreceiver: write START_REPLICATION: %w", err)
 	}

@@ -378,7 +378,9 @@ func decodeTupleBody(r *reader) ([]DecodedColumn, error) {
 		switch status {
 		case pgoColNull, 'u':
 			cols[i] = DecodedColumn{Status: status}
-		case pgoColText:
+		case pgoColText, 'b':
+			// 't' text or 'b' binary (LOGICALREP_COLUMN_BINARY): both are
+			// a length-prefixed value.
 			ln, err := r.u32()
 			if err != nil {
 				return nil, err

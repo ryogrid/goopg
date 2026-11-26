@@ -75,6 +75,9 @@ type launchedWorker struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
+	// binary is the subscription's binary option the worker was started
+	// with; a change restarts it (maybe_reread_subscription).
+	binary bool
 }
 
 // NewApplyLauncher wires the launcher to the runtime's catalog +
@@ -227,7 +230,7 @@ func (l *ApplyLauncher) reconcile(ctx context.Context) {
 
 	l.mu.Lock()
 	for name, w := range l.workers {
-		if _, ok := enabled[name]; !ok {
+		if sub, ok := enabled[name]; !ok || sub.Binary != w.binary {
 			toStop = append(toStop, w)
 			delete(l.workers, name)
 		}
@@ -237,7 +240,7 @@ func (l *ApplyLauncher) reconcile(ctx context.Context) {
 			continue
 		}
 		workerCtx, cancel := context.WithCancel(ctx)
-		lw := &launchedWorker{ctx: workerCtx, cancel: cancel, done: make(chan struct{})}
+		lw := &launchedWorker{ctx: workerCtx, cancel: cancel, done: make(chan struct{}), binary: sub.Binary}
 		l.workers[name] = lw
 		toStart = append(toStart, sub)
 	}
@@ -345,6 +348,7 @@ func DefaultLaunchApplyWorker(ctx context.Context, cfg ApplyLauncherConfig, sub 
 		ApplicationName: appName,
 		SlotName:        slotName,
 		Publications:    sub.Publications,
+		Binary:          sub.Binary,
 		StartLSN:        startLSN,
 		Apply:           apply,
 	})
