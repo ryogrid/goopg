@@ -3025,7 +3025,10 @@ type CreatePublicationStmt struct {
 	Name      string
 	AllTables bool
 	Tables    []ObjectName
-	With      map[string]string
+	// TableColumns is parallel to Tables: each table's publication column
+	// list (`FOR TABLE t (a, b)`, gram.y opt_column_list), nil when none.
+	TableColumns [][]string
+	With         map[string]string
 }
 
 func (s *CreatePublicationStmt) Pos() int  { return s.pos }

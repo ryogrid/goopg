@@ -149,12 +149,18 @@ func writePublicationMemberRowsFor(ctx *Context, pub *catalog.Publication, table
 			continue
 		}
 		prOID := im.AllocOID()
+		prattrs := NullDatum
+		if cols, ok := pub.Columns[qname]; ok {
+			if tbl := publicationTable(im, ctx, qname); tbl != nil {
+				prattrs = NewBytesDatum(pgInt2VectorBytes(publicationColumnAttnums(tbl, cols)))
+			}
+		}
 		row := Row{
 			NewIntDatum(int64(prOID)),
 			NewIntDatum(int64(pub.OID)),
 			NewIntDatum(int64(relOID)),
 			NullDatum, // prqual — no row filter
-			NullDatum, // prattrs — no column list
+			prattrs,
 		}
 		tid, err := writeHeapRowCanonical(ctx, pgPublicationRelRel(), PGPublicationRelColumnsPG18(), row)
 		if err != nil {
@@ -177,15 +183,24 @@ func writePublicationMemberRowsFor(ctx *Context, pub *catalog.Publication, table
 // publicationTableOID resolves a publication's stored qualified table name
 // ("schema.name") to its pg_class OID.
 func publicationTableOID(im *catalog.InMemory, ctx *Context, qname string) uint32 {
+	if tbl := publicationTable(im, ctx, qname); tbl != nil {
+		return tbl.OID
+	}
+	return 0
+}
+
+// publicationTable resolves a publication member's qualified name in the
+// connection's database (nil when it does not exist).
+func publicationTable(im *catalog.InMemory, ctx *Context, qname string) *catalog.Table {
 	schema, name := "public", qname
 	if dot := indexByteLast(qname, '.'); dot >= 0 {
 		schema, name = qname[:dot], qname[dot+1:]
 	}
 	if tbl, ok := im.LookupTable(parser.ObjectName{Schema: schema, Name: name},
 		catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)); ok && tbl != nil {
-		return tbl.OID
+		return tbl
 	}
-	return 0
+	return nil
 }
 
 func indexByteLast(s string, b byte) int {
@@ -259,4 +274,20 @@ func mirrorPublicationCatalogFiles(ctx *Context) {
 	} {
 		_ = mirrorCatalogRelToPostgresDB(ctx, oid)
 	}
+}
+
+// publicationColumnAttnums is a column list's attnums in table order
+// (prattrs).
+func publicationColumnAttnums(tbl *catalog.Table, cols []string) []int16 {
+	want := map[string]bool{}
+	for _, c := range cols {
+		want[c] = true
+	}
+	var out []int16
+	for _, c := range tbl.Columns {
+		if want[c.Name] && !c.Dropped {
+			out = append(out, int16(c.Ordinal+1))
+		}
+	}
+	return out
 }

@@ -1,6 +1,6 @@
 # M0149\-0048 — Port subscription/t/011\_generated.pl
 
-Status: in progress \(0048a, 0048b, 0048c landed\). TestPort\_Subscription011Generated is written \(three pairings\) and gated by GOOPG\_TAP\_011. The
+Status: in progress \(0048a, 0048b, 0048c, 0048e landed\). TestPort\_Subscription011Generated is written \(three pairings\) and gated by GOOPG\_TAP\_011. The
 first run's failures split into five children, each named by a failing assertion.
 
 ## Landed — M0149\-0048a, a goopg publisher publishes only the columns PG publishes
@@ -65,10 +65,27 @@ Tests: TestApplyColumnMapRejectsGeneratedTarget, TestComputeGeneratedColumnsOver
 pg18\-publisher\-goopg\-subscriber passes 11/12; the last assertion waits for the t1 error after CREATE SUBSCRIPTION
 returns, which needs a retried tablesync \(M0149\-0048f\).
 
+## Landed — M0149\-0048e, publication column lists
+
+- **Parser.** `FOR TABLE t (a, b)` is gram.y's `TABLE relation_expr opt_column_list`
+  \(`CreatePublicationStmt.TableColumns`, parallel to Tables\). This is the hand\-written parser; the goldens are
+  unchanged.
+- **DDL.** `publicationColumnList` is pub\_collist\_validate: an unknown column is 42703, a system or virtual generated
+  column 42P10, a repeated one 42710. The list is stored in table order, as prattrs is sorted.
+- **Catalog.** `Publication.Columns` maps each member table to its list. The map is replaced, never mutated, and is
+  pruned when ALTER PUBLICATION changes the members. pg\_publication\_rel.prattrs is written as an int2vector of the
+  attnums and decoded on reload \(`int2VectorDatumAttnums`: the heap decode yields the array body without its varlena
+  header\). The virtual pg\_publication\_rel view shows it.
+- **Publishing.** pg\_get\_publication\_tables' attrs is the list when there is one. `PgOutput.publishedColumns` gains
+  the rule's first arm: a column list wins over publish\_generated\_columns \(`xlog.ColumnListFilter`, implemented
+  by the walsender filter; a covering publication without a list publishes the whole table\).
+
+Tests: TestCreatePublicationColumnList, TestPublicationColumnList, TestPgOutputColumnList, TestInt2VectorDatumAttnums.
+TAP 011 goopg\-publisher\-pg18\-subscriber passes 12/12. all\-goopg and pg18\-publisher\-goopg\-subscriber pass 11/12 and
+wait only on the t1 error log \(M0149\-0048f\).
+
 ## Open
 - **M0149\-0048f**: a failed table sync is retried, as PG's tablesync worker restarts after
   wal\_retrieve\_retry\_interval. goopg's sync runs inside the command and logs a failure once.
 - **M0149\-0048d**: goopg's tablesync copies a publisher's stored generated columns when they are published \(PG 18
   copy\_table's COPY \(SELECT …\) form when gencol\_published\).
-- **M0149\-0048e**: publication column lists — FOR TABLE t \(cols\) grammar, pg\_publication\_rel.prattrs, the pgoutput
-  column rule, pg\_get\_publication\_tables attrs, and goopg tablesync honouring a remote column list.

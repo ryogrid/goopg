@@ -3345,6 +3345,11 @@ func reloadUserEventTriggersFromHeapMode(mgr *storage.Manager, cat *catalog.InMe
 func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, pubsub *catalog.PubSub, clog *transam.CLog) error {
 	// Pass 1: member rows, grouped by publication OID.
 	membersByPub := map[uint32][]string{}
+	colsByPub := map[uint32]map[string][]string{}
+	type prMember struct {
+		pub, rel uint32
+		attnums  []int16
+	}
 	prCols := executor.PGPublicationRelColumnsPG18()
 	prRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 6106, Fork: storage.MainFork}
 	prRows, err := scanCatalogHeapRows(mgr, prRel, clog, "pg_publication_rel",
@@ -3354,15 +3359,32 @@ func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory,
 			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, prCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
 				return nil, false, derr
 			}
-			return [2]uint32{uint32(decoded[1].Int), uint32(decoded[2].Int)}, false, nil // {prpubid, prrelid}
+			return prMember{pub: uint32(decoded[1].Int), rel: uint32(decoded[2].Int), attnums: int2VectorDatumAttnums(decoded[4])}, false, nil
 		})
 	if err != nil {
 		return err
 	}
 	for _, raw := range prRows {
-		pr := raw.([2]uint32)
-		if tbl, ok := cat.LookupTableByOID(pr[1]); ok && tbl != nil {
-			membersByPub[pr[0]] = append(membersByPub[pr[0]], tbl.QualifiedName())
+		pr := raw.(prMember)
+		tbl, ok := cat.LookupTableByOID(pr.rel)
+		if !ok || tbl == nil {
+			continue
+		}
+		membersByPub[pr.pub] = append(membersByPub[pr.pub], tbl.QualifiedName())
+		if len(pr.attnums) > 0 {
+			// prattrs → the column list by attnum (attnum = Ordinal + 1).
+			var cols []string
+			for _, n := range pr.attnums {
+				for _, c := range tbl.Columns {
+					if c.Ordinal+1 == int(n) && !c.Dropped {
+						cols = append(cols, c.Name)
+					}
+				}
+			}
+			if colsByPub[pr.pub] == nil {
+				colsByPub[pr.pub] = map[string][]string{}
+			}
+			colsByPub[pr.pub][tbl.QualifiedName()] = cols
 		}
 	}
 
@@ -3416,6 +3438,7 @@ func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory,
 		pr := raw.(pubRow)
 		pr.pub.DBOid = nsDBOid
 		pr.pub.Tables = membersByPub[pr.pub.OID]
+		pr.pub.Columns = colsByPub[pr.pub.OID]
 		pubsub.CreatePublicationDuringRecovery(&pr.pub)
 		cat.SetPublicationHeapTID(pr.pub.OID, catalog.SchemaHeapTID{Block: uint32(pr.tid.Block), Offset: pr.tid.Offset})
 	}
@@ -4023,4 +4046,43 @@ func pubGenColsFromHeap(d executor.Datum) byte {
 		return 's'
 	}
 	return 'n'
+}
+
+// int2VectorDatumAttnums decodes an int2vector cell (pg_publication_rel.
+// prattrs). The heap decode yields the array body without its varlena
+// header — ndim(4) dataoffset(4) elemtype(4) dim(4) lbound(4), then the
+// int2 values; a blob that still carries the 4-byte varlena header, or the
+// "1 2 3" text form, is accepted too. NULL is nil.
+func int2VectorDatumAttnums(d executor.Datum) []int16 {
+	if d.IsNull() {
+		return nil
+	}
+	var b []byte
+	if d.Kind == executor.KindBytes {
+		b = d.BytesValue()
+	} else {
+		b = []byte(d.StringValue())
+	}
+	hdr := -1
+	switch {
+	case len(b) >= 20 && binary.LittleEndian.Uint32(b[0:4]) == 1 && binary.LittleEndian.Uint32(b[8:12]) == 21:
+		hdr = 20
+	case len(b) >= 24 && binary.LittleEndian.Uint32(b[4:8]) == 1 && binary.LittleEndian.Uint32(b[12:16]) == 21:
+		hdr = 24
+	}
+	if hdr > 0 {
+		n := int(binary.LittleEndian.Uint32(b[hdr-8 : hdr-4]))
+		out := make([]int16, 0, n)
+		for i := 0; i < n && hdr+2*i+2 <= len(b); i++ {
+			out = append(out, int16(binary.LittleEndian.Uint16(b[hdr+2*i:])))
+		}
+		return out
+	}
+	var out []int16
+	for _, f := range strings.Fields(string(b)) {
+		if v, err := strconv.Atoi(f); err == nil {
+			out = append(out, int16(v))
+		}
+	}
+	return out
 }

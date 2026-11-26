@@ -15,6 +15,7 @@ package initdb
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -485,16 +486,21 @@ func registerPublicationViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
 			}
 			for _, qname := range pub.Tables {
 				relOID := lookupRelOID(cat, qname)
+				// prattrs is NULL without a column list; with one, the
+				// listed columns' attnums in table order (int2vector
+				// text). prqual stays NULL (no row filters). They were
+				// "", which psql's \dRp+ (describe.c) reads as present
+				// and prints as `"public.t" () WHERE`.
+				prattrs := catalog.VirtualNull
+				if cols, ok := pub.Columns[qname]; ok {
+					prattrs = publicationAttnumsText(cat, qname, cols)
+				}
 				out = append(out, []string{
 					"", // oid of the pg_publication_rel row itself
 					fmt.Sprintf("%d", pub.OID),
 					relOID,
-					// prqual / prattrs are NULL without a row filter /
-					// column list (goopg models neither). They were "",
-					// which psql's \dRp+ (describe.c) reads as present
-					// and prints as `"public.t" () WHERE`.
 					catalog.VirtualNull, // prqual
-					catalog.VirtualNull, // prattrs
+					prattrs,
 				})
 			}
 		}
@@ -671,6 +677,27 @@ func registerSubscriptionViews(cat *catalog.InMemory, ps *catalog.PubSub) error 
 // just "name") to its OID via the catalog's LookupTable. Empty
 // when the table isn't registered — keeps `pg_publication_rel`
 // well-formed even for stale publication entries.
+// publicationAttnumsText renders a column list as prattrs' int2vector text:
+// the listed columns' attnums (Ordinal + 1) in table order.
+func publicationAttnumsText(cat *catalog.InMemory, qname string, cols []string) string {
+	schema, name := splitQualifiedName(qname)
+	t, ok := cat.LookupTable(parser.ObjectName{Schema: schema, Name: name})
+	if !ok {
+		return catalog.VirtualNull
+	}
+	want := map[string]bool{}
+	for _, c := range cols {
+		want[c] = true
+	}
+	var parts []string
+	for _, c := range t.Columns {
+		if want[c.Name] && !c.Dropped {
+			parts = append(parts, fmt.Sprintf("%d", c.Ordinal+1))
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
 func lookupRelOID(cat *catalog.InMemory, qname string) string {
 	schema, name := splitQualifiedName(qname)
 	t, ok := cat.LookupTable(parser.ObjectName{Schema: schema, Name: name})

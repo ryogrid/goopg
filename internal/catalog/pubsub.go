@@ -47,6 +47,11 @@ type Publication struct {
 	// true. Insertion order is preserved so views render rows
 	// in the order an operator added them.
 	Tables []string
+	// Columns maps a member table's qualified name to its publication
+	// column list (pg_publication_rel.prattrs) in table-column order; a
+	// table absent from the map publishes every column. The map is
+	// replaced, never mutated, so shallow copies may share it.
+	Columns map[string][]string
 	// DBOid is the real physical database oid this publication was CREATE
 	// PUBLICATION'd under (mirrors Subscription.DBOid + UserTSConfig.DBOid).
 	// Two distinct databases may each create a same-named publication without
@@ -373,9 +378,39 @@ func (p *PubSub) SetPublicationTables(name string, tables []string, dbOid ...uin
 		return nil, fmt.Errorf("publication %q does not exist", name)
 	}
 	pub.Tables = append([]string(nil), tables...)
+	if len(pub.Columns) > 0 {
+		kept := map[string][]string{}
+		for _, t := range pub.Tables {
+			if cols, ok := pub.Columns[t]; ok {
+				kept[t] = cols
+			}
+		}
+		pub.Columns = kept
+	}
 	out := *pub
 	out.Tables = append([]string(nil), pub.Tables...)
 	return &out, nil
+}
+
+// SetPublicationColumnLists sets the column lists of a publication's member
+// tables (FOR TABLE t (cols)); a table not in cols publishes every column.
+func (p *PubSub) SetPublicationColumnLists(name string, cols map[string][]string, dbOid ...uint32) error {
+	defer p.pubGen.Add(1)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pub, ok := p.publications[pubMapKey(resolveDBOid(dbOid), name)]
+	if !ok {
+		return fmt.Errorf("publication %q does not exist", name)
+	}
+	next := make(map[string][]string, len(pub.Columns)+len(cols))
+	for t, c := range pub.Columns {
+		next[t] = c
+	}
+	for t, c := range cols {
+		next[t] = append([]string(nil), c...)
+	}
+	pub.Columns = next
+	return nil
 }
 
 // SetPublicationOptions replaces a publication's publish actions (ALTER

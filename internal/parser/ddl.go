@@ -2457,7 +2457,25 @@ func (p *parser) parseCreatePublicationTail(pos int) (Stmt, error) {
 				if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
 					p.advance()
 				}
+				// opt_column_list: `( columnList )`.
+				var cols []string
+				if p.acceptSymbol("(") {
+					for {
+						if p.cur().Kind != TokenIdent && p.cur().Kind != TokenKeyword {
+							return nil, p.errAtCur("expected column name in publication column list")
+						}
+						cols = append(cols, p.cur().Value)
+						p.advance()
+						if !p.acceptSymbol(",") {
+							break
+						}
+					}
+					if !p.acceptSymbol(")") {
+						return nil, p.errAtCur("expected ) after publication column list")
+					}
+				}
 				stmt.Tables = append(stmt.Tables, obj)
+				stmt.TableColumns = append(stmt.TableColumns, cols)
 				if !p.acceptSymbol(",") {
 					break
 				}

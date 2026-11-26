@@ -17111,11 +17111,13 @@ verify each at HEAD when the task starts.
   - 011 all\-goopg and pg18\-publisher\-goopg\-subscriber: tab\_gen\_to\_nogen initial sync with publish\_generated\_columns = stored reads `1|` \(want `1|2`\). PG 18 tablesync copy\_table uses COPY \(SELECT cols FROM t\) when gencol\_published.
   - Path\-to\-TAP: 011 ← 0048d \(1 link\).
   - 2026\-11\-26: the mechanism landed with 0048c \(PG 18 column set \+ COPY \(SELECT …\)\); the tab\_gen\_to\_nogen stored initial\-sync assertion now passes in pg18\-publisher\-goopg\-subscriber and all\-goopg. Close once the all\-goopg pairing runs to the end \(blocked by 0048e's column\-list DDL\).
-- [ ] **M0149-0048e — publication column lists \(FOR TABLE t \(cols\)\)**
+- [x] **M0149-0048e — publication column lists \(FOR TABLE t \(cols\)\)**
   Kind: impl
   Parent: M0149-0048
   - 011 goopg publisher: `CREATE PUBLICATION pub1 FOR table tab2(gen1) …` → syntax error at or near "\(". pg18\-publisher\-goopg\-subscriber: tab2 initial sync reads `1|` \(goopg tablesync ignores the remote column list; want `|2`\). Needs grammar, pg\_publication\_rel.prattrs, the pgoutput column rule, pg\_get\_publication\_tables attrs and goopg tablesync.
   - Path\-to\-TAP: 011 ← 0048e \(1 link\).
+  - 2026\-11\-26 \(done\): parser TableColumns; publicationColumnList \(pub\_collist\_validate codes\); Publication.Columns \+ SetPublicationColumnLists; prattrs written and reloaded \(int2VectorDatumAttnums\) and shown in the virtual pg\_publication\_rel; attrs from the list; pgoutput ColumnListFilter arm. Restart verified on a scratch server \(attrs `1 3` before and after\).
+  Movement: yes — tap 011 goopg-publisher-pg18-subscriber 7/12 -> 12/12, all-goopg 7/12 -> 11/12 assertions; regress publication 595 -> 576
 - [ ] **M0149-0049 — port subscription/t/012_collation.pl**
   Kind: impl
   Parent: none

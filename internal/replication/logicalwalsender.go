@@ -497,6 +497,12 @@ var _ = storage.MainFork
 type publicationFilter struct {
 	allTablesAllowed allowFlags
 	byTable          map[string]allowFlags
+	// colLists is the union of the column lists the subscribed
+	// publications give a table; wholeTable marks a table one of them
+	// publishes without a list (as FOR ALL TABLES does every table).
+	colLists   map[string][]string
+	wholeTable map[string]bool
+	allTables  bool
 }
 
 // allowFlags is the bitset of publish-* flags that have been
@@ -535,6 +541,22 @@ func (f *publicationFilter) Allows(rel *xlog.RelationDef, kind xlog.ChangeKind) 
 		return true
 	}
 	return false
+}
+
+// ColumnList implements xlog.ColumnListFilter: the union of the subscribed
+// publications' column lists for rel, unless one of them publishes the
+// whole table. PG requires the lists to be identical (pgoutput_column_list_init
+// "cannot use different column lists"); goopg takes their union.
+func (f *publicationFilter) ColumnList(rel *xlog.RelationDef) ([]string, bool) {
+	if rel == nil || f.allTables {
+		return nil, false
+	}
+	q := relQualifiedName(rel)
+	cols, ok := f.colLists[q]
+	if !ok || f.wholeTable[q] {
+		return nil, false
+	}
+	return cols, true
 }
 
 // PublishesStoredGenerated implements xlog.GenColsFilter: a publication
@@ -633,10 +655,22 @@ func buildPublicationFilter(ps *catalog.PubSub, names []string, dbOid ...uint32)
 		}
 		if pub.AllTables {
 			out.allTablesAllowed = unionFlags(out.allTablesAllowed, flags)
+			out.allTables = true
 			continue
 		}
 		for _, qname := range pub.Tables {
 			out.byTable[qname] = unionFlags(out.byTable[qname], flags)
+			if cols, ok := pub.Columns[qname]; ok {
+				if out.colLists == nil {
+					out.colLists = map[string][]string{}
+				}
+				out.colLists[qname] = append(out.colLists[qname], cols...)
+			} else {
+				if out.wholeTable == nil {
+					out.wholeTable = map[string]bool{}
+				}
+				out.wholeTable[qname] = true
+			}
 		}
 	}
 	return out
@@ -674,6 +708,14 @@ func (f *livePublicationFilter) Allows(rel *xlog.RelationDef, kind xlog.ChangeKi
 		f.refresh()
 	}
 	return f.cur.Allows(rel, kind)
+}
+
+// ColumnList implements xlog.ColumnListFilter.
+func (f *livePublicationFilter) ColumnList(rel *xlog.RelationDef) ([]string, bool) {
+	if g := f.ps.PublicationGeneration(); g != f.gen {
+		f.refresh()
+	}
+	return f.cur.ColumnList(rel)
 }
 
 // PublishesStoredGenerated implements xlog.GenColsFilter.

@@ -233,6 +233,10 @@ func splitQualifiedTable(qname string) (string, string) {
 // subscriber's tablesync copies exactly these columns
 // (fetch_remote_table_info).
 func publicationPublishedAttnums(pub *catalog.Publication, t *catalog.Table) []int16 {
+	if cols, ok := pub.Columns[t.QualifiedName()]; ok {
+		// A column list: exactly its columns (prattrs).
+		return publicationColumnAttnums(t, cols)
+	}
 	nums := make([]int16, 0, len(t.Columns))
 	for _, col := range t.Columns {
 		if col.Dropped {

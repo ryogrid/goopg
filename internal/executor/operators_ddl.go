@@ -1225,6 +1225,44 @@ func (o *ddlOp) resolveUserMappingRoleName(user string) string {
 // pg_subscription, pg_subscription_rel) read the same registry, so
 // the SQL surface and the views stay coherent. See
 // docs/design/0008-0003-publication-subscription-ddl.md.
+// publicationColumnList is pub_collist_validate + publication_translate_columns
+// (pg_publication.c): every named column must exist (42703), must not be a
+// virtual generated column (42P10) and must not repeat (42710). The list is
+// returned in table-column (attnum) order, as prattrs stores it sorted.
+func publicationColumnList(tbl *catalog.Table, names []string) ([]string, error) {
+	seen := map[string]bool{}
+	for _, n := range names {
+		idx := -1
+		for j, c := range tbl.Columns {
+			if !c.Dropped && c.Name == n {
+				idx = j
+				break
+			}
+		}
+		if idx < 0 {
+			switch n {
+			case "ctid", "xmin", "cmin", "xmax", "cmax", "tableoid":
+				return nil, &ExecError{Code: "42P10", Message: fmt.Sprintf("cannot use system column \"%s\" in publication column list", n)}
+			}
+			return nil, &ExecError{Code: "42703", Message: fmt.Sprintf("column \"%s\" of relation \"%s\" does not exist", n, tbl.Name)}
+		}
+		if tbl.Columns[idx].GeneratedExpr != "" && tbl.Columns[idx].GeneratedVirtual {
+			return nil, &ExecError{Code: "42P10", Message: fmt.Sprintf("cannot use virtual generated column \"%s\" in publication column list", n)}
+		}
+		if seen[n] {
+			return nil, &ExecError{Code: "42710", Message: fmt.Sprintf("duplicate column \"%s\" in publication column list", n)}
+		}
+		seen[n] = true
+	}
+	out := make([]string, 0, len(names))
+	for _, c := range tbl.Columns {
+		if seen[c.Name] && !c.Dropped {
+			out = append(out, c.Name)
+		}
+	}
+	return out, nil
+}
+
 func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 	if o.ctx.PubSub == nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "CREATE PUBLICATION requires PubSub registry in Context"}
@@ -1243,7 +1281,8 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 	// decode time. Unqualified names fall back to `public` to mirror
 	// PG's default search_path. See 0103-0015.
 	tables := make([]string, 0, len(s.Tables))
-	for _, t := range s.Tables {
+	var colLists map[string][]string
+	for i, t := range s.Tables {
 		tbl, ok := o.ctx.Catalog.LookupTable(t, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !ok && t.Schema == "" {
 			tbl, ok = o.ctx.Catalog.LookupTable(parser.ObjectName{Schema: "public", Name: t.Name}, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
@@ -1252,10 +1291,26 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", qualifiedTableName(t))}
 		}
 		tables = append(tables, tbl.QualifiedName())
+		if i < len(s.TableColumns) && s.TableColumns[i] != nil {
+			cols, err := publicationColumnList(tbl, s.TableColumns[i])
+			if err != nil {
+				return err
+			}
+			if colLists == nil {
+				colLists = map[string][]string{}
+			}
+			colLists[tbl.QualifiedName()] = cols
+		}
 	}
 	pub, err := o.ctx.PubSub.CreatePublicationAsOwner(s.Name, tables, opts, o.currentDDLOwnerOID(), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	if colLists != nil {
+		if err := o.ctx.PubSub.SetPublicationColumnLists(s.Name, colLists, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
+			return err
+		}
+		pub.Columns = colLists
 	}
 	// DU-002 restart-persistence follow-up (M0119-0004, loop #67 ledger
 	// resume point): goopg has no per-publication on-disk file namespace,

@@ -7,6 +7,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/access/transam"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -136,4 +137,19 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestInt2VectorDatumAttnums: prattrs decodes from the varlena-stripped
+// array body the heap decode yields, from the full blob, and from text.
+func TestInt2VectorDatumAttnums(t *testing.T) {
+	body := []byte{1, 0, 0, 0, 0, 0, 0, 0, 21, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 3, 0}
+	full := append([]byte{byte((len(body) + 4) << 2), 0, 0, 0}, body...)
+	for _, d := range []executor.Datum{executor.NewBytesDatum(body), executor.NewBytesDatum(full), executor.NewStringDatum("1 3")} {
+		if got := int2VectorDatumAttnums(d); fmt.Sprint(got) != "[1 3]" {
+			t.Errorf("%v -> %v, want [1 3]", d, got)
+		}
+	}
+	if int2VectorDatumAttnums(executor.NullDatum) != nil {
+		t.Error("NULL must decode to nil")
+	}
 }

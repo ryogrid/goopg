@@ -95,6 +95,14 @@ type GenColsFilter interface {
 	PublishesStoredGenerated(rel *RelationDef) bool
 }
 
+// ColumnListFilter is implemented by a RelationFilter that knows the
+// publications' column lists: ColumnList returns rel's published column
+// names when every covering publication has a list (their union), and
+// ok = false when some publication publishes the whole table.
+type ColumnListFilter interface {
+	ColumnList(rel *RelationDef) (cols []string, ok bool)
+}
+
 // PgOutput emits logical-replication messages to an io.Writer in
 // upstream pgoutput's wire format. One PgOutput per active
 // logical slot; not goroutine-safe (the `SlotDecoder` loop is
@@ -392,6 +400,21 @@ func (p *PgOutput) writeRelation(rel *RelationDef) error {
 // that drops virtual generated columns and, unless the publications
 // publish them, stored ones.
 func (p *PgOutput) publishedColumns(rel *RelationDef) []bool {
+	if cf, ok := p.filter.(ColumnListFilter); ok {
+		if list, has := cf.ColumnList(rel); has {
+			// A column list takes precedence over
+			// publish_generated_columns: exactly its columns.
+			want := make(map[string]bool, len(list))
+			for _, c := range list {
+				want[c] = true
+			}
+			include := make([]bool, len(rel.Columns))
+			for i, col := range rel.Columns {
+				include[i] = want[col.Name]
+			}
+			return include
+		}
+	}
 	stored := false
 	if gf, ok := p.filter.(GenColsFilter); ok {
 		stored = gf.PublishesStoredGenerated(rel)
