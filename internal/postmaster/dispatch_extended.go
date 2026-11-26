@@ -459,6 +459,9 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 	ectx.AsyncCommit = sessionAsyncCommit(sess)
 	if s.applyLauncher != nil {
 		ectx.OnSubscriptionChange = s.applyLauncher.Wake
+		if s.replHandler != nil {
+			ectx.LogicalSlotChanges = s.replHandler.SQLSlotChanges
+		}
 		ectx.CreateSubscriptionSlot, ectx.DropSubscriptionSlot, ectx.CheckPublicationsOnPublisher,
 			ectx.RefreshSubscriptionOnPublisher = s.subscriptionSlotHooks()
 	}

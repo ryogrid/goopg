@@ -18,6 +18,10 @@ var builtinSRFColumns = map[string]BuiltinSRFColumns{
 	"pg_ls_dir": {Types: []string{"text"}},
 	// genfile.c pg_stat_file: record (size, access, modification, change,
 	// creation, isdir).
+	// logicalfuncs.c pg_logical_slot_{get,peek}_binary_changes: SETOF
+	// (lsn pg_lsn, xid xid, data bytea).
+	"pg_logical_slot_get_binary_changes":  {Names: []string{"lsn", "xid", "data"}, Types: []string{"pg_lsn", "xid", "bytea"}},
+	"pg_logical_slot_peek_binary_changes": {Names: []string{"lsn", "xid", "data"}, Types: []string{"pg_lsn", "xid", "bytea"}},
 	"pg_stat_file": {
 		Names: []string{"size", "access", "modification", "change", "creation", "isdir"},
 		Types: []string{"int8", "timestamptz", "timestamptz", "timestamptz", "timestamptz", "bool"},

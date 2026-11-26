@@ -21,6 +21,11 @@ var builtinSRFSpecs = map[string]builtinSRFSpec{
 	"pg_ls_dir": {minArgs: 1, maxArgs: 3},
 	// pg_stat_file(filename text [, missing_ok bool]) RETURNS record.
 	"pg_stat_file": {minArgs: 1, maxArgs: 2},
+	// pg_logical_slot_{get,peek}_binary_changes(slot_name name, upto_lsn
+	// pg_lsn, upto_nchanges int, VARIADIC options text[]): the option
+	// name/value pairs arrive as further arguments.
+	"pg_logical_slot_get_binary_changes":  {minArgs: 3, maxArgs: 1 << 16},
+	"pg_logical_slot_peek_binary_changes": {minArgs: 3, maxArgs: 1 << 16},
 }
 
 // IsBuiltinSRF reports whether name is planned as a BuiltinSRFScan.

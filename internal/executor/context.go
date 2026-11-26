@@ -709,6 +709,12 @@ type Context struct {
 	// for its periodic poll. nil disables the wakeup (the launcher
 	// still converges via the timer). M0103-0002.
 	OnSubscriptionChange func()
+	// LogicalSlotChanges runs SQL logical decoding over a slot
+	// (pg_logical_slot_{get,peek}_binary_changes): peek leaves the slot
+	// where it is, options are the VARIADIC name/value list. physDBOid is
+	// the connection's pg_database.oid, nsDBOid its catalog namespace. Nil
+	// when the server has no walsender handler.
+	LogicalSlotChanges func(slot string, peek bool, options []string, physDBOid, nsDBOid uint32) ([]LogicalSlotChange, error)
 	// CreateSubscriptionSlot / DropSubscriptionSlot create and drop a
 	// subscription's slot on its publisher (CreateSubscription's
 	// walrcv_create_slot, DropSubscription's ReplicationSlotDropAtPubNode).
@@ -2207,4 +2213,13 @@ type PreparedLiteralSettings struct {
 	DateStyle string
 	// TimezoneAbbreviations is timezone_abbreviations at PREPARE (M0149-0001h1a82).
 	TimezoneAbbreviations string
+}
+
+// LogicalSlotChange is one row of pg_logical_slot_{get,peek}_binary_changes:
+// the message's LSN, its transaction id (0 outside a transaction) and its
+// output-plugin bytes.
+type LogicalSlotChange struct {
+	LSN  uint64
+	XID  uint32
+	Data []byte
 }

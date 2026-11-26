@@ -1581,7 +1581,7 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			}
 			return catalog.Type{Name: "bool"}, nil
 		case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
-			if !isComparable(leftTyp, rightTyp) {
+			if !isComparable(leftTyp, rightTyp) && !xidIntEquality(x.Op, leftTyp, rightTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s has incompatible operand types %q and %q", x.Op, leftTyp.Name, rightTyp.Name))
 			}
 			return catalog.Type{Name: "bool"}, nil
@@ -3695,6 +3695,26 @@ func isByteaOrUnknown(t catalog.Type) bool {
 		return true
 	}
 	return strings.ToLower(t.Name) == "bytea"
+}
+
+// xidIntEquality reports xid = int4 / xid <> int4 (xideqint4 / xidneqint4 in
+// pg_operator.dat), either operand order. PG defines no ordering operators
+// for the pair. The analyzer types an integer literal as int8, so any integer
+// width is accepted. 020_messages.pl filters
+// pg_logical_slot_get_binary_changes on `xid = 0` (M0149-0051).
+func xidIntEquality(op parser.OpCode, left, right catalog.Type) bool {
+	if op != parser.OpEq && op != parser.OpNe {
+		return false
+	}
+	isXid := func(t catalog.Type) bool { return !t.IsArray && strings.EqualFold(t.Name, "xid") }
+	isInt := func(t catalog.Type) bool {
+		switch strings.ToLower(t.Name) {
+		case "int2", "int4", "int8", "integer", "smallint", "bigint":
+			return !t.IsArray
+		}
+		return false
+	}
+	return (isXid(left) && isInt(right)) || (isInt(left) && isXid(right))
 }
 
 func isComparable(left, right catalog.Type) bool {

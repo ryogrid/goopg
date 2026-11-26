@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
 )
 
@@ -25,6 +26,17 @@ type builtinSRFFunc func(ctx *Context, args []Datum) ([]Row, error)
 var builtinSRFFuncs = map[string]builtinSRFFunc{
 	"pg_ls_dir":    pgLsDir,
 	"pg_stat_file": pgStatFile,
+
+	"pg_logical_slot_get_binary_changes":  pgLogicalSlotGetBinaryChanges,
+	"pg_logical_slot_peek_binary_changes": pgLogicalSlotPeekBinaryChanges,
+}
+
+// builtinSRFNotStrict names the functions whose NULL arguments are
+// meaningful (proisstrict = false): the slot-changes functions take NULL
+// upto_lsn / upto_nchanges for "no limit".
+var builtinSRFNotStrict = map[string]bool{
+	"pg_logical_slot_get_binary_changes":  true,
+	"pg_logical_slot_peek_binary_changes": true,
 }
 
 type builtinSRFScanOp struct {
@@ -57,7 +69,7 @@ func (o *builtinSRFScanOp) Open(ctx *Context) error {
 		if err != nil {
 			return err
 		}
-		if d.IsNull() {
+		if d.IsNull() && !builtinSRFNotStrict[o.plan.Func] {
 			return nil // every genfile.c function is strict
 		}
 		args[i] = d
@@ -225,4 +237,46 @@ func pgStatFile(ctx *Context, args []Datum) ([]Row, error) {
 		NullDatum,
 		NewBoolDatum(fi.IsDir()),
 	}}, nil
+}
+
+func pgLogicalSlotGetBinaryChanges(ctx *Context, args []Datum) ([]Row, error) {
+	return pgLogicalSlotBinaryChanges(ctx, args, false)
+}
+
+func pgLogicalSlotPeekBinaryChanges(ctx *Context, args []Datum) ([]Row, error) {
+	return pgLogicalSlotBinaryChanges(ctx, args, true)
+}
+
+// pgLogicalSlotBinaryChanges is pg_logical_slot_get_changes_guts with
+// binary output: (slot_name, upto_lsn, upto_nchanges, VARIADIC options).
+// The slot name is required (22004 "slot name must not be null", as
+// pg_logical_slot_get_changes_guts reports); upto_lsn / upto_nchanges are
+// accepted but only NULL (decode to the current end of WAL) is honoured.
+func pgLogicalSlotBinaryChanges(ctx *Context, args []Datum, peek bool) ([]Row, error) {
+	if len(args) < 3 {
+		return nil, &ExecError{Code: "42883", Message: "function requires slot_name, upto_lsn and upto_nchanges"}
+	}
+	if args[0].IsNull() {
+		return nil, &ExecError{Code: "22004", Message: "slot name must not be null"}
+	}
+	if ctx.LogicalSlotChanges == nil {
+		return nil, &ExecError{Code: "0A000", Message: "logical decoding is not available in this context"}
+	}
+	var options []string
+	for _, a := range args[3:] {
+		if a.IsNull() {
+			return nil, &ExecError{Code: "22004", Message: "array must not contain nulls"}
+		}
+		options = append(options, a.StringValue())
+	}
+	changes, err := ctx.LogicalSlotChanges(args[0].StringValue(), peek, options,
+		logicalMessageDBOid(ctx), catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]Row, 0, len(changes))
+	for _, c := range changes {
+		rows = append(rows, Row{NewStringDatum(formatPgLSN(c.LSN)), NewIntDatum(int64(c.XID)), NewBytesDatum(c.Data)})
+	}
+	return rows, nil
 }

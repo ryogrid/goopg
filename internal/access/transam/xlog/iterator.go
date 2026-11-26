@@ -381,6 +381,14 @@ func (it *RecordIterator) parkUntilWake(ctx context.Context, atEndOfWAL bool) er
 	}
 }
 
+// ConsumedThrough returns the 0-based byte position of the iterator's
+// cursor: every record ending at or before it has been returned by Next.
+// Call it from the goroutine that drives Next. A one-shot consumer that
+// decodes up to a fixed end LSN (pg_logical_slot_get_changes) stops once
+// this reaches that end; AtEndOfWAL cannot serve, because the parked flag
+// is cleared as soon as Next returns.
+func (it *RecordIterator) ConsumedThrough() uint64 { return uint64(it.pos) }
+
 // AtEndOfWAL reports that the iterator has consumed every *complete*
 // record the writer holds and cannot advance further without new
 // bytes being appended.

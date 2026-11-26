@@ -17184,11 +17184,29 @@ verify each at HEAD when the task starts.
   - Path\-to\-TAP: 014 ← 0050e \(1 link\).
   - 2026\-11\-26 \(done\): only ALTER TYPE … SET was missing \(shell type, LANGUAGE internal functions and CREATE TYPE \(input, output\) already worked\). Grammar arm `SET '(' type_set_list ')'` \(conflicts stay 61\) \+ parseAlterType twin; execAlterTypeSetOptions records CompositeType.SendFunc / ReceiveFunc. Tests TestAlterTypeSetOptions, TestAlterTypeSetSendReceive. Regress create\_type unchanged \(112/405\).
   Movement: yes — tap 014 goopg-publisher-pg18-subscriber 6/9 -> 9/9 assertions
-- [ ] **M0149-0051 — port subscription/t/020_messages.pl**
+- [x] **M0149-0051 — port subscription/t/020_messages.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/020_messages.pl` — logical decoding messages through pgoutput.
   Likely prerequisites \(verify at start\): `messages` option + `M` message, `pg_logical_slot_peek_binary_changes` with pgoutput, transactional vs non-transactional messages.
+  - 2026\-11\-26 \(progress\): TestPort\_Subscription020Messages written, gated GOOPG\_TAP\_020. The pg18\-publisher\-goopg\-subscriber pairing passes as is; the two goopg\-publisher pairings stop at the first `pg_logical_slot_peek_binary_changes` \(0051a\).
+  - 2026\-11\-26 \(done\): 0051a landed; 020 ungated, 3/3 x 3; inventory 020 → port.
+  Movement: yes — tap 020 all-goopg 0/5 -> 5/5, goopg-publisher-pg18-subscriber 0/5 -> 5/5 (3/3 x 3 pairings); 020 port
+- [x] **M0149-0051a — pg\_logical\_slot\_get\_binary\_changes / pg\_logical\_slot\_peek\_binary\_changes for a pgoutput slot**
+  Kind: impl
+  Parent: M0149-0051
+  - 020 \(goopg publisher\): neither SRF existed. PG: logicalfuncs.c pg\_logical\_slot\_get\_changes\_guts decodes from the slot's restart point to GetFlushRecPtr, one row per OutputPluginWrite \(lsn = write\_location, xid, data\), and advances the slot only for get. 020 also filters on `xid = 0` \(xideqint4\).
+  - Path\-to\-TAP: 020 goopg\-publisher pairings ← 0051a \(1 link; a subset of M0149\-0035a\).
+  - 2026\-11\-26 \(done\): replication.Handler.SQLSlotChanges \(slot checks, pgoutput with the live publication filter and messages option, RecordIterator bounded at WrittenLSN via the new ConsumedThrough, pgoutput's empty\-transaction rule in sqlChangeCollector, slot advance for get\); builtin SRFs with variadic options \(builtinSRFNotStrict for the NULL upto args\); ExecContext.LogicalSlotChanges wired in both dispatch paths; analyzer xidIntEquality. Tests TestSQLChangeCollectorEmptyTransaction, TestXidIntEquality.
+  Movement: yes — tap 020 all-goopg 0/5 -> 5/5, goopg-publisher-pg18-subscriber 0/5 -> 5/5
+- [ ] **M0149-0051b — SQL slot\-change rows: a BEGIN row carries txn\->first\_lsn, upto\_lsn / upto\_nchanges are honoured**
+  Kind: impl
+  Parent: M0149-0051
+  - begin\_cb\_wrapper sets write\_location = txn\->first\_lsn; goopg's reorder buffer keeps no first LSN, so the B row shows the commit LSN. The upto\_lsn / upto\_nchanges arguments are accepted and ignored. 020 checks neither. PG parity only.
+- [ ] **M0149-0051c — a logical slot made by CREATE\_REPLICATION\_SLOT keeps its plugin and database**
+  Kind: impl
+  Parent: M0149-0051
+  - Probe 2026\-11\-26: `CREATE_REPLICATION_SLOT s2 LOGICAL pgoutput` on a replication=database connection → pg\_replication\_slots shows `logical` with empty plugin and database, and the state file's NameData plugin / database oid are zero, so after a restart the slot loads as `physical` \(slots\_pg.go derives kind from the plugin\). PG keeps both. 020 does not restart. Nearby defect, not worked.
 - [ ] **M0149-0052 — port subscription/t/024_add_drop_pub.pl**
   Kind: impl
   Parent: none
