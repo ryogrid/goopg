@@ -16851,6 +16851,7 @@ verify each at HEAD when the task starts.
   Kind: test
   Parent: none \(nearby, seen while gating M0149\-0040d/0041b; not on any TAP path\)
   - In `go test -p 1 -run 'TestPort_PgoutputInterop|TestPort_Subscription|TestPubSubCluster'` it failed on 3 of 4 runs since 2026\-11\-26 \("async DoD lower bound: count\(\*\)=407 < 489 … too many rows lost"\) and passes every time alone \(6 s\). The PG publisher and goopg subscriber paths it uses were not changed by those loops. Check whether a preceding test's leftover server or slot load shortens the window \(timing\-based kill\), or whether asyncLossBound is too tight.
+  - 2026\-11\-26: now also fails standalone, 5/5 runs, on HEAD 514c91732 and on the M0149\-0048c tree alike \(count 258\-393 vs bound \~500\); it passed inside the replication set at 49a081800 earlier the same day.
 - [ ] **M0149-0041a — a goopg database uses the encoding goopg init \-E / CREATE DATABASE ENCODING names**
   Kind: impl
   Parent: M0149-0041
@@ -17091,16 +17092,25 @@ verify each at HEAD when the task starts.
   - Path\-to\-TAP: 011 goopg\-publisher\-pg18\-subscriber ← 0048b \(1 link\).
   - 2026\-11\-26 \(done\): SRF shape \(pubid, relid, attrs int2vector, qual pg\_node\_tree\) in planner.go \(FROM\-clause \+ ProjectSet\) and analyzer.go \(base \+ composite\); attrs = publicationPublishedAttnums as int2vector text. Tests TestPublicationPublishedAttnums \+ updated shape tests. Found M0149\-0100 \(filed, S2\).
   Movement: yes — tap 011 goopg-publisher-pg18-subscriber 0/12 -> 7/12 assertions
-- [ ] **M0149-0048c — a goopg subscriber computes its own generated columns on apply and rejects a published column that maps to a local generated column**
+- [x] **M0149-0048c — a goopg subscriber computes its own generated columns on apply and rejects a published column that maps to a local generated column**
   Kind: impl
   Parent: M0149-0048
   - 011 pg18\-publisher\-goopg\-subscriber: applied rows read `4|||` \(b, c NULL; want 88, 132\); with the REPLICA trigger `8|||18`. The t1 case never logs "has incompatible generated columns: "c2", "c3"" \(PG: logicalrep\_rel\_open, worker.c / relation.c\).
   - Path\-to\-TAP: 011 pg18\-publisher\-goopg\-subscriber \+ all\-goopg ← 0048c \(1 link\).
+  - 2026\-11\-26 \(done\): applyInsert / applyUpdateByKey compute generated columns after BEFORE triggers; IncompatibleGeneratedColumnsError in applyRel.columnMap and postmaster copyColumnIndex; FetchRemoteColumns follows PG 18 fetch\_remote\_table\_info \(attrs column set over the subscription's publications, no attgenerated filter, gencol\_published → COPY \(SELECT …\)\). Tests TestApplyColumnMapRejectsGeneratedTarget, TestComputeGeneratedColumnsOverwritesReplicatedRow.
+  - The t1 error is logged once, during CREATE SUBSCRIPTION, before the test's log offset → M0149\-0048f.
+  Movement: yes — tap 011 pg18-publisher-goopg-subscriber 1/12 -> 11/12, all-goopg 3/12 -> 7/12 assertions
+- [ ] **M0149-0048f — a failed table sync is retried after wal\_retrieve\_retry\_interval**
+  Kind: impl
+  Parent: M0149-0048
+  - 011 pg18\-publisher\-goopg\-subscriber: `waitForLog(... has incompatible generated columns: "c2", "c3")` from an offset taken after CREATE SUBSCRIPTION returns. PG's tablesync worker fails, exits and is relaunched by the apply worker after wal\_retrieve\_retry\_interval \(process\_syncing\_tables\_for\_apply, logicalrep\_worker\_launch\), logging the ERROR each time. goopg's RefreshSubscriptionOnPublisher syncs inside the command, logs once and leaves the rel at i / d until the next refresh.
+  - Path\-to\-TAP: 011 pg18\-publisher\-goopg\-subscriber ← 0048f \(1 link\).
 - [ ] **M0149-0048d — goopg tablesync copies the publisher's published stored generated columns**
   Kind: impl
   Parent: M0149-0048
   - 011 all\-goopg and pg18\-publisher\-goopg\-subscriber: tab\_gen\_to\_nogen initial sync with publish\_generated\_columns = stored reads `1|` \(want `1|2`\). PG 18 tablesync copy\_table uses COPY \(SELECT cols FROM t\) when gencol\_published.
   - Path\-to\-TAP: 011 ← 0048d \(1 link\).
+  - 2026\-11\-26: the mechanism landed with 0048c \(PG 18 column set \+ COPY \(SELECT …\)\); the tab\_gen\_to\_nogen stored initial\-sync assertion now passes in pg18\-publisher\-goopg\-subscriber and all\-goopg. Close once the all\-goopg pairing runs to the end \(blocked by 0048e's column\-list DDL\).
 - [ ] **M0149-0048e — publication column lists \(FOR TABLE t \(cols\)\)**
   Kind: impl
   Parent: M0149-0048

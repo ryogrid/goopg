@@ -331,6 +331,10 @@ func (w *ApplyWorker) applyInsert(m *xlog.DecodedMessage) error {
 	if !keep {
 		return nil
 	}
+	// ExecComputeStoredGenerated after the BEFORE ROW triggers: the
+	// subscriber computes its own generated columns (a published column
+	// never maps onto one — columnMap rejects that).
+	_ = computeGeneratedColumns(r.local.Columns, row)
 
 	rel := w.cat.RelFileNode(r.local)
 	ptr, err := writeHeapRowReturning(ctx, rel, r.local.Columns, row)
@@ -736,6 +740,10 @@ func applyUpdateByKey(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		// preserves the pre-existing "no-match UPDATE installs a row"
 		// behaviour rather than fixing it here.
 	}
+	// The subscriber's generated columns are recomputed from the new row
+	// (ExecComputeStoredGenerated in ExecSimpleRelationUpdate), after any
+	// BEFORE ROW trigger has run.
+	_ = computeGeneratedColumns(cols, newRow)
 	if err := applyDeleteByKey(ctx, rel, cols, oldKeyRow); err != nil {
 		return err
 	}
@@ -1048,6 +1056,15 @@ func (r *applyRel) columnMap() ([]int, []bool, error) {
 		if err != nil {
 			return nil, nil, err
 		}
+		var gen []string
+		for i, rc := range r.remote.Columns {
+			if r.local.Columns[idx[i]].GeneratedExpr != "" {
+				gen = append(gen, rc.Name)
+			}
+		}
+		if err := IncompatibleGeneratedColumnsError(r.remote.Schema, r.remote.Name, gen); err != nil {
+			return nil, nil, err
+		}
 		r.localIdx, r.claimed = idx, claimed
 	}
 	return r.localIdx, r.claimed, nil
@@ -1156,4 +1173,28 @@ func (w *ApplyWorker) SafeRollback() {
 		w.inXact = false
 		w.currentTx = transam.Transaction{}
 	}
+}
+
+// IncompatibleGeneratedColumnsError is logicalrep_report_missing_or_gen_attrs'
+// generated half: a replicated column that maps onto a generated column of
+// the target table is refused (55000), since the subscriber computes its own
+// generated values. nil when names is empty. schema "" reads as public.
+func IncompatibleGeneratedColumnsError(schema, rel string, names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	if schema == "" {
+		schema = "public"
+	}
+	quoted := make([]string, len(names))
+	for i, n := range names {
+		quoted[i] = `"` + n + `"`
+	}
+	noun := "column"
+	if len(names) > 1 {
+		noun = "columns"
+	}
+	return &ExecError{Code: "55000", Message: fmt.Sprintf(
+		"logical replication target relation \"%s.%s\" has incompatible generated %s: %s",
+		schema, rel, noun, strings.Join(quoted, ", "))}
 }

@@ -73,6 +73,9 @@ type TableSyncManagerConfig struct {
 
 	// SubName picks which subscription's rels to walk.
 	SubName string
+	// Publications are the subscription's publication names, which
+	// fetch_remote_table_info's column-list query filters on.
+	Publications []string
 
 	// ResolveRel turns a relOID into the qualified "schema.name"
 	// the publisher will see on its `COPY <name> TO STDOUT`
@@ -187,7 +190,7 @@ func syncOneRel(ctx context.Context, cfg TableSyncManagerConfig, relOID uint32, 
 
 	// fetch_remote_table_info: the publisher's column list, which both
 	// the COPY and the local column mapping follow. M0149-0044a.
-	remoteCols, err := FetchRemoteColumns(conn.Reader, conn.Writer, relname)
+	remoteCols, gencolPublished, err := FetchRemoteColumns(conn.Reader, conn.Writer, relname, cfg.Publications)
 	if err != nil {
 		res.Err = fmt.Errorf("tablesync_manager: fetch columns of rel %d (%s): %w", relOID, relname, err)
 		return res
@@ -238,6 +241,8 @@ func syncOneRel(ctx context.Context, cfg TableSyncManagerConfig, relOID uint32, 
 		Writer:  conn.Writer,
 		Stat:    statHandle,
 		Logger:  cfg.Logger,
+
+		CopySelect: gencolPublished,
 	})
 	res.Rows = rows
 	if err != nil {

@@ -1,6 +1,6 @@
 # M0149\-0048 — Port subscription/t/011\_generated.pl
 
-Status: in progress \(0048a, 0048b landed\). TestPort\_Subscription011Generated is written \(three pairings\) and gated by GOOPG\_TAP\_011. The
+Status: in progress \(0048a, 0048b, 0048c landed\). TestPort\_Subscription011Generated is written \(three pairings\) and gated by GOOPG\_TAP\_011. The
 first run's failures split into five children, each named by a failing assertion.
 
 ## Landed — M0149\-0048a, a goopg publisher publishes only the columns PG publishes
@@ -44,10 +44,30 @@ Tests: TestPublicationPublishedAttnums; the pg\_get\_publication\_tables shape t
 
 Found while probing: generated columns stop being generated after a goopg restart \(M0149\-0100, S2, filed\).
 
+## Landed — M0149\-0048c, a goopg subscriber owns its generated columns
+
+- **Apply.** applyInsert computes the table's generated columns after the BEFORE ROW triggers \(ExecComputeStoredGenerated
+  in ExecSimpleRelationInsert\). applyUpdateByKey recomputes them from the merged new row before the heap write, which
+  covers the trigger branch too. Before this the rows read `4|||`.
+- **Incompatible targets.** A replicated column that maps onto a generated subscriber column is refused, as in
+  logicalrep\_report\_missing\_or\_gen\_attrs, with 55000 and PG's text \(`IncompatibleGeneratedColumnsError`\). The
+  check runs in the apply worker's column map and in goopg's tablesync \(copyColumnIndex, after the missing\-column check
+  PG prioritises\).
+- **Tablesync column set.** goopg's `FetchRemoteColumns` was fetch\_remote\_table\_info for a pre\-18 publisher
+  \(attgenerated = '' filter, no column lists\). It now follows the 18 path: the column set from
+  `pg_get_publication_tables(...).attrs` over the subscription's publications \(refused when two publications give
+  different lists\), every live attribute in attnum order kept when the set includes it, and gencol\_published when one
+  of them is generated. copy\_table's `COPY (SELECT cols FROM rel)` form is used when gencol\_published. With a PG
+  publisher this also makes the stored\-generated\-column and column\-list initial syncs right \(0048d's and 0048e's
+  subscriber halves\).
+
+Tests: TestApplyColumnMapRejectsGeneratedTarget, TestComputeGeneratedColumnsOverwritesReplicatedRow. TAP 011
+pg18\-publisher\-goopg\-subscriber passes 11/12; the last assertion waits for the t1 error after CREATE SUBSCRIPTION
+returns, which needs a retried tablesync \(M0149\-0048f\).
+
 ## Open
-- **M0149\-0048c**: a goopg subscriber computes its own generated columns on apply \(INSERT / UPDATE\). When a published
-  column maps to a local generated column, it raises PG's "logical replication target relation "%s" has incompatible
-  generated columns: %s" \(logicalrep\_rel\_open\).
+- **M0149\-0048f**: a failed table sync is retried, as PG's tablesync worker restarts after
+  wal\_retrieve\_retry\_interval. goopg's sync runs inside the command and logs a failure once.
 - **M0149\-0048d**: goopg's tablesync copies a publisher's stored generated columns when they are published \(PG 18
   copy\_table's COPY \(SELECT …\) form when gencol\_published\).
 - **M0149\-0048e**: publication column lists — FOR TABLE t \(cols\) grammar, pg\_publication\_rel.prattrs, the pgoutput

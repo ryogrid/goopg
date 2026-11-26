@@ -44,6 +44,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,9 +78,12 @@ type TableSyncConfig struct {
 	// subscriber table with extra local columns fills them with its own
 	// defaults. Empty copies every column. M0149-0044a.
 	Columns []string
-	From    LineWriter
-	Reader  *libpq.FrameReader
-	Writer  *libpq.FrameWriter
+	// CopySelect is copy_table's COPY (SELECT cols FROM rel) form, used
+	// when a published column is generated (gencol_published).
+	CopySelect bool
+	From       LineWriter
+	Reader     *libpq.FrameReader
+	Writer     *libpq.FrameWriter
 
 	// Stat is the optional pg_stat_subscription handle for this
 	// tablesync worker. When non-nil, RunTableSync stamps every
@@ -146,6 +150,9 @@ func RunTableSync(cfg TableSyncConfig) (int64, error) {
 			quoted[i] = quoteIdentifier(c)
 		}
 		sql = fmt.Sprintf("COPY %s (%s) TO STDOUT", cfg.Relname, strings.Join(quoted, ", "))
+		if cfg.CopySelect {
+			sql = fmt.Sprintf("COPY (SELECT %s FROM %s) TO STDOUT", strings.Join(quoted, ", "), cfg.Relname)
+		}
 	}
 	if err := cfg.Writer.WriteQuery(sql); err != nil {
 		return 0, fmt.Errorf("tablesync: write Query: %w", err)
@@ -354,21 +361,68 @@ func quoteIdentifier(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
-// FetchRemoteColumns is fetch_remote_table_info's column query
-// (tablesync.c): the publisher's live, non-generated columns of relname in
-// attnum order, on the table-sync connection. M0149-0044a.
-func FetchRemoteColumns(rd *libpq.FrameReader, wr *libpq.FrameWriter, relname string) ([]string, error) {
-	rows, err := queryRowsOn(rd, wr, "SELECT a.attname FROM pg_catalog.pg_attribute a"+
-		" WHERE a.attnum > 0::pg_catalog.int2 AND NOT a.attisdropped AND a.attgenerated = ''"+
-		" AND a.attrelid = "+quotePublicationLiteral(relname)+"::pg_catalog.regclass ORDER BY a.attnum")
-	if err != nil {
-		return nil, err
-	}
-	cols := make([]string, 0, len(rows))
-	for _, row := range rows {
-		if len(row) > 0 && row[0] != nil {
-			cols = append(cols, string(row[0]))
+// FetchRemoteColumns is fetch_remote_table_info's column half (tablesync.c,
+// a PG 18 publisher): the publication column set comes from
+// pg_get_publication_tables' attrs over the subscription's publications
+// (NULL when every column is published), then the publisher's live columns
+// of relname in attnum order, kept when the set includes them. Generated
+// columns are no longer filtered by attgenerated — attrs already leaves out
+// the ones not published. gencolPublished reports whether a generated
+// column is among them, which makes copy_table use COPY (SELECT …).
+// pubs empty skips the column-list query. M0149-0044a, M0149-0048c.
+func FetchRemoteColumns(rd *libpq.FrameReader, wr *libpq.FrameWriter, relname string, pubs []string) (cols []string, gencolPublished bool, err error) {
+	relLit := quotePublicationLiteral(relname) + "::pg_catalog.regclass"
+	var included map[int]bool
+	if len(pubs) > 0 {
+		names := make([]string, len(pubs))
+		for i, p := range pubs {
+			names[i] = quotePublicationLiteral(p)
+		}
+		rows, err := queryRowsOn(rd, wr, "SELECT DISTINCT"+
+			"  (CASE WHEN (array_length(gpt.attrs, 1) = c.relnatts)"+
+			"   THEN NULL ELSE gpt.attrs END)"+
+			"  FROM pg_publication p,"+
+			"  LATERAL pg_get_publication_tables(p.pubname) gpt,"+
+			"  pg_class c"+
+			" WHERE gpt.relid = "+relLit+" AND c.oid = gpt.relid"+
+			"   AND p.pubname IN ( "+strings.Join(names, ", ")+" )")
+		if err != nil {
+			return nil, false, err
+		}
+		if len(rows) > 1 {
+			return nil, false, fmt.Errorf("cannot use different column lists for table %q in different publications", relname)
+		}
+		if len(rows) == 1 && len(rows[0]) > 0 && rows[0][0] != nil {
+			included = map[int]bool{}
+			for _, f := range strings.Fields(string(rows[0][0])) {
+				if n, perr := strconv.Atoi(f); perr == nil {
+					included[n] = true
+				}
+			}
 		}
 	}
-	return cols, nil
+	rows, err := queryRowsOn(rd, wr, "SELECT a.attnum, a.attname, a.attgenerated != ''"+
+		" FROM pg_catalog.pg_attribute a"+
+		" WHERE a.attnum > 0::pg_catalog.int2 AND NOT a.attisdropped"+
+		" AND a.attrelid = "+relLit+" ORDER BY a.attnum")
+	if err != nil {
+		return nil, false, err
+	}
+	cols = make([]string, 0, len(rows))
+	for _, row := range rows {
+		if len(row) < 3 || row[0] == nil || row[1] == nil {
+			continue
+		}
+		if included != nil {
+			n, perr := strconv.Atoi(string(row[0]))
+			if perr != nil || !included[n] {
+				continue
+			}
+		}
+		cols = append(cols, string(row[1]))
+		if string(row[2]) == "t" {
+			gencolPublished = true
+		}
+	}
+	return cols, gencolPublished, nil
 }

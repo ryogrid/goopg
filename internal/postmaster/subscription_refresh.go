@@ -134,8 +134,9 @@ func (s *Server) RefreshSubscriptionOnPublisher(subName, conninfo string, dbOid 
 	// (upstream's tablesync workers; the command reports the workers'
 	// outcomes, so per-rel failures surface below).
 	results, mgrErr := replication.RunTableSyncManager(context.Background(), replication.TableSyncManagerConfig{
-		PubSub:  s.cfg.PubSub,
-		SubName: subName,
+		PubSub:       s.cfg.PubSub,
+		SubName:      subName,
+		Publications: pubs,
 		ResolveRel: func(relOID uint32) (string, bool) {
 			rr, ok := rels[relOID]
 			if !ok {
@@ -298,12 +299,15 @@ func copyColumnIndex(tbl *catalog.Table, remoteCols []string) ([]int, error) {
 		byName[c.Name] = i
 	}
 	idx := make([]int, 0, len(remoteCols))
-	var missing []string
+	var missing, generated []string
 	for _, rc := range remoteCols {
 		i, ok := byName[rc]
 		if !ok {
 			missing = append(missing, `"`+rc+`"`)
 			continue
+		}
+		if tbl.Columns[i].GeneratedExpr != "" {
+			generated = append(generated, rc)
 		}
 		idx = append(idx, i)
 	}
@@ -319,6 +323,10 @@ func copyColumnIndex(tbl *catalog.Table, remoteCols []string) ([]int, error) {
 		return nil, &executor.ExecError{Code: "55000", Message: fmt.Sprintf(
 			"logical replication target relation \"%s.%s\" is missing replicated %s: %s",
 			schema, tbl.Name, noun, strings.Join(missing, ", "))}
+	}
+	// Missing columns are reported first, as PG prioritises them.
+	if err := executor.IncompatibleGeneratedColumnsError(tbl.Schema, tbl.Name, generated); err != nil {
+		return nil, err
 	}
 	return idx, nil
 }
