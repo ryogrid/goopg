@@ -422,30 +422,33 @@ func (w *ApplyWorker) applyDelete(m *xlog.DecodedMessage) error {
 	}
 	ctx := w.applyContext()
 	rel := w.cat.RelFileNode(r.local)
+	// apply_handle_delete_internal: locate ONE row (FindReplTupleInLocalRel,
+	// through the identity / usable index when there is one), then delete
+	// that row. A missing row is the delete_missing conflict: skipped.
+	found, err := applyFindTuple(ctx, rel, r.local, r.local.Columns, keyRow, applyLocalIndex(ctx, r.local, r.remote, r.claimed))
+	if err != nil {
+		return err
+	}
+	if found == nil {
+		return nil
+	}
 	// ExecSimpleRelationDelete: BEFORE ROW triggers see the located row
 	// and may skip the delete; AFTER ROW triggers follow it. M0149-0040c.
 	trigCtx := w.triggerContext(ctx)
-	var oldRow Row
-	if tableHasTrigger(r.local, "before", "delete", true) || tableHasTrigger(r.local, "after", "delete", true) {
-		oldRow, err = applyScanFirstMatch(ctx, rel, r.local.Columns, keyRow)
-		if err != nil {
-			return err
+	if tableHasTrigger(r.local, "before", "delete", true) {
+		_, keep, terr := fireTriggers(trigCtx, r.local, "before", "delete", found.row, nil)
+		if terr != nil {
+			return fmt.Errorf("applyworker: BEFORE DELETE trigger on %q: %w", r.local.Name, terr)
 		}
-		if oldRow != nil {
-			_, keep, terr := fireTriggers(trigCtx, r.local, "before", "delete", oldRow, nil)
-			if terr != nil {
-				return fmt.Errorf("applyworker: BEFORE DELETE trigger on %q: %w", r.local.Name, terr)
-			}
-			if !keep {
-				return nil
-			}
+		if !keep {
+			return nil
 		}
 	}
-	if err := applyDeleteByKey(ctx, rel, r.local.Columns, keyRow); err != nil {
+	if err := applyDeleteTuple(ctx, rel, found.ptr); err != nil {
 		return err
 	}
-	if oldRow != nil {
-		if err := queueAfterRowTriggers(trigCtx, r.local, "delete", oldRow, nil, nil); err != nil {
+	if tableHasTrigger(r.local, "after", "delete", true) {
+		if err := queueAfterRowTriggers(trigCtx, r.local, "delete", found.row, nil, nil); err != nil {
 			return fmt.Errorf("applyworker: AFTER DELETE trigger on %q: %w", r.local.Name, err)
 		}
 	}
@@ -515,42 +518,36 @@ func (w *ApplyWorker) applyUpdate(m *xlog.DecodedMessage) error {
 	}
 	ctx := w.applyContext()
 	rel := w.cat.RelFileNode(r.local)
+	// apply_handle_update_internal: locate ONE row through the identity /
+	// usable index (or the heap), then update that row.
+	found, err := applyFindTuple(ctx, rel, r.local, r.local.Columns, oldKeyRow, applyLocalIndex(ctx, r.local, r.remote, r.claimed))
+	if err != nil {
+		return err
+	}
 	// ExecSimpleRelationUpdate: BEFORE ROW triggers see the located old
 	// row and the new one (its unchanged-TOAST and subscriber-only cells
 	// taken from the old row) and may replace or skip it; AFTER ROW
 	// triggers follow. M0149-0040c.
-	if !tableHasTrigger(r.local, "before", "update", true) && !tableHasTrigger(r.local, "after", "update", true) {
-		return applyUpdateByKey(ctx, rel, r.local, r.local.Columns, oldKeyRow, newRow, newUnchanged, newMissing)
-	}
 	trigCtx := w.triggerContext(ctx)
 	updCols := remoteUpdatedColumns(r.local.Columns, newUnchanged, newMissing)
-	oldRow, err := applyScanFirstMatch(ctx, rel, r.local.Columns, oldKeyRow)
-	if err != nil {
-		return err
-	}
-	if oldRow != nil {
-		for i := range newRow {
-			if i < len(oldRow) && ((i < len(newUnchanged) && newUnchanged[i]) || (i < len(newMissing) && newMissing[i])) {
-				newRow[i] = oldRow[i]
+	if found != nil {
+		applyFillFromOld(newRow, found.row, newUnchanged, newMissing)
+		if tableHasTrigger(r.local, "before", "update", true) {
+			var keep bool
+			newRow, keep, err = fireTriggersCols(trigCtx, r.local, "before", "update", found.row, newRow, updCols)
+			if err != nil {
+				return fmt.Errorf("applyworker: BEFORE UPDATE trigger on %q: %w", r.local.Name, err)
+			}
+			if !keep {
+				return nil
 			}
 		}
-		// The cells are filled: applyUpdateByKey must not overwrite what a
-		// trigger returned for them.
-		newUnchanged, newMissing = nil, nil
-		var keep bool
-		newRow, keep, err = fireTriggersCols(trigCtx, r.local, "before", "update", oldRow, newRow, updCols)
-		if err != nil {
-			return fmt.Errorf("applyworker: BEFORE UPDATE trigger on %q: %w", r.local.Name, err)
-		}
-		if !keep {
-			return nil
-		}
 	}
-	if err := applyUpdateByKey(ctx, rel, r.local, r.local.Columns, oldKeyRow, newRow, newUnchanged, newMissing); err != nil {
+	if err := applyUpdateFound(ctx, rel, r.local, r.local.Columns, found, newRow); err != nil {
 		return err
 	}
-	if oldRow != nil {
-		if err := queueAfterRowTriggers(trigCtx, r.local, "update", oldRow, newRow, updCols); err != nil {
+	if found != nil && tableHasTrigger(r.local, "after", "update", true) {
+		if err := queueAfterRowTriggers(trigCtx, r.local, "update", found.row, newRow, updCols); err != nil {
 			return fmt.Errorf("applyworker: AFTER UPDATE trigger on %q: %w", r.local.Name, err)
 		}
 	}
@@ -637,203 +634,56 @@ func (w *ApplyWorker) applyContext() *Context {
 // applyDeleteByKey scans rel for a visible tuple whose decoded columns
 // match keyRow (equality on all non-null key columns) and stamps xmax
 // on each match. Designed for the apply worker's DELETE path.
-func applyDeleteByKey(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, keyRow Row) error {
-	// A nondeterministic replica-identity collation decides equality
-	// (tuples_equal / the index's opclass under the column's collation).
-	colls := nondeterministicCollators(ctx, cols)
-	nBlocks, err := ctx.Pool.NBlocks(rel)
-	if err != nil {
-		return err
-	}
-	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
-		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
-		if err != nil {
-			return err
-		}
-		s.RLock()
-		page := s.Page()
-		if storage.IsNew(page) {
-			s.RUnlock()
-			ctx.Pool.Unpin(s)
-			continue
-		}
-		count, err := storage.PageLinePointerCount(page)
-		if err != nil {
-			s.RUnlock()
-			ctx.Pool.Unpin(s)
-			return err
-		}
-		type match struct{ slot uint16 }
-		var matches []match
-		scanRow := make(Row, len(cols))
-		for slot := uint16(1); slot <= uint16(count); slot++ {
-			tup, err := storage.PageGetHeapTuple(page, slot)
-			if err != nil {
-				continue
-			}
-			if !transam.TupleVisibleSubxact(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
-				continue
-			}
-			if err := DecodeHeapTupleRowInto(scanRow, cols, tup, nil); err != nil {
-				continue
-			}
-			if rowMatchesKeyCollated(scanRow, keyRow, colls) {
-				matches = append(matches, match{slot: slot})
-			}
-		}
-		s.RUnlock()
-		ctx.Pool.Unpin(s)
-		for _, m := range matches {
-			sw, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
-			if err != nil {
-				return err
-			}
-			sw.Lock()
-			oldTup, _ := storage.PageGetHeapTuple(sw.Page(), m.slot)
-			var oldBytes []byte
-			oldBytes, _ = oldTup.MarshalBinary()
-			if err := storage.PageSetHeapTupleXmax(sw.Page(), m.slot, ctx.Tx.XID); err == nil {
-				_ = markHeapDeleteDirtyAndClearVM(ctx, sw, rel, blk, m.slot, ctx.Tx.XID, oldBytes)
-			}
-			sw.Unlock()
-			ctx.Pool.Unpin(sw)
-		}
-	}
-	return nil
-}
-
-// applyUpdateByKey finds the row matching oldKeyRow in rel, deletes it,
-// then inserts newRow — implementing a logical UPDATE for the apply worker.
-// When newUnchanged has any true entries (a 'u' / unchanged-TOAST cell in
-// the publisher's NewTuple), a read-only first scan finds the matched
-// heap row and copies its values into newRow for each unchanged slot
-// before the delete+insert phase. The two-scan cost is paid only when
-// 'u' is present — the all-'t'/'n' hot path stays single-scan.
-func applyUpdateByKey(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, oldKeyRow, newRow Row, newUnchanged, newMissing []bool) error {
-	// needFill picks up two distinct cases that share the same remedy
-	// (overwrite the slot from the matched existing heap row):
-	//   - newUnchanged[i]: publisher emitted 'u' (unchanged TOAST) for
-	//     remote column i; the pre-image value lives in our heap and
-	//     must survive the delete+insert.
-	//   - newMissing[i]: column i exists on the subscriber but not on
-	//     the publisher (subscriber-extra). Without the fill, every
-	//     replicated UPDATE would NULL the subscriber-only value.
-	needFill := false
-	for _, u := range newUnchanged {
-		if u {
-			needFill = true
+// applyFillFromOld copies the located old row's values into newRow for the
+// cells the publisher did not send: 'u' (unchanged TOAST) columns and
+// subscriber-only columns, which an UPDATE must not reset to NULL.
+func applyFillFromOld(newRow, oldRow Row, newUnchanged, newMissing []bool) {
+	for i := range newRow {
+		if i >= len(oldRow) {
 			break
 		}
-	}
-	if !needFill {
-		for _, m := range newMissing {
-			if m {
-				needFill = true
-				break
-			}
+		if (i < len(newUnchanged) && newUnchanged[i]) || (i < len(newMissing) && newMissing[i]) {
+			newRow[i] = oldRow[i]
 		}
 	}
-	if needFill {
-		matched, err := applyScanFirstMatch(ctx, rel, cols, oldKeyRow)
-		if err != nil {
-			return err
-		}
-		if matched != nil {
-			for i := range newRow {
-				if i >= len(matched) {
-					break
-				}
-				take := false
-				if i < len(newUnchanged) && newUnchanged[i] {
-					take = true
-				}
-				if i < len(newMissing) && newMissing[i] {
-					take = true
-				}
-				if take {
-					newRow[i] = matched[i]
-				}
-			}
-		}
-		// If matched == nil, the 'u' / missing slots remain NullDatum.
-		// The subsequent applyDeleteByKey is a no-op (nothing to xmax),
-		// but writeHeapRowReturning still installs newRow — that
-		// preserves the pre-existing "no-match UPDATE installs a row"
-		// behaviour rather than fixing it here.
-	}
+}
+
+// applyUpdateFound replaces the located row found with newRow (delete +
+// insert, re-filing the index entries). found == nil keeps goopg's
+// pre-existing behaviour of installing newRow anyway; PG skips the change
+// as the update_missing conflict (M0149-0044c).
+func applyUpdateFound(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, found *applyFoundTuple, newRow Row) error {
 	// The subscriber's generated columns are recomputed from the new row
 	// (ExecComputeStoredGenerated in ExecSimpleRelationUpdate), after any
 	// BEFORE ROW trigger has run.
 	_ = computeGeneratedColumns(cols, newRow)
-	if err := applyDeleteByKey(ctx, rel, cols, oldKeyRow); err != nil {
-		return err
+	if found != nil {
+		if err := applyDeleteTuple(ctx, rel, found.ptr); err != nil {
+			return err
+		}
 	}
 	ptr, err := writeHeapRowReturning(ctx, rel, cols, newRow)
 	if err != nil {
 		return err
 	}
-	// Re-add to unique/primary-key indexes so post-UPDATE
-	// equality probes find the new row (matches applyInsert).
 	if tbl != nil {
 		maintainUniqueIndexesForInsert(ctx, tbl, cols, newRow, ptr)
 	}
 	return nil
 }
 
-// applyScanFirstMatch returns a copy of the first visible heap row
-// in rel whose decoded columns match keyRow under rowMatchesKey, or
-// (nil, nil) when no row matches. Used by applyUpdateByKey to source
-// the values for 'u' unchanged-TOAST cells in the publisher's NewTuple.
-// Pure read-only — never stamps xmax or marks pages dirty.
-func applyScanFirstMatch(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, keyRow Row) (Row, error) {
-	// A nondeterministic replica-identity collation decides equality
-	// (tuples_equal / the index's opclass under the column's collation).
-	colls := nondeterministicCollators(ctx, cols)
-	nBlocks, err := ctx.Pool.NBlocks(rel)
+// applyUpdateByKey locates the first row matching oldKeyRow by heap scan and
+// replaces it with newRow, filling 'u' (unchanged TOAST) and subscriber-only
+// cells from the located row.
+func applyUpdateByKey(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, oldKeyRow, newRow Row, newUnchanged, newMissing []bool) error {
+	found, err := applyFindTuple(ctx, rel, tbl, cols, oldKeyRow, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
-		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
-		if err != nil {
-			return nil, err
-		}
-		s.RLock()
-		page := s.Page()
-		if storage.IsNew(page) {
-			s.RUnlock()
-			ctx.Pool.Unpin(s)
-			continue
-		}
-		count, err := storage.PageLinePointerCount(page)
-		if err != nil {
-			s.RUnlock()
-			ctx.Pool.Unpin(s)
-			return nil, err
-		}
-		scanRow := make(Row, len(cols))
-		for slot := uint16(1); slot <= uint16(count); slot++ {
-			tup, err := storage.PageGetHeapTuple(page, slot)
-			if err != nil {
-				continue
-			}
-			if !transam.TupleVisibleSubxact(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
-				continue
-			}
-			if err := DecodeHeapTupleRowInto(scanRow, cols, tup, nil); err != nil {
-				continue
-			}
-			if rowMatchesKeyCollated(scanRow, keyRow, colls) {
-				out := append(Row(nil), scanRow...)
-				s.RUnlock()
-				ctx.Pool.Unpin(s)
-				return out, nil
-			}
-		}
-		s.RUnlock()
-		ctx.Pool.Unpin(s)
+	if found != nil {
+		applyFillFromOld(newRow, found.row, newUnchanged, newMissing)
 	}
-	return nil, nil
+	return applyUpdateFound(ctx, rel, tbl, cols, found, newRow)
 }
 
 // rowMatchesKey returns true when every non-null datum in keyRow equals

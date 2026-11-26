@@ -17254,11 +17254,33 @@ verify each at HEAD when the task starts.
   - SET SCHEMA changes only the in\-memory catalog \(no pg\_class relnamespace heap update\), so it does not survive a restart; the table's row type, owned sequences and constraints do not move \(AlterTableNamespaceInternal → AlterRelationNamespaceInternal, AlterIndexNamespaces, AlterSeqNamespaces, AlterConstraintNamespaces, AlterTypeNamespaceInternal\). PG parity only; 025 does not restart.
   - Verified 2026\-11\-27: `CREATE TABLE sch1.t5 …; ALTER TABLE sch1.t5 SET SCHEMA public;` then a restart → `public.t5` is 42P01 and `sch1.t5` holds the row again \(pre\-existing; the old arm did not persist either\).
 
-- [ ] **M0149-0054 — port subscription/t/032_subscribe_use_index.pl**
+- [x] **M0149-0054 — port subscription/t/032_subscribe_use_index.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/032_subscribe_use_index.pl` — apply uses non-PK indexes for REPLICA IDENTITY FULL lookups.
   Likely prerequisites \(verify at start\): `FindUsableIndexForReplicaIdentityFull` equivalent, `pg_stat_all_indexes.idx_scan` counted by apply.
+  - 2026\-11\-27 \(progress\): TestPort\_Subscription032SubscribeUseIndex written, gated GOOPG\_TAP\_032. Every pairing stops at its first idx\_scan poll: a goopg subscriber never uses an index for REPLICA IDENTITY FULL \(0054a\); a goopg publisher does not publish the partitions of a FOR TABLE partitioned table \(0054b\).
+  - 2026\-11\-27 \(done\): 0054a \+ 0054b landed; 032 ungated, 3/3 x 3; inventory 032 → port.
+  Movement: yes — tap 032 all-goopg 0/15 -> 15/15, pg18-publisher-goopg-subscriber 0/15 -> 15/15, goopg-publisher-pg18-subscriber 2/15 -> 15/15 (3/3 x 3 pairings); 032 port
+- [x] **M0149-0054a — the apply worker locates ONE row through the identity or a usable index, and counts idx\_scan**
+  Kind: impl
+  Parent: M0149-0054
+  - 032 \(goopg subscriber\): `pg_stat_all_indexes.idx_scan` stays 0 — the apply worker found rows by a full heap scan and deleted EVERY match \(an UPDATE of one of several identical FULL\-identity rows removed all of them and inserted one back\), and the view's idx\_scan was a constant 0. PG: relation.c FindLogicalRepLocalIndex \(GetRelationIdentityOrPK, then FindUsableIndexForReplicaIdentityFull / IsIndexUsableForReplicaIdentityFull\), execReplication.c RelationFindReplTupleByIndex / RelationFindReplTupleSeq \(first match\), pgstat\_count\_index\_scan.
+  - Path\-to\-TAP: 032 goopg\-subscriber pairings ← 0054a \(1 link\).
+  - 2026\-11\-27 \(done\): applyworker\_lookup.go — applyLocalIndex \(replica identity index / PK, else for FULL the first usable index in OID order: btree/hash, not partial, plain leftmost key mapped remotely\), applyFindTuple \(index RangeScan on the leading plain key columns \+ full recheck, first visible match; a no\-NULL\-entries index only when the key row has an entry — applyIndexHasEntryFor\), applyDeleteTuple; applyDelete / applyUpdate locate one tuple and change only it; recordApplyIndexScan → shared numScans; catalog.IndexScanStatsFunc feeds pg\_stat\_all\_indexes.idx\_scan. Tests TestApplyLocalIndexSelection, TestApplyUpdateReplacesOneOfIdenticalRows.
+  Movement: yes — tap 032 pg18-publisher-goopg-subscriber 0/15 -> 15/15
+- [x] **M0149-0054b — a goopg publisher publishes the partitions of a FOR TABLE partitioned table**
+  Kind: impl
+  Parent: M0149-0054
+  - 032 \(goopg publisher\): `FOR TABLE users_table_part` \(partitioned\) — pg\_get\_publication\_tables listed the parent, and the walsender filter matched only the leaf's own name, so changes to users\_table\_part\_0/\_1 were never sent. PG: GetPubPartitionOptionRelations \(PUBLICATION\_PART\_LEAF\), pgoutput get\_rel\_sync\_entry ancestor\_published.
+  - Path\-to\-TAP: 032 goopg\-publisher pairings ← 0054b \(1 link\).
+  - 2026\-11\-27 \(done\): catalog.PublicationLeafTables / PartitionAncestorNames; pg\_get\_publication\_tables and pg\_publication\_tables expand a partitioned member to its leaves; RelationDef.AncestorNames and the filter's ancestor check.
+  Movement: yes — tap 032 goopg-publisher pairings 2/15 -> 15/15
+- [ ] **M0149-0054c — index\-scan statistics for ordinary queries; pg\_stat\_\*\_indexes details**
+  Kind: impl
+  Parent: M0149-0054
+  - Only the apply worker's lookups count idx\_scan; an ordinary IndexScan / IndexOnlyScan / BitmapIndexScan counts nothing \(PG: pgstat\_count\_index\_scan in \_bt\_first / hashgettuple / btgetbitmap\), last\_idx\_scan stays NULL and idx\_tup\_read / idx\_tup\_fetch 0. pg\_stat\_all\_indexes also lists a partitioned table's index \(PG's view keeps relkind r, t, m\). PG parity only.
+
 - [ ] **M0149-0055 — port subscription/t/034_temporal.pl**
   Kind: impl
   Parent: none

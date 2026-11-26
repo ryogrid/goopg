@@ -58,6 +58,11 @@ type RelationDef struct {
 	// publishes a partition whose ancestor is in one of its schemas
 	// (pgoutput get_rel_sync_entry's ancestor check). M0149-0053a.
 	AncestorSchemas []string
+	// AncestorNames are the qualified names of the partition ancestors,
+	// nearest first: a FOR TABLE publication of a partitioned table
+	// publishes its partitions (pgoutput get_rel_sync_entry's
+	// ancestor_published). M0149-0054b.
+	AncestorNames []string
 }
 
 // ColumnDef mirrors `catalog.Column` but lives in the snapshot
@@ -142,6 +147,7 @@ func relationDefFor(c *catalog.InMemory, t *catalog.Table, dbOid ...uint32) *Rel
 		NotPublishable: !catalog.IsPublishableTable(t),
 
 		AncestorSchemas: catalog.PartitionAncestorSchemas(c, t),
+		AncestorNames:   catalog.PartitionAncestorNames(c, t),
 	}
 	ident := identityColumns(c, t, def.ReplIdent, dbOid...)
 	for i, col := range t.Columns {

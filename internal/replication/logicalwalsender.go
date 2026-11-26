@@ -569,6 +569,13 @@ func (f *publicationFilter) Allows(rel *xlog.RelationDef, kind xlog.ChangeKind) 
 	if flags, ok := f.schemaFlags(rel); ok && flags.allowsKind(kind) {
 		return true
 	}
+	// A partition of a published partitioned table (publish_via_partition_root
+	// = false: published as itself). M0149-0054b.
+	for _, anc := range rel.AncestorNames {
+		if flags, ok := f.byTable[anc]; ok && flags.allowsKind(kind) {
+			return true
+		}
+	}
 	return false
 }
 

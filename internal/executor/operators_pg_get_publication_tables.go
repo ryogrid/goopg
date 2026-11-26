@@ -212,6 +212,18 @@ func publicationTablesForCtx(ctx *Context, pub *catalog.Publication) []*catalog.
 		if !ok {
 			continue
 		}
+		// A partitioned member is published as its leaf partitions
+		// (GetPubPartitionOptionRelations, PUBLICATION_PART_LEAF: goopg does
+		// not model publish_via_partition_root). M0149-0054b.
+		if in, ok := ctx.Catalog.(*catalog.InMemory); ok && len(t.PartitionKey) > 0 {
+			for _, leaf := range catalog.PublicationLeafTables(in, t, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
+				if !seen[leaf.OID] {
+					seen[leaf.OID] = true
+					out = append(out, leaf)
+				}
+			}
+			continue
+		}
 		seen[t.OID] = true
 		out = append(out, t)
 	}

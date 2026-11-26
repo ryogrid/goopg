@@ -128,6 +128,10 @@ var relStats = newRelationStatsManager()
 // AdvisoryLockRowsFunc). Formatted here so the catalog package stays
 // dependency-free.
 func init() {
+	catalog.IndexScanStatsFunc = func(oid uint32) int64 {
+		c, _ := relStats.get(oid)
+		return c.numScans
+	}
 	catalog.UserTableTriggerStatsFunc = func(oid uint32) (dead, mod, ins string) {
 		// The view's n_dead_tup / n_mod_since_analyze / n_ins_since_vacuum read
 		// the same flushed shared entry as the pg_stat_get_* function getters
@@ -610,6 +614,26 @@ func recordRelScan(ctx *Context, oid uint32, returned int64) {
 		return
 	}
 	relStats.recordScan(sessionStatsID(ctx), oid, returned)
+}
+
+// recordApplyIndexScan counts one index scan of index oid made by the
+// logical replication apply worker's row lookup (RelationFindReplTupleByIndex
+// → pgstat_count_index_scan). The apply worker has no client session, and PG
+// reports its counters at each applied commit (pgstat_report_stat in
+// apply_handle_commit_internal), so the scan goes straight to the shared
+// store that pg_stat_all_indexes.idx_scan reads. M0149-0054a.
+func recordApplyIndexScan(ctx *Context, oid uint32) {
+	if oid == 0 || !shouldTrackCounts(ctx) {
+		return
+	}
+	relStats.mu.Lock()
+	defer relStats.mu.Unlock()
+	s := relStats.shared[oid]
+	if s == nil {
+		s = &relStatCounters{}
+		relStats.shared[oid] = s
+	}
+	s.numScans++
 }
 
 // recordRelInsert / recordRelUpdate / recordRelDelete / recordRelTruncate stage

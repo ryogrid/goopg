@@ -545,6 +545,17 @@ func registerPublicationViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
 			listed := map[string]bool{}
 			for _, qname := range pub.Tables {
 				schema, name := splitQualifiedName(qname)
+				// A partitioned member lists as its leaf partitions
+				// (pg_get_publication_tables, viaroot = false).
+				if t, ok := cat.LookupTable(parser.ObjectName{Schema: schema, Name: name}, pub.DBOid); ok && len(t.PartitionKey) > 0 {
+					for _, leaf := range catalog.PublicationLeafTables(cat, t, pub.DBOid) {
+						if !listed[leaf.Schema+"."+leaf.Name] {
+							listed[leaf.Schema+"."+leaf.Name] = true
+							out = append(out, pubTableRow(pub.Name, leaf.Schema, leaf.Name))
+						}
+					}
+					continue
+				}
 				listed[schema+"."+name] = true
 				out = append(out, pubTableRow(pub.Name, schema, name))
 			}

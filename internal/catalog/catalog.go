@@ -67,6 +67,18 @@ var VirtualSpecLockRowsFunc func() [][]string
 // built in this package; the executor owns the live counters.
 var UserTableTriggerStatsFunc func(oid uint32) (dead, mod, ins string)
 
+// IndexScanStatsFunc is optionally set by the executor to supply an index's
+// cumulative scan count (pg_stat_get_numscans(indexrelid), the
+// pg_stat_all_indexes.idx_scan column). nil renders 0. M0149-0054a.
+var IndexScanStatsFunc func(oid uint32) int64
+
+func indexScanCount(oid uint32) string {
+	if IndexScanStatsFunc == nil {
+		return "0"
+	}
+	return strconv.FormatInt(IndexScanStatsFunc(oid), 10)
+}
+
 // RelAllVisibleFunc is optionally set by initdb/bootstrap to report the
 // relation's VM-derived all-visible block count (pg_class.relallvisible).
 var RelAllVisibleFunc func(dbOid, relOid uint32) int32
@@ -9129,7 +9141,7 @@ func (c *InMemory) PGStatIndexesRowsForDBOid(dbOid uint32, scope StatTableScope)
 			schema,                     // 2: schemaname (parent table schema)
 			t.Name,                     // 3: relname (parent table name)
 			idx.Name,                   // 4: indexrelname
-			"0",                        // 5: idx_scan
+			indexScanCount(idx.OID),    // 5: idx_scan
 			VirtualNull,                // 6: last_idx_scan
 			"0",                        // 7: idx_tup_read
 			"0",                        // 8: idx_tup_fetch

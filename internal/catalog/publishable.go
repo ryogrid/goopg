@@ -48,20 +48,12 @@ func PublicationSchemaTables(c *InMemory, schemas []string, dbOid uint32) []*Tab
 	}
 	seen := map[uint32]bool{}
 	var out []*Table
-	var addLeaves func(t *Table, depth int)
-	addLeaves = func(t *Table, depth int) {
-		if t == nil || seen[t.OID] || depth > 64 {
-			return
-		}
-		if len(t.PartitionKey) > 0 {
-			for _, child := range c.PartitionChildren(t.OID, dbOid) {
-				addLeaves(child, depth+1)
+	addLeaves := func(t *Table, _ int) {
+		for _, leaf := range PublicationLeafTables(c, t, dbOid) {
+			if !seen[leaf.OID] {
+				seen[leaf.OID] = true
+				out = append(out, leaf)
 			}
-			return
-		}
-		if IsPublishableTable(t) {
-			seen[t.OID] = true
-			out = append(out, t)
 		}
 	}
 	for _, t := range c.AllTables(dbOid) {
@@ -97,6 +89,56 @@ func PartitionAncestorSchemas(c *InMemory, t *Table) []string {
 			break
 		}
 		out = append(out, pt.Schema)
+		oid = parent
+	}
+	return out
+}
+
+// PublicationLeafTables is GetPubPartitionOptionRelations with
+// PUBLICATION_PART_LEAF for one publication member t: a partitioned table
+// becomes its publishable leaf partitions (recursively), any other
+// publishable table stands for itself. M0149-0054b.
+func PublicationLeafTables(c *InMemory, t *Table, dbOid uint32) []*Table {
+	var out []*Table
+	var walk func(t *Table, depth int)
+	walk = func(t *Table, depth int) {
+		if t == nil || depth > 64 {
+			return
+		}
+		if len(t.PartitionKey) > 0 && c != nil {
+			for _, child := range c.PartitionChildren(t.OID, dbOid) {
+				walk(child, depth+1)
+			}
+			return
+		}
+		if IsPublishableTable(t) {
+			out = append(out, t)
+		}
+	}
+	walk(t, 0)
+	return out
+}
+
+// PartitionAncestorNames returns the qualified names ("schema.name") of t's
+// partition ancestors, nearest first: a FOR TABLE publication of a
+// partitioned table publishes its partitions' changes
+// (GetTopMostAncestorInPublication). M0149-0054b.
+func PartitionAncestorNames(c *InMemory, t *Table) []string {
+	if c == nil || t == nil {
+		return nil
+	}
+	var out []string
+	oid := t.OID
+	for depth := 0; depth < 64; depth++ {
+		parent, ok := c.PartitionParentOf(oid)
+		if !ok {
+			break
+		}
+		pt, _, ok := c.LookupTableByOIDAllDBs(parent)
+		if !ok || pt == nil {
+			break
+		}
+		out = append(out, pt.QualifiedName())
 		oid = parent
 	}
 	return out
