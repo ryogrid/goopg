@@ -6,12 +6,14 @@ package executor
 // name set. The argument list accepts either a single text[] (the VARIADIC
 // spread shape libpqrcv emits) or any number of plain text values; an empty
 // argument list returns every (publication, table) pair the PubSub registry
-// holds. The output schema is (relid oid, attrs text, qual text); attrs and
-// qual are NULL since goopg does not yet model column lists or row filters
-// on publications. M0103-0008 probe-survival.
+// holds. The output schema is PG 18's (pubid oid, relid oid, attrs
+// int2vector, qual pg_node_tree). attrs lists the published attnums
+// (publicationPublishedAttnums); qual is NULL since goopg does not yet model
+// row filters. M0103-0008 probe-survival, M0149-0048b.
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -113,9 +115,20 @@ func buildPgGetPublicationTablesRows(ctx *Context, args []Datum) ([]Row, error) 
 			} else {
 				relidDatum = NewIntDatum(int64(t.OID))
 			}
+			attrs := NullDatum
+			if nums := publicationPublishedAttnums(pub, t); len(nums) > 0 {
+				// int2vector's text form (int2vectorout), as the virtual
+				// pg_index.indkey cell carries it.
+				parts := make([]string, len(nums))
+				for i, n := range nums {
+					parts[i] = strconv.Itoa(int(n))
+				}
+				attrs = NewStringDatum(strings.Join(parts, " "))
+			}
 			rows = append(rows, Row{
+				NewIntDatum(int64(pub.OID)),
 				relidDatum,
-				NullDatum, // attrs (column list — not modeled)
+				attrs,
 				NullDatum, // qual (row filter — not modeled)
 			})
 		}
@@ -211,4 +224,24 @@ func splitQualifiedTable(qname string) (string, string) {
 		return "", qname
 	}
 	return qname[:i], qname[i+1:]
+}
+
+// publicationPublishedAttnums is pg_get_publication_tables' attrs when the
+// publication has no column list: every non-dropped column except a
+// virtual generated one, and a stored generated one only under
+// publish_generated_columns = stored (pg_publication.c). A PG 18
+// subscriber's tablesync copies exactly these columns
+// (fetch_remote_table_info).
+func publicationPublishedAttnums(pub *catalog.Publication, t *catalog.Table) []int16 {
+	nums := make([]int16, 0, len(t.Columns))
+	for _, col := range t.Columns {
+		if col.Dropped {
+			continue
+		}
+		if col.GeneratedExpr != "" && (col.GeneratedVirtual || pub.GenColsType() != 's') {
+			continue
+		}
+		nums = append(nums, int16(col.Ordinal+1))
+	}
+	return nums
 }

@@ -1,6 +1,6 @@
 # M0149\-0048 — Port subscription/t/011\_generated.pl
 
-Status: in progress. TestPort\_Subscription011Generated is written \(three pairings\) and gated by GOOPG\_TAP\_011. The
+Status: in progress \(0048a, 0048b landed\). TestPort\_Subscription011Generated is written \(three pairings\) and gated by GOOPG\_TAP\_011. The
 first run's failures split into five children, each named by a failing assertion.
 
 ## Landed — M0149\-0048a, a goopg publisher publishes only the columns PG publishes
@@ -26,11 +26,25 @@ incompatible generated columns: "b", "c""\), and a goopg subscriber stored the p
 Test: TestPgOutputGeneratedColumns. In TAP 011 all\\-goopg, the publish\_generated\_columns = none incremental
 assertion now passes, and stored\\-mode incremental rows carry the generated value.
 
-## Open
+## Landed — M0149\-0048b, pg\_get\_publication\_tables returns PG 18's columns
 
-- **M0149\-0048b**: pg\_get\_publication\_tables has PG 18's shape \(pubid, relid, attrs int2vector, qual\), with attrs
-  set to the published attnums. A PG 18 subscriber's tablesync \(fetch\_remote\_table\_info\) takes the column set
-  from it. goopg returns NULL attrs, so the PG subscriber copies every column, including generated ones, and fails.
+A PG 18 subscriber's tablesync \(fetch\_remote\_table\_info\) takes the set of columns to copy from
+`CASE WHEN array_length(gpt.attrs, 1) = c.relnatts THEN NULL ELSE gpt.attrs END`. It no longer filters on
+attgenerated for an 18 publisher. goopg returned \(relid, attrs text, qual text\) with attrs always NULL, so the PG
+subscriber copied every column, generated ones included, and rejected the table.
+
+- The SRF now has PG's shape \(pubid oid, relid oid, attrs int2vector, qual pg\_node\_tree\) in all four schema sites:
+  the FROM\-clause plan, the ProjectSet composite schema, the analyzer's base columns and its composite columns.
+- attrs is pg\_publication.c's list without a column list \(`publicationPublishedAttnums`\): every non\-dropped
+  column except virtual generated ones, plus stored generated ones only under publish\_generated\_columns = stored. It is
+  carried as int2vector text, as the virtual pg\_index.indkey cell is, and array\_length works on it.
+
+Tests: TestPublicationPublishedAttnums; the pg\_get\_publication\_tables shape tests now expect four columns. In TAP
+011 goopg\-publisher\-pg18\-subscriber, every assertion before the column\-list DDL passes.
+
+Found while probing: generated columns stop being generated after a goopg restart \(M0149\-0100, S2, filed\).
+
+## Open
 - **M0149\-0048c**: a goopg subscriber computes its own generated columns on apply \(INSERT / UPDATE\). When a published
   column maps to a local generated column, it raises PG's "logical replication target relation "%s" has incompatible
   generated columns: %s" \(logicalrep\_rel\_open\).

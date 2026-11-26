@@ -71,7 +71,7 @@ func TestPgGetPublicationTablesFromClauseFilter(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("row count = %d, want 1", len(rows))
 	}
-	if rows[0][0].IsNull() {
+	if rows[0][1].IsNull() {
 		t.Fatalf("relid is NULL, want a non-zero OID")
 	}
 }
@@ -149,11 +149,11 @@ func TestIndirectionStarTargetListPlansAsFromSrf(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("row count = %d, want 1", len(rows))
 	}
-	// Composite expansion: three columns (relid, attrs, qual).
-	if len(rows[0]) != 3 {
-		t.Fatalf("column count = %d, want 3", len(rows[0]))
+	// Composite expansion: PG 18's four columns (pubid, relid, attrs, qual).
+	if len(rows[0]) != 4 {
+		t.Fatalf("column count = %d, want 4", len(rows[0]))
 	}
-	if rows[0][0].IsNull() {
+	if rows[0][1].IsNull() {
 		t.Fatalf("relid is NULL, want a non-zero OID")
 	}
 }
@@ -190,10 +190,10 @@ func TestIndirectionStarWithAggregateArgument(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("row count = %d, want 1", len(rows))
 	}
-	if len(rows[0]) != 3 {
-		t.Fatalf("column count = %d, want 3 (relid/attrs/qual)", len(rows[0]))
+	if len(rows[0]) != 4 {
+		t.Fatalf("column count = %d, want 4 (pubid/relid/attrs/qual)", len(rows[0]))
 	}
-	if rows[0][0].IsNull() {
+	if rows[0][1].IsNull() {
 		t.Fatalf("relid is NULL, want a non-zero OID")
 	}
 }
@@ -228,8 +228,8 @@ func TestIndirectionStarWithAggregateArgumentAndWhere(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("row count = %d, want 1 (only publication 'p' survives WHERE)", len(rows))
 	}
-	if len(rows[0]) != 3 {
-		t.Fatalf("column count = %d, want 3 (relid/attrs/qual)", len(rows[0]))
+	if len(rows[0]) != 4 {
+		t.Fatalf("column count = %d, want 4 (pubid/relid/attrs/qual)", len(rows[0]))
 	}
 }
 
@@ -300,13 +300,13 @@ func TestIndirectionStarInsideDerivedSubqueryStarSelect(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("row count = %d, want 1", len(rows))
 	}
-	if len(rows[0]) != 3 {
-		t.Fatalf("column count = %d, want 3 (relid/attrs/qual)", len(rows[0]))
+	if len(rows[0]) != 4 {
+		t.Fatalf("column count = %d, want 4 (pubid/relid/attrs/qual)", len(rows[0]))
 	}
 }
 
 // TestIndirectionStarDerivedSubqueryExplicitAliases pins that explicit
-// column aliases on the derived table — `… AS gpt (r, a, q)` — override
+// column aliases on the derived table — `… AS gpt (p, r, a, q)` — override
 // the SRF's default column names and remain resolvable at the outer
 // scope. M0103-0008.
 func TestIndirectionStarDerivedSubqueryExplicitAliases(t *testing.T) {
@@ -317,7 +317,7 @@ func TestIndirectionStarDerivedSubqueryExplicitAliases(t *testing.T) {
 	if err := runDDL(t, ctx, "CREATE PUBLICATION p FOR TABLE items"); err != nil {
 		t.Fatal(err)
 	}
-	rows := runQueryRows(t, ctx, `SELECT gpt.r FROM ( SELECT (pg_get_publication_tables('p')).* ) AS gpt (r, a, q)`)
+	rows := runQueryRows(t, ctx, `SELECT gpt.r FROM ( SELECT (pg_get_publication_tables('p')).* ) AS gpt (p, r, a, q)`)
 	if len(rows) != 1 {
 		t.Fatalf("row count = %d, want 1", len(rows))
 	}

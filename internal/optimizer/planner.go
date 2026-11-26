@@ -6665,9 +6665,10 @@ func projectSetCompositeSchema(name string) Schema {
 	switch name {
 	case "pg_get_publication_tables":
 		return Schema{
+			SchemaColumn{Name: "pubid", Type: catalog.Type{Name: "oid"}},
 			SchemaColumn{Name: "relid", Type: catalog.Type{Name: "oid"}},
-			SchemaColumn{Name: "attrs", Type: catalog.Type{Name: "text"}},
-			SchemaColumn{Name: "qual", Type: catalog.Type{Name: "text"}},
+			SchemaColumn{Name: "attrs", Type: catalog.Type{Name: "int2vector"}},
+			SchemaColumn{Name: "qual", Type: catalog.Type{Name: "pg_node_tree"}},
 		}
 	}
 	return nil
@@ -8283,7 +8284,7 @@ func planPgGetPublicationTables(rv parser.RangeVar, sourceIdx int16, lateralCtx 
 	if alias == "" {
 		alias = "pg_get_publication_tables"
 	}
-	colNames := []string{"relid", "attrs", "qual"}
+	colNames := []string{"pubid", "relid", "attrs", "qual"}
 	if len(rv.Columns) > 0 {
 		for i := range colNames {
 			if i < len(rv.Columns) {
@@ -8291,7 +8292,7 @@ func planPgGetPublicationTables(rv parser.RangeVar, sourceIdx int16, lateralCtx 
 			}
 		}
 	}
-	colTypes := []string{"oid", "text", "text"}
+	colTypes := []string{"oid", "oid", "int2vector", "pg_node_tree"}
 	schema := make(Schema, len(colNames))
 	cols := make([]catalog.Column, len(colNames))
 	for i := range colNames {

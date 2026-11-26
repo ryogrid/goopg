@@ -16988,6 +16988,14 @@ verify each at HEAD when the task starts.
   - tstzrange bounds print at \+00 under `SET timezone = '\+2'` \(PG range\_out → timestamptz\_out in the session zone\).
   - 2026\-11\-26 \(done\): decodePhysicalPGValueLowered re\-renders tstzrange / tsrange / daterange bounds with restyleRangeText under the scan's OutputStyle; colsHaveArray makes the style live for those columns. Unit test TestRangeOutputSessionStyle.
   - Movement: 002's insert check now differs from PG only in hstore \(the table cannot be created\).
+- [ ] **M0149-0100 — generated columns stop being generated after a server restart** \(filed 2026\-11\-26 by M0149\-0048b; S2 — wrong results\)
+  Kind: impl
+  Movement: none — correctness fix — no plan instrument
+  Parent: none
+  - > **ESCALATION 2026\-11\-26 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\.
+  - Repro \(fresh `goopg init`\): `CREATE TABLE tab1 \(a int PRIMARY KEY, b int GENERATED ALWAYS AS \(a \* 2\) STORED, c int GENERATED ALWAYS AS \(a \* 3\) VIRTUAL\)`; restart the server; `INSERT INTO tab1 \(a\) VALUES \(5\); SELECT \* FROM tab1` → `5||` \(PG: `5|10|15`\). After the restart `pg_attrdef` has no row for tab1, and the in\-memory catalog.Column has an empty GeneratedExpr, so pg\_get\_publication\_tables and pgoutput also treat b and c as ordinary columns. pg\_attribute \(a heap read\) still shows attgenerated s / v.
+  - First step: find where the restart reload rebuilds catalog.Column \(internal/initdb catalog\_heap\_reload.go / open.go\) and restore GeneratedExpr / GeneratedVirtual from pg\_attrdef \+ attgenerated, then check the write side persists the pg\_attrdef row for a generated column.
 - [ ] **M0149-0099 — a range column reloads as text after a server restart**
   Kind: impl
   Parent: none
@@ -17076,11 +17084,13 @@ verify each at HEAD when the task starts.
   Parent: M0149-0048
   - 2026\-11\-26 \(done\): pubgencols modelled \(catalog, option parse, ALTER SET, heap attnum 10 \+ reload, views\); ColumnDef.Generated; PgOutput.publishedColumns masks Relation / new / old tuples; publicationFilter implements xlog.GenColsFilter. Unit test TestPgOutputGeneratedColumns.
   Movement: yes — tap 011 all-goopg 2/12 -> 3/12 assertions; regress publication 597 -> 595
-- [ ] **M0149-0048b — pg\_get\_publication\_tables returns PG 18's \(pubid, relid, attrs int2vector, qual\) with the published attnums**
+- [x] **M0149-0048b — pg\_get\_publication\_tables returns PG 18's \(pubid, relid, attrs int2vector, qual\) with the published attnums**
   Kind: impl
   Parent: M0149-0048
   - 011 goopg\-publisher\-pg18\-subscriber: tablesync loops on "logical replication target relation "public.tab1" has incompatible generated columns: "b", "c"". fetch\_remote\_table\_info reads `CASE WHEN array_length(gpt.attrs, 1) = c.relnatts THEN NULL ELSE gpt.attrs END`; goopg's attrs is a NULL text column. PG: pg\_publication.c pg\_get\_publication\_tables \(attrs = non\-dropped, non\-virtual, stored only under pubgencols = s\). Touches the planner's SRF schema \(internal/optimizer/planner.go colNames relid/attrs/qual; analyzer.go\) — fireset \+ census gates.
   - Path\-to\-TAP: 011 goopg\-publisher\-pg18\-subscriber ← 0048b \(1 link\).
+  - 2026\-11\-26 \(done\): SRF shape \(pubid, relid, attrs int2vector, qual pg\_node\_tree\) in planner.go \(FROM\-clause \+ ProjectSet\) and analyzer.go \(base \+ composite\); attrs = publicationPublishedAttnums as int2vector text. Tests TestPublicationPublishedAttnums \+ updated shape tests. Found M0149\-0100 \(filed, S2\).
+  Movement: yes — tap 011 goopg-publisher-pg18-subscriber 0/12 -> 7/12 assertions
 - [ ] **M0149-0048c — a goopg subscriber computes its own generated columns on apply and rejects a published column that maps to a local generated column**
   Kind: impl
   Parent: M0149-0048

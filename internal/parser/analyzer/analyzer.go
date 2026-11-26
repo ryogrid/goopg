@@ -2625,8 +2625,8 @@ func tableFuncBaseColumns(tf *parser.TableFuncRef, alias string, colAliases []st
 	}
 	switch strings.ToLower(tf.Name) {
 	case "pg_get_publication_tables":
-		names := []string{"relid", "attrs", "qual"}
-		types := []string{"oid", "text", "text"}
+		names := []string{"pubid", "relid", "attrs", "qual"}
+		types := []string{"oid", "oid", "int2vector", "pg_node_tree"}
 		for i := range names {
 			if i < len(colAliases) && colAliases[i] != "" {
 				names[i] = colAliases[i]
@@ -2894,9 +2894,10 @@ func compositeFuncColumns(funcName string) []catalog.Column {
 	switch strings.ToLower(funcName) {
 	case "pg_get_publication_tables":
 		return []catalog.Column{
-			{Name: "relid", Type: catalog.Type{Name: "oid"}, Ordinal: 0},
-			{Name: "attrs", Type: catalog.Type{Name: "text"}, Ordinal: 1},
-			{Name: "qual", Type: catalog.Type{Name: "text"}, Ordinal: 2},
+			{Name: "pubid", Type: catalog.Type{Name: "oid"}, Ordinal: 0},
+			{Name: "relid", Type: catalog.Type{Name: "oid"}, Ordinal: 1},
+			{Name: "attrs", Type: catalog.Type{Name: "int2vector"}, Ordinal: 2},
+			{Name: "qual", Type: catalog.Type{Name: "pg_node_tree"}, Ordinal: 3},
 		}
 	}
 	return nil
