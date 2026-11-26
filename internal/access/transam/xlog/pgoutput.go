@@ -57,6 +57,7 @@ const (
 	pgoUpdate   = 'U'
 	pgoTruncate = 'T'
 	pgoMessage  = 'M'
+	pgoType     = 'Y'
 )
 
 // pgoutput TRUNCATE option-bit constants. Mirror upstream's

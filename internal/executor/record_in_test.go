@@ -128,3 +128,41 @@ func TestRangeOutputSessionStyle(t *testing.T) {
 		t.Error("colsHaveArray(tstzrange column) = false: the scan would not resolve the session style")
 	}
 }
+
+// TestApplyWorkerTypedTextAndCatalogUnwrap pins two apply-side fixes of
+// subscription/t/002_types.pl's PG-publisher pairing (M0149-0046g): an
+// array column's pgoutput text is kept as array text (the column's Type
+// names the ELEMENT type; parsing it as int4 stopped the apply worker),
+// and a composite / enum key encodes through the search-path catalog the
+// apply worker runs with (catalog.WithSearchPath) — a bare *InMemory
+// assertion failed there and the replicated row was silently left out of
+// its primary-key index.
+func TestApplyWorkerTypedTextAndCatalogUnwrap(t *testing.T) {
+	d, err := parsePgoutputText(catalog.Type{Name: "int4", IsArray: true}, []byte("{1,2,3}"))
+	if err != nil || d.StringValue() != "{1,2,3}" {
+		t.Fatalf("parsePgoutputText(int4[]) = %v, %v; want the array text", d, err)
+	}
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	for _, ddl := range []string{
+		"CREATE TYPE e46g AS ENUM ('a','b')",
+		"CREATE TYPE c46g AS (a FLOAT, b e46g)",
+	} {
+		if err := runDDL(t, ctx, ddl); err != nil {
+			t.Fatalf("%s: %v", ddl, err)
+		}
+	}
+	wrapped := *ctx
+	wrapped.Catalog = catalog.WithSearchPath(ctx.Catalog, nil)
+	for _, tc := range []struct{ typ, val string }{{"e46g", "b"}, {"c46g", "(1,a)"}} {
+		col := &catalog.Column{Name: "a", Type: catalog.Type{Name: tc.typ}}
+		k1, err1 := encodeBTreeKeyForColumn(ctx, NewStringDatum(tc.val), col, 0)
+		k2, err2 := encodeBTreeKeyForColumn(&wrapped, NewStringDatum(tc.val), col, 0)
+		if err1 != nil || err2 != nil {
+			t.Fatalf("%s key: bare %v, wrapped %v", tc.typ, err1, err2)
+		}
+		if string(k1) != string(k2) {
+			t.Errorf("%s key differs through the search-path wrapper", tc.typ)
+		}
+	}
+}

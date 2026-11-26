@@ -16997,11 +16997,17 @@ verify each at HEAD when the task starts.
   - `CREATE EXTENSION hstore` fails with "extension "hstore" is not available". 002 needs the type, its I/O, equality for UPDATE/DELETE by key, and its pgoutput text form.
   - 2026\-11\-26 \(done\): knownExtensions hstore 1.8; executor/hstore.go hstoreIn \(parse\_hstore / get\_val state machines, comparePairs order, first duplicate kept, hstore\_out quoting\) at assignment and in evalCast. Checked against a PG 18.3 node with contrib hstore. indexScanOp resolves the session output style \(colsHaveArray\), so tstzrange / timestamptz\[\] read through an index follow SET timezone. Unit test TestHstoreIn.
   - Movement: on a goopg node 002's DDL and insert check match PG exactly. The ungated run fails at the first catch\-up in all three pairings \(0046g, 0046h\).
-- [ ] **M0149-0046g — a goopg subscriber's apply worker decodes array columns as their element type**
+- [x] **M0149-0046g — a goopg subscriber's apply worker decodes array columns as their element type**
   Kind: impl
   Parent: M0149-0046
   - 002 pg18\-publisher\-goopg\-subscriber: "applyworker: decode insert tuple for "tst\_one\_array": col "b": int4 parse "\{1,2,3\}"". The apply path reads catalog.Type\{Name:"int4", IsArray:true\} as int4. PG's apply worker runs the column type's input function \(array\_in, record\_in, range\_in, hstore\_in\) on the pgoutput text. Check composite, range and hstore columns on the same path.
   - Path\-to\-TAP: 002 \(PG\-publisher and all\-goopg pairings\) ← 0046g \(1 link\).
+  - 2026\-11\-26 \(done\), three apply\-side fixes:
+    - parsePgoutputText keeps an array column's text.
+    - The pgoutput decoder and the apply worker accept the Type \(`Y`\) message.
+    - The composite and enum key arms look through catalog.WithSearchPath \(underlyingInMemory\), so a replicated row with an enum or composite PK is filed in its index; maintainUniqueIndexesForInsert had dropped the encode error \(M0149\-0098\).
+  - Unit tests TestDecodeTypeMessage, TestApplyWorkerTypedTextAndCatalogUnwrap.
+  Movement: yes — tap 002 pg18-publisher-goopg-subscriber 0/4 -> 4/4 assertions (3/3 runs); 1/3 pairings pass
 - [ ] **M0149-0046h — a goopg publisher's pgoutput misreads a stored hstore value as an external TOAST pointer**
   Kind: impl
   Parent: M0149-0046

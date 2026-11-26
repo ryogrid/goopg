@@ -368,3 +368,23 @@ func messageLength(buf []byte, kind byte) (int, error) {
 // every test in the file (used in encoder helpers via wrapAsHeapTuple
 // above; keep the import explicit here).
 var _ = storage.InvalidTransactionID
+
+// TestDecodeTypeMessage pins the pgoutput Type message (logicalrep_write_typ):
+// 'Y' | type_oid(4) | nspname\0 | typname\0. A PG publisher sends one before
+// the Relation message of a table with an enum / composite column, and the
+// goopg decoder used to stop the apply worker with "unknown message kind
+// 'Y'" (subscription/t/002_types.pl, M0149-0046g).
+func TestDecodeTypeMessage(t *testing.T) {
+	msg := []byte{'Y', 0, 0, 0x40, 0x10}
+	msg = append(msg, "public\x00tst_enum_t\x00"...)
+	m, err := DecodeMessage(msg)
+	if err != nil {
+		t.Fatalf("DecodeMessage(Y): %v", err)
+	}
+	if m.Kind != 'Y' || m.TypeOID != 0x4010 || m.TypeNamespace != "public" || m.TypeName != "tst_enum_t" {
+		t.Errorf("decoded %+v, want Y oid 16400 public.tst_enum_t", m)
+	}
+	if _, err := DecodeMessage([]byte{'Y', 0, 0}); err == nil {
+		t.Error("truncated Y message decoded without error")
+	}
+}

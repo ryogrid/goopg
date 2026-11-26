@@ -41,10 +41,10 @@ const (
 // encoding, or ok=false when typeName is not a composite type in ctx's
 // catalog.
 func compositeKeyFields(ctx *Context, typeName string) ([]catalog.Column, bool) {
-	if ctx == nil || ctx.Catalog == nil {
+	if ctx == nil {
 		return nil, false
 	}
-	im, ok := ctx.Catalog.(*catalog.InMemory)
+	im, ok := underlyingInMemory(ctx.Catalog)
 	if !ok {
 		return nil, false
 	}
@@ -58,6 +58,25 @@ func compositeKeyFields(ctx *Context, typeName string) ([]catalog.Column, bool) 
 		cols[i] = catalog.Column{Name: f.Name, Type: catalog.Type{Name: compositeFieldBaseTypeName(base), IsArray: isArray}}
 	}
 	return cols, true
+}
+
+// underlyingInMemory is cat's *catalog.InMemory, looking through the
+// search-path wrapper the apply worker and other off-session callers use
+// (catalog.WithSearchPath). A bare `.(*catalog.InMemory)` assertion failed
+// there, so a replicated row's composite / enum key did not encode and the
+// row went missing from its primary-key index (M0149-0046g).
+func underlyingInMemory(cat catalog.Catalog) (*catalog.InMemory, bool) {
+	for i := 0; i < 4 && cat != nil; i++ {
+		switch c := cat.(type) {
+		case *catalog.InMemory:
+			return c, true
+		case *catalog.SearchPathCatalog:
+			cat = c.Catalog
+		default:
+			return nil, false
+		}
+	}
+	return nil, false
 }
 
 // compositeFieldBaseTypeName is a field's base type name as the key

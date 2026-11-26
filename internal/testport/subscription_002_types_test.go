@@ -15,11 +15,10 @@ import (
 // It runs in three pairings: all-goopg, a PG 18.3 publisher with a goopg
 // subscriber, and a goopg publisher with a PG 18.3 subscriber.
 //
-// Gated by GOOPG_TAP_002 until it passes (M0149-0046). The DDL and DML
-// fail on a goopg node: no hstore extension, btree keys on composite types
-// are refused, composite fields are not coerced to their column types
-// (1.0 prints as 1.0, not 1), range input is not canonicalised
-// ('[1, 10]' is not [1,11)); NULL array elements landed (M0149-0046a).
+// Gated by GOOPG_TAP_002 until it passes (M0149-0046). The PG 18.3
+// publisher with a goopg subscriber passes (M0149-0046a-g); both pairings
+// with a goopg publisher fail because its pgoutput misreads a stored hstore
+// value as an external TOAST pointer (M0149-0046h).
 func TestPort_Subscription002Types(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")

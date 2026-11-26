@@ -21,7 +21,7 @@ is one link from the TAP test:
 | M0149\-0046d \(done\) | range input is not canonicalised: int4range `'[1, 10]'` stays `[1, 10]`, not `[1,11)` |
 | M0149\-0046e \(done\) | range output ignores the session TimeZone: tstzrange bounds print at \+00 under `SET timezone = '+2'` |
 | M0149\-0046f \(done\) | no hstore extension |
-| M0149\-0046g | a goopg subscriber's apply worker decodes an array column's replicated text as the element type: "int4 parse "\{1,2,3\}"" |
+| M0149\-0046g \(done\) | a goopg subscriber's apply worker decodes an array column's replicated text as the element type: "int4 parse "\{1,2,3\}"" |
 | M0149\-0046h | a goopg publisher's pgoutput misreads a stored hstore value as an external TOAST pointer |
 
 ## Landed — M0149\-0046a, NULL array elements
@@ -158,3 +158,21 @@ primary\-keyed tst\_range\_array is read. `indexScanOp` now resolves the session
 
 **Result.** On a goopg node all of 002's DDL and inserts now match PG exactly. Replication itself fails in all three
 pairings \(0046g, 0046h\).
+
+## Landed — M0149\-0046g, a goopg subscriber applies 002's types
+
+Three apply\-side gaps stopped a goopg subscriber of a PG 18.3 publisher:
+
+- **Array columns.** `parsePgoutputText` switched on `Type.Name`, which for an array column is the element type, so
+  `{1,2,3}` was parsed as one int4. An array column now keeps its array\_out text.
+- **The Type message.** PG's pgoutput sends `Y` \(logicalrep\_write\_typ: type OID, namespace, type name\) before the
+  Relation message of a table with a non\-built\-in column type. goopg's decoder stopped on "unknown message kind 'Y'".
+  `DecodeMessage` now decodes it into TypeOID / TypeNamespace / TypeName, and the apply worker accepts it. PG uses it
+  only for its type map; values apply as text through the local column type.
+- **Keys through the search\-path catalog.** The apply worker runs with `catalog.WithSearchPath`, and the composite
+  and enum key arms asserted `*catalog.InMemory`. A replicated row's enum or composite key failed to encode, and
+  `maintainUniqueIndexesForInsert` dropped the error, so the row was missing from its primary\-key index and
+  `ORDER BY a` returned nothing. `underlyingInMemory` looks through the wrapper.
+
+The PG\-publisher → goopg\-subscriber pairing of TestPort\_Subscription002Types now passes 4/4 assertions, 3 of 3
+runs.

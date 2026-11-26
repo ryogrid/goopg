@@ -197,6 +197,13 @@ func (w *ApplyWorker) ApplyMessage(m *xlog.DecodedMessage) (uint64, error) {
 		err = w.applyUpdate(m)
 	case 'T':
 		err = w.applyTruncate(m)
+	case 'Y':
+		// TYPE (logicalrep_write_typ): the publisher names a non-built-in
+		// column type before the Relation message that uses it. PG's
+		// apply worker only records it in its type map (for error
+		// messages, logicalrep_typmap_update); values are applied as
+		// text through the LOCAL column's type, as here. M0149-0046g.
+		err = nil
 	case 'M':
 		// MESSAGE is a logical-decoding plugin/extension channel, not a
 		// table mutation. PostgreSQL forwards it through pgoutput when the
@@ -1092,6 +1099,14 @@ func decodePgoutputTupleAsRowWith(localIdx []int, claimed []bool, remoteCols []x
 // pgoDecodeValue in the encoder — same v0 type set.
 func parsePgoutputText(t catalog.Type, data []byte) (Datum, error) {
 	s := string(data)
+	// An ARRAY column's catalog.Type names its ELEMENT type (Name "int4",
+	// IsArray true); its pgoutput value is array_out's text ("{1,2,3}"),
+	// which the heap encoder takes as a string. Matching on t.Name parsed
+	// the whole array as one int4 and stopped the apply worker
+	// (subscription/t/002_types.pl, M0149-0046g).
+	if t.IsArray {
+		return NewStringDatum(s), nil
+	}
 	switch t.Name {
 	case "int4", "integer", "int":
 		v, err := strconv.ParseInt(s, 10, 64)

@@ -16802,7 +16802,7 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 	// so a record or enum[] key encodes its enum parts exactly like an enum
 	// column does. M0149-0046c.
 	if v.Kind == KindString && ctx != nil {
-		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		if im, ok := underlyingInMemory(ctx.Catalog); ok {
 			if et, isEnum := im.LookupEnum(col.Type.Name); isEnum {
 				label := v.StringValue()
 				for _, ev := range et.Values {

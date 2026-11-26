@@ -36,6 +36,14 @@ type DecodedMessage struct {
 	// Relation field — populated for kind == 'R'.
 	Relation *DecodedRelation
 
+	// Type fields — populated for kind == 'Y' (logicalrep_write_typ): the
+	// publisher's pg_type OID, namespace ("" for pg_catalog) and type name
+	// of a non-built-in column type, sent before the Relation message
+	// that uses it. M0149-0046g.
+	TypeOID       uint32
+	TypeNamespace string
+	TypeName      string
+
 	// Insert / Delete fields.
 	RelOID   uint32
 	NewTuple []DecodedColumn // populated for 'I'
@@ -220,6 +228,27 @@ func DecodeMessage(payload []byte) (*DecodedMessage, error) {
 		out.RelOID = oid
 		out.OldTuple = oldCols
 		out.NewTuple = newCols
+		return out, nil
+	case pgoType:
+		// 'Y' | type_oid(4) | nspname(NUL) | typname(NUL)
+		// (logicalrep_write_typ, proto.c; the xid field exists only while
+		// streaming an in-progress transaction, which this decoder does
+		// not negotiate).
+		oid, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		nsp, err := r.cstring()
+		if err != nil {
+			return nil, err
+		}
+		name, err := r.cstring()
+		if err != nil {
+			return nil, err
+		}
+		out.TypeOID = oid
+		out.TypeNamespace = nsp
+		out.TypeName = name
 		return out, nil
 	case pgoMessage:
 		// 'M' | flags(1) | lsn(8) | prefix(NUL) | size(4) | payload.
