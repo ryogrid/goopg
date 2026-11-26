@@ -620,6 +620,9 @@ func (w *ApplyWorker) applyContext() *Context {
 // match keyRow (equality on all non-null key columns) and stamps xmax
 // on each match. Designed for the apply worker's DELETE path.
 func applyDeleteByKey(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, keyRow Row) error {
+	// A nondeterministic replica-identity collation decides equality
+	// (tuples_equal / the index's opclass under the column's collation).
+	colls := nondeterministicCollators(ctx, cols)
 	nBlocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return err
@@ -656,7 +659,7 @@ func applyDeleteByKey(ctx *Context, rel storage.RelFileNode, cols []catalog.Colu
 			if err := DecodeHeapTupleRowInto(scanRow, cols, tup, nil); err != nil {
 				continue
 			}
-			if rowMatchesKey(scanRow, keyRow) {
+			if rowMatchesKeyCollated(scanRow, keyRow, colls) {
 				matches = append(matches, match{slot: slot})
 			}
 		}
@@ -765,6 +768,9 @@ func applyUpdateByKey(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 // the values for 'u' unchanged-TOAST cells in the publisher's NewTuple.
 // Pure read-only — never stamps xmax or marks pages dirty.
 func applyScanFirstMatch(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, keyRow Row) (Row, error) {
+	// A nondeterministic replica-identity collation decides equality
+	// (tuples_equal / the index's opclass under the column's collation).
+	colls := nondeterministicCollators(ctx, cols)
 	nBlocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return nil, err
@@ -799,7 +805,7 @@ func applyScanFirstMatch(ctx *Context, rel storage.RelFileNode, cols []catalog.C
 			if err := DecodeHeapTupleRowInto(scanRow, cols, tup, nil); err != nil {
 				continue
 			}
-			if rowMatchesKey(scanRow, keyRow) {
+			if rowMatchesKeyCollated(scanRow, keyRow, colls) {
 				out := append(Row(nil), scanRow...)
 				s.RUnlock()
 				ctx.Pool.Unpin(s)

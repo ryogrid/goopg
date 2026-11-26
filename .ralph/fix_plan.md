@@ -16997,6 +16997,10 @@ verify each at HEAD when the task starts.
     > continues with the banner\.
   - Repro \(fresh `goopg init`\): `CREATE TABLE tab1 \(a int PRIMARY KEY, b int GENERATED ALWAYS AS \(a \* 2\) STORED, c int GENERATED ALWAYS AS \(a \* 3\) VIRTUAL\)`; restart the server; `INSERT INTO tab1 \(a\) VALUES \(5\); SELECT \* FROM tab1` → `5||` \(PG: `5|10|15`\). After the restart `pg_attrdef` has no row for tab1, and the in\-memory catalog.Column has an empty GeneratedExpr, so pg\_get\_publication\_tables and pgoutput also treat b and c as ordinary columns. pg\_attribute \(a heap read\) still shows attgenerated s / v.
   - First step: find where the restart reload rebuilds catalog.Column \(internal/initdb catalog\_heap\_reload.go / open.go\) and restore GeneratedExpr / GeneratedVirtual from pg\_attrdef \+ attgenerated, then check the write side persists the pg\_attrdef row for a generated column.
+- [ ] **M0149-0101 — equality under a nondeterministic ICU collation compares bytes** \(filed 2026\-11\-26 by M0149\-0049a; wrong results\)
+  Kind: impl
+  Parent: none
+  - `CREATE COLLATION c (provider = icu, locale = 'und', deterministic = false); SELECT U&'\00E4bc' = U&'\0061\0308bc' COLLATE c` → goopg `f`, PG `t` \(texteq → varstr\_cmp under a nondeterministic collation\). The same applies to WHERE, unique indexes, GROUP BY and DISTINCT on such columns. The apply worker's row lookup now uses internal/executor/collation\_nondet.go; the SQL evaluator, btree and hashing do not.
 - [ ] **M0149-0099 — a range column reloads as text after a server restart**
   Kind: impl
   Parent: none
@@ -17126,6 +17130,19 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/subscription/t/012_collation.pl` — nondeterministic ICU collations as replica identity.
   Likely prerequisites \(verify at start\): ICU nondeterministic collations \(mirror upstream ICU skip only\); overlaps M0148's collation family.
+  - 2026\-11\-26 \(progress\): TestPort\_Subscription012Collation written, gated GOOPG\_TAP\_012. The PG 18.3 build has no ICU \(pg\_config --configure lacks --with-icu\), so goopg\-publisher\-pg18\-subscriber mirrors the .pl's with\_icu skip \(the subscriber creates the ICU collation\); all\-goopg and pg18\-publisher\-goopg\-subscriber run.
+  - Path\-to\-TAP: 012 ← 0049a \(done\); 012 all\-goopg FULL case ← 0049b. One link each.
+- [x] **M0149-0049a — the apply row lookup honours a nondeterministic ICU collation**
+  Kind: impl
+  Parent: M0149-0049
+  - 2026\-11\-26 \(done\): nondeterministicCollators \+ rowMatchesKeyCollated \(internal/executor/collation\_nondet.go\) in applyDeleteByKey / applyScanFirstMatch. Test TestApplyKeyMatchNondeterministicCollation.
+  Movement: yes — tap 012 pg18-publisher-goopg-subscriber 0/2 -> 2/2 (3/3), all-goopg 0/2 -> 1/2 assertions
+- [ ] **M0149-0049b — a goopg publisher logs the old tuple of an UPDATE under REPLICA IDENTITY FULL**
+  Kind: impl
+  Parent: M0149-0049
+  - 012 all\-goopg: `UPDATE tab2 SET b = 'bar'` \(REPLICA IDENTITY FULL\) leaves the subscriber with `foo`/`bar`: the decoded U carries no old tuple \(classifyDecodedXLog's update arms set no OldTuple; only DELETE handles XLH\_DELETE\_CONTAINS\_OLD\_TUPLE\), so the subscriber keys the lookup by the new row. PG: heap\_update logs the ExtractReplicaIdentity old tuple with XLH\_UPDATE\_CONTAINS\_OLD\_TUPLE \(or \_OLD\_KEY\) at wal\_level = logical, and DecodeUpdate passes it as change->data.tp.oldtuple.
+  - Path\-to\-TAP: 012 all\-goopg ← 0049b \(1 link\).
+
 - [ ] **M0149-0050 — port subscription/t/014_binary.pl**
   Kind: impl
   Parent: none
