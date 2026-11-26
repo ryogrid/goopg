@@ -17008,11 +17008,23 @@ verify each at HEAD when the task starts.
     - The composite and enum key arms look through catalog.WithSearchPath \(underlyingInMemory\), so a replicated row with an enum or composite PK is filed in its index; maintainUniqueIndexesForInsert had dropped the encode error \(M0149\-0098\).
   - Unit tests TestDecodeTypeMessage, TestApplyWorkerTypedTextAndCatalogUnwrap.
   Movement: yes — tap 002 pg18-publisher-goopg-subscriber 0/4 -> 4/4 assertions (3/3 runs); 1/3 pairings pass
-- [ ] **M0149-0046h — a goopg publisher's pgoutput misreads a stored hstore value as an external TOAST pointer**
+- [x] **M0149-0046h — a goopg publisher's pgoutput misreads a stored hstore value as an external TOAST pointer**
   Kind: impl
   Parent: M0149-0046
   - 002 goopg\-publisher\-pg18\-subscriber: "pgoutput: encode insert tuple for "tst\_hstore": col "b": hstore: external TOAST pointer in logical change not supported". The pgoutput tuple decoder does not know the hstore type name, and a 1\-byte\-header varlena is read as va\_tag external. It must decode an hstore column as the varlena text goopg stores.
   - Path\-to\-TAP: 002 \(goopg\-publisher and all\-goopg pairings\) ← 0046h \(1 link\).
+  - 2026\-11\-26 \(done\): the cause was not hstore. pgoDecodePhysicalValue tested the OLD TOAST marker 0x1B, which is also the 1\-byte header of every 12\-byte value; the heap codec had already moved to 0x01. Any 12\-character text from a goopg publisher stopped the walsender. It now tests 0x01. Unit test TestPgOutputTwelveByteTextIsNotToast.
+  Movement: yes — tap 002 goopg-publisher-pg18-subscriber 0/4 -> 1/4 assertions (insert check passes); all-goopg likewise
+- [ ] **M0149-0046i — UPDATE … SET array element (b\[2\] = NULL)**
+  Kind: impl
+  Parent: M0149-0046
+  - 002 update batch on a goopg publisher: `UPDATE tst\_comp\_mix\_array SET b\[2\] = NULL WHERE \(\(a\).a\).a = 1` fails with "syntax error at or near "\["". PG's set\_target accepts an indirection \(transformAssignmentIndirection → array\_set\_element\). Parser change \(read the playbook §12 first\) plus executor assignment.
+  - Path\-to\-TAP: 002 goopg\-publisher pairings ← 0046i \(1 link\).
+- [ ] **M0149-0046j — nested composite field selection ((a).a).a**
+  Kind: impl
+  Parent: M0149-0046
+  - 002 delete batch on a goopg node: `DELETE FROM tst\_comp\_mix\_array WHERE \(\(a\).a\).a = 1` fails with "column notation .a applied to type public . tst\_comp\_basic\_t, which is not a composite type". The inner field's type is the parser's token string with a schema qualifier; resolve it like compositeFieldBaseTypeName does.
+  - Path\-to\-TAP: 002 goopg\-publisher pairings ← 0046j \(1 link\).
 - [ ] **M0149-0047 — port subscription/t/010_truncate.pl**
   Kind: impl
   Parent: none

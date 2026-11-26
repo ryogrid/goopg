@@ -738,7 +738,12 @@ func pgoDecodePhysicalValue(t catalog.Type, data []byte, regOut func(string, uin
 	}
 	// External on-disk TOAST pointer: logical replication of toasted values is
 	// not supported in v0 — fail loudly rather than emit a garbled value.
-	if len(data) >= 1 && data[0] == 0x1B {
+	// The marker is VARATT_IS_1B_E's 0x01, the heap codec's (executor
+	// codec.go). This sibling still tested the old 0x1B marker, which is
+	// also the 1-byte header of every 12-byte value — so a goopg publisher
+	// refused any 12-character text, e.g. 002_types.pl's
+	// '"zzz"=>"foo"' hstore (M0149-0046h).
+	if len(data) >= 1 && data[0] == 0x01 {
 		return nil, 0, fmt.Errorf("%s: external TOAST pointer in logical change not supported", t.Name)
 	}
 	// Varlena types (text / varchar / bpchar / char / numeric / decimal /

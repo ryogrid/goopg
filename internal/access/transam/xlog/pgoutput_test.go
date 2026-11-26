@@ -737,3 +737,30 @@ func TestPgOutputSkipsMaterializedView(t *testing.T) {
 		t.Errorf("matview change emitted %x, want nothing", buf.Bytes())
 	}
 }
+
+// TestPgOutputTwelveByteTextIsNotToast pins the external-TOAST marker in
+// pgoutput's value decoder to the heap codec's VARATT_IS_1B_E byte (0x01).
+// It tested 0x1B, the 1-byte varlena header of every 12-byte value, so a
+// goopg publisher failed "external TOAST pointer in logical change not
+// supported" on any 12-character text or hstore value and the walsender
+// stopped (subscription/t/002_types.pl, M0149-0046h).
+func TestPgOutputTwelveByteTextIsNotToast(t *testing.T) {
+	val := `"zzz"=>"foo"` // 12 bytes
+	stored := append([]byte{byte((len(val)+1)<<1 | 1)}, val...)
+	if stored[0] != 0x1B {
+		t.Fatalf("test setup: header %#x, want 0x1b", stored[0])
+	}
+	for _, typ := range []string{"text", "hstore"} {
+		got, n, err := pgoDecodePhysicalValue(catalog.Type{Name: typ}, stored, nil)
+		if err != nil {
+			t.Fatalf("%s: decode 12-byte value: %v", typ, err)
+		}
+		if string(got) != val || n != len(stored) {
+			t.Errorf("%s: decoded %q (%d bytes), want %q (%d)", typ, got, n, val, len(stored))
+		}
+	}
+	ptr := append([]byte{0x01}, make([]byte, 12)...)
+	if _, _, err := pgoDecodePhysicalValue(catalog.Type{Name: "text"}, ptr, nil); err == nil {
+		t.Error("an external TOAST pointer (0x01) decoded without error")
+	}
+}

@@ -22,7 +22,9 @@ is one link from the TAP test:
 | M0149\-0046e \(done\) | range output ignores the session TimeZone: tstzrange bounds print at \+00 under `SET timezone = '+2'` |
 | M0149\-0046f \(done\) | no hstore extension |
 | M0149\-0046g \(done\) | a goopg subscriber's apply worker decodes an array column's replicated text as the element type: "int4 parse "\{1,2,3\}"" |
-| M0149\-0046h | a goopg publisher's pgoutput misreads a stored hstore value as an external TOAST pointer |
+| M0149\-0046h \(done\) | a goopg publisher's pgoutput misreads a stored hstore value as an external TOAST pointer |
+| M0149\-0046i | `UPDATE … SET b[2] = NULL` \(array element assignment\) is a syntax error on a goopg node |
+| M0149\-0046j | `((a).a).a` on a nested composite field is refused: "column notation .a applied to type public . tst\_comp\_basic\_t, which is not a composite type" |
 
 ## Landed — M0149\-0046a, NULL array elements
 
@@ -176,3 +178,14 @@ Three apply\-side gaps stopped a goopg subscriber of a PG 18.3 publisher:
 
 The PG\-publisher → goopg\-subscriber pairing of TestPort\_Subscription002Types now passes 4/4 assertions, 3 of 3
 runs.
+
+## Landed — M0149\-0046h, 12\-byte values from a goopg publisher
+
+pgoutput's value decoder refused a value whose first byte is 0x1B as an external TOAST pointer. 0x1B is goopg's
+former TOAST marker, and it is also the 1\-byte varlena header of every 12\-byte value. The heap codec had already
+moved to VARATT\_IS\_1B\_E's 0x01 because of that collision. This decode sibling had not, so a goopg publisher failed
+on any 12\-character text, here 002's `"zzz"=>"foo"` hstore, and the walsender stopped. It now tests 0x01. Unit test
+TestPgOutputTwelveByteTextIsNotToast.
+
+With a goopg publisher the insert check now passes. The update batch then fails on the goopg node itself \(0046i,
+0046j\).

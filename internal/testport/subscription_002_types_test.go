@@ -16,9 +16,10 @@ import (
 // subscriber, and a goopg publisher with a PG 18.3 subscriber.
 //
 // Gated by GOOPG_TAP_002 until it passes (M0149-0046). The PG 18.3
-// publisher with a goopg subscriber passes (M0149-0046a-g); both pairings
-// with a goopg publisher fail because its pgoutput misreads a stored hstore
-// value as an external TOAST pointer (M0149-0046h).
+// publisher with a goopg subscriber passes (M0149-0046a-g); with a goopg
+// publisher the insert check passes (M0149-0046h) and the update batch fails
+// on the goopg node: `UPDATE … SET b[2] = NULL` does not parse (M0149-0046i)
+// and `((a).a).a` on a nested composite field is refused (M0149-0046j).
 func TestPort_Subscription002Types(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")
