@@ -19,7 +19,7 @@ is one link from the TAP test:
 | M0149\-0046b \(done\) | btree keys on composite types: "btree v0 only supports int4 / numeric keys" for the four composite\-keyed tables |
 | M0149\-0046c \(done\) | composite fields are not coerced to their column types: `ROW(1.0, 'a', 1)` into \(float8, text, int\) prints `(1.0,a,1)`, not `(1,a,1)`; an array field keeps its input spelling `{a, b, c}` |
 | M0149\-0046d \(done\) | range input is not canonicalised: int4range `'[1, 10]'` stays `[1, 10]`, not `[1,11)` |
-| M0149\-0046e | range output ignores the session TimeZone: tstzrange bounds print at \+00 under `SET timezone = '+2'` |
+| M0149\-0046e \(done\) | range output ignores the session TimeZone: tstzrange bounds print at \+00 under `SET timezone = '+2'` |
 | M0149\-0046f | no hstore extension |
 
 ## Landed — M0149\-0046a, NULL array elements
@@ -113,3 +113,23 @@ int4range\_canonical, int8range\_canonical and daterange\_canonical. It was miss
 
 The rangetypes regress case went from 463 to 444 mismatched lines. 002's range tables match PG, except tstzrange
 output in the session TimeZone \(0046e\).
+
+## Landed — M0149\-0046e, date\-time range output in the session style
+
+A range is stored as its text, but PG's range\_out renders each bound through the subtype's output function:
+timestamptz\_out in the session TimeZone and DateStyle, timestamp\_out and date\_out in the DateStyle. goopg returned
+the stored text. 002 runs `SET timezone = '+2'` before its SELECTs, then read `2014-08-03 22:00:00+00` where PG
+reads `2014-08-04 00:00:00+02`.
+
+Two changes fix it:
+
+- **Decode arm.** `decodePhysicalPGValueLowered` now decodes a tstzrange / tsrange / daterange value and
+  re\-renders it with `restyleRangeText`: each bound is parsed through its subtype and formatted with the scan's
+  `array.OutputStyle`, then the range is deparsed. Infinite or absent bounds and `empty` are kept.
+- **Style resolution.** A scan resolves the session style only when `colsHaveArray` says a column needs it. That
+  check now includes the three date\-time range types.
+
+The rangetypes regress case is unchanged \(444\).
+
+**Filed: M0149\-0099.** A range column reloads as text after a server restart, because pg\_attribute records
+atttypid = text for it and the reload follows. Range\-specific input and output are lost after a restart.

@@ -16981,10 +16981,16 @@ verify each at HEAD when the task starts.
   - int4range `'\[1, 10\]'` is stored as written \(`\[1, 10\]`\); PG range\_in \+ int4range\_canonical gives `\[1,11\)`. The same applies to int8range elements of an int8range\[\].
   - 2026\-11\-26 \(done\): coerceRowForConstraintChecks routes range columns through evalCast \(range\_in\) and range\-array columns through arrayInElems; evalCast's "\[\]" arm does the same for range element types. rangeColumnType covers built\-in and user range types. Unit test TestRangeInAtAssignment.
   - Movement: regress rangetypes 463→444; 002's range tables match PG except tstzrange TimeZone output \(0046e\).
-- [ ] **M0149-0046e — range output follows the session TimeZone**
+- [x] **M0149-0046e — range output follows the session TimeZone**
   Kind: impl
   Parent: M0149-0046
   - tstzrange bounds print at \+00 under `SET timezone = '\+2'` \(PG range\_out → timestamptz\_out in the session zone\).
+  - 2026\-11\-26 \(done\): decodePhysicalPGValueLowered re\-renders tstzrange / tsrange / daterange bounds with restyleRangeText under the scan's OutputStyle; colsHaveArray makes the style live for those columns. Unit test TestRangeOutputSessionStyle.
+  - Movement: 002's insert check now differs from PG only in hstore \(the table cannot be created\).
+- [ ] **M0149-0099 — a range column reloads as text after a server restart**
+  Kind: impl
+  Parent: none
+  - Nearby defect \(found by M0149\-0046e\), filed, not worked. pg\_attribute.atttypid for an int4range / tstzrange column is text \(25\), because catalog.TypeNameToOID falls back to text for range names. The catalog reload rebuilds the column as text, so after a restart range\_in canonicalisation, range operators' typing and range\_out styling no longer apply. PG stores the range type OIDs \(3904 int4range, 3910 tstzrange, …\).
 - [ ] **M0149-0046f — hstore extension**
   Kind: impl
   Parent: M0149-0046

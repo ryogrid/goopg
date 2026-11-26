@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/utils/adt/array"
 )
 
 // TestRecordInNormalizesFields pins record_in for composite casts and
@@ -94,5 +95,36 @@ func TestRangeInAtAssignment(t *testing.T) {
 	}
 	if !rangeColumnType(ctx, "int4range") || rangeColumnType(ctx, "text") || rangeColumnType(ctx, "int4") {
 		t.Error("rangeColumnType misclassifies int4range / text / int4")
+	}
+}
+
+// TestRangeOutputSessionStyle pins range_out for the date-time range types
+// (M0149-0046e): a stored tstzrange's bounds render in the session
+// TimeZone and DateStyle (timestamptz_out), tsrange / daterange bounds in
+// the DateStyle, infinite and absent bounds and `empty` are kept. goopg
+// returned the stored text, so after `SET timezone = '+2'`
+// subscription/t/002_types.pl read "2014-08-03 22:00:00+00" where PG reads
+// "2014-08-04 00:00:00+02". The decode-time style is live for a scan of
+// these columns (colsHaveArray).
+func TestRangeOutputSessionStyle(t *testing.T) {
+	st := array.DefaultOutputStyle()
+	st.Zone = "<+02>-02" // SET timezone = '+2' as the session resolves it
+	for _, tc := range []struct{ typ, in, want string }{
+		{"tstzrange", `["2014-08-03 22:00:00+00",infinity)`, `["2014-08-04 00:00:00+02",infinity)`},
+		{"tstzrange", `(,"2014-08-04 00:00:00+00"]`, `(,"2014-08-04 02:00:00+02"]`},
+		{"tstzrange", "empty", "empty"},
+		{"tsrange", `["2014-08-01 10:00:00","2014-08-02 00:00:00")`, `["2014-08-01 10:00:00","2014-08-02 00:00:00")`},
+	} {
+		if got := restyleRangeText(tc.typ, tc.in, st); got != tc.want {
+			t.Errorf("restyleRangeText(%s, %s) = %s, want %s", tc.typ, tc.in, got, tc.want)
+		}
+	}
+	german := array.DefaultOutputStyle()
+	german.Style, german.Order = "German", "DMY"
+	if got := restyleRangeText("daterange", "[2014-08-01,2014-08-06)", german); got != "[01.08.2014,06.08.2014)" {
+		t.Errorf("German daterange = %s", got)
+	}
+	if !colsHaveArray([]catalog.Column{{Name: "b", Type: catalog.Type{Name: "tstzrange"}}}) {
+		t.Error("colsHaveArray(tstzrange column) = false: the scan would not resolve the session style")
 	}
 }

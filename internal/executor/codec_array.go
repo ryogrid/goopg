@@ -421,6 +421,13 @@ func colsHaveArray(cols []catalog.Column) bool {
 		if cols[i].Type.IsArray || strings.EqualFold(cols[i].Type.Name, "aclitem") {
 			return true
 		}
+		// A date-time range column renders its bounds under the session
+		// DateStyle / TimeZone at decode time (restyleRangeText,
+		// M0149-0046e).
+		switch strings.ToLower(cols[i].Type.Name) {
+		case "tstzrange", "tsrange", "daterange":
+			return true
+		}
 	}
 	return false
 }

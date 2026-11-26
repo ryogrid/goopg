@@ -1780,6 +1780,16 @@ func decodePhysicalPGValueLowered(t *catalog.Type, tname string, data []byte, sc
 		// array decoder.
 		return decodeArrayValuePGStyled(*t, data, st)
 	}
+	// A date-time range is stored as its text, but range_out renders the
+	// bounds through the subtype's output function under the session's
+	// DateStyle / TimeZone, like an array's elements (M0149-0046e).
+	if tname == "tstzrange" || tname == "tsrange" || tname == "daterange" {
+		d, n, err := decodePhysicalPGValueLowered(&catalog.Type{Name: "text"}, "text", data, sctx, st)
+		if err != nil || d.IsNull() {
+			return d, n, err
+		}
+		return NewStringDatum(restyleRangeText(tname, d.StringValue(), st)), n, nil
+	}
 	switch tname {
 	case "bool", "boolean":
 		if len(data) < 1 {

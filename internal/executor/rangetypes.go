@@ -5,6 +5,9 @@ import (
 	"math"
 	"strings"
 	"time"
+
+	"github.com/goopg/goopg/internal/utils/adt/array"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // Range type input, output and the range constructor functions.
@@ -585,4 +588,51 @@ func evalRangeConstructor(name string, args []Datum, pos int, ctx *Context) (Dat
 		return Datum{}, err
 	}
 	return NewStringDatum(text), nil
+}
+
+// restyleRangeText re-renders a stored tstzrange / tsrange / daterange text
+// under the session output style: each finite bound goes back through its
+// subtype's output (timestamptz_out in the session TimeZone and DateStyle,
+// timestamp_out / date_out in the DateStyle) and the range is deparsed again
+// (range_out). Text that does not parse, and infinite or absent bounds, are
+// kept as stored. M0149-0046e.
+func restyleRangeText(rangeType, s string, st array.OutputStyle) string {
+	flags, lb, ub, err := rangeParse(s, 0)
+	if err != nil || flags&rangeFlagEmpty != 0 {
+		return s
+	}
+	subtype := builtinRangeTypes[rangeType].subtype
+	out := func(b string) (string, bool) {
+		switch strings.ToLower(strings.TrimSpace(b)) {
+		case "infinity", "-infinity":
+			return b, true
+		}
+		d, err := evalCast(NewStringDatum(b), subtype, 0, nil)
+		if err != nil || d.IsNull() || d.Kind != KindTime {
+			return b, false
+		}
+		switch rangeType {
+		case "tstzrange":
+			return misc.FormatTimestampTZ(d.TimeValue(), st.Style, st.Order, st.Zone), true
+		case "tsrange":
+			return misc.FormatTimestamp(d.TimeValue(), st.Style, st.Order), true
+		default:
+			return misc.FormatDate(d.TimeValue(), st.Style, st.Order), true
+		}
+	}
+	if rangeHasLbound(flags) {
+		v, ok := out(lb)
+		if !ok {
+			return s
+		}
+		lb = v
+	}
+	if rangeHasUbound(flags) {
+		v, ok := out(ub)
+		if !ok {
+			return s
+		}
+		ub = v
+	}
+	return rangeDeparse(flags, lb, ub)
 }
