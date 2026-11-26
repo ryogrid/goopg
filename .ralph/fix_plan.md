@@ -17050,6 +17050,18 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/subscription/t/010_truncate.pl` — TRUNCATE replication incl. CASCADE / RESTART IDENTITY and sync rep.
   Likely prerequisites \(verify at start\): pgoutput Truncate message + options, `publish = 'truncate'`, logical walsender in `synchronous_standby_names`.
+  - Path\-to\-TAP: 010 \(PG\-publisher pairing\) ← 0047a \(done\); 010 \(goopg\-publisher pairings\) ← 0047b. One link each.
+  - 2026\-11\-26 \(progress\): TestPort\_Subscription010Truncate written and gated by GOOPG\_TAP\_010. pg18\-publisher\-goopg\-subscriber passes 15/15 after 0047a. In the goopg\-publisher pairings no TRUNCATE reaches the subscriber.
+- [x] **M0149-0047a — a goopg subscriber restarts owned sequences on a replicated TRUNCATE RESTART IDENTITY**
+  Kind: impl
+  Parent: M0149-0047
+  - 2026\-11\-26 \(done\): restartTruncatedSequences \(shared with execTruncate\) resets the serial / identity, nextval\-default and OWNED BY sequences. applyTruncate calls it on TRUNCATE\_RESTART\_SEQS. Unit test TestRestartTruncatedSequencesOwnedBy.
+  Movement: yes — tap 010 pg18-publisher-goopg-subscriber 13/15 -> 15/15 assertions
+- [ ] **M0149-0047b — a goopg publisher replicates TRUNCATE**
+  Kind: impl
+  Parent: M0149-0047
+  - 010 all\-goopg / goopg\-publisher\-pg18\-subscriber: no TRUNCATE reaches the subscriber. Needed: write xl\_heap\_truncate \(XLOG\_HEAP\_TRUNCATE, relids \+ CASCADE / RESTART\_SEQS flags\) at wal\_level = logical in execTruncate; decode it in the classifier into a truncate change; PgOutput emits `T` \(pgoTruncate, option bits already defined\) for published relids whose publication has publish = 'truncate' \(the relation filter needs a truncate kind\).
+  - Path\-to\-TAP: 010 goopg\-publisher pairings ← 0047b \(1 link\).
 - [ ] **M0149-0048 — port subscription/t/011_generated.pl**
   Kind: impl
   Parent: none

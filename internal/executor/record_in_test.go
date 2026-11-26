@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/utils/adt/array"
 )
 
@@ -191,5 +192,41 @@ func TestArrayCastNormalisesScalarElements(t *testing.T) {
 		if d.StringValue() != tc.want {
 			t.Errorf("%s::%s = %s, want %s", tc.in, tc.typ, d.StringValue(), tc.want)
 		}
+	}
+}
+
+// TestRestartTruncatedSequencesOwnedBy pins TRUNCATE … RESTART IDENTITY's
+// sequence rule (M0149-0047a): a sequence OWNED BY a column of the table is
+// reset to its START, as PG's getOwnedSequences does — the naming-convention
+// and nextval-default lookups missed `CREATE SEQUENCE s OWNED BY t.a` with
+// no default. The logical-replication apply of a Truncate message with
+// RESTART_SEQS uses the same helper (subscription/t/010_truncate.pl).
+func TestRestartTruncatedSequencesOwnedBy(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	for _, ddl := range []string{
+		"CREATE TABLE tr47 (a int PRIMARY KEY)",
+		"CREATE SEQUENCE seq47 OWNED BY tr47.a",
+		"ALTER SEQUENCE seq47 START 101",
+	} {
+		if err := runDDL(t, ctx, ddl); err != nil {
+			t.Fatalf("%s: %v", ddl, err)
+		}
+	}
+	next := func() string {
+		t.Helper()
+		rows := runSQL(t, ctx, "SELECT nextval('seq47')")
+		return rows[0][0].Format()
+	}
+	if got := next(); got != "1" {
+		t.Fatalf("first nextval = %s, want 1", got)
+	}
+	tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "tr47"})
+	if !ok {
+		t.Fatal("tr47 not found")
+	}
+	restartTruncatedSequences(ctx, tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid), nil)
+	if got := next(); got != "101" {
+		t.Errorf("nextval after restart = %s, want 101 (the sequence's START)", got)
 	}
 }

@@ -575,9 +575,21 @@ func (w *ApplyWorker) applyTruncate(m *xlog.DecodedMessage) error {
 		if err := truncateRelation(ctx, rel); err != nil {
 			return fmt.Errorf("applyworker: truncate %q: %w", r.local.Name, err)
 		}
+		// TRUNCATE_RESTART_SEQS (logicalrep_write_truncate's option bit
+		// 2): apply_handle_truncate passes restart_seqs to
+		// ExecuteTruncateGuts, which resets the table's owned sequences.
+		// M0149-0047.
+		if m.TruncateOption&truncateOptRestartSeqs != 0 {
+			restartTruncatedSequences(ctx, r.local, w.dbOid(), nil)
+		}
 	}
 	return nil
 }
+
+// truncateOptRestartSeqs is TRUNCATE_RESTART_SEQS in a pgoutput Truncate
+// message's option byte (TRUNCATE_CASCADE is 1; the apply worker always
+// truncates RESTRICT, as PG's does).
+const truncateOptRestartSeqs = 2
 
 // applyContext builds a minimal executor Context for apply-worker
 // storage operations. Pool, Catalog, TxnMgr, Tx, and Snap are set.

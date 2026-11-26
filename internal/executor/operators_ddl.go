@@ -17687,6 +17687,49 @@ func btreeKeyTypeRejectionError(typName string, pos int) *ExecError {
 	return &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 only supports int4 / numeric keys, got %q", typName)}
 }
 
+// restartTruncatedSequences is TRUNCATE … RESTART IDENTITY's sequence half
+// (ExecuteTruncateGuts → ResetSequence over getOwnedSequences) for one
+// table: the serial / identity sequence of each column, a sequence its
+// DEFAULT nextval()s, and — PG's actual rule — every sequence OWNED BY one
+// of its columns (ALTER SEQUENCE … OWNED BY t.c, which the naming-convention
+// lookup missed). restore, when non-nil, records the old counter so a
+// ROLLBACK of the explicit transaction can undo the reset. Shared by the
+// TRUNCATE statement and the logical-replication apply of a Truncate
+// message with RESTART IDENTITY (apply_handle_truncate). M0149-0047.
+func restartTruncatedSequences(ctx *Context, tbl *catalog.Table, seqDBOid uint32, restore *BasicSession) {
+	seen := map[string]bool{}
+	reset := func(seqName string) {
+		if seqName == "" || seen[seqName] {
+			return
+		}
+		seen[seqName] = true
+		if restore != nil {
+			if oldCurr, oldCalled, ok := GetSequenceCurrentValue(seqName, seqDBOid); ok {
+				restore.RecordSeqRestore(SeqRestoreEntry{Name: seqName, OldCurr: oldCurr, OldCalled: oldCalled, DBOid: seqDBOid})
+			}
+		}
+		if ResetSequence(seqName, seqDBOid) {
+			// Restart persistence: the reset counter must survive a
+			// restart too. See RecordKindSequenceState.
+			WALLogSequenceState(ctx, seqName)
+		}
+	}
+	for _, col := range tbl.Columns {
+		if col.Dropped {
+			continue
+		}
+		colTypeLow := strings.ToLower(col.Type.Name)
+		isSerial := colTypeLow == "serial" || colTypeLow == "serial4" || colTypeLow == "bigserial" || colTypeLow == "serial8" || colTypeLow == "smallserial" || colTypeLow == "serial2"
+		if isSerial || col.IdentityColumn {
+			reset(strings.ToLower(tbl.Name) + "_" + strings.ToLower(col.Name) + "_seq")
+		} else {
+			// Column uses an explicit nextval(seqname) default — reset the referenced sequence.
+			reset(extractNextvalSeqNameFromExpr(col.DefaultExpr))
+		}
+		reset(FindSequenceOwnedBy(strings.ToLower(tbl.Name)+"."+strings.ToLower(col.Name), seqDBOid))
+	}
+}
+
 // truncateTableEntry is the per-table state in execTruncate's BFS loop.
 type truncateTableEntry struct {
 	tbl  *catalog.Table
@@ -17932,34 +17975,11 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt, tempTables bool) error {
 		inExplicitTx := isBas && sess.InExplicitTransaction()
 		seqDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 		for _, entry := range sortedTruncateTableSet(tableSet, nameOrder) {
-			tbl := entry.tbl
-			for _, col := range tbl.Columns {
-				if col.Dropped {
-					continue
-				}
-				colTypeLow := strings.ToLower(col.Type.Name)
-				isSerial := colTypeLow == "serial" || colTypeLow == "serial4" || colTypeLow == "bigserial" || colTypeLow == "serial8" || colTypeLow == "smallserial" || colTypeLow == "serial2"
-				var seqName string
-				if isSerial || col.IdentityColumn {
-					seqName = strings.ToLower(tbl.Name) + "_" + strings.ToLower(col.Name) + "_seq"
-				} else {
-					// Column uses an explicit nextval(seqname) default — reset the referenced sequence.
-					seqName = extractNextvalSeqNameFromExpr(col.DefaultExpr)
-				}
-				if seqName != "" {
-					if inExplicitTx {
-						// Save old counter so ROLLBACK can restore it.
-						if oldCurr, oldCalled, ok := GetSequenceCurrentValue(seqName, seqDBOid); ok {
-							sess.RecordSeqRestore(SeqRestoreEntry{Name: seqName, OldCurr: oldCurr, OldCalled: oldCalled, DBOid: seqDBOid})
-						}
-					}
-					if ResetSequence(seqName, seqDBOid) {
-						// Restart persistence: the reset counter must survive a
-						// restart too. See RecordKindSequenceState.
-						WALLogSequenceState(o.ctx, seqName)
-					}
-				}
+			var restore *BasicSession
+			if inExplicitTx {
+				restore = sess
 			}
+			restartTruncatedSequences(o.ctx, entry.tbl, seqDBOid, restore)
 		}
 	}
 
