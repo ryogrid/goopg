@@ -1,7 +1,7 @@
 # M0149\-0048 — Port subscription/t/011\_generated.pl
 
-Status: in progress \(0048a, 0048b, 0048c, 0048e landed\). TestPort\_Subscription011Generated is written \(three pairings\) and gated by GOOPG\_TAP\_011. The
-first run's failures split into five children, each named by a failing assertion.
+Status: done. TestPort\_Subscription011Generated passes 3/3 in all three pairings \(all\-goopg, PG 18.3 publisher →
+goopg subscriber, goopg publisher → PG 18.3 subscriber\).
 
 ## Landed — M0149\-0048a, a goopg publisher publishes only the columns PG publishes
 
@@ -84,8 +84,17 @@ Tests: TestCreatePublicationColumnList, TestPublicationColumnList, TestPgOutputC
 TAP 011 goopg\-publisher\-pg18\-subscriber passes 12/12. all\-goopg and pg18\-publisher\-goopg\-subscriber pass 11/12 and
 wait only on the t1 error log \(M0149\-0048f\).
 
-## Open
-- **M0149\-0048f**: a failed table sync is retried, as PG's tablesync worker restarts after
-  wal\_retrieve\_retry\_interval. goopg's sync runs inside the command and logs a failure once.
-- **M0149\-0048d**: goopg's tablesync copies a publisher's stored generated columns when they are published \(PG 18
-  copy\_table's COPY \(SELECT …\) form when gencol\_published\).
+## Landed — M0149\-0048f, a failed table sync is retried
+
+PG's tablesync worker exits on an ERROR, and the apply worker relaunches it after wal\_retrieve\_retry\_interval
+\(process\_syncing\_tables\_for\_apply → logicalrep\_worker\_launch\), so the ERROR repeats in the subscriber log until
+the cause is fixed. goopg runs the initial sync inside CREATE / ALTER SUBSCRIPTION, logged a failure once and left the
+rel at i / d until the next refresh.
+
+- The sync step is `runSubscriptionTableSyncs` \(run the manager, log each failed rel, promote the completed ones\).
+- When a rel fails, `scheduleTableSyncRetry` arms a per\-subscription timer for wal\_retrieve\_retry\_interval \(read
+  from the GUC registry, default 5s\). It re\-runs the sync for the rels still waiting, and re\-arms on failure.
+- It stops when the subscription is dropped or disabled, or when nothing is pending; a newer refresh replaces a pending
+  timer.
+
+TestPort\_Subscription011Generated is ungated and passes 3/3 in all three pairings.

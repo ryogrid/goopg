@@ -17073,7 +17073,7 @@ verify each at HEAD when the task starts.
   - Path\-to\-TAP: 010 goopg\-publisher pairings ← 0047b \(1 link\).
   - 2026\-11\-26 \(done\): execTruncate writes XLOG\_HEAP\_TRUNCATE at wal\_level = logical \(logHeapTruncate\); classifyDecodedXLog queues a ChangeTruncate \(db\-filtered\); PgOutput.truncate sends Relation \+ `T` for publishable relations whose publications carry the new PublishTruncate flag \(default on, persisted in the pg\_publication heap\). 010 ungated, 3/3 in all three pairings; inventory 010 → port.
   Movement: yes — tap 010 all-goopg + goopg-publisher-pg18-subscriber fail -> pass (3/3 x 3 pairings); regress publication/psql/subscription identical to HEAD (Truncates column now t)
-- [ ] **M0149-0048 — port subscription/t/011_generated.pl**
+- [x] **M0149-0048 — port subscription/t/011_generated.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/011_generated.pl` — generated columns in initial sync and apply.
@@ -17100,17 +17100,20 @@ verify each at HEAD when the task starts.
   - 2026\-11\-26 \(done\): applyInsert / applyUpdateByKey compute generated columns after BEFORE triggers; IncompatibleGeneratedColumnsError in applyRel.columnMap and postmaster copyColumnIndex; FetchRemoteColumns follows PG 18 fetch\_remote\_table\_info \(attrs column set over the subscription's publications, no attgenerated filter, gencol\_published → COPY \(SELECT …\)\). Tests TestApplyColumnMapRejectsGeneratedTarget, TestComputeGeneratedColumnsOverwritesReplicatedRow.
   - The t1 error is logged once, during CREATE SUBSCRIPTION, before the test's log offset → M0149\-0048f.
   Movement: yes — tap 011 pg18-publisher-goopg-subscriber 1/12 -> 11/12, all-goopg 3/12 -> 7/12 assertions
-- [ ] **M0149-0048f — a failed table sync is retried after wal\_retrieve\_retry\_interval**
+- [x] **M0149-0048f — a failed table sync is retried after wal\_retrieve\_retry\_interval**
   Kind: impl
   Parent: M0149-0048
   - 011 pg18\-publisher\-goopg\-subscriber: `waitForLog(... has incompatible generated columns: "c2", "c3")` from an offset taken after CREATE SUBSCRIPTION returns. PG's tablesync worker fails, exits and is relaunched by the apply worker after wal\_retrieve\_retry\_interval \(process\_syncing\_tables\_for\_apply, logicalrep\_worker\_launch\), logging the ERROR each time. goopg's RefreshSubscriptionOnPublisher syncs inside the command, logs once and leaves the rel at i / d until the next refresh.
   - Path\-to\-TAP: 011 pg18\-publisher\-goopg\-subscriber ← 0048f \(1 link\).
-- [ ] **M0149-0048d — goopg tablesync copies the publisher's published stored generated columns**
+  - 2026\-11\-26 \(done\): runSubscriptionTableSyncs \(extracted\) \+ scheduleTableSyncRetry / pendingTableSyncRels \(internal/postmaster/tablesync\_retry.go\), a90ea1e25. 011 ungated, 3/3 in all three pairings; inventory 011 → port.
+  Movement: yes — tap 011 all-goopg 11/12 -> 12/12, pg18-publisher-goopg-subscriber 11/12 -> 12/12 (3/3 x 3 pairings)
+- [x] **M0149-0048d — goopg tablesync copies the publisher's published stored generated columns**
   Kind: impl
   Parent: M0149-0048
   - 011 all\-goopg and pg18\-publisher\-goopg\-subscriber: tab\_gen\_to\_nogen initial sync with publish\_generated\_columns = stored reads `1|` \(want `1|2`\). PG 18 tablesync copy\_table uses COPY \(SELECT cols FROM t\) when gencol\_published.
   - Path\-to\-TAP: 011 ← 0048d \(1 link\).
   - 2026\-11\-26: the mechanism landed with 0048c \(PG 18 column set \+ COPY \(SELECT …\)\); the tab\_gen\_to\_nogen stored initial\-sync assertion now passes in pg18\-publisher\-goopg\-subscriber and all\-goopg. Close once the all\-goopg pairing runs to the end \(blocked by 0048e's column\-list DDL\).
+  - 2026\-11\-26 \(closed, verification only\): the code landed in ba4d3c18f \(M0149\-0048c\); the tab\_gen\_to\_nogen stored initial\-sync assertions pass in all three pairings, 3/3.
 - [x] **M0149-0048e — publication column lists \(FOR TABLE t \(cols\)\)**
   Kind: impl
   Parent: M0149-0048
