@@ -17045,7 +17045,7 @@ verify each at HEAD when the task starts.
     - indexProbeKey normalises a text probe for an array key.
   - Unit test TestArrayCastNormalisesScalarElements. TestArrayIndexQuotedBraceElement now pins PG's count 0 for a 2\-D literal probe instead of goopg's old 0A000.
   Movement: yes — tap 002 3/3 pairings pass (goopg-publisher pairings 1/4 -> 4/4); regress arrays 750 -> 749
-- [ ] **M0149-0047 — port subscription/t/010_truncate.pl**
+- [x] **M0149-0047 — port subscription/t/010_truncate.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/010_truncate.pl` — TRUNCATE replication incl. CASCADE / RESTART IDENTITY and sync rep.
@@ -17057,11 +17057,13 @@ verify each at HEAD when the task starts.
   Parent: M0149-0047
   - 2026\-11\-26 \(done\): restartTruncatedSequences \(shared with execTruncate\) resets the serial / identity, nextval\-default and OWNED BY sequences. applyTruncate calls it on TRUNCATE\_RESTART\_SEQS. Unit test TestRestartTruncatedSequencesOwnedBy.
   Movement: yes — tap 010 pg18-publisher-goopg-subscriber 13/15 -> 15/15 assertions
-- [ ] **M0149-0047b — a goopg publisher replicates TRUNCATE**
+- [x] **M0149-0047b — a goopg publisher replicates TRUNCATE**
   Kind: impl
   Parent: M0149-0047
   - 010 all\-goopg / goopg\-publisher\-pg18\-subscriber: no TRUNCATE reaches the subscriber. Needed: write xl\_heap\_truncate \(XLOG\_HEAP\_TRUNCATE, relids \+ CASCADE / RESTART\_SEQS flags\) at wal\_level = logical in execTruncate; decode it in the classifier into a truncate change; PgOutput emits `T` \(pgoTruncate, option bits already defined\) for published relids whose publication has publish = 'truncate' \(the relation filter needs a truncate kind\).
   - Path\-to\-TAP: 010 goopg\-publisher pairings ← 0047b \(1 link\).
+  - 2026\-11\-26 \(done\): execTruncate writes XLOG\_HEAP\_TRUNCATE at wal\_level = logical \(logHeapTruncate\); classifyDecodedXLog queues a ChangeTruncate \(db\-filtered\); PgOutput.truncate sends Relation \+ `T` for publishable relations whose publications carry the new PublishTruncate flag \(default on, persisted in the pg\_publication heap\). 010 ungated, 3/3 in all three pairings; inventory 010 → port.
+  Movement: yes — tap 010 all-goopg + goopg-publisher-pg18-subscriber fail -> pass (3/3 x 3 pairings); regress publication/psql/subscription identical to HEAD (Truncates column now t)
 - [ ] **M0149-0048 — port subscription/t/011_generated.pl**
   Kind: impl
   Parent: none

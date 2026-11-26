@@ -195,6 +195,15 @@ func classifyDecodedXLog(d *Decoder, r Record) error {
 	if h.Rmid != RmgrHeap {
 		return nil
 	}
+	if h.Info&xlogHeapOpMask == xlogHeapTruncate {
+		// No block reference: the relids are in the main data.
+		t, err := DecodeHeapTruncate(r.XLog.MainData)
+		if err != nil {
+			return err
+		}
+		d.applyHeapTruncate(storage.TransactionID(h.XID), r.EndLSN, t)
+		return nil
+	}
 	block, ok := xlogBlockRefByID(r.XLog, 0)
 	if !ok {
 		return nil

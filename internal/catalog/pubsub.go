@@ -34,6 +34,10 @@ type Publication struct {
 	PublishInsert bool
 	PublishUpdate bool
 	PublishDelete bool
+	// PublishTruncate is pg_publication.pubtruncate (publish = 'truncate'):
+	// pgoutput_truncate sends a TRUNCATE only for a relation one of whose
+	// publications carries it.
+	PublishTruncate bool
 	// Tables are qualified table names ("schema.name") the
 	// publication is restricted to. Ignored when AllTables is
 	// true. Insertion order is preserved so views render rows
@@ -191,21 +195,23 @@ func subMapKey(dbOid uint32, name string) string {
 // publishing are all on; row-filter / column-list / via-root
 // are off.
 type PublicationOptions struct {
-	AllTables     bool
-	PublishInsert bool
-	PublishUpdate bool
-	PublishDelete bool
+	AllTables       bool
+	PublishInsert   bool
+	PublishUpdate   bool
+	PublishDelete   bool
+	PublishTruncate bool
 }
 
 // DefaultPublicationOptions returns the upstream-default option
-// set: publish=insert,update,delete (truncate is M0008-out-of-
-// scope so it stays off).
+// set: publish = 'insert, update, delete, truncate'
+// (publicationcmds.c parse_publication_options).
 func DefaultPublicationOptions() PublicationOptions {
 	return PublicationOptions{
-		AllTables:     false,
-		PublishInsert: true,
-		PublishUpdate: true,
-		PublishDelete: true,
+		AllTables:       false,
+		PublishInsert:   true,
+		PublishUpdate:   true,
+		PublishDelete:   true,
+		PublishTruncate: true,
 	}
 }
 
@@ -248,6 +254,8 @@ func (p *PubSub) CreatePublicationAsOwner(name string, tables []string, opts Pub
 		PublishUpdate: opts.PublishUpdate,
 		PublishDelete: opts.PublishDelete,
 		DBOid:         oid,
+
+		PublishTruncate: opts.PublishTruncate,
 	}
 	if !opts.AllTables && len(tables) > 0 {
 		pub.Tables = append(pub.Tables, tables...)
@@ -372,6 +380,7 @@ func (p *PubSub) SetPublicationOptions(name string, opts PublicationOptions, dbO
 		return nil, fmt.Errorf("publication %q does not exist", name)
 	}
 	pub.PublishInsert, pub.PublishUpdate, pub.PublishDelete = opts.PublishInsert, opts.PublishUpdate, opts.PublishDelete
+	pub.PublishTruncate = opts.PublishTruncate
 	out := *pub
 	out.Tables = append([]string(nil), pub.Tables...)
 	return &out, nil

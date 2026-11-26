@@ -271,8 +271,8 @@ func TestPgPublicationViewRendersRows(t *testing.T) {
 	if row[4] != "t" || row[5] != "t" || row[6] != "t" {
 		t.Errorf("publish flags=%v want t/t/t", row[4:7])
 	}
-	if row[7] != "f" {
-		t.Errorf("pubtruncate=%q want f (M0008-out-of-scope)", row[7])
+	if row[7] != "t" {
+		t.Errorf("pubtruncate=%q want t (the default publish list includes truncate)", row[7])
 	}
 }
 

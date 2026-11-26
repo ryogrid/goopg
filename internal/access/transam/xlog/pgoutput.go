@@ -210,6 +210,9 @@ func (p *PgOutput) LogicalMessage(_ storage.TransactionID, lsn uint64, transacti
 // they were created after slot creation and are out of v0's
 // scope.
 func (p *PgOutput) Change(c Change) error {
+	if c.Kind == ChangeTruncate {
+		return p.truncate(c)
+	}
 	rel, changed, ok := p.snap.Current(c.Rel)
 	if changed {
 		// The relation's schema changed since its Relation message
@@ -255,6 +258,53 @@ func (p *PgOutput) Change(c Change) error {
 		return p.writeUpdate(rel, c.OldTuple, c.NewTuple)
 	}
 	return fmt.Errorf("pgoutput: unknown change kind %d", c.Kind)
+}
+
+// truncate is pgoutput_truncate: of the truncated relations, those that
+// are publishable and published with publish = 'truncate' get their
+// Relation message (if not yet sent) and are listed in one `T` message
+// with the CASCADE / RESTART IDENTITY option bits. Nothing is written when
+// no relation qualifies.
+func (p *PgOutput) truncate(c Change) error {
+	relids := make([]uint32, 0, len(c.Relids))
+	for _, oid := range c.Relids {
+		rel, changed, ok := p.snap.Current(storage.RelFileNode{RelOid: oid})
+		if !ok || !relationIsPublishable(rel) {
+			continue
+		}
+		if changed {
+			delete(p.emittedRel, rel.OID)
+		}
+		if p.filter != nil && !p.filter.Allows(rel, ChangeTruncate) {
+			continue
+		}
+		relids = append(relids, rel.OID)
+		if _, sent := p.emittedRel[rel.OID]; !sent {
+			if err := p.writeRelation(rel); err != nil {
+				return err
+			}
+			p.emittedRel[rel.OID] = struct{}{}
+		}
+	}
+	if len(relids) == 0 {
+		return nil
+	}
+	var opts byte
+	if c.TruncateFlags&XLHTruncateCascade != 0 {
+		opts |= pgoTruncateCascade
+	}
+	if c.TruncateFlags&XLHTruncateRestartSeqs != 0 {
+		opts |= pgoTruncateRestartSeqs
+	}
+	buf := make([]byte, 0, 6+4*len(relids))
+	buf = append(buf, pgoTruncate)
+	buf = appendUint32(buf, uint32(len(relids)))
+	buf = append(buf, opts)
+	for _, oid := range relids {
+		buf = appendUint32(buf, oid)
+	}
+	_, err := p.w.Write(buf)
+	return err
 }
 
 // relationIsPublishable is is_publishable_class for a decoded change: a

@@ -503,7 +503,7 @@ type publicationFilter struct {
 // observed across the union of subscribed publications. Any one
 // publication granting an action is enough.
 type allowFlags struct {
-	insert, update, delete bool
+	insert, update, delete, truncate bool
 }
 
 func (f allowFlags) allowsKind(k xlog.ChangeKind) bool {
@@ -514,6 +514,8 @@ func (f allowFlags) allowsKind(k xlog.ChangeKind) bool {
 		return f.update
 	case xlog.ChangeDelete:
 		return f.delete
+	case xlog.ChangeTruncate:
+		return f.truncate
 	}
 	return false
 }
@@ -604,9 +606,10 @@ func buildPublicationFilter(ps *catalog.PubSub, names []string, dbOid ...uint32)
 			continue
 		}
 		flags := allowFlags{
-			insert: pub.PublishInsert,
-			update: pub.PublishUpdate,
-			delete: pub.PublishDelete,
+			insert:   pub.PublishInsert,
+			update:   pub.PublishUpdate,
+			delete:   pub.PublishDelete,
+			truncate: pub.PublishTruncate,
 		}
 		if pub.AllTables {
 			out.allTablesAllowed = unionFlags(out.allTablesAllowed, flags)
@@ -659,9 +662,10 @@ func (f *livePublicationFilter) Allows(rel *xlog.RelationDef, kind xlog.ChangeKi
 // action" rule.
 func unionFlags(a, b allowFlags) allowFlags {
 	return allowFlags{
-		insert: a.insert || b.insert,
-		update: a.update || b.update,
-		delete: a.delete || b.delete,
+		insert:   a.insert || b.insert,
+		update:   a.update || b.update,
+		delete:   a.delete || b.delete,
+		truncate: a.truncate || b.truncate,
 	}
 }
 

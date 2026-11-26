@@ -1484,6 +1484,7 @@ func applyPublicationOptions(with map[string]string, opts *catalog.PublicationOp
 		switch name {
 		case "publish":
 			opts.PublishInsert, opts.PublishUpdate, opts.PublishDelete = false, false, false
+			opts.PublishTruncate = false
 			for _, kind := range splitCommaList(value) {
 				switch kind {
 				case "insert":
@@ -1493,6 +1494,7 @@ func applyPublicationOptions(with map[string]string, opts *catalog.PublicationOp
 				case "delete":
 					opts.PublishDelete = true
 				case "truncate":
+					opts.PublishTruncate = true
 				default:
 					return &ExecError{Code: "42601", Message: fmt.Sprintf("unrecognized value for publication option \"publish\": \"%s\"", kind)}
 				}
@@ -1520,7 +1522,7 @@ func (o *ddlOp) execAlterPublicationOptions(s *parser.AlterPublicationOptionsStm
 		return &ExecError{Code: "42704", Message: fmt.Sprintf("publication \"%s\" does not exist", s.Name)}
 	}
 	opts := catalog.PublicationOptions{AllTables: pub.AllTables, PublishInsert: pub.PublishInsert,
-		PublishUpdate: pub.PublishUpdate, PublishDelete: pub.PublishDelete}
+		PublishUpdate: pub.PublishUpdate, PublishDelete: pub.PublishDelete, PublishTruncate: pub.PublishTruncate}
 	if err := applyPublicationOptions(s.With, &opts); err != nil {
 		return err
 	}
@@ -17730,6 +17732,46 @@ func restartTruncatedSequences(ctx *Context, tbl *catalog.Table, seqDBOid uint32
 	}
 }
 
+// relationIsLogicallyLogged is RelationIsLogicallyLogged for a TRUNCATE
+// target: a permanent (WAL-logged), non-foreign user relation. A
+// partitioned parent counts, as in ExecuteTruncate's relids_logged.
+func relationIsLogicallyLogged(tbl *catalog.Table) bool {
+	return !tbl.Temp && !tbl.Unlogged && tbl.ForeignServerName == "" && tbl.OID >= catalog.FirstNormalObjectId
+}
+
+// logHeapTruncate is the end of ExecuteTruncateGuts: at wal_level = logical
+// one XLOG_HEAP_TRUNCATE record lists every logically logged relation the
+// statement truncated, with the CASCADE / RESTART IDENTITY flags, so
+// logical decoding can send a Truncate message. Recovery ignores it.
+func logHeapTruncate(ctx *Context, relids []uint32, cascade, restartSeqs bool) error {
+	if len(relids) == 0 || ctx.WAL == nil || ctx.IsStandby {
+		return nil
+	}
+	if lvl, ok := ctx.GetSetting("wal_level"); !ok || !strings.EqualFold(lvl, "logical") {
+		return nil
+	}
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return err
+	}
+	var flags uint8
+	if cascade {
+		flags |= xlog.XLHTruncateCascade
+	}
+	if restartSeqs {
+		flags |= xlog.XLHTruncateRestartSeqs
+	}
+	payload, err := xlog.EncodeHeapTruncatePG(ctx.Tx.XID, xlog.HeapTruncate{
+		DBOid:  logicalMessageDBOid(ctx),
+		Flags:  flags,
+		Relids: relids,
+	})
+	if err != nil {
+		return err
+	}
+	_, _, err = ctx.WAL.Append(payload)
+	return err
+}
+
 // truncateTableEntry is the per-table state in execTruncate's BFS loop.
 type truncateTableEntry struct {
 	tbl  *catalog.Table
@@ -17955,10 +17997,14 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt, tempTables bool) error {
 	}
 
 	// Truncate all tables (and their partition children unless ONLY).
+	var loggedRelids []uint32
 	for _, entry := range sortedTruncateTableSet(tableSet, nameOrder) {
-		if err := o.truncateTableAndPartitions(entry.tbl, s.Pos(), entry.only); err != nil {
+		if err := o.truncateTableAndPartitions(entry.tbl, s.Pos(), entry.only, &loggedRelids); err != nil {
 			return err
 		}
+	}
+	if err := logHeapTruncate(o.ctx, loggedRelids, s.Behavior == parser.DropCascade, s.RestartIdentity); err != nil {
+		return err
 	}
 
 	// Cumulative relation stats: a TRUNCATE forgets the relation's live/dead
@@ -18274,7 +18320,10 @@ func restoreTruncateUndo(ctx *Context, entry TruncateUndoEntry) {
 // M0097-0028 fix: without recursion, TRUNCATE on a multi-level partitioned
 // table left data in grandchild partitions, causing subsequent tests to see
 // stale rows.
-func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only bool) error {
+func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only bool, logged *[]uint32) error {
+	if relationIsLogicallyLogged(tbl) {
+		*logged = append(*logged, tbl.OID)
+	}
 	// Recurse into partition/inheritance children unless ONLY was specified.
 	if !only {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
@@ -18287,7 +18336,7 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 				if child.DetachPendingEpoch != 0 {
 					continue
 				}
-				if err := o.truncateTableAndPartitions(child, pos, false); err != nil {
+				if err := o.truncateTableAndPartitions(child, pos, false, logged); err != nil {
 					return err
 				}
 			}
@@ -18295,7 +18344,7 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 			// TRUNCATE inh_parent must not touch another backend's temp child.
 			// Design 0118-0036 (M0118-0008 inherit-temp).
 			for _, child := range catalog.AccessibleInheritanceChildren(im.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx)) {
-				if err := o.truncateTableAndPartitions(child, pos, false); err != nil {
+				if err := o.truncateTableAndPartitions(child, pos, false, logged); err != nil {
 					return err
 				}
 			}

@@ -1,8 +1,7 @@
 # M0149\-0047 — Port subscription/t/010\_truncate.pl
 
-Status: in progress. TestPort\_Subscription010Truncate is written \(three pairings\) and gated by GOOPG\_TAP\_010. The PG
-18.3 publisher with a goopg subscriber passes all 15 assertions. Both goopg\\-publisher pairings fail because a goopg
-publisher writes no TRUNCATE to the logical stream \(M0149\-0047b\).
+Status: done. TestPort\_Subscription010Truncate passes 3/3 in all three pairings \(all\-goopg, PG 18.3 publisher →
+goopg subscriber, goopg publisher → PG 18.3 subscriber\).
 
 ## Landed — M0149\-0047a, a goopg subscriber restarts sequences on a replicated RESTART IDENTITY
 
@@ -23,9 +22,25 @@ column's nextval default.
 The apply worker calls it when the option bit is set. It always truncates RESTRICT, as PG's does, so the CASCADE bit
 \(1\) needs no handling. Unit test TestRestartTruncatedSequencesOwnedBy.
 
-## Open — M0149\-0047b, TRUNCATE from a goopg publisher
+## Landed — M0149\-0047b, a goopg publisher replicates TRUNCATE
 
-goopg's TRUNCATE writes no XLOG\_HEAP\_TRUNCATE record for logical decoding, so the slot decoder sees nothing. PG writes
-xl\_heap\_truncate with the relids and the CASCADE / RESTART\_SEQS flags at wal\_level = logical \(ExecuteTruncateGuts →
-XLogInsert\). The decoder turns it into a REORDER\_BUFFER\_CHANGE\_TRUNCATE, and pgoutput\_truncate sends `T` for the
-published relids whose publications carry pubtruncate.
+- **WAL.** execTruncate collects every logically logged relation it truncates \(RelationIsLogicallyLogged: permanent,
+  not foreign, a user relation; a partitioned parent counts, as in ExecuteTruncate's relids\_logged\). At
+  wal\_level = logical it then writes one XLOG\_HEAP\_TRUNCATE record \(`logHeapTruncate`,
+  `xlog.EncodeHeapTruncatePG`\). The record carries xl\_heap\_truncate \(dbId, nrelids, the XLH\_TRUNCATE\_CASCADE /
+  RESTART\_SEQS flags, padding to 12 bytes, the relid array\) as main data only. Recovery treats it as a no\-op, as
+  heap\_redo does.
+- **Decoding.** classifyDecodedXLog decodes the record before its block\-0 lookup \(it has no block references\). It
+  skips a TRUNCATE from another database \(DecodeTruncate's dbId check, the same filter as logical messages\). Otherwise
+  it queues one `ChangeTruncate` carrying the relids and flags in the truncating transaction.
+- **Output.** `PgOutput.truncate` is pgoutput\_truncate. Of the truncated relations, it keeps those that are
+  publishable and whose publications carry publish = 'truncate' \(the publication filter's new truncate flag\). It sends
+  each kept relation's Relation message if not yet sent, then one `T` with the option bits. Nothing is sent when no
+  relation qualifies.
+- **Publication flag.** Publications now model pubtruncate \(`Publication.PublishTruncate`\). It defaults on, parses
+  from `publish`, is copied by ALTER PUBLICATION SET, and is persisted in and reloaded from the pg\_publication heap
+  \(attnum 8\). pg\_publication shows it, so `\dRp` and pg\_dump now print PG's `Truncates = t` and
+  `publish = 'insert, update, delete, truncate'`.
+
+Tests: TestHeapTruncateCodec and TestHeapTruncateDecodesToPgoutputTruncate \(internal/access/transam/xlog\).
+TestPort\_Subscription010Truncate is ungated and passes 3/3 in all three pairings.

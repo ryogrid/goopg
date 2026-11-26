@@ -451,7 +451,7 @@ func registerPublicationViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
 				boolText(pub.PublishInsert),
 				boolText(pub.PublishUpdate),
 				boolText(pub.PublishDelete),
-				"f", // pubtruncate: M0008-out-of-scope
+				boolText(pub.PublishTruncate),
 				"f", // pubviaroot: out of scope
 				"n", // pubgencols: generated cols not published
 			})

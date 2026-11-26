@@ -3392,6 +3392,8 @@ func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory,
 					PublishInsert: decoded[4].BoolValue(),
 					PublishUpdate: decoded[5].BoolValue(),
 					PublishDelete: decoded[6].BoolValue(),
+
+					PublishTruncate: decoded[7].BoolValue(),
 				},
 				tid: tid,
 			}, false, nil

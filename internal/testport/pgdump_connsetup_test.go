@@ -5151,10 +5151,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// use pending real per-session ownership tracking — and the
 	// pg_publication view renders it instead of "". Verified against real
 	// pg_dump 18.3: it emits `CREATE PUBLICATION goopg_pub1 FOR ALL TABLES
-	// WITH (publish = 'insert, update, delete');` (goopg's
-	// DefaultPublicationOptions leaves `truncate` off — M0008-out-of-scope,
-	// so it's correctly absent from the WITH-list) plus an `ALTER PUBLICATION
-	// ... OWNER TO postgres;` follow-up, both asserted below.
+	// WITH (publish = 'insert, update, delete, truncate');` (the default
+	// publish list; goopg models pubtruncate since M0149-0047b) plus an
+	// `ALTER PUBLICATION ... OWNER TO postgres;` follow-up, both asserted
+	// below.
 	if err := runSQLSimple(t, c, "CREATE PUBLICATION goopg_pub1 FOR ALL TABLES"); err != nil {
 		t.Fatalf("create publication: %v", err)
 	}
@@ -11386,7 +11386,7 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// make pg_dump exit nonzero and this whole `res.ExitCode == 0` block
 		// would never even run, so the surrounding exit-0 gate is itself part
 		// of the regression guard.
-		pubStmt := "CREATE PUBLICATION goopg_pub1 FOR ALL TABLES WITH (publish = 'insert, update, delete');"
+		pubStmt := "CREATE PUBLICATION goopg_pub1 FOR ALL TABLES WITH (publish = 'insert, update, delete, truncate');"
 		if !strings.Contains(res.Stdout, pubStmt) {
 			t.Errorf("pg_dump dropped the CREATE PUBLICATION round-trip (slice-422); missing %q\n  full stdout=%q", pubStmt, res.Stdout)
 		}

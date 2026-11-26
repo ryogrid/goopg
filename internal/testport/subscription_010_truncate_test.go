@@ -1,7 +1,6 @@
 package testport
 
 import (
-	"os"
 	"strings"
 	"testing"
 
@@ -19,16 +18,13 @@ import (
 // publisher with a goopg subscriber, and a goopg publisher with a PG 18.3
 // subscriber.
 //
-// Gated by GOOPG_TAP_010 until it passes (M0149-0047): the PG 18.3 publisher
-// with a goopg subscriber passes (M0149-0047a); a goopg publisher writes no
-// TRUNCATE to the logical stream, so both goopg-publisher pairings fail
-// (M0149-0047b).
+// The goopg subscriber restarts owned sequences on a replicated RESTART
+// IDENTITY (M0149-0047a); the goopg publisher writes XLOG_HEAP_TRUNCATE at
+// wal_level = logical and its walsender sends pgoutput Truncate filtered by
+// publish = 'truncate' (M0149-0047b).
 func TestPort_Subscription010Truncate(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")
-	}
-	if os.Getenv("GOOPG_TAP_010") == "" {
-		t.Skip("010 re-port is not passing yet (M0149-0047); set GOOPG_TAP_010=1 to run")
 	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)

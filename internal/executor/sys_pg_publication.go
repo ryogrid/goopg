@@ -11,8 +11,8 @@ package executor
 // records: pg_subscription is a SHARED catalog (global/) and converts in B4.
 //
 // Column layouts: postgres/src/include/catalog/pg_publication.h,
-// pg_publication_rel.h. goopg does not model pubtruncate/pubviaroot, so both
-// bools journal as false (matching goopg's own publication semantics).
+// pg_publication_rel.h. goopg does not model pubviaroot, so it journals as
+// false (matching goopg's own publication semantics).
 
 import (
 	"encoding/binary"
@@ -72,7 +72,7 @@ func buildPGPublicationRow(pub *catalog.Publication) Row {
 		NewBoolDatum(pub.PublishInsert),
 		NewBoolDatum(pub.PublishUpdate),
 		NewBoolDatum(pub.PublishDelete),
-		NewBoolDatum(false), // pubtruncate — not modeled
+		NewBoolDatum(pub.PublishTruncate),
 		NewBoolDatum(false), // pubviaroot — not modeled
 	}
 }

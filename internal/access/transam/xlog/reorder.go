@@ -55,6 +55,10 @@ const (
 	// its transaction like a row change (REORDER_BUFFER_CHANGE_MESSAGE).
 	// MsgPrefix / MsgContent carry it; it never folds.
 	ChangeMessage
+	// ChangeTruncate is a TRUNCATE (REORDER_BUFFER_CHANGE_TRUNCATE):
+	// Relids lists the truncated relations, TruncateFlags their
+	// XLH_TRUNCATE_* bits. It never folds.
+	ChangeTruncate
 )
 
 // Change is one row-level event in flight through the reorder
@@ -72,6 +76,10 @@ type Change struct {
 	// MsgPrefix and MsgContent are a ChangeMessage's prefix and bytes.
 	MsgPrefix  string
 	MsgContent []byte
+	// Relids and TruncateFlags are a ChangeTruncate's relations and
+	// XLH_TRUNCATE_* flags.
+	Relids        []uint32
+	TruncateFlags uint8
 }
 
 // txn is the per-xact accumulator inside the reorder buffer.
