@@ -289,6 +289,39 @@ func (s *Slots) AdvanceConfirmedFlushLSN(name string, lsn uint64) error {
 	return s.writeSlotLocked(slot)
 }
 
+// AdvanceLogicalFeedback is LogicalConfirmReceivedLocation: the
+// subscriber's flushed position becomes confirmed_flush_lsn, and
+// restart_lsn follows it only as far as restartCap — the point a decoding
+// restart must begin at to see every transaction not yet committed (PG's
+// candidate_restart_lsn from running transactions). restartCap 0 means
+// unknown: restart_lsn does not move. Neither value moves backwards.
+// M0149-0057c.
+func (s *Slots) AdvanceLogicalFeedback(name string, flush, restartCap uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	slot, ok := s.m[name]
+	if !ok {
+		return ErrSlotNotFound
+	}
+	changed := false
+	if flush > slot.ConfirmedFlushLSN {
+		slot.ConfirmedFlushLSN = flush
+		changed = true
+	}
+	restart := flush
+	if restartCap < restart {
+		restart = restartCap
+	}
+	if restart > slot.RestartLSN {
+		slot.RestartLSN = restart
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	return s.writeSlotLocked(slot)
+}
+
 // ErrSlotNotReserved is pg_replication_slot_advance's "cannot be advanced":
 // the slot never reserved WAL or has been invalidated.
 var ErrSlotNotReserved = errors.New("replication slot cannot be advanced")

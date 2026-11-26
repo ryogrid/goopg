@@ -167,6 +167,13 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 	}
 	// logicalmsg_decode skips a message emitted from another database.
 	dec.SetDatabase(resolveConnDBOid(im, dbName))
+	// start_decoding_at = max(client start point, confirmed_flush_lsn):
+	// what the subscriber already has is not sent again, and the slot moves
+	// only on the subscriber's feedback (handleStandbyCopyData), so what it
+	// has not confirmed is sent again after a reconnect. M0149-0057c.
+	dec.SetFeedbackOnly(true)
+	dec.SetSkipThrough(startSent)
+	dec.SetWriteLocationHook(adapter.setWriteLocation)
 
 	// Receive-side goroutine: parse standby-status frames so the
 	// slot's confirmed_flush_lsn advances. The decoder's commit
@@ -200,7 +207,7 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 			}
 			switch f.Type {
 			case libpq.MsgCopyData:
-				_ = s.handleStandbyCopyData(args.SlotName, f.Payload, senderHandle, s.cfg.SyncRep, appName)
+				_ = s.handleStandbyCopyDataCapped(args.SlotName, f.Payload, senderHandle, s.cfg.SyncRep, appName, dec.RestartCapFor)
 				adapter.noteReply(f.Payload)
 			case libpq.MsgCopyDone:
 				clientCopyDone.Store(true)
@@ -511,6 +518,33 @@ type publicationFilter struct {
 	// name): a relation in one of them, or a partition whose ancestor is,
 	// is published whole. M0149-0053a.
 	bySchema map[string]allowFlags
+	// viaRootTables / viaRootSchemas are the members of the
+	// publish_via_partition_root publications. M0149-0057d.
+	viaRootTables  map[string]bool
+	viaRootSchemas map[string]bool
+}
+
+// PublishAsAncestor is GetTopMostAncestorInPublication over the
+// publish_via_partition_root publications: the topmost ancestor of rel that
+// is one of their members (by name, or by its schema).
+func (f *publicationFilter) PublishAsAncestor(rel *xlog.RelationDef) (uint32, bool) {
+	if rel == nil || len(rel.AncestorOIDs) == 0 || (len(f.viaRootTables) == 0 && len(f.viaRootSchemas) == 0) {
+		return 0, false
+	}
+	for i := len(rel.AncestorOIDs) - 1; i >= 0; i-- {
+		name := ""
+		if i < len(rel.AncestorNames) {
+			name = rel.AncestorNames[i]
+		}
+		sch := ""
+		if i < len(rel.AncestorSchemas) {
+			sch = strings.ToLower(rel.AncestorSchemas[i])
+		}
+		if f.viaRootTables[name] || f.viaRootSchemas[sch] {
+			return rel.AncestorOIDs[i], true
+		}
+	}
+	return 0, false
 }
 
 // schemaFlags is the union of the schema publications covering rel — its
@@ -711,6 +745,20 @@ func buildPublicationFilterMissing(ps *catalog.PubSub, names []string, missing f
 			out.allTables = true
 			continue
 		}
+		if pub.PublishViaRoot {
+			for _, q := range pub.Tables {
+				if out.viaRootTables == nil {
+					out.viaRootTables = map[string]bool{}
+				}
+				out.viaRootTables[q] = true
+			}
+			for _, sch := range pub.Schemas {
+				if out.viaRootSchemas == nil {
+					out.viaRootSchemas = map[string]bool{}
+				}
+				out.viaRootSchemas[strings.ToLower(sch)] = true
+			}
+		}
 		for _, sch := range pub.Schemas {
 			if out.bySchema == nil {
 				out.bySchema = map[string]allowFlags{}
@@ -775,6 +823,11 @@ func (f *livePublicationFilter) load() *publicationFilter {
 		}, f.dbOid...)
 	}
 	return f.cur
+}
+
+// PublishAsAncestor implements xlog.ViaRootFilter.
+func (f *livePublicationFilter) PublishAsAncestor(rel *xlog.RelationDef) (uint32, bool) {
+	return f.load().PublishAsAncestor(rel)
 }
 
 // Allows implements xlog.RelationFilter.

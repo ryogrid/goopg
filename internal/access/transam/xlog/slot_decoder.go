@@ -20,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
+	"sync/atomic"
 )
 
 // SlotDecoder runs the WAL → reorder buffer → output plugin
@@ -52,7 +54,83 @@ type SlotDecoder struct {
 	// ctx->write_location (the LSN its pgoutput messages carry) and
 	// reader EndRecPtr (its sentPtr). M0149-0040b.
 	beforeRecord, afterRecord func(rec Record)
+
+	// feedbackOnly: the slot's confirmed position moves only on the
+	// consumer's feedback, not on each decoded commit (SetFeedbackOnly).
+	feedbackOnly bool
+	// safeRestart is the latest restart point that loses no in-flight
+	// transaction (Decoder.SafeRestartLSN after the last record), read by
+	// the feedback goroutine. M0149-0057c.
+	safeRestart atomic.Uint64
+	startLSN    uint64
+	sentMu      sync.Mutex
+	sent        []sentTxn
 }
+
+// SafeRestartLSN is the latest point the slot's restart_lsn may move to:
+// decoding restarted there sees every transaction not yet committed. Zero
+// until the first record is decoded.
+func (s *SlotDecoder) SafeRestartLSN() uint64 { return s.safeRestart.Load() }
+
+// RestartCapFor is how far restart_lsn may move once the subscriber has
+// flushed through flush: no later than the first record of any transaction
+// it has not finished — one sent but committing after flush, or one still
+// being decoded. PG keeps restart_lsn at such a transaction's start
+// (candidate_restart_lsn from xl_running_xacts). M0149-0057c.
+func (s *SlotDecoder) RestartCapFor(flush uint64) uint64 {
+	cap := flush
+	if safe := s.safeRestart.Load(); safe == 0 {
+		return 0
+	} else if safe < cap {
+		cap = safe
+	}
+	s.sentMu.Lock()
+	keep := s.sent[:0]
+	for _, t := range s.sent {
+		if t.commitEnd <= flush {
+			continue
+		}
+		keep = append(keep, t)
+		if t.restart < cap {
+			cap = t.restart
+		}
+	}
+	s.sent = keep
+	s.sentMu.Unlock()
+	return cap
+}
+
+// sentTxn is one transaction handed to the plugin and not yet known to be
+// flushed by the subscriber.
+type sentTxn struct{ commitEnd, restart uint64 }
+
+func (s *SlotDecoder) noteSent(commitEnd, restart uint64) {
+	s.sentMu.Lock()
+	s.sent = append(s.sent, sentTxn{commitEnd, restart})
+	s.sentMu.Unlock()
+}
+
+// SetFeedbackOnly stops Run from advancing the slot on every decoded commit.
+// A logical walsender sets it: PG moves confirmed_flush_lsn only when the
+// subscriber reports what it has flushed (LogicalConfirmReceivedLocation),
+// so a subscriber that restarts before applying a transaction receives it
+// again; advancing on decode lost it. Skip-through-start keeps an already
+// applied transaction from being sent twice (Decoder.SetSkipThrough).
+// M0149-0057c.
+func (s *SlotDecoder) SetFeedbackOnly(on bool) {
+	s.feedbackOnly = on
+	if on {
+		s.decoder.SetSentHook(s.noteSent)
+	} else {
+		s.decoder.SetSentHook(nil)
+	}
+}
+
+// SetWriteLocationHook is Decoder.SetWriteLocationHook.
+func (s *SlotDecoder) SetWriteLocationHook(fn func(lsn uint64)) { s.decoder.SetWriteLocationHook(fn) }
+
+// SetSkipThrough is Decoder.SetSkipThrough.
+func (s *SlotDecoder) SetSkipThrough(lsn uint64) { s.decoder.SetSkipThrough(lsn) }
 
 // SetRecordHooks installs callbacks run before and after each record
 // is classified (either may be nil). Must be called before Run.
@@ -102,6 +180,7 @@ func NewSlotDecoder(slots *Slots, slotName string, w *Writer, walDir string, seg
 		slots:    slots,
 		iter:     it,
 		decoder:  NewDecoder(plugin),
+		startLSN: slot.RestartLSN,
 	}, nil
 }
 
@@ -149,6 +228,7 @@ func (s *SlotDecoder) Close() error {
 // way. ctx.Cancelled / io.EOF are returned cleanly so a graceful
 // shutdown distinguishes itself from a crash.
 func (s *SlotDecoder) Run(ctx context.Context) error {
+	prevEnd := s.startLSN
 	for {
 		rec, err := s.iter.Next(ctx)
 		if err != nil {
@@ -163,9 +243,12 @@ func (s *SlotDecoder) Run(ctx context.Context) error {
 		if s.beforeRecord != nil {
 			s.beforeRecord(rec)
 		}
+		s.decoder.SetRecordStart(prevEnd)
 		if err := Classify(s.decoder, rec); err != nil {
 			return fmt.Errorf("wal: slot %q classify: %w", s.slotName, err)
 		}
+		prevEnd = rec.EndLSN
+		s.safeRestart.Store(s.decoder.SafeRestartLSN(rec.EndLSN))
 		if s.afterRecord != nil {
 			s.afterRecord(rec)
 		}
@@ -178,7 +261,7 @@ func (s *SlotDecoder) Run(ctx context.Context) error {
 		// one byte past the record end, so a resume from a position a
 		// subscriber had confirmed read a misaligned header ("padding
 		// bytes nonzero"). M0149-0040f.
-		if recordIsXactCommit(rec) {
+		if !s.feedbackOnly && recordIsXactCommit(rec) {
 			if err := s.slots.AdvanceConfirmedFlushLSN(s.slotName, rec.EndLSN); err != nil {
 				return fmt.Errorf("wal: slot %q advance confirmed_flush_lsn: %w", s.slotName, err)
 			}

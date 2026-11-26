@@ -42,6 +42,11 @@ type Publication struct {
 	// default; also 0) or 's' (stored — STORED generated columns are
 	// published; virtual ones never are).
 	PublishGeneratedColumns byte
+	// PublishViaRoot is pg_publication.pubviaroot
+	// (publish_via_partition_root): a partition's changes are published as
+	// its partitioned ancestor's, and the table lists name the partitioned
+	// table instead of its leaves. M0149-0057d.
+	PublishViaRoot bool
 	// Tables are qualified table names ("schema.name") the
 	// publication is restricted to. Ignored when AllTables is
 	// true. Insertion order is preserved so views render rows
@@ -222,6 +227,8 @@ type PublicationOptions struct {
 	PublishTruncate bool
 	// PublishGeneratedColumns is publish_generated_columns: 'n' or 's'.
 	PublishGeneratedColumns byte
+	// PublishViaRoot is publish_via_partition_root (pubviaroot).
+	PublishViaRoot bool
 }
 
 // DefaultPublicationOptions returns the upstream-default option
@@ -282,6 +289,7 @@ func (p *PubSub) CreatePublicationAsOwner(name string, tables []string, opts Pub
 		PublishTruncate: opts.PublishTruncate,
 
 		PublishGeneratedColumns: opts.PublishGeneratedColumns,
+		PublishViaRoot:          opts.PublishViaRoot,
 	}
 	if !opts.AllTables && len(tables) > 0 {
 		pub.Tables = append(pub.Tables, tables...)
@@ -455,6 +463,7 @@ func (p *PubSub) SetPublicationOptions(name string, opts PublicationOptions, dbO
 	pub.PublishInsert, pub.PublishUpdate, pub.PublishDelete = opts.PublishInsert, opts.PublishUpdate, opts.PublishDelete
 	pub.PublishTruncate = opts.PublishTruncate
 	pub.PublishGeneratedColumns = opts.PublishGeneratedColumns
+	pub.PublishViaRoot = opts.PublishViaRoot
 	out := *pub
 	out.Tables = append([]string(nil), pub.Tables...)
 	return &out, nil

@@ -104,6 +104,9 @@ func (d *Decoder) applyLogicalMessage(xid storage.TransactionID, lsn uint64, m L
 		d.buf.Append(xid, Change{Kind: ChangeMessage, LSN: lsn, MsgPrefix: m.Prefix, MsgContent: m.Content})
 		return nil
 	}
+	if d.skipThrough != 0 && lsn <= d.skipThrough {
+		return nil
+	}
 	mp, ok := d.plugin.(MessagePlugin)
 	if !ok {
 		return nil

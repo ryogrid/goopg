@@ -1584,6 +1584,12 @@ func applyPublicationOptions(with map[string]string, opts *catalog.PublicationOp
 					Detail: `Valid values are "none" and "stored".`}
 			}
 		case "publish_via_partition_root":
+			// defGetBoolean.
+			b, ok := pgDefBoolean(value)
+			if !ok {
+				return &ExecError{Code: "42601", Message: fmt.Sprintf("%s requires a Boolean value", name)}
+			}
+			opts.PublishViaRoot = b
 		default:
 			return &ExecError{Code: "42601", Message: fmt.Sprintf("unrecognized publication parameter: \"%s\"", name)}
 		}
@@ -1607,7 +1613,7 @@ func (o *ddlOp) execAlterPublicationOptions(s *parser.AlterPublicationOptionsStm
 	}
 	opts := catalog.PublicationOptions{AllTables: pub.AllTables, PublishInsert: pub.PublishInsert,
 		PublishUpdate: pub.PublishUpdate, PublishDelete: pub.PublishDelete, PublishTruncate: pub.PublishTruncate,
-		PublishGeneratedColumns: pub.GenColsType()}
+		PublishGeneratedColumns: pub.GenColsType(), PublishViaRoot: pub.PublishViaRoot}
 	if err := applyPublicationOptions(s.With, &opts); err != nil {
 		return err
 	}
@@ -30345,4 +30351,17 @@ func indexesInOIDOrder(idxs []*catalog.Index) []*catalog.Index {
 	out := append([]*catalog.Index(nil), idxs...)
 	sortIndexesByOID(out)
 	return out
+}
+
+// pgDefBoolean is defGetBoolean's accepted spellings: true / false, on /
+// off, yes / no, 1 / 0 (case-insensitive); an option given without a value
+// ("") is true.
+func pgDefBoolean(v string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "true", "on", "yes", "1", "t", "y":
+		return true, true
+	case "false", "off", "no", "0", "f", "n":
+		return false, true
+	}
+	return false, false
 }

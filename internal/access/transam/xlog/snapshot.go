@@ -63,6 +63,10 @@ type RelationDef struct {
 	// publishes its partitions (pgoutput get_rel_sync_entry's
 	// ancestor_published). M0149-0054b.
 	AncestorNames []string
+	// AncestorOIDs are the partition ancestors' OIDs, parallel to
+	// AncestorNames (publish_via_partition_root publishes a partition's
+	// change as an ancestor's). M0149-0057d.
+	AncestorOIDs []uint32
 }
 
 // ColumnDef mirrors `catalog.Column` but lives in the snapshot
@@ -148,6 +152,7 @@ func relationDefFor(c *catalog.InMemory, t *catalog.Table, dbOid ...uint32) *Rel
 
 		AncestorSchemas: catalog.PartitionAncestorSchemas(c, t),
 		AncestorNames:   catalog.PartitionAncestorNames(c, t),
+		AncestorOIDs:    catalog.PartitionAncestorOIDs(c, t),
 	}
 	ident := identityColumns(c, t, def.ReplIdent, dbOid...)
 	for i, col := range t.Columns {

@@ -39,6 +39,14 @@ func IsPublishableTable(t *Table) bool {
 // (which may live in other schemas). The result is deduplicated and sorted
 // by schema, then name.
 func PublicationSchemaTables(c *InMemory, schemas []string, dbOid uint32) []*Table {
+	return PublicationSchemaTablesMode(c, schemas, dbOid, false)
+}
+
+// PublicationSchemaTablesMode is PublicationSchemaTables in either
+// partition mode: viaRoot (PUBLICATION_PART_ROOT, publish_via_partition_root)
+// lists a partitioned table itself and leaves out partitions, whose changes
+// go out under it. M0149-0057d.
+func PublicationSchemaTablesMode(c *InMemory, schemas []string, dbOid uint32, viaRoot bool) []*Table {
 	if c == nil || len(schemas) == 0 {
 		return nil
 	}
@@ -49,6 +57,16 @@ func PublicationSchemaTables(c *InMemory, schemas []string, dbOid uint32) []*Tab
 	seen := map[uint32]bool{}
 	var out []*Table
 	addLeaves := func(t *Table, _ int) {
+		if viaRoot {
+			if _, isPart := c.PartitionParentOf(t.OID); isPart || seen[t.OID] {
+				return
+			}
+			if len(t.PartitionKey) > 0 || IsPublishableTable(t) {
+				seen[t.OID] = true
+				out = append(out, t)
+			}
+			return
+		}
 		for _, leaf := range PublicationLeafTables(c, t, dbOid) {
 			if !seen[leaf.OID] {
 				seen[leaf.OID] = true
@@ -139,6 +157,25 @@ func PartitionAncestorNames(c *InMemory, t *Table) []string {
 			break
 		}
 		out = append(out, pt.QualifiedName())
+		oid = parent
+	}
+	return out
+}
+
+// PartitionAncestorOIDs returns the OIDs of t's partition ancestors,
+// nearest first (get_partition_ancestors). M0149-0057d.
+func PartitionAncestorOIDs(c *InMemory, t *Table) []uint32 {
+	if c == nil || t == nil {
+		return nil
+	}
+	var out []uint32
+	oid := t.OID
+	for depth := 0; depth < 64; depth++ {
+		parent, ok := c.PartitionParentOf(oid)
+		if !ok {
+			break
+		}
+		out = append(out, parent)
 		oid = parent
 	}
 	return out

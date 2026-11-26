@@ -163,7 +163,7 @@ func buildPGPublicationRow(pub *catalog.Publication) Row {
 		NewBoolDatum(pub.PublishUpdate),
 		NewBoolDatum(pub.PublishDelete),
 		NewBoolDatum(pub.PublishTruncate),
-		NewBoolDatum(false), // pubviaroot — not modeled
+		NewBoolDatum(pub.PublishViaRoot),
 		NewStringDatum(string(pub.GenColsType())),
 	}
 }

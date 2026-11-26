@@ -90,7 +90,10 @@ type Change struct {
 type txn struct {
 	xid      storage.TransactionID
 	beginLSN uint64
-	changes  []Change
+	// restartLSN is where decoding must restart to see this transaction's
+	// first change (ReorderBuffer.curStart at its first Append).
+	restartLSN uint64
+	changes    []Change
 }
 
 // ReorderBuffer holds in-progress transactions until commit.
@@ -99,6 +102,11 @@ type txn struct {
 // ever moves to a goroutine pool, wrap this in a mutex.
 type ReorderBuffer struct {
 	txns map[storage.TransactionID]*txn
+	// curStart is the 0-based start of the record being decoded (the end of
+	// the one before it), set by the decoder; a transaction's first Append
+	// keeps it as the point decoding must restart from to see all of that
+	// transaction again (restart_lsn). M0149-0057c.
+	curStart uint64
 }
 
 // NewReorderBuffer constructs an empty buffer.
@@ -121,7 +129,7 @@ func (rb *ReorderBuffer) Append(xid storage.TransactionID, c Change) {
 	}
 	t, ok := rb.txns[xid]
 	if !ok {
-		t = &txn{xid: xid, beginLSN: c.LSN}
+		t = &txn{xid: xid, beginLSN: c.LSN, restartLSN: rb.curStart}
 		rb.txns[xid] = t
 	}
 	t.changes = append(t.changes, c)
@@ -212,6 +220,30 @@ func (rb *ReorderBuffer) Abort(xid storage.TransactionID) bool {
 // publisher.
 func (rb *ReorderBuffer) Active() int {
 	return len(rb.txns)
+}
+
+// RestartLSNOf is the restart point of in-flight transaction xid (the start
+// of its first record), and false when xid is not in flight.
+func (rb *ReorderBuffer) RestartLSNOf(xid storage.TransactionID) (uint64, bool) {
+	t, ok := rb.txns[xid]
+	if !ok {
+		return 0, false
+	}
+	return t.restartLSN, true
+}
+
+// OldestRestartLSN is the earliest restart point of an in-flight
+// transaction — the 0-based start of its first record — and false when
+// none is in flight.
+func (rb *ReorderBuffer) OldestRestartLSN() (uint64, bool) {
+	var min uint64
+	found := false
+	for _, t := range rb.txns {
+		if !found || t.restartLSN < min {
+			min, found = t.restartLSN, true
+		}
+	}
+	return min, found
 }
 
 // OldestBeginLSN returns the smallest begin LSN across all

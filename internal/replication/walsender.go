@@ -992,6 +992,13 @@ func (s *Handler) endHistoricStreaming(w *libpq.FrameWriter, hist historicTimeli
 // are also pushed into the observability registry so
 // pg_stat_replication renders write_lsn / flush_lsn / replay_lsn.
 func (s *Handler) handleStandbyCopyData(slotName string, payload []byte, senderHandle *xlog.Sender, syncRep *xlog.SyncRep, appName string) error {
+	return s.handleStandbyCopyDataCapped(slotName, payload, senderHandle, syncRep, appName, nil)
+}
+
+// handleStandbyCopyDataCapped is handleStandbyCopyData for a logical slot
+// when restartCap is non-nil: the flush feedback moves confirmed_flush_lsn,
+// and restart_lsn only as far as restartCap(flush) (Slots.AdvanceLogicalFeedback).
+func (s *Handler) handleStandbyCopyDataCapped(slotName string, payload []byte, senderHandle *xlog.Sender, syncRep *xlog.SyncRep, appName string, restartCap func(flush uint64) uint64) error {
 	parsed, kind, err := libpq.DecodeReplicationMessage(payload)
 	if err != nil {
 		return err
@@ -999,7 +1006,11 @@ func (s *Handler) handleStandbyCopyData(slotName string, payload []byte, senderH
 	if kind == libpq.ReplMsgStandbyStatus {
 		st := parsed.(*libpq.StandbyStatusUpdate)
 		if slotName != "" && s.cfg.Slots != nil {
-			_ = s.cfg.Slots.AdvanceConfirmedFlushLSN(slotName, st.FlushLSN)
+			if restartCap != nil {
+				_ = s.cfg.Slots.AdvanceLogicalFeedback(slotName, st.FlushLSN, restartCap(st.FlushLSN))
+			} else {
+				_ = s.cfg.Slots.AdvanceConfirmedFlushLSN(slotName, st.FlushLSN)
+			}
 		}
 		if senderHandle != nil {
 			senderHandle.ApplyStandbyStatus(st.WriteLSN, st.FlushLSN, st.ApplyLSN)

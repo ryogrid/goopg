@@ -457,7 +457,7 @@ func registerPublicationViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
 				boolText(pub.PublishUpdate),
 				boolText(pub.PublishDelete),
 				boolText(pub.PublishTruncate),
-				"f", // pubviaroot: out of scope
+				boolText(pub.PublishViaRoot),
 				string(pub.GenColsType()),
 			})
 		}
@@ -547,7 +547,7 @@ func registerPublicationViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
 				schema, name := splitQualifiedName(qname)
 				// A partitioned member lists as its leaf partitions
 				// (pg_get_publication_tables, viaroot = false).
-				if t, ok := cat.LookupTable(parser.ObjectName{Schema: schema, Name: name}, pub.DBOid); ok && len(t.PartitionKey) > 0 {
+				if t, ok := cat.LookupTable(parser.ObjectName{Schema: schema, Name: name}, pub.DBOid); ok && len(t.PartitionKey) > 0 && !pub.PublishViaRoot {
 					for _, leaf := range catalog.PublicationLeafTables(cat, t, pub.DBOid) {
 						if !listed[leaf.Schema+"."+leaf.Name] {
 							listed[leaf.Schema+"."+leaf.Name] = true
@@ -560,7 +560,7 @@ func registerPublicationViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
 				out = append(out, pubTableRow(pub.Name, schema, name))
 			}
 			// FOR TABLES IN SCHEMA members (pg_get_publication_tables).
-			for _, t := range catalog.PublicationSchemaTables(cat, pub.Schemas, pub.DBOid) {
+			for _, t := range catalog.PublicationSchemaTablesMode(cat, pub.Schemas, pub.DBOid, pub.PublishViaRoot) {
 				if !listed[t.Schema+"."+t.Name] {
 					out = append(out, pubTableRow(pub.Name, t.Schema, t.Name))
 				}

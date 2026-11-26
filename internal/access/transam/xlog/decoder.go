@@ -72,7 +72,60 @@ type Decoder struct {
 	plugin OutputPlugin
 	// dbOid filters logical messages by their database (SetDatabase).
 	dbOid uint32
+	// skipThrough is start_decoding_at (SetSkipThrough): a transaction
+	// whose commit record ends at or before it, and a non-transactional
+	// message at or before it, has already been delivered and is not sent
+	// again (SnapBuildXactNeedsSkip). M0149-0057c.
+	skipThrough uint64
+	// writeLocation, when set, is told the LSN each plugin callback's
+	// output belongs to (SetWriteLocationHook).
+	writeLocation func(lsn uint64)
+	// onSent, when set, is told each transaction handed to the plugin: its
+	// commit record's end and the restart point that decodes it again.
+	onSent func(commitEnd, restart uint64)
 }
+
+// SetSentHook sets the callback told, for each transaction sent, its commit
+// end and its restart point (where decoding must begin to send it again).
+func (d *Decoder) SetSentHook(fn func(commitEnd, restart uint64)) { d.onSent = fn }
+
+// SetWriteLocationHook sets the callback told, before each Begin / Change /
+// Commit, the position that output goes out at — logical decoding's
+// ctx->write_location: the transaction's first change for Begin
+// (begin_cb_wrapper: txn->first_lsn), the change's own for a change, the
+// commit record's end for Commit (commit_cb_wrapper: txn->end_lsn). A
+// subscriber advances its received position from these, and confirms it when
+// it has nothing pending; stamping every message with the commit's end made
+// it confirm a transaction it had only begun to apply, and a restart then
+// skipped it. M0149-0057c.
+func (d *Decoder) SetWriteLocationHook(fn func(lsn uint64)) { d.writeLocation = fn }
+
+func (d *Decoder) at(lsn uint64) {
+	if d.writeLocation != nil && lsn != 0 {
+		d.writeLocation(lsn)
+	}
+}
+
+// SetRecordStart tells the decoder the 0-based start of the record about to
+// be classified (the end of the previous one).
+func (d *Decoder) SetRecordStart(lsn uint64) { d.buf.curStart = lsn }
+
+// SafeRestartLSN is the latest point a decoding restart may begin at after
+// the record ending at end: end itself when no transaction is in flight,
+// else the first record of the oldest in-flight one — restart_lsn, which
+// PG keeps at the oldest running transaction (SnapBuildProcessRunningXacts).
+func (d *Decoder) SafeRestartLSN(end uint64) uint64 {
+	if lsn, ok := d.buf.OldestRestartLSN(); ok {
+		return lsn
+	}
+	return end
+}
+
+// SetSkipThrough makes the decoder drop what ends at or before lsn — the
+// later of the client's START_REPLICATION point and the slot's
+// confirmed_flush_lsn (CreateDecodingContext's start_decoding_at). A
+// reconnecting subscriber must not receive a transaction it already applied.
+func (d *Decoder) SetSkipThrough(lsn uint64) { d.skipThrough = lsn }
 
 // NewDecoder constructs a decoder backed by `plugin`. The plugin
 // may be nil for tests that exercise only the reorder-buffer
@@ -99,17 +152,26 @@ func (d *Decoder) ApplyChange(xid storage.TransactionID, c Change) {
 // only xact); returns nil in that case so the upstream classifier
 // loop doesn't need to track which xids made it into the buffer.
 func (d *Decoder) ApplyCommit(xid storage.TransactionID, commitLSN uint64) error {
-	changes, _, ok := d.buf.Commit(xid)
+	restart, _ := d.buf.RestartLSNOf(xid)
+	changes, beginLSN, ok := d.buf.Commit(xid)
 	if !ok {
+		return nil
+	}
+	if d.skipThrough != 0 && commitLSN <= d.skipThrough {
 		return nil
 	}
 	if d.plugin == nil {
 		return ErrNoPlugin
 	}
+	if d.onSent != nil {
+		d.onSent(commitLSN, restart)
+	}
+	d.at(beginLSN)
 	if err := d.plugin.Begin(xid, commitLSN); err != nil {
 		return fmt.Errorf("wal: decoder Begin(xid=%d): %w", xid, err)
 	}
 	for _, c := range changes {
+		d.at(c.LSN)
 		if c.Kind == ChangeMessage {
 			// A transactional logical message, in WAL order with the
 			// row changes (ReorderBufferApplyMessage).
@@ -124,6 +186,7 @@ func (d *Decoder) ApplyCommit(xid storage.TransactionID, commitLSN uint64) error
 			return fmt.Errorf("wal: decoder Change(xid=%d, lsn=%d): %w", xid, c.LSN, err)
 		}
 	}
+	d.at(commitLSN)
 	if err := d.plugin.Commit(xid, commitLSN); err != nil {
 		return fmt.Errorf("wal: decoder Commit(xid=%d): %w", xid, err)
 	}

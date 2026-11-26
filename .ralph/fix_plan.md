@@ -17358,6 +17358,37 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/subscription/t/027_nosuperuser.pl` — logical replication respects permissions.
   Likely prerequisites \(verify at start\): non-superuser subscription owners \(`pg_create_subscription`, `password_required`\), apply privilege checks incl. RLS, owner change mid-stream.
+  - 2026\-11\-27 \(progress\): TestPort\_Subscription027Nosuperuser written, gated GOOPG\_TAP\_027 \(the password\_required block is skipped like upstream without Unix sockets — tapnode is TCP\). goopg\-publisher\-pg18\-subscriber passes 6/6 after 0057c \+ 0057d; the goopg\-subscriber pairings need 0057a, 0057b, 0057e.
+- [ ] **M0149-0057a — the apply worker runs each change as the table owner \(SET ROLE check, RLS refusal, table privileges\) and restarts when the owner loses superuser**
+  Kind: impl
+  Parent: M0149-0057
+  - 027 \(goopg subscriber\): no "role \"regress\_admin\" cannot SET ROLE to \"regress\_alice\"" error — goopg applies as superuser regardless of owner. PG: worker.c apply\_handle\_\* → TargetPrivilegesCheck / SwitchToUntrustedUser \(run\_as\_owner = false: member\_can\_set\_role check, "cannot SET ROLE"\), check\_enable\_rls → "user \"%s\" cannot replicate into relation with row\-level security enabled: \"%s\"", pg\_class\_aclcheck INSERT / UPDATE / DELETE \+ SELECT for UPDATE/DELETE lookups \("permission denied for table %s"\), maybe\_reread\_subscription "will restart because the subscription owner's superuser privileges have been revoked".
+  - Path\-to\-TAP: 027 goopg\-subscriber pairings ← 0057a \(1 link\).
+- [ ] **M0149-0057b — goopg tablesync copies a partitioned remote table with COPY \(SELECT …\)**
+  Kind: impl
+  Parent: M0149-0057
+  - 027 pg18\-publisher\-goopg\-subscriber: "tablesync \(publisher rejected COPY\): \[42809\] cannot copy from partitioned table \"hashpart\"". PG 18 copy\_table: a partitioned remote relation \(relkind p, publish\_via\_partition\_root\) is copied with `COPY (SELECT cols FROM tab) TO STDOUT`.
+  - Path\-to\-TAP: 027 goopg\-subscriber pairings ← 0057b \(1 link\).
+- [ ] **M0149-0057e — the apply worker routes UPDATE / DELETE for a partitioned local table**
+  Kind: impl
+  Parent: M0149-0057
+  - 027 \(goopg subscriber, hashpart via root\): changes arrive for the partitioned root; only INSERT is routed \(M0149\-0056b\). PG: apply\_handle\_tuple\_routing \(find the leaf by the old tuple; cross\-partition UPDATE = delete \+ insert\).
+  - Path\-to\-TAP: 027 goopg\-subscriber pairings ← 0057e \(1 link\).
+- [x] **M0149-0057c — a goopg publisher re\-sends what the subscriber has not confirmed: feedback\-only slot advance, start\_decoding\_at skip, PG write locations, restart\_lsn at the oldest unfinished transaction** \(data loss, found by 027\)
+  Kind: impl
+  Parent: M0149-0057
+  - 027 goopg\-publisher\-pg18\-subscriber: after an apply error the PG subscriber reconnects, and goopg never re\-sent the failed transaction — the update / delete was lost. Three defects: \(1\) SlotDecoder.Run advanced confirmed\_flush \(and restart\_lsn\) on every decoded commit, before the subscriber had it; \(2\) every message of a transaction carried the commit end as its CopyData walEnd, so the subscriber's received position — which it confirms when nothing is pending — passed the transaction once its BEGIN arrived; \(3\) feedback moved restart\_lsn to the flush position even inside a sent but unfinished transaction, so a reconnect decoded it without its first changes. PG: LogicalConfirmReceivedLocation, begin/change/commit\_cb\_wrapper write\_location, SnapBuildXactNeedsSkip, candidate\_restart\_lsn.
+  - Path\-to\-TAP: 027 goopg\-publisher pairing ← 0057c \(1 link\).
+  - 2026\-11\-27 \(done\): SlotDecoder.SetFeedbackOnly \(logical walsender\); Decoder.SetSkipThrough \(start\_decoding\_at = max\(client start, confirmed\_flush\), commits and non\-transactional messages\); Decoder.SetWriteLocationHook \(Begin = first change, change = own LSN, Commit = commit end\); ReorderBuffer restart points \+ SlotDecoder.RestartCapFor \(sent\-but\-unflushed transactions, in\-flight oldest\); Slots.AdvanceLogicalFeedback. Tests TestDecoderWriteLocationsAndSkip, TestRestartCapFor. 027 goopg\-publisher pairing 6/6.
+  Movement: yes — tap 027 goopg-publisher-pg18-subscriber intermittent lost transactions -> 6/6 passes (with 0057d)
+- [x] **M0149-0057d — publish\_via\_partition\_root on a goopg publisher**
+  Kind: impl
+  Parent: M0149-0057
+  - 027 \(goopg publisher\): `WITH (publish_via_partition_root = true)` was accepted and ignored; the PG subscriber, whose hash partitions use the other remainders, got leaf changes and failed "new row … violates partition constraint". PG: pubviaroot, GetPubPartitionOptionRelations PUBLICATION\_PART\_ROOT, get\_rel\_sync\_entry publish\_as\_relid \(GetTopMostAncestorInPublication\).
+  - Path\-to\-TAP: 027 goopg\-publisher pairing ← 0057d \(1 link\).
+  - 2026\-11\-27 \(done\): Publication.PublishViaRoot \(option, ALTER SET, pubviaroot journal \+ reload, views\); table lists keep a partitioned member as itself and schema lists drop partitions \(PublicationSchemaTablesMode\); RelationDef.AncestorOIDs \+ filter PublishAsAncestor; PgOutput sends the change as the root's when the layouts match \(sameTupleLayout\).
+  Movement: yes — tap 027 goopg-publisher-pg18-subscriber hashpart check fail -> pass
+
 - [ ] **M0149-0058 — port subscription/t/033_run_as_table_owner.pl**
   Kind: impl
   Parent: none

@@ -259,6 +259,21 @@ func (p *PgOutput) Change(c Change) error {
 		// changes they'll never receive.
 		return nil
 	}
+	// publish_via_partition_root: the change goes out as the topmost
+	// published ancestor's (get_rel_sync_entry publish_as_relid). The
+	// tuple bytes are the leaf's, so the substitution needs the same column
+	// layout; PG converts through an attribute map (ledgered).
+	// M0149-0057d.
+	if vf, ok := p.filter.(ViaRootFilter); ok {
+		if oid, ok := vf.PublishAsAncestor(rel); ok {
+			if root, rchanged, rok := p.snap.Current(storage.RelFileNode{RelOid: oid}); rok && sameTupleLayout(rel, root) {
+				if rchanged {
+					delete(p.emittedRel, root.OID)
+				}
+				rel = root
+			}
+		}
+	}
 	if _, ok := p.emittedRel[rel.OID]; !ok {
 		if err := p.writeRelation(rel); err != nil {
 			return err
@@ -1005,4 +1020,26 @@ func appendUint64(b []byte, v uint64) []byte {
 func appendCString(b []byte, s string) []byte {
 	b = append(b, []byte(s)...)
 	return append(b, 0)
+}
+
+// ViaRootFilter is implemented by a publication filter that knows which
+// partitions are published through an ancestor (publish_via_partition_root):
+// PublishAsAncestor returns that ancestor's OID.
+type ViaRootFilter interface {
+	PublishAsAncestor(rel *RelationDef) (uint32, bool)
+}
+
+// sameTupleLayout reports whether a and b decode the same tuple bytes alike:
+// the same columns, in the same order, with the same types.
+func sameTupleLayout(a, b *RelationDef) bool {
+	if len(a.Columns) != len(b.Columns) {
+		return false
+	}
+	for i := range a.Columns {
+		x, y := a.Columns[i], b.Columns[i]
+		if x.Name != y.Name || x.Typmod != y.Typmod || x.Type.IsArray != y.Type.IsArray || !strings.EqualFold(x.Type.Name, y.Type.Name) {
+			return false
+		}
+	}
+	return true
 }
