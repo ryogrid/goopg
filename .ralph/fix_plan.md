@@ -16958,7 +16958,7 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: M0149-0046
   - 2026\-11\-26 \(done\): the encoder writes PG's null bitmap and dataoffset \(MAXALIGN\(24 \+ ceil\(n/8\)\)\); only the unquoted NULL token is NULL. array.RenderTextStyled reads the bitmap back, and a subscript of a NULL element returns SQL NULL. Unit test TestArrayCodecNullElements.
-  - Movement: regress arrays 1134→760 mismatched lines; 002's array and enum tables now match PG on a goopg node.
+  Movement: yes — regress arrays 1134 -> 760 mismatched lines (of 2651); 002's array and enum tables now match PG on a goopg node.
 - [x] **M0149-0046b — btree keys on composite types**
   Kind: impl
   Parent: M0149-0046
@@ -16980,7 +16980,7 @@ verify each at HEAD when the task starts.
   Parent: M0149-0046
   - int4range `'\[1, 10\]'` is stored as written \(`\[1, 10\]`\); PG range\_in \+ int4range\_canonical gives `\[1,11\)`. The same applies to int8range elements of an int8range\[\].
   - 2026\-11\-26 \(done\): coerceRowForConstraintChecks routes range columns through evalCast \(range\_in\) and range\-array columns through arrayInElems; evalCast's "\[\]" arm does the same for range element types. rangeColumnType covers built\-in and user range types. Unit test TestRangeInAtAssignment.
-  - Movement: regress rangetypes 463→444; 002's range tables match PG except tstzrange TimeZone output \(0046e\).
+  Movement: yes — regress rangetypes 463 -> 444 mismatched lines (of 1726); 002's range tables match PG except tstzrange TimeZone output \(0046e\).
 - [x] **M0149-0046e — range output follows the session TimeZone**
   Kind: impl
   Parent: M0149-0046
@@ -16991,10 +16991,22 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: none
   - Nearby defect \(found by M0149\-0046e\), filed, not worked. pg\_attribute.atttypid for an int4range / tstzrange column is text \(25\), because catalog.TypeNameToOID falls back to text for range names. The catalog reload rebuilds the column as text, so after a restart range\_in canonicalisation, range operators' typing and range\_out styling no longer apply. PG stores the range type OIDs \(3904 int4range, 3910 tstzrange, …\).
-- [ ] **M0149-0046f — hstore extension**
+- [x] **M0149-0046f — hstore extension**
   Kind: impl
   Parent: M0149-0046
   - `CREATE EXTENSION hstore` fails with "extension "hstore" is not available". 002 needs the type, its I/O, equality for UPDATE/DELETE by key, and its pgoutput text form.
+  - 2026\-11\-26 \(done\): knownExtensions hstore 1.8; executor/hstore.go hstoreIn \(parse\_hstore / get\_val state machines, comparePairs order, first duplicate kept, hstore\_out quoting\) at assignment and in evalCast. Checked against a PG 18.3 node with contrib hstore. indexScanOp resolves the session output style \(colsHaveArray\), so tstzrange / timestamptz\[\] read through an index follow SET timezone. Unit test TestHstoreIn.
+  - Movement: on a goopg node 002's DDL and insert check match PG exactly. The ungated run fails at the first catch\-up in all three pairings \(0046g, 0046h\).
+- [ ] **M0149-0046g — a goopg subscriber's apply worker decodes array columns as their element type**
+  Kind: impl
+  Parent: M0149-0046
+  - 002 pg18\-publisher\-goopg\-subscriber: "applyworker: decode insert tuple for "tst\_one\_array": col "b": int4 parse "\{1,2,3\}"". The apply path reads catalog.Type\{Name:"int4", IsArray:true\} as int4. PG's apply worker runs the column type's input function \(array\_in, record\_in, range\_in, hstore\_in\) on the pgoutput text. Check composite, range and hstore columns on the same path.
+  - Path\-to\-TAP: 002 \(PG\-publisher and all\-goopg pairings\) ← 0046g \(1 link\).
+- [ ] **M0149-0046h — a goopg publisher's pgoutput misreads a stored hstore value as an external TOAST pointer**
+  Kind: impl
+  Parent: M0149-0046
+  - 002 goopg\-publisher\-pg18\-subscriber: "pgoutput: encode insert tuple for "tst\_hstore": col "b": hstore: external TOAST pointer in logical change not supported". The pgoutput tuple decoder does not know the hstore type name, and a 1\-byte\-header varlena is read as va\_tag external. It must decode an hstore column as the varlena text goopg stores.
+  - Path\-to\-TAP: 002 \(goopg\-publisher and all\-goopg pairings\) ← 0046h \(1 link\).
 - [ ] **M0149-0047 — port subscription/t/010_truncate.pl**
   Kind: impl
   Parent: none

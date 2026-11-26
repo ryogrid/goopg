@@ -20,7 +20,9 @@ is one link from the TAP test:
 | M0149\-0046c \(done\) | composite fields are not coerced to their column types: `ROW(1.0, 'a', 1)` into \(float8, text, int\) prints `(1.0,a,1)`, not `(1,a,1)`; an array field keeps its input spelling `{a, b, c}` |
 | M0149\-0046d \(done\) | range input is not canonicalised: int4range `'[1, 10]'` stays `[1, 10]`, not `[1,11)` |
 | M0149\-0046e \(done\) | range output ignores the session TimeZone: tstzrange bounds print at \+00 under `SET timezone = '+2'` |
-| M0149\-0046f | no hstore extension |
+| M0149\-0046f \(done\) | no hstore extension |
+| M0149\-0046g | a goopg subscriber's apply worker decodes an array column's replicated text as the element type: "int4 parse "\{1,2,3\}"" |
+| M0149\-0046h | a goopg publisher's pgoutput misreads a stored hstore value as an external TOAST pointer |
 
 ## Landed — M0149\-0046a, NULL array elements
 
@@ -133,3 +135,26 @@ The rangetypes regress case is unchanged \(444\).
 
 **Filed: M0149\-0099.** A range column reloads as text after a server restart, because pg\_attribute records
 atttypid = text for it and the reload follows. Range\-specific input and output are lost after a restart.
+
+## Landed — M0149\-0046f, hstore
+
+CREATE EXTENSION hstore is accepted \(`knownExtensions`, version 1.8\), and goopg carries an hstore value as its
+canonical text. `hstore.go` ports hstore\_io.c:
+
+- **Parsing.** parse\_hstore and get\_val as the same state machines, including the two error texts: "syntax error
+  in hstore, near "c" at position N" and "unexpected end of string", both 42601.
+- **Ordering.** comparePairs orders by key length, then key bytes. All input pairs tie on needfree, so a stable sort
+  keeps the first of a duplicate key, as PG 18.3 does for `a=>1, a=>3`.
+- **Output.** hstore\_out renders `"k"=>"v"` pairs joined by ", ", escapes `"` and `\` with a backslash, and writes
+  NULL unquoted.
+
+Both INSERT / UPDATE assignment \(`coerceRowForConstraintChecks`\) and evalCast run values through hstoreIn. The
+results were checked against a PG 18.3 node from the module toolchain.
+
+**Index scans.** 002's insert check also showed that an index scan decoded rows with the boot default output style.
+A tstzrange or timestamptz\[\] read through an index therefore ignored `SET timezone`, which is how the
+primary\-keyed tst\_range\_array is read. `indexScanOp` now resolves the session style in openPrep when
+`colsHaveArray`, as the seq scan does.
+
+**Result.** On a goopg node all of 002's DDL and inserts now match PG exactly. Replication itself fails in all three
+pairings \(0046g, 0046h\).

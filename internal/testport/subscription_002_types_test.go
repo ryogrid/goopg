@@ -2,6 +2,7 @@ package testport
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/testutil/tapnode"
@@ -509,6 +510,18 @@ func runSubscriptionTypes(t *testing.T, nodePublisher, nodeSubscriber *tapnode.N
 	}
 	nodePublisher.Start()
 	nodeSubscriber.Start()
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		for _, n := range []*tapnode.Node{nodeSubscriber, nodePublisher} {
+			for _, l := range strings.Split(fileTail(n.LogPath(), 2000), "\n") {
+				if strings.Contains(l, "ERROR") || strings.Contains(l, "FATAL") || strings.Contains(l, "level=ERROR") || strings.Contains(l, "level=WARN") || strings.Contains(l, "decoder run failed") {
+					t.Log(n.Name() + " log| " + l)
+				}
+			}
+		}
+	})
 
 	// Setup structure on both nodes
 	nodePublisher.SafePSQL("postgres", types002DDL)

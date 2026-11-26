@@ -272,6 +272,12 @@ type indexScanOp struct {
 	// re-derived its type facts from a string: 29.70% of TPC-H CPU reached
 	// decodeRowRangeInfo this way. seqScanOp already threaded its memo.
 	colInfo []colTypeInfo
+	// arrayStyle is the session output style an array element or a
+	// date-time range bound renders under at decode time, resolved in
+	// openPrep when a column needs it (colsHaveArray) — the seq scan's
+	// rule. The index scan used the boot default, so a timestamptz[] or
+	// tstzrange read through an index ignored SET timezone. M0149-0046e.
+	arrayStyle array.OutputStyle
 	// M0092-0001: heap-fetch-lazy; M0142-0005b: TID-list-lazy too.
 	// `tids`/`poss` are now a per-LEAF batch refilled from `cur` (the
 	// leaf-grain nbtree.ScanCursor) only when Next() reaches the batch
@@ -483,6 +489,10 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 	if o.plan.Table != nil {
 		o.enumTypes, _ = resolveEnumColumns(ctx.Catalog, o.plan.Table.Columns)
 		o.colInfo = resolveColTypeInfo(o.plan.Table.Columns)
+		o.arrayStyle = array.DefaultOutputStyle()
+		if colsHaveArray(o.plan.Table.Columns) {
+			o.arrayStyle = arrayOutputStyle(ctx)
+		}
 		// C34: walk past the columns no consumer reads.
 		applyIndexReadSet(ctx, o.plan, o.colInfo)
 	} else {
@@ -1497,11 +1507,11 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 			// Tuple-decompose + range-decode by name: there is NO HeapTuple
 			// range helper, so natts comes from Infomask2 at this site.
 			natts := int(tuple.Header.Infomask2 & storage.HeapNattsMask)
-			_, decErr = decodeRowRangeInfo(o.scanRow, cols, o.colInfo, tuple.Data, tuple.Bitmap, natts, nil, array.DefaultOutputStyle(), 0, survivorBound, 0)
+			_, decErr = decodeRowRangeInfo(o.scanRow, cols, o.colInfo, tuple.Data, tuple.Bitmap, natts, nil, o.arrayStyle, 0, survivorBound, 0)
 			poisonDeformTail(o.scanRow, survivorBound)
 		} else {
 			natts2 := int(tuple.Header.Infomask2 & storage.HeapNattsMask)
-			decErr = decodeRowIntoInfo(o.scanRow, cols, o.colInfo, tuple.Data, tuple.Bitmap, natts2, nil, array.DefaultOutputStyle())
+			decErr = decodeRowIntoInfo(o.scanRow, cols, o.colInfo, tuple.Data, tuple.Bitmap, natts2, nil, o.arrayStyle)
 		}
 		slot.RUnlock()
 		o.ctx.Pool.Unpin(slot)

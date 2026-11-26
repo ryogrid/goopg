@@ -2862,6 +2862,16 @@ func coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i
 		// A composite column (or an array of one) takes record_in per field
 		// (M0149-0046c): ROW(1.0,'a',1) into a (float8, text, int) column is
 		// stored as (1,a,1), as PG's assignment coercion stores it.
+		if row[i].Kind == KindString && !col.Type.IsArray && isHstoreTypeName(col.Type.Name) {
+			// hstore_in: an hstore column stores the canonical pair text
+			// (sorted, deduplicated, quoted). M0149-0046f.
+			out, herr := hstoreIn(row[i].StringValue(), pos)
+			if herr != nil {
+				return herr
+			}
+			row[i] = NewStringDatum(out)
+			continue
+		}
 		if row[i].Kind == KindString {
 			// A range column (or an array of one) takes range_in, which
 			// canonicalizes a discrete range: '[1, 10]' into an int4range

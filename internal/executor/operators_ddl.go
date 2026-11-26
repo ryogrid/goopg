@@ -327,6 +327,7 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 var knownExtensions = map[string]string{
 	"amcheck":    "1.4", // PG 18 contrib/amcheck default version
 	"pg_prewarm": "1.2", // contrib/pg_prewarm (pg_prewarm function only; M0149-0029)
+	"hstore":     "1.8", // contrib/hstore (the type and its text I/O; M0149-0046f)
 }
 
 // execCreateExtension handles CREATE EXTENSION by inserting a pg_extension

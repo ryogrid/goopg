@@ -6115,6 +6115,13 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 	// Composite target (or an array of one): record_in per field, so the
 	// stored text is record_out's (M0149-0046c). A '{' value cast to the
 	// element type name is how an array-of-composite column assigns.
+	if d.Kind == KindString && isHstoreTypeName(targetType) {
+		out, err := hstoreIn(d.StringValue(), pos)
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewStringDatum(out), nil
+	}
 	if d.Kind == KindString && ctx != nil {
 		elemTarget, isArrTarget := strings.CutSuffix(strings.TrimSpace(targetType), "[]")
 		// An array of ranges: range_in per element (M0149-0046d).
