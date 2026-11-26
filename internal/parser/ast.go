@@ -3028,8 +3028,16 @@ type CreatePublicationStmt struct {
 	// TableColumns is parallel to Tables: each table's publication column
 	// list (`FOR TABLE t (a, b)`, gram.y opt_column_list), nil when none.
 	TableColumns [][]string
-	With         map[string]string
+	// Schemas are the `TABLES IN SCHEMA s` items (gram.y PublicationObjSpec
+	// PUBLICATIONOBJ_TABLES_IN_SCHEMA), in order; CURRENT_SCHEMA is kept as
+	// PubCurrentSchema for the executor to resolve.
+	Schemas []string
+	With    map[string]string
 }
+
+// PubCurrentSchema stands for `TABLES IN SCHEMA CURRENT_SCHEMA`
+// (PUBLICATIONOBJ_TABLES_IN_CUR_SCHEMA) in a publication's Schemas.
+const PubCurrentSchema = "\x00current_schema"
 
 func (s *CreatePublicationStmt) Pos() int  { return s.pos }
 func (s *CreatePublicationStmt) stmtNode() {}
@@ -3080,6 +3088,9 @@ type AlterPublicationTablesStmt struct {
 	Name   string
 	Action string
 	Tables []ObjectName
+	// Schemas are the `TABLES IN SCHEMA s` items (PubCurrentSchema for
+	// CURRENT_SCHEMA).
+	Schemas []string
 }
 
 func (s *AlterPublicationTablesStmt) Pos() int  { return s.pos }

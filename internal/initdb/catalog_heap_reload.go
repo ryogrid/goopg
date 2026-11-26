@@ -3389,6 +3389,31 @@ func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory,
 		}
 	}
 
+	// Pass 1b: FOR TABLES IN SCHEMA members (pg_publication_namespace,
+	// pnnspid → the schema name). M0149-0053a.
+	schemasByPub := map[uint32][]string{}
+	type pnMember struct{ pub, nsp uint32 }
+	pnCols := executor.PGPublicationNamespaceColumnsPG18()
+	pnRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 6237, Fork: storage.MainFork}
+	pnRows, err := scanCatalogHeapRows(mgr, pnRel, clog, "pg_publication_namespace",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(pnCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, pnCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			return pnMember{pub: uint32(decoded[1].Int), nsp: uint32(decoded[2].Int)}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range pnRows {
+		pn := raw.(pnMember)
+		if name := cat.SchemaNameForOID(pn.nsp); name != "" {
+			schemasByPub[pn.pub] = append(schemasByPub[pn.pub], name)
+		}
+	}
+
 	// Pass 2: base rows.
 	pubCols := executor.PGPublicationColumnsPG18()
 	pubRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 6104, Fork: storage.MainFork}
@@ -3440,6 +3465,7 @@ func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory,
 		pr.pub.DBOid = nsDBOid
 		pr.pub.Tables = membersByPub[pr.pub.OID]
 		pr.pub.Columns = colsByPub[pr.pub.OID]
+		pr.pub.Schemas = schemasByPub[pr.pub.OID]
 		pubsub.CreatePublicationDuringRecovery(&pr.pub)
 		cat.SetPublicationHeapTID(pr.pub.OID, catalog.SchemaHeapTID{Block: uint32(pr.tid.Block), Offset: pr.tid.Offset})
 	}

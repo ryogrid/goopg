@@ -13923,6 +13923,60 @@ func (c *InMemory) RenameTable(old, new parser.ObjectName, dbOid ...uint32) erro
 	return nil
 }
 
+// ErrRelationExistsInSchema is SetTableSchema's collision error.
+var ErrRelationExistsInSchema = errors.New("relation already exists in schema")
+
+// SetTableSchema moves table tbl and its indexes to schema newSchema
+// (ALTER TABLE ... SET SCHEMA, AlterTableNamespaceInternal: the relation
+// and its indexes change relnamespace together). The catalog maps are
+// re-keyed under the new qualified names; the *Table / *Index pointers are
+// kept. A relation of the same name already in newSchema is
+// ErrRelationExistsInSchema and changes nothing. M0149-0053b.
+func (c *InMemory) SetTableSchema(tbl *Table, newSchema string, dbOid ...uint32) error {
+	if tbl == nil {
+		return fmt.Errorf("SetTableSchema: nil table")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	resolved := resolveDBOid(dbOid)
+	ns := c.ns(resolved)
+	cur, oldK, exists := lookupTableKeyLocked(ns, parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name})
+	if !exists || cur != tbl {
+		return fmt.Errorf("relation %q does not exist", key(parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name}))
+	}
+	newK := key(parser.ObjectName{Schema: newSchema, Name: tbl.Name})
+	if newK == oldK {
+		return nil
+	}
+	if _, _, taken := lookupTableKeyLocked(ns, parser.ObjectName{Schema: newSchema, Name: tbl.Name}); taken {
+		return ErrRelationExistsInSchema
+	}
+	type move struct {
+		idx        *Index
+		oldK, newK string
+	}
+	var moves []move
+	for k, idx := range ns.byTable[tbl.OID] {
+		nk := key(parser.ObjectName{Schema: newSchema, Name: idx.Name})
+		if other, _, taken := c.lookupIndexLocked(parser.ObjectName{Schema: newSchema, Name: idx.Name}, resolved); taken && other != idx {
+			return ErrRelationExistsInSchema
+		}
+		moves = append(moves, move{idx, k, nk})
+	}
+	tbl.Schema = newSchema
+	ns.tables[newK] = tbl
+	delete(ns.tables, oldK)
+	perTable := ns.byTable[tbl.OID]
+	for _, m := range moves {
+		m.idx.Schema = newSchema
+		delete(ns.indexes, m.oldK)
+		ns.indexes[m.newK] = m.idx
+		delete(perTable, m.oldK)
+		perTable[m.newK] = m.idx
+	}
+	return nil
+}
+
 // RegisterTable re-inserts a previously-dropped table back into the catalog.
 // Used when a TEMP TABLE shadows a permanent table and is then dropped —
 // the permanent table is restored by re-registering its saved *Table. M0097-0003.

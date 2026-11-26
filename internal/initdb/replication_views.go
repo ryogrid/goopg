@@ -542,9 +542,17 @@ func registerPublicationViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
 				}
 				continue
 			}
+			listed := map[string]bool{}
 			for _, qname := range pub.Tables {
 				schema, name := splitQualifiedName(qname)
+				listed[schema+"."+name] = true
 				out = append(out, pubTableRow(pub.Name, schema, name))
+			}
+			// FOR TABLES IN SCHEMA members (pg_get_publication_tables).
+			for _, t := range catalog.PublicationSchemaTables(cat, pub.Schemas, pub.DBOid) {
+				if !listed[t.Schema+"."+t.Name] {
+					out = append(out, pubTableRow(pub.Name, t.Schema, t.Name))
+				}
 			}
 		}
 		return out
@@ -661,8 +669,9 @@ func registerSubscriptionViews(cat *catalog.InMemory, ps *catalog.PubSub) error 
 		return err
 	}
 
-	// pg_publication_namespace — namespace-level publication filtering (PG15+).
-	// Stub: always empty; goopg does not support schema-level publications.
+	// pg_publication_namespace — one row per FOR TABLES IN SCHEMA member
+	// (pnpubid, pnnspid). The row's own oid is not tracked (empty, like
+	// pg_publication_rel's). M0149-0053a.
 	pgPubNS := &catalog.Table{
 		Schema: "pg_catalog",
 		Name:   "pg_publication_namespace",
@@ -673,7 +682,22 @@ func registerSubscriptionViews(cat *catalog.InMemory, ps *catalog.PubSub) error 
 		},
 		Virtual: true,
 	}
-	pgPubNS.VirtualRows = func() [][]string { return nil }
+	pgPubNS.VirtualRows = func() [][]string {
+		if ps == nil {
+			return nil
+		}
+		var out [][]string
+		for _, pub := range ps.Publications() {
+			for _, sch := range pub.Schemas {
+				nsp := cat.SchemaOID(sch, pub.DBOid)
+				if nsp == 0 {
+					continue
+				}
+				out = append(out, []string{"", fmt.Sprintf("%d", pub.OID), fmt.Sprintf("%d", nsp)})
+			}
+		}
+		return out
+	}
 	return cat.RegisterVirtualTable(pgPubNS)
 }
 

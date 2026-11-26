@@ -205,13 +205,26 @@ func publicationTablesForCtx(ctx *Context, pub *catalog.Publication) []*catalog.
 		return nil
 	}
 	out := make([]*catalog.Table, 0, len(pub.Tables))
+	seen := map[uint32]bool{}
 	for _, qname := range pub.Tables {
 		schema, name := splitQualifiedTable(qname)
 		t, ok := ctx.Catalog.LookupTable(parser.ObjectName{Schema: schema, Name: name})
 		if !ok {
 			continue
 		}
+		seen[t.OID] = true
 		out = append(out, t)
+	}
+	// FOR TABLES IN SCHEMA members: the schemas' tables as of now
+	// (GetSchemaPublicationRelations), deduplicated against the FOR TABLE
+	// members as pg_get_publication_tables does. M0149-0053a.
+	if in, ok := ctx.Catalog.(*catalog.InMemory); ok && len(pub.Schemas) > 0 {
+		for _, t := range catalog.PublicationSchemaTables(in, pub.Schemas, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
+			if !seen[t.OID] {
+				seen[t.OID] = true
+				out = append(out, t)
+			}
+		}
 	}
 	return out
 }

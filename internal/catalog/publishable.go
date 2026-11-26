@@ -1,6 +1,9 @@
 package catalog
 
-import "strings"
+import (
+	"sort"
+	"strings"
+)
 
 // FirstNormalObjectId is the first OID assigned to user objects
 // (access/transam.h); every OID below it belongs to the system catalogs.
@@ -27,4 +30,74 @@ func IsPublishableTable(t *Table) bool {
 		return false
 	}
 	return t.OID >= FirstNormalObjectId
+}
+
+// PublicationSchemaTables is GetSchemaPublicationRelations with
+// PUBLICATION_PART_LEAF (publish_via_partition_root = false, the only mode
+// goopg models) for the given schemas of database dbOid: every publishable
+// table in them, with a partitioned table replaced by its leaf partitions
+// (which may live in other schemas). The result is deduplicated and sorted
+// by schema, then name.
+func PublicationSchemaTables(c *InMemory, schemas []string, dbOid uint32) []*Table {
+	if c == nil || len(schemas) == 0 {
+		return nil
+	}
+	want := map[string]bool{}
+	for _, s := range schemas {
+		want[strings.ToLower(s)] = true
+	}
+	seen := map[uint32]bool{}
+	var out []*Table
+	var addLeaves func(t *Table, depth int)
+	addLeaves = func(t *Table, depth int) {
+		if t == nil || seen[t.OID] || depth > 64 {
+			return
+		}
+		if len(t.PartitionKey) > 0 {
+			for _, child := range c.PartitionChildren(t.OID, dbOid) {
+				addLeaves(child, depth+1)
+			}
+			return
+		}
+		if IsPublishableTable(t) {
+			seen[t.OID] = true
+			out = append(out, t)
+		}
+	}
+	for _, t := range c.AllTables(dbOid) {
+		if want[strings.ToLower(t.Schema)] {
+			addLeaves(t, 0)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Schema != out[j].Schema {
+			return out[i].Schema < out[j].Schema
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+// PartitionAncestorSchemas returns the schemas of t's partition ancestors,
+// nearest first (get_partition_ancestors), for the publication checks that
+// publish a partition through an ancestor's schema.
+func PartitionAncestorSchemas(c *InMemory, t *Table) []string {
+	if c == nil || t == nil {
+		return nil
+	}
+	var out []string
+	oid := t.OID
+	for depth := 0; depth < 64; depth++ {
+		parent, ok := c.PartitionParentOf(oid)
+		if !ok {
+			break
+		}
+		pt, _, ok := c.LookupTableByOIDAllDBs(parent)
+		if !ok || pt == nil {
+			break
+		}
+		out = append(out, pt.Schema)
+		oid = parent
+	}
+	return out
 }

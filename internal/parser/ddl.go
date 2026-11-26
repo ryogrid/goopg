@@ -2445,10 +2445,34 @@ func (p *parser) parseCreatePublicationTail(pos int) (Stmt, error) {
 				return nil, p.errAtCur("expected TABLES after FOR ALL")
 			}
 			stmt.AllTables = true
-		} else if p.acceptKeyword(KwTable) {
-			// pub_obj_list TABLE items: [ONLY] name [*] (gram.y
-			// PublicationObjSpec relation_expr).
+		} else if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwTable || p.cur().Keyword == KwTables) {
+			// pub_obj_list (gram.y): `TABLE [ONLY] name [*] [(cols)]` and
+			// `TABLES IN SCHEMA { name | CURRENT_SCHEMA }` items; a bare
+			// item after a comma continues the previous kind
+			// (PUBLICATIONOBJ_CONTINUATION, preprocess_pubobj_list).
+			kind := ""
 			for {
+				switch {
+				case p.acceptKeyword(KwTable):
+					kind = "table"
+				case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTables:
+					p.advance()
+					if err := p.expectPubTablesInSchema(); err != nil {
+						return nil, err
+					}
+					kind = "schema"
+				}
+				if kind == "schema" {
+					name, err := p.parsePubSchemaName()
+					if err != nil {
+						return nil, err
+					}
+					stmt.Schemas = append(stmt.Schemas, name)
+					if !p.acceptSymbol(",") {
+						break
+					}
+					continue
+				}
 				p.acceptIdentKeyword("only")
 				obj, err := p.parseObjectName()
 				if err != nil {
@@ -2479,12 +2503,9 @@ func (p *parser) parseCreatePublicationTail(pos int) (Stmt, error) {
 				if !p.acceptSymbol(",") {
 					break
 				}
-				// pub_obj_list: a later item may repeat TABLE
-				// (`TABLE a, TABLE b`) or continue bare (`TABLE a, b`).
-				p.acceptKeyword(KwTable)
 			}
 		} else {
-			return nil, p.errAtCur("expected ALL TABLES or TABLE after FOR")
+			return nil, p.errAtCur("expected ALL TABLES, TABLE or TABLES IN SCHEMA after FOR")
 		}
 	}
 	if p.acceptKeyword(KwWith) {
@@ -2495,6 +2516,33 @@ func (p *parser) parseCreatePublicationTail(pos int) (Stmt, error) {
 		stmt.With = opts
 	}
 	return stmt, nil
+}
+
+// expectPubTablesInSchema consumes `IN SCHEMA` after TABLES in a
+// publication object list.
+func (p *parser) expectPubTablesInSchema() error {
+	if !p.acceptKeyword(KwIn) {
+		return p.errAtCur("expected IN SCHEMA after TABLES")
+	}
+	if !p.acceptIdentKeyword("schema") {
+		return p.errAtCur("expected SCHEMA after TABLES IN")
+	}
+	return nil
+}
+
+// parsePubSchemaName parses a `TABLES IN SCHEMA` item's ColId or
+// CURRENT_SCHEMA (returned as PubCurrentSchema).
+func (p *parser) parsePubSchemaName() (string, error) {
+	t := p.cur()
+	if (t.Kind == TokenIdent || t.Kind == TokenKeyword) && strings.EqualFold(t.Value, "current_schema") {
+		p.advance()
+		return PubCurrentSchema, nil
+	}
+	if t.Kind != TokenIdent && !(t.Kind == TokenKeyword && IsColNameKeyword(t.Keyword)) {
+		return "", p.errAtCur("expected schema name after TABLES IN SCHEMA")
+	}
+	p.advance()
+	return t.Value, nil
 }
 
 // parseCreateSubscriptionTail picks up after CREATE SUBSCRIPTION.
@@ -8943,9 +8991,9 @@ func (p *parser) parseAlter() (Stmt, error) {
 				}
 			}
 		}
-		// ALTER PUBLICATION name { ADD | SET | DROP } TABLE [ONLY] t [*] [, ...].
-		// Other ADD/SET/DROP forms (SET (option ...), TABLES IN SCHEMA) stay
-		// the compat no-op below.
+		// ALTER PUBLICATION name { ADD | SET | DROP } { TABLE [ONLY] t [*] |
+		// TABLES IN SCHEMA s } [, ...]. SET (option ...) is
+		// AlterPublicationOptionsStmt.
 		if pubSubKind == KwPublication {
 			action := ""
 			switch {
@@ -8963,28 +9011,44 @@ func (p *parser) parseAlter() (Stmt, error) {
 				}
 				return &AlterPublicationOptionsStmt{pos: t.Pos, Name: name, With: opts}, nil
 			}
-			if action != "" && p.acceptKeyword(KwTable) {
+			if action != "" && p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwTable || p.cur().Keyword == KwTables) {
+				// pub_obj_list of TABLE and TABLES IN SCHEMA items; a bare
+				// item after a comma continues the previous kind
+				// (preprocess_pubobj_list). A column list `t (a, b)` or a row
+				// filter `t WHERE (...)` is a publication feature goopg does
+				// not model on ALTER: the statement stays the compat no-op
+				// below, as before, rather than failing on syntax PG accepts.
 				stmt := &AlterPublicationTablesStmt{pos: t.Pos, Name: name, Action: action}
+				kind := ""
 				modelled := true
 				for modelled {
-					// A TABLES IN SCHEMA item, a column list `t (a, b)`
-					// or a row filter `t WHERE (...)` is a publication
-					// feature goopg does not model: the statement stays
-					// the compat no-op below, as before, rather than
-					// failing on syntax PG accepts.
-					if p.cur().Kind == TokenKeyword && Keyword(p.cur().Value) == KwTables {
-						modelled = false
-						break
-					}
-					p.acceptIdentKeyword("only")
-					obj, err := p.parseObjectName()
-					if err != nil {
-						return nil, err
-					}
-					if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
+					switch {
+					case p.acceptKeyword(KwTable):
+						kind = "table"
+					case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTables:
 						p.advance()
+						if err := p.expectPubTablesInSchema(); err != nil {
+							return nil, err
+						}
+						kind = "schema"
 					}
-					stmt.Tables = append(stmt.Tables, obj)
+					if kind == "schema" {
+						sch, err := p.parsePubSchemaName()
+						if err != nil {
+							return nil, err
+						}
+						stmt.Schemas = append(stmt.Schemas, sch)
+					} else {
+						p.acceptIdentKeyword("only")
+						obj, err := p.parseObjectName()
+						if err != nil {
+							return nil, err
+						}
+						if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
+							p.advance()
+						}
+						stmt.Tables = append(stmt.Tables, obj)
+					}
 					switch {
 					case p.cur().Kind == TokenSymbol && p.cur().Value == ",":
 						p.advance()

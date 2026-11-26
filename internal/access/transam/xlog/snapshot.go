@@ -53,6 +53,11 @@ type RelationDef struct {
 	// MATERIALIZED VIEW rewrites the matview's heap, bug #15044). The
 	// zero value is publishable. M0149-0045.
 	NotPublishable bool
+	// AncestorSchemas are the schemas of the relation's partition
+	// ancestors, nearest first: a FOR TABLES IN SCHEMA publication
+	// publishes a partition whose ancestor is in one of its schemas
+	// (pgoutput get_rel_sync_entry's ancestor check). M0149-0053a.
+	AncestorSchemas []string
 }
 
 // ColumnDef mirrors `catalog.Column` but lives in the snapshot
@@ -135,6 +140,8 @@ func relationDefFor(c *catalog.InMemory, t *catalog.Table, dbOid ...uint32) *Rel
 		// is_publishable_class (the sibling the publication table
 		// lists use, M0149-0041b).
 		NotPublishable: !catalog.IsPublishableTable(t),
+
+		AncestorSchemas: catalog.PartitionAncestorSchemas(c, t),
 	}
 	ident := identityColumns(c, t, def.ReplIdent, dbOid...)
 	for i, col := range t.Columns {

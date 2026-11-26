@@ -52,6 +52,13 @@ type Publication struct {
 	// table absent from the map publishes every column. The map is
 	// replaced, never mutated, so shallow copies may share it.
 	Columns map[string][]string
+	// Schemas are the publication's FOR TABLES IN SCHEMA members
+	// (pg_publication_namespace.pnnspid), as schema names in the order
+	// they were added. Every table currently in one of them is published
+	// — a table created in the schema later joins, one moved out by ALTER
+	// TABLE ... SET SCHEMA leaves (GetSchemaPublicationRelations). The
+	// slice is replaced, never mutated, so shallow copies may share it.
+	Schemas []string
 	// DBOid is the real physical database oid this publication was CREATE
 	// PUBLICATION'd under (mirrors Subscription.DBOid + UserTSConfig.DBOid).
 	// Two distinct databases may each create a same-named publication without
@@ -391,6 +398,23 @@ func (p *PubSub) SetPublicationTables(name string, tables []string, dbOid ...uin
 		}
 		pub.Columns = kept
 	}
+	out := *pub
+	out.Tables = append([]string(nil), pub.Tables...)
+	return &out, nil
+}
+
+// SetPublicationSchemas replaces a publication's FOR TABLES IN SCHEMA
+// members (CREATE PUBLICATION ... TABLES IN SCHEMA, ALTER PUBLICATION ...
+// ADD / SET / DROP TABLES IN SCHEMA; the caller computes the new list).
+func (p *PubSub) SetPublicationSchemas(name string, schemas []string, dbOid ...uint32) (*Publication, error) {
+	defer p.pubGen.Add(1)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pub, ok := p.publications[pubMapKey(resolveDBOid(dbOid), name)]
+	if !ok {
+		return nil, fmt.Errorf("publication %q does not exist", name)
+	}
+	pub.Schemas = append([]string(nil), schemas...)
 	out := *pub
 	out.Tables = append([]string(nil), pub.Tables...)
 	return &out, nil

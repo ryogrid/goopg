@@ -30,6 +30,12 @@ const (
 	pgPublicationRelRelOID          = 6106
 	pgPublicationRelOidIndexOID     = 6112
 	pgPublicationRelPrrelidPrpubOID = 6113
+
+	// pg_publication_namespace (pg_publication_namespace.h): the FOR
+	// TABLES IN SCHEMA members. M0149-0053a.
+	pgPublicationNamespaceRelOID       = 6237
+	pgPublicationNamespaceOidIndexOID  = 6238
+	pgPublicationNamespacePnnspidPnpub = 6239
 )
 
 // PGPublicationColumnsPG18 mirrors FormData_pg_publication (10 columns).
@@ -58,6 +64,89 @@ func PGPublicationRelColumnsPG18() []catalog.Column {
 		{Name: "prqual", Type: catalog.Type{Name: "pg_node_tree"}},
 		{Name: "prattrs", Type: catalog.Type{Name: "int2vector"}},
 	}
+}
+
+// PGPublicationNamespaceColumnsPG18 mirrors FormData_pg_publication_namespace
+// (oid, pnpubid, pnnspid).
+func PGPublicationNamespaceColumnsPG18() []catalog.Column {
+	return []catalog.Column{
+		{Name: "oid", Type: catalog.Type{Name: "oid"}},
+		{Name: "pnpubid", Type: catalog.Type{Name: "oid"}},
+		{Name: "pnnspid", Type: catalog.Type{Name: "oid"}},
+	}
+}
+
+func pgPublicationNamespaceRel() storage.RelFileNode {
+	return storage.RelFileNode{DBOid: catalog.DefaultDBOid, RelOid: pgPublicationNamespaceRelOID, Fork: storage.MainFork}
+}
+
+// writePublicationNamespaceRows journals one pg_publication_namespace row
+// per schema added to pub (publication_add_schema): oid, pnpubid, pnnspid,
+// plus both index entries.
+func writePublicationNamespaceRows(ctx *Context, pub *catalog.Publication, schemas []string) error {
+	if !catalogHeapSyncAvailable(ctx) || len(schemas) == 0 {
+		return nil
+	}
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	dbOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
+	for _, sch := range schemas {
+		nsp := im.SchemaOID(sch, dbOid)
+		if nsp == 0 {
+			continue
+		}
+		pnOID := im.AllocOID()
+		row := Row{NewIntDatum(int64(pnOID)), NewIntDatum(int64(pub.OID)), NewIntDatum(int64(nsp))}
+		tid, err := writeHeapRowCanonical(ctx, pgPublicationNamespaceRel(), PGPublicationNamespaceColumnsPG18(), row)
+		if err != nil {
+			return err
+		}
+		blk, off := uint32(tid.Block), tid.Offset
+		if err := insertCanonicalSysBtreeLeaf(ctx, pgPublicationNamespaceOidIndexOID,
+			buildIndexTupleOidKey(blk, off, pnOID), cmpKeyUint32); err != nil {
+			return err
+		}
+		if err := insertCanonicalSysBtreeLeaf(ctx, pgPublicationNamespacePnnspidPnpub,
+			buildIndexTupleOidOidKey(blk, off, nsp, pub.OID), cmpKeyOidOid); err != nil {
+			return err
+		}
+	}
+	mirrorPublicationCatalogFiles(ctx)
+	return nil
+}
+
+// deletePublicationNamespaceRows stamps xmax on publication pubOID's
+// pg_publication_namespace rows for the given schemas (ALTER PUBLICATION
+// ... DROP / SET TABLES IN SCHEMA).
+func deletePublicationNamespaceRows(ctx *Context, pubOID uint32, schemas []string) {
+	if !catalogHeapSyncAvailable(ctx) || len(schemas) == 0 {
+		return
+	}
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return
+	}
+	dbOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
+	nsps := map[uint32]bool{}
+	for _, sch := range schemas {
+		if oid := im.SchemaOID(sch, dbOid); oid != 0 {
+			nsps[oid] = true
+		}
+	}
+	if len(nsps) == 0 {
+		return
+	}
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return
+	}
+	// pnpubid at offset 4, pnnspid at offset 8.
+	stampCatalogRows(ctx, pgPublicationNamespaceRel(), ctx.Tx.XID, func(data []byte) bool {
+		return len(data) >= 12 && binary.LittleEndian.Uint32(data[4:8]) == pubOID &&
+			nsps[binary.LittleEndian.Uint32(data[8:12])]
+	})
+	mirrorPublicationCatalogFiles(ctx)
 }
 
 func buildPGPublicationRow(pub *catalog.Publication) Row {
@@ -228,6 +317,10 @@ func deletePublicationCatalogRows(ctx *Context, pubOID uint32) {
 	stampCatalogRows(ctx, pgPublicationRelRel(), ctx.Tx.XID, func(data []byte) bool {
 		return len(data) >= 8 && binary.LittleEndian.Uint32(data[4:8]) == pubOID
 	})
+	// pg_publication_namespace: pnpubid is column 1 (offset 4).
+	stampCatalogRows(ctx, pgPublicationNamespaceRel(), ctx.Tx.XID, func(data []byte) bool {
+		return len(data) >= 8 && binary.LittleEndian.Uint32(data[4:8]) == pubOID
+	})
 	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 		im.DropPublicationHeapTID(pubOID)
 	}
@@ -271,6 +364,7 @@ func mirrorPublicationCatalogFiles(ctx *Context) {
 	for _, oid := range []uint32{
 		pgPublicationRelOID, pgPublicationOidIndexOID, pgPublicationPubnameIndexOID,
 		pgPublicationRelRelOID, pgPublicationRelOidIndexOID, pgPublicationRelPrrelidPrpubOID,
+		pgPublicationNamespaceRelOID, pgPublicationNamespaceOidIndexOID, pgPublicationNamespacePnnspidPnpub,
 	} {
 		_ = mirrorCatalogRelToPostgresDB(ctx, oid)
 	}

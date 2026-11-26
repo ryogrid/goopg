@@ -17226,11 +17226,34 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: M0149-0052
   - Only pid is typed \(int4\); every other column of the virtual view is text \(PG: usesysid oid, client\_addr inet, client\_port int4, backend\_start / reply\_time timestamptz, backend\_xmin xid, \*\_lsn pg\_lsn, \*\_lag interval, sync\_priority int4\), so e.g. `sent_lsn >= '0/…'` compares as text. usesysid / usename / client\_port are empty strings. PG parity only.
-- [ ] **M0149-0053 — port subscription/t/025_rep_changes_for_schema.pl**
+- [x] **M0149-0053 — port subscription/t/025_rep_changes_for_schema.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/025_rep_changes_for_schema.pl` — `FOR TABLES IN SCHEMA` publications.
   Likely prerequisites \(verify at start\): `pg_publication_namespace`, relation-sync-cache invalidation on schema changes, rename/move of tables between schemas.
+  - 2026\-11\-27 \(progress\): TestPort\_Subscription025RepChangesForSchema written, gated GOOPG\_TAP\_025. The pg18\-publisher\-goopg\-subscriber pairing passes as is; the goopg\-publisher pairings fail at `CREATE PUBLICATION … FOR TABLES IN SCHEMA` \(0053a\), then at `ALTER TABLE sch1.tab3 SET SCHEMA public` \(0053b\).
+  - 2026\-11\-27 \(done\): 0053a \+ 0053b landed; 025 ungated, 3/3 x 3; inventory 025 → port.
+  Movement: yes — tap 025 all-goopg 0/13 -> 13/13, goopg-publisher-pg18-subscriber 0/13 -> 13/13 (3/3 x 3 pairings); 025 port
+- [x] **M0149-0053a — FOR TABLES IN SCHEMA publications**
+  Kind: impl
+  Parent: M0149-0053
+  - 025 \(goopg publisher\): `CREATE PUBLICATION tap_pub_schema FOR TABLES IN SCHEMA sch1` is a syntax error, and ALTER PUBLICATION … DROP TABLES IN SCHEMA was a compat no\-op. PG: gram.y pub\_obj\_list TABLES IN SCHEMA items, publicationcmds.c PublicationAddSchemas / AlterPublicationSchemas, pg\_publication\_namespace, pg\_publication.c GetSchemaPublicationRelations \(PUBLICATION\_PART\_LEAF\), pgoutput get\_rel\_sync\_entry schema \+ ancestor checks.
+  - Path\-to\-TAP: 025 goopg\-publisher pairings ← 0053a \(1 link\).
+  - 2026\-11\-27 \(done\): parser TABLES IN SCHEMA / CURRENT\_SCHEMA items for CREATE and ALTER ADD/SET/DROP \(continuation items, PubCurrentSchema\); catalog Publication.Schemas \+ SetPublicationSchemas, PublicationSchemaTables \(leaf partitions\), PartitionAncestorSchemas; executor resolvePublicationSchemas \(3F000 / 22023 system schema / dedupe\) and alterPublicationSchemas \(42710 / 42704, SET replaces\); pg\_publication\_namespace heap rows \+ 6238/6239 index entries \(split key meta registered\), DROP stamps them, startup reload; views pg\_publication\_tables / pg\_publication\_namespace and pg\_get\_publication\_tables include schema tables; walsender filter bySchema with RelationDef.AncestorSchemas. Tests TestParsePublicationTablesInSchema, TestPublicationSchemaTables, TestPublicationFilterTablesInSchema.
+  Movement: yes — tap 025 goopg-publisher pairings CREATE PUBLICATION syntax error -> pass (next stop SET SCHEMA, 0053b)
+- [x] **M0149-0053b — ALTER TABLE … SET SCHEMA moves the table in the catalog**
+  Kind: impl
+  Parent: M0149-0053
+  - 025 \(goopg publisher\): after `ALTER TABLE sch1.tab3 SET SCHEMA public`, `INSERT INTO public.tab3` is 42P01 — the SET SCHEMA arm only assigned tbl.Schema, so the catalog map stayed keyed `sch1.tab3` \(pg\_class showed public, name lookup failed\). Affects every goopg ALTER TABLE SET SCHEMA, not just publications.
+  - Path\-to\-TAP: 025 goopg\-publisher pairings ← 0053b \(1 link\).
+  - 2026\-11\-27 \(done\): catalog.SetTableSchema re\-keys the table and its indexes \(ErrRelationExistsInSchema → 42P07 "relation \"%s\" already exists in schema \"%s\""\); sequences keep their existing path. Covered by TestPublicationSchemaTables.
+  Movement: yes — tap 025 13/13 in all pairings
+- [ ] **M0149-0053c — ALTER TABLE … SET SCHEMA residuals: durability, row type, owned sequences, constraints**
+  Kind: impl
+  Parent: M0149-0053
+  - SET SCHEMA changes only the in\-memory catalog \(no pg\_class relnamespace heap update\), so it does not survive a restart; the table's row type, owned sequences and constraints do not move \(AlterTableNamespaceInternal → AlterRelationNamespaceInternal, AlterIndexNamespaces, AlterSeqNamespaces, AlterConstraintNamespaces, AlterTypeNamespaceInternal\). PG parity only; 025 does not restart.
+  - Verified 2026\-11\-27: `CREATE TABLE sch1.t5 …; ALTER TABLE sch1.t5 SET SCHEMA public;` then a restart → `public.t5` is 42P01 and `sch1.t5` holds the row again \(pre\-existing; the old arm did not persist either\).
+
 - [ ] **M0149-0054 — port subscription/t/032_subscribe_use_index.pl**
   Kind: impl
   Parent: none

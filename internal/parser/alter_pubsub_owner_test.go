@@ -69,7 +69,8 @@ func TestParseAlterPublicationOtherFormsStillNoop(t *testing.T) {
 	cases := []string{
 		// RENAME TO left this list when it was modelled (M0149-0043b,
 		// TestParseAlterPublicationRename).
-		"ALTER PUBLICATION mypub ADD TABLES IN SCHEMA s",
+		// ADD TABLES IN SCHEMA left this list when schema publications
+		// were modelled (M0149-0053a, TestParsePublicationTablesInSchema).
 		"ALTER SUBSCRIPTION mysub RENAME TO othersub",
 		// SET PUBLICATION p2 left this list when the publication-list
 		// arms landed (M0122-0014, TestParseAlterSubscriptionPublications);
@@ -130,15 +131,14 @@ func TestParseAlterPublicationTables(t *testing.T) {
 	}
 }
 
-// TestParseAlterPublicationUnmodelledTableFormsStayNoop: a column list, a row
-// filter or a TABLES IN SCHEMA item is a publication feature goopg does not
-// model; such an ALTER PUBLICATION stays the compat no-op it was, instead of
-// a syntax error on SQL PG accepts.
+// TestParseAlterPublicationUnmodelledTableFormsStayNoop: a column list or a
+// row filter on ALTER is a publication feature goopg does not model; such an
+// ALTER PUBLICATION stays the compat no-op it was, instead of a syntax error
+// on SQL PG accepts. (TABLES IN SCHEMA items are modelled since M0149-0053a.)
 func TestParseAlterPublicationUnmodelledTableFormsStayNoop(t *testing.T) {
 	for _, sql := range []string{
 		"ALTER PUBLICATION p ADD TABLE t (a, b)",
 		"ALTER PUBLICATION p SET TABLE t WHERE (a > 1)",
-		"ALTER PUBLICATION p ADD TABLE t, TABLES IN SCHEMA s",
 	} {
 		stmts, err := Parse(sql)
 		if err != nil {

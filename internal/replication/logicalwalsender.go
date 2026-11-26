@@ -507,6 +507,28 @@ type publicationFilter struct {
 	colLists   map[string][]string
 	wholeTable map[string]bool
 	allTables  bool
+	// bySchema holds the FOR TABLES IN SCHEMA members (lower-cased schema
+	// name): a relation in one of them, or a partition whose ancestor is,
+	// is published whole. M0149-0053a.
+	bySchema map[string]allowFlags
+}
+
+// schemaFlags is the union of the schema publications covering rel — its
+// own schema and its partition ancestors' (pgoutput get_rel_sync_entry:
+// GetSchemaPublications of the relation's namespace, then of each ancestor's).
+func (f *publicationFilter) schemaFlags(rel *xlog.RelationDef) (allowFlags, bool) {
+	if len(f.bySchema) == 0 || rel == nil {
+		return allowFlags{}, false
+	}
+	var out allowFlags
+	found := false
+	for _, sch := range append([]string{rel.Schema}, rel.AncestorSchemas...) {
+		if fl, ok := f.bySchema[strings.ToLower(sch)]; ok {
+			out = unionFlags(out, fl)
+			found = true
+		}
+	}
+	return out, found
 }
 
 // allowFlags is the bitset of publish-* flags that have been
@@ -544,6 +566,9 @@ func (f *publicationFilter) Allows(rel *xlog.RelationDef, kind xlog.ChangeKind) 
 	if flags, ok := f.byTable[qname]; ok && flags.allowsKind(kind) {
 		return true
 	}
+	if flags, ok := f.schemaFlags(rel); ok && flags.allowsKind(kind) {
+		return true
+	}
 	return false
 }
 
@@ -558,6 +583,10 @@ func (f *publicationFilter) ColumnList(rel *xlog.RelationDef) ([]string, bool) {
 	q := relQualifiedName(rel)
 	cols, ok := f.colLists[q]
 	if !ok || f.wholeTable[q] {
+		return nil, false
+	}
+	// A schema publication publishes the table whole.
+	if _, bySchema := f.schemaFlags(rel); bySchema {
 		return nil, false
 	}
 	return cols, true
@@ -575,7 +604,11 @@ func (f *publicationFilter) PublishesStoredGenerated(rel *xlog.RelationDef) bool
 	if f.allTablesAllowed.gencolsStored {
 		return true
 	}
-	return f.byTable[relQualifiedName(rel)].gencolsStored
+	if f.byTable[relQualifiedName(rel)].gencolsStored {
+		return true
+	}
+	fl, _ := f.schemaFlags(rel)
+	return fl.gencolsStored
 }
 
 // walsenderCatalogDBOidVar resolves the connection's database name to the
@@ -670,6 +703,13 @@ func buildPublicationFilterMissing(ps *catalog.PubSub, names []string, missing f
 			out.allTablesAllowed = unionFlags(out.allTablesAllowed, flags)
 			out.allTables = true
 			continue
+		}
+		for _, sch := range pub.Schemas {
+			if out.bySchema == nil {
+				out.bySchema = map[string]allowFlags{}
+			}
+			k := strings.ToLower(sch)
+			out.bySchema[k] = unionFlags(out.bySchema[k], flags)
 		}
 		for _, qname := range pub.Tables {
 			out.byTable[qname] = unionFlags(out.byTable[qname], flags)

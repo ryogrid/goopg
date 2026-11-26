@@ -118,7 +118,7 @@ func sysBtreeKeyTypes(indexOID uint32) ([]catKeyType, bool) {
 		return []catKeyType{O, N}, true
 	case pgEnumTypidSortOrderIndexID: // (oid, float4): float4 lays out as int4
 		return []catKeyType{O, I}, true
-	case pgCastSourceTargetIndexOID, pgUserMappingUserSrvIdx, pgPublicationRelPrrelidPrpubOID,
+	case pgCastSourceTargetIndexOID, pgUserMappingUserSrvIdx, pgPublicationRelPrrelidPrpubOID, pgPublicationNamespacePnnspidPnpub,
 		pgTransformTypeLangIndexOID:
 		return []catKeyType{O, O}, true
 	case pgOperatorOprnameLRNIndexOID:

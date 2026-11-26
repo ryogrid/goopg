@@ -1302,9 +1302,18 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 			colLists[tbl.QualifiedName()] = cols
 		}
 	}
+	schemas, err := o.resolvePublicationSchemas(s.Schemas)
+	if err != nil {
+		return err
+	}
 	pub, err := o.ctx.PubSub.CreatePublicationAsOwner(s.Name, tables, opts, o.currentDDLOwnerOID(), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	if len(schemas) > 0 {
+		if pub, err = o.ctx.PubSub.SetPublicationSchemas(s.Name, schemas, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
+			return err
+		}
 	}
 	if colLists != nil {
 		if err := o.ctx.PubSub.SetPublicationColumnLists(s.Name, colLists, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
@@ -1326,6 +1335,9 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 	}
 	if err := writePublicationMemberRows(o.ctx, pub); err != nil {
 		return fmt.Errorf("pg_publication_rel journal: %w", err)
+	}
+	if err := writePublicationNamespaceRows(o.ctx, pub, pub.Schemas); err != nil {
+		return fmt.Errorf("pg_publication_namespace journal: %w", err)
 	}
 	// CreatePublication (publicationcmds.c): a publication is created anyway,
 	// but below wal_level = logical nothing can be decoded from it.
@@ -1648,9 +1660,20 @@ func (o *ddlOp) execAlterPublicationTables(s *parser.AlterPublicationTablesStmt)
 		return &ExecError{Code: "42704", Message: fmt.Sprintf("publication \"%s\" does not exist", s.Name)}
 	}
 	if pub.AllTables {
+		detail := "Tables cannot be added to or dropped from FOR ALL TABLES publications."
+		if len(s.Tables) == 0 && len(s.Schemas) > 0 {
+			detail = "Schemas cannot be added to or dropped from FOR ALL TABLES publications."
+		}
 		return &ExecError{Code: "55000",
 			Message: fmt.Sprintf("publication \"%s\" is defined as FOR ALL TABLES", s.Name),
-			Detail:  "Tables cannot be added to or dropped from FOR ALL TABLES publications."}
+			Detail:  detail}
+	}
+	if err := o.alterPublicationSchemas(s, pub, dbOid); err != nil {
+		return err
+	}
+	if len(s.Tables) == 0 && s.Action != "set" {
+		// ADD / DROP TABLES IN SCHEMA only: the table list is unchanged.
+		return nil
 	}
 	type member struct{ qname, name string }
 	var listed []member
@@ -1723,6 +1746,116 @@ func (o *ddlOp) execAlterPublicationTables(s *parser.AlterPublicationTablesStmt)
 		return fmt.Errorf("pg_publication_rel journal: %w", err)
 	}
 	deletePublicationMemberRows(o.ctx, updated.OID, removed)
+	return nil
+}
+
+// resolvePublicationSchemas resolves FOR TABLES IN SCHEMA items to schema
+// names (ObjectsInPublicationToOids): CURRENT_SCHEMA is the first existing
+// search_path schema, a missing schema is 3F000, a system or temporary
+// schema 22023 (CheckPubRelationColumnList's sibling check in
+// PublicationAddSchemas), and duplicates collapse (list_append_unique_oid).
+func (o *ddlOp) resolvePublicationSchemas(items []string) ([]string, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	im, _ := o.ctx.Catalog.(*catalog.InMemory)
+	var out []string
+	seen := map[string]bool{}
+	for _, name := range items {
+		if name == parser.PubCurrentSchema {
+			d, derr := currentSchemaFromSearchPath(o.ctx)
+			if derr != nil {
+				return nil, derr
+			}
+			if d.IsNull() || d.StringValue() == "" {
+				return nil, &ExecError{Code: "3F000", Message: "no schema has been selected for CURRENT_SCHEMA"}
+			}
+			name = d.StringValue()
+		}
+		lc := strings.ToLower(name)
+		if lc == "pg_catalog" || lc == "information_schema" || lc == "pg_toast" || strings.HasPrefix(lc, "pg_temp") || strings.HasPrefix(lc, "pg_toast_temp") {
+			return nil, &ExecError{Code: "22023",
+				Message: fmt.Sprintf("cannot add schema \"%s\" to publication", name),
+				Detail:  "This operation is not supported for system schemas."}
+		}
+		if im == nil || !im.SchemaExists(name, dbOid) {
+			return nil, &ExecError{Code: "3F000", Message: fmt.Sprintf("schema \"%s\" does not exist", name)}
+		}
+		if !seen[lc] {
+			seen[lc] = true
+			out = append(out, name)
+		}
+	}
+	return out, nil
+}
+
+// alterPublicationSchemas applies the TABLES IN SCHEMA part of ALTER
+// PUBLICATION ... ADD / DROP / SET (AlterPublicationSchemas): ADD of a
+// member is 42710, DROP of a non-member 42704, and SET replaces the list —
+// including with nothing when SET names only tables.
+func (o *ddlOp) alterPublicationSchemas(s *parser.AlterPublicationTablesStmt, pub *catalog.Publication, dbOid uint32) error {
+	if len(s.Schemas) == 0 && s.Action != "set" {
+		return nil
+	}
+	listed, err := o.resolvePublicationSchemas(s.Schemas)
+	if err != nil {
+		return err
+	}
+	current := map[string]bool{}
+	for _, sch := range pub.Schemas {
+		current[strings.ToLower(sch)] = true
+	}
+	var next []string
+	switch s.Action {
+	case "add":
+		next = append(next, pub.Schemas...)
+		for _, sch := range listed {
+			if current[strings.ToLower(sch)] {
+				return &ExecError{Code: "42710", Message: fmt.Sprintf("schema \"%s\" is already member of publication \"%s\"", sch, s.Name)}
+			}
+			next = append(next, sch)
+		}
+	case "drop":
+		drop := map[string]bool{}
+		for _, sch := range listed {
+			if !current[strings.ToLower(sch)] {
+				return &ExecError{Code: "42704", Message: fmt.Sprintf("tables from schema \"%s\" are not part of the publication", sch)}
+			}
+			drop[strings.ToLower(sch)] = true
+		}
+		for _, sch := range pub.Schemas {
+			if !drop[strings.ToLower(sch)] {
+				next = append(next, sch)
+			}
+		}
+	default: // set
+		next = listed
+	}
+	updated, err := o.ctx.PubSub.SetPublicationSchemas(s.Name, next, dbOid)
+	if err != nil {
+		return &ExecError{Code: "42704", Message: err.Error()}
+	}
+	nextSet := map[string]bool{}
+	for _, sch := range next {
+		nextSet[strings.ToLower(sch)] = true
+	}
+	var added, removed []string
+	for _, sch := range next {
+		if !current[strings.ToLower(sch)] {
+			added = append(added, sch)
+		}
+	}
+	for _, sch := range pub.Schemas {
+		if !nextSet[strings.ToLower(sch)] {
+			removed = append(removed, sch)
+		}
+	}
+	if err := writePublicationNamespaceRows(o.ctx, updated, added); err != nil {
+		return fmt.Errorf("pg_publication_namespace journal: %w", err)
+	}
+	deletePublicationNamespaceRows(o.ctx, updated.OID, removed)
+	pub.Schemas = updated.Schemas
 	return nil
 }
 
@@ -9981,7 +10114,20 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			return err
 		}
 		oldSchema, oldBare := tbl.Schema, tbl.Name
-		tbl.Schema = s.SetSchema
+		// Re-key the relation (and its indexes) under the new schema: a bare
+		// tbl.Schema assignment left the catalog map keyed by the old
+		// qualified name, so `newschema.t` did not resolve afterwards
+		// (AlterTableNamespaceInternal). M0149-0053b.
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && !tbl.IsSequence {
+			if err := im.SetTableSchema(tbl, s.SetSchema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
+				if errors.Is(err, catalog.ErrRelationExistsInSchema) {
+					return &ExecError{Code: "42P07", Pos: s.Pos(), Message: fmt.Sprintf("relation \"%s\" already exists in schema \"%s\"", tbl.Name, s.SetSchema)}
+				}
+				return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
+			}
+		} else {
+			tbl.Schema = s.SetSchema
+		}
 		if tbl.IsSequence {
 			// Mirror the AlterTableRenameTable cascade below: the sequence
 			// registry key is schema-qualified, so a bare tbl.Schema update
