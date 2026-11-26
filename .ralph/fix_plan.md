@@ -17286,11 +17286,43 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/subscription/t/034_temporal.pl` — temporal PK/UNIQUE \(`WITHOUT OVERLAPS`\) as replica identity.
   Likely prerequisites \(verify at start\): PG 18 `WITHOUT OVERLAPS` constraints, replica-identity rules and error texts.
-- [ ] **M0149-0056 — port subscription/t/035_conflicts.pl**
+  - 2026\-11\-27: skipped as `detour` \(ANTI\-DETOUR RULE\). Probe: `PRIMARY KEY (id, valid_at WITHOUT OVERLAPS)` is a syntax error, and a UNIQUE index on int4range fails "btree v0 only supports int4 / numeric keys". Path\-to\-TAP 034 ← WITHOUT OVERLAPS grammar \+ temporal constraint ← exclusion/GiST overlap enforcement ← range\-typed index keys ← GiST\-backed replica identity in apply — more than 3 links. Took M0149\-0056.
+
+- [x] **M0149-0056 — port subscription/t/035_conflicts.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/035_conflicts.pl` — `multiple_unique_conflicts` detection.
   Likely prerequisites \(verify at start\): apply-side conflict detection and PG log text, `pg_stat_subscription_stats` conflict counters.
+  - 2026\-11\-27 \(progress\): TestPort\_Subscription035Conflicts written, gated GOOPG\_TAP\_035. goopg\-publisher\-pg18\-subscriber passes as is; a goopg subscriber logs nothing — the apply worker inserted rows violating unique indexes \(0056a\), and a row for a partitioned table went into the parent's heap \(0056b\).
+  - 2026\-11\-27 \(done\): 0056a \+ 0056b \+ 0056c landed; 035 ungated, 3/3 x 3; inventory 035 → port.
+  Movement: yes — tap 035 all-goopg 0/3 -> 3/3, pg18-publisher-goopg-subscriber 0/3 -> 3/3 (3/3 x 3 pairings); 035 port
+- [x] **M0149-0056a — the apply worker detects unique\-key conflicts and reports them as ReportApplyConflict does**
+  Kind: impl
+  Parent: M0149-0056
+  - 035 \(goopg subscriber\): `INSERT (2,3,4)` against local \(2,2,2\), \(3,3,3\), \(4,4,4\) was applied as a duplicate — apply maintained unique indexes without checking them. PG: InitConflictIndexes, CheckAndReportConflict / FindConflictTuple, conflict.c ReportApplyConflict \(insert\_exists / update\_exists / multiple\_unique\_conflicts\).
+  - Path\-to\-TAP: 035 goopg\-subscriber pairings ← 0056a \(1 link\).
+  - 2026\-11\-27 \(done\): applyworker\_conflict.go — applyConflictIndexes \(immediate unique, OID order\), applyFindConflicts \(index probe per index, the UPDATE's own row skipped\), applyConflictError \(23505, PG errmsg \+ detail\), pgServerLogText \(DETAIL with tab\-indented lines\) logged by ApplyMessage; applyInsert / applyUpdate raise it. Tests TestApplyConflictErrorFormat.
+  Movement: yes — tap 035 goopg-subscriber pairings 0/3 -> 2/3
+- [x] **M0149-0056b — the apply worker routes an INSERT for a partitioned table to its leaf**
+  Kind: impl
+  Parent: M0149-0056
+  - 035 \(goopg subscriber\): conf\_tab\_2 is partitioned on the subscriber only; apply wrote the row into the parent's heap. PG: apply\_handle\_tuple\_routing \(ExecFindPartition\).
+  - Path\-to\-TAP: 035 goopg\-subscriber pairings ← 0056b \(1 link\).
+  - 2026\-11\-27 \(done\): applyInsert routes through routeToPartition and remaps the row to the leaf; triggers, generated columns, conflict check and indexes use the leaf. UPDATE / DELETE routing is not done \(ledger\).
+  Movement: yes — tap 035 third conflict reported on conf\_tab\_2\_p1
+- [x] **M0149-0056c — partition clones of a parent unique index get PG's names and order**
+  Kind: impl
+  Parent: M0149-0056
+  - 035 \(goopg subscriber\): the leaf's clone of `UNIQUE (a, b)` was named conf\_tab\_2\_p1\_key \(PG: conf\_tab\_2\_p1\_a\_b\_key\) and created before the pkey clone, so the report listed the indexes in the wrong order. PG: ChooseIndexName / ChooseIndexNameAddition, RelationGetIndexList OID order.
+  - Path\-to\-TAP: 035 goopg\-subscriber pairings ← 0056c \(1 link\).
+  - 2026\-11\-27 \(done\): partitionCloneIndexName \+ indexesInOIDOrder in the PARTITION OF and ATTACH PARTITION clone loops. Test TestPartitionCloneIndexName.
+  Movement: yes — tap 035 goopg-subscriber pairings 2/3 -> 3/3
+- [ ] **M0149-0056d — update\_missing / delete\_missing, and no replay of an applied transaction after an apply error** \(filed 2026\-11\-27 by M0149\-0056; S2 — wrong results\)
+  Kind: impl
+  Parent: M0149-0056
+  - Observed in 035 after its last step: the worker restarts from the slot's confirmed position, re\-applies an already\-committed UPDATE whose old row is gone, installs the new row \(M0149\-0044c\), and then loops on update\_exists against that row. PG: replication origins \(replorigin\_session\_origin\_lsn\) skip transactions already applied; a missing row is the update\_missing / delete\_missing conflict, LOGged and skipped \(conflict.c, apply\_handle\_update\_internal\). Data\-correctness risk on any apply restart; not a 035 blocker.
+  - > **ESCALATION 2026\-11\-27 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: after any apply error the goopg apply worker re\-applies transactions it had already committed \(no replication\-origin progress\), and an UPDATE whose row is gone installs the new row — duplicated or diverging subscriber data. Per S2 the owner places it in the banner.
+
 - [ ] **M0149-0080 — re-port subscription/t/001_rep_changes.pl to the M0149 contract**
   Kind: impl
   Parent: none

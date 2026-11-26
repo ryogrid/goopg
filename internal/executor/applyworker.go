@@ -216,6 +216,10 @@ func (w *ApplyWorker) ApplyMessage(m *xlog.DecodedMessage) (uint64, error) {
 	default:
 		err = fmt.Errorf("applyworker: unsupported pgoutput kind %q", m.Kind)
 	}
+	if ee, ok := isApplyConflictError(err); ok {
+		// ReportApplyConflict's ERROR, as PG's server log shows it.
+		w.log().Error(pgServerLogText(ee))
+	}
 	if err != nil {
 		w.log().Error("logical apply: per-message failure",
 			"event", xlog.EventApplyError,
@@ -328,17 +332,44 @@ func (w *ApplyWorker) applyInsert(m *xlog.DecodedMessage) error {
 	ctx.TxnMgr = w.txnMgr
 	ctx.Tx = w.currentTx
 	ctx.CurrentDatabaseOid = w.dbOid()
+	// The conflict search (applyFindConflicts) reads under the apply
+	// transaction's snapshot.
+	if w.txnMgr != nil {
+		if snap, serr := w.txnMgr.SnapshotFor(w.currentTx); serr == nil {
+			ctx.Snap = snap
+		}
+	}
 	// A subscriber-only serial or identity column takes its sequence's
 	// next value, as slot_fill_defaults' nextval() default does in PG
 	// (goopg keeps that nextval out of DefaultExpr). M0149-0044a.
 	autoGenerateSerialValues(ctx, r.local.Name, r.local.Columns, row, missing)
 
+	// apply_handle_tuple_routing: a partitioned local table takes the row
+	// into the leaf partition it routes to (ExecFindPartition), whose
+	// triggers, generated columns, indexes and conflict report apply.
+	// M0149-0056b.
+	tgt := r.local
+	if len(r.local.PartitionKey) > 0 {
+		im, ok := underlyingInMemory(w.cat)
+		if !ok {
+			return fmt.Errorf("applyworker: INSERT into partitioned %q needs an in-memory catalog", r.local.Name)
+		}
+		leaf, rerr := routeToPartition(r.local, row, im, ctx)
+		if rerr != nil {
+			return rerr
+		}
+		if leaf != r.local {
+			row = remapParentRowToChild(row, nil, r.local.Columns, leaf.Columns)
+			tgt = leaf
+		}
+	}
+
 	// ExecSimpleRelationInsert: BEFORE ROW triggers may replace the row
 	// or skip it (RETURN NULL). M0149-0040c.
 	trigCtx := w.triggerContext(ctx)
-	row, keep, err := fireTriggers(trigCtx, r.local, "before", "insert", nil, row)
+	row, keep, err := fireTriggers(trigCtx, tgt, "before", "insert", nil, row)
 	if err != nil {
-		return fmt.Errorf("applyworker: BEFORE INSERT trigger on %q: %w", r.local.Name, err)
+		return fmt.Errorf("applyworker: BEFORE INSERT trigger on %q: %w", tgt.Name, err)
 	}
 	if !keep {
 		return nil
@@ -346,12 +377,21 @@ func (w *ApplyWorker) applyInsert(m *xlog.DecodedMessage) error {
 	// ExecComputeStoredGenerated after the BEFORE ROW triggers: the
 	// subscriber computes its own generated columns (a published column
 	// never maps onto one — columnMap rejects that).
-	_ = computeGeneratedColumns(r.local.Columns, row)
+	_ = computeGeneratedColumns(tgt.Columns, row)
 
-	rel := w.cat.RelFileNode(r.local)
-	ptr, err := writeHeapRowReturning(ctx, rel, r.local.Columns, row)
+	rel := w.cat.RelFileNode(tgt)
+	// insert_exists / multiple_unique_conflicts (CheckAndReportConflict).
+	// M0149-0056a.
+	conflicts, err := applyFindConflicts(ctx, rel, tgt, tgt.Columns, row, nil)
 	if err != nil {
-		return fmt.Errorf("applyworker: writeHeapRow %q: %w", r.local.Name, err)
+		return err
+	}
+	if len(conflicts) > 0 {
+		return applyConflictError(ctx, tgt, tgt.Columns, "insert_exists", conflicts, row)
+	}
+	ptr, err := writeHeapRowReturning(ctx, rel, tgt.Columns, row)
+	if err != nil {
+		return fmt.Errorf("applyworker: writeHeapRow %q: %w", tgt.Name, err)
 	}
 	// Maintain unique/primary-key indexes so fresh-session queries
 	// using equality predicates on indexed columns find the row.
@@ -359,9 +399,9 @@ func (w *ApplyWorker) applyInsert(m *xlog.DecodedMessage) error {
 	// though SeqScan still sees the tuple — the M0103-0007 rung-1
 	// fresh-session visibility gap surfaced in
 	// `TestPubSubClusterSmokePGToGoopgFreshSessionVisibility`.
-	maintainUniqueIndexesForInsert(ctx, r.local, r.local.Columns, row, ptr)
-	if err := queueAfterRowTriggers(trigCtx, r.local, "insert", nil, row, nil); err != nil {
-		return fmt.Errorf("applyworker: AFTER INSERT trigger on %q: %w", r.local.Name, err)
+	maintainUniqueIndexesForInsert(ctx, tgt, tgt.Columns, row, ptr)
+	if err := queueAfterRowTriggers(trigCtx, tgt, "insert", nil, row, nil); err != nil {
+		return fmt.Errorf("applyworker: AFTER INSERT trigger on %q: %w", tgt.Name, err)
 	}
 	return nil
 }
@@ -543,6 +583,19 @@ func (w *ApplyWorker) applyUpdate(m *xlog.DecodedMessage) error {
 			}
 		}
 	}
+	// update_exists / multiple_unique_conflicts: another local row already
+	// holds one of the new row's unique keys. M0149-0056a.
+	var skip *storage.ItemPointer
+	if found != nil {
+		skip = &found.ptr
+	}
+	conflicts, err := applyFindConflicts(ctx, rel, r.local, r.local.Columns, newRow, skip)
+	if err != nil {
+		return err
+	}
+	if len(conflicts) > 0 {
+		return applyConflictError(ctx, r.local, r.local.Columns, "update_exists", conflicts, newRow)
+	}
 	if err := applyUpdateFound(ctx, rel, r.local, r.local.Columns, found, newRow); err != nil {
 		return err
 	}
@@ -631,9 +684,6 @@ func (w *ApplyWorker) applyContext() *Context {
 	return ctx
 }
 
-// applyDeleteByKey scans rel for a visible tuple whose decoded columns
-// match keyRow (equality on all non-null key columns) and stamps xmax
-// on each match. Designed for the apply worker's DELETE path.
 // applyFillFromOld copies the located old row's values into newRow for the
 // cells the publisher did not send: 'u' (unchanged TOAST) columns and
 // subscriber-only columns, which an UPDATE must not reset to NULL.

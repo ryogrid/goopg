@@ -103,28 +103,44 @@ func columnPosition(cols []catalog.Column, name string) int {
 // applyFoundTuple is the located row: its heap TID (the visible chain
 // member) and a copy of its decoded columns.
 type applyFoundTuple struct {
-	ptr storage.ItemPointer
-	row Row
+	ptr  storage.ItemPointer
+	row  Row
+	xmin uint32
 }
 
 // applyFindTuple finds the first visible row of rel matching keyRow
 // (rowMatchesKeyCollated), through idx when one is given and a probe can be
 // built, by heap scan otherwise. A nil result means no row matched.
 func applyFindTuple(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, keyRow Row, idx *catalog.Index) (*applyFoundTuple, error) {
+	return applyFindTupleSkip(ctx, rel, tbl, cols, keyRow, idx, nil)
+}
+
+// applyFindTupleSkip is applyFindTuple ignoring the tuple at skip (the row
+// an UPDATE is replacing, when looking for another row with its new key).
+func applyFindTupleSkip(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, keyRow Row, idx *catalog.Index, skip *storage.ItemPointer) (*applyFoundTuple, error) {
+	return applyFindTupleOpts(ctx, rel, tbl, cols, keyRow, idx, skip, true)
+}
+
+// applyFindTupleOpts is applyFindTupleSkip; countScan says whether an index
+// lookup counts as an index scan (pg_stat_all_indexes.idx_scan). The
+// row-locating lookup does (RelationFindReplTupleByIndex); the unique-
+// conflict search does not — PG detects a conflict while inserting the
+// index entry (_bt_check_unique), which counts no scan.
+func applyFindTupleOpts(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, keyRow Row, idx *catalog.Index, skip *storage.ItemPointer, countScan bool) (*applyFoundTuple, error) {
 	colls := nondeterministicCollators(ctx, cols)
 	if idx != nil && tbl != nil {
-		if found, used, err := applyFindTupleByIndex(ctx, rel, tbl, cols, keyRow, idx, colls); used || err != nil {
+		if found, used, err := applyFindTupleByIndex(ctx, rel, tbl, cols, keyRow, idx, colls, skip, countScan); used || err != nil {
 			return found, err
 		}
 	}
-	return applyFindTupleSeq(ctx, rel, cols, keyRow, colls)
+	return applyFindTupleSeq(ctx, rel, cols, keyRow, colls, skip)
 }
 
 // applyFindTupleByIndex is RelationFindReplTupleByIndex. used is false when
 // the index cannot serve this key (no plain leading column with a value, or
 // an index whose entries may omit NULL-keyed rows), and the caller scans the
 // heap instead.
-func applyFindTupleByIndex(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, keyRow Row, idx *catalog.Index, colls []*collate.Collator) (*applyFoundTuple, bool, error) {
+func applyFindTupleByIndex(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, keyRow Row, idx *catalog.Index, colls []*collate.Collator, skip *storage.ItemPointer, countScan bool) (*applyFoundTuple, bool, error) {
 	// An index that does not store NULL-keyed entries (the blob format, or a
 	// cluster without the capability — goopg's interim guard) omits a row
 	// with a NULL key, so it can serve the lookup only when the row being
@@ -171,7 +187,9 @@ func applyFindTupleByIndex(ctx *Context, rel storage.RelFileNode, tbl *catalog.T
 	if err != nil {
 		return nil, false, nil
 	}
-	recordApplyIndexScan(ctx, idx.OID)
+	if countScan {
+		recordApplyIndexScan(ctx, idx.OID)
+	}
 	var found *applyFoundTuple
 	scanRow := make(Row, len(cols))
 	err = tree.RangeScan(lo, hi, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
@@ -184,8 +202,12 @@ func applyFindTupleByIndex(ctx *Context, rel storage.RelFileNode, tbl *catalog.T
 			if !transam.TupleVisibleSubxact(t.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				return true
 			}
+			here := storage.ItemPointer{Block: ptr.Block, Offset: mslot}
+			if skip != nil && here == *skip {
+				return false
+			}
 			if err := DecodeHeapTupleRowInto(scanRow, cols, t, nil); err == nil && rowMatchesKeyCollated(scanRow, keyRow, colls) {
-				found = &applyFoundTuple{ptr: storage.ItemPointer{Block: ptr.Block, Offset: mslot}, row: append(Row(nil), scanRow...)}
+				found = &applyFoundTuple{ptr: here, row: append(Row(nil), scanRow...), xmin: uint32(t.Header.Xmin)}
 			}
 			return false
 		})
@@ -223,7 +245,7 @@ func applyIndexHasEntryFor(ctx *Context, idx *catalog.Index, tbl *catalog.Table,
 
 // applyFindTupleSeq is RelationFindReplTupleSeq: the first visible heap
 // row matching keyRow.
-func applyFindTupleSeq(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, keyRow Row, colls []*collate.Collator) (*applyFoundTuple, error) {
+func applyFindTupleSeq(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, keyRow Row, colls []*collate.Collator, skip *storage.ItemPointer) (*applyFoundTuple, error) {
 	nBlocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return nil, err
@@ -258,8 +280,11 @@ func applyFindTupleSeq(ctx *Context, rel storage.RelFileNode, cols []catalog.Col
 			if err := DecodeHeapTupleRowInto(scanRow, cols, tup, nil); err != nil {
 				continue
 			}
+			if skip != nil && skip.Block == blk && skip.Offset == slot {
+				continue
+			}
 			if rowMatchesKeyCollated(scanRow, keyRow, colls) {
-				out := &applyFoundTuple{ptr: storage.ItemPointer{Block: blk, Offset: slot}, row: append(Row(nil), scanRow...)}
+				out := &applyFoundTuple{ptr: storage.ItemPointer{Block: blk, Offset: slot}, row: append(Row(nil), scanRow...), xmin: uint32(tup.Header.Xmin)}
 				s.RUnlock()
 				ctx.Pool.Unpin(s)
 				return out, nil

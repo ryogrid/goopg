@@ -6637,20 +6637,11 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	// child partition.  Naming uses the standard auto-generated form
 	// (`<child>_pkey` for PRIMARY, `<child>_<col>_key` for UNIQUE) so
 	// adjacency between catalog/btree state and pg_class is predictable.
-	for _, parentIdx := range o.ctx.Catalog.IndexesOnTable(parent, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+	for _, parentIdx := range indexesInOIDOrder(o.ctx.Catalog.IndexesOnTable(parent, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))) {
 		if parentIdx.Method != "btree" || (!parentIdx.Primary && !parentIdx.Unique) {
 			continue
 		}
-		var childIdxName parser.ObjectName
-		if parentIdx.Primary {
-			childIdxName = parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_pkey"}
-		} else {
-			suffix := "_key"
-			if len(parentIdx.Columns) == 1 {
-				suffix = "_" + parentIdx.Columns[0] + "_key"
-			}
-			childIdxName = parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + suffix}
-		}
+		childIdxName := parser.ObjectName{Schema: s.Name.Schema, Name: partitionCloneIndexName(tbl.Name, parentIdx)}
 		// M0134-0005f: forward the parent constraint index's Deferrable/
 		// InitiallyDeferred/IsConstraint so the clone honours SET CONSTRAINTS
 		// … DEFERRED and appears in pg_constraint — see btreeIndexProps'
@@ -11063,7 +11054,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// upsertOp's arbiter probe and insertOp's unique-constraint check both
 			// miss live duplicates. Only create when the child doesn't already
 			// have a matching index. M0097-0028.
-			for _, parentIdx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+			for _, parentIdx := range indexesInOIDOrder(o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))) {
 				if parentIdx.Method != "btree" {
 					continue
 				}
@@ -11117,16 +11108,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 					continue
 				}
-				var childIdxName parser.ObjectName
-				if parentIdx.Primary {
-					childIdxName = parser.ObjectName{Schema: childTbl.Schema, Name: childTbl.Name + "_pkey"}
-				} else {
-					suffix := "_key"
-					if len(parentIdx.Columns) == 1 {
-						suffix = "_" + parentIdx.Columns[0] + "_key"
-					}
-					childIdxName = parser.ObjectName{Schema: childTbl.Schema, Name: childTbl.Name + suffix}
-				}
+				childIdxName := parser.ObjectName{Schema: childTbl.Schema, Name: partitionCloneIndexName(childTbl.Name, parentIdx)}
 				// M0134-0005f: same forwarding as the PARTITION OF clone loop
 				// above — see btreeIndexProps' doc comment.
 				_ = o.createBTreeIndex(act.Pos(), childIdxName, childTbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct, parentIdx.ColDescending, parentIdx.ColNullsFirst, &btreeIndexProps{
@@ -30333,4 +30315,34 @@ func attachIndexMatches(parent, child *catalog.Index) bool {
 		}
 	}
 	return true
+}
+
+// partitionCloneIndexName is the name DefineIndex gives the index it clones
+// onto a partition for a parent primary key / unique index:
+// ChooseIndexName → ChooseRelationName(child, ChooseIndexNameAddition(cols),
+// "pkey" | "key") — the key columns joined by "_" ("expr" for an
+// expression column). goopg had used "<child>_key" for any multi-column
+// unique index, so conflict reports named "conf_tab_2_p1_key" where PG says
+// "conf_tab_2_p1_a_b_key" (035_conflicts, M0149-0056c). Uniquifying a taken
+// name (ChooseRelationName's numeric suffix) is not modelled here.
+func partitionCloneIndexName(child string, parentIdx *catalog.Index) string {
+	if parentIdx.Primary {
+		return child + "_pkey"
+	}
+	parts := make([]string, 0, len(parentIdx.Columns))
+	for _, c := range parentIdx.Columns {
+		if c == "" {
+			c = "expr"
+		}
+		parts = append(parts, c)
+	}
+	return child + "_" + strings.Join(parts, "_") + "_key"
+}
+
+// indexesInOIDOrder is RelationGetIndexList's order (index OID), which
+// DefineIndex's partition cascade and the clone loops follow.
+func indexesInOIDOrder(idxs []*catalog.Index) []*catalog.Index {
+	out := append([]*catalog.Index(nil), idxs...)
+	sortIndexesByOID(out)
+	return out
 }
