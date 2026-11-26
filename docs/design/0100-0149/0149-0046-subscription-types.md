@@ -18,7 +18,7 @@ is one link from the TAP test:
 | M0149\-0046a \(done\) | NULL array elements were refused \("NULL array elements are not supported"\) |
 | M0149\-0046b \(done\) | btree keys on composite types: "btree v0 only supports int4 / numeric keys" for the four composite\-keyed tables |
 | M0149\-0046c \(done\) | composite fields are not coerced to their column types: `ROW(1.0, 'a', 1)` into \(float8, text, int\) prints `(1.0,a,1)`, not `(1,a,1)`; an array field keeps its input spelling `{a, b, c}` |
-| M0149\-0046d | range input is not canonicalised: int4range `'[1, 10]'` stays `[1, 10]`, not `[1,11)` |
+| M0149\-0046d \(done\) | range input is not canonicalised: int4range `'[1, 10]'` stays `[1, 10]`, not `[1,11)` |
 | M0149\-0046e | range output ignores the session TimeZone: tstzrange bounds print at \+00 under `SET timezone = '+2'` |
 | M0149\-0046f | no hstore extension |
 
@@ -97,3 +97,19 @@ and uniqueness was not enforced. The swallowed index\-insert error is filed as M
 
 All of 002's array, enum and composite tables now read exactly as on PG on a goopg node. Ranges and hstore remain
 \(0046d–f\).
+
+## Landed — M0149\-0046d, range\_in at assignment and in range arrays
+
+goopg's `rangeIn` already canonicalised a discrete range: `'[1, 10]'::int4range` is `[1,11)`, via
+int4range\_canonical, int8range\_canonical and daterange\_canonical. It was missing in two places:
+
+- **Assignment.** INSERT / UPDATE stored a range column's literal as typed \(`[1, 10]`\).
+  `coerceRowForConstraintChecks` now runs range columns through evalCast and range\-array columns through
+  `arrayInElems`.
+- **Array casts.** `'{"[1,2]"}'::int8range[]` kept its elements. evalCast's array\-target arm now runs range
+  elements through range\_in.
+
+`rangeColumnType` covers the six built\-ins and user range types. Built\-in scalar names skip the catalog lookup.
+
+The rangetypes regress case went from 463 to 444 mismatched lines. 002's range tables match PG, except tstzrange
+output in the session TimeZone \(0046e\).

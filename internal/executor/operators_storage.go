@@ -2863,6 +2863,25 @@ func coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i
 		// (M0149-0046c): ROW(1.0,'a',1) into a (float8, text, int) column is
 		// stored as (1,a,1), as PG's assignment coercion stores it.
 		if row[i].Kind == KindString {
+			// A range column (or an array of one) takes range_in, which
+			// canonicalizes a discrete range: '[1, 10]' into an int4range
+			// column is stored as [1,11) (M0149-0046d).
+			if rangeColumnType(ctx, col.Type.Name) {
+				var coerced Datum
+				var cerr error
+				if col.Type.IsArray {
+					var out string
+					out, cerr = arrayInElems(ctx, col.Type.Name, row[i].StringValue(), pos)
+					coerced = NewStringDatum(out)
+				} else {
+					coerced, cerr = evalCast(row[i], col.Type.Name, pos, ctx)
+				}
+				if cerr != nil {
+					return cerr
+				}
+				row[i] = coerced
+				continue
+			}
 			if _, ok := compositeCastTarget(ctx, col.Type.Name); ok {
 				target := col.Type.Name
 				if col.Type.IsArray {

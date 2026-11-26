@@ -132,3 +132,19 @@ func capitalizeDetail(s string) string {
 	}
 	return strings.ToUpper(s[:1]) + s[1:] + "."
 }
+
+// rangeColumnType reports whether typeName is a range type (a built-in or a
+// CREATE TYPE … AS RANGE type), for range_in at assignment and in array
+// casts (M0149-0046d). Built-in scalar names answer false without a catalog
+// lookup.
+func rangeColumnType(ctx *Context, typeName string) bool {
+	lower := strings.ToLower(strings.TrimSpace(typeName))
+	if _, ok := builtinRangeTypes[lower]; ok {
+		return true
+	}
+	if oid := catalog.TypeNameToOID(lower); oid != catalog.OIDText || lower == "text" {
+		return false
+	}
+	_, ok := lookupRangeTypeForIO(lower, ctx)
+	return ok
+}

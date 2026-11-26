@@ -6117,6 +6117,14 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 	// element type name is how an array-of-composite column assigns.
 	if d.Kind == KindString && ctx != nil {
 		elemTarget, isArrTarget := strings.CutSuffix(strings.TrimSpace(targetType), "[]")
+		// An array of ranges: range_in per element (M0149-0046d).
+		if isArrTarget && rangeColumnType(ctx, elemTarget) {
+			out, err := arrayInElems(ctx, elemTarget, d.StringValue(), pos)
+			if err != nil {
+				return Datum{}, err
+			}
+			return NewStringDatum(out), nil
+		}
 		if fields, ok := compositeCastTarget(ctx, elemTarget); ok {
 			sv := d.StringValue()
 			if isArrTarget || strings.HasPrefix(strings.TrimSpace(sv), "{") {

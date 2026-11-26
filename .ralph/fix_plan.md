@@ -16975,10 +16975,12 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: none
   - Nearby defect \(found by M0149\-0046c\), filed, not worked. Before the enum\-label fix, an INSERT into a table whose composite PK had an enum field succeeded, but the row was missing from the PK index: an ordered index scan returned 0 rows and uniqueness went unchecked. encodeIndexKeyFromCols returns the encode error, so a caller on the row\-insert path \(pgindex\_btree.go tuple\-format funnel or its caller\) treats the error as "no entry". PG raises the error and the INSERT fails.
-- [ ] **M0149-0046d — range input canonicalised**
+- [x] **M0149-0046d — range input canonicalised**
   Kind: impl
   Parent: M0149-0046
   - int4range `'\[1, 10\]'` is stored as written \(`\[1, 10\]`\); PG range\_in \+ int4range\_canonical gives `\[1,11\)`. The same applies to int8range elements of an int8range\[\].
+  - 2026\-11\-26 \(done\): coerceRowForConstraintChecks routes range columns through evalCast \(range\_in\) and range\-array columns through arrayInElems; evalCast's "\[\]" arm does the same for range element types. rangeColumnType covers built\-in and user range types. Unit test TestRangeInAtAssignment.
+  - Movement: regress rangetypes 463→444; 002's range tables match PG except tstzrange TimeZone output \(0046e\).
 - [ ] **M0149-0046e — range output follows the session TimeZone**
   Kind: impl
   Parent: M0149-0046

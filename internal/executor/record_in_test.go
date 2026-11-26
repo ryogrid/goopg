@@ -1,6 +1,10 @@
 package executor
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
+)
 
 // TestRecordInNormalizesFields pins record_in for composite casts and
 // assignment (M0149-0046c): each field goes through its type's input and
@@ -48,5 +52,47 @@ func TestRecordInNormalizesFields(t *testing.T) {
 		} else if ee, ok := err.(*ExecError); !ok || ee.Code != "22P02" {
 			t.Errorf("%s::cb46: err %v, want 22P02", bad, err)
 		}
+	}
+}
+
+// TestRangeInAtAssignment pins range_in for range columns and range arrays
+// (M0149-0046d): INSERT / UPDATE assignment and array casts canonicalize a
+// discrete range — '[1, 10]' into int4range is [1,11), '(1, 90)' is
+// [2,90), an int8range[] element likewise, NULL elements kept — while a
+// continuous range (numrange) keeps its bounds' inclusivity. goopg stored
+// the literal as typed, so subscription/t/002_types.pl's range tables read
+// [1, 10] where PG reads [1,11).
+func TestRangeInAtAssignment(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	for _, tc := range []struct{ typ, in, want string }{
+		{"int8range[]", `{"[1,2]", "[10,20]"}`, `{"[1,3)","[10,21)"}`},
+		{"int8range[]", `{NULL, "[11,9999999]"}`, `{NULL,"[11,10000000)"}`},
+		{"numrange[]", `{"[1.5,2.5]"}`, `{"[1.5,2.5]"}`},
+	} {
+		d, err := evalCast(NewStringDatum(tc.in), tc.typ, 0, ctx)
+		if err != nil {
+			t.Fatalf("%s::%s: %v", tc.in, tc.typ, err)
+		}
+		if d.StringValue() != tc.want {
+			t.Errorf("%s::%s = %s, want %s", tc.in, tc.typ, d.StringValue(), tc.want)
+		}
+	}
+	cols := []catalog.Column{
+		{Name: "b", Type: catalog.Type{Name: "int4range"}},
+		{Name: "d", Type: catalog.Type{Name: "int8range", IsArray: true}},
+		{Name: "t", Type: catalog.Type{Name: "text"}},
+	}
+	row := Row{NewStringDatum("[1, 10]"), NewStringDatum(`{"[4,5]", NULL}`), NewStringDatum("[1, 10]")}
+	if err := coerceRowForConstraintChecks(cols, row, func(int) bool { return true }, ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []string{"[1,11)", `{"[4,6)",NULL}`, "[1, 10]"} {
+		if row[i].StringValue() != want {
+			t.Errorf("column %s = %s, want %s", cols[i].Name, row[i].StringValue(), want)
+		}
+	}
+	if !rangeColumnType(ctx, "int4range") || rangeColumnType(ctx, "text") || rangeColumnType(ctx, "int4") {
+		t.Error("rangeColumnType misclassifies int4range / text / int4")
 	}
 }
