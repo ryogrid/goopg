@@ -3394,6 +3394,8 @@ func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory,
 					PublishDelete: decoded[6].BoolValue(),
 
 					PublishTruncate: decoded[7].BoolValue(),
+
+					PublishGeneratedColumns: pubGenColsFromHeap(decoded[9]),
 				},
 				tid: tid,
 			}, false, nil
@@ -4009,4 +4011,16 @@ func (r *Runtime) RefreshCatalogAfterReplay(dbOid uint32) error {
 		return err
 	}
 	return reloadUserRoutinesFromHeapForDBMode(r.StorageMgr, cat, clog, heapDB, true)
+}
+
+// pubGenColsFromHeap reads pg_publication.pubgencols; a row written before
+// goopg journaled it (9 attributes) reads NULL and means 'n'.
+func pubGenColsFromHeap(d executor.Datum) byte {
+	if d.IsNull() {
+		return 'n'
+	}
+	if v := d.StringValue(); v == "s" {
+		return 's'
+	}
+	return 'n'
 }

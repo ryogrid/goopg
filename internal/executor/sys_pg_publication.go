@@ -32,7 +32,7 @@ const (
 	pgPublicationRelPrrelidPrpubOID = 6113
 )
 
-// PGPublicationColumnsPG18 mirrors FormData_pg_publication (9 columns).
+// PGPublicationColumnsPG18 mirrors FormData_pg_publication (10 columns).
 // Exported for the initdb reload.
 func PGPublicationColumnsPG18() []catalog.Column {
 	return []catalog.Column{
@@ -45,6 +45,7 @@ func PGPublicationColumnsPG18() []catalog.Column {
 		{Name: "pubdelete", Type: catalog.Type{Name: "bool"}},
 		{Name: "pubtruncate", Type: catalog.Type{Name: "bool"}},
 		{Name: "pubviaroot", Type: catalog.Type{Name: "bool"}},
+		{Name: "pubgencols", Type: catalog.Type{Name: "char"}},
 	}
 }
 
@@ -74,6 +75,7 @@ func buildPGPublicationRow(pub *catalog.Publication) Row {
 		NewBoolDatum(pub.PublishDelete),
 		NewBoolDatum(pub.PublishTruncate),
 		NewBoolDatum(false), // pubviaroot — not modeled
+		NewStringDatum(string(pub.GenColsType())),
 	}
 }
 

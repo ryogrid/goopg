@@ -3596,7 +3596,7 @@ func publicationRowsForDBOid(ps *catalog.PubSub, dbOid uint32) [][]string {
 			boolToText(pub.PublishDelete),
 			boolToText(pub.PublishTruncate),
 			"f", // pubviaroot
-			"n", // pubgencols
+			string(pub.GenColsType()),
 		})
 	}
 	return out

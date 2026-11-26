@@ -17069,6 +17069,33 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/subscription/t/011_generated.pl` — generated columns in initial sync and apply.
   Likely prerequisites \(verify at start\): PG 18 `publish_generated_columns`, stored vs virtual generated columns on both sides.
+  - 2026\-11\-26 \(progress\): TestPort\_Subscription011Generated written \(three pairings\), gated GOOPG\_TAP\_011. First run: all\-goopg 2/12, pg18\-publisher\-goopg\-subscriber 1/12 \(fatal at the column\-list DDL in the goopg publisher pairings only\), goopg\-publisher\-pg18\-subscriber 0/12 \(tablesync stuck in d\).
+  - Path\-to\-TAP: each child below is one link from a failing 011 assertion.
+- [x] **M0149-0048a — a goopg publisher publishes only the columns logicalrep\_should\_publish\_column admits \(publish\_generated\_columns\)**
+  Kind: impl
+  Parent: M0149-0048
+  - 2026\-11\-26 \(done\): pubgencols modelled \(catalog, option parse, ALTER SET, heap attnum 10 \+ reload, views\); ColumnDef.Generated; PgOutput.publishedColumns masks Relation / new / old tuples; publicationFilter implements xlog.GenColsFilter. Unit test TestPgOutputGeneratedColumns.
+  Movement: yes — tap 011 all-goopg 2/12 -> 3/12 assertions; regress publication 597 -> 595
+- [ ] **M0149-0048b — pg\_get\_publication\_tables returns PG 18's \(pubid, relid, attrs int2vector, qual\) with the published attnums**
+  Kind: impl
+  Parent: M0149-0048
+  - 011 goopg\-publisher\-pg18\-subscriber: tablesync loops on "logical replication target relation "public.tab1" has incompatible generated columns: "b", "c"". fetch\_remote\_table\_info reads `CASE WHEN array_length(gpt.attrs, 1) = c.relnatts THEN NULL ELSE gpt.attrs END`; goopg's attrs is a NULL text column. PG: pg\_publication.c pg\_get\_publication\_tables \(attrs = non\-dropped, non\-virtual, stored only under pubgencols = s\). Touches the planner's SRF schema \(internal/optimizer/planner.go colNames relid/attrs/qual; analyzer.go\) — fireset \+ census gates.
+  - Path\-to\-TAP: 011 goopg\-publisher\-pg18\-subscriber ← 0048b \(1 link\).
+- [ ] **M0149-0048c — a goopg subscriber computes its own generated columns on apply and rejects a published column that maps to a local generated column**
+  Kind: impl
+  Parent: M0149-0048
+  - 011 pg18\-publisher\-goopg\-subscriber: applied rows read `4|||` \(b, c NULL; want 88, 132\); with the REPLICA trigger `8|||18`. The t1 case never logs "has incompatible generated columns: "c2", "c3"" \(PG: logicalrep\_rel\_open, worker.c / relation.c\).
+  - Path\-to\-TAP: 011 pg18\-publisher\-goopg\-subscriber \+ all\-goopg ← 0048c \(1 link\).
+- [ ] **M0149-0048d — goopg tablesync copies the publisher's published stored generated columns**
+  Kind: impl
+  Parent: M0149-0048
+  - 011 all\-goopg and pg18\-publisher\-goopg\-subscriber: tab\_gen\_to\_nogen initial sync with publish\_generated\_columns = stored reads `1|` \(want `1|2`\). PG 18 tablesync copy\_table uses COPY \(SELECT cols FROM t\) when gencol\_published.
+  - Path\-to\-TAP: 011 ← 0048d \(1 link\).
+- [ ] **M0149-0048e — publication column lists \(FOR TABLE t \(cols\)\)**
+  Kind: impl
+  Parent: M0149-0048
+  - 011 goopg publisher: `CREATE PUBLICATION pub1 FOR table tab2(gen1) …` → syntax error at or near "\(". pg18\-publisher\-goopg\-subscriber: tab2 initial sync reads `1|` \(goopg tablesync ignores the remote column list; want `|2`\). Needs grammar, pg\_publication\_rel.prattrs, the pgoutput column rule, pg\_get\_publication\_tables attrs and goopg tablesync.
+  - Path\-to\-TAP: 011 ← 0048e \(1 link\).
 - [ ] **M0149-0049 — port subscription/t/012_collation.pl**
   Kind: impl
   Parent: none

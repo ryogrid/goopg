@@ -38,6 +38,10 @@ type Publication struct {
 	// pgoutput_truncate sends a TRUNCATE only for a relation one of whose
 	// publications carries it.
 	PublishTruncate bool
+	// PublishGeneratedColumns is pg_publication.pubgencols: 'n' (none, the
+	// default; also 0) or 's' (stored — STORED generated columns are
+	// published; virtual ones never are).
+	PublishGeneratedColumns byte
 	// Tables are qualified table names ("schema.name") the
 	// publication is restricted to. Ignored when AllTables is
 	// true. Insertion order is preserved so views render rows
@@ -200,6 +204,8 @@ type PublicationOptions struct {
 	PublishUpdate   bool
 	PublishDelete   bool
 	PublishTruncate bool
+	// PublishGeneratedColumns is publish_generated_columns: 'n' or 's'.
+	PublishGeneratedColumns byte
 }
 
 // DefaultPublicationOptions returns the upstream-default option
@@ -212,6 +218,8 @@ func DefaultPublicationOptions() PublicationOptions {
 		PublishUpdate:   true,
 		PublishDelete:   true,
 		PublishTruncate: true,
+
+		PublishGeneratedColumns: 'n',
 	}
 }
 
@@ -256,6 +264,8 @@ func (p *PubSub) CreatePublicationAsOwner(name string, tables []string, opts Pub
 		DBOid:         oid,
 
 		PublishTruncate: opts.PublishTruncate,
+
+		PublishGeneratedColumns: opts.PublishGeneratedColumns,
 	}
 	if !opts.AllTables && len(tables) > 0 {
 		pub.Tables = append(pub.Tables, tables...)
@@ -381,6 +391,7 @@ func (p *PubSub) SetPublicationOptions(name string, opts PublicationOptions, dbO
 	}
 	pub.PublishInsert, pub.PublishUpdate, pub.PublishDelete = opts.PublishInsert, opts.PublishUpdate, opts.PublishDelete
 	pub.PublishTruncate = opts.PublishTruncate
+	pub.PublishGeneratedColumns = opts.PublishGeneratedColumns
 	out := *pub
 	out.Tables = append([]string(nil), pub.Tables...)
 	return &out, nil
@@ -917,4 +928,12 @@ func (p *PubSub) AllSubscriptionRels() []*SubscriptionRel {
 		}
 	}
 	return out
+}
+
+// GenColsType is pubgencols as a char: 's' for stored, 'n' otherwise.
+func (p *Publication) GenColsType() byte {
+	if p.PublishGeneratedColumns == 's' {
+		return 's'
+	}
+	return 'n'
 }

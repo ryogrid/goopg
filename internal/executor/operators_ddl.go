@@ -1499,7 +1499,18 @@ func applyPublicationOptions(with map[string]string, opts *catalog.PublicationOp
 					return &ExecError{Code: "42601", Message: fmt.Sprintf("unrecognized value for publication option \"publish\": \"%s\"", kind)}
 				}
 			}
-		case "publish_via_partition_root", "publish_generated_columns":
+		case "publish_generated_columns":
+			// defGetGeneratedColsOption (publicationcmds.c).
+			switch strings.ToLower(value) {
+			case "none":
+				opts.PublishGeneratedColumns = 'n'
+			case "stored":
+				opts.PublishGeneratedColumns = 's'
+			default:
+				return &ExecError{Code: "42601", Message: fmt.Sprintf("invalid value for publication parameter \"%s\": \"%s\"", name, value),
+					Detail: `Valid values are "none" and "stored".`}
+			}
+		case "publish_via_partition_root":
 		default:
 			return &ExecError{Code: "42601", Message: fmt.Sprintf("unrecognized publication parameter: \"%s\"", name)}
 		}
@@ -1522,7 +1533,8 @@ func (o *ddlOp) execAlterPublicationOptions(s *parser.AlterPublicationOptionsStm
 		return &ExecError{Code: "42704", Message: fmt.Sprintf("publication \"%s\" does not exist", s.Name)}
 	}
 	opts := catalog.PublicationOptions{AllTables: pub.AllTables, PublishInsert: pub.PublishInsert,
-		PublishUpdate: pub.PublishUpdate, PublishDelete: pub.PublishDelete, PublishTruncate: pub.PublishTruncate}
+		PublishUpdate: pub.PublishUpdate, PublishDelete: pub.PublishDelete, PublishTruncate: pub.PublishTruncate,
+		PublishGeneratedColumns: pub.GenColsType()}
 	if err := applyPublicationOptions(s.With, &opts); err != nil {
 		return err
 	}

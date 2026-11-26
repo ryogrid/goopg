@@ -504,6 +504,9 @@ type publicationFilter struct {
 // publication granting an action is enough.
 type allowFlags struct {
 	insert, update, delete, truncate bool
+	// gencolsStored: a publication covering the relation has
+	// publish_generated_columns = stored.
+	gencolsStored bool
 }
 
 func (f allowFlags) allowsKind(k xlog.ChangeKind) bool {
@@ -532,6 +535,21 @@ func (f *publicationFilter) Allows(rel *xlog.RelationDef, kind xlog.ChangeKind) 
 		return true
 	}
 	return false
+}
+
+// PublishesStoredGenerated implements xlog.GenColsFilter: a publication
+// that covers rel (FOR ALL TABLES or by name) has publish_generated_columns
+// = stored. PG requires every publication of a table to agree (pgoutput's
+// "cannot use different values of publish_generated_columns"); goopg
+// takes their union.
+func (f *publicationFilter) PublishesStoredGenerated(rel *xlog.RelationDef) bool {
+	if rel == nil {
+		return false
+	}
+	if f.allTablesAllowed.gencolsStored {
+		return true
+	}
+	return f.byTable[relQualifiedName(rel)].gencolsStored
 }
 
 // walsenderCatalogDBOidVar resolves the connection's database name to the
@@ -610,6 +628,8 @@ func buildPublicationFilter(ps *catalog.PubSub, names []string, dbOid ...uint32)
 			update:   pub.PublishUpdate,
 			delete:   pub.PublishDelete,
 			truncate: pub.PublishTruncate,
+
+			gencolsStored: pub.GenColsType() == 's',
 		}
 		if pub.AllTables {
 			out.allTablesAllowed = unionFlags(out.allTablesAllowed, flags)
@@ -656,6 +676,14 @@ func (f *livePublicationFilter) Allows(rel *xlog.RelationDef, kind xlog.ChangeKi
 	return f.cur.Allows(rel, kind)
 }
 
+// PublishesStoredGenerated implements xlog.GenColsFilter.
+func (f *livePublicationFilter) PublishesStoredGenerated(rel *xlog.RelationDef) bool {
+	if g := f.ps.PublicationGeneration(); g != f.gen {
+		f.refresh()
+	}
+	return f.cur.PublishesStoredGenerated(rel)
+}
+
 // unionFlags ORs the publish-flag bitsets — a relation gets the
 // most-permissive treatment across every publication that
 // covers it. Mirrors upstream's "any publication grants the
@@ -666,6 +694,8 @@ func unionFlags(a, b allowFlags) allowFlags {
 		update:   a.update || b.update,
 		delete:   a.delete || b.delete,
 		truncate: a.truncate || b.truncate,
+
+		gencolsStored: a.gencolsStored || b.gencolsStored,
 	}
 }
 

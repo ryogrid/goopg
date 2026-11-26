@@ -87,6 +87,14 @@ type RelationFilter interface {
 	Allows(rel *RelationDef, kind ChangeKind) bool
 }
 
+// GenColsFilter is implemented by a RelationFilter that knows the
+// publications' publish_generated_columns: PublishesStoredGenerated
+// reports whether rel's publications publish its STORED generated columns
+// (pgoutput's include_gencols_type = PUBLISH_GENCOLS_STORED).
+type GenColsFilter interface {
+	PublishesStoredGenerated(rel *RelationDef) bool
+}
+
 // PgOutput emits logical-replication messages to an io.Writer in
 // upstream pgoutput's wire format. One PgOutput per active
 // logical slot; not goroutine-safe (the `SlotDecoder` loop is
@@ -354,8 +362,12 @@ func (p *PgOutput) writeRelation(rel *RelationDef) error {
 		ident = 'd'
 	}
 	buf = append(buf, ident)
-	buf = appendUint16(buf, uint16(len(rel.Columns)))
-	for _, col := range rel.Columns {
+	include := p.publishedColumns(rel)
+	buf = appendUint16(buf, uint16(countPublished(rel.Columns, include)))
+	for i, col := range rel.Columns {
+		if include != nil && !include[i] {
+			continue
+		}
 		// flag byte: bit 0 = LOGICALREP_IS_REPLICA_IDENTITY, set only on
 		// the replica identity's columns (logicalrep_write_attrs). It
 		// used to be set on every column, and a subscriber locating a
@@ -375,8 +387,47 @@ func (p *PgOutput) writeRelation(rel *RelationDef) error {
 	return err
 }
 
+// publishedColumns is logicalrep_should_publish_column over rel's columns
+// (no column lists yet): nil when every column is published, else a mask
+// that drops virtual generated columns and, unless the publications
+// publish them, stored ones.
+func (p *PgOutput) publishedColumns(rel *RelationDef) []bool {
+	stored := false
+	if gf, ok := p.filter.(GenColsFilter); ok {
+		stored = gf.PublishesStoredGenerated(rel)
+	}
+	var include []bool
+	for i, col := range rel.Columns {
+		if col.Generated == 0 || (col.Generated == 's' && stored) {
+			continue
+		}
+		if include == nil {
+			include = make([]bool, len(rel.Columns))
+			for j := range include {
+				include[j] = true
+			}
+		}
+		include[i] = false
+	}
+	return include
+}
+
+// countPublished is the number of columns include keeps (all when nil).
+func countPublished(cols []ColumnDef, include []bool) int {
+	if include == nil {
+		return len(cols)
+	}
+	n := 0
+	for _, ok := range include {
+		if ok {
+			n++
+		}
+	}
+	return n
+}
+
 func (p *PgOutput) writeInsert(rel *RelationDef, tuple []byte) error {
-	body, err := encodePgoTuple(rel.Columns, tuple, p.snap.RegOut)
+	body, err := encodePgoTupleMasked(rel.Columns, tuple, p.snap.RegOut, p.publishedColumns(rel))
 	if err != nil {
 		return fmt.Errorf("pgoutput: encode insert tuple for %q: %w", rel.Name, err)
 	}
@@ -394,7 +445,7 @@ func (p *PgOutput) writeDelete(rel *RelationDef, oldTuple []byte) error {
 	buf = append(buf, pgoDelete)
 	buf = appendUint32(buf, rel.OID)
 	if len(oldTuple) > 0 {
-		kind, body, err := encodePgoOldTuple(rel, oldTuple, p.snap.RegOut)
+		kind, body, err := encodePgoOldTuple(rel, oldTuple, p.snap.RegOut, p.publishedColumns(rel))
 		if err != nil {
 			return fmt.Errorf("pgoutput: encode delete old-tuple for %q: %w", rel.Name, err)
 		}
@@ -421,7 +472,8 @@ func (p *PgOutput) writeUpdate(rel *RelationDef, oldTuple, newTuple []byte) erro
 	// one (the goopg pre-2026-05-14 behaviour) was rejected by libpq
 	// subscribers as malformed since natts=0 violates the relation's
 	// declared column count.
-	newBody, err := encodePgoTuple(rel.Columns, newTuple, p.snap.RegOut)
+	include := p.publishedColumns(rel)
+	newBody, err := encodePgoTupleMasked(rel.Columns, newTuple, p.snap.RegOut, include)
 	if err != nil {
 		return fmt.Errorf("pgoutput: encode update new-tuple for %q: %w", rel.Name, err)
 	}
@@ -429,7 +481,7 @@ func (p *PgOutput) writeUpdate(rel *RelationDef, oldTuple, newTuple []byte) erro
 	buf = append(buf, pgoUpdate)
 	buf = appendUint32(buf, rel.OID)
 	if len(oldTuple) > 0 {
-		kind, oldBody, err := encodePgoOldTuple(rel, oldTuple, p.snap.RegOut)
+		kind, oldBody, err := encodePgoOldTuple(rel, oldTuple, p.snap.RegOut, p.publishedColumns(rel))
 		if err != nil {
 			return fmt.Errorf("pgoutput: encode update old-tuple for %q: %w", rel.Name, err)
 		}
@@ -452,12 +504,18 @@ func (p *PgOutput) writeUpdate(rel *RelationDef, oldTuple, newTuple []byte) erro
 // legacy [flag][value] walk was removed. Decode uses the tuple header (natts +
 // null bitmap).
 func encodePgoTuple(cols []ColumnDef, raw []byte, regOut func(string, uint32) string) ([]byte, error) {
+	return encodePgoTupleMasked(cols, raw, regOut, nil)
+}
+
+// encodePgoTupleMasked is encodePgoTuple emitting only the columns include
+// keeps (every column when include is nil).
+func encodePgoTupleMasked(cols []ColumnDef, raw []byte, regOut func(string, uint32) string, include []bool) ([]byte, error) {
 	tup, err := storage.ParseHeapTuple(raw)
 	if err != nil {
 		return nil, err
 	}
 	natts := int(tup.Header.Infomask2 & storage.HeapNattsMask)
-	return encodePgoTuplePhysical(cols, tup.Data, tup.Bitmap, natts, regOut, false)
+	return encodePgoTuplePhysicalMasked(cols, tup.Data, tup.Bitmap, natts, regOut, false, include)
 }
 
 // encodePgoOldTuple is the old-tuple half of logicalrep_write_update /
@@ -469,7 +527,7 @@ func encodePgoTuple(cols []ColumnDef, raw []byte, regOut func(string, uint32) st
 // other columns differ locally is still found. A relation with no
 // identity columns keeps 'O' (PG refuses to publish UPDATE/DELETE there
 // at all). M0149-0040d.
-func encodePgoOldTuple(rel *RelationDef, raw []byte, regOut func(string, uint32) string) (byte, []byte, error) {
+func encodePgoOldTuple(rel *RelationDef, raw []byte, regOut func(string, uint32) string, include []bool) (byte, []byte, error) {
 	keyOnly := rel.ReplIdent != 'f'
 	if keyOnly {
 		hasKey := false
@@ -486,7 +544,7 @@ func encodePgoOldTuple(rel *RelationDef, raw []byte, regOut func(string, uint32)
 		return 0, nil, err
 	}
 	natts := int(tup.Header.Infomask2 & storage.HeapNattsMask)
-	body, err := encodePgoTuplePhysical(rel.Columns, tup.Data, tup.Bitmap, natts, regOut, keyOnly)
+	body, err := encodePgoTuplePhysicalMasked(rel.Columns, tup.Data, tup.Bitmap, natts, regOut, keyOnly, include)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -503,19 +561,32 @@ func encodePgoOldTuple(rel *RelationDef, raw []byte, regOut func(string, uint32)
 // keyOnly emits every column outside the replica identity as NULL (the 'K'
 // old-key tuple); the walk still decodes it so later offsets stay right.
 func encodePgoTuplePhysical(cols []ColumnDef, body, bitmap []byte, storedNatts int, regOut func(string, uint32) string, keyOnly bool) ([]byte, error) {
+	return encodePgoTuplePhysicalMasked(cols, body, bitmap, storedNatts, regOut, keyOnly, nil)
+}
+
+// encodePgoTuplePhysicalMasked is encodePgoTuplePhysical writing only the
+// columns include keeps (logicalrep_write_tuple's
+// logicalrep_should_publish_column); the walk still decodes every stored
+// column so later offsets stay right.
+func encodePgoTuplePhysicalMasked(cols []ColumnDef, body, bitmap []byte, storedNatts int, regOut func(string, uint32) string, keyOnly bool, include []bool) ([]byte, error) {
 	out := make([]byte, 0, 2+len(cols)*8)
-	out = appendUint16(out, uint16(len(cols)))
+	out = appendUint16(out, uint16(countPublished(cols, include)))
 
 	off := 0
 	for i, col := range cols {
+		skip := include != nil && !include[i]
 		// Columns beyond stored natts were added via ALTER TABLE ADD COLUMN.
 		if i >= storedNatts {
-			out = append(out, pgoColNull)
+			if !skip {
+				out = append(out, pgoColNull)
+			}
 			continue
 		}
 		// Null bitmap: bit i = 0 means column i is NULL.
 		if len(bitmap) > 0 && (bitmap[i/8]>>(uint(i)%8))&1 == 0 {
-			out = append(out, pgoColNull)
+			if !skip {
+				out = append(out, pgoColNull)
+			}
 			continue
 		}
 		// D-09 att_align_pointer (shared rule: catalog.AttAlignPointer):
@@ -530,6 +601,9 @@ func encodePgoTuplePhysical(cols []ColumnDef, body, bitmap []byte, storedNatts i
 			return nil, fmt.Errorf("col %q: %w", col.Name, derr)
 		}
 		off += n
+		if skip {
+			continue
+		}
 		if keyOnly && !col.ReplIdent {
 			out = append(out, pgoColNull)
 			continue
