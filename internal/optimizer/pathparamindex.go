@@ -419,7 +419,7 @@ func (s *searchCtx) addParamIndexPathFor(rel *RelOptInfo, tbl *catalog.Table, ca
 	indexOnly := false
 	if s.neededColsKnown && !indexOnlyHardDisabled(cat) && scanLeafIsBare(rel.baseLeaf) {
 		if needed := s.neededColumnsOfRel(rel, tbl); len(needed) > 0 {
-			ioCovered, indexOnly = indexCoversColumns(idx, needed)
+			ioCovered, indexOnly = indexCoversColumns(cat, idx, needed)
 		}
 	}
 	allVisFrac := 0.0
@@ -620,7 +620,7 @@ func (s *searchCtx) addParamSkipPathFor(rel *RelOptInfo, tbl *catalog.Table, cat
 	indexOnly := false
 	if s.neededColsKnown && !indexOnlyHardDisabled(cat) && scanLeafIsBare(rel.baseLeaf) {
 		if needed := s.neededColumnsOfRel(rel, tbl); len(needed) > 0 {
-			ioCovered, indexOnly = indexCoversColumns(idx, needed)
+			ioCovered, indexOnly = indexCoversColumns(cat, idx, needed)
 		}
 	}
 	allVisFrac := 0.0

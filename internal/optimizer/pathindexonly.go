@@ -131,7 +131,7 @@ func (s *searchCtx) orderedFullIndexOnlyCovers(cat catalog.Catalog, rel *RelOptI
 	if len(needed) == 0 {
 		return false
 	}
-	_, ok := indexCoversColumns(idx, needed)
+	_, ok := indexCoversColumns(cat, idx, needed)
 	return ok
 }
 
@@ -219,7 +219,7 @@ func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, t
 	if idx == nil || idx.DeclaredHash || !partialIndexUsable(tbl, idx, conjuncts) {
 		return nil, false
 	}
-	covered, ok := indexCoversColumns(idx, needed)
+	covered, ok := indexCoversColumns(cat, idx, needed)
 	if !ok {
 		return nil, false
 	}
@@ -412,7 +412,7 @@ func indexOnlyResidualAdmissible(residual []Expr, leafSchema Schema, covered []c
 // index quals that consume all of the leaf's local quals.
 func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index,
 	needed []catalog.Column, clauses []indexPathClause, colExprs map[string]Expr, relPages int64, relTuples, totalPages float64) bool {
-	covered, ok := indexCoversColumns(idx, needed)
+	covered, ok := indexCoversColumns(cat, idx, needed)
 	if !ok {
 		return false
 	}
@@ -599,9 +599,38 @@ func indexOnlyOutputWidth(covered []catalog.Column) int {
 // re-bases. Index order rather than table order is not cosmetic: the executor's
 // `IndexOnlyScan.Covered` names what the index tuple supplies position by
 // position.
-func indexCoversColumns(idx *catalog.Index, needed []catalog.Column) ([]catalog.Column, bool) {
+//
+// A composite (row) key column is never covered: goopg's record_ops key is
+// keyed field by field and the executor's key decoders cannot rebuild the
+// record without the type's field list, so the heap must supply it
+// (M0149-0046b; PG's record_ops can return the value — deferral ledger).
+func indexCoversColumns(cat catalog.Catalog, idx *catalog.Index, needed []catalog.Column) ([]catalog.Column, bool) {
 	if idx == nil || len(idx.Columns) == 0 || !isBTreeIndex(idx) {
 		return nil, false
+	}
+	if cf, ok := cat.(interface {
+		LookupCompositeTypeFields(name string, dbOid ...uint32) []catalog.CompositeField
+	}); ok {
+		// Every KEY column, not just the needed ones: a decoder reaching a
+		// later column walks past the earlier ones.
+		keyCols := needed
+		if idx.Table != nil {
+			inKey := make(map[string]bool, len(idx.Columns))
+			for _, c := range idx.Columns {
+				inKey[c] = true
+			}
+			keyCols = make([]catalog.Column, 0, len(idx.Columns))
+			for _, c := range idx.Table.Columns {
+				if inKey[c.Name] {
+					keyCols = append(keyCols, c)
+				}
+			}
+		}
+		for _, c := range keyCols {
+			if !c.Type.IsArray && !isBuiltinKeyTypeName(c.Type.Name) && len(cf.LookupCompositeTypeFields(c.Type.Name)) > 0 {
+				return nil, false
+			}
+		}
 	}
 	// A partial index answers only for the rows its predicate admits — the
 	// same refusal `pickIndexCoveringLeadingPrefix` makes.
@@ -628,6 +657,18 @@ func indexCoversColumns(idx *catalog.Index, needed []catalog.Column) ([]catalog.
 		}
 	}
 	return covered, len(covered) == len(needed)
+}
+
+// isBuiltinKeyTypeName short-cuts the composite lookup for the common
+// built-in key types.
+func isBuiltinKeyTypeName(name string) bool {
+	switch strings.ToLower(name) {
+	case "int4", "integer", "int", "int8", "bigint", "int2", "smallint", "text", "varchar",
+		"character varying", "numeric", "decimal", "date", "timestamp", "timestamptz",
+		"float8", "float4", "bool", "boolean", "oid", "uuid", "bpchar", "char", "name":
+		return true
+	}
+	return false
 }
 
 // relAllVisibleFraction is PG's `baserel->allvisfrac` (`estimate_rel_size`,

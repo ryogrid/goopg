@@ -16959,10 +16959,12 @@ verify each at HEAD when the task starts.
   Parent: M0149-0046
   - 2026\-11\-26 \(done\): the encoder writes PG's null bitmap and dataoffset \(MAXALIGN\(24 \+ ceil\(n/8\)\)\); only the unquoted NULL token is NULL. array.RenderTextStyled reads the bitmap back, and a subscript of a NULL element returns SQL NULL. Unit test TestArrayCodecNullElements.
   - Movement: regress arrays 1134→760 mismatched lines; 002's array and enum tables now match PG on a goopg node.
-- [ ] **M0149-0046b — btree keys on composite types**
+- [x] **M0149-0046b — btree keys on composite types**
   Kind: impl
   Parent: M0149-0046
   - 002 DDL: `CREATE TABLE tst_comps \(a tst_comp_basic_t PRIMARY KEY, …\)` fails with "btree v0 only supports int4 / numeric keys, got "tst\_comp\_basic\_t"", as do tst\_comp\_enum\_array, tst\_comp\_enum\_what and tst\_comp\_mix\_array. PG compares them with btrecordcmp \(record\_cmp\).
+  - 2026\-11\-26 \(done\): record\_ops key \(btree\_record\_key.go\): per field, a present tag plus the field's own key or a NULL tag \(0xFF\, after every value\), then an end marker; recursive through encodeBTreeKeyForColumn. createBTreeIndex admits composite types. optimizer.indexCoversColumns refuses index\-only coverage of a composite key column \(no decode\). Unit test TestRecordBTreeKeyOrder.
+  - Movement: 002's composite\-keyed tables are created and all 002 inserts succeed on a goopg node; the uniqueness check is by value \(ROW\(1,'a',1\) collides with \(1.0,a,1\)\).
 - [ ] **M0149-0046c — composite fields coerced to their column types**
   Kind: impl
   Parent: M0149-0046

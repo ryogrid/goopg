@@ -16,7 +16,7 @@ is one link from the TAP test:
 | task | blocker |
 |---|---|
 | M0149\-0046a \(done\) | NULL array elements were refused \("NULL array elements are not supported"\) |
-| M0149\-0046b | btree keys on composite types: "btree v0 only supports int4 / numeric keys" for the four composite\-keyed tables |
+| M0149\-0046b \(done\) | btree keys on composite types: "btree v0 only supports int4 / numeric keys" for the four composite\-keyed tables |
 | M0149\-0046c | composite fields are not coerced to their column types: `ROW(1.0, 'a', 1)` into \(float8, text, int\) prints `(1.0,a,1)`, not `(1,a,1)`; an array field keeps its input spelling `{a, b, c}` |
 | M0149\-0046d | range input is not canonicalised: int4range `'[1, 10]'` stays `[1, 10]`, not `[1,11)` |
 | M0149\-0046e | range output ignores the session TimeZone: tstzrange bounds print at \+00 under `SET timezone = '+2'` |
@@ -40,3 +40,32 @@ goopg refused NULL elements outright. Three paths change:
 
 On PG 18.3 the stored blob for `'{5,NULL,3}'::int[]` is 40 bytes, and goopg's matches. The arrays regress case
 went from 1134 to 760 mismatched lines.
+
+## Landed — M0149\-0046b, btree keys on composite types
+
+PG indexes a composite column with btree record\_ops, whose comparison is record\_cmp \(rowtypes.c\):
+
+- fields compare one by one, each with its type's default btree comparison;
+- a NULL field sorts after every non\-NULL value.
+
+goopg refused composite key columns. The record key now mirrors the array\_ops key \(`btree_record_key.go`\): each
+field is a present tag followed by that field's own key, or a NULL tag \(0xFF\), and an end marker closes the
+record. Each field key comes from `encodeBTreeKeyForColumn` with the field's type, so:
+
+- nested composites and composite arrays recurse through it;
+- the key is value\-based: `ROW(1.0,'a',1)` and `ROW(1,'a',1)` collide in a unique index, as on PG.
+
+Field types come from the composite's catalog field list; a schema\-qualified field type has its qualifier
+dropped.
+
+**Decoding is not available.** The key decoders have no catalog and cannot rebuild a record from its key, so
+`optimizer.indexCoversColumns` never lets an index\-only scan cover an index with a composite key column. The heap
+supplies the value instead.
+
+Two gaps remain \(deferral ledger\):
+
+- equality on a composite column plans a seq scan, where PG uses the index;
+- skip scans, trailing\-SAOP walks and amcheck's key walk over an index whose leading key is composite would
+  decode it.
+
+Unit test TestRecordBTreeKeyOrder. All of 002's DDL except hstore and all its inserts now succeed on a goopg node.

@@ -15788,10 +15788,12 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 				if err == nil && planExpr != nil {
 					if typ, ok := optimizer.ExprResultType(planExpr); ok {
 						if !isSupportedBTreeKeyType(typ.Name) {
-							// Also accept user-defined enum types. M0097-0022.
+							// Also accept user-defined enum types (M0097-0022)
+							// and composite types (record_ops, M0149-0046b).
 							isEnum := false
 							if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
 								_, isEnum = im.LookupEnum(typ.Name)
+								isEnum = isEnum || len(im.LookupCompositeTypeFields(typ.Name)) > 0
 							}
 							if !isEnum {
 								return btreeKeyTypeRejectionError(typ.Name, pos)
@@ -15807,10 +15809,12 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 			return &ExecError{Code: "42703", Pos: pos, Message: fmt.Sprintf("column %q of relation %q does not exist", name, tbl.Name)}
 		}
 		if !isSupportedBTreeKeyType(col.Type.Name) {
-			// Also accept user-defined enum types. M0097-0022.
+			// Also accept user-defined enum types (M0097-0022) and
+			// composite types (record_ops, M0149-0046b).
 			isEnum := false
 			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
 				_, isEnum = im.LookupEnum(col.Type.Name)
+				isEnum = isEnum || len(im.LookupCompositeTypeFields(col.Type.Name)) > 0
 			}
 			if !isEnum {
 				return btreeKeyTypeRejectionError(col.Type.Name, pos)
@@ -16612,6 +16616,13 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 	// (array_cmp) encoding BEFORE the scalar switch. M0119-0006.
 	if col.Type.IsArray {
 		return encodeArrayBTreeKey(ctx, v, col, pos)
+	}
+	// Composite (row) type: record_ops, keyed field by field
+	// (btree_record_key.go). M0149-0046b.
+	if !isSupportedBTreeKeyType(col.Type.Name) {
+		if fields, ok := compositeKeyFields(ctx, col.Type.Name); ok {
+			return encodeRecordBTreeKey(ctx, v, col, fields, pos)
+		}
 	}
 	// reg* family: the heap stores a 4-byte OID, but the KEY is the 8-byte
 	// unsigned oidcmp form (btree.EncodeInt8), identical to the oid arm

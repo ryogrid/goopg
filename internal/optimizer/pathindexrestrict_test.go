@@ -97,11 +97,11 @@ func TestIndexOnlyResidualReadsCoveredColumnsOnly(t *testing.T) {
 	if got := restrictionEqualityPrefix(cat, tbl, composite, []Expr{eqSK, gtFlag}); len(got) != 1 || got[0].local != Expr(eqSK) {
 		t.Fatalf("the composite binds i_item_sk = 2 only; got %d clauses", len(got))
 	}
-	both, _ := indexCoversColumns(composite, []catalog.Column{tbl.Columns[0], tbl.Columns[2]})
+	both, _ := indexCoversColumns(cat, composite, []catalog.Column{tbl.Columns[0], tbl.Columns[2]})
 	if !indexOnlyResidualAdmissible([]Expr{gtFlag}, schema, both) {
 		t.Fatal("i_flag > 7 reads a covered column: want it kept as the Filter")
 	}
-	skOnly, _ := indexCoversColumns(pkey, []catalog.Column{tbl.Columns[0]})
+	skOnly, _ := indexCoversColumns(cat, pkey, []catalog.Column{tbl.Columns[0]})
 	if indexOnlyResidualAdmissible([]Expr{gtFlag}, schema, skOnly) {
 		t.Fatal("i_flag is not in item_pkey: the residual cannot be evaluated over the narrowed row")
 	}
@@ -139,7 +139,7 @@ func TestIndexOnlyScanPlanCarriesIndexQuals(t *testing.T) {
 	if len(clauses) != 2 {
 		t.Fatalf("fixture: want 2 prefix clauses, got %d", len(clauses))
 	}
-	covered, _ := indexCoversColumns(composite, []catalog.Column{tbl.Columns[0], tbl.Columns[2]})
+	covered, _ := indexCoversColumns(cat, composite, []catalog.Column{tbl.Columns[0], tbl.Columns[2]})
 	p := &Path{Kind: PathIndexScan, Rel: rel, IndexInfo: composite, IndexScanDir: ForwardScanDirection,
 		IndexOnly: true, IndexOnlyCovered: covered, IndexClauses: clauses}
 	ios, ok := createIndexScanPlan(p).(*IndexOnlyScan)
