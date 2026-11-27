@@ -249,7 +249,10 @@ func (c *Cluster) Start() error {
 	if c.started {
 		return errors.New("pgcluster: already started")
 	}
-	logFile, err := os.OpenFile(c.logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	// Append, as Cluster.pm's pg_ctl -l does: a restart must not erase the
+	// log a test is reading from a saved offset (013_partition.pl reads
+	// the update_origin_differs conflict across a subscriber restart).
+	logFile, err := os.OpenFile(c.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return fmt.Errorf("pgcluster: open log: %w", err)
 	}

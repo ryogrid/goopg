@@ -1,7 +1,6 @@
 package testport
 
 import (
-	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -25,13 +24,10 @@ import (
 // whose column order changes. Three pairings: all-goopg, a PG 18.3 publisher
 // with goopg subscribers, a goopg publisher with PG 18.3 subscribers.
 //
-// Gated by GOOPG_TAP_013 until it passes (M0149-0061).
+// Three pairings 3/3 each (M0149-0061).
 func TestPort_Subscription013Partition(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")
-	}
-	if os.Getenv("GOOPG_TAP_013") == "" {
-		t.Skip("013 port is not passing yet (M0149-0061); set GOOPG_TAP_013=1 to run")
 	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)

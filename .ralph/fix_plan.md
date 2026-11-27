@@ -16998,6 +16998,14 @@ verify each at HEAD when the task starts.
     > continues with the banner\.
   - Repro \(fresh `goopg init`\): `CREATE TABLE tab1 \(a int PRIMARY KEY, b int GENERATED ALWAYS AS \(a \* 2\) STORED, c int GENERATED ALWAYS AS \(a \* 3\) VIRTUAL\)`; restart the server; `INSERT INTO tab1 \(a\) VALUES \(5\); SELECT \* FROM tab1` → `5||` \(PG: `5|10|15`\). After the restart `pg_attrdef` has no row for tab1, and the in\-memory catalog.Column has an empty GeneratedExpr, so pg\_get\_publication\_tables and pgoutput also treat b and c as ordinary columns. pg\_attribute \(a heap read\) still shows attgenerated s / v.
   - First step: find where the restart reload rebuilds catalog.Column \(internal/initdb catalog\_heap\_reload.go / open.go\) and restore GeneratedExpr / GeneratedVirtual from pg\_attrdef \+ attgenerated, then check the write side persists the pg\_attrdef row for a generated column.
+- [ ] **M0149-0102 — ALTER COLUMN TYPE after a DROP COLUMN and an UPDATE loses every row** \(filed 2026\-11\-27 by M0149\-0061l; S2 — data loss\)
+  Kind: impl
+  Movement: none — correctness fix — no plan instrument
+  Parent: none
+  - > **ESCALATION 2026\-11\-27 \(S2, data loss\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\.
+  - Repro \(fresh `goopg init`, reproduced on HEAD 2cbea62af before 0061l\): `CREATE TABLE tab5 \(a int NOT NULL, b int\); CREATE UNIQUE INDEX tab5\_a\_idx ON tab5 \(a\); INSERT INTO tab5 VALUES \(3, 1\); ALTER TABLE tab5 DROP COLUMN b, ADD COLUMN c int; UPDATE tab5 SET c = 1 WHERE a = 3; ALTER TABLE tab5 ALTER COLUMN c TYPE bigint; SELECT \* FROM tab5` → no rows \(PG: `3\|1`\). Neither UPDATE \+ ALTER TYPE nor DROP COLUMN \+ ALTER TYPE alone loses the row.
+  - First step: instrument execAlterColumnType's Phase 1 row collection \(internal/executor/operators\_ddl.go\) — it likely reads the heap with a layout or visibility rule that drops the post\-rewrite UPDATE's new version.
 - [ ] **M0149-0101 — equality under a nondeterministic ICU collation compares bytes** \(filed 2026\-11\-26 by M0149\-0049a; wrong results\)
   Kind: impl
   Parent: none
@@ -17462,12 +17470,14 @@ verify each at HEAD when the task starts.
     - goopg publisher: quoted identifiers in a CREATE PUBLICATION column list were a syntax error; ALTER PUBLICATION ADD / SET with a column list was a compat no\-op; COPY TO of an enum column failed \(kind 9\); pg\_create\_logical\_replication\_slot and int2send / int4send / int8send were missing; differing column lists across publications were unioned instead of pgoutput\_column\_list\_init's ERROR.
     - Landed: parser parsePubColumnList \(CREATE \+ ALTER, quoted names\); ALTER ADD / SET column lists \(SET clears, changed members re\-journaled, DROP with a list 42601\); SetPublicationColumnLists nil = clear; DROP SCHEMA CASCADE drops foreign\-schema partitions first; FetchPublicationTables ColumnListConflictError, checked in the pre\-slot publication check and in the refresh \(0A000\); COPY TEXT KindEnum arm; pg\_create\_logical\_replication\_slot \(+ record FROM scan for both slot creators\); intNsend; xlog.ColumnListChecker / publicationFilter.CheckColumnLists, the walsender logs the ERROR and ends the stream with 0A000. Tests TestDropSchemaCascadeDropsForeignSchemaPartitions, TestCopyTextEnumAndIntSend, TestAlterPublicationColumnLists, TestPublicationFilterColumnListConflict, TestParseAlterPublicationColumnList.
   Movement: yes — tap 031 fail -> pass (3/3 x 3 pairings); 031 port
-- [ ] **M0149-0061 — port subscription/t/013_partition.pl**
+- [x] **M0149-0061 — port subscription/t/013_partition.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/013_partition.pl` — partitioned tables on publisher and subscriber.
   Likely prerequisites \(verify at start\): `publish_via_partition_root`, subscriber-side tuple routing into differently shaped partitions, ATTACH/DETACH.
   - 2026\-11\-27: port written \(TestPort\_Subscription013Partition, gated by GOOPG\_TAP\_013\); after 0061a the remaining failures are 0061b\-e \(all three pairings stop at the sub2 catch\-up of 0061b\).
+  - 2026\-11\-27 \(done\): after 0061l all three pairings pass 3/3; GOOPG\_TAP\_013 gate removed, inventory 013 → port, make regen\-testport.
+  Movement: yes — tap 013 not\-tried → port \(3 pairings x 3 runs PASS\)
 - [x] **M0149-0061a — UPDATE / DELETE through a parent reach a partition with a different column order \(S2: wrong results\)**
   Kind: impl
   Parent: M0149-0061
@@ -17514,27 +17524,30 @@ verify each at HEAD when the task starts.
   - Path\-to\-TAP: 013 goopg\-subscriber pairings \(line \~623, `INSERT INTO tab2` after the track\_commit\_timestamp restart → relation does not exist\) ← 0061k \(1 link\).
   - 2026\-11\-27 \(done\): writes — a partitioned table's key as its pg\_partitioned\_table heap row \(writePartitionedTableRow: PG's partstrat / partnatts / partattrs, partexprs = PartitionKeyDef text\), a partition's parent edge as a pg\_inherits row \(seqno 1\); ATTACH PARTITION now sets the child's PartitionParentOID and re\-journals it \(immediate, DEFAULT and commit\-time paths\), DETACH clears the link before its re\-sync. Reload — relkind 'p' admitted; relpartbound decoded and re\-parsed \(ParsePartitionBoundText over the factored BuildPartitionBound\); loadPartitionKeysFromHeap \(ParsePartitionKeyDef\) runs before the pg\_inherits pass, which registers an edge whose parent is partitioned as a partition. Test TestPort\_PartitionedTableSurvivesRestart.
   Movement: yes — partitioned tables after restart lost -> restored (RANGE/LIST/HASH, nested, ATTACH, DEFAULT, DETACH); tap 013 goopg-subscriber post-restart "relation does not exist" -> pass
-- [ ] **M0149-0061l — origin\_differs check \(013 line 629\) in every pairing, and sub2 catch\-up \(line 686, goopg publisher\)**
+- [x] **M0149-0061l — origin\_differs check \(013 line 629\) in every pairing, and sub2 catch\-up \(line 686, goopg publisher\)**
   Kind: impl
   Parent: M0149-0061
   - After 0061k all three pairings reach 629; the goopg publisher pairings then stall at 686. Path\-to\-TAP: 013 ← 0061l \(1 link\); not yet diagnosed. Supersedes 0061i.
   - Finding \(goopg subscriber\): after the restart pg\_subscription\_rel was EMPTY — the tablesync state lived only in the PubSub registry, so after any subscriber restart should\_apply\_changes\_for\_rel found no READY rel and every change was silently skipped. Filed and fixed as 0061m.
+  - 2026\-11\-27 \(done\): two causes. \(1\) 629 with a PG subscriber: the test harness's pgcluster opened the PG log with O\_TRUNC on every start, so the restart erased the log the test reads from its saved offset \(Cluster.pm's pg\_ctl \-l appends\) — now O\_APPEND. \(2\) 686: goopg's in\-place DROP COLUMN / ALTER COLUMN TYPE rewrite re\-inserts every row through the ordinary insert path, and logical decoding published each as an INSERT \(subscriber insert\_exists loop\). PG rewrites into a relrewrite transient heap that is never decoded. Now the rewrite opens a HEAP\_INSERT\_NO\_LOGICAL window \(xlog.BeginNoLogicalInserts\), its inserts are logged without XLH\_INSERT\_CONTAINS\_NEW\_TUPLE, and Classify skips them as DecodeInsert does. Test TestNoLogicalInsertIsNotDecoded; probe: pg\_recvlogical across DROP COLUMN shows B,C only \(was B,R,I,C\).
+  Movement: yes — tap 013 goopg\-publisher pairings fail at 629/686 → PASS
 - [x] **M0149-0061m — pg\_subscription\_rel survives a restart \(S2: replication silently stops after a subscriber restart\)**
   Kind: impl
   Parent: M0149-0061
   - Path\-to\-TAP: 013 "updating a row that was modified by a different origin" \(goopg subscriber, after the restart\) ← 0061m \(1 link\).
   - 2026\-11\-27 \(done\): PubSub subscription\-rel journal hook \(add / advance / drop / DROP SUBSCRIPTION, fired outside the lock\); the postmaster journals each change to the subscription database's pg\_subscription\_rel heap \(executor.JournalSubscriptionRel, own transaction\); reloadSubscriptionRelsFromHeap restores the rows at startup \(RestoreSubscriptionRel\). Test TestSubscriptionRelHookJournalsEveryChange.
   Movement: yes — tap 013 goopg-subscriber pairings: post-restart origin_differs check fail -> pass (pg18-publisher pairing now fails only at 243)
-- [ ] **M0149-0061i — 013 "updating a row that was modified by a different origin" and the later sub2 catch\-up \(goopg publisher → PG subscriber, lines 629 / 686\)**
+- [x] **M0149-0061i — 013 "updating a row that was modified by a different origin" and the later sub2 catch\-up \(goopg publisher → PG subscriber, lines 629 / 686\)**
   Kind: impl
   Parent: M0149-0061
   - Path\-to\-TAP: 013 goopg\-publisher pairings ← 0061i \(1 link\); not yet diagnosed \(origin / track\_commit\_timestamp conflict detection\).
+  - 2026\-11\-27: superseded by 0061l \(done\).
 - [x] **M0149-0061c — apply fires the subscriber partition's AFTER ROW triggers for routed UPDATEs**
   Kind: impl
   Parent: M0149-0061
   - 013 \(goopg subscriber\): "check replica update after trigger applied on subscriber" — sub1's tab1\_2\_2 ENABLE ALWAYS AFTER trigger records nothing for UPDATEs routed into it \(apply\_handle\_tuple\_routing\). Path\-to\-TAP: 013 ← 0061c \(1 link\).
   - 2026\-11\-27 \(done\): applyworker\_partition.go fires the leaf's row triggers — same\-leaf UPDATE fires UPDATE \(updated columns remapped to the leaf\), a cross\-partition move fires DELETE on the old leaf \+ INSERT on the new, routed DELETE fires DELETE \(applyLeafDelete\). Test TestApplyWorkerFiresLeafPartitionTriggers \(fails on HEAD\). 013 pg18\-pub → goopg\-sub pairing now PASSES end to end; the goopg\-publisher pairings still fail at 629 \(0061l\).
-  - Movement: TestPort\_Subscription013Partition pairings passing 0/3 → 1/3 \(pg18\-publisher\-goopg\-subscriber PASS\).
+  Movement: TestPort\_Subscription013Partition pairings passing 0/3 → 1/3 \(pg18\-publisher\-goopg\-subscriber PASS\).
 - [x] **M0149-0061d — replicated TRUNCATE of a partitioned table truncates its sub\-partitions**
   Kind: impl
   Parent: M0149-0061

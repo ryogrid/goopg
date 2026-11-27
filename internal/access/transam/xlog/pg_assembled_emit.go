@@ -155,7 +155,11 @@ func EncodeHeapInsertPGVis(rel storage.RelFileNode, blk storage.BlockNumber, lin
 
 	mainData := make([]byte, sizeOfXLogHeapInsertData)
 	binary.LittleEndian.PutUint16(mainData[0:2], lineSlot) // offnum
-	mainData[2] = xlhInsertContainsNewTuple                // flags
+	// XLH_INSERT_CONTAINS_NEW_TUPLE unless the insert is
+	// HEAP_INSERT_NO_LOGICAL (an in-place rewrite, no_logical_insert.go).
+	if !InsertIsNoLogical(rel, storage.TransactionID(xid)) {
+		mainData[2] = xlhInsertContainsNewTuple // flags
+	}
 	if visCleared {
 		mainData[2] |= xlogHeapInsertAllVisibleCleared
 	}

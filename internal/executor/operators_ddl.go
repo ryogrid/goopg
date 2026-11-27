@@ -29596,13 +29596,20 @@ func (o *ddlOp) dropColumn(tbl *catalog.Table, act parser.AlterTableAction, only
 	}
 
 	// Phase 4: re-insert all rows with the new column layout and rebuild indexes.
+	// The re-inserts are a rewrite, not changes: not logically decoded.
+	endNoLogical, nerr := beginRewriteNoLogical(o.ctx, rel)
+	if nerr != nil {
+		return nerr
+	}
 	for _, row := range allRows {
 		ptr, werr := writeHeapRowReturning(o.ctx, rel, tbl.Columns, row)
 		if werr != nil {
+			endNoLogical()
 			return werr
 		}
 		maintainUniqueIndexesForInsert(o.ctx, tbl, tbl.Columns, row, ptr)
 	}
+	endNoLogical()
 
 	// Phase 5: update catalog heap — delete old pg_class/pg_attribute rows and
 	// re-sync so the dropped column is no longer visible via pg_attribute scans.
@@ -29655,6 +29662,18 @@ func noUsingCoercionError(colName, targetType string) *ExecError {
 		Message: fmt.Sprintf("column %q cannot be cast automatically to type %s", colName, targetType),
 		Hint:    fmt.Sprintf("You might need to specify \"USING %s::%s\".", colName, targetType),
 	}
+}
+
+// beginRewriteNoLogical opens an in-place rewrite's no-logical window: the
+// rows it re-inserts into rel are HEAP_INSERT_NO_LOGICAL, as PG's rewrite
+// into a relrewrite transient heap is never decoded (xlog
+// no_logical_insert.go). Call the returned function once the re-insert is
+// done. M0149-0061l.
+func beginRewriteNoLogical(ctx *Context, rel storage.RelFileNode) (func(), error) {
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return nil, err
+	}
+	return xlog.BeginNoLogicalInserts(rel, effectiveWriterXID(ctx)), nil
 }
 
 func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAction, only bool) error {
@@ -29928,7 +29947,13 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 		_, _ = createIndexBTree(o.ctx, idx, idxRel)
 	}
 
-	// Phase 4: re-insert all rows with the new encoding.
+	// Phase 4: re-insert all rows with the new encoding — a rewrite, not
+	// changes: not logically decoded.
+	endNoLogical, nerr := beginRewriteNoLogical(o.ctx, rel)
+	if nerr != nil {
+		return nerr
+	}
+	defer endNoLogical()
 	for _, row := range allRows {
 		if werr := writeHeapRow(o.ctx, rel, tbl.Columns, row); werr != nil {
 			return werr

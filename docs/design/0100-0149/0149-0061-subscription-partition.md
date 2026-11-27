@@ -178,7 +178,26 @@ change the pg18 publisher → goopg subscriber pairing of 013 passes in full.
 
 Test: TestApplyWorkerFiresLeafPartitionTriggers.
 
-## Open
+## Landed — M0149\-0061l \(rewrite inserts are not decoded; the PG node log survives a restart\)
 
-- **0061d.** A replicated TRUNCATE of a partitioned target must reach its sub\-partitions.
-- **0061l.** The origin\_differs check in every pairing, and the sub2 catch\-up with a goopg publisher.
+Two causes kept the goopg\-publisher pairings from passing.
+
+- **Rewrite inserts were published.** goopg's DROP COLUMN and ALTER COLUMN TYPE rewrite the table in place: they
+  truncate its relfilenode and re\-insert every row through the ordinary insert path. Logical decoding published each
+  re\-inserted row as an INSERT, and the subscriber looped on insert\_exists. PG rewrites into a transient heap whose
+  pg\_class row carries relrewrite, and decoding never publishes it.
+  - The rewrite now opens a window \(`beginRewriteNoLogical` → `xlog.BeginNoLogicalInserts`, keyed by relation and
+    writer xid\).
+  - Inserts inside the window are logged without XLH\_INSERT\_CONTAINS\_NEW\_TUPLE, as heap\_insert does under
+    HEAP\_INSERT\_NO\_LOGICAL. Redo does not read the flag.
+  - `Classify` skips such an insert, as DecodeInsert does.
+- **The PG node log was truncated on restart.** The test harness's pgcluster opened the log with O\_TRUNC on every
+  start, so a restart erased the text a test reads from a saved offset. Cluster.pm's `pg_ctl -l` appends; so does
+  pgcluster now.
+
+Tests: TestNoLogicalInsertIsNotDecoded, and TestPort\_Subscription013Partition, which now passes all three pairings
+3/3 and is no longer gated.
+
+## Status
+
+M0149\-0061 is complete. 013\_partition.pl is ported \(inventory status port\).

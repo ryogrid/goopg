@@ -214,6 +214,12 @@ func classifyDecodedXLog(d *Decoder, r Record) error {
 		if err != nil {
 			return err
 		}
+		// DecodeInsert: an insert without XLH_INSERT_CONTAINS_NEW_TUPLE
+		// (HEAP_INSERT_NO_LOGICAL — a table rewrite) is not a change.
+		// M0149-0061l.
+		if xlogHeapInsertFlags(r.XLog.MainData)&xlhInsertContainsNewTuple == 0 {
+			return nil
+		}
 		xid := storage.TransactionID(h.XID)
 		tuple, err := decodeXLogHeapInsertTuple(block, xid, offnum)
 		if err != nil {

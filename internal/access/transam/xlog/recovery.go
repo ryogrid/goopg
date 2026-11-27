@@ -3866,6 +3866,14 @@ func restoreDecodedXLogBlockImage(mgr *storage.Manager, block XLogBlockRef, lsn 
 	return writeBlockOrExtend(mgr, block.Rel, block.Block, page)
 }
 
+// xlogHeapInsertFlags is xl_heap_insert.flags.
+func xlogHeapInsertFlags(mainData []byte) uint8 {
+	if len(mainData) < sizeOfXLogHeapInsertData {
+		return 0
+	}
+	return mainData[2]
+}
+
 func decodeXLogHeapInsertMainData(mainData []byte) (uint16, error) {
 	if len(mainData) < sizeOfXLogHeapInsertData {
 		return 0, fmt.Errorf("wal: invalid xlog heap-insert main-data len %d (want >= %d)", len(mainData), sizeOfXLogHeapInsertData)
