@@ -17407,11 +17407,21 @@ verify each at HEAD when the task starts.
   - Path\-to\-TAP: 027 goopg\-subscriber pairings ← 0057f \(1 link\).
   - 2026\-11\-27 \(done\): IsOwnerACLRevoked is true once the owner entry is materialized; HasOwnerPrivilege reads only the owner entry and PUBLIC; the owner branch adds the owner role's own HasTablePrivilege. Test TestOwnerACLPartialRevoke.
   Movement: yes — tap 027 goopg-subscriber privilege steps fail -> pass
-- [ ] **M0149-0058 — port subscription/t/033_run_as_table_owner.pl**
+- [x] **M0149-0058 — port subscription/t/033_run_as_table_owner.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/033_run_as_table_owner.pl` — `run_as_owner` and table-owner apply.
   Likely prerequisites \(verify at start\): `run_as_owner` option, apply switching to table owner under a security-restricted operation.
+  - 2026\-11\-27 \(done\): 0058a landed; TestPort\_Subscription033RunAsTableOwner passes 3/3 x 3 \(the goopg\-publisher pairing passed as written\); inventory 033 → port.
+  Movement: yes — tap 033 goopg-subscriber pairings fail -> pass (3/3 x 3 pairings); 033 port
+- [x] **M0149-0058a — run\_as\_owner, and SET / INHERIT\-aware apply checks**
+  Kind: impl
+  Parent: M0149-0058
+  - 033 \(goopg subscriber\): `WITH (run_as_owner = true)` was parsed and dropped, the SET ROLE check ignored the membership's SET option, and a role inheriting the table owner's privileges \(INHERIT membership\) did not get the owner's implicit privileges. PG: subrunasowner, SwitchToUntrustedUser / member\_can\_set\_role \(ROLERECURSE\_SETROLE\), pg\_class\_aclmask's has\_privs\_of\_role\(role, owner\), check\_enable\_rls object\_ownercheck.
+  - Path\-to\-TAP: 033 goopg\-subscriber pairings ← 0058a \(1 link\).
+  - 2026\-11\-27 \(done\): Subscription.RunAsOwner \(CREATE, ALTER … SET, subrunasowner journal / reload / views\); applyTableAccess acts as the subscription owner under run\_as\_owner, else SET ROLE via catalog.MemberCanSetRole; dmlPrivilegePermittedAs gives the owner's implicit privileges to an INHERIT member \(roleHasPrivsOfOwner\); the RLS owner test uses HasPrivsOfRole. Test TestMemberCanSetRole.
+  Movement: yes — tap 033 goopg-subscriber pairings fail -> pass
+
 - [ ] **M0149-0059 — port subscription/t/028_row_filter.pl**
   Kind: impl
   Parent: none

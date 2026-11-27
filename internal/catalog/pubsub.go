@@ -91,6 +91,10 @@ type Subscription struct {
 	Owner        uint32
 	Publications []string
 	Enabled      bool
+	// RunAsOwner is pg_subscription.subrunasowner (WITH (run_as_owner =
+	// true)): the apply worker acts as the subscription owner instead of
+	// switching to each table's owner. M0149-0058a.
+	RunAsOwner bool
 	// Binary is pg_subscription.subbinary (WITH (binary = true)): table
 	// sync copies in binary format and the apply worker asks pgoutput for
 	// binary tuple columns.
@@ -630,6 +634,18 @@ func (p *PubSub) SetSubscriptionEnabled(name string, enabled bool, dbOid ...uint
 		return ErrSubscriptionNotFound
 	}
 	sub.Enabled = enabled
+	return nil
+}
+
+// SetSubscriptionRunAsOwner sets pg_subscription.subrunasowner.
+func (p *PubSub) SetSubscriptionRunAsOwner(name string, on bool, dbOid ...uint32) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	sub, ok := p.subscriptions[subMapKey(resolveDBOid(dbOid), name)]
+	if !ok {
+		return ErrSubscriptionNotFound
+	}
+	sub.RunAsOwner = on
 	return nil
 }
 

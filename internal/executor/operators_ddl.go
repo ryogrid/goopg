@@ -1462,6 +1462,12 @@ func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
 			sub.Binary = true
 		}
 	}
+	if opts.runAsOwner {
+		// WITH (run_as_owner = true): subrunasowner. M0149-0058a.
+		if rerr := o.ctx.PubSub.SetSubscriptionRunAsOwner(s.Name, true, subDBOid); rerr == nil {
+			sub.RunAsOwner = true
+		}
+	}
 	// B4.4: journal the pg_subscription heap row (replaces kind 53).
 	if err := syncSubscriptionRow(o.ctx, sub.OID, sub); err != nil {
 		return fmt.Errorf("pg_subscription heap write: %w", err)
@@ -2002,6 +2008,22 @@ func (o *ddlOp) execAlterSubscriptionSet(s *parser.AlterSubscriptionSetStmt) err
 	slotName, slotSet, err := parseAlterSubscriptionSetOptions(s.Options, s.Pos())
 	if err != nil {
 		return err
+	}
+	if v, ok := s.Options["run_as_owner"]; ok {
+		// subrunasowner (SUBOPT_RUN_AS_OWNER): read by the apply worker at
+		// each change. M0149-0058a.
+		b, berr := defGetSubscriptionBoolean("run_as_owner", v, s.Pos())
+		if berr != nil {
+			return berr
+		}
+		if serr := o.ctx.PubSub.SetSubscriptionRunAsOwner(s.Name, b, subDBOid); serr != nil {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
+		}
+		if cur, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); ok {
+			if herr := syncSubscriptionRow(o.ctx, cur.OID, cur); herr != nil {
+				return fmt.Errorf("pg_subscription heap write: %w", herr)
+			}
+		}
 	}
 	if v, ok := s.Options["binary"]; ok {
 		// subbinary (AlterSubscription's SUBOPT_BINARY): the apply worker

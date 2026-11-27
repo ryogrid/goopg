@@ -6877,6 +6877,34 @@ func (c *InMemory) RoleIsMemberOf(memberOid, roleOid uint32) bool {
 	return false
 }
 
+// MemberCanSetRole is member_can_set_role (acl.c): a superuser, the role
+// itself, or a member reaching roleOid through memberships that all carry
+// the SET option (roles_is_member_of with ROLERECURSE_SETROLE). M0149-0058a.
+func (c *InMemory) MemberCanSetRole(memberOid, roleOid uint32) bool {
+	if memberOid == roleOid || c.IsSuperuser(memberOid) {
+		return true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	seen := map[uint32]bool{memberOid: true}
+	queue := []uint32{memberOid}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for key, m := range c.roleMembers {
+			if key.MemberOID != cur || !m.SetOption || seen[key.RoleOID] {
+				continue
+			}
+			if key.RoleOID == roleOid {
+				return true
+			}
+			seen[key.RoleOID] = true
+			queue = append(queue, key.RoleOID)
+		}
+	}
+	return false
+}
+
 // IsSuperuser reports whether oid names a role with the SUPERUSER attribute:
 // the bootstrap superuser (OID 10, always superuser — see
 // BootstrapSuperuserOID) or a registered role whose RoleAttrs.Superuser is

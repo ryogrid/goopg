@@ -614,6 +614,7 @@ func registerSubscriptionViews(cat *catalog.InMemory, ps *catalog.PubSub) error 
 		}
 		out := make([][]string, 0)
 		for _, sub := range ps.Subscriptions() {
+			ro := boolText(sub.RunAsOwner)
 			out = append(out, []string{
 				fmt.Sprintf("%d", sub.OID),
 				// subdbid must match pg_database.oid for the live database so
@@ -630,7 +631,7 @@ func registerSubscriptionViews(cat *catalog.InMemory, ps *catalog.PubSub) error 
 				"d",   // subtwophasestate disabled
 				"f",   // subdisableonerr
 				"t",   // subpasswordrequired (upstream default)
-				"f",   // subrunasowner (upstream default)
+				ro,    // subrunasowner
 				"any", // suborigin (LOGICALREP_ORIGIN_ANY upstream default)
 				"f",   // subfailover (upstream default)
 				sub.Conninfo,

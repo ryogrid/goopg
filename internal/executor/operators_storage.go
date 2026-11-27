@@ -2768,7 +2768,7 @@ func dmlPrivilegePermittedAs(ctx *Context, tbl *catalog.Table, priv, checkRole s
 		// relations below FirstNormalObjectId. M0097-0040 SELECT follow-up.
 		return true
 	}
-	if tbl.Owner != "" && strings.EqualFold(tbl.Owner, checkRole) {
+	if tbl.Owner != "" && (strings.EqualFold(tbl.Owner, checkRole) || roleHasPrivsOfOwner(ctx, checkRole, tbl.Owner)) {
 		if !ctx.Catalog.IsOwnerACLRevoked(tbl.OID) {
 			return true
 		}
@@ -2777,6 +2777,19 @@ func dmlPrivilegePermittedAs(ctx *Context, tbl *catalog.Table, priv, checkRole s
 		return ctx.Catalog.HasOwnerPrivilege(tbl.OID, priv) || ctx.Catalog.HasTablePrivilege(tbl.OID, checkRole, priv)
 	}
 	return ctx.Catalog.HasTablePrivilege(tbl.OID, checkRole, priv)
+}
+
+// roleHasPrivsOfOwner is pg_class_aclmask's owner test for a non-owner:
+// has_privs_of_role(role, owner) — a member through INHERIT memberships holds
+// the owner's implicit privileges (M0149-0058a, 033_run_as_table_owner).
+func roleHasPrivsOfOwner(ctx *Context, role, owner string) bool {
+	im, ok := underlyingInMemory(ctx.Catalog)
+	if !ok {
+		return false
+	}
+	r, ok1 := im.RoleOID(role)
+	o, ok2 := im.RoleOID(owner)
+	return ok1 && ok2 && r != o && !im.IsSuperuser(r) && im.HasPrivsOfRole(r, o)
 }
 
 // dmlPrivilegePermittedAsAny is dmlPrivilegePermittedAs but ORs the check

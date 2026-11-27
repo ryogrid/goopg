@@ -464,7 +464,7 @@ S-026,subscription-tap,tap,postgres/src/test/subscription/t/026_stats.pl,port,ye
 ,subscription-tap,tap,postgres/src/test/subscription/t/030_origin.pl,not-tried,no,-,,,
 ,subscription-tap,tap,postgres/src/test/subscription/t/031_column_list.pl,not-tried,no,-,,,
 ,subscription-tap,tap,postgres/src/test/subscription/t/032_subscribe_use_index.pl,port,yes,-,Ported as TestPort_Subscription032SubscribeUseIndex (internal/testport/subscription_032_subscribe_use_index_test.go): three pairings (all-goopg; PG 18.3 publisher -> goopg subscriber; goopg publisher -> PG 18.3 subscriber) 3/3 each (M0149-0054),,
-,subscription-tap,tap,postgres/src/test/subscription/t/033_run_as_table_owner.pl,not-tried,no,-,,,
+,subscription-tap,tap,postgres/src/test/subscription/t/033_run_as_table_owner.pl,port,yes,-,Ported as TestPort_Subscription033RunAsTableOwner (internal/testport/subscription_033_run_as_table_owner_test.go): three pairings (all-goopg; PG 18.3 publisher -> goopg subscriber; goopg publisher -> PG 18.3 subscriber) 3/3 each (M0149-0058),,
 ,subscription-tap,tap,postgres/src/test/subscription/t/034_temporal.pl,not-tried,no,-,,,
 ,subscription-tap,tap,postgres/src/test/subscription/t/035_conflicts.pl,port,yes,-,Ported as TestPort_Subscription035Conflicts (internal/testport/subscription_035_conflicts_test.go): three pairings (all-goopg; PG 18.3 publisher -> goopg subscriber; goopg publisher -> PG 18.3 subscriber) 3/3 each (M0149-0056),,
 ,subscription-tap,tap,postgres/src/test/subscription/t/100_bugs.pl,not-tried,no,-,,,

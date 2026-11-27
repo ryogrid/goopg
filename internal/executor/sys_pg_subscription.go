@@ -61,6 +61,7 @@ func buildPGSubscriptionRow(sub *catalog.Subscription) Row {
 	if sub.SlotName != "" {
 		slot = NewStringDatum(sub.SlotName)
 	}
+	runAs := NewBoolDatum(sub.RunAsOwner)
 	return Row{
 		NewIntDatum(int64(sub.OID)),   // oid
 		NewIntDatum(int64(sub.DBOid)), // subdbid
@@ -73,7 +74,7 @@ func buildPGSubscriptionRow(sub *catalog.Subscription) Row {
 		NewStringDatum("d"),           // subtwophasestate — LOGICALREP_TWOPHASE_STATE_DISABLED
 		NewBoolDatum(false),           // subdisableonerr
 		NewBoolDatum(true),            // subpasswordrequired
-		NewBoolDatum(false),           // subrunasowner
+		runAs,                         // subrunasowner
 		NewBoolDatum(false),           // subfailover
 		NewStringDatum(sub.Conninfo),  // subconninfo
 		slot,                          // subslotname (NULL when unset)

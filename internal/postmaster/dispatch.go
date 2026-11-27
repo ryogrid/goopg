@@ -3615,6 +3615,7 @@ func subscriptionRowsForDBOid(ps *catalog.PubSub, dbOid uint32) [][]string {
 	}
 	out := make([][]string, 0, len(subs))
 	for _, sub := range subs {
+		ro := boolToText(sub.RunAsOwner)
 		out = append(out, []string{
 			fmt.Sprintf("%d", sub.OID),
 			fmt.Sprintf("%d", catalog.PostgresDBOid), // subdbid — matches pg_database.oid
@@ -3626,7 +3627,7 @@ func subscriptionRowsForDBOid(ps *catalog.PubSub, dbOid uint32) [][]string {
 			"d",   // subtwophasestate disabled
 			"f",   // subdisableonerr
 			"t",   // subpasswordrequired (upstream default)
-			"f",   // subrunasowner (upstream default)
+			ro,    // subrunasowner
 			"any", // suborigin (LOGICALREP_ORIGIN_ANY upstream default)
 			"f",   // subfailover (upstream default)
 			sub.Conninfo,

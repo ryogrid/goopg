@@ -3,8 +3,9 @@ package executor
 // applyworker_privilege.go — the apply worker's identity and privilege checks
 // (M0149-0057a, subscription/t/027_nosuperuser.pl).
 //
-// PG (worker.c, usercontext.c): with run_as_owner = false (the default, and
-// the only mode goopg models) each change runs as the target table's owner.
+// PG (worker.c, usercontext.c): with run_as_owner = false (the default) each
+// change runs as the target table's owner; with run_as_owner = true as the
+// subscription owner (M0149-0058a).
 // SwitchToUntrustedUser first requires that the subscription owner may SET
 // ROLE to the table owner (member_can_set_role) — "role \"%s\" cannot SET
 // ROLE to \"%s\"" otherwise — and stays the subscription owner when the table
@@ -76,16 +77,19 @@ func applyTableAccess(ctx *Context, w *ApplyWorker, tbl *catalog.Table, action s
 			tblOwner = oid
 		}
 	}
-	canSetRole := func(member, role uint32) bool {
-		return member == role || im.IsSuperuser(member) || im.RoleIsMemberOf(member, role)
-	}
-	if !canSetRole(subOwner, tblOwner) {
-		return &ExecError{Code: "42501", Message: fmt.Sprintf("role \"%s\" cannot SET ROLE to \"%s\"",
-			im.RoleNameForOIDOrUnknown(subOwner), im.RoleNameForOIDOrUnknown(tblOwner))}
-	}
-	user := tblOwner
-	if canSetRole(tblOwner, subOwner) {
-		user = subOwner
+	// run_as_owner = true acts as the subscription owner throughout; false
+	// switches to the table owner (SwitchToUntrustedUser), which needs SET
+	// ROLE to it, and stays the subscription owner when the table owner
+	// may SET ROLE back.
+	user := subOwner
+	if !w.applyRunAsOwner() {
+		if !im.MemberCanSetRole(subOwner, tblOwner) {
+			return &ExecError{Code: "42501", Message: fmt.Sprintf("role \"%s\" cannot SET ROLE to \"%s\"",
+				im.RoleNameForOIDOrUnknown(subOwner), im.RoleNameForOIDOrUnknown(tblOwner))}
+		}
+		if !im.MemberCanSetRole(tblOwner, subOwner) {
+			user = tblOwner
+		}
 	}
 	if im.IsSuperuser(user) {
 		return nil
@@ -110,10 +114,24 @@ func applyTableAccess(ctx *Context, w *ApplyWorker, tbl *catalog.Table, action s
 	// only when forced, and never to a BYPASSRLS role.
 	if tbl.RowSecurity {
 		attrs, _ := im.LookupRoleAttrs(name)
-		applies := !attrs.BypassRLS && (user != tblOwner || tbl.ForceRowSecurity)
+		// object_ownercheck: a role with the owner's privileges (INHERIT
+		// membership) counts as the owner.
+		owner := user == tblOwner || im.HasPrivsOfRole(user, tblOwner)
+		applies := !attrs.BypassRLS && (!owner || tbl.ForceRowSecurity)
 		if applies {
 			return &ExecError{Code: "42501", Message: fmt.Sprintf("user \"%s\" cannot replicate into relation with row-level security enabled: \"%s\"", name, tbl.Name)}
 		}
 	}
 	return nil
+}
+
+// applyRunAsOwner reports pg_subscription.subrunasowner for the worker's
+// subscription (re-read per change, as the worker re-reads its
+// subscription). M0149-0058a.
+func (w *ApplyWorker) applyRunAsOwner() bool {
+	if w.pubsub == nil || w.subName == "" {
+		return false
+	}
+	sub, ok := w.pubsub.LookupSubscription(w.subName, w.dbOid())
+	return ok && sub != nil && sub.RunAsOwner
 }
