@@ -275,6 +275,13 @@ func (w *ApplyWorker) applyBegin(m *xlog.DecodedMessage) error {
 	}
 	w.currentTx = tx
 	w.inXact = true
+	// replorigin_session_origin: the apply worker's transactions carry
+	// its subscription's replication origin into their commit
+	// timestamps (track_commit_timestamp), so a later change can tell a
+	// row the subscription wrote from one modified locally. M0149-0061j.
+	if origin := w.replOrigin(); origin != 0 {
+		w.txnMgr.SetTxnOrigin(tx, origin)
+	}
 	// remote_final_lsn: the Begin message's final_lsn, which
 	// should_apply_changes_for_rel compares with a SYNCDONE rel's sync
 	// LSN. M0149-0061b.
@@ -531,8 +538,10 @@ func (w *ApplyWorker) applyDelete(m *xlog.DecodedMessage) error {
 		return err
 	}
 	if found == nil {
+		w.logApplyConflict(ctx, r.local, r.local.Columns, "delete_missing", "Could not find the row to be deleted.", nil, nil, keyRow)
 		return nil
 	}
+	w.checkOriginDiffers(ctx, r.local, r.local.Columns, "delete", found, nil, keyRow)
 	// ExecSimpleRelationDelete: BEFORE ROW triggers see the located row
 	// and may skip the delete; AFTER ROW triggers follow it. M0149-0040c.
 	trigCtx := w.triggerContext(ctx)
@@ -631,6 +640,13 @@ func (w *ApplyWorker) applyUpdate(m *xlog.DecodedMessage) error {
 	if err != nil {
 		return err
 	}
+	if found == nil {
+		// update_missing: PG LOGs the conflict and skips the change
+		// (apply_handle_update_internal). M0149-0061e.
+		w.logApplyConflict(ctx, r.local, r.local.Columns, "update_missing", "Could not find the row to be updated.", nil, newRow, oldKeyRow)
+		return nil
+	}
+	w.checkOriginDiffers(ctx, r.local, r.local.Columns, "update", found, newRow, oldKeyRow)
 	// ExecSimpleRelationUpdate: BEFORE ROW triggers see the located old
 	// row and the new one (its unchanged-TOAST and subscriber-only cells
 	// taken from the old row) and may replace or skip it; AFTER ROW

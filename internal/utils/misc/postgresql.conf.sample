@@ -207,6 +207,8 @@
                                         # (SIGHUP to apply)
 #max_slot_wal_keep_size = -1            # -1 to 2147483647 MB; -1 = no limit
                                         # (SIGHUP to apply)
+#track_commit_timestamp = off           # collect timestamp of transaction commit
+                                        # (change requires restart)
 #synchronous_standby_names = ''         # standby selection grammar;
                                         # '' = async (no wait)
                                         # (SIGHUP to apply)

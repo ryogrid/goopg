@@ -46,9 +46,15 @@ func (w *ApplyWorker) applyDeletePartitioned(ctx *Context, r *applyRel, keyRow R
 	}
 	rel := w.cat.RelFileNode(leaf)
 	found, err := applyFindTuple(ctx, rel, leaf, leaf.Columns, key, applyLocalIndex(ctx, leaf, r.remote, nil))
-	if err != nil || found == nil {
+	if err != nil {
 		return err
 	}
+	if found == nil {
+		// delete_missing on the leaf the row would live in. M0149-0061e.
+		w.logApplyConflict(ctx, leaf, leaf.Columns, "delete_missing", "Could not find the row to be deleted.", nil, nil, key)
+		return nil
+	}
+	w.checkOriginDiffers(ctx, leaf, leaf.Columns, "delete", found, nil, key)
 	return applyDeleteTuple(ctx, rel, found.ptr)
 }
 
@@ -66,9 +72,14 @@ func (w *ApplyWorker) applyUpdatePartitioned(ctx *Context, r *applyRel, oldKeyRo
 		return err
 	}
 	if found == nil {
-		// update_missing: nothing to update (PG LOGs and skips).
+		// update_missing: nothing to update (PG LOGs and skips); the
+		// remote row is shown in the leaf's layout. M0149-0061e.
+		w.logApplyConflict(ctx, oldLeaf, oldLeaf.Columns, "update_missing", "Could not find the row to be updated.", nil,
+			remapParentRowToChild(newRow, nil, r.local.Columns, oldLeaf.Columns), oldKey)
 		return nil
 	}
+	w.checkOriginDiffers(ctx, oldLeaf, oldLeaf.Columns, "update", found,
+		remapParentRowToChild(newRow, nil, r.local.Columns, oldLeaf.Columns), oldKey)
 	// The unchanged-TOAST and subscriber-only cells come from the located
 	// row, in the parent's layout.
 	applyFillFromOld(newRow, remapChildRowToParent(found.row, buildInheritColMap(r.local.Columns, oldLeaf.Columns)), newUnchanged, newMissing)

@@ -89,11 +89,38 @@ SearchPathCatalog wrapper. This also cleared the later sub\_viaroot stall \(0061
 
 Test: TestApplyWorkerTruncatePartitionedTarget.
 
+## Landed — M0149\-0061e / 0061j \(conflict logging, commit timestamps\)
+
+- **0061e.** `logApplyConflict` is ReportApplyConflict at LOG. The message is `conflict detected on relation "s.t":
+  conflict=<kind>`. The DETAIL is the conflict's own line, followed by build\_tuple\_value\_details:
+
+  ```
+  Existing local row …; remote row …; replica identity (a)=(…).
+  ```
+
+  The replica identity uses the replica identity or primary\-key index; without one it shows `replica identity full
+  …`. update\_missing and delete\_missing are logged and the change is skipped, in both the plain and the
+  partitioned \(leaf\) paths. The plain UPDATE used to install the new row anyway \(M0149\-0044c\).
+- **0061j.**
+  - `track_commit_timestamp` is now a GUC \(postmaster context\). Before, a postgresql.conf setting it made the
+    server fail to start.
+  - transam keeps a commit\_ts store: `CommitTsData` returns a committed xid's time and replication origin, recorded
+    while tracking is on.
+  - The apply worker's transactions carry its subscription's origin \(`SetTxnOrigin`, named `pg_<suboid>`\).
+  - `checkOriginDiffers` logs update\_origin\_differs / delete\_origin\_differs when the located row's xmin committed
+    under another origin \("Updating the row that was modified locally in transaction N at T."\), and applies the
+    change.
+
+  Deviations \(ledgered\): the store is in memory only \(no pg\_commit\_ts SLRU or WAL\), and there is no
+  pg\_replication\_origin catalog.
+
+Test: TestApplyWorkerOriginDiffersAndMissingConflicts.
+
 ## Open
 
 - **0061c.** Subscriber AFTER ROW triggers must fire on the partitions that routed UPDATEs land in.
 - **0061d.** A replicated TRUNCATE of a partitioned target must reach its sub\-partitions.
-- **0061e.** update\_missing / delete\_missing conflict log lines for routed changes.
-- **0061j.** A goopg subscriber fails to restart with track\_commit\_timestamp.
+- **0061k \(S2\).** A partitioned table must survive a server restart. The startup loader drops relkind 'p', and the
+  partition key and parent link are not persisted.
 - **0061i.** Origin conflict detection \("updating a row that was modified by a different origin"\) and the later sub2
   catch\-up, goopg publisher → PG subscriber.

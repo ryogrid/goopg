@@ -1688,6 +1688,14 @@ func BuildDefaultRegistry() *Registry {
 	// WAL-logs every relation change at every wal_level, so it never skips
 	// WAL for a relation created in the same transaction (the minimal-level
 	// optimisation wal_skip_threshold tunes). M0149-0006.
+	// track_commit_timestamp (commit_ts.c): record each commit's time and
+	// replication origin, for the apply worker's origin_differs conflict
+	// detection. M0149-0061j.
+	r.MustRegister(NewVariable(Variable{
+		Name: "track_commit_timestamp", Type: TypeBool, BootVal: "off",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "wal_log_hints", Type: TypeBool, BootVal: "off",
 		Context: ContextPostmaster,

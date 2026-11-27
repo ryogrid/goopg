@@ -16936,10 +16936,11 @@ verify each at HEAD when the task starts.
     - `REFRESH PUBLICATION [WITH \(copy\_data\)]` parses to AlterSubscriptionPublicationsStmt with Action "refresh". execAlterSubscriptionRefresh applies 55000 for a disabled subscription, 42601 for any option except copy\_data, and 25001 inside a transaction block, then runs the refresh hook over the current publications.
     - A failed table copy now logs ERROR with PG's message instead of failing the command \(PG's async tablesync worker outcome\). The missing\-columns errcode is now 55000 \(it was 42P10\).
   - Results: 008 passes in pg18\-publisher\-goopg\-subscriber and goopg\-publisher\-pg18\-subscriber. all\-goopg still times out on the catch\-up after the test\_tab2 refresh \(slot inactive\), which is M0149\-0042b. Unit test TestAlterSubscriptionRefresh; parser pins updated.
-- [ ] **M0149-0044c — applyUpdateByKey installs a row when the old row is not found**
+- [x] **M0149-0044c — applyUpdateByKey installs a row when the old row is not found**
   Kind: impl
   Parent: M0149-0044
   - Nearby defect, filed, not worked. PG's apply\_handle\_update skips the change and logs "logical replication did not find row to be updated in replication target relation …" \(update\_missing conflict, LOG\). goopg inserts the new tuple without local defaults.
+  - 2026\-11\-27 \(done, via M0149\-0061e\): applyUpdate now LOGs the update\_missing conflict and skips the change, as apply\_handle\_update\_internal does; applyUpdateByKey has no production caller left.
 - [x] **M0149-0045 — port subscription/t/009_matviews.pl**
   Kind: impl
   Parent: none
@@ -17498,10 +17499,19 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: M0149-0061
   - 2026\-11\-27 \(done\): resolved by 0061d — the stall followed from the TRUNCATE that left rows behind.
-- [ ] **M0149-0061j — goopg subscriber1 fails to restart with track\_commit\_timestamp \(013 line \~621\)**
+- [x] **M0149-0061j — goopg subscriber1 fails to restart with track\_commit\_timestamp \(013 line \~621\)**
   Kind: impl
   Parent: M0149-0061
   - 013 \(goopg subscriber\): `node_subscriber1->append_conf\(track_commit_timestamp = on\); restart` — the start exits early with an empty cluster.log; then "updating a row that was modified by a different origin" \(629\). Path\-to\-TAP: 013 ← 0061j \(1 link\); not yet diagnosed.
+  - Finding: `track_commit_timestamp` was not a GUC \(postgresql.conf "unknown parameter" → start failure\), and goopg had no commit timestamps / replication origins.
+  - 2026\-11\-27 \(done\): track\_commit\_timestamp GUC \(postmaster, sample entry\); transam commit\_ts store \(CommitTsData: time \+ origin per committed xid, recorded when tracking is on\); the apply worker's transactions carry its subscription's replication origin \(SetTxnOrigin, "pg\_<suboid>"\); checkOriginDiffers logs update\_origin\_differs / delete\_origin\_differs when the located row's xmin committed under another origin. Test TestApplyWorkerOriginDiffersAndMissingConflicts.
+  Movement: yes — tap 013 goopg-subscriber restart with track_commit_timestamp start failure -> starts (stops next at 0061k)
+- [ ] **M0149-0061k — a partitioned table survives a server restart \(S2: catalog loss\)**
+  Kind: impl
+  Parent: M0149-0061
+  - **S2 escalation**: after a restart every partitioned table is gone and its partitions come back as standalone tables — `CREATE TABLE p1 \(a int\) PARTITION BY RANGE \(a\); CREATE TABLE p1\_1 PARTITION OF p1 …;` restart → pg\_class shows only p1\_1 \(r\). Pre\-existing \(reproduced at 5a2906dda\).
+  - Cause \(read\-only trace\): internal/initdb/open.go loadUserTablesFromHeapForDBMode keeps only relkind r/m/v/S/f rows \(:4040\), so the 'p' row is dropped; the partition strategy / key \(pg\_partitioned\_table\) is never written; relispartition / relpartbound are written but not decoded on reload, and partitions write no pg\_inherits rows, so PartitionParentOID / PartitionBounds / RegisterPartitionChild are never restored.
+  - Path\-to\-TAP: 013 goopg\-subscriber pairings \(line \~623, `INSERT INTO tab2` after the track\_commit\_timestamp restart → relation does not exist\) ← 0061k \(1 link\).
 - [ ] **M0149-0061i — 013 "updating a row that was modified by a different origin" and the later sub2 catch\-up \(goopg publisher → PG subscriber, lines 629 / 686\)**
   Kind: impl
   Parent: M0149-0061
@@ -17516,10 +17526,12 @@ verify each at HEAD when the task starts.
   - 013 \(goopg subscriber\): "truncate of tab1\_2 replicated" leaves row 5 \(subscriber's tab1\_2 is itself partitioned\). PG: apply\_handle\_truncate adds the partitions of a partitioned target \(find\_all\_inheritors\). Path\-to\-TAP: 013 ← 0061d \(1 link\).
   - 2026\-11\-27 \(done\): applyTruncate skips a rel should\_apply\_changes\_for\_rel rejects and truncates every partition of a partitioned target \(PartitionChildren, recursively, via underlyingInMemory — w.cat is a SearchPathCatalog wrapper\). Test TestApplyWorkerTruncatePartitionedTarget. Also cleared 0061h \(the sub\_viaroot stall at 588 followed from the un\-truncated rows\).
   Movement: yes — tap 013 goopg-subscriber pairings: truncate checks (305/316/568/571) fail -> pass; 588 stall -> pass (stops at 612-621)
-- [ ] **M0149-0061e — update\_missing / delete\_missing conflict log lines for routed changes**
+- [x] **M0149-0061e — update\_missing / delete\_missing conflict log lines for routed changes**
   Kind: impl
   Parent: M0149-0061
   - 013 \(goopg subscriber\): the `conflict detected on relation "public.tab1\_2\_2": conflict=update\_missing` / delete\_missing log checks do not match \(routed UPDATE / DELETE of a missing row; overlaps M0149-0056d\). Path\-to\-TAP: 013 ← 0061e \(1 link\).
+  - 2026\-11\-27 \(done\): logApplyConflict is ReportApplyConflict at LOG \(conflict.c errdetail\_apply\_conflict \+ build\_tuple\_value\_details: "Existing local row …; remote row …; replica identity \(a\)=\(…\)." with the replica identity / PK index, else "replica identity full …"\); update\_missing / delete\_missing are logged and skipped in the plain and the partitioned \(leaf\) paths. Test TestApplyWorkerOriginDiffersAndMissingConflicts.
+  Movement: yes — tap 013 goopg-subscriber update/delete-missing log checks (340-346, 612-614) fail -> pass
 - [ ] **M0149-0062 — port subscription/t/030_origin.pl**
   Kind: impl
   Parent: none

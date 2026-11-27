@@ -501,6 +501,12 @@ func New(cfg Config) *Server {
 	// M0100-0006b: wire spec-insert registry cleanup on transaction end.
 	if cfg.TxnMgr != nil {
 		cfg.TxnMgr.SetOnTxnEnd(executor.DeregisterSpecXID)
+		// track_commit_timestamp (postmaster context). M0149-0061j.
+		if cfg.Registry != nil {
+			if v, ok := cfg.Registry.Get("track_commit_timestamp"); ok {
+				cfg.TxnMgr.SetTrackCommitTimestamp(v.Display() == "on")
+			}
+		}
 	}
 	// M0100-0006b: propagate SET application_name to the activity registry
 	// so pg_locks JOIN with pg_stat_activity reflects the updated name.

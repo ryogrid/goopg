@@ -65,6 +65,9 @@ type Manager struct {
 	// twoPhase is the prepared-transaction registry (twophase_registry.go).
 	twoPhase twoPhaseRegistry
 
+	// commitTs is the track_commit_timestamp store (commit_ts.go).
+	commitTs commitTsStore
+
 	abortedMu   sync.RWMutex
 	abortedXIDs []storage.TransactionID
 
@@ -882,6 +885,8 @@ func (m *Manager) finish(tx Transaction, kind XactMarker, waitLocalFlush bool) e
 			}
 		}
 	}
+
+	m.recordCommitTs(tx, xid, kind)
 
 	// Clear the slot.
 	s.xid.Store(0)
