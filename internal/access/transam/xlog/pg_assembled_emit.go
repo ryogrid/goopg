@@ -486,6 +486,20 @@ func EncodeXactCommitPGWithRelsAt(xactTime int64, xid storage.TransactionID, sub
 // replaying the commit drops those entries
 // (xact_redo_commit → pgstat_execute_transactional_drops).
 func EncodeXactCommitPGWithStatsAt(xactTime int64, xid storage.TransactionID, subxacts []storage.TransactionID, rels []storage.RelFileNode, stats []transam.XactStatsItem, hasInvals bool) ([]byte, error) {
+	return EncodeXactCommitPGWithOriginAt(xactTime, xid, subxacts, rels, stats, hasInvals, transam.TxnOrigin{})
+}
+
+// xactXinfoHasOrigin is XACT_XINFO_HAS_ORIGIN (xact.h).
+const xactXinfoHasOrigin = 1 << 5
+
+// EncodeXactCommitPGWithOriginAt is EncodeXactCommitPGWithStatsAt for a
+// transaction applying changes from a replication origin
+// (replorigin_session_origin != InvalidRepOriginId): XactLogCommitRecord
+// adds xinfo HAS_ORIGIN + xl_xact_origin{origin_lsn, origin_timestamp}
+// last, and the record header names the origin (XLOG_INCLUDE_ORIGIN), which
+// logical decoding filters on (DecodeCommit → FilterByOrigin). A zero
+// origin.ID writes the plain record. M0149-0062a.
+func EncodeXactCommitPGWithOriginAt(xactTime int64, xid storage.TransactionID, subxacts []storage.TransactionID, rels []storage.RelFileNode, stats []transam.XactStatsItem, hasInvals bool, origin transam.TxnOrigin) ([]byte, error) {
 	info := xlogXactCommit
 	var xinfo uint32
 	if hasInvals {
@@ -500,6 +514,9 @@ func EncodeXactCommitPGWithStatsAt(xactTime int64, xid storage.TransactionID, su
 	if len(stats) > 0 {
 		xinfo |= xactXinfoHasDroppedStats
 	}
+	if origin.ID != 0 {
+		xinfo |= xactXinfoHasOrigin
+	}
 	mainData := binary.LittleEndian.AppendUint64(nil, uint64(xactTime)) // xact_time
 	if xinfo != 0 {
 		info |= xlogXactHasInfo
@@ -509,11 +526,22 @@ func EncodeXactCommitPGWithStatsAt(xactTime int64, xid storage.TransactionID, su
 	mainData = appendXactRelFileLocators(mainData, rels)
 	mainData = appendXactStatsItems(mainData, stats)
 	if hasInvals {
-		// nmsgs = 0 (goopg carries no message array). The invals chunk is last
-		// of the chunks goopg writes, matching upstream's order.
+		// nmsgs = 0 (goopg carries no message array), matching upstream's
+		// chunk order.
 		mainData = binary.LittleEndian.AppendUint32(mainData, 0)
 	}
-	return framedAssemble(RmgrXact, info, uint32(xid), mainData, nil)
+	if origin.ID == 0 {
+		return framedAssemble(RmgrXact, info, uint32(xid), mainData, nil)
+	}
+	// xl_xact_origin{origin_lsn XLogRecPtr, origin_timestamp TimestampTz}.
+	mainData = binary.LittleEndian.AppendUint64(mainData, origin.LSN)
+	mainData = binary.LittleEndian.AppendUint64(mainData, uint64(origin.Time))
+	var env [pgAssembledEnvelopeHeader]byte
+	env[0] = pgAssembledMarker
+	env[1] = byte(RmgrXact)
+	env[2] = info
+	binary.LittleEndian.PutUint32(env[3:7], uint32(xid))
+	return assembleXLogRecordOriginInto(env[:], mainData, nil, origin.ID)
 }
 
 // appendXactSubxacts appends xl_xact_subxacts{nsubxacts, subxacts[]} when

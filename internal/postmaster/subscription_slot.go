@@ -93,3 +93,24 @@ func (s *Server) subscriptionSlotHooks() (create, drop func(subName, conninfo, s
 	}
 	return create, drop, checkPubs, refresh
 }
+
+// checkPublicationsOrigin is the executor's CheckPublicationsOriginOnPublisher
+// hook: check_publications_origin's publisher query, with PG's error
+// ("could not receive list of replicated tables from the publisher").
+// M0149-0062a.
+func (s *Server) checkPublicationsOrigin(subName, conninfo string, pubs []string, exclude [][2]string) ([]string, error) {
+	if s.applyLauncher == nil {
+		return nil, nil
+	}
+	out, err := s.applyLauncher.CheckPublicationsOrigin(conninfo, pubs, exclude)
+	if err == nil {
+		return out, nil
+	}
+	var rce *replication.RemoteCommandError
+	if errors.As(err, &rce) {
+		return nil, &executor.ExecError{Code: "08006",
+			Message: fmt.Sprintf("could not receive list of replicated tables from the publisher: %s", rce.Error())}
+	}
+	return nil, &executor.ExecError{Code: "08006",
+		Message: fmt.Sprintf("subscription \"%s\" could not connect to the publisher: %v", subName, errors.Unwrap(err))}
+}

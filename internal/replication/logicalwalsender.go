@@ -138,6 +138,19 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 		return s.writeStreamingError(w, errcodes.InternalError, err.Error())
 	}
 	defer dec.Close()
+	// pgoutput's "origin" option (parse_output_parameters): with origin =
+	// none, pgoutput_origin_filter skips every transaction that came from
+	// a replication origin, so a bidirectional pair does not loop changes
+	// back. M0149-0062a.
+	if v, ok := args.Options["origin"]; ok {
+		switch {
+		case strings.EqualFold(v, "none"):
+			dec.SetOriginFilter(func(origin uint16) bool { return origin != 0 })
+		case strings.EqualFold(v, "any"):
+		default:
+			return s.writeStreamingError(w, errcodes.InvalidParameterValue, fmt.Sprintf("unrecognized origin value: \"%s\"", v))
+		}
+	}
 	// Logical decoding's positions (M0149-0040b): a pgoutput message
 	// goes out at the LSN of the record being decoded — goopg decodes a
 	// transaction at its commit record, so its Begin, changes and Commit

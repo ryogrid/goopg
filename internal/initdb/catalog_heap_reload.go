@@ -1803,6 +1803,7 @@ func reloadSubscriptionsFromHeap(mgr *storage.Manager, pubsub *catalog.PubSub, c
 				Conninfo:     decoded[13].StringValue(),
 				SlotName:     decoded[14].StringValue(),
 				Publications: executor.ParseTextArrayLiteral(decoded[16].StringValue()),
+				Origin:       reloadSubOrigin(decoded),
 			}, false, nil
 		})
 	if err != nil {
@@ -4254,4 +4255,16 @@ func parseTextLSN(s string) uint64 {
 		return 0
 	}
 	return h<<32 | l
+}
+
+// reloadSubOrigin is pg_subscription.suborigin from a reloaded row: "any"
+// (the default) is kept as "". M0149-0062a.
+func reloadSubOrigin(decoded executor.Row) string {
+	if len(decoded) <= 17 || decoded[17].IsNull() {
+		return ""
+	}
+	if o := strings.ToLower(decoded[17].StringValue()); o != "any" {
+		return o
+	}
+	return ""
 }

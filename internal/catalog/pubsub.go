@@ -105,6 +105,10 @@ type Subscription struct {
 	// sync copies in binary format and the apply worker asks pgoutput for
 	// binary tuple columns.
 	Binary bool
+	// Origin is pg_subscription.suborigin: "none" (WITH (origin = none)
+	// — ask the publisher only for changes with no replication origin) or
+	// "" for the default "any". M0149-0062a.
+	Origin string
 	// SlotName is pg_subscription.subslotname: "" is NULL, i.e.
 	// slot_name = NONE (no publisher-side slot — DROP SUBSCRIPTION then
 	// skips ReplicationSlotDropAtPubNode). The subscription-name default
@@ -725,6 +729,23 @@ func (p *PubSub) SetSubscriptionRunAsOwner(name string, on bool, dbOid ...uint32
 		return ErrSubscriptionNotFound
 	}
 	sub.RunAsOwner = on
+	return nil
+}
+
+// SetSubscriptionOrigin sets pg_subscription.suborigin ("none" or "any";
+// "any" is stored as ""). Returns ErrSubscriptionNotFound when the
+// subscription does not exist. M0149-0062a.
+func (p *PubSub) SetSubscriptionOrigin(name, origin string, dbOid ...uint32) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	sub, ok := p.subscriptions[subMapKey(resolveDBOid(dbOid), name)]
+	if !ok {
+		return ErrSubscriptionNotFound
+	}
+	if strings.EqualFold(origin, "any") {
+		origin = ""
+	}
+	sub.Origin = strings.ToLower(origin)
 	return nil
 }
 

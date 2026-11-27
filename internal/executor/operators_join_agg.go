@@ -2317,6 +2317,21 @@ func (o *joinOp) Close() error {
 
 func (o *joinOp) Schema() optimizer.Schema { return o.schema }
 
+// BindLateralOuter forwards an enclosing lateral join's outer row to the
+// leaves that reference it — both children, except the right side of a
+// lateral join, which binds to its own left sibling (the planner's
+// nodeReferencesOuter makes the same split). M0149-0062a.
+func (o *joinOp) BindLateralOuter(slot SlotView) {
+	if b, ok := o.left.(lateralBindable); ok {
+		b.BindLateralOuter(slot)
+	}
+	if !o.plan.Lateral {
+		if b, ok := o.right.(lateralBindable); ok {
+			b.BindLateralOuter(slot)
+		}
+	}
+}
+
 // aggregateOp performs grouped aggregation in memory.
 type aggregateOp struct {
 	plan   *optimizer.Aggregate

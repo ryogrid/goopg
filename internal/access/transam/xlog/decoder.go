@@ -83,7 +83,17 @@ type Decoder struct {
 	// onSent, when set, is told each transaction handed to the plugin: its
 	// commit record's end and the restart point that decodes it again.
 	onSent func(commitEnd, restart uint64)
+	// filterByOrigin, when set, reports whether a transaction from the
+	// given replication origin is skipped (SetOriginFilter).
+	filterByOrigin func(origin uint16) bool
 }
+
+// SetOriginFilter sets the output plugin's filter_by_origin_cb: a committed
+// transaction whose commit record names an origin the filter rejects is
+// forgotten instead of sent (DecodeCommit → FilterByOrigin →
+// ReorderBufferForget). pgoutput's origin = none skips every transaction
+// with a non-zero origin. M0149-0062a.
+func (d *Decoder) SetOriginFilter(fn func(origin uint16) bool) { d.filterByOrigin = fn }
 
 // SetSentHook sets the callback told, for each transaction sent, its commit
 // end and its restart point (where decoding must begin to send it again).
@@ -166,6 +176,16 @@ type CommitStartAware interface {
 // ApplyCommitAt is ApplyCommit with the commit record's start LSN (0 when
 // unknown: the plugin then uses commitLSN, the record's end, for both).
 func (d *Decoder) ApplyCommitAt(xid storage.TransactionID, startLSN, commitLSN uint64) error {
+	return d.ApplyCommitOriginAt(xid, startLSN, commitLSN, 0)
+}
+
+// ApplyCommitOriginAt is ApplyCommitAt for a commit record naming its
+// replication origin (XLogRecGetOrigin). M0149-0062a.
+func (d *Decoder) ApplyCommitOriginAt(xid storage.TransactionID, startLSN, commitLSN uint64, origin uint16) error {
+	if origin != 0 && d.filterByOrigin != nil && d.filterByOrigin(origin) {
+		d.buf.Commit(xid) // ReorderBufferForget
+		return nil
+	}
 	if ca, ok := d.plugin.(CommitStartAware); ok {
 		ca.SetCommitStart(startLSN)
 	}

@@ -28,7 +28,7 @@ type commitTsStore struct {
 	track   atomic.Bool
 	mu      sync.RWMutex
 	entries map[storage.TransactionID]CommitTsInfo
-	origins map[TxnHandle]uint16
+	origins map[TxnHandle]TxnOrigin
 }
 
 // SetTrackCommitTimestamp sets track_commit_timestamp (a postmaster-context
@@ -44,10 +44,50 @@ func (m *Manager) SetTxnOrigin(tx Transaction, origin uint16) {
 	s := &m.commitTs
 	s.mu.Lock()
 	if s.origins == nil {
-		s.origins = map[TxnHandle]uint16{}
+		s.origins = map[TxnHandle]TxnOrigin{}
 	}
-	s.origins[tx.Handle] = origin
+	o := s.origins[tx.Handle]
+	o.ID = origin
+	s.origins[tx.Handle] = o
 	s.mu.Unlock()
+}
+
+// TxnOrigin is a transaction's replication origin session state
+// (replorigin_session_origin, _origin_lsn, _origin_timestamp): the origin
+// it applies changes from and the remote commit being applied, which the
+// commit record carries in xl_xact_origin. M0149-0062a.
+type TxnOrigin struct {
+	ID   uint16
+	LSN  uint64 // remote commit end LSN
+	Time int64  // remote commit time, PG microseconds since 2000-01-01
+}
+
+// SetTxnOriginProgress records the remote commit tx is applying
+// (apply_handle_commit_internal sets replorigin_session_origin_lsn and
+// _timestamp before committing).
+func (m *Manager) SetTxnOriginProgress(tx Transaction, lsn uint64, ts int64) {
+	s := &m.commitTs
+	s.mu.Lock()
+	if o, ok := s.origins[tx.Handle]; ok {
+		o.LSN, o.Time = lsn, ts
+		s.origins[tx.Handle] = o
+	}
+	s.mu.Unlock()
+}
+
+// TxnOriginOfXID is the origin state of the in-progress transaction whose
+// top-level xid is xid, for the commit record (XactLogCommitRecord).
+func (m *Manager) TxnOriginOfXID(xid storage.TransactionID) (TxnOrigin, bool) {
+	s := &m.commitTs
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for h, o := range s.origins {
+		procNum := int(h) - 1
+		if procNum >= 0 && procNum < len(m.procArray.slots) && storage.TransactionID(m.procArray.slots[procNum].xid.Load()) == xid {
+			return o, o.ID != 0
+		}
+	}
+	return TxnOrigin{}, false
 }
 
 // CommitTsData is TransactionIdGetCommitTsData: xid's commit timestamp and
@@ -65,7 +105,7 @@ func (m *Manager) recordCommitTs(tx Transaction, xid storage.TransactionID, kind
 	s := &m.commitTs
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	origin := s.origins[tx.Handle]
+	origin := s.origins[tx.Handle].ID
 	delete(s.origins, tx.Handle)
 	if kind != XactCommit || xid == storage.InvalidTransactionID || !s.track.Load() {
 		return

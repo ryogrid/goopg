@@ -81,6 +81,9 @@ type LogicalReceiverConfig struct {
 	// Binary asks pgoutput for binary tuple columns (the subscription's
 	// binary option; libpqrcv_startstreaming's "binary 'true'").
 	Binary bool
+	// Origin is the subscription's origin ("none", or "" for "any"),
+	// sent as libpqrcv_startstreaming's "origin" option. M0149-0062a.
+	Origin string
 
 	// StartLSN is the resume position. 0 maps to the slot's
 	// current `confirmed_flush_lsn`.
@@ -537,6 +540,57 @@ func FetchPublicationTables(ctx context.Context, cfg LogicalReceiverConfig, pubs
 	return out, nil
 }
 
+// CheckPublicationsOrigin is check_publications_origin's publisher query
+// (subscriptioncmds.c): the publications among pubs that publish a table
+// the publisher itself subscribes to (directly, or through a partition
+// ancestor or descendant) — so copy_data with origin = none might copy
+// data that came from another origin. exclude names (schema, table) pairs
+// the subscriber already has (ALTER SUBSCRIPTION ... REFRESH's
+// subrel_local_oids). The query text is PG's, verbatim. M0149-0062a.
+func CheckPublicationsOrigin(ctx context.Context, cfg LogicalReceiverConfig, pubs []string, exclude [][2]string) ([]string, error) {
+	if cfg.DialTimeout <= 0 {
+		cfg.DialTimeout = 10 * time.Second
+	}
+	r := NewLogicalReceiver(cfg)
+	if err := r.connect(ctx); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+	}
+	defer r.closeConn()
+	var cmd strings.Builder
+	cmd.WriteString("SELECT DISTINCT P.pubname AS pubname\n" +
+		"FROM pg_publication P,\n" +
+		"     LATERAL pg_get_publication_tables(P.pubname) GPT\n" +
+		"     JOIN pg_subscription_rel PS ON (GPT.relid = PS.srrelid OR" +
+		"     GPT.relid IN (SELECT relid FROM pg_partition_ancestors(PS.srrelid) UNION" +
+		"                   SELECT relid FROM pg_partition_tree(PS.srrelid))),\n" +
+		"     pg_class C JOIN pg_namespace N ON (N.oid = C.relnamespace)\n" +
+		"WHERE C.oid = GPT.relid AND P.pubname IN (")
+	for i, p := range pubs {
+		if i > 0 {
+			cmd.WriteString(", ")
+		}
+		cmd.WriteString(quotePublicationLiteral(p))
+	}
+	cmd.WriteString(")\n")
+	for _, e := range exclude {
+		fmt.Fprintf(&cmd, "AND NOT (N.nspname = '%s' AND C.relname = '%s')\n", e[0], e[1])
+	}
+	rows, err := r.queryRows(cmd.String())
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, row := range rows {
+		if len(row) < 1 || row[0] == nil || seen[string(row[0])] {
+			continue
+		}
+		seen[string(row[0])] = true
+		out = append(out, string(row[0]))
+	}
+	return out, nil
+}
+
 // ColumnListConflictError is fetch_table_list's refusal of a table that the
 // subscription's publications publish with different column lists.
 // M0149-0060.
@@ -624,6 +678,13 @@ func (r *LogicalReceiver) startStreaming() error {
 	if r.cfg.Binary {
 		cmd = strings.TrimSuffix(cmd, ")") + ", \"binary\" 'true')"
 	}
+	// libpqrcv_startstreaming sends origin to a server >= 16 (both a
+	// PG 18 publisher and goopg's walsender parse it). M0149-0062a.
+	origin := "any"
+	if r.cfg.Origin != "" {
+		origin = r.cfg.Origin
+	}
+	cmd = strings.TrimSuffix(cmd, ")") + ", origin '" + origin + "')"
 	if err := r.w.WriteQuery(cmd); err != nil {
 		return fmt.Errorf("logicalreceiver: write START_REPLICATION: %w", err)
 	}

@@ -1524,6 +1524,11 @@ func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
 		}
 		o.warnMissingPublications(missing)
 	}
+	if opts.connect {
+		if err := o.checkPublicationsOrigin(s.Name, s.Conninfo, s.Publications, opts.copyData, opts.origin, ""); err != nil {
+			return err
+		}
+	}
 	if opts.connect && opts.createSlot && o.ctx.CreateSubscriptionSlot != nil {
 		if err := o.ctx.CreateSubscriptionSlot(s.Name, s.Conninfo, slotName); err != nil {
 			return err
@@ -1538,6 +1543,12 @@ func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
 		// WITH (binary = true): subbinary.
 		if berr := o.ctx.PubSub.SetSubscriptionBinary(s.Name, true, subDBOid); berr == nil {
 			sub.Binary = true
+		}
+	}
+	if opts.origin == logicalRepOriginNone {
+		// WITH (origin = none): suborigin. M0149-0062a.
+		if oerr := o.ctx.PubSub.SetSubscriptionOrigin(s.Name, opts.origin, subDBOid); oerr == nil {
+			sub.Origin = opts.origin
 		}
 	}
 	if opts.runAsOwner {
@@ -1725,6 +1736,54 @@ func (o *ddlOp) execAlterPublicationOptions(s *parser.AlterPublicationOptionsStm
 // warnMissingPublications is check_publications' report
 // (subscriptioncmds.c:493-501): one WARNING (ERRCODE_UNDEFINED_OBJECT)
 // naming every publication missing on the publisher, singular or plural.
+// checkPublicationsOrigin is check_publications_origin (subscriptioncmds.c):
+// a subscription that copies data with origin = none WARNs when a table it
+// would copy is one the publisher itself subscribes to — the initial copy
+// cannot tell which rows came from another origin. existing names the
+// subscription's current tables (ALTER SUBSCRIPTION ... REFRESH's
+// subrel_local_oids), which the check skips. M0149-0062a.
+func (o *ddlOp) checkPublicationsOrigin(subName, conninfo string, pubs []string, copyData bool, origin string, subRelsOf string) error {
+	if !copyData || !strings.EqualFold(origin, logicalRepOriginNone) || len(pubs) == 0 || o.ctx.CheckPublicationsOriginOnPublisher == nil {
+		return nil
+	}
+	var exclude [][2]string
+	if subRelsOf != "" && o.ctx.PubSub != nil {
+		if im, ok := underlyingInMemory(o.ctx.Catalog); ok {
+			for _, r := range o.ctx.PubSub.SubscriptionRels(subRelsOf) {
+				if tbl, ok := im.LookupTableByOID(r.RelOID); ok && tbl != nil {
+					schema := tbl.Schema
+					if schema == "" {
+						schema = "public"
+					}
+					exclude = append(exclude, [2]string{schema, tbl.Name})
+				}
+			}
+		}
+	}
+	publist, err := o.ctx.CheckPublicationsOriginOnPublisher(subName, conninfo, pubs, exclude)
+	if err != nil {
+		return err
+	}
+	if len(publist) == 0 {
+		return nil
+	}
+	quoted := make([]string, len(publist))
+	for i, p := range publist {
+		quoted[i] = `"` + p + `"`
+	}
+	detail := fmt.Sprintf("The subscription being created subscribes to a publication (%s) that contains tables that are written to by other subscriptions.", strings.Join(quoted, ", "))
+	if len(publist) > 1 {
+		detail = fmt.Sprintf("The subscription being created subscribes to publications (%s) that contain tables that are written to by other subscriptions.", strings.Join(quoted, ", "))
+	}
+	o.ctx.WarningsWithHint = append(o.ctx.WarningsWithHint, WarningWithHint{
+		Code:    "55000",
+		Message: fmt.Sprintf("subscription \"%s\" requested copy_data with origin = NONE but might copy data that had a different origin", subName),
+		Detail:  detail,
+		Hint:    "Verify that initial data copied from the publisher tables did not come from other origins.",
+	})
+	return nil
+}
+
 func (o *ddlOp) warnMissingPublications(missing []string) {
 	if len(missing) == 0 {
 		return
@@ -2172,6 +2231,19 @@ func (o *ddlOp) execAlterSubscriptionSet(s *parser.AlterSubscriptionSetStmt) err
 			}
 		}
 	}
+	if v, ok := s.Options["origin"]; ok {
+		// suborigin (AlterSubscription's SUBOPT_ORIGIN; the value was
+		// validated above): the apply worker restarts and asks the
+		// publisher with the new origin. M0149-0062a.
+		if serr := o.ctx.PubSub.SetSubscriptionOrigin(s.Name, v, subDBOid); serr != nil {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
+		}
+		if cur, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); ok {
+			if herr := syncSubscriptionRow(o.ctx, cur.OID, cur); herr != nil {
+				return fmt.Errorf("pg_subscription heap write: %w", herr)
+			}
+		}
+	}
 	if v, ok := s.Options["binary"]; ok {
 		// subbinary (AlterSubscription's SUBOPT_BINARY): the apply worker
 		// restarts with the new mode (the launcher compares it), and a
@@ -2369,6 +2441,11 @@ func (o *ddlOp) execAlterSubscriptionPublications(s *parser.AlterSubscriptionPub
 	// (42P01) aborts with the subscription's publication list unchanged
 	// — a later ADD of the same publication retries cleanly. goopg's
 	// registry write is the commit point and sits after this call.
+	if refresh {
+		if err := o.checkPublicationsOrigin(s.Name, sub.Conninfo, next, copyData, sub.Origin, s.Name); err != nil {
+			return err
+		}
+	}
 	if refresh && o.ctx.RefreshSubscriptionOnPublisher != nil {
 		if rerr := o.ctx.RefreshSubscriptionOnPublisher(s.Name, sub.Conninfo, subDBOid, next, copyData); rerr != nil {
 			return rerr
@@ -2428,6 +2505,9 @@ func (o *ddlOp) execAlterSubscriptionRefresh(s *parser.AlterSubscriptionPublicat
 	if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
 		return &ExecError{Code: "25001", Pos: s.Pos(),
 			Message: "ALTER SUBSCRIPTION ... REFRESH cannot run inside a transaction block"}
+	}
+	if err := o.checkPublicationsOrigin(s.Name, sub.Conninfo, sub.Publications, copyData, sub.Origin, s.Name); err != nil {
+		return err
 	}
 	if o.ctx.RefreshSubscriptionOnPublisher != nil {
 		if rerr := o.ctx.RefreshSubscriptionOnPublisher(s.Name, sub.Conninfo, subDBOid, sub.Publications, copyData); rerr != nil {

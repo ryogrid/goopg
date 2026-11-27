@@ -348,6 +348,10 @@ func foldPlanConstantsInner(node Node) {
 		if n.Arg != nil {
 			n.Arg = FoldConstants(n.Arg)
 		}
+	case *PgPartitionTree:
+		if n.Arg != nil {
+			n.Arg = FoldConstants(n.Arg)
+		}
 	case *VerifyHeapam:
 		if n.Arg != nil {
 			n.Arg = FoldConstants(n.Arg)

@@ -4572,6 +4572,10 @@ func nodeReferencesOuter(n Node) bool {
 			}
 		}
 		return false
+	case *PgPartitionTree:
+		// `FROM t, LATERAL pg_partition_tree(t.oid)`: a lateral argument, as
+		// for pg_options_to_table below. M0149-0062a.
+		return exprContainsColumnRef(x.Arg)
 	case *PgOptionsToTable:
 		// `FROM t, LATERAL pg_options_to_table(t.opts)`: the argument is a
 		// plain *ColumnRef against the left sibling, so the wrapping Join has
@@ -4580,6 +4584,14 @@ func nodeReferencesOuter(n Node) bool {
 		// row, and the query died with "column ref opts/1 on nil slot"
 		// (review/260831-2 EO2-6).
 		return exprContainsColumnRef(x.Arg)
+	case *Join:
+		// `FROM p, LATERAL f(p.x) g JOIN t ON …`: the lateral reference sits
+		// in a leaf of an explicit JOIN that is itself the comma item
+		// (check_publications_origin's query). A lateral Join's right side
+		// binds to its own left sibling, not to this scope. M0149-0062a.
+		// The general walk (outer refs anywhere, the join's own predicates
+		// included) still applies.
+		return planHasOuterRef(x) || nodeReferencesOuter(x.Left) || (!x.Lateral && nodeReferencesOuter(x.Right))
 	case *OrdinalityWrap:
 		// WITH ORDINALITY wraps the underlying SRF node; unwrap so a
 		// correlated argument is still detected under the wrapper.
@@ -7434,7 +7446,21 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 				alias = "relid"
 			}
 		}
-		ctx := &resolveContext{}
+		// The argument resolves against the lateral siblings and the outer
+		// scope chain, as pg_options_to_table's does: the copy_data origin
+		// check CREATE SUBSCRIPTION sends the publisher correlates
+		// pg_partition_ancestors(PS.srrelid) on the enclosing join
+		// (check_publications_origin). M0149-0062a.
+		ctx := &resolveContext{cat: cat, parent: planParentOf(cat), settings: DefaultPlannerSettings()}
+		if lateralCtx != nil {
+			if lateralCtx.parent == nil {
+				cp := *lateralCtx
+				cp.parent = planParentOf(cat)
+				ctx = &cp
+			} else {
+				ctx = lateralCtx
+			}
+		}
 		var arg Expr
 		if len(tf.Args) > 0 {
 			var err error

@@ -78,6 +78,9 @@ type launchedWorker struct {
 	// binary is the subscription's binary option the worker was started
 	// with; a change restarts it (maybe_reread_subscription).
 	binary bool
+	// origin is the suborigin the worker started with; an ALTER
+	// SUBSCRIPTION ... SET (origin) restarts it. M0149-0062a.
+	origin string
 }
 
 // NewApplyLauncher wires the launcher to the runtime's catalog +
@@ -136,6 +139,12 @@ func (l *ApplyLauncher) CheckPublications(conninfo string, pubs []string) ([]str
 // (subscriptioncmds.c:2103-2160).
 func (l *ApplyLauncher) FetchPublicationTables(conninfo string, pubs []string) ([]PubTable, error) {
 	return FetchPublicationTables(context.Background(), l.publisherConfig(conninfo, ""), pubs)
+}
+
+// CheckPublicationsOrigin is CheckPublicationsOrigin against the
+// subscription's publisher. M0149-0062a.
+func (l *ApplyLauncher) CheckPublicationsOrigin(conninfo string, pubs []string, exclude [][2]string) ([]string, error) {
+	return CheckPublicationsOrigin(context.Background(), l.publisherConfig(conninfo, ""), pubs, exclude)
 }
 
 // OpenPublisherConn dials one authenticated publisher query connection
@@ -230,7 +239,7 @@ func (l *ApplyLauncher) reconcile(ctx context.Context) {
 
 	l.mu.Lock()
 	for name, w := range l.workers {
-		if sub, ok := enabled[name]; !ok || sub.Binary != w.binary {
+		if sub, ok := enabled[name]; !ok || sub.Binary != w.binary || sub.Origin != w.origin {
 			toStop = append(toStop, w)
 			delete(l.workers, name)
 		}
@@ -240,7 +249,7 @@ func (l *ApplyLauncher) reconcile(ctx context.Context) {
 			continue
 		}
 		workerCtx, cancel := context.WithCancel(ctx)
-		lw := &launchedWorker{ctx: workerCtx, cancel: cancel, done: make(chan struct{}), binary: sub.Binary}
+		lw := &launchedWorker{ctx: workerCtx, cancel: cancel, done: make(chan struct{}), binary: sub.Binary, origin: sub.Origin}
 		l.workers[name] = lw
 		toStart = append(toStart, sub)
 	}
@@ -349,6 +358,7 @@ func DefaultLaunchApplyWorker(ctx context.Context, cfg ApplyLauncherConfig, sub 
 		SlotName:        slotName,
 		Publications:    sub.Publications,
 		Binary:          sub.Binary,
+		Origin:          sub.Origin,
 		StartLSN:        startLSN,
 		Apply:           apply,
 	})

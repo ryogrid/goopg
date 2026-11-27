@@ -1487,6 +1487,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			// record names it in xl_xact_twophase (RecordTransactionCommitPrepared).
 			prepEntry, twoPhase := txnMgr.TakeTwoPhaseEntry(xid)
 			finishedPrepared = twoPhase
+			// A transaction applying a subscription's changes names its
+			// replication origin in the commit record (XACT_XINFO_HAS_ORIGIN
+			// + XLOG_INCLUDE_ORIGIN), which pgoutput's origin = none filters
+			// on. M0149-0062a.
+			origin, _ := txnMgr.TxnOriginOfXID(xid)
 			commitSubs := txnMgr.SubxidsOf(xid, true)
 			if twoPhase {
 				commitSubs = mergeSubxids(prepEntry.Subxacts, commitSubs)
@@ -1497,7 +1502,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 				if twoPhase {
 					payload, perr = xlog.EncodeXactCommitPreparedPGAt(stopTime, xid, commitSubs, dropped, true)
 				} else {
-					payload, perr = xlog.EncodeXactCommitPGWithStatsAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, droppedStats, true)
+					payload, perr = xlog.EncodeXactCommitPGWithOriginAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, droppedStats, true, origin)
 				}
 				_ = catalog.WithRelCacheInitLock(func() error {
 					if err := catalog.RelcacheInitFileUnlink(abs, catalog.DefaultDBOid); err != nil {
@@ -1518,7 +1523,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			} else if twoPhase {
 				payload, perr = xlog.EncodeXactCommitPreparedPGAt(stopTime, xid, commitSubs, dropped, false)
 			} else {
-				payload, perr = xlog.EncodeXactCommitPGWithStatsAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, droppedStats, false)
+				payload, perr = xlog.EncodeXactCommitPGWithOriginAt(stopTime, xid, txnMgr.SubxidsOf(xid, true), dropped, droppedStats, false, origin)
 			}
 		case transam.XactAbort:
 			// The relations the transaction created go into the abort record;

@@ -440,6 +440,10 @@ func nodeOwnExprs(n Node) []Expr {
 		if t.Arg != nil {
 			exprs = append(exprs, t.Arg)
 		}
+	case *PgPartitionTree:
+		if t.Arg != nil {
+			exprs = append(exprs, t.Arg)
+		}
 	case *VerifyHeapam:
 		if t.Arg != nil {
 			exprs = append(exprs, t.Arg)

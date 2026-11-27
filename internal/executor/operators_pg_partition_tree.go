@@ -19,10 +19,16 @@ import (
 )
 
 type pgPartitionTreeOp struct {
-	plan *optimizer.PgPartitionTree
-	rows []Row
-	idx  int
+	plan      *optimizer.PgPartitionTree
+	outerSlot SlotView
+	rows      []Row
+	idx       int
 }
+
+// BindLateralOuter binds the outer row's slot for a lateral argument
+// (`FROM t, LATERAL pg_partition_tree(t.oid)`), as pg_options_to_table's
+// op does; nil clears it. M0149-0062a.
+func (o *pgPartitionTreeOp) BindLateralOuter(slot SlotView) { o.outerSlot = slot }
 
 func newPgPartitionTreeOp(p *optimizer.PgPartitionTree) *pgPartitionTreeOp {
 	return &pgPartitionTreeOp{plan: p}
@@ -39,7 +45,13 @@ func (o *pgPartitionTreeOp) Open(ctx *Context) error {
 	if o.plan.Arg == nil {
 		return nil
 	}
-	argVal, err := evalExpr(o.plan.Arg, nil, ctx)
+	// A lateral argument resolves against the bound outer slot, a
+	// correlated one (inside a sublink) against the correlation stack.
+	slot := o.outerSlot
+	if slot == nil && len(ctx.OuterRows) > 0 {
+		slot = SlotFromRow(nil, ctx.OuterRows[len(ctx.OuterRows)-1])
+	}
+	argVal, err := evalExprSlot(o.plan.Arg, slot, ctx)
 	if err != nil || argVal.IsNull() {
 		return nil
 	}

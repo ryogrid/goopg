@@ -730,6 +730,12 @@ type Context struct {
 	// *ExecError (PG's message and SQLSTATE) on connect/query failure. nil
 	// — tests without a server — skips the publisher side. M0122-0014.
 	CheckPublicationsOnPublisher func(subName, conninfo string, pubs []string) (missing []string, err error)
+	// CheckPublicationsOriginOnPublisher runs check_publications_origin's
+	// publisher query: which of pubs publish a table the publisher itself
+	// subscribes to, skipping the (schema, table) pairs in exclude. It
+	// returns a ready *ExecError on failure; nil skips the check.
+	// M0149-0062a.
+	CheckPublicationsOriginOnPublisher func(subName, conninfo string, pubs []string, exclude [][2]string) ([]string, error)
 	// RefreshSubscriptionOnPublisher runs AlterSubscription_refresh's
 	// data half after the publication-list write: fetch_table_list, the
 	// pg_subscription_rel row swap (drop rows of tables that left the
@@ -1437,11 +1443,13 @@ func (c *Context) AddWarning(msg string) {
 	c.Warnings = append(c.Warnings, msg)
 }
 
-// WarningWithHint is one WARNING with its own SQLSTATE and HINT.
+// WarningWithHint is one WARNING with its own SQLSTATE, HINT and
+// (optional) DETAIL.
 type WarningWithHint struct {
 	Code    string
 	Message string
 	Hint    string
+	Detail  string
 }
 
 // AddWarningWithHint queues a WARNING carrying SQLSTATE code and a HINT.

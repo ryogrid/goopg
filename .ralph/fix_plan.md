@@ -17560,11 +17560,17 @@ verify each at HEAD when the task starts.
   - 013 \(goopg subscriber\): the `conflict detected on relation "public.tab1\_2\_2": conflict=update\_missing` / delete\_missing log checks do not match \(routed UPDATE / DELETE of a missing row; overlaps M0149-0056d\). Path\-to\-TAP: 013 ← 0061e \(1 link\).
   - 2026\-11\-27 \(done\): logApplyConflict is ReportApplyConflict at LOG \(conflict.c errdetail\_apply\_conflict \+ build\_tuple\_value\_details: "Existing local row …; remote row …; replica identity \(a\)=\(…\)." with the replica identity / PK index, else "replica identity full …"\); update\_missing / delete\_missing are logged and skipped in the plain and the partitioned \(leaf\) paths. Test TestApplyWorkerOriginDiffersAndMissingConflicts.
   Movement: yes — tap 013 goopg-subscriber update/delete-missing log checks (340-346, 612-614) fail -> pass
-- [ ] **M0149-0062 — port subscription/t/030_origin.pl**
+- [x] **M0149-0062 — port subscription/t/030_origin.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/030_origin.pl` — `origin` parameter and `copy_data` interaction.
   Likely prerequisites \(verify at start\): replication origins \(`pg_replication_origin_status`, `replorigin_checkpoint` file\), `origin = none` filtering, PG WARNING text for copy\_data with origin, bidirectional setups.
+  - 2026\-11\-28 \(done, as 0062a\): port TestPort\_Subscription030Origin \(three pairings 3/3\). Blockers fixed in one slice, each a proven 030 requirement:
+    - Path\-to\-TAP: 030 "not replicated when origin parameter is none" ← commit\-record origin \+ decoder origin filter \+ pgoutput origin option \+ subscriber sends origin \(1 link\).
+    - Path\-to\-TAP: 030 copy\_data WARNING \(goopg subscriber\) ← check\_publications\_origin \(1 link\); \(PG subscriber → goopg publisher\) ← goopg answers PG's query ← pg\_partition\_ancestors correlated in a JOIN ON \+ lateral SRF under an explicit JOIN \(2 links\).
+    - Path\-to\-TAP: 030 all\-goopg catch\-up after node B's DELETE ← apply UPDATE leaves no ctid chain, so B's waiting RC DELETE skipped the new version \(1 link\).
+  - Tests: TestCommitOriginIsFilteredByOrigin, TestSubscriptionOriginOption, TestPartitionTreeCorrelatedAndLateralUnderJoin, TestApplyUpdateLinksCtidChain \(fails without the stamp\). Design doc 0149\-0062.
+  Movement: yes — tap 030 not\-tried → port \(3 pairings x 3 runs PASS\)
 - [ ] **M0149-0063 — port subscription/t/015_stream.pl**
   Kind: impl
   Parent: none

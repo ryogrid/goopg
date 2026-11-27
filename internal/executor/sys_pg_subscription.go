@@ -62,6 +62,10 @@ func buildPGSubscriptionRow(sub *catalog.Subscription) Row {
 		slot = NewStringDatum(sub.SlotName)
 	}
 	runAs := NewBoolDatum(sub.RunAsOwner)
+	origin := "any" // LOGICALREP_ORIGIN_ANY
+	if sub.Origin != "" {
+		origin = sub.Origin
+	}
 	return Row{
 		NewIntDatum(int64(sub.OID)),   // oid
 		NewIntDatum(int64(sub.DBOid)), // subdbid
@@ -80,7 +84,7 @@ func buildPGSubscriptionRow(sub *catalog.Subscription) Row {
 		slot,                          // subslotname (NULL when unset)
 		NewStringDatum("off"),         // subsynccommit
 		NewStringDatum(formatTextArray(sub.Publications)), // subpublications text[]
-		NewStringDatum("any"),                             // suborigin — LOGICALREP_ORIGIN_ANY
+		NewStringDatum(origin),                            // suborigin
 	}
 }
 

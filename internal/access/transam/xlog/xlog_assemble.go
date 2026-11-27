@@ -84,6 +84,15 @@ func assembleXLogRecord(mainData []byte, blocks []BlockRef) ([]byte, error) {
 // envelope — a second allocation and a second full copy of every WAL record it
 // emits. Passing the envelope in as a prefix removes both.
 func assembleXLogRecordInto(prefix []byte, mainData []byte, blocks []BlockRef) ([]byte, error) {
+	return assembleXLogRecordOriginInto(prefix, mainData, blocks, 0)
+}
+
+// assembleXLogRecordOriginInto is assembleXLogRecordInto for a record that
+// names its replication origin: a non-zero origin adds the
+// XLR_BLOCK_ID_ORIGIN chunk after the block headers and before the
+// main-data header, as XLogRecordAssemble does when XLOG_INCLUDE_ORIGIN is
+// set inside a replication-origin session. M0149-0062a.
+func assembleXLogRecordOriginInto(prefix []byte, mainData []byte, blocks []BlockRef, origin uint16) ([]byte, error) {
 	// review/260831 XL-68: both regions used to grow from nil, so every WAL
 	// record paid a handful of reallocations and then one more copy for the
 	// concatenation at the end. The sizes are known up front — a block header
@@ -91,7 +100,7 @@ func assembleXLogRecordInto(prefix []byte, mainData []byte, blocks []BlockRef) (
 	// RelFileLocator + 4 block number) and the payload is the images, the block
 	// data and the main data — so both are allocated once, and so is the result.
 	const maxBlockHeaderBytes = 25
-	headerCap := len(blocks)*maxBlockHeaderBytes + 5 // + main-data chunk header
+	headerCap := len(blocks)*maxBlockHeaderBytes + 5 + 3 // + main-data chunk header + origin
 	payloadCap := len(mainData)
 	for i := range blocks {
 		payloadCap += len(blocks[i].Data)
@@ -167,6 +176,11 @@ func assembleXLogRecordInto(prefix []byte, mainData []byte, blocks []BlockRef) (
 		if len(b.Data) > 0 {
 			payload = append(payload, b.Data...)
 		}
+	}
+
+	if origin != 0 {
+		header = append(header, xlrBlockIDOrigin)
+		header = binary.LittleEndian.AppendUint16(header, origin)
 	}
 
 	// Main-data chunk header goes last in the header region (the decoder

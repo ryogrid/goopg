@@ -566,6 +566,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		}
 		ectx.CreateSubscriptionSlot, ectx.DropSubscriptionSlot, ectx.CheckPublicationsOnPublisher,
 			ectx.RefreshSubscriptionOnPublisher = s.subscriptionSlotHooks()
+		ectx.CheckPublicationsOriginOnPublisher = s.checkPublicationsOrigin
 	}
 	ectx.DataDir = s.cfg.DataDir
 	// Keep the connection-time role set + auth UserStore in sync when the
@@ -5022,6 +5023,9 @@ func executorNoticeFrames(ctx *executor.Context) [][]libpq.ErrorField {
 			{Code: libpq.FieldSeverityNonLocal, Value: "WARNING"},
 			{Code: libpq.FieldSQLState, Value: code},
 			{Code: libpq.FieldMessage, Value: wh.Message},
+		}
+		if wh.Detail != "" {
+			fields = append(fields, libpq.ErrorField{Code: libpq.FieldDetail, Value: wh.Detail})
 		}
 		if wh.Hint != "" {
 			fields = append(fields, libpq.ErrorField{Code: libpq.FieldHint, Value: wh.Hint})

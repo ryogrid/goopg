@@ -166,7 +166,7 @@ func classifyDecodedXLog(d *Decoder, r Record) error {
 		// (xl_xid) and no block ref. Drive the reorder buffer by xact boundary.
 		switch h.Info & xlogXactOpMask {
 		case xlogXactCommit:
-			return d.ApplyCommitAt(storage.TransactionID(h.XID), r.StartLSN, r.EndLSN)
+			return d.ApplyCommitOriginAt(storage.TransactionID(h.XID), r.StartLSN, r.EndLSN, r.XLog.RecordOrigin)
 		case xlogXactAbort:
 			d.ApplyAbort(storage.TransactionID(h.XID))
 		case xlogXactCommitPrepared, xlogXactAbortPrepared:

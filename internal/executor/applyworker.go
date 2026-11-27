@@ -820,6 +820,16 @@ func applyUpdateFound(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	if tbl != nil {
 		maintainUniqueIndexesForInsert(ctx, tbl, cols, newRow, ptr)
 	}
+	// simple_table_tuple_update is a heap_update: the old version's t_ctid
+	// points at the new one, so a concurrent READ COMMITTED DELETE or
+	// UPDATE that waited on this apply transaction follows the chain to
+	// the new row (EvalPlanQual) instead of skipping it — as updateOp's
+	// non-HOT path links it (M0100-0005z). M0149-0062a.
+	if found != nil {
+		if cerr := stampOldCtid(ctx, rel, found.ptr.Block, found.ptr.Offset, ptr); cerr != nil {
+			return cerr
+		}
+	}
 	return nil
 }
 
@@ -969,6 +979,14 @@ func applyDatumEqual(a, b Datum) bool {
 
 func (w *ApplyWorker) applyCommit(m *xlog.DecodedMessage) error {
 	if w.inXact {
+		// apply_handle_commit_internal: replorigin_session_origin_lsn /
+		// _timestamp name the remote commit, which the commit record's
+		// xl_xact_origin carries. M0149-0062a.
+		remoteEnd := m.EndLSN
+		if remoteEnd == 0 {
+			remoteEnd = m.CommitLSN
+		}
+		w.txnMgr.SetTxnOriginProgress(w.currentTx, remoteEnd, int64(m.CommitTime))
 		if err := w.txnMgr.Commit(w.currentTx); err != nil {
 			return fmt.Errorf("applyworker: commit (commit_lsn=%d): %w", m.CommitLSN, err)
 		}

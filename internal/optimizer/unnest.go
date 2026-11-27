@@ -1052,6 +1052,10 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		if n.Arg != nil {
 			walkExprTree(n.Arg, visit)
 		}
+	case *PgPartitionTree:
+		if n.Arg != nil {
+			walkExprTree(n.Arg, visit)
+		}
 	case *VerifyHeapam:
 		if n.Arg != nil {
 			walkExprTree(n.Arg, visit)
