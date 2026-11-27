@@ -86,6 +86,9 @@ type TableSyncConfig struct {
 	// remote table (relkind 'r'), copied with FROM ONLY. M0149-0059a.
 	Quals    []string
 	Ordinary bool
+	// CaptureSyncLSN copies inside a REPEATABLE READ transaction and
+	// records its pg_current_wal_lsn() as the SYNCDONE LSN (M0149-0061b).
+	CaptureSyncLSN bool
 	// Binary is copy_table's binary format (the subscription's binary
 	// option): COPY ... TO STDOUT WITH (FORMAT binary), the stream pushed
 	// through the writer's PushBinaryData.
@@ -157,6 +160,28 @@ func RunTableSync(cfg TableSyncConfig) (int64, error) {
 	// quotes for the schema and table parts so a name with a dot
 	// inside still parses; the upstream tablesync uses the same
 	// dotted form.
+	// The sync LSN (M0149-0061b): PG's tablesync worker copies inside the
+	// snapshot of its own replication slot and records the slot's
+	// consistent point as the SYNCDONE statelsn, so the apply worker skips
+	// exactly the changes the copy holds. goopg copies in a REPEATABLE READ
+	// transaction whose first statement reads pg_current_wal_lsn(): the
+	// snapshot and the LSN are taken by the same statement.
+	var syncLSN uint64
+	if cfg.CaptureSyncLSN {
+		if _, err := queryRowsOn(cfg.Reader, cfg.Writer, "BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ"); err != nil {
+			return 0, fmt.Errorf("tablesync: begin: %w", err)
+		}
+		rows, err := queryRowsOn(cfg.Reader, cfg.Writer, "SELECT pg_catalog.pg_current_wal_lsn()")
+		if err != nil {
+			return 0, fmt.Errorf("tablesync: read sync LSN: %w", err)
+		}
+		if len(rows) == 1 && len(rows[0]) == 1 && rows[0][0] != nil {
+			syncLSN, err = parseLSN(string(rows[0][0]))
+			if err != nil {
+				return 0, fmt.Errorf("tablesync: parse sync LSN %q: %w", rows[0][0], err)
+			}
+		}
+	}
 	sql := fmt.Sprintf("COPY %s TO STDOUT", cfg.Relname)
 	if len(cfg.Columns) > 0 {
 		quoted := make([]string, len(cfg.Columns))
@@ -268,13 +293,18 @@ func RunTableSync(cfg TableSyncConfig) (int64, error) {
 			if err := drainCopyTrailer(cfg.Reader); err != nil {
 				return cfg.From.RowsInserted(), fmt.Errorf("tablesync: drain trailer: %w", err)
 			}
+			if cfg.CaptureSyncLSN {
+				if _, err := queryRowsOn(cfg.Reader, cfg.Writer, "COMMIT"); err != nil {
+					return cfg.From.RowsInserted(), fmt.Errorf("tablesync: end copy transaction: %w", err)
+				}
+			}
 			if cfg.Commit != nil {
 				if err := cfg.Commit(); err != nil {
 					return cfg.From.RowsInserted(), fmt.Errorf("tablesync: commit: %w", err)
 				}
 			}
 			if _, err := cfg.PubSub.AdvanceSubscriptionRel(cfg.SubName, cfg.RelOID,
-				catalog.SubRelStateSyncDone, 0); err != nil {
+				catalog.SubRelStateSyncDone, syncLSN); err != nil {
 				return cfg.From.RowsInserted(), fmt.Errorf("tablesync: advance to s: %w", err)
 			}
 			logger.Info("logical tablesync: state change",

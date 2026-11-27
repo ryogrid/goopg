@@ -134,6 +134,14 @@ type PgOutput struct {
 	// existed.
 	filter RelationFilter
 
+	// commitStart is the current transaction's commit record start LSN
+	// (SetCommitStart), 0 when unknown.
+	commitStart uint64
+
+	// conv, while a change is written, maps the leaf tuple being published
+	// via its root onto the root's column layout (nil: same layout).
+	conv *tupleConv
+
 	// messages is pgoutput's "messages" option: logical decoding
 	// messages are written only when the subscriber asked for them
 	// (pgoutput_message returns early otherwise).
@@ -167,10 +175,22 @@ func (p *PgOutput) SetFilter(f RelationFilter) {
 // emission time — v0 doesn't yet stamp xact-end records with
 // the commit timestamp, so the plugin uses time.Now(). Apply
 // workers don't depend on commit_time being the exact original.
+// SetCommitStart implements CommitStartAware.
+func (p *PgOutput) SetCommitStart(lsn uint64) { p.commitStart = lsn }
+
+// finalLSN is the commit record's start (Begin final_lsn / Commit
+// commit_lsn), falling back to its end when the decoder did not say.
+func (p *PgOutput) finalLSN(commitEnd uint64) uint64 {
+	if p.commitStart != 0 {
+		return p.commitStart
+	}
+	return commitEnd
+}
+
 func (p *PgOutput) Begin(xid storage.TransactionID, commitLSN uint64) error {
 	buf := make([]byte, 0, 21)
 	buf = append(buf, pgoBegin)
-	buf = appendUint64(buf, commitLSN)
+	buf = appendUint64(buf, p.finalLSN(commitLSN))
 	buf = appendUint64(buf, pgoTimestamp(time.Now()))
 	buf = appendUint32(buf, uint32(xid))
 	_, err := p.w.Write(buf)
@@ -179,13 +199,13 @@ func (p *PgOutput) Begin(xid storage.TransactionID, commitLSN uint64) error {
 
 // Commit emits the per-xact `C` epilogue. flags is fixed at 0
 // (upstream documents the field as "unused for now").
-// commit_lsn and end_lsn carry the same value in v0 — there's
-// no separate flushed-vs-applied notion at the encoder layer.
+// commit_lsn is the commit record's start and end_lsn its end
+// (logicalrep_write_commit; M0149-0061b).
 func (p *PgOutput) Commit(_ storage.TransactionID, commitLSN uint64) error {
 	buf := make([]byte, 0, 26)
 	buf = append(buf, pgoCommit)
 	buf = append(buf, 0) // flags
-	buf = appendUint64(buf, commitLSN)
+	buf = appendUint64(buf, p.finalLSN(commitLSN))
 	buf = appendUint64(buf, commitLSN) // end_lsn
 	buf = appendUint64(buf, pgoTimestamp(time.Now()))
 	_, err := p.w.Write(buf)
@@ -274,11 +294,22 @@ func (p *PgOutput) Change(c Change) error {
 	// M0149-0057d.
 	if vf, ok := p.filter.(ViaRootFilter); ok {
 		if oid, ok := vf.PublishAsAncestor(rel); ok {
-			if root, rchanged, rok := p.snap.Current(storage.RelFileNode{RelOid: oid}); rok && sameTupleLayout(rel, root) {
-				if rchanged {
-					delete(p.emittedRel, root.OID)
+			if root, rchanged, rok := p.snap.Current(storage.RelFileNode{RelOid: oid}); rok {
+				// A leaf laid out differently from the root (columns in
+				// another order) is converted through an attribute map,
+				// as get_rel_sync_entry's attrmap does. M0149-0061b.
+				conv, cok := (*tupleConv)(nil), sameTupleLayout(rel, root)
+				if !cok {
+					conv, cok = newTupleConv(rel, root)
 				}
-				rel = root
+				if cok {
+					if rchanged {
+						delete(p.emittedRel, root.OID)
+					}
+					rel = root
+					p.conv = conv
+					defer func() { p.conv = nil }()
+				}
 			}
 		}
 	}
@@ -496,7 +527,7 @@ func countPublished(cols []ColumnDef, include []bool) int {
 }
 
 func (p *PgOutput) writeInsert(rel *RelationDef, tuple []byte) error {
-	body, err := encodePgoTupleMasked(rel.Columns, tuple, p.snap.RegOut, p.publishedColumns(rel))
+	body, err := p.encodeNewTuple(rel, tuple, p.publishedColumns(rel))
 	if err != nil {
 		return fmt.Errorf("pgoutput: encode insert tuple for %q: %w", rel.Name, err)
 	}
@@ -514,7 +545,7 @@ func (p *PgOutput) writeDelete(rel *RelationDef, oldTuple []byte) error {
 	buf = append(buf, pgoDelete)
 	buf = appendUint32(buf, rel.OID)
 	if len(oldTuple) > 0 {
-		kind, body, err := encodePgoOldTuple(rel, oldTuple, p.snap.RegOut, p.publishedColumns(rel))
+		kind, body, err := p.encodeOldTuple(rel, oldTuple, p.publishedColumns(rel))
 		if err != nil {
 			return fmt.Errorf("pgoutput: encode delete old-tuple for %q: %w", rel.Name, err)
 		}
@@ -542,7 +573,7 @@ func (p *PgOutput) writeUpdate(rel *RelationDef, oldTuple, newTuple []byte) erro
 	// subscribers as malformed since natts=0 violates the relation's
 	// declared column count.
 	include := p.publishedColumns(rel)
-	newBody, err := encodePgoTupleMasked(rel.Columns, newTuple, p.snap.RegOut, include)
+	newBody, err := p.encodeNewTuple(rel, newTuple, include)
 	if err != nil {
 		return fmt.Errorf("pgoutput: encode update new-tuple for %q: %w", rel.Name, err)
 	}
@@ -550,7 +581,7 @@ func (p *PgOutput) writeUpdate(rel *RelationDef, oldTuple, newTuple []byte) erro
 	buf = append(buf, pgoUpdate)
 	buf = appendUint32(buf, rel.OID)
 	if len(oldTuple) > 0 {
-		kind, oldBody, err := encodePgoOldTuple(rel, oldTuple, p.snap.RegOut, p.publishedColumns(rel))
+		kind, oldBody, err := p.encodeOldTuple(rel, oldTuple, p.publishedColumns(rel))
 		if err != nil {
 			return fmt.Errorf("pgoutput: encode update old-tuple for %q: %w", rel.Name, err)
 		}
@@ -1062,6 +1093,115 @@ type ViaRootFilter interface {
 
 // sameTupleLayout reports whether a and b decode the same tuple bytes alike:
 // the same columns, in the same order, with the same types.
+// tupleConv is a leaf-to-root attribute map (build_attrmap_by_name): perm[i]
+// is the leaf column holding the root's column i.
+type tupleConv struct {
+	leaf *RelationDef
+	perm []int
+}
+
+// newTupleConv maps leaf's columns onto root's by name; ok is false when a
+// root column has no same-named, same-typed leaf column.
+func newTupleConv(leaf, root *RelationDef) (*tupleConv, bool) {
+	if len(leaf.Columns) != len(root.Columns) {
+		return nil, false
+	}
+	perm := make([]int, len(root.Columns))
+	for i, rc := range root.Columns {
+		perm[i] = -1
+		for j, lc := range leaf.Columns {
+			if lc.Name == rc.Name && lc.Type.IsArray == rc.Type.IsArray && strings.EqualFold(lc.Type.Name, rc.Type.Name) {
+				perm[i] = j
+				break
+			}
+		}
+		if perm[i] < 0 {
+			return nil, false
+		}
+	}
+	return &tupleConv{leaf: leaf, perm: perm}, true
+}
+
+// rootColumns decodes a leaf heap tuple and returns its columns in the
+// root's order.
+func (p *PgOutput) rootColumns(raw []byte) ([]DecodedColumn, error) {
+	body, err := encodePgoTuple(p.conv.leaf.Columns, raw, p.snap.RegOut)
+	if err != nil {
+		return nil, err
+	}
+	cols, err := decodeTupleBody(&reader{buf: body})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DecodedColumn, len(p.conv.perm))
+	for i, j := range p.conv.perm {
+		if j < len(cols) {
+			out[i] = cols[j]
+		} else {
+			out[i] = DecodedColumn{Status: pgoColNull}
+		}
+	}
+	return out, nil
+}
+
+// encodeDecodedColumns writes decoded columns as a TupleData body, keeping
+// the ones include keeps; keyOnly nulls the non-identity columns of rel.
+func encodeDecodedColumns(rel *RelationDef, cols []DecodedColumn, include []bool, keyOnly bool) []byte {
+	out := appendUint16(nil, uint16(countPublished(rel.Columns, include)))
+	for i, c := range cols {
+		if include != nil && !include[i] {
+			continue
+		}
+		if c.Status == pgoColNull || (keyOnly && !rel.Columns[i].ReplIdent) {
+			out = append(out, pgoColNull)
+			continue
+		}
+		out = append(out, c.Status)
+		if c.Status != 'u' {
+			out = appendUint32(out, uint32(len(c.Bytes)))
+			out = append(out, c.Bytes...)
+		}
+	}
+	return out
+}
+
+// encodeNewTuple is encodePgoTupleMasked through the leaf-to-root map.
+func (p *PgOutput) encodeNewTuple(rel *RelationDef, raw []byte, include []bool) ([]byte, error) {
+	if p.conv == nil {
+		return encodePgoTupleMasked(rel.Columns, raw, p.snap.RegOut, include)
+	}
+	cols, err := p.rootColumns(raw)
+	if err != nil {
+		return nil, err
+	}
+	return encodeDecodedColumns(rel, cols, include, false), nil
+}
+
+// encodeOldTuple is encodePgoOldTuple through the leaf-to-root map.
+func (p *PgOutput) encodeOldTuple(rel *RelationDef, raw []byte, include []bool) (byte, []byte, error) {
+	if p.conv == nil {
+		return encodePgoOldTuple(rel, raw, p.snap.RegOut, include)
+	}
+	keyOnly := false
+	if rel.ReplIdent != 'f' {
+		for _, c := range rel.Columns {
+			if c.ReplIdent {
+				keyOnly = true
+				break
+			}
+		}
+	}
+	cols, err := p.rootColumns(raw)
+	if err != nil {
+		return 0, nil, err
+	}
+	kind := byte('O')
+	if keyOnly {
+		kind = 'K'
+	}
+	return kind, encodeDecodedColumns(rel, cols, include, keyOnly), nil
+}
+
 func sameTupleLayout(a, b *RelationDef) bool {
 	if len(a.Columns) != len(b.Columns) {
 		return false

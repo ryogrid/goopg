@@ -32,6 +32,36 @@ func IsPublishableTable(t *Table) bool {
 	return t.OID >= FirstNormalObjectId
 }
 
+// AllTablesPublicationRelations is GetAllTablesPublicationRelations
+// (pg_publication.c) over database dbOid: the publishable plain tables,
+// partitions included; with publish_via_partition_root, partitions are
+// replaced by the partitioned roots (relkind 'p' that are not themselves
+// partitions). A partitioned table is never listed otherwise — its rows are
+// its partitions'. M0149-0061b.
+func AllTablesPublicationRelations(c *InMemory, dbOid uint32, viaRoot bool) []*Table {
+	if c == nil {
+		return nil
+	}
+	var out []*Table
+	for _, t := range c.AllTables(dbOid) {
+		if !IsPublishableTable(t) {
+			continue
+		}
+		partitioned := len(t.PartitionKey) > 0 || t.PartitionMethod != ""
+		isPartition := t.PartitionParentOID != 0
+		switch {
+		case partitioned && !viaRoot:
+			continue
+		case partitioned && isPartition:
+			continue // an intermediate partitioned table
+		case !partitioned && isPartition && viaRoot:
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
 // PublicationSchemaTables is GetSchemaPublicationRelations with
 // PUBLICATION_PART_LEAF (publish_via_partition_root = false, the only mode
 // goopg models) for the given schemas of database dbOid: every publishable

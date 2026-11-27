@@ -531,6 +531,8 @@ type publicationFilter struct {
 	// publish_via_partition_root publications. M0149-0057d.
 	viaRootTables  map[string]bool
 	viaRootSchemas map[string]bool
+	// viaRootAll: a FOR ALL TABLES publication publishes via the root.
+	viaRootAll bool
 	// pubs are the subscribed publications, for the per-publication row
 	// filter rules (pgoutput_row_filter_init). M0149-0059c.
 	pubs []*catalog.Publication
@@ -661,7 +663,13 @@ func publicationCovers(pub *catalog.Publication, rel *xlog.RelationDef, q string
 // publish_via_partition_root publications: the topmost ancestor of rel that
 // is one of their members (by name, or by its schema).
 func (f *publicationFilter) PublishAsAncestor(rel *xlog.RelationDef) (uint32, bool) {
-	if rel == nil || len(rel.AncestorOIDs) == 0 || (len(f.viaRootTables) == 0 && len(f.viaRootSchemas) == 0) {
+	if rel == nil || len(rel.AncestorOIDs) == 0 {
+		return 0, false
+	}
+	if f.viaRootAll {
+		return rel.AncestorOIDs[len(rel.AncestorOIDs)-1], true
+	}
+	if len(f.viaRootTables) == 0 && len(f.viaRootSchemas) == 0 {
 		return 0, false
 	}
 	for i := len(rel.AncestorOIDs) - 1; i >= 0; i-- {
@@ -877,6 +885,12 @@ func buildPublicationFilterMissing(ps *catalog.PubSub, names []string, missing f
 		if pub.AllTables {
 			out.allTablesAllowed = unionFlags(out.allTablesAllowed, flags)
 			out.allTables = true
+			if pub.PublishViaRoot {
+				// FOR ALL TABLES publishes every partitioned root, so a
+				// partition's change goes out as its topmost ancestor's.
+				// M0149-0061b.
+				out.viaRootAll = true
+			}
 			continue
 		}
 		if pub.PublishViaRoot {

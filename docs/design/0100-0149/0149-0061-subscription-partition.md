@@ -32,11 +32,35 @@ The remapped path skips Phase\-1 EPQ, as inheritance children already do \(ledge
 
 Test: TestPartitionDMLMismatchedColumnOrder.
 
+## Landed — M0149\-0061b \(sync LSN, and what it uncovered on the publisher\)
+
+- **Sync LSN.** `RunTableSync` \(CaptureSyncLSN\) copies inside `BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ`. The
+  transaction's first statement reads `pg_current_wal_lsn\(\)`, and that value is recorded as the SYNCDONE statelsn.
+  The refresh no longer promotes such a rel to READY. The apply worker's `shouldApplyChangesForRel` is
+  should\_apply\_changes\_for\_rel: READY, or SYNCDONE with statelsn <= remote\_final\_lsn \(the Begin's final\_lsn\).
+  The commit's end\_lsn \(process\_syncing\_tables\) and idle keepalives \(`PromoteSyncedRels`\) promote the rel.
+  PG instead copies in the snapshot of the tablesync worker's own slot \(USE\_SNAPSHOT\); goopg's
+  snapshot\-then\-LSN statement leaves a small window for a commit concurrent with the copy \(ledgered\).
+- **pgoutput commit LSNs.** Begin final\_lsn and Commit commit\_lsn now carry the commit record's start
+  \(decode.c DecodeCommit buf\->origptr\), and end\_lsn its end \(`CommitStartAware`, `Decoder.ApplyCommitAt`\). goopg
+  used to send the end in all three fields, which made a PG\-rule sync\-LSN comparison wrong for the transaction
+  ending at the sync point. goopg's subscriber now reports end\_lsn as its applied position, as PG's does.
+- **FOR ALL TABLES with publish\_via\_partition\_root.**
+  - The walsender's filter now publishes a partition's change as its topmost ancestor's \(viaRootAll\).
+  - `catalog.AllTablesPublicationRelations` is GetAllTablesPublicationRelations: plain tables and partitions without
+    viaroot, plain tables and partitioned roots with it. Partitioned parents had been listed in every mode, so a
+    subscriber copied a parent and its leaves.
+- **Attribute map.** A leaf whose columns are in another order from the root is published through the root's
+  layout \(`tupleConv`, build\_attrmap\_by\_name\). It used to be published as itself, and a subscriber without that
+  leaf could not apply it.
+
+Tests: TestApplyWorkerSkipsChangesBeforeSyncLSN; TestApplyWorkerPromotesSyncDoneToReadyOnCommit, updated to PG's
+rule \(a commit past the sync LSN applies\).
+
 ## Open
 
-- **0061b.** Table sync must record a sync LSN so the apply worker skips the changes the COPY already holds.
-  Today a refresh double\-applies them, and sub2 loops on insert\_exists. PG's design is the tablesync slot's
-  consistent point plus SYNCDONE statelsn.
 - **0061c.** Subscriber AFTER ROW triggers must fire on the partitions that routed UPDATEs land in.
 - **0061d.** A replicated TRUNCATE of a partitioned target must reach its sub\-partitions.
 - **0061e.** update\_missing / delete\_missing conflict log lines for routed changes.
+- **0061f.** A leaf TRUNCATE must not be published when the leaf is published via its root.
+- **0061g.** The leaf\-to\-root map must survive dropped and re\-added columns.

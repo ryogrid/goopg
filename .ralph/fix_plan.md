@@ -17474,11 +17474,21 @@ verify each at HEAD when the task starts.
   - Path\-to\-TAP: 013 "update of tab1\_1, tab1\_2 replicated" \(goopg publisher\) ← 0061a \(1 link\).
   - 2026\-11\-27 \(done\): updateOp / deleteOp flag mismatched\-layout leaves for the inheritance child's remap \(evaluation in parent space, newRow mapped back\); the pending update keeps childColMap, routes on the parent\-ordered row and remaps a moved row into the destination's layout. Test TestPartitionDMLMismatchedColumnOrder.
   Movement: yes — tap 013 goopg-publisher "update of tab1_1, tab1_2 replicated" fail -> pass; UPDATE/DELETE on a mismatched-layout partition 0 rows -> correct
-- [ ] **M0149-0061b — table sync records its sync LSN; the apply worker skips changes the copy already holds**
+- [x] **M0149-0061b — table sync records its sync LSN; the apply worker skips changes the copy already holds**
   Kind: impl
   Parent: M0149-0061
   - 013 \(goopg subscriber, both publishers\): after `ALTER SUBSCRIPTION sub2 SET PUBLICATION …` the copy of tab2 holds row 1 and the stream re\-sends INSERT \(1\): 23505 insert\_exists, the worker restarts forever and sub2 never catches up. goopg promotes a synced rel to READY at LSN 0, so changes between the slot's resume point and the COPY snapshot are applied twice. PG: the tablesync worker's own slot \(CREATE\_REPLICATION\_SLOT … USE\_SNAPSHOT\), SUBREL\_STATE\_SYNCDONE with statelsn, should\_apply\_changes\_for\_rel / process\_syncing\_tables\_for\_apply. Also PG skips changes of rels with no pg\_subscription\_rel row \(state UNKNOWN\).
   - Path\-to\-TAP: 013 sub2 catch\-up ← 0061b \(1 link\).
+  - 2026\-11\-27 \(done\): RunTableSync copies inside BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ whose first statement reads pg\_current\_wal\_lsn\(\) and records it as the SYNCDONE LSN \(CaptureSyncLSN\); the refresh no longer promotes such a rel to READY; shouldApplyChangesForRel applies a SYNCDONE rel when statelsn <= remote\_final\_lsn \(Begin final\_lsn\); keepalives promote idle SYNCDONE rels \(PromoteSyncedRels\). Uncovered on the goopg publisher, each 1 link from 013's sub2 catch\-up: pgoutput sent the commit record's END as Begin final\_lsn / Commit commit\_lsn \(PG: start, decode.c buf\->origptr\) — now start, with end\_lsn the end \(CommitStartAware, ApplyCommitAt; goopg's subscriber reports end\_lsn\); FOR ALL TABLES ignored publish\_via\_partition\_root \(viaRootAll; AllTablesPublicationRelations lists roots / leaves as GetAllTablesPublicationRelations, partitioned parents were listed in every mode\); a leaf in another column order was published as itself instead of through the root's attribute map \(tupleConv\). Tests TestApplyWorkerSkipsChangesBeforeSyncLSN, TestApplyWorkerPromotesSyncDoneToReadyOnCommit \(updated to PG's rule\).
+  Movement: yes — tap 013 all three pairings: sub2 catch-up after SET PUBLICATION timeout -> pass (stops move to 0061d/f/g)
+- [ ] **M0149-0061f — a leaf TRUNCATE is not published when the leaf is published via its root**
+  Kind: impl
+  Parent: M0149-0061
+  - 013 \(goopg publisher\): `TRUNCATE tab1\_2, tab2\_1, tab3\_1` under publish\_via\_partition\_root must send nothing \(pgoutput\_truncate skips a relation whose publish\_as\_relid differs\); sub2 stalls at the catch\-up after it. Path\-to\-TAP: 013 ← 0061f \(1 link\).
+- [ ] **M0149-0061g — the leaf\-to\-root map survives dropped / re\-added columns**
+  Kind: impl
+  Parent: M0149-0061
+  - 013 \(goopg publisher\): after `ALTER TABLE tab2 DROP b, ADD COLUMN c …, ADD b` sub\_viaroot stalls \(tupleConv requires equal column counts; dropped columns break it\). PG rebuilds the attrmap per relation invalidation. Path\-to\-TAP: 013 ← 0061g \(1 link\).
 - [ ] **M0149-0061c — apply fires the subscriber partition's AFTER ROW triggers for routed UPDATEs**
   Kind: impl
   Parent: M0149-0061

@@ -1155,9 +1155,10 @@ func TestApplyWorkerPromotesSyncDoneToReadyOnCommit(t *testing.T) {
 	w.SetSubscriptionContext(ps, "sub1")
 	defer w.SafeRollback()
 
-	// First commit at 0xFEED — past the sync-end LSN. The INSERT
-	// itself is gated (state is still 's' when it arrives), but
-	// the commit promotes 's' → 'r'.
+	// First commit at 0xFEED — past the sync-end LSN. As in PG's
+	// should_apply_changes_for_rel (SYNCDONE and statelsn <=
+	// remote_final_lsn) its INSERT applies — the copy does not hold it —
+	// and the commit promotes 's' → 'r'. M0149-0061b.
 	stream := pgoutputBIRC(t, snap, rel, 1, "first", 0xFEED)
 	driveStream(t, w, stream)
 	got, _ := ps.LookupSubscriptionRel("sub1", subRel.RelOid)
@@ -1192,8 +1193,63 @@ func TestApplyWorkerPromotesSyncDoneToReadyOnCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0][0].Int != 2 {
-		t.Errorf("scan rows=%v want one row with id=2", rows)
+	if len(rows) != 2 || rows[0][0].Int+rows[1][0].Int != 3 {
+		t.Errorf("scan rows=%v want ids 1 and 2", rows)
+	}
+}
+
+// TestApplyWorkerSkipsChangesBeforeSyncLSN pins the other half of
+// should_apply_changes_for_rel: a SYNCDONE rel's change in a transaction
+// whose final LSN is before the sync LSN is in the table sync's copy and is
+// skipped. M0149-0061b.
+func TestApplyWorkerSkipsChangesBeforeSyncLSN(t *testing.T) {
+	_, pubCat, pubCleanup := newStorageFixture(t)
+	defer pubCleanup()
+	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
+	snap := xlog.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
+	rel := pubCat.RelFileNode(pubTbl)
+	subCtx, subCat, subCleanup := newStorageFixture(t)
+	defer subCleanup()
+	subTbl, _ := subCat.LookupTable(parser.ObjectName{Name: "items"})
+	subRel := subCat.RelFileNode(subTbl)
+	ps := catalog.NewPubSub()
+	if _, err := ps.CreateSubscription("sub1", "x", []string{"p"}, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AddSubscriptionRel("sub1", subRel.RelOid); err != nil {
+		t.Fatal(err)
+	}
+	for _, st := range []struct {
+		state string
+		lsn   uint64
+	}{{catalog.SubRelStateDataCopy, 0}, {catalog.SubRelStateSyncDone, 0xCAFE}} {
+		if _, err := ps.AdvanceSubscriptionRel("sub1", subRel.RelOid, st.state, st.lsn); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := NewApplyWorker(subCat, subCtx.Pool, subCtx.TxnMgr)
+	w.SetSubscriptionContext(ps, "sub1")
+	defer w.SafeRollback()
+	driveStream(t, w, pgoutputBIRC(t, snap, rel, 1, "first", 0xBEEF))
+	if got, _ := ps.LookupSubscriptionRel("sub1", subRel.RelOid); got.State != catalog.SubRelStateSyncDone {
+		t.Errorf("a commit before the sync LSN promoted the rel: state=%q", got.State)
+	}
+	tx, _ := subCtx.TxnMgr.Begin(0)
+	defer subCtx.TxnMgr.Rollback(tx)
+	snap2, _ := subCtx.TxnMgr.SnapshotFor(tx)
+	scanCtx := NewContext()
+	scanCtx.Pool, scanCtx.Catalog, scanCtx.TxnMgr, scanCtx.Tx, scanCtx.Snap = subCtx.Pool, subCat, subCtx.TxnMgr, tx, snap2
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: subTbl})
+	if err := scan.Open(scanCtx); err != nil {
+		t.Fatal(err)
+	}
+	defer scan.Close()
+	rows, err := drainScan(scan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("rows=%v: the change the copy already holds was applied", rows)
 	}
 }
 

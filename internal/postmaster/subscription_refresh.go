@@ -169,10 +169,11 @@ func (s *Server) RefreshSubscriptionOnPublisher(subName, conninfo string, dbOid 
 // returns the manager-level errors and whether any rel failed.
 func (s *Server) runSubscriptionTableSyncs(subName, conninfo string, pubs []string, rels map[uint32]*refreshRel) ([]string, bool) {
 	results, mgrErr := replication.RunTableSyncManager(context.Background(), replication.TableSyncManagerConfig{
-		PubSub:       s.cfg.PubSub,
-		SubName:      subName,
-		Publications: pubs,
-		Binary:       s.subscriptionBinary(subName, rels),
+		PubSub:         s.cfg.PubSub,
+		SubName:        subName,
+		Publications:   pubs,
+		CaptureSyncLSN: true,
+		Binary:         s.subscriptionBinary(subName, rels),
 		ResolveRel: func(relOID uint32) (string, bool) {
 			rr, ok := rels[relOID]
 			if !ok {
@@ -211,8 +212,16 @@ func (s *Server) runSubscriptionTableSyncs(subName, conninfo string, pubs []stri
 	// changes. PG promotes at the restart point, so do the same here:
 	// the sweep completed, the worker restarts at the slot's resume
 	// point, and every change after it streams onto a 'r' rel.
+	// A copy that recorded its sync LSN stays SYNCDONE: the apply worker
+	// applies the rel's changes from that LSN on and promotes it to READY
+	// once the stream passes it (should_apply_changes_for_rel,
+	// process_syncing_tables_for_apply), so a change the copy already holds
+	// is not applied twice. M0149-0061b.
 	for _, r := range results {
 		if r.Err != nil || r.FinalState != catalog.SubRelStateSyncDone {
+			continue
+		}
+		if sr, ok := s.cfg.PubSub.LookupSubscriptionRel(subName, r.RelOID); ok && sr.LSN != 0 {
 			continue
 		}
 		if _, perr := s.cfg.PubSub.AdvanceSubscriptionRel(subName, r.RelOID, catalog.SubRelStateReady, 1); perr == nil {

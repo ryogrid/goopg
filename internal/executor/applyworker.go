@@ -53,6 +53,10 @@ type ApplyWorker struct {
 	// reference. UPDATE / DELETE find their target table here.
 	relations map[uint32]*applyRel
 
+	// remoteFinalLSN is the open transaction's final LSN (the Begin
+	// message's final_lsn, worker.c remote_final_lsn).
+	remoteFinalLSN uint64
+
 	// currentTx is the in-progress local transaction opened on
 	// `B` and closed on `C` / abort. Apply work happens inside
 	// it. When inXact is false, change events outside an open
@@ -228,7 +232,13 @@ func (w *ApplyWorker) ApplyMessage(m *xlog.DecodedMessage) (uint64, error) {
 		// valid stream and its surrounding transaction intact.
 		err = nil
 	case 'C':
-		commitLSN = m.CommitLSN
+		// The commit's end_lsn is the position the subscriber has applied
+		// up to (apply_handle_commit: store_flush_position(end_lsn));
+		// commit_lsn is the record's start. M0149-0061b.
+		commitLSN = m.EndLSN
+		if commitLSN == 0 {
+			commitLSN = m.CommitLSN
+		}
 		err = w.applyCommit(m)
 	default:
 		err = fmt.Errorf("applyworker: unsupported pgoutput kind %q", m.Kind)
@@ -265,6 +275,10 @@ func (w *ApplyWorker) applyBegin(m *xlog.DecodedMessage) error {
 	}
 	w.currentTx = tx
 	w.inXact = true
+	// remote_final_lsn: the Begin message's final_lsn, which
+	// should_apply_changes_for_rel compares with a SYNCDONE rel's sync
+	// LSN. M0149-0061b.
+	w.remoteFinalLSN = m.CommitLSN
 	return nil
 }
 
@@ -297,7 +311,21 @@ func (w *ApplyWorker) shouldApplyChangesForRel(r *applyRel) bool {
 	// the same identifier the tablesync transport used to seed the row.
 	localOID := w.cat.RelFileNode(r.local).RelOid
 	sr, tracked := w.pubsub.LookupSubscriptionRel(w.subName, localOID)
-	return tracked && sr.State == catalog.SubRelStateReady
+	if !tracked {
+		return false
+	}
+	// SYNCDONE: the table sync's COPY holds every change committed before
+	// its sync LSN (statelsn); a transaction whose final LSN is at or past
+	// it is not in the copy and applies. M0149-0061b.
+	return sr.State == catalog.SubRelStateReady ||
+		(sr.State == catalog.SubRelStateSyncDone && sr.LSN != 0 && sr.LSN <= w.remoteFinalLSN)
+}
+
+// PromoteSyncedRels is process_syncing_tables_for_apply on an idle stream:
+// a SYNCDONE rel whose sync LSN the stream has passed (a keepalive's
+// walEnd) becomes READY. M0149-0061b.
+func (w *ApplyWorker) PromoteSyncedRels(lsn uint64) {
+	w.promoteSyncedRels(lsn)
 }
 
 func (w *ApplyWorker) applyInsert(m *xlog.DecodedMessage) error {
@@ -916,9 +944,14 @@ func (w *ApplyWorker) applyCommit(m *xlog.DecodedMessage) error {
 	// (Idle commit with no Begin observed — v0 pgoutput can emit
 	// commit-only sequences when every change was filtered.
 	// Falls through to the tablesync promotion check below.)
-	w.promoteSyncedRels(m.CommitLSN)
+	endLSN := m.EndLSN
+	if endLSN == 0 {
+		endLSN = m.CommitLSN
+	}
+	// process_syncing_tables(commit_data.end_lsn).
+	w.promoteSyncedRels(endLSN)
 	if w.stat != nil {
-		w.stat.AdvanceReceivedLSN(m.CommitLSN)
+		w.stat.AdvanceReceivedLSN(endLSN)
 	}
 	w.log().Info("logical apply: commit",
 		"event", xlog.EventApplyCommit,

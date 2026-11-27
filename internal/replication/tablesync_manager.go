@@ -78,6 +78,8 @@ type TableSyncManagerConfig struct {
 	Publications []string
 	// Binary is the subscription's binary option at the time of the sync.
 	Binary bool
+	// CaptureSyncLSN records each copy's sync LSN (TableSyncConfig).
+	CaptureSyncLSN bool
 
 	// ResolveRel turns a relOID into the qualified "schema.name"
 	// the publisher will see on its `COPY <name> TO STDOUT`
@@ -257,6 +259,8 @@ func syncOneRel(ctx context.Context, cfg TableSyncManagerConfig, relOID uint32, 
 		Ordinary:   info.RelKind == "r",
 		Binary:     cfg.Binary,
 		Commit:     closeWriter,
+
+		CaptureSyncLSN: cfg.CaptureSyncLSN,
 	})
 	res.Rows = rows
 	if err != nil {

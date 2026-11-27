@@ -880,6 +880,10 @@ func (r *LogicalReceiver) handleCopyData(payload []byte) error {
 			if err := r.cfg.Apply.CheckSubscription(); err != nil {
 				return fmt.Errorf("logicalreceiver: %w", err)
 			}
+			// process_syncing_tables(last_received) on an idle stream:
+			// a synced rel becomes READY once the stream passes its sync
+			// LSN even when no further commit arrives. M0149-0061b.
+			r.cfg.Apply.PromoteSyncedRels(ka.WALEnd)
 		}
 		// send_feedback(last_received, reply_requested, false): a
 		// requested reply is forced; otherwise one goes out only when

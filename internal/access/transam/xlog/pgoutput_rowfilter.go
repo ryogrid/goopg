@@ -106,10 +106,11 @@ func (p *PgOutput) rowFilterValues(rel *RelationDef, raw []byte, old bool) ([]*s
 	}
 	var body []byte
 	var err error
-	if keyOnly {
-		_, body, err = encodePgoOldTuple(rel, raw, p.snap.RegOut, nil)
-	} else {
-		body, err = encodePgoTuple(rel.Columns, raw, p.snap.RegOut)
+	switch {
+	case keyOnly:
+		_, body, err = p.encodeOldTuple(rel, raw, nil)
+	default:
+		body, err = p.encodeNewTuple(rel, raw, nil)
 	}
 	if err != nil {
 		return nil, err

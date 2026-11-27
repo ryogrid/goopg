@@ -152,6 +152,23 @@ func (d *Decoder) ApplyChange(xid storage.TransactionID, c Change) {
 // only xact); returns nil in that case so the upstream classifier
 // loop doesn't need to track which xids made it into the buffer.
 func (d *Decoder) ApplyCommit(xid storage.TransactionID, commitLSN uint64) error {
+	return d.ApplyCommitAt(xid, 0, commitLSN)
+}
+
+// CommitStartAware is implemented by an output plugin that needs the commit
+// record's start LSN: pgoutput's Begin final_lsn and Commit commit_lsn are
+// the record's start (decode.c DecodeCommit: buf->origptr), its end_lsn the
+// record's end. M0149-0061b.
+type CommitStartAware interface {
+	SetCommitStart(lsn uint64)
+}
+
+// ApplyCommitAt is ApplyCommit with the commit record's start LSN (0 when
+// unknown: the plugin then uses commitLSN, the record's end, for both).
+func (d *Decoder) ApplyCommitAt(xid storage.TransactionID, startLSN, commitLSN uint64) error {
+	if ca, ok := d.plugin.(CommitStartAware); ok {
+		ca.SetCommitStart(startLSN)
+	}
 	restart, _ := d.buf.RestartLSNOf(xid)
 	changes, beginLSN, ok := d.buf.Commit(xid)
 	if !ok {

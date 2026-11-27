@@ -136,7 +136,7 @@ func Classify(d *Decoder, r Record) error {
 		if err != nil {
 			return err
 		}
-		return d.ApplyCommit(xid, r.EndLSN)
+		return d.ApplyCommitAt(xid, r.StartLSN, r.EndLSN)
 	case RecordKindXactAbort:
 		xid, err := DecodeXactMarker(r.Payload)
 		if err != nil {
@@ -166,7 +166,7 @@ func classifyDecodedXLog(d *Decoder, r Record) error {
 		// (xl_xid) and no block ref. Drive the reorder buffer by xact boundary.
 		switch h.Info & xlogXactOpMask {
 		case xlogXactCommit:
-			return d.ApplyCommit(storage.TransactionID(h.XID), r.EndLSN)
+			return d.ApplyCommitAt(storage.TransactionID(h.XID), r.StartLSN, r.EndLSN)
 		case xlogXactAbort:
 			d.ApplyAbort(storage.TransactionID(h.XID))
 		case xlogXactCommitPrepared, xlogXactAbortPrepared:
@@ -179,7 +179,7 @@ func classifyDecodedXLog(d *Decoder, r Record) error {
 				return err
 			}
 			if h.Info&xlogXactOpMask == xlogXactCommitPrepared {
-				return d.ApplyCommit(storage.TransactionID(p.TwophaseXid), r.EndLSN)
+				return d.ApplyCommitAt(storage.TransactionID(p.TwophaseXid), r.StartLSN, r.EndLSN)
 			}
 			d.ApplyAbort(storage.TransactionID(p.TwophaseXid))
 		}
