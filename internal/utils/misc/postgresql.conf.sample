@@ -92,6 +92,7 @@
                                         # "Plan-parity harness")
 #maintenance_work_mem = 64MB            # min 64kB; accepted, VACUUM/CREATE
                                         # INDEX do not yet size off this GUC
+#logical_decoding_work_mem = 64MB       # min 64kB
 
 # - Background Writer -
 
@@ -526,6 +527,7 @@
                                         # no catalog change on it) so test
                                         # setups that SET it succeed
 #debug_parallel_query = off             # off, on, regress; no-op in goopg
+#debug_logical_replication_streaming = buffered # buffered, immediate
                                         # (no parallel executor) — accepted so
                                         # test scripts that force parallel
                                         # plans don't fail on SET

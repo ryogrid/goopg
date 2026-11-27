@@ -36,6 +36,14 @@ func Classify(d *Decoder, r Record) error {
 	if d == nil {
 		return nil
 	}
+	if err := classify(d, r); err != nil {
+		return err
+	}
+	// A stream callback run from ApplyChange / ApplyAbort. M0149-0063a.
+	return d.takeStreamErr()
+}
+
+func classify(d *Decoder, r Record) error {
 	if len(r.Payload) == 0 {
 		// PG-format records (a block ref is present, so parseXLogRecordData
 		// leaves Payload nil) dispatch on the decoded XLog header. HeapInsert is
@@ -168,7 +176,7 @@ func classifyDecodedXLog(d *Decoder, r Record) error {
 		case xlogXactCommit:
 			return d.ApplyCommitOriginAt(storage.TransactionID(h.XID), r.StartLSN, r.EndLSN, r.XLog.RecordOrigin)
 		case xlogXactAbort:
-			d.ApplyAbort(storage.TransactionID(h.XID))
+			return d.ApplyAbortAt(storage.TransactionID(h.XID), r.EndLSN)
 		case xlogXactCommitPrepared, xlogXactAbortPrepared:
 			// Without two-phase decoding, a prepared transaction is decoded
 			// when it is finished (DecodeCommit / DecodeAbort with the

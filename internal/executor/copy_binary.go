@@ -719,6 +719,13 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		return NewStringDatum(s), nil
 	case "numeric", "decimal":
 		return decodeNumericBinary(payload)
+	case "bytea":
+		// bytearecv: the payload IS the value. Before this arm the default
+		// handed the raw bytes back as a STRING Datum, which the heap encoder
+		// then ran through byteain — so a binary-mode subscription (015_stream.pl
+		// with binary = on) failed "invalid input syntax for type bytea" on
+		// any value holding a backslash. M0149-0063a.
+		return NewBytesDatum(append([]byte(nil), payload...)), nil
 	default:
 		return NewStringDatum(string(payload)), nil
 	}

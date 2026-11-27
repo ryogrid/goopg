@@ -27,6 +27,7 @@ package xlog
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"math"
@@ -146,6 +147,19 @@ type PgOutput struct {
 	// messages are written only when the subscriber asked for them
 	// (pgoutput_message returns early otherwise).
 	messages bool
+
+	// Streaming of in-progress transactions (pgoutput "streaming" option,
+	// stream_*_cb). parallel is streaming = parallel, whose stream abort
+	// carries the abort LSN and time. Inside a stream segment every change
+	// message carries streamXid after its type byte, and emittedRel is the
+	// streamed transaction's own relation set (RelationSyncEntry's
+	// streamed_txns): a schema sent inside a stream counts for the session
+	// only once that transaction commits. M0149-0063a.
+	streaming, parallel bool
+	inStream            bool
+	streamXid           storage.TransactionID
+	sessionRel          map[uint32]struct{}
+	streamRel           map[storage.TransactionID]map[uint32]struct{}
 }
 
 // NewPgOutput constructs a plugin that writes pgoutput messages
@@ -232,7 +246,7 @@ func (p *PgOutput) Message(transactional bool, lsn uint64, prefix string, payloa
 	buf = appendCString(buf, prefix)
 	buf = appendUint32(buf, uint32(len(payload)))
 	buf = append(buf, payload...)
-	_, err := p.w.Write(buf)
+	_, err := p.writeChange(buf)
 	return err
 }
 
@@ -404,7 +418,7 @@ func (p *PgOutput) truncate(c Change) error {
 	for _, oid := range relids {
 		buf = appendUint32(buf, oid)
 	}
-	_, err := p.w.Write(buf)
+	_, err := p.writeChange(buf)
 	return err
 }
 
@@ -476,7 +490,7 @@ func (p *PgOutput) writeRelation(rel *RelationDef) error {
 		// atttypmod (logicalrep_write_attrs), -1 for none.
 		buf = appendUint32(buf, uint32(col.Typmod))
 	}
-	_, err := p.w.Write(buf)
+	_, err := p.writeChange(buf)
 	return err
 }
 
@@ -544,7 +558,7 @@ func (p *PgOutput) writeInsert(rel *RelationDef, tuple []byte) error {
 	buf = appendUint32(buf, rel.OID)
 	buf = append(buf, 'N')
 	buf = append(buf, body...)
-	_, err = p.w.Write(buf)
+	_, err = p.writeChange(buf)
 	return err
 }
 
@@ -566,7 +580,7 @@ func (p *PgOutput) writeDelete(rel *RelationDef, oldTuple []byte) error {
 		buf = append(buf, 'K')
 		buf = appendUint16(buf, 0)
 	}
-	_, err := p.w.Write(buf)
+	_, err := p.writeChange(buf)
 	return err
 }
 
@@ -598,7 +612,7 @@ func (p *PgOutput) writeUpdate(rel *RelationDef, oldTuple, newTuple []byte) erro
 	}
 	buf = append(buf, 'N')
 	buf = append(buf, newBody...)
-	_, err = p.w.Write(buf)
+	_, err = p.writeChange(buf)
 	return err
 }
 
@@ -984,6 +998,16 @@ func pgoDecodePhysicalValue(t catalog.Type, data []byte, regOut func(string, uin
 	payload, n, err := pgoDecodePhysicalVarlena(data)
 	if err != nil {
 		return nil, 0, err
+	}
+	// bytea's text form is byteaout's (bytea_output = hex, the default):
+	// "\x" and two hex digits per byte. The raw bytes used to go out as
+	// the "text" value, which a subscriber's byteain rejected or misread
+	// (015_stream.pl). M0149-0063a.
+	if strings.EqualFold(t.Name, "bytea") {
+		out := make([]byte, 2+2*len(payload))
+		out[0], out[1] = '\\', 'x'
+		hex.Encode(out[2:], payload)
+		return out, n, nil
 	}
 	// A real PG publisher emits all N characters of a bpchar in the change
 	// message. Since M0143-0007b goopg's own heap image is padded too, so this

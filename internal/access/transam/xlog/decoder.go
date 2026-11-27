@@ -86,6 +86,12 @@ type Decoder struct {
 	// filterByOrigin, when set, reports whether a transaction from the
 	// given replication origin is skipped (SetOriginFilter).
 	filterByOrigin func(origin uint16) bool
+	// streamLimit / streamImmediate configure streaming of in-progress
+	// transactions (SetStreaming); streamErr carries a stream callback's
+	// failure out of ApplyChange to Classify. M0149-0063a.
+	streamLimit     int64
+	streamImmediate bool
+	streamErr       error
 }
 
 // SetOriginFilter sets the output plugin's filter_by_origin_cb: a committed
@@ -152,6 +158,16 @@ func NewDecoder(plugin OutputPlugin) *Decoder {
 // never reaches the wire.
 func (d *Decoder) ApplyChange(xid storage.TransactionID, c Change) {
 	d.buf.Append(xid, c)
+	if d.streamLimit > 0 && d.streamErr == nil {
+		d.streamErr = d.checkMemoryLimit()
+	}
+}
+
+// takeStreamErr returns and clears a stream callback failure.
+func (d *Decoder) takeStreamErr() error {
+	err := d.streamErr
+	d.streamErr = nil
+	return err
 }
 
 // ApplyCommit drains `xid`'s queue through the plugin in
@@ -190,9 +206,23 @@ func (d *Decoder) ApplyCommitOriginAt(xid storage.TransactionID, startLSN, commi
 		ca.SetCommitStart(startLSN)
 	}
 	restart, _ := d.buf.RestartLSNOf(xid)
+	streamed := false
+	if t, tok := d.buf.txns[xid]; tok {
+		streamed = t.streamed
+	}
 	changes, beginLSN, ok := d.buf.Commit(xid)
 	if !ok {
 		return nil
+	}
+	if streamed {
+		// Part of the transaction already went out in a stream: finish it
+		// as one (stream_commit_cb). M0149-0063a.
+		if d.onSent != nil {
+			d.onSent(commitLSN, restart)
+		}
+		if sp, sok := d.plugin.(StreamingPlugin); sok {
+			return d.commitStreamed(sp, xid, changes, commitLSN)
+		}
 	}
 	if d.skipThrough != 0 && commitLSN <= d.skipThrough {
 		return nil
@@ -233,7 +263,9 @@ func (d *Decoder) ApplyCommitOriginAt(xid storage.TransactionID, startLSN, commi
 // ApplyAbort drops `xid`'s queued changes. The plugin is not
 // invoked — aborted xacts never reach the wire.
 func (d *Decoder) ApplyAbort(xid storage.TransactionID) {
-	d.buf.Abort(xid)
+	if err := d.ApplyAbortAt(xid, 0); err != nil && d.streamErr == nil {
+		d.streamErr = err
+	}
 }
 
 // Active reports the number of in-flight transactions in the

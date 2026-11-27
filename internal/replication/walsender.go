@@ -80,6 +80,10 @@ type Config struct {
 	WALSegmentSize int64
 	SystemID       string
 	Timeline       uint32
+	// Setting reads a server GUC's current value (nil: defaults); the
+	// logical walsender sizes streaming by logical_decoding_work_mem and
+	// debug_logical_replication_streaming. M0149-0063a.
+	Setting func(name string) (string, bool)
 }
 
 // WriteQueryErrorFunc writes an ErrorResponse plus a trailing ReadyForQuery on

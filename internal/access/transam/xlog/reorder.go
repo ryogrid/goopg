@@ -94,6 +94,12 @@ type txn struct {
 	// first change (ReorderBuffer.curStart at its first Append).
 	restartLSN uint64
 	changes    []Change
+	// size is the bytes its queued changes hold (ReorderBufferTXN.size);
+	// streamed marks a transaction part of which has already gone out in
+	// a stream (rbtxn_is_streamed). M0149-0063a.
+	size     int64
+	streamed bool
+	segments int
 }
 
 // ReorderBuffer holds in-progress transactions until commit.
@@ -107,6 +113,9 @@ type ReorderBuffer struct {
 	// keeps it as the point decoding must restart from to see all of that
 	// transaction again (restart_lsn). M0149-0057c.
 	curStart uint64
+	// size is the bytes held by every queued change (rb->size), which
+	// logical_decoding_work_mem bounds. M0149-0063a.
+	size int64
 }
 
 // NewReorderBuffer constructs an empty buffer.
@@ -133,6 +142,9 @@ func (rb *ReorderBuffer) Append(xid storage.TransactionID, c Change) {
 		rb.txns[xid] = t
 	}
 	t.changes = append(t.changes, c)
+	sz := changeSize(c)
+	t.size += sz
+	rb.size += sz
 }
 
 // Commit returns the changes queued under `xid` (in append order)
@@ -155,6 +167,7 @@ func (rb *ReorderBuffer) Commit(xid storage.TransactionID) ([]Change, uint64, bo
 		return nil, 0, false
 	}
 	delete(rb.txns, xid)
+	rb.size -= t.size
 	return foldChanges(t.changes), t.beginLSN, true
 }
 
@@ -208,10 +221,12 @@ func foldChanges(in []Change) []Change {
 // Returns true when the xact was tracked, false when `xid` was
 // unknown.
 func (rb *ReorderBuffer) Abort(xid storage.TransactionID) bool {
-	if _, ok := rb.txns[xid]; !ok {
+	t, ok := rb.txns[xid]
+	if !ok {
 		return false
 	}
 	delete(rb.txns, xid)
+	rb.size -= t.size
 	return true
 }
 

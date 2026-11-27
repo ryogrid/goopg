@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -138,6 +139,44 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 		return s.writeStreamingError(w, errcodes.InternalError, err.Error())
 	}
 	defer dec.Close()
+	// pgoutput's "streaming" option (parse_output_parameters →
+	// defGetStreamingMode) and pgoutput_startup's proto_version checks:
+	// with it on, the decoder streams in-progress transactions past
+	// logical_decoding_work_mem (ReorderBufferCheckMemoryLimit). M0149-0063a.
+	if v, ok := args.Options["streaming"]; ok {
+		on, parallel := false, false
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "true", "on", "1":
+			on = true
+		case "false", "off", "0":
+		case "parallel":
+			on, parallel = true, true
+		default:
+			return s.writeStreamingError(w, errcodes.SyntaxError, `streaming requires a Boolean value or "parallel"`)
+		}
+		proto, _ := strconv.Atoi(strings.TrimSpace(args.Options["proto_version"]))
+		switch {
+		case on && !parallel && proto < 2:
+			return s.writeStreamingError(w, errcodes.InvalidParameterValue, fmt.Sprintf("requested proto_version=%d does not support streaming, need %d or higher", proto, 2))
+		case parallel && proto < 4:
+			return s.writeStreamingError(w, errcodes.InvalidParameterValue, fmt.Sprintf("requested proto_version=%d does not support parallel streaming, need %d or higher", proto, 4))
+		}
+		if on {
+			plugin.SetStreaming(true, parallel)
+			limitKB, immediate := int64(65536), false
+			if s.cfg.Setting != nil {
+				if mem, ok := s.cfg.Setting("logical_decoding_work_mem"); ok {
+					if n, err := strconv.ParseInt(mem, 10, 64); err == nil && n > 0 {
+						limitKB = n
+					}
+				}
+				if mode, ok := s.cfg.Setting("debug_logical_replication_streaming"); ok {
+					immediate = strings.EqualFold(mode, "immediate")
+				}
+			}
+			dec.SetStreaming(limitKB*1024, immediate)
+		}
+	}
 	// pgoutput's "origin" option (parse_output_parameters): with origin =
 	// none, pgoutput_origin_filter skips every transaction that came from
 	// a replication origin, so a bidirectional pair does not loop changes

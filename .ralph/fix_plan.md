@@ -17576,6 +17576,21 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/subscription/t/015_stream.pl` — streaming of a large in-progress transaction.
   Likely prerequisites \(verify at start\): `logical_decoding_work_mem` spill \(PG `xid-*.spill` files\), pgoutput Stream Start/Stop/Commit/Abort, `streaming = on|parallel` incl. parallel apply workers, `debug_logical_replication_streaming`.
+  - 2026\-11\-28: port written \(TestPort\_Subscription015Stream, gated by GOOPG\_TAP\_015\). After 0063a the goopg\-publisher → PG\-subscriber pairing PASSES; the two goopg\-subscriber pairings stop at the first parallel\-apply log check \(015 line 251\).
+- [x] **M0149-0063a — publisher streams large in\-progress transactions; bytea text / binary in pgoutput**
+  Kind: impl
+  Parent: M0149-0063
+  - Path\-to\-TAP: 015 goopg\-publisher pairing ← walsender streaming \(stream messages, streaming option, logical\_decoding\_work\_mem\) \(1 link\); 015 every pairing ← bytea text cell is raw bytes \(publisher\) / binary bytea read as text \(subscriber\) \(1 link\).
+  - 2026\-11\-28 \(done\): reorder\-buffer size accounting \+ Decoder.SetStreaming / checkMemoryLimit / commitStreamed / ApplyAbortAt \(xlog stream.go\); pgoutput stream messages \+ xid prefix \+ per\-txn relation sets \(pgoutput\_stream.go\); walsender streaming option \+ proto checks; GUCs logical\_decoding\_work\_mem / debug\_logical\_replication\_streaming registered; bytea text = byteaout hex; copyBinaryToDatum bytea arm. Tests TestDecoderStreamsLargeTransactions, TestPgOutputStreamMessages, TestPgoutputByteaTextIsHex, TestCopyBinaryByteaIsBytes. Design doc 0149\-0063.
+  Movement: yes — tap 015 goopg-publisher-pg18-subscriber: timeout at 227 → PASS; goopg-subscriber pairings 227 → 251
+- [ ] **M0149-0063b — goopg subscriber applies streamed transactions \(streaming = on\)**
+  Kind: impl
+  Parent: M0149-0063
+  - Path\-to\-TAP: 015 goopg\-subscriber pairings ← receiver requests streaming \+ apply decodes S/E/c/A and xid\-prefixed changes \(1 link\). Buffer per xid, apply at stream commit, discard at stream abort.
+- [ ] **M0149-0063c — parallel apply \(streaming = parallel\) with PG's DEBUG lines and deadlock detection**
+  Kind: impl
+  Parent: M0149-0063
+  - Path\-to\-TAP: 015 line 251 "finished processing the STREAM COMMIT command" / "applied N changes in the streaming chunk" / "deadlock detected" ← parallel apply worker per streamed xid \(applyparallelworker.c\) \(1 link, after 0063b\).
 - [ ] **M0149-0064 — port subscription/t/016_stream_subxact.pl**
   Kind: impl
   Parent: none

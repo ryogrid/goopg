@@ -583,6 +583,16 @@ func New(cfg Config) *Server {
 			SystemID:       cfg.SystemID,
 			Timeline:       cfg.Timeline,
 			Stopping:       s.walsndStopping,
+			Setting: func(name string) (string, bool) {
+				if cfg.Registry == nil {
+					return "", false
+				}
+				v, ok := cfg.Registry.Get(name)
+				if !ok {
+					return "", false
+				}
+				return v.Display(), true
+			},
 		},
 		s.writeQueryError,
 		backup.NewHandler(backup.Config{

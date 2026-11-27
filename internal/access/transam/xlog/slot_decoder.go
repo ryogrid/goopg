@@ -129,6 +129,11 @@ func (s *SlotDecoder) SetFeedbackOnly(on bool) {
 // SetWriteLocationHook is Decoder.SetWriteLocationHook.
 func (s *SlotDecoder) SetWriteLocationHook(fn func(lsn uint64)) { s.decoder.SetWriteLocationHook(fn) }
 
+// SetStreaming is Decoder.SetStreaming.
+func (s *SlotDecoder) SetStreaming(limitBytes int64, immediate bool) {
+	s.decoder.SetStreaming(limitBytes, immediate)
+}
+
 // SetOriginFilter is Decoder.SetOriginFilter.
 func (s *SlotDecoder) SetOriginFilter(fn func(origin uint16) bool) { s.decoder.SetOriginFilter(fn) }
 

@@ -136,3 +136,19 @@ func TestApplyUpdateLinksCtidChain(t *testing.T) {
 		t.Errorf("rows after the apply update = %q, want 33", got)
 	}
 }
+
+// TestCopyBinaryByteaIsBytes pins M0149-0063a: a bytea value in binary
+// format (binary COPY, a binary-mode subscription's 'b' column) is the
+// value itself (bytearecv). It used to come back as a STRING Datum that the
+// heap encoder ran through byteain — "invalid input syntax for type bytea"
+// for any value holding a backslash.
+func TestCopyBinaryByteaIsBytes(t *testing.T) {
+	raw := []byte{'\\', 0x81, 0x00, 'C'}
+	d, err := copyBinaryToDatum(catalog.Type{Name: "bytea"}, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Kind != KindBytes || string(d.BytesValue()) != string(raw) {
+		t.Errorf("datum = kind %v %q, want KindBytes %q", d.Kind, d.BytesValue(), raw)
+	}
+}

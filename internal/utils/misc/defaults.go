@@ -1006,6 +1006,27 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
 	}))
+	// logical_decoding_work_mem (RESOURCES_MEM, PGC_USERSET, kB, default
+	// 64MB, min 64kB): the reorder buffer's memory limit, past which a
+	// walsender streams the largest in-progress transaction to a
+	// subscriber that asked for streaming (ReorderBufferCheckMemoryLimit).
+	// M0149-0063a.
+	r.MustRegister(NewVariable(Variable{
+		Name: "logical_decoding_work_mem", Type: TypeInt, Unit: UnitKB, BootVal: "64MB",
+		MinVal: 64, MaxVal: 1 << 31,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	// debug_logical_replication_streaming (DEVELOPER_OPTIONS, PGC_USERSET,
+	// buffered/immediate): immediate streams each change on the publisher
+	// and makes a parallel apply leader serialize every change on the
+	// subscriber. M0149-0063a.
+	r.MustRegister(NewVariable(Variable{
+		Name: "debug_logical_replication_streaming", Type: TypeEnum, BootVal: "buffered",
+		EnumOptions: []string{"buffered", "immediate"},
+		Context:     ContextUserset,
+		Scope:       ScopeSession | ScopeTransaction,
+	}))
 	// debug_parallel_query (renamed from force_parallel_mode) — a developer
 	// GUC that forces a parallel plan for testing. goopg has no parallel
 	// executor so it is a no-op, but SET must succeed so upstream isolation
