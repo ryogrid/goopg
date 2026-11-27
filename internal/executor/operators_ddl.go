@@ -6687,19 +6687,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	}
 
 	// Build partition bounds from the FOR VALUES clause.
-	var pb catalog.PartitionBound
-	pb.ChildName = tbl.Name
-	if poc.Default {
-		// DEFAULT partition: catches all values not matched by other partitions.
-		pb.IsDefault = true
-		tbl.PartitionBounds = []catalog.PartitionBound{pb}
-	} else if poc.IsHash {
-		// HASH partition: MODULUS + REMAINDER. M0097-0015.
-		pb.IsHash = true
-		pb.Modulus = poc.Modulus
-		pb.Remainder = poc.Remainder
-		tbl.PartitionBounds = []catalog.PartitionBound{pb}
-	} else if len(poc.InValues) > 0 {
+	if len(poc.InValues) > 0 && !poc.Default && !poc.IsHash {
 		// Validate IN values are type-compatible with the partition key column type.
 		// Integer literals cannot be directly used as boolean partition bounds (PG rejects
 		// "FOR VALUES IN (1)" for bool columns; string literal '1' is allowed).
@@ -6722,36 +6710,9 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 				}
 			}
 		}
-		// LIST partition: evaluate each IN value as a string. InValues keeps the
-		// raw unquoted form (routing compares against it); InValueLiterals keeps
-		// the SQL-literal form ('a', 1, …) so FormatPartitionBound emits a valid
-		// relpartbound for pg_dump.
-		for _, e := range poc.InValues {
-			pb.InValues = append(pb.InValues, exprToString(e))
-			pb.InValueLiterals = append(pb.InValueLiterals, boundExprToSQLLiteral(e))
-		}
-		tbl.PartitionBounds = []catalog.PartitionBound{pb}
-	} else if len(poc.FromValues) > 0 || len(poc.ToValues) > 0 {
-		// RANGE partition: store all key-column values for multi-column routing.
-		// FromValues/ToValues keep the raw unquoted routing form; the parallel
-		// *ValueLiterals keep the SQL-literal form ('a', 5, MINVALUE) so
-		// FormatPartitionBound emits a valid relpartbound for pg_dump.
-		if len(poc.FromValues) > 0 {
-			pb.From = exprToString(poc.FromValues[0]) // backward compat (single-col)
-			for _, v := range poc.FromValues {
-				pb.FromValues = append(pb.FromValues, exprToString(v))
-			}
-			pb.FromValueLiterals = rangeBoundLiterals(poc.FromValues)
-			pb.FromUnbounded, pb.FromUnboundMax = rangeBoundUnboundedFlags(poc.FromValues)
-		}
-		if len(poc.ToValues) > 0 {
-			pb.To = exprToString(poc.ToValues[0]) // backward compat (single-col)
-			for _, v := range poc.ToValues {
-				pb.ToValues = append(pb.ToValues, exprToString(v))
-			}
-			pb.ToValueLiterals = rangeBoundLiterals(poc.ToValues)
-			pb.ToUnbounded, pb.ToUnboundMax = rangeBoundUnboundedFlags(poc.ToValues)
-		}
+	}
+	pb := BuildPartitionBound(poc, tbl.Name)
+	if pb.IsDefault || pb.IsHash || len(poc.InValues) > 0 || len(poc.FromValues) > 0 || len(poc.ToValues) > 0 {
 		tbl.PartitionBounds = []catalog.PartitionBound{pb}
 	}
 	// Also register bounds on the PARENT so validatePartitionChild can scan them.
@@ -9844,6 +9805,10 @@ func ApplyPendingPartitionAttaches(ctx *Context, sess *BasicSession) {
 		// this attach can resolve via the normal committed-clone path; drop the
 		// in-flight marker.
 		im.ClearPendingAttachXID(a.ChildOID)
+		// The commit-time half of ATTACH PARTITION re-journals the child's
+		// partition link too (M0149-0061k).
+		childTbl.PartitionParentOID = a.ParentOID
+		_ = resyncPartitionLinkCtx(ctx, childTbl)
 	}
 }
 
@@ -11009,6 +10974,9 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
 						im.RegisterPartitionChild(tbl.OID, childTbl.OID)
 					}
+					if err := o.resyncPartitionLink(childTbl); err != nil {
+						return err
+					}
 				}
 				break
 			}
@@ -11220,6 +11188,14 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					// ALTER TYPE) fire on an ATTACHed partition. Mirrors PG's
 					// MergeAttributesIntoExisting (tablecmds.c:17500).
 					markAttachedColumnsInherited(tbl, childTbl)
+				}
+				// The child's own parent link, as CREATE TABLE … PARTITION OF
+				// sets it (it was left 0, so pg_class.relispartition and
+				// relpartbound were never written for an ATTACHed partition).
+				// M0149-0061k.
+				childTbl.PartitionParentOID = tbl.OID
+				if err := o.resyncPartitionLink(childTbl); err != nil {
+					return err
 				}
 			}
 			// Propagate parent unique/PK indexes to the newly attached child
@@ -11467,6 +11443,12 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// RemoveInheritance (tablecmds.c:17950-18144), twin of
 				// mergeNotNullOnAttach. M0134-0005q.
 				unmergeNotNullOnDetach(tbl, childTbl)
+				// The partition link is cleared BEFORE the re-sync, so the
+				// rewritten pg_class / pg_inherits rows describe a standalone
+				// table (relispartition false, no relpartbound, no parent
+				// edge) and a restart does not re-attach it. M0149-0061k.
+				childTbl.PartitionParentOID = 0
+				childTbl.PartitionBounds = nil
 				if catalogHeapSyncAvailable(o.ctx) {
 					if err := o.ctx.MaterializeWriterXID(); err == nil {
 						xmax := o.ctx.Tx.XID
@@ -11478,8 +11460,6 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						return fmt.Errorf("DDL catalog sync: %w", syncErr)
 					}
 				}
-				childTbl.PartitionParentOID = 0
-				childTbl.PartitionBounds = nil
 				im.ClearPartitionDetachPending(childTbl.OID)
 			} else {
 				// Plain DETACH / DETACH FINALIZE: single-phase. FINALIZE also
@@ -11514,6 +11494,12 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// Un-absorb the child's NOT NULL constraints — twin of the
 				// concurrent-detach phase-2 branch above. M0134-0005q.
 				unmergeNotNullOnDetach(tbl, childTbl)
+				// The partition link is cleared BEFORE the re-sync, so the
+				// rewritten pg_class / pg_inherits rows describe a standalone
+				// table (relispartition false, no relpartbound, no parent
+				// edge) and a restart does not re-attach it. M0149-0061k.
+				childTbl.PartitionParentOID = 0
+				childTbl.PartitionBounds = nil
 				if catalogHeapSyncAvailable(o.ctx) {
 					if err := o.ctx.MaterializeWriterXID(); err == nil {
 						xmax := o.ctx.Tx.XID
@@ -11525,8 +11511,6 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						return fmt.Errorf("DDL catalog sync: %w", syncErr)
 					}
 				}
-				childTbl.PartitionParentOID = 0
-				childTbl.PartitionBounds = nil
 				im.ClearPartitionDetachPending(childTbl.OID)
 			}
 
@@ -20620,6 +20604,10 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 	stampCatalogRows(ctx, inheritsRel, xmax, func(data []byte) bool {
 		return len(data) >= 4 && binary.LittleEndian.Uint32(data[0:4]) == relOID
 	})
+	// M0149-0061k: and its pg_partitioned_table row (partrelid, bytes 0:4).
+	stampCatalogRows(ctx, storage.RelFileNode{DBOid: dbOid, RelOid: pgPartitionedTableRelOID, Fork: storage.MainFork}, xmax, func(data []byte) bool {
+		return len(data) >= 4 && binary.LittleEndian.Uint32(data[0:4]) == relOID
+	})
 	// B5 Slice C: stamp this relation's pg_rewrite _RETURN rule row (ev_class ==
 	// relOID) so a dropped/re-synced view/matview leaves no stale rule visible to
 	// loadViewsFromHeap.
@@ -21218,6 +21206,20 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		}
 		if err := writeInheritsRow(ctx, tbl.OID, parentOID, int32(i+1)); err != nil {
 			return fmt.Errorf("pg_inherits parent %d: %w", parentOID, err)
+		}
+	}
+	// M0149-0061k: a partition's parent link rides pg_inherits too, as in
+	// PG (StorePartitionBound + StoreSingleInheritance, inhseqno 1), and a
+	// partitioned table's key is journaled as its pg_partitioned_table row,
+	// so both survive a restart.
+	if tbl.PartitionParentOID != 0 {
+		if err := writeInheritsRow(ctx, tbl.OID, tbl.PartitionParentOID, 1); err != nil {
+			return fmt.Errorf("pg_inherits partition parent %d: %w", tbl.PartitionParentOID, err)
+		}
+	}
+	if tbl.PartitionMethod != "" {
+		if err := writePartitionedTableRow(ctx, tbl); err != nil {
+			return fmt.Errorf("pg_partitioned_table: %w", err)
 		}
 	}
 
@@ -30647,4 +30649,105 @@ func pgDefBoolean(v string) (bool, bool) {
 		return false, true
 	}
 	return false, false
+}
+
+// BuildPartitionBound turns a FOR VALUES clause into the catalog's
+// PartitionBound (the part of CREATE TABLE … PARTITION OF that needs no
+// parent: DEFAULT, HASH modulus / remainder, LIST values and RANGE bounds,
+// each in its raw routing form and its SQL-literal form). Also the reload
+// path's decoder of a persisted relpartbound (ParsePartitionBoundText).
+// M0149-0061k.
+func BuildPartitionBound(poc *parser.PartitionOfClause, childName string) catalog.PartitionBound {
+	var pb catalog.PartitionBound
+	pb.ChildName = childName
+	switch {
+	case poc.Default:
+		pb.IsDefault = true
+	case poc.IsHash:
+		pb.IsHash = true
+		pb.Modulus = poc.Modulus
+		pb.Remainder = poc.Remainder
+	case len(poc.InValues) > 0:
+		for _, e := range poc.InValues {
+			pb.InValues = append(pb.InValues, exprToString(e))
+			pb.InValueLiterals = append(pb.InValueLiterals, boundExprToSQLLiteral(e))
+		}
+	case len(poc.FromValues) > 0 || len(poc.ToValues) > 0:
+		if len(poc.FromValues) > 0 {
+			pb.From = exprToString(poc.FromValues[0])
+			for _, v := range poc.FromValues {
+				pb.FromValues = append(pb.FromValues, exprToString(v))
+			}
+			pb.FromValueLiterals = rangeBoundLiterals(poc.FromValues)
+			pb.FromUnbounded, pb.FromUnboundMax = rangeBoundUnboundedFlags(poc.FromValues)
+		}
+		if len(poc.ToValues) > 0 {
+			pb.To = exprToString(poc.ToValues[0])
+			for _, v := range poc.ToValues {
+				pb.ToValues = append(pb.ToValues, exprToString(v))
+			}
+			pb.ToValueLiterals = rangeBoundLiterals(poc.ToValues)
+			pb.ToUnbounded, pb.ToUnboundMax = rangeBoundUnboundedFlags(poc.ToValues)
+		}
+	}
+	return pb
+}
+
+// ParsePartitionBoundText decodes a relpartbound written by
+// catalog.FormatPartitionBound ("FOR VALUES FROM (0) TO (10)", "DEFAULT", …)
+// back into a PartitionBound. M0149-0061k.
+func ParsePartitionBoundText(bound, childName string) (catalog.PartitionBound, error) {
+	stmts, err := parser.Parse("CREATE TABLE goopg_partbound PARTITION OF goopg_partparent " + bound)
+	if err != nil {
+		return catalog.PartitionBound{}, err
+	}
+	ct, ok := stmts[0].(*parser.CreateTableStmt)
+	if !ok || ct.PartitionOf == nil {
+		return catalog.PartitionBound{}, fmt.Errorf("relpartbound %q: not a partition bound", bound)
+	}
+	return BuildPartitionBound(ct.PartitionOf, childName), nil
+}
+
+// ParsePartitionKeyDef decodes a persisted PartitionKeyDef ("RANGE (a)")
+// onto tbl's partition-key fields. M0149-0061k.
+func ParsePartitionKeyDef(tbl *catalog.Table, def string) error {
+	stmts, err := parser.Parse("CREATE TABLE goopg_partkey (goopg_k int) PARTITION BY " + def)
+	if err != nil {
+		return err
+	}
+	ct, ok := stmts[0].(*parser.CreateTableStmt)
+	if !ok || ct.PartitionBy == nil {
+		return fmt.Errorf("partition key %q: no PARTITION BY", def)
+	}
+	pb := ct.PartitionBy
+	tbl.PartitionMethod = pb.Method
+	tbl.PartitionKey = pb.KeyCols
+	tbl.PartitionKeyOpClasses = pb.OpClasses
+	tbl.PartitionKeyExprs = pb.KeyExprs
+	tbl.PartitionKeyCollations = pb.Collations
+	return nil
+}
+
+// resyncPartitionLink re-journals childTbl's catalog rows after ATTACH
+// PARTITION changed its partition link (relispartition, relpartbound and
+// the pg_inherits parent edge), so the attachment survives a restart: the
+// rows written at CREATE time described a standalone table. M0149-0061k.
+func (o *ddlOp) resyncPartitionLink(childTbl *catalog.Table) error {
+	return resyncPartitionLinkCtx(o.ctx, childTbl)
+}
+
+func resyncPartitionLinkCtx(ctx *Context, childTbl *catalog.Table) error {
+	if !catalogHeapSyncAvailable(ctx) {
+		return nil
+	}
+	if err := ctx.MaterializeWriterXID(); err == nil {
+		xmax := ctx.Tx.XID
+		for _, dbOid := range tableCatalogDBOids(ctx) {
+			deleteCatalogRowsForOID(ctx, dbOid, childTbl.OID, xmax)
+		}
+	}
+	if err := syncTableToCatalogHeap(ctx, childTbl); err != nil {
+		return fmt.Errorf("DDL catalog sync: %w", err)
+	}
+	return nil
 }

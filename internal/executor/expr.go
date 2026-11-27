@@ -14306,55 +14306,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		if !found || tbl.PartitionMethod == "" {
 			return NullDatum, nil
 		}
-		numKeys := len(tbl.PartitionKey)
-		if n := len(tbl.PartitionKeyExprs); n > numKeys {
-			numKeys = n
-		}
-		var parts []string
-		for i := 0; i < numKeys; i++ {
-			var part string
-			colName := ""
-			if i < len(tbl.PartitionKey) {
-				colName = tbl.PartitionKey[i]
-			}
-			var keyExpr parser.Expr
-			if i < len(tbl.PartitionKeyExprs) {
-				keyExpr = tbl.PartitionKeyExprs[i]
-			}
-			if keyExpr != nil {
-				part = defaultExprToSQL(keyExpr)
-				// pg_get_partkeydef_worker (ruleutils.c) wraps each EXPRESSION key
-				// in `(%s)` unless it "looks like a function call"
-				// (looks_like_function): a bare function call — and the
-				// func_expr_common_subexpr family (COALESCE/NULLIF/GREATEST/LEAST,
-				// SQL value functions, XML/JSON) — deparses without the extra parens,
-				// while everything else (operators, casts, CASE, …) is wrapped. goopg
-				// represents every one of those callable forms as *parser.FuncCall
-				// (including the niladic value functions, which defaultExprToSQL emits
-				// as bare uppercase keywords), so that single type check mirrors PG's
-				// node-tag switch. Without this wrap a binary-op key
-				// `((a + b) * c)` dumped as `RANGE (((a + b) * c))` — one paren short
-				// of real pg_dump 18.3's `RANGE ((((a + b) * c)))` (verified
-				// byte-identical). The opclass/collation suffixes below are appended
-				// AFTER the wrap, matching PG's append order (DU-002 slice 300).
-				if _, isFunc := keyExpr.(*parser.FuncCall); !isFunc {
-					part = "(" + part + ")"
-				}
-			} else {
-				part = colName
-			}
-			if i < len(tbl.PartitionKeyOpClasses) && tbl.PartitionKeyOpClasses[i] != "" {
-				part += " " + tbl.PartitionKeyOpClasses[i]
-			}
-			if i < len(tbl.PartitionKeyCollations) {
-				coll := tbl.PartitionKeyCollations[i]
-				if coll != "" && strings.ToLower(coll) != "default" && strings.ToLower(coll) != "pg_default" {
-					part += ` COLLATE "` + coll + `"`
-				}
-			}
-			parts = append(parts, part)
-		}
-		return NewStringDatum(strings.ToUpper(tbl.PartitionMethod) + " (" + strings.Join(parts, ", ") + ")"), nil
+		return NewStringDatum(PartitionKeyDef(tbl)), nil
 
 	case "pg_get_expr":
 		// pg_get_expr(tree pg_node_tree, relation oid [, pretty bool]) → text
@@ -22696,4 +22648,60 @@ func splitTextToArray(input string, sep Datum, nullStr *string) ([]string, []boo
 		}
 	}
 	return fields, nulls
+}
+
+// PartitionKeyDef is pg_get_partkeydef_worker: the PARTITION BY clause body
+// of partitioned tbl ("RANGE (a)", "LIST ((a + 1) text_ops)", …). It is also
+// the form goopg persists the partition key in (pg_partitioned_table
+// partexprs), re-read by ParsePartitionKeyDef at startup. M0149-0061k.
+func PartitionKeyDef(tbl *catalog.Table) string {
+	numKeys := len(tbl.PartitionKey)
+	if n := len(tbl.PartitionKeyExprs); n > numKeys {
+		numKeys = n
+	}
+	var parts []string
+	for i := 0; i < numKeys; i++ {
+		var part string
+		colName := ""
+		if i < len(tbl.PartitionKey) {
+			colName = tbl.PartitionKey[i]
+		}
+		var keyExpr parser.Expr
+		if i < len(tbl.PartitionKeyExprs) {
+			keyExpr = tbl.PartitionKeyExprs[i]
+		}
+		if keyExpr != nil {
+			part = defaultExprToSQL(keyExpr)
+			// pg_get_partkeydef_worker (ruleutils.c) wraps each EXPRESSION key
+			// in `(%s)` unless it "looks like a function call"
+			// (looks_like_function): a bare function call — and the
+			// func_expr_common_subexpr family (COALESCE/NULLIF/GREATEST/LEAST,
+			// SQL value functions, XML/JSON) — deparses without the extra parens,
+			// while everything else (operators, casts, CASE, …) is wrapped. goopg
+			// represents every one of those callable forms as *parser.FuncCall
+			// (including the niladic value functions, which defaultExprToSQL emits
+			// as bare uppercase keywords), so that single type check mirrors PG's
+			// node-tag switch. Without this wrap a binary-op key
+			// `((a + b) * c)` dumped as `RANGE (((a + b) * c))` — one paren short
+			// of real pg_dump 18.3's `RANGE ((((a + b) * c)))` (verified
+			// byte-identical). The opclass/collation suffixes below are appended
+			// AFTER the wrap, matching PG's append order (DU-002 slice 300).
+			if _, isFunc := keyExpr.(*parser.FuncCall); !isFunc {
+				part = "(" + part + ")"
+			}
+		} else {
+			part = colName
+		}
+		if i < len(tbl.PartitionKeyOpClasses) && tbl.PartitionKeyOpClasses[i] != "" {
+			part += " " + tbl.PartitionKeyOpClasses[i]
+		}
+		if i < len(tbl.PartitionKeyCollations) {
+			coll := tbl.PartitionKeyCollations[i]
+			if coll != "" && strings.ToLower(coll) != "default" && strings.ToLower(coll) != "pg_default" {
+				part += ` COLLATE "` + coll + `"`
+			}
+		}
+		parts = append(parts, part)
+	}
+	return strings.ToUpper(tbl.PartitionMethod) + " (" + strings.Join(parts, ", ") + ")"
 }

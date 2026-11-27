@@ -2104,6 +2104,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// AFTER every table-load pass, since the parent and the child may reload in
 	// either order and both must already be registered before the edge is
 	// restored. Without it a restart dropped every inheritance relationship.
+	// Partition keys first (pg_partitioned_table), so the pg_inherits pass
+	// can tell a partition edge from an inheritance edge. M0149-0061k.
+	if err := loadPartitionKeysFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_partitioned_table reload: %w", err)
+	}
 	if err := loadInheritanceFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
@@ -4011,6 +4019,13 @@ func loadUserTablesFromHeapForDBMode(mgr *storage.Manager, cat *catalog.InMemory
 					if len(decoded) > 3 && !decoded[3].IsNull() {
 						row.RelType = uint32(decoded[3].Int)
 					}
+					// relpartbound: a partition's bound, re-parsed into
+					// PartitionBounds below. M0149-0061k.
+					for i, c := range cols {
+						if c.Name == "relpartbound" && i < len(decoded) && !decoded[i].IsNull() {
+							row.RelPartBound = decoded[i].StringValue()
+						}
+					}
 				}
 			}
 			// Legacy-layout rows require a locally-committed xmin
@@ -4037,7 +4052,11 @@ func loadUserTablesFromHeapForDBMode(mgr *storage.Manager, cat *catalog.InMemory
 		if rec.row.RelPersistence == "t" {
 			continue
 		}
-		if (rec.row.RelKind == "r" || rec.row.RelKind == "m" || rec.row.RelKind == "v" || rec.row.RelKind == "S" || rec.row.RelKind == "f") && rec.row.OID >= catalog.FirstUserOID {
+		// 'p' (partitioned table, no storage) joined the set in M0149-0061k:
+		// its row was skipped, so every partitioned table vanished across a
+		// restart and its partitions came back as standalone tables.
+		// loadPartitionsFromHeap restores the key and the partition links.
+		if (rec.row.RelKind == "r" || rec.row.RelKind == "p" || rec.row.RelKind == "m" || rec.row.RelKind == "v" || rec.row.RelKind == "S" || rec.row.RelKind == "f") && rec.row.OID >= catalog.FirstUserOID {
 			userTableRows = append(userTableRows, rec)
 		}
 	}
@@ -4158,6 +4177,13 @@ func loadUserTablesFromHeapForDBMode(mgr *storage.Manager, cat *catalog.InMemory
 		}
 		if tr.RelFileNode != 0 && tr.RelFileNode != tr.OID {
 			tbl.RelFileNodeOID = tr.RelFileNode
+		}
+		// A partition's bound (relpartbound); its parent link is restored
+		// from pg_inherits by loadPartitionsFromHeap. M0149-0061k.
+		if tr.RelPartBound != "" {
+			if pb, perr := executor.ParsePartitionBoundText(tr.RelPartBound, tr.RelName); perr == nil {
+				tbl.PartitionBounds = []catalog.PartitionBound{pb}
+			}
 		}
 		// Restore pg_class.reltablespace (M0122-0007 tablespace-restart-
 		// durability follow-up) — otherwise a CREATE/ALTER TABLE ... TABLESPACE

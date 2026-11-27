@@ -616,6 +616,10 @@ type PGClassRow struct {
 	// (the general PG-tuple decoder) and feeds it to ApplyTableReloptions.
 	// M0119-0004.
 	RelOptions string
+	// RelPartBound is pg_class.relpartbound — a partition's bound, held
+	// as FormatPartitionBound text; "" for a non-partition. Decoded on
+	// the reload path only (M0149-0061k).
+	RelPartBound string
 	// RelType is pg_class.reltype (the relation's rowtype), filled by
 	// loadUserTablesFromHeap's full decode. M0149-0001h1a34.
 	RelType uint32

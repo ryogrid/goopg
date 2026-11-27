@@ -490,8 +490,22 @@ func loadInheritanceFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, c
 		sort.Slice(edges, func(i, j int) bool { return edges[i].seqno < edges[j].seqno })
 		parents := make([]uint32, 0, len(edges))
 		for _, e := range edges {
-			if _, _, pok := cat.LookupTableByOIDAllDBs(e.parent); !pok {
+			parentTbl, _, pok := cat.LookupTableByOIDAllDBs(e.parent)
+			if !pok {
 				continue // parent dropped since the row was written
+			}
+			// A partition edge (the parent is partitioned): restore the
+			// partition link instead of an inheritance one — the child's
+			// PartitionParentOID, the parent's partition registry and its
+			// copy of the child's bound, as CREATE TABLE … PARTITION OF /
+			// ATTACH PARTITION leave them. M0149-0061k.
+			if parentTbl != nil && parentTbl.PartitionMethod != "" {
+				childTbl.PartitionParentOID = e.parent
+				cat.RegisterPartitionChild(e.parent, childOID)
+				if len(childTbl.PartitionBounds) > 0 {
+					parentTbl.PartitionBounds = append(parentTbl.PartitionBounds, childTbl.PartitionBounds[0])
+				}
+				continue
 			}
 			parents = append(parents, e.parent)
 			cat.RegisterInheritanceChild(e.parent, childOID)
@@ -4128,4 +4142,56 @@ func int2VectorDatumAttnums(d executor.Datum) []int16 {
 		}
 	}
 	return out
+}
+
+// loadPartitionKeysFromHeap restores every partitioned table's key from its
+// pg_partitioned_table heap row (writePartitionedTableRow: partexprs holds
+// the PartitionKeyDef text), in each database. M0149-0061k.
+func loadPartitionKeysFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	dbs := []uint32{catalog.DefaultDBOid}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid || dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		dbs = append(dbs, dbOid)
+	}
+	cols := executor.PGPartitionedTableColumnsPG18()
+	for _, heapDBOid := range dbs {
+		type keyRow struct {
+			rel uint32
+			def string
+		}
+		rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 3350, Fork: storage.MainFork}
+		rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_partitioned_table",
+			func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+				natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+				decoded := make(executor.Row, len(cols))
+				if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+					return nil, false, derr
+				}
+				def := ""
+				if !decoded[7].IsNull() {
+					def = decoded[7].StringValue()
+				}
+				return keyRow{rel: uint32(decoded[0].Int), def: def}, false, nil
+			})
+		if err != nil {
+			return err
+		}
+		for _, r := range rows {
+			kr := r.(keyRow)
+			tbl, _, ok := cat.LookupTableByOIDAllDBs(kr.rel)
+			if !ok || tbl == nil || kr.def == "" {
+				continue
+			}
+			if err := executor.ParsePartitionKeyDef(tbl, kr.def); err != nil {
+				return fmt.Errorf("partition key of %q (%q): %w", tbl.Name, kr.def, err)
+			}
+		}
+	}
+	return nil
 }

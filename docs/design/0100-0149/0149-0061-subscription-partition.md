@@ -116,11 +116,37 @@ Test: TestApplyWorkerTruncatePartitionedTarget.
 
 Test: TestApplyWorkerOriginDiffersAndMissingConflicts.
 
+## Landed — M0149\-0061k \(S2: partitioned tables survive a restart\)
+
+A restart lost every partitioned table:
+
+- the startup loader kept only relkind r/m/v/S/f pg\_class rows;
+- the partition key was never written to disk;
+- a partition's parent link was not restored, so it came back as a standalone table;
+- ATTACH PARTITION never set the child's `PartitionParentOID` or re\-journaled it.
+
+**Write side** \(`syncTableToCatalogHeap`\):
+
+- A partitioned table writes its pg\_partitioned\_table heap row \(`writePartitionedTableRow`\). partstrat, partnatts
+  and partattrs are PG's; partclass and partcollation are zeros. partexprs holds `PartitionKeyDef` text, the
+  pg\_get\_partkeydef body, as goopg stores other pg\_node\_tree columns.
+- A partition writes its pg\_inherits parent edge, as PG's StoreSingleInheritance does.
+- ATTACH sets `PartitionParentOID` and re\-journals the child on the immediate, DEFAULT and commit\-time paths.
+- DETACH clears the link before its re\-sync.
+
+**Reload side:**
+
+- relkind 'p' rows are admitted.
+- relpartbound is decoded and re\-parsed through `ParsePartitionBoundText`, which reuses `BuildPartitionBound`, the
+  helper factored out of CREATE TABLE … PARTITION OF.
+- `loadPartitionKeysFromHeap` \(`ParsePartitionKeyDef`\) runs before the pg\_inherits pass. That pass registers an
+  edge whose parent is partitioned as a partition: `PartitionParentOID`, the parent's partition registry, and the
+  parent's copy of the bound.
+
+Test: TestPort\_PartitionedTableSurvivesRestart.
+
 ## Open
 
 - **0061c.** Subscriber AFTER ROW triggers must fire on the partitions that routed UPDATEs land in.
 - **0061d.** A replicated TRUNCATE of a partitioned target must reach its sub\-partitions.
-- **0061k \(S2\).** A partitioned table must survive a server restart. The startup loader drops relkind 'p', and the
-  partition key and parent link are not persisted.
-- **0061i.** Origin conflict detection \("updating a row that was modified by a different origin"\) and the later sub2
-  catch\-up, goopg publisher → PG subscriber.
+- **0061l.** The origin\_differs check in every pairing, and the sub2 catch\-up with a goopg publisher.

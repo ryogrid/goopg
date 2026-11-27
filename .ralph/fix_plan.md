@@ -17506,12 +17506,18 @@ verify each at HEAD when the task starts.
   - Finding: `track_commit_timestamp` was not a GUC \(postgresql.conf "unknown parameter" → start failure\), and goopg had no commit timestamps / replication origins.
   - 2026\-11\-27 \(done\): track\_commit\_timestamp GUC \(postmaster, sample entry\); transam commit\_ts store \(CommitTsData: time \+ origin per committed xid, recorded when tracking is on\); the apply worker's transactions carry its subscription's replication origin \(SetTxnOrigin, "pg\_<suboid>"\); checkOriginDiffers logs update\_origin\_differs / delete\_origin\_differs when the located row's xmin committed under another origin. Test TestApplyWorkerOriginDiffersAndMissingConflicts.
   Movement: yes — tap 013 goopg-subscriber restart with track_commit_timestamp start failure -> starts (stops next at 0061k)
-- [ ] **M0149-0061k — a partitioned table survives a server restart \(S2: catalog loss\)**
+- [x] **M0149-0061k — a partitioned table survives a server restart \(S2: catalog loss\)**
   Kind: impl
   Parent: M0149-0061
   - **S2 escalation**: after a restart every partitioned table is gone and its partitions come back as standalone tables — `CREATE TABLE p1 \(a int\) PARTITION BY RANGE \(a\); CREATE TABLE p1\_1 PARTITION OF p1 …;` restart → pg\_class shows only p1\_1 \(r\). Pre\-existing \(reproduced at 5a2906dda\).
   - Cause \(read\-only trace\): internal/initdb/open.go loadUserTablesFromHeapForDBMode keeps only relkind r/m/v/S/f rows \(:4040\), so the 'p' row is dropped; the partition strategy / key \(pg\_partitioned\_table\) is never written; relispartition / relpartbound are written but not decoded on reload, and partitions write no pg\_inherits rows, so PartitionParentOID / PartitionBounds / RegisterPartitionChild are never restored.
   - Path\-to\-TAP: 013 goopg\-subscriber pairings \(line \~623, `INSERT INTO tab2` after the track\_commit\_timestamp restart → relation does not exist\) ← 0061k \(1 link\).
+  - 2026\-11\-27 \(done\): writes — a partitioned table's key as its pg\_partitioned\_table heap row \(writePartitionedTableRow: PG's partstrat / partnatts / partattrs, partexprs = PartitionKeyDef text\), a partition's parent edge as a pg\_inherits row \(seqno 1\); ATTACH PARTITION now sets the child's PartitionParentOID and re\-journals it \(immediate, DEFAULT and commit\-time paths\), DETACH clears the link before its re\-sync. Reload — relkind 'p' admitted; relpartbound decoded and re\-parsed \(ParsePartitionBoundText over the factored BuildPartitionBound\); loadPartitionKeysFromHeap \(ParsePartitionKeyDef\) runs before the pg\_inherits pass, which registers an edge whose parent is partitioned as a partition. Test TestPort\_PartitionedTableSurvivesRestart.
+  Movement: yes — partitioned tables after restart lost -> restored (RANGE/LIST/HASH, nested, ATTACH, DEFAULT, DETACH); tap 013 goopg-subscriber post-restart "relation does not exist" -> pass
+- [ ] **M0149-0061l — origin\_differs check \(013 line 629\) in every pairing, and sub2 catch\-up \(line 686, goopg publisher\)**
+  Kind: impl
+  Parent: M0149-0061
+  - After 0061k all three pairings reach 629; the goopg publisher pairings then stall at 686. Path\-to\-TAP: 013 ← 0061l \(1 link\); not yet diagnosed. Supersedes 0061i.
 - [ ] **M0149-0061i — 013 "updating a row that was modified by a different origin" and the later sub2 catch\-up \(goopg publisher → PG subscriber, lines 629 / 686\)**
   Kind: impl
   Parent: M0149-0061
