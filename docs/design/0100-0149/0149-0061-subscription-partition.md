@@ -76,11 +76,24 @@ rule \(a commit past the sync LSN applies\).
 
   Test: TestAlterTableColumnRecursesIntoPartitions.
 
+## Landed — M0149\-0061d
+
+`applyTruncate` truncated only the local target's own relfilenode, and a partitioned target has none, so every
+row stayed. PG's apply\_handle\_truncate:
+
+- skips a relation should\_apply\_changes\_for\_rel rejects;
+- adds all partitions of a partitioned target \(find\_all\_inheritors\).
+
+goopg now does both. It reaches the partitions through `underlyingInMemory`, because the worker's catalog is a
+SearchPathCatalog wrapper. This also cleared the later sub\_viaroot stall \(0061h\).
+
+Test: TestApplyWorkerTruncatePartitionedTarget.
+
 ## Open
 
 - **0061c.** Subscriber AFTER ROW triggers must fire on the partitions that routed UPDATEs land in.
 - **0061d.** A replicated TRUNCATE of a partitioned target must reach its sub\-partitions.
 - **0061e.** update\_missing / delete\_missing conflict log lines for routed changes.
-- **0061h.** A goopg subscriber stalls at sub\_viaroot after the publisher's ALTER TABLE tab2 DROP / ADD column.
+- **0061j.** A goopg subscriber fails to restart with track\_commit\_timestamp.
 - **0061i.** Origin conflict detection \("updating a row that was modified by a different origin"\) and the later sub2
   catch\-up, goopg publisher → PG subscriber.

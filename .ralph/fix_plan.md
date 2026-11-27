@@ -17494,10 +17494,14 @@ verify each at HEAD when the task starts.
   - Finding: the real cause was DDL — **S2**: `ALTER TABLE parent DROP COLUMN / ADD COLUMN` never recursed into partitions \(ADD walked only inheritance children; DROP walked nothing\), so a partitioned table and its partitions disagreed on their columns and rows routed into a partition lost the added column. PG: ATExecDropColumn / ATExecAddColumn recurse through find\_inheritance\_children \(a partition's columns are attislocal = false, attinhcount = 1\).
   - 2026\-11\-27 \(done\): execAlterDropColumn → dropColumnFromChildren \(partitions always, inheritance children when the column is inherited, recursively\); addColumnRecursive walks PartitionChildren too, marks the child column inherited and re\-syncs the child's catalog heap rows. Test TestAlterTableColumnRecursesIntoPartitions.
   Movement: yes — tap 013 goopg-publisher -> PG subscriber: 588 timeout -> pass (stops at 629/686); ALTER TABLE parent DROP/ADD COLUMN partitions unchanged -> recursed
-- [ ] **M0149-0061h — goopg subscriber stalls at sub\_viaroot after the publisher's ALTER TABLE tab2 DROP/ADD column \(013 line \~588\)**
+- [x] **M0149-0061h — goopg subscriber stalls at sub\_viaroot after the publisher's ALTER TABLE tab2 DROP/ADD column \(013 line \~588\)**
   Kind: impl
   Parent: M0149-0061
-  - Path\-to\-TAP: 013 goopg\-subscriber pairings ← 0061h \(1 link\); not yet diagnosed.
+  - 2026\-11\-27 \(done\): resolved by 0061d — the stall followed from the TRUNCATE that left rows behind.
+- [ ] **M0149-0061j — goopg subscriber1 fails to restart with track\_commit\_timestamp \(013 line \~621\)**
+  Kind: impl
+  Parent: M0149-0061
+  - 013 \(goopg subscriber\): `node_subscriber1->append_conf\(track_commit_timestamp = on\); restart` — the start exits early with an empty cluster.log; then "updating a row that was modified by a different origin" \(629\). Path\-to\-TAP: 013 ← 0061j \(1 link\); not yet diagnosed.
 - [ ] **M0149-0061i — 013 "updating a row that was modified by a different origin" and the later sub2 catch\-up \(goopg publisher → PG subscriber, lines 629 / 686\)**
   Kind: impl
   Parent: M0149-0061
@@ -17506,10 +17510,12 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: M0149-0061
   - 013 \(goopg subscriber\): "check replica update after trigger applied on subscriber" — sub1's tab1\_2\_2 ENABLE ALWAYS AFTER trigger records nothing for UPDATEs routed into it \(apply\_handle\_tuple\_routing\). Path\-to\-TAP: 013 ← 0061c \(1 link\).
-- [ ] **M0149-0061d — replicated TRUNCATE of a partitioned table truncates its sub\-partitions**
+- [x] **M0149-0061d — replicated TRUNCATE of a partitioned table truncates its sub\-partitions**
   Kind: impl
   Parent: M0149-0061
   - 013 \(goopg subscriber\): "truncate of tab1\_2 replicated" leaves row 5 \(subscriber's tab1\_2 is itself partitioned\). PG: apply\_handle\_truncate adds the partitions of a partitioned target \(find\_all\_inheritors\). Path\-to\-TAP: 013 ← 0061d \(1 link\).
+  - 2026\-11\-27 \(done\): applyTruncate skips a rel should\_apply\_changes\_for\_rel rejects and truncates every partition of a partitioned target \(PartitionChildren, recursively, via underlyingInMemory — w.cat is a SearchPathCatalog wrapper\). Test TestApplyWorkerTruncatePartitionedTarget. Also cleared 0061h \(the sub\_viaroot stall at 588 followed from the un\-truncated rows\).
+  Movement: yes — tap 013 goopg-subscriber pairings: truncate checks (305/316/568/571) fail -> pass; 588 stall -> pass (stops at 612-621)
 - [ ] **M0149-0061e — update\_missing / delete\_missing conflict log lines for routed changes**
   Kind: impl
   Parent: M0149-0061

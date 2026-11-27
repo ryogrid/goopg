@@ -710,9 +710,27 @@ func (w *ApplyWorker) applyTruncate(m *xlog.DecodedMessage) error {
 			return fmt.Errorf("applyworker: TRUNCATE for relation %s.%s has no local table",
 				r.remote.Schema, r.remote.Name)
 		}
-		rel := w.cat.RelFileNode(r.local)
-		if err := truncateRelation(ctx, rel); err != nil {
-			return fmt.Errorf("applyworker: truncate %q: %w", r.local.Name, err)
+		// apply_handle_truncate: a rel not yet synchronized is skipped
+		// (should_apply_changes_for_rel), and a partitioned target is
+		// truncated with all its partitions (find_all_inheritors) — a
+		// partitioned table has no storage of its own, so truncating only
+		// its relfilenode left every row in place. M0149-0061d.
+		if !w.shouldApplyChangesForRel(r) {
+			continue
+		}
+		targets := []*catalog.Table{r.local}
+		if im, ok := underlyingInMemory(w.cat); ok && (r.local.PartitionMethod != "" || len(r.local.PartitionKey) > 0) {
+			for i := 0; i < len(targets); i++ {
+				targets = append(targets, im.PartitionChildren(targets[i].OID, catalog.NamespaceDBOid(w.dbOid()))...)
+			}
+		}
+		for _, t := range targets {
+			if t == nil {
+				continue
+			}
+			if err := truncateRelation(ctx, w.cat.RelFileNode(t)); err != nil {
+				return fmt.Errorf("applyworker: truncate %q: %w", t.Name, err)
+			}
 		}
 		// TRUNCATE_RESTART_SEQS (logicalrep_write_truncate's option bit
 		// 2): apply_handle_truncate passes restart_seqs to

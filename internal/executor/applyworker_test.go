@@ -1554,3 +1554,51 @@ func TestApplyWorkerUpdatesNonKeyColumnOverPgoutput(t *testing.T) {
 		t.Errorf("subscriber rows = %v, want exactly (7,beta) and (8,gamma)", all)
 	}
 }
+
+// TestApplyWorkerTruncatePartitionedTarget pins apply_handle_truncate's
+// find_all_inheritors: a TRUNCATE whose local target is partitioned
+// truncates every partition (a partitioned table has no storage of its
+// own). Before, only the parent's relfilenode was truncated and every row
+// stayed. M0149-0061d.
+func TestApplyWorkerTruncatePartitionedTarget(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+	for _, q := range []string{
+		"CREATE TABLE atp (a int) PARTITION BY RANGE (a)",
+		"CREATE TABLE atp_1 PARTITION OF atp FOR VALUES FROM (0) TO (10) PARTITION BY RANGE (a)",
+		"CREATE TABLE atp_1_1 PARTITION OF atp_1 FOR VALUES FROM (0) TO (5)",
+		"CREATE TABLE atp_2 PARTITION OF atp FOR VALUES FROM (10) TO (20)",
+		"INSERT INTO atp VALUES (1), (12)",
+	} {
+		if err := runDDL(t, ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "atp"})
+	if !ok {
+		t.Fatal("atp not found")
+	}
+	w := NewApplyWorker(cat, ctx.Pool, ctx.TxnMgr)
+	defer w.SafeRollback()
+	for _, m := range []*xlog.DecodedMessage{
+		{Kind: 'B', XID: 100, CommitLSN: 0xD00D},
+		{Kind: 'R', Relation: &xlog.DecodedRelation{OID: 99001, Name: "atp", Columns: []xlog.DecodedAttr{{Name: "a", TypeOID: 23}}}},
+		{Kind: 'T', TruncateRels: []uint32{99001}},
+		{Kind: 'C', CommitLSN: 0xD00D, EndLSN: 0xD00D},
+	} {
+		if _, err := w.ApplyMessage(m); err != nil {
+			t.Fatalf("%c: %v", m.Kind, err)
+		}
+	}
+	_ = tbl
+	// Read in a fresh transaction: the fixture's snapshot predates the
+	// apply worker's commit.
+	tx, _ := ctx.TxnMgr.Begin(0)
+	defer ctx.TxnMgr.Rollback(tx)
+	snap, _ := ctx.TxnMgr.SnapshotFor(tx)
+	ctx.Tx, ctx.Snap = tx, snap
+	rows := runSQL(t, ctx, "SELECT count(*) FROM atp")
+	if len(rows) != 1 || rows[0][0].Int != 0 {
+		t.Errorf("after TRUNCATE: %v rows remain, want 0", rows)
+	}
+}
