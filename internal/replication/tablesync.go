@@ -81,6 +81,11 @@ type TableSyncConfig struct {
 	// CopySelect is copy_table's COPY (SELECT cols FROM rel) form, used
 	// when a published column is generated (gencol_published).
 	CopySelect bool
+	// Quals are the publications' row filters (FetchRemoteRowFilters); the
+	// COPY keeps rows matching any of them. Ordinary marks an ordinary
+	// remote table (relkind 'r'), copied with FROM ONLY. M0149-0059a.
+	Quals    []string
+	Ordinary bool
 	// Binary is copy_table's binary format (the subscription's binary
 	// option): COPY ... TO STDOUT WITH (FORMAT binary), the stream pushed
 	// through the writer's PushBinaryData.
@@ -159,8 +164,19 @@ func RunTableSync(cfg TableSyncConfig) (int64, error) {
 			quoted[i] = quoteIdentifier(c)
 		}
 		sql = fmt.Sprintf("COPY %s (%s) TO STDOUT", cfg.Relname, strings.Join(quoted, ", "))
-		if cfg.CopySelect {
-			sql = fmt.Sprintf("COPY (SELECT %s FROM %s) TO STDOUT", strings.Join(quoted, ", "), cfg.Relname)
+		if cfg.CopySelect || len(cfg.Quals) > 0 {
+			// copy_table: COPY (SELECT cols FROM [ONLY] rel [WHERE q1 OR
+			// q2 …]) — ONLY for an ordinary table, so an inheritance
+			// child is copied on its own; the row filters are OR'ed.
+			only := ""
+			if cfg.Ordinary {
+				only = "ONLY "
+			}
+			where := ""
+			if len(cfg.Quals) > 0 {
+				where = " WHERE " + strings.Join(cfg.Quals, " OR ")
+			}
+			sql = fmt.Sprintf("COPY (SELECT %s FROM %s%s%s) TO STDOUT", strings.Join(quoted, ", "), only, cfg.Relname, where)
 		}
 	}
 	if cfg.Binary {
@@ -384,6 +400,38 @@ func errFromErrorResponse(payload []byte, ctx string) error {
 
 // quoteIdentifier is quote_identifier: double-quoted, embedded quotes
 // doubled.
+// FetchRemoteRowFilters is fetch_remote_table_info's row-filter half: the
+// distinct pg_get_expr(qual) of relname across the subscription's
+// publications. Several are OR'ed by the COPY; a NULL one (a publication
+// without a filter, FOR ALL TABLES or TABLES IN SCHEMA) means the whole
+// table is copied, reported as nil. M0149-0059a.
+func FetchRemoteRowFilters(rd *libpq.FrameReader, wr *libpq.FrameWriter, relname string, pubs []string) ([]string, error) {
+	if len(pubs) == 0 {
+		return nil, nil
+	}
+	names := make([]string, len(pubs))
+	for i, p := range pubs {
+		names[i] = quotePublicationLiteral(p)
+	}
+	relLit := quotePublicationLiteral(relname) + "::pg_catalog.regclass"
+	rows, err := queryRowsOn(rd, wr, "SELECT DISTINCT pg_get_expr(gpt.qual, gpt.relid)"+
+		"  FROM pg_publication p,"+
+		"  LATERAL pg_get_publication_tables(p.pubname) gpt"+
+		" WHERE gpt.relid = "+relLit+
+		"   AND p.pubname IN ( "+strings.Join(names, ", ")+" )")
+	if err != nil {
+		return nil, err
+	}
+	var quals []string
+	for _, row := range rows {
+		if len(row) == 0 || row[0] == nil {
+			return nil, nil
+		}
+		quals = append(quals, string(row[0]))
+	}
+	return quals, nil
+}
+
 func quoteIdentifier(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
@@ -399,6 +447,29 @@ func quoteIdentifier(s string) string {
 // does a remote relation that is not an ordinary table (relkind 'p').
 // pubs empty skips the column-list query. M0149-0044a, M0149-0048c.
 func FetchRemoteColumns(rd *libpq.FrameReader, wr *libpq.FrameWriter, relname string, pubs []string) (cols []string, gencolPublished bool, err error) {
+	info, err := FetchRemoteTableInfo(rd, wr, relname, pubs)
+	if err != nil {
+		return nil, false, err
+	}
+	return info.Columns, info.GencolPublished || info.RelKind != "r", nil
+}
+
+// RemoteTableInfo is fetch_remote_table_info's result: the replicated
+// columns, whether a generated column is among them, and the remote relkind.
+type RemoteTableInfo struct {
+	Columns         []string
+	GencolPublished bool
+	RelKind         string
+}
+
+// FetchRemoteTableInfo is FetchRemoteColumns with the relkind kept apart
+// (copy_table needs it for COPY (SELECT … FROM ONLY rel)). M0149-0059a.
+func FetchRemoteTableInfo(rd *libpq.FrameReader, wr *libpq.FrameWriter, relname string, pubs []string) (RemoteTableInfo, error) {
+	cols, gencolPublished, kind, err := fetchRemoteColumnsKind(rd, wr, relname, pubs)
+	return RemoteTableInfo{Columns: cols, GencolPublished: gencolPublished, RelKind: kind}, err
+}
+
+func fetchRemoteColumnsKind(rd *libpq.FrameReader, wr *libpq.FrameWriter, relname string, pubs []string) (cols []string, gencolPublished bool, relkind string, err error) {
 	relLit := quotePublicationLiteral(relname) + "::pg_catalog.regclass"
 	var included map[int]bool
 	if len(pubs) > 0 {
@@ -415,10 +486,10 @@ func FetchRemoteColumns(rd *libpq.FrameReader, wr *libpq.FrameWriter, relname st
 			" WHERE gpt.relid = "+relLit+" AND c.oid = gpt.relid"+
 			"   AND p.pubname IN ( "+strings.Join(names, ", ")+" )")
 		if err != nil {
-			return nil, false, err
+			return nil, false, "", err
 		}
 		if len(rows) > 1 {
-			return nil, false, fmt.Errorf("cannot use different column lists for table %q in different publications", relname)
+			return nil, false, "", fmt.Errorf("cannot use different column lists for table %q in different publications", relname)
 		}
 		if len(rows) == 1 && len(rows[0]) > 0 && rows[0][0] != nil {
 			included = map[int]bool{}
@@ -434,7 +505,7 @@ func FetchRemoteColumns(rd *libpq.FrameReader, wr *libpq.FrameWriter, relname st
 		" WHERE a.attnum > 0::pg_catalog.int2 AND NOT a.attisdropped"+
 		" AND a.attrelid = "+relLit+" ORDER BY a.attnum")
 	if err != nil {
-		return nil, false, err
+		return nil, false, "", err
 	}
 	cols = make([]string, 0, len(rows))
 	for _, row := range rows {
@@ -458,10 +529,11 @@ func FetchRemoteColumns(rd *libpq.FrameReader, wr *libpq.FrameWriter, relname st
 	// rel), which reads its partitions. M0149-0057b.
 	kind, err := queryRowsOn(rd, wr, "SELECT c.relkind FROM pg_catalog.pg_class c WHERE c.oid = "+relLit)
 	if err != nil {
-		return nil, false, err
+		return nil, false, "", err
 	}
-	if len(kind) == 1 && len(kind[0]) > 0 && kind[0][0] != nil && string(kind[0][0]) != "r" {
-		gencolPublished = true
+	relkind = "r"
+	if len(kind) == 1 && len(kind[0]) > 0 && kind[0][0] != nil {
+		relkind = string(kind[0][0])
 	}
-	return cols, gencolPublished, nil
+	return cols, gencolPublished, relkind, nil
 }

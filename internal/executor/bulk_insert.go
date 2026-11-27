@@ -256,8 +256,8 @@ func (bs *bulkInsertState) extend(ctx *Context, numPages int,
 // must see every earlier row already there. nextval does not count
 // (contain_volatile_functions_not_nextval).
 func copyUsesMultiInsert(ctx *Context, tbl *catalog.Table, cols []catalog.Column, missing []bool) bool {
-	if tbl == nil {
-		return false
+	if tbl == nil || tbl.PartitionMethod != "" {
+		return false // routed row by row: storeRoutedRow
 	}
 	for _, tr := range tbl.Triggers {
 		if !tr.ForEachRow || (tr.Timing != catalog.TriggerBefore && tr.Timing != catalog.TriggerInsteadOf) {

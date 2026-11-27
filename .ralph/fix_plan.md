@@ -17427,6 +17427,26 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/subscription/t/028_row_filter.pl` — publication row filters.
   Likely prerequisites \(verify at start\): `PUBLICATION … WHERE` parse/validation, old/new tuple transformation on UPDATE, filtered initial COPY, `publish_via_partition_root`.
+  - 2026\-11\-27: port written \(TestPort\_Subscription028RowFilter, gated by GOOPG\_TAP\_028\); the pg18\-publisher pairing passes after 0059a/b; the goopg\-publisher pairings stop at the first `CREATE PUBLICATION … WHERE` \(0059c\).
+- [x] **M0149-0059a — tablesync applies the publications' row filters**
+  Kind: impl
+  Parent: M0149-0059
+  - 028 \(goopg subscriber\): the initial COPY ignored the publisher's row filters and copied every row. PG: fetch\_remote\_table\_info's `SELECT DISTINCT pg_get_expr(gpt.qual, gpt.relid) … pg_get_publication_tables` \(a NULL row = no filter\), copy\_table's `COPY (SELECT … FROM [ONLY] rel WHERE q1 OR q2) TO STDOUT`.
+  - Path\-to\-TAP: 028 pg18\-publisher pairing ← 0059a \(1 link\).
+  - 2026\-11\-27 \(done\): FetchRemoteTableInfo \(columns, gencol, relkind\), FetchRemoteRowFilters; TableSyncConfig.Quals / Ordinary build the filtered COPY \(ONLY for relkind r\).
+  Movement: yes — tap 028 pg18-publisher initial-copy checks fail -> pass
+- [x] **M0149-0059b — COPY FROM routes rows into partitions \(S2: data loss\)**
+  Kind: impl
+  Parent: M0149-0059
+  - **S2 escalation**: `COPY parted FROM STDIN` reported `COPY n` and stored the rows in the partitioned parent's own relfilenode, which no scan reads — every row was silently lost \(SQL COPY and the subscriber's table sync alike\). PG: copyfrom.c ExecSetupPartitionTupleRouting / ExecFindPartition.
+  - Path\-to\-TAP: 028 "check publish\_via\_partition\_root behavior" \(REFRESH copy into the partitioned root\) ← 0059b \(1 link\).
+  - 2026\-11\-27 \(done\): CopyFromExecutor.storeRoutedRow routes each row \(routeToPartition, remapRowForPartition, leaf NOT NULL / CHECK / default\-partition / unique checks\) and writes the leaf; copyUsesMultiInsert declines the buffer for a partitioned target \(PG keeps per\-leaf buffers — page placement only\). Test TestCopyFromRoutesIntoPartitions.
+  Movement: yes — tap 028 pg18-publisher "check publish_via_partition_root behavior" fail -> pass; COPY into partitioned table 0 rows -> routed
+- [ ] **M0149-0059c — publisher row filters \(`FOR TABLE t WHERE \(…\)`\)**
+  Kind: impl
+  Parent: M0149-0059
+  - 028 \(goopg publisher\): `CREATE PUBLICATION tap_pub_x FOR TABLE tab_rf_x WHERE (x > 10)` is a syntax error. Needs: grammar in CREATE / ALTER ADD / SET with PG's validation errors, prqual storage in pg\_publication\_rel, pg\_get\_publication\_tables' qual, pgoutput filter evaluation with the UPDATE old/new transformation, ignoring the filter under FOR ALL TABLES / TABLES IN SCHEMA, viaroot and inheritance\-child handling.
+  - Path\-to\-TAP: 028 goopg\-publisher pairings ← 0059c \(1 link\).
 - [ ] **M0149-0060 — port subscription/t/031_column_list.pl**
   Kind: impl
   Parent: none

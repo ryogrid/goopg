@@ -755,6 +755,9 @@ func (c *CopyFromExecutor) storeCopyRow(row Row) error {
 		}
 		return nil
 	}
+	if c.plan.Table.PartitionMethod != "" {
+		return c.storeRoutedRow(row)
+	}
 	// CIM_SINGLE: table_tuple_insert through the statement's bistate.
 	rel, bs := c.bulkState()
 	c.ctx.bulkInsert = bs
@@ -772,6 +775,71 @@ func (c *CopyFromExecutor) storeCopyRow(row Row) error {
 	// pgstat_count_heap_insert(relation, 1) (heapam.c:2251), so each single-row
 	// COPY insert counts one tuple (M-NIGHTLY, 2026-10-31).
 	recordRelInsert(c.ctx, tableOIDFromCatalog(c.plan.Table), 1)
+	c.rowsIn++
+	return nil
+}
+
+// storeRoutedRow is CopyFrom's tuple routing (copyfrom.c, proute =
+// ExecSetupPartitionTupleRouting; ExecFindPartition per row): a COPY into a
+// partitioned table stores each row in the leaf partition its key selects,
+// with the leaf's NOT NULL, default-partition and unique checks naming the
+// leaf, as INSERT's routed arm does. A partitioned table has no storage of
+// its own, so writing the row to the parent's relfilenode — what this path
+// did before — reported "COPY n" and stored nothing a scan could see
+// (M0149-0059b). goopg routes row by row; PG's CIM_MULTI_CONDITIONAL keeps
+// one multi-insert buffer per leaf (copyUsesMultiInsert declines the
+// buffer for a partitioned target), which changes only page placement.
+func (c *CopyFromExecutor) storeRoutedRow(row Row) error {
+	im, ok := c.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return &ExecError{Code: "0A000", Pos: c.plan.Pos(),
+			Message: fmt.Sprintf("COPY into partitioned table %q requires the in-memory catalog", c.plan.Table.Name)}
+	}
+	leaf, err := routeToPartition(c.plan.Table, row, im, c.ctx)
+	if err != nil {
+		return err
+	}
+	if leaf == nil {
+		return &ExecError{Code: "23514", Pos: c.plan.Pos(),
+			Message: fmt.Sprintf("no partition of relation %q found for row", c.plan.Table.Name)}
+	}
+	if err := lockRoutingPathPartitions(c.ctx, c.plan.Table, leaf); err != nil {
+		return err
+	}
+	leafRow := remapRowForPartition(c.plan.Table.Columns, leaf.Columns, row)
+	if err := checkDefaultPartitionInsertConstraint(c.ctx, leaf, leaf.Columns, leafRow, c.plan.Pos()); err != nil {
+		return err
+	}
+	for i, col := range leaf.Columns {
+		if col.NotNull && i < len(leafRow) && leafRow[i].IsNull() {
+			return &ExecError{
+				Code:    "23502",
+				Message: fmt.Sprintf("null value in column %q of relation %q violates not-null constraint", col.Name, leaf.Name),
+				Detail:  formatRowForDetail(c.ctx, leaf.Columns, leafRow),
+			}
+		}
+	}
+	if len(leaf.CheckConstraints) > 0 {
+		if err := checkConstraints(c.ctx, leaf, leafRow); err != nil {
+			return err
+		}
+	}
+	_ = computeGeneratedColumns(leaf.Columns, leafRow)
+	if err := checkUniqueIndexesForInsert(c.ctx, leaf, leaf.Columns, leafRow, c.plan.Pos()); err != nil {
+		return err
+	}
+	rel := c.ctx.Catalog.RelFileNode(leaf)
+	if c.bulk == nil || c.bulk.rel != rel {
+		c.bulk = newBulkInsertState(rel)
+	}
+	c.ctx.bulkInsert = c.bulk
+	ptr, err := writeHeapRowReturning(c.ctx, rel, leaf.Columns, leafRow)
+	c.ctx.bulkInsert = nil
+	if err != nil {
+		return err
+	}
+	maintainUniqueIndexesForInsert(c.ctx, leaf, leaf.Columns, leafRow, ptr)
+	recordRelInsert(c.ctx, tableOIDFromCatalog(leaf), 1)
 	c.rowsIn++
 	return nil
 }

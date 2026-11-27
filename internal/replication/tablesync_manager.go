@@ -192,9 +192,17 @@ func syncOneRel(ctx context.Context, cfg TableSyncManagerConfig, relOID uint32, 
 
 	// fetch_remote_table_info: the publisher's column list, which both
 	// the COPY and the local column mapping follow. M0149-0044a.
-	remoteCols, gencolPublished, err := FetchRemoteColumns(conn.Reader, conn.Writer, relname, cfg.Publications)
+	info, err := FetchRemoteTableInfo(conn.Reader, conn.Writer, relname, cfg.Publications)
 	if err != nil {
 		res.Err = fmt.Errorf("tablesync_manager: fetch columns of rel %d (%s): %w", relOID, relname, err)
+		return res
+	}
+	remoteCols := info.Columns
+	gencolPublished := info.GencolPublished || info.RelKind != "r"
+	// The publications' row filters (M0149-0059a).
+	quals, err := FetchRemoteRowFilters(conn.Reader, conn.Writer, relname, cfg.Publications)
+	if err != nil {
+		res.Err = fmt.Errorf("could not fetch table WHERE clause info for table %s from publisher: %w", relname, err)
 		return res
 	}
 	writer, err := cfg.OpenWriter(ctx, relOID, remoteCols)
@@ -245,6 +253,8 @@ func syncOneRel(ctx context.Context, cfg TableSyncManagerConfig, relOID uint32, 
 		Logger:  cfg.Logger,
 
 		CopySelect: gencolPublished,
+		Quals:      quals,
+		Ordinary:   info.RelKind == "r",
 		Binary:     cfg.Binary,
 		Commit:     closeWriter,
 	})
