@@ -17466,6 +17466,31 @@ verify each at HEAD when the task starts.
   Parent: none
   Upstream: `postgres/src/test/subscription/t/013_partition.pl` — partitioned tables on publisher and subscriber.
   Likely prerequisites \(verify at start\): `publish_via_partition_root`, subscriber-side tuple routing into differently shaped partitions, ATTACH/DETACH.
+  - 2026\-11\-27: port written \(TestPort\_Subscription013Partition, gated by GOOPG\_TAP\_013\); after 0061a the remaining failures are 0061b\-e \(all three pairings stop at the sub2 catch\-up of 0061b\).
+- [x] **M0149-0061a — UPDATE / DELETE through a parent reach a partition with a different column order \(S2: wrong results\)**
+  Kind: impl
+  Parent: M0149-0061
+  - **S2 escalation**: `UPDATE tab1 SET a = 2 WHERE a = 1` reported UPDATE 0 when the row lived in a partition attached with its columns in another order \(`tab1\_1 \(b text, a int\)`\); DELETE likewise; a cross\-partition move wrote the row in the source's order \(NOT NULL violation\). The parent's WHERE was evaluated against the leaf's raw columns. PG: ExecInitPartitionInfo / the child\-to\-root attribute map, ExecCrossPartitionUpdate's tuple conversion.
+  - Path\-to\-TAP: 013 "update of tab1\_1, tab1\_2 replicated" \(goopg publisher\) ← 0061a \(1 link\).
+  - 2026\-11\-27 \(done\): updateOp / deleteOp flag mismatched\-layout leaves for the inheritance child's remap \(evaluation in parent space, newRow mapped back\); the pending update keeps childColMap, routes on the parent\-ordered row and remaps a moved row into the destination's layout. Test TestPartitionDMLMismatchedColumnOrder.
+  Movement: yes — tap 013 goopg-publisher "update of tab1_1, tab1_2 replicated" fail -> pass; UPDATE/DELETE on a mismatched-layout partition 0 rows -> correct
+- [ ] **M0149-0061b — table sync records its sync LSN; the apply worker skips changes the copy already holds**
+  Kind: impl
+  Parent: M0149-0061
+  - 013 \(goopg subscriber, both publishers\): after `ALTER SUBSCRIPTION sub2 SET PUBLICATION …` the copy of tab2 holds row 1 and the stream re\-sends INSERT \(1\): 23505 insert\_exists, the worker restarts forever and sub2 never catches up. goopg promotes a synced rel to READY at LSN 0, so changes between the slot's resume point and the COPY snapshot are applied twice. PG: the tablesync worker's own slot \(CREATE\_REPLICATION\_SLOT … USE\_SNAPSHOT\), SUBREL\_STATE\_SYNCDONE with statelsn, should\_apply\_changes\_for\_rel / process\_syncing\_tables\_for\_apply. Also PG skips changes of rels with no pg\_subscription\_rel row \(state UNKNOWN\).
+  - Path\-to\-TAP: 013 sub2 catch\-up ← 0061b \(1 link\).
+- [ ] **M0149-0061c — apply fires the subscriber partition's AFTER ROW triggers for routed UPDATEs**
+  Kind: impl
+  Parent: M0149-0061
+  - 013 \(goopg subscriber\): "check replica update after trigger applied on subscriber" — sub1's tab1\_2\_2 ENABLE ALWAYS AFTER trigger records nothing for UPDATEs routed into it \(apply\_handle\_tuple\_routing\). Path\-to\-TAP: 013 ← 0061c \(1 link\).
+- [ ] **M0149-0061d — replicated TRUNCATE of a partitioned table truncates its sub\-partitions**
+  Kind: impl
+  Parent: M0149-0061
+  - 013 \(goopg subscriber\): "truncate of tab1\_2 replicated" leaves row 5 \(subscriber's tab1\_2 is itself partitioned\). PG: apply\_handle\_truncate adds the partitions of a partitioned target \(find\_all\_inheritors\). Path\-to\-TAP: 013 ← 0061d \(1 link\).
+- [ ] **M0149-0061e — update\_missing / delete\_missing conflict log lines for routed changes**
+  Kind: impl
+  Parent: M0149-0061
+  - 013 \(goopg subscriber\): the `conflict detected on relation "public.tab1\_2\_2": conflict=update\_missing` / delete\_missing log checks do not match \(routed UPDATE / DELETE of a missing row; overlaps M0149-0056d\). Path\-to\-TAP: 013 ← 0061e \(1 link\).
 - [ ] **M0149-0062 — port subscription/t/030_origin.pl**
   Kind: impl
   Parent: none

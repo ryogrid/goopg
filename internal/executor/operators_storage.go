@@ -6056,13 +6056,32 @@ func (o *updateOp) next() (TupleSlot, error) {
 	// PG's expand_inherited_rtentry, which is gated on the identical
 	// rte->inh flag for both inheritance and partitioning. M0134-0005ao.
 	if imU, ok := o.ctx.Catalog.(*catalog.InMemory); ok && !o.plan.Only {
-		updateScanTables = append(updateScanTables, collectDMLPartitionLeaves(imU, tbl.OID, o.ctx.Snap.PartitionDetachEpoch)...)
+		leaves := collectDMLPartitionLeaves(imU, tbl.OID, o.ctx.Snap.PartitionDetachEpoch)
+		updateScanTables = append(updateScanTables, leaves...)
+		// A partition whose columns are in a different order from the
+		// parent's (ATTACH of a table created separately) takes the
+		// inheritance child's remap: WHERE / SET / RETURNING evaluate in
+		// the parent's column space and the new row maps back to the
+		// leaf (PG's ExecInitUpdate child-to-root attribute map). It used
+		// to evaluate the parent's expressions against the leaf's raw
+		// column order, so `UPDATE parent SET a = 2 WHERE a = 1` matched
+		// nothing in such a leaf. M0149-0061.
+		for _, leaf := range leaves {
+			if !partitionColOrderMatches(cols, leaf.Columns) {
+				if inheritChildOIDs == nil {
+					inheritChildOIDs = map[uint32]bool{}
+				}
+				inheritChildOIDs[leaf.OID] = true
+			}
+		}
 		// Drop other-session temp inheritance children (RELATION_IS_OTHER_TEMP).
 		// Design 0118-0036 (M0118-0008 inherit-temp).
 		inheritChildren := catalog.AccessibleInheritanceChildren(imU.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx))
 		updateScanTables = append(updateScanTables, inheritChildren...)
 		if len(inheritChildren) > 0 {
-			inheritChildOIDs = make(map[uint32]bool, len(inheritChildren))
+			if inheritChildOIDs == nil {
+				inheritChildOIDs = make(map[uint32]bool, len(inheritChildren))
+			}
 			for _, ic := range inheritChildren {
 				inheritChildOIDs[ic.OID] = true
 			}
@@ -6113,6 +6132,10 @@ func (o *updateOp) next() (TupleSlot, error) {
 		oldRow         Row            // for BEFORE UPDATE trigger firing
 		scanTbl        *catalog.Table // table the row came from (M0100-0005o: partition-child triggers)
 		beforeFired    bool           // BEFORE trigger already fired in Phase 1 (M0100-0011)
+		// childColMap maps newRow (the source relation's column order)
+		// back to the parent's, for partition routing; nil when the two
+		// orders agree. M0149-0061.
+		childColMap []int
 	}
 	pending := make([]pendingUpdate, 0, 1)
 	// M-NIGHTLY 2026-07-15 UPDATE-side follow-up: only columns this
@@ -6456,7 +6479,7 @@ func (o *updateOp) next() (TupleSlot, error) {
 			pending = append(pending, pendingUpdate{
 				rel: captureRel, blk: writeBlk, slot: writeSlot, cols: captureCols,
 				newRow: newRow, retRow: retRow, inheritColMap: storedColMap, oldRow: oldRow,
-				scanTbl: scanTbl, beforeFired: beforeFiredP1,
+				scanTbl: scanTbl, beforeFired: beforeFiredP1, childColMap: inheritColMap,
 			})
 			return nil
 		}); err != nil {
@@ -6744,8 +6767,16 @@ func (o *updateOp) next() (TupleSlot, error) {
 				var destPart *catalog.Table
 				isCrossPartitionMove := false
 				if imW, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(tbl.PartitionKey) > 0 {
+					// Route on the parent-ordered row; a moved row is
+					// written in the destination's own column order
+					// (ExecCrossPartitionUpdate's tuple conversion).
+					// M0149-0061.
+					routeRow := pu.newRow
+					if pu.childColMap != nil {
+						routeRow = remapChildRowToParent(pu.newRow, pu.childColMap)
+					}
 					var routeErr error
-					destPart, routeErr = routeToPartition(tbl, pu.newRow, imW, o.ctx)
+					destPart, routeErr = routeToPartition(tbl, routeRow, imW, o.ctx)
 					if routeErr != nil {
 						return nil, routeErr
 					}
@@ -6753,6 +6784,7 @@ func (o *updateOp) next() (TupleSlot, error) {
 						destRel := o.ctx.Catalog.RelFileNode(destPart)
 						if destRel != puRel {
 							isCrossPartitionMove = true
+							pu.newRow = remapRowForPartition(cols, destPart.Columns, routeRow)
 						}
 						targetWriteRel = destRel
 						targetWriteCols = destPart.Columns
@@ -7161,13 +7193,26 @@ func (o *deleteOp) next() (TupleSlot, error) {
 	// DELETE FROM ONLY skips inheritance/partition children entirely — see
 	// updateOp.Next's identical gate. M0134-0005ao.
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && !o.plan.Only {
-		scanTables = append(scanTables, collectDMLPartitionLeaves(im, tbl.OID, o.ctx.Snap.PartitionDetachEpoch)...)
+		delLeaves := collectDMLPartitionLeaves(im, tbl.OID, o.ctx.Snap.PartitionDetachEpoch)
+		scanTables = append(scanTables, delLeaves...)
+		// A partition laid out in a different column order takes the
+		// inheritance child's remap, as in updateOp.Next (M0149-0061).
+		for _, leaf := range delLeaves {
+			if !partitionColOrderMatches(tbl.Columns, leaf.Columns) {
+				if delInheritChildOIDs == nil {
+					delInheritChildOIDs = map[uint32]bool{}
+				}
+				delInheritChildOIDs[leaf.OID] = true
+			}
+		}
 		// Drop other-session temp inheritance children (RELATION_IS_OTHER_TEMP).
 		// Design 0118-0036 (M0118-0008 inherit-temp).
 		delInheritChildren := catalog.AccessibleInheritanceChildren(im.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx))
 		scanTables = append(scanTables, delInheritChildren...)
 		if len(delInheritChildren) > 0 {
-			delInheritChildOIDs = make(map[uint32]bool, len(delInheritChildren))
+			if delInheritChildOIDs == nil {
+				delInheritChildOIDs = make(map[uint32]bool, len(delInheritChildren))
+			}
 			for _, ic := range delInheritChildren {
 				delInheritChildOIDs[ic.OID] = true
 			}
