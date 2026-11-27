@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // TestPartitionDMLMismatchedColumnOrder pins M0149-0061a against PG 18.3:
@@ -40,5 +41,52 @@ func TestPartitionDMLMismatchedColumnOrder(t *testing.T) {
 	runSQL(t, ctx, "DELETE FROM pco WHERE a = 3")
 	if got := strings.Join(renderRows(runSQLWith(t, ctx, "SELECT a FROM pco ORDER BY a", ps)), ";"); got != "1" {
 		t.Errorf("after DELETE: %q, want 1", got)
+	}
+}
+
+// TestAlterTableColumnRecursesIntoPartitions pins M0149-0061g against PG
+// 18.3: ALTER TABLE ... DROP COLUMN / ADD COLUMN on a partitioned table
+// recurse into its partitions (ATExecDropColumn / ATExecAddColumn over
+// find_inheritance_children) — including a partition attached with its
+// columns in another order — and into inheritance children whose column is
+// inherited. Before, the partitions kept the dropped column and never got
+// the added one.
+func TestAlterTableColumnRecursesIntoPartitions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"CREATE TABLE acr (a int PRIMARY KEY, b text) PARTITION BY LIST (a)",
+		"CREATE TABLE acr_1 (b text, a int NOT NULL)",
+		"ALTER TABLE acr ATTACH PARTITION acr_1 FOR VALUES IN (0, 1, 2, 3)",
+		"CREATE TABLE acr_2 PARTITION OF acr FOR VALUES IN (5, 6)",
+		"INSERT INTO acr VALUES (0, 'zero'), (6, 'six')",
+		"ALTER TABLE acr DROP b, ADD COLUMN c text DEFAULT 'dflt', ADD b text",
+		"INSERT INTO acr (a, b) VALUES (1, 'x'), (5, 'y')",
+		"CREATE TABLE acr_ih (x int, y int)",
+		"CREATE TABLE acr_ihc (z int) INHERITS (acr_ih)",
+		"ALTER TABLE acr_ih DROP y, ADD w int",
+	} {
+		runSQL(t, ctx, q)
+	}
+	names := func(tbl string) string {
+		tt, ok := cat.LookupTable(parser.ObjectName{Name: tbl})
+		if !ok {
+			t.Fatalf("%s not found", tbl)
+		}
+		var out []string
+		for _, c := range tt.Columns {
+			out = append(out, c.Name)
+		}
+		return strings.Join(out, ",")
+	}
+	for tbl, want := range map[string]string{"acr_1": "a,c,b", "acr_2": "a,c,b", "acr_ihc": "x,z,w"} {
+		if got := names(tbl); got != want {
+			t.Errorf("%s columns = %s, want %s", tbl, got, want)
+		}
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	got := strings.Join(renderRows(runSQLWith(t, ctx, "SELECT a, c, b FROM acr ORDER BY a", ps)), ";")
+	if want := "0|dflt|NULL;1|dflt|x;5|dflt|y;6|dflt|NULL"; got != want {
+		t.Errorf("rows = %q, want %q", got, want)
 	}
 }

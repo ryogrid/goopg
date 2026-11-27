@@ -17481,14 +17481,27 @@ verify each at HEAD when the task starts.
   - Path\-to\-TAP: 013 sub2 catch\-up ← 0061b \(1 link\).
   - 2026\-11\-27 \(done\): RunTableSync copies inside BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ whose first statement reads pg\_current\_wal\_lsn\(\) and records it as the SYNCDONE LSN \(CaptureSyncLSN\); the refresh no longer promotes such a rel to READY; shouldApplyChangesForRel applies a SYNCDONE rel when statelsn <= remote\_final\_lsn \(Begin final\_lsn\); keepalives promote idle SYNCDONE rels \(PromoteSyncedRels\). Uncovered on the goopg publisher, each 1 link from 013's sub2 catch\-up: pgoutput sent the commit record's END as Begin final\_lsn / Commit commit\_lsn \(PG: start, decode.c buf\->origptr\) — now start, with end\_lsn the end \(CommitStartAware, ApplyCommitAt; goopg's subscriber reports end\_lsn\); FOR ALL TABLES ignored publish\_via\_partition\_root \(viaRootAll; AllTablesPublicationRelations lists roots / leaves as GetAllTablesPublicationRelations, partitioned parents were listed in every mode\); a leaf in another column order was published as itself instead of through the root's attribute map \(tupleConv\). Tests TestApplyWorkerSkipsChangesBeforeSyncLSN, TestApplyWorkerPromotesSyncDoneToReadyOnCommit \(updated to PG's rule\).
   Movement: yes — tap 013 all three pairings: sub2 catch-up after SET PUBLICATION timeout -> pass (stops move to 0061d/f/g)
-- [ ] **M0149-0061f — a leaf TRUNCATE is not published when the leaf is published via its root**
+- [x] **M0149-0061f — a leaf TRUNCATE is not published when the leaf is published via its root**
   Kind: impl
   Parent: M0149-0061
   - 013 \(goopg publisher\): `TRUNCATE tab1\_2, tab2\_1, tab3\_1` under publish\_via\_partition\_root must send nothing \(pgoutput\_truncate skips a relation whose publish\_as\_relid differs\); sub2 stalls at the catch\-up after it. Path\-to\-TAP: 013 ← 0061f \(1 link\).
-- [ ] **M0149-0061g — the leaf\-to\-root map survives dropped / re\-added columns**
+  - 2026\-11\-27 \(done\): PgOutput.truncate skips a partition whose PublishAsAncestor is another relation.
+  Movement: yes — tap 013 goopg-publisher pairings: sub2 catch-up after the leaf TRUNCATE timeout -> pass
+- [x] **M0149-0061g — the leaf\-to\-root map survives dropped / re\-added columns**
   Kind: impl
   Parent: M0149-0061
   - 013 \(goopg publisher\): after `ALTER TABLE tab2 DROP b, ADD COLUMN c …, ADD b` sub\_viaroot stalls \(tupleConv requires equal column counts; dropped columns break it\). PG rebuilds the attrmap per relation invalidation. Path\-to\-TAP: 013 ← 0061g \(1 link\).
+  - Finding: the real cause was DDL — **S2**: `ALTER TABLE parent DROP COLUMN / ADD COLUMN` never recursed into partitions \(ADD walked only inheritance children; DROP walked nothing\), so a partitioned table and its partitions disagreed on their columns and rows routed into a partition lost the added column. PG: ATExecDropColumn / ATExecAddColumn recurse through find\_inheritance\_children \(a partition's columns are attislocal = false, attinhcount = 1\).
+  - 2026\-11\-27 \(done\): execAlterDropColumn → dropColumnFromChildren \(partitions always, inheritance children when the column is inherited, recursively\); addColumnRecursive walks PartitionChildren too, marks the child column inherited and re\-syncs the child's catalog heap rows. Test TestAlterTableColumnRecursesIntoPartitions.
+  Movement: yes — tap 013 goopg-publisher -> PG subscriber: 588 timeout -> pass (stops at 629/686); ALTER TABLE parent DROP/ADD COLUMN partitions unchanged -> recursed
+- [ ] **M0149-0061h — goopg subscriber stalls at sub\_viaroot after the publisher's ALTER TABLE tab2 DROP/ADD column \(013 line \~588\)**
+  Kind: impl
+  Parent: M0149-0061
+  - Path\-to\-TAP: 013 goopg\-subscriber pairings ← 0061h \(1 link\); not yet diagnosed.
+- [ ] **M0149-0061i — 013 "updating a row that was modified by a different origin" and the later sub2 catch\-up \(goopg publisher → PG subscriber, lines 629 / 686\)**
+  Kind: impl
+  Parent: M0149-0061
+  - Path\-to\-TAP: 013 goopg\-publisher pairings ← 0061i \(1 link\); not yet diagnosed \(origin / track\_commit\_timestamp conflict detection\).
 - [ ] **M0149-0061c — apply fires the subscriber partition's AFTER ROW triggers for routed UPDATEs**
   Kind: impl
   Parent: M0149-0061

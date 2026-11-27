@@ -57,10 +57,30 @@ Test: TestPartitionDMLMismatchedColumnOrder.
 Tests: TestApplyWorkerSkipsChangesBeforeSyncLSN; TestApplyWorkerPromotesSyncDoneToReadyOnCommit, updated to PG's
 rule \(a commit past the sync LSN applies\).
 
+## Landed — M0149\-0061f / 0061g
+
+- **0061f.** pgoutput\_truncate skips a partition whose publish\-as relation is another relation, i.e. one published
+  through its root. The root, listed in the same TRUNCATE, is sent. `PgOutput.truncate` now consults
+  `PublishAsAncestor`.
+- **0061g \(S2, DDL\).** `ALTER TABLE parent DROP COLUMN / ADD COLUMN` did not recurse into partitions:
+  - ADD walked only inheritance children;
+  - DROP walked nothing.
+
+  A partitioned table and its partitions therefore disagreed on their columns, and a row routed into a partition
+  lost the added column. PG's ATExecDropColumn / ATExecAddColumn recurse through find\_inheritance\_children. A
+  partition's columns are always inherited \(attislocal = false, attinhcount = 1\). goopg now matches this:
+  - `dropColumnFromChildren` drops the column from every partition, and from an inheritance child whose column is
+    inherited, recursively;
+  - `addColumnRecursive` walks partitions too, marks the child column inherited, and re\-syncs the child's
+    pg\_attribute / pg\_class rows.
+
+  Test: TestAlterTableColumnRecursesIntoPartitions.
+
 ## Open
 
 - **0061c.** Subscriber AFTER ROW triggers must fire on the partitions that routed UPDATEs land in.
 - **0061d.** A replicated TRUNCATE of a partitioned target must reach its sub\-partitions.
 - **0061e.** update\_missing / delete\_missing conflict log lines for routed changes.
-- **0061f.** A leaf TRUNCATE must not be published when the leaf is published via its root.
-- **0061g.** The leaf\-to\-root map must survive dropped and re\-added columns.
+- **0061h.** A goopg subscriber stalls at sub\_viaroot after the publisher's ALTER TABLE tab2 DROP / ADD column.
+- **0061i.** Origin conflict detection \("updating a row that was modified by a different origin"\) and the later sub2
+  catch\-up, goopg publisher → PG subscriber.

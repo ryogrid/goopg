@@ -13578,10 +13578,35 @@ func (o *ddlOp) addColumnRecursive(tbl *catalog.Table, col catalog.Column, act p
 		if isRoot {
 			return &ExecError{Code: "42701", Pos: act.Pos(), Message: err.Error()}
 		}
+	} else if !isRoot && catalogHeapSyncAvailable(o.ctx) {
+		// A recursed child's pg_attribute / pg_class rows are re-synced
+		// like the root's (the caller syncs the root), so pg_attribute
+		// scans — and pg_dump — see the inherited column. M0149-0061g.
+		if err := o.ctx.MaterializeWriterXID(); err == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range tableCatalogDBOids(o.ctx) {
+				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+			}
+		}
+		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
 	}
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		for _, child := range im.InheritanceChildren(tbl.OID) {
-			if err := o.addColumnRecursive(child, col, act, stmt, false); err != nil {
+		// Partitions too (ATExecAddColumn recurses through
+		// find_inheritance_children, which lists both): the partitions
+		// of a partitioned table did not get the new column, and rows
+		// routed into them lost it. M0149-0061g.
+		children := append(im.PartitionChildren(tbl.OID), im.InheritanceChildren(tbl.OID)...)
+		seen := map[uint32]bool{}
+		for _, child := range children {
+			if child == nil || seen[child.OID] {
+				continue
+			}
+			seen[child.OID] = true
+			childCol := col
+			childCol.Inherited = true
+			if err := o.addColumnRecursive(child, childCol, act, stmt, false); err != nil {
 				return err
 			}
 		}
@@ -29305,7 +29330,66 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 // Indexes referencing only the dropped column become empty orphans (harmless
 // for now; a future pass can DROP them explicitly).
 func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAction, only bool) error {
-	return o.dropColumn(tbl, act, only, false)
+	// The column's presence before the drop decides whether children are
+	// visited (DROP COLUMN IF EXISTS on a missing column recurses nowhere).
+	had := false
+	for _, c := range tbl.Columns {
+		if strings.EqualFold(c.Name, act.ColumnName) {
+			had = true
+			break
+		}
+	}
+	if err := o.dropColumn(tbl, act, only, false); err != nil {
+		return err
+	}
+	if had && !only {
+		return o.dropColumnFromChildren(tbl, act)
+	}
+	return nil
+}
+
+// dropColumnFromChildren is ATExecDropColumn's recursion (tablecmds.c): the
+// column goes from every child that inherits it — always from a partition
+// (a partition's columns are all inherited, attislocal = false), and from an
+// inheritance child whose column came from the parent — and so on down.
+// It used to stop at the named table, so a partitioned table and its
+// partitions disagreed on their columns after `ALTER TABLE parent DROP b`.
+// M0149-0061g.
+func (o *ddlOp) dropColumnFromChildren(tbl *catalog.Table, act parser.AlterTableAction) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	children := append(im.PartitionChildren(tbl.OID, dbOid), im.InheritanceChildren(tbl.OID, dbOid)...)
+	seen := map[uint32]bool{}
+	for _, child := range children {
+		if child == nil || seen[child.OID] {
+			continue
+		}
+		seen[child.OID] = true
+		inherits := false
+		has := false
+		for _, c := range child.Columns {
+			if strings.EqualFold(c.Name, act.ColumnName) {
+				has = true
+				inherits = child.PartitionParentOID != 0 || c.Inherited
+				break
+			}
+		}
+		if !has || !inherits {
+			continue
+		}
+		childAct := act
+		childAct.IfExists = true
+		if err := o.dropColumn(child, childAct, false, true); err != nil {
+			return err
+		}
+		if err := o.dropColumnFromChildren(child, act); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // dropColumn is ALTER TABLE … DROP COLUMN's body. fromDependency marks a

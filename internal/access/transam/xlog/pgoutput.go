@@ -371,6 +371,14 @@ func (p *PgOutput) truncate(c Change) error {
 		if p.filter != nil && !p.filter.Allows(rel, ChangeTruncate) {
 			continue
 		}
+		// pgoutput_truncate: a partition published through its root
+		// (publish_as_relid != relid) is not sent — the root, listed in the
+		// same TRUNCATE, is. M0149-0061f.
+		if vf, ok := p.filter.(ViaRootFilter); ok && len(rel.AncestorOIDs) > 0 {
+			if anc, ok := vf.PublishAsAncestor(rel); ok && anc != rel.OID {
+				continue
+			}
+		}
 		relids = append(relids, rel.OID)
 		if _, sent := p.emittedRel[rel.OID]; !sent {
 			if err := p.writeRelation(rel); err != nil {
