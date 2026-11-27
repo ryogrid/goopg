@@ -274,11 +274,27 @@ func (p *PgOutput) Change(c Change) error {
 			}
 		}
 	}
+	// Row filter (pgoutput_row_filter), before the Relation message: a
+	// filtered-out change sends nothing, and an UPDATE may go out as an
+	// INSERT or a DELETE. M0149-0059c.
+	outcome, err := p.applyRowFilter(rel, c)
+	if err != nil {
+		return fmt.Errorf("pgoutput: row filter for %q: %w", rel.Name, err)
+	}
+	if outcome == rowFilterSkip {
+		return nil
+	}
 	if _, ok := p.emittedRel[rel.OID]; !ok {
 		if err := p.writeRelation(rel); err != nil {
 			return err
 		}
 		p.emittedRel[rel.OID] = struct{}{}
+	}
+	switch outcome {
+	case rowFilterAsInsert:
+		return p.writeInsert(rel, c.NewTuple)
+	case rowFilterAsDelete:
+		return p.writeDelete(rel, c.OldTuple)
 	}
 	switch c.Kind {
 	case ChangeInsert:

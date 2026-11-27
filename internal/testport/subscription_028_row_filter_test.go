@@ -1,7 +1,6 @@
 package testport
 
 import (
-	"os"
 	"strings"
 	"testing"
 
@@ -19,14 +18,9 @@ import (
 // publish_via_partition_root, inheritance children, TOAST and virtual
 // generated columns. Three pairings: all-goopg, a PG 18.3 publisher with a
 // goopg subscriber, a goopg publisher with a PG 18.3 subscriber.
-//
-// Gated by GOOPG_TAP_028 until it passes (M0149-0059).
 func TestPort_Subscription028RowFilter(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subscription TAP port in short mode")
-	}
-	if os.Getenv("GOOPG_TAP_028") == "" {
-		t.Skip("028 port is not passing yet (M0149-0059); set GOOPG_TAP_028=1 to run")
 	}
 	repo := repoRoot(t)
 	tapnode.Available(t, repo)

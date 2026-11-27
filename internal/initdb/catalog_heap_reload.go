@@ -3348,9 +3348,11 @@ func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory,
 	// Pass 1: member rows, grouped by publication OID.
 	membersByPub := map[uint32][]string{}
 	colsByPub := map[uint32]map[string][]string{}
+	qualsByPub := map[uint32]map[string]string{}
 	type prMember struct {
 		pub, rel uint32
 		attnums  []int16
+		qual     string
 	}
 	prCols := executor.PGPublicationRelColumnsPG18()
 	prRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 6106, Fork: storage.MainFork}
@@ -3361,7 +3363,11 @@ func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory,
 			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, prCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
 				return nil, false, derr
 			}
-			return prMember{pub: uint32(decoded[1].Int), rel: uint32(decoded[2].Int), attnums: int2VectorDatumAttnums(decoded[4])}, false, nil
+			qual := ""
+			if !decoded[3].IsNull() {
+				qual = decoded[3].StringValue()
+			}
+			return prMember{pub: uint32(decoded[1].Int), rel: uint32(decoded[2].Int), attnums: int2VectorDatumAttnums(decoded[4]), qual: qual}, false, nil
 		})
 	if err != nil {
 		return err
@@ -3373,6 +3379,13 @@ func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory,
 			continue
 		}
 		membersByPub[pr.pub] = append(membersByPub[pr.pub], tbl.QualifiedName())
+		if pr.qual != "" {
+			// prqual: the row filter's deparsed text (M0149-0059c).
+			if qualsByPub[pr.pub] == nil {
+				qualsByPub[pr.pub] = map[string]string{}
+			}
+			qualsByPub[pr.pub][tbl.QualifiedName()] = pr.qual
+		}
 		if len(pr.attnums) > 0 {
 			// prattrs → the column list by attnum (attnum = Ordinal + 1).
 			var cols []string
@@ -3467,6 +3480,7 @@ func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory,
 		pr.pub.DBOid = nsDBOid
 		pr.pub.Tables = membersByPub[pr.pub.OID]
 		pr.pub.Columns = colsByPub[pr.pub.OID]
+		pr.pub.RowFilters = qualsByPub[pr.pub.OID]
 		pr.pub.Schemas = schemasByPub[pr.pub.OID]
 		pubsub.CreatePublicationDuringRecovery(&pr.pub)
 		cat.SetPublicationHeapTID(pr.pub.OID, catalog.SchemaHeapTID{Block: uint32(pr.tid.Block), Offset: pr.tid.Offset})

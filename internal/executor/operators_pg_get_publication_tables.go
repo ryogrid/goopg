@@ -8,7 +8,7 @@ package executor
 // argument list returns every (publication, table) pair the PubSub registry
 // holds. The output schema is PG 18's (pubid oid, relid oid, attrs
 // int2vector, qual pg_node_tree). attrs lists the published attnums
-// (publicationPublishedAttnums); qual is NULL since goopg does not yet model
+// (publicationPublishedAttnums); qual is the row filter (PublicationRowFilter); formerly NULL since goopg did not model
 // row filters. M0103-0008 probe-survival, M0149-0048b.
 
 import (
@@ -98,11 +98,16 @@ func buildPgGetPublicationTablesRows(ctx *Context, args []Datum) ([]Row, error) 
 	}
 	pubs := ctx.PubSub.PublicationsForDBOid(catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	rows := make([]Row, 0)
+	var rowTables []*catalog.Table
+	viaroot := false
 	for _, pub := range pubs {
 		if !all {
 			if _, ok := want[pub.Name]; !ok {
 				continue
 			}
+		}
+		if pub.PublishViaRoot {
+			viaroot = true
 		}
 		tables := publicationTablesForCtx(ctx, pub)
 		for _, t := range tables {
@@ -125,13 +130,42 @@ func buildPgGetPublicationTablesRows(ctx *Context, args []Datum) ([]Row, error) 
 				}
 				attrs = NewStringDatum(strings.Join(parts, " "))
 			}
+			qual := NullDatum
+			if q, ok := catalog.PublicationRowFilter(pub, t.Schema, t.Name); ok {
+				qual = NewStringDatum(q)
+			}
 			rows = append(rows, Row{
 				NewIntDatum(int64(pub.OID)),
 				relidDatum,
 				attrs,
-				NullDatum, // qual (row filter — not modeled)
+				qual, // prqual (M0149-0059c)
 			})
+			rowTables = append(rowTables, t)
 		}
+	}
+	// filter_partitions (pg_publication.c): once any of the publications
+	// publishes via its partition root, a partition whose ancestor is also
+	// listed is dropped, so its rows are not synchronized twice.
+	// M0149-0059c.
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok && viaroot {
+		listed := map[uint32]bool{}
+		for _, t := range rowTables {
+			listed[t.OID] = true
+		}
+		kept := rows[:0]
+		for i, r := range rows {
+			skip := false
+			for _, anc := range catalog.PartitionAncestorOIDs(im, rowTables[i]) {
+				if listed[anc] {
+					skip = true
+					break
+				}
+			}
+			if !skip {
+				kept = append(kept, r)
+			}
+		}
+		rows = kept
 	}
 	return rows, nil
 }

@@ -57,6 +57,12 @@ type Publication struct {
 	// table absent from the map publishes every column. The map is
 	// replaced, never mutated, so shallow copies may share it.
 	Columns map[string][]string
+	// RowFilters maps a member table's qualified name to its row filter
+	// (pg_publication_rel.prqual), held as the deparsed SQL expression
+	// pg_get_expr returns; a table absent from the map has no filter. The
+	// map is replaced, never mutated, so shallow copies may share it.
+	// M0149-0059c.
+	RowFilters map[string]string
 	// Schemas are the publication's FOR TABLES IN SCHEMA members
 	// (pg_publication_namespace.pnnspid), as schema names in the order
 	// they were added. Every table currently in one of them is published
@@ -410,6 +416,15 @@ func (p *PubSub) SetPublicationTables(name string, tables []string, dbOid ...uin
 		}
 		pub.Columns = kept
 	}
+	if len(pub.RowFilters) > 0 {
+		kept := map[string]string{}
+		for _, t := range pub.Tables {
+			if q, ok := pub.RowFilters[t]; ok {
+				kept[t] = q
+			}
+		}
+		pub.RowFilters = kept
+	}
 	out := *pub
 	out.Tables = append([]string(nil), pub.Tables...)
 	return &out, nil
@@ -450,6 +465,59 @@ func (p *PubSub) SetPublicationColumnLists(name string, cols map[string][]string
 		next[t] = append([]string(nil), c...)
 	}
 	pub.Columns = next
+	return nil
+}
+
+// PublicationRowFilter is the row filter publication pub applies to the
+// published relation schema.name (pg_get_publication_tables' qual,
+// pgoutput_row_filter_init): its pg_publication_rel prqual, except that a
+// FOR ALL TABLES publication, or one that also publishes the relation's
+// schema (FOR TABLES IN SCHEMA), applies none. ok is false when there is no
+// filter. M0149-0059c.
+func PublicationRowFilter(pub *Publication, schema, name string) (string, bool) {
+	if pub == nil || pub.AllTables || len(pub.RowFilters) == 0 {
+		return "", false
+	}
+	nsp := schema
+	if nsp == "" {
+		nsp = "public"
+	}
+	for _, sch := range pub.Schemas {
+		if strings.EqualFold(sch, nsp) {
+			return "", false
+		}
+	}
+	// Member keys are Table.QualifiedName(): bare for an unqualified table.
+	q, ok := pub.RowFilters[nsp+"."+name]
+	if !ok && nsp == "public" {
+		q, ok = pub.RowFilters[name]
+	}
+	return q, ok && q != ""
+}
+
+// SetPublicationRowFilters sets the row filters of a publication's member
+// tables: a table mapped to "" loses its filter, a table absent from
+// filters keeps the one it has. M0149-0059c.
+func (p *PubSub) SetPublicationRowFilters(name string, filters map[string]string, dbOid ...uint32) error {
+	defer p.pubGen.Add(1)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pub, ok := p.publications[pubMapKey(resolveDBOid(dbOid), name)]
+	if !ok {
+		return fmt.Errorf("publication %q does not exist", name)
+	}
+	next := make(map[string]string, len(pub.RowFilters)+len(filters))
+	for t, q := range pub.RowFilters {
+		next[t] = q
+	}
+	for t, q := range filters {
+		if q == "" {
+			delete(next, t)
+			continue
+		}
+		next[t] = q
+	}
+	pub.RowFilters = next
 	return nil
 }
 

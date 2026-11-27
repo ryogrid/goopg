@@ -2473,7 +2473,7 @@ func (p *parser) parseCreatePublicationTail(pos int) (Stmt, error) {
 					}
 					continue
 				}
-				p.acceptIdentKeyword("only")
+				only := p.acceptIdentKeyword("only")
 				obj, err := p.parseObjectName()
 				if err != nil {
 					return nil, err
@@ -2498,8 +2498,14 @@ func (p *parser) parseCreatePublicationTail(pos int) (Stmt, error) {
 						return nil, p.errAtCur("expected ) after publication column list")
 					}
 				}
+				where, err := p.parsePubRowFilter()
+				if err != nil {
+					return nil, err
+				}
 				stmt.Tables = append(stmt.Tables, obj)
 				stmt.TableColumns = append(stmt.TableColumns, cols)
+				stmt.TableWhere = append(stmt.TableWhere, where)
+				stmt.TableOnly = append(stmt.TableOnly, only)
 				if !p.acceptSymbol(",") {
 					break
 				}
@@ -2516,6 +2522,26 @@ func (p *parser) parseCreatePublicationTail(pos int) (Stmt, error) {
 		stmt.With = opts
 	}
 	return stmt, nil
+}
+
+// parsePubRowFilter parses a publication table's optional row filter,
+// gram.y's OptWhereClause `WHERE '(' a_expr ')'` — the parentheses are
+// required. It returns nil when no WHERE follows. M0149-0059c.
+func (p *parser) parsePubRowFilter() (Expr, error) {
+	if !p.acceptKeyword(KwWhere) {
+		return nil, nil
+	}
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("syntax error")
+	}
+	e, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("syntax error")
+	}
+	return e, nil
 }
 
 // expectPubTablesInSchema consumes `IN SCHEMA` after TABLES in a
@@ -2753,6 +2779,16 @@ func (p *parser) parsePubSubWithList(allowEmpty bool) (map[string]string, error)
 		}
 		key := p.cur().Value
 		p.advance()
+		// def_elem's bare `ColLabel` form (gram.y): an option without
+		// `= value` has a NULL argument, which defGetBoolean reads as true
+		// — `WITH (publish_via_partition_root)`. M0149-0059c.
+		if cur := p.cur(); cur.Kind == TokenSymbol && (cur.Value == "," || cur.Value == ")") {
+			out[key] = "true"
+			if !p.acceptSymbol(",") {
+				break
+			}
+			continue
+		}
 		if cur := p.cur(); !(cur.Kind == TokenOperator && cur.Value == "=") {
 			return nil, p.errAtCur("expected '=' after option name")
 		}
@@ -9014,10 +9050,11 @@ func (p *parser) parseAlter() (Stmt, error) {
 			if action != "" && p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwTable || p.cur().Keyword == KwTables) {
 				// pub_obj_list of TABLE and TABLES IN SCHEMA items; a bare
 				// item after a comma continues the previous kind
-				// (preprocess_pubobj_list). A column list `t (a, b)` or a row
-				// filter `t WHERE (...)` is a publication feature goopg does
-				// not model on ALTER: the statement stays the compat no-op
-				// below, as before, rather than failing on syntax PG accepts.
+				// (preprocess_pubobj_list). A column list `t (a, b)` is a
+				// publication feature goopg does not model on ALTER: the
+				// statement stays the compat no-op below, as before, rather
+				// than failing on syntax PG accepts. A row filter
+				// `t WHERE (...)` is modelled (M0149-0059c).
 				stmt := &AlterPublicationTablesStmt{pos: t.Pos, Name: name, Action: action}
 				kind := ""
 				modelled := true
@@ -9039,7 +9076,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 						}
 						stmt.Schemas = append(stmt.Schemas, sch)
 					} else {
-						p.acceptIdentKeyword("only")
+						only := p.acceptIdentKeyword("only")
 						obj, err := p.parseObjectName()
 						if err != nil {
 							return nil, err
@@ -9047,7 +9084,13 @@ func (p *parser) parseAlter() (Stmt, error) {
 						if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
 							p.advance()
 						}
+						where, err := p.parsePubRowFilter()
+						if err != nil {
+							return nil, err
+						}
 						stmt.Tables = append(stmt.Tables, obj)
+						stmt.TableWhere = append(stmt.TableWhere, where)
+						stmt.TableOnly = append(stmt.TableOnly, only)
 					}
 					switch {
 					case p.cur().Kind == TokenSymbol && p.cur().Value == ",":

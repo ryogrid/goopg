@@ -216,7 +216,8 @@ func upsertPublicationCatalogRow(ctx *Context, pub *catalog.Publication) error {
 }
 
 // writePublicationMemberRows journals one pg_publication_rel row per member
-// table (FOR TABLE publications). prqual/prattrs are NULL.
+// table (FOR TABLE publications), with its row filter (prqual) and column
+// list (prattrs) when it has them.
 func writePublicationMemberRows(ctx *Context, pub *catalog.Publication) error {
 	return writePublicationMemberRowsFor(ctx, pub, pub.Tables)
 }
@@ -244,11 +245,18 @@ func writePublicationMemberRowsFor(ctx *Context, pub *catalog.Publication, table
 				prattrs = NewBytesDatum(pgInt2VectorBytes(publicationColumnAttnums(tbl, cols)))
 			}
 		}
+		// prqual: the row filter, held as its deparsed SQL text (goopg
+		// stores pg_node_tree columns as text, as relpartbound does;
+		// pg_get_expr passes it through). M0149-0059c.
+		prqual := NullDatum
+		if q, ok := pub.RowFilters[qname]; ok && q != "" {
+			prqual = NewStringDatum(q)
+		}
 		row := Row{
 			NewIntDatum(int64(prOID)),
 			NewIntDatum(int64(pub.OID)),
 			NewIntDatum(int64(relOID)),
-			NullDatum, // prqual — no row filter
+			prqual,
 			prattrs,
 		}
 		tid, err := writeHeapRowCanonical(ctx, pgPublicationRelRel(), PGPublicationRelColumnsPG18(), row)

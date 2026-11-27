@@ -131,14 +131,14 @@ func TestParseAlterPublicationTables(t *testing.T) {
 	}
 }
 
-// TestParseAlterPublicationUnmodelledTableFormsStayNoop: a column list or a
-// row filter on ALTER is a publication feature goopg does not model; such an
-// ALTER PUBLICATION stays the compat no-op it was, instead of a syntax error
-// on SQL PG accepts. (TABLES IN SCHEMA items are modelled since M0149-0053a.)
+// TestParseAlterPublicationUnmodelledTableFormsStayNoop: a column list on
+// ALTER is a publication feature goopg does not model; such an ALTER
+// PUBLICATION stays the compat no-op it was, instead of a syntax error on SQL
+// PG accepts. (TABLES IN SCHEMA items are modelled since M0149-0053a, row
+// filters since M0149-0059c — TestParsePublicationRowFilter.)
 func TestParseAlterPublicationUnmodelledTableFormsStayNoop(t *testing.T) {
 	for _, sql := range []string{
 		"ALTER PUBLICATION p ADD TABLE t (a, b)",
-		"ALTER PUBLICATION p SET TABLE t WHERE (a > 1)",
 	} {
 		stmts, err := Parse(sql)
 		if err != nil {
@@ -355,5 +355,33 @@ func TestParseAlterPublicationRename(t *testing.T) {
 	r, ok := stmts[0].(*AlterPublicationRenameStmt)
 	if !ok || r.Name != "mypub" || r.NewName != "otherpub" {
 		t.Fatalf("stmt = %#v, want AlterPublicationRenameStmt mypub -> otherpub", stmts[0])
+	}
+}
+
+// TestParsePublicationRowFilter: gram.y's PublicationObjSpec takes an
+// OptWhereClause `WHERE ( a_expr )` after a table, on CREATE PUBLICATION and
+// on ALTER PUBLICATION ADD / SET; the parentheses are required. M0149-0059c.
+func TestParsePublicationRowFilter(t *testing.T) {
+	stmts, err := Parse("CREATE PUBLICATION p FOR TABLE t1 WHERE (a > 1 AND b <> 'x'), t2, TABLE t3 WHERE (c % 2 = 0) WITH (publish = 'insert')")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs, ok := stmts[0].(*CreatePublicationStmt)
+	if !ok || len(cs.Tables) != 3 || len(cs.TableWhere) != 3 {
+		t.Fatalf("CREATE: %#v", stmts[0])
+	}
+	if cs.TableWhere[0] == nil || cs.TableWhere[1] != nil || cs.TableWhere[2] == nil {
+		t.Errorf("CREATE TableWhere = %v", cs.TableWhere)
+	}
+	stmts, err = Parse("ALTER PUBLICATION p SET TABLE t1 WHERE (a > 1000), t2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	as, ok := stmts[0].(*AlterPublicationTablesStmt)
+	if !ok || as.Action != "set" || len(as.TableWhere) != 2 || as.TableWhere[0] == nil || as.TableWhere[1] != nil {
+		t.Fatalf("ALTER: %#v", stmts[0])
+	}
+	if _, err := Parse("CREATE PUBLICATION p FOR TABLE t1 WHERE a > 1"); err == nil {
+		t.Error("WHERE without parentheses parsed; gram.y requires them")
 	}
 }

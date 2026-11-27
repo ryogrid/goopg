@@ -1263,6 +1263,55 @@ func publicationColumnList(tbl *catalog.Table, names []string) ([]string, error)
 	return out, nil
 }
 
+// publicationMemberTables is OpenTableList's expansion of one `TABLE [ONLY]
+// t` item: t, and — unless ONLY was given or t is partitioned (its
+// partitions are published through it) — every inheritance descendant of t,
+// each carrying the item's row filter and column list. M0149-0059c.
+func (o *ddlOp) publicationMemberTables(tbl *catalog.Table, only bool) []*catalog.Table {
+	out := []*catalog.Table{tbl}
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if only || !ok || len(tbl.PartitionKey) > 0 {
+		return out
+	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	seen := map[uint32]bool{tbl.OID: true}
+	for i := 0; i < len(out); i++ {
+		for _, c := range im.InheritanceChildren(out[i].OID, dbOid) {
+			if c != nil && !seen[c.OID] {
+				seen[c.OID] = true
+				out = append(out, c)
+			}
+		}
+	}
+	return out
+}
+
+// publicationRowFilter is the row-filter half of publication_add_relation
+// (publicationcmds.c TransformPubWhereClauses, ruleutils' pg_get_expr): the
+// filter is resolved against its table — an unknown column or function fails
+// the statement as it does in PG — and stored as its deparsed SQL text, the
+// form pg_get_expr(prqual, prrelid) returns. PG's other validations
+// (check_simple_rowfilter_expr: no user-defined operators or functions, no
+// non-immutable functions, no aggregates / window functions / subqueries;
+// the replica-identity check for UPDATE / DELETE publications) are
+// ledgered. M0149-0059c.
+func (o *ddlOp) publicationRowFilter(tbl *catalog.Table, e parser.Expr) (string, error) {
+	text := defaultExprToSQL(e)
+	if _, err := parser.ParseExpr(text); text == "" || err != nil {
+		return "", &ExecError{Code: "0A000", Message: "invalid publication WHERE expression",
+			Detail: "The expression cannot be represented in a publication row filter."}
+	}
+	sql := "SELECT (" + text + ")::bool FROM ONLY " + quoteQualifiedIdentifier(tbl.Schema, tbl.Name) + " LIMIT 0"
+	stmts, err := parser.Parse(sql)
+	if err != nil || len(stmts) != 1 {
+		return "", &ExecError{Code: "42601", Message: "invalid publication WHERE expression"}
+	}
+	if _, err := optimizer.Plan(stmts[0], ctxPlanCatalog(o.ctx)); err != nil {
+		return "", err
+	}
+	return text, nil
+}
+
 func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 	if o.ctx.PubSub == nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "CREATE PUBLICATION requires PubSub registry in Context"}
@@ -1282,6 +1331,8 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 	// PG's default search_path. See 0103-0015.
 	tables := make([]string, 0, len(s.Tables))
 	var colLists map[string][]string
+	var rowFilters map[string]string
+	seenMember := map[string]bool{}
 	for i, t := range s.Tables {
 		tbl, ok := o.ctx.Catalog.LookupTable(t, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !ok && t.Schema == "" {
@@ -1290,16 +1341,37 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 		if !ok {
 			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", qualifiedTableName(t))}
 		}
-		tables = append(tables, tbl.QualifiedName())
-		if i < len(s.TableColumns) && s.TableColumns[i] != nil {
-			cols, err := publicationColumnList(tbl, s.TableColumns[i])
+		filter := ""
+		if i < len(s.TableWhere) && s.TableWhere[i] != nil {
+			q, err := o.publicationRowFilter(tbl, s.TableWhere[i])
 			if err != nil {
 				return err
 			}
-			if colLists == nil {
-				colLists = map[string][]string{}
+			filter = q
+		}
+		only := i < len(s.TableOnly) && s.TableOnly[i]
+		for _, m := range o.publicationMemberTables(tbl, only) {
+			if seenMember[m.QualifiedName()] {
+				continue
 			}
-			colLists[tbl.QualifiedName()] = cols
+			seenMember[m.QualifiedName()] = true
+			tables = append(tables, m.QualifiedName())
+			if i < len(s.TableColumns) && s.TableColumns[i] != nil {
+				cols, err := publicationColumnList(m, s.TableColumns[i])
+				if err != nil {
+					return err
+				}
+				if colLists == nil {
+					colLists = map[string][]string{}
+				}
+				colLists[m.QualifiedName()] = cols
+			}
+			if filter != "" {
+				if rowFilters == nil {
+					rowFilters = map[string]string{}
+				}
+				rowFilters[m.QualifiedName()] = filter
+			}
 		}
 	}
 	schemas, err := o.resolvePublicationSchemas(s.Schemas)
@@ -1320,6 +1392,12 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 			return err
 		}
 		pub.Columns = colLists
+	}
+	if rowFilters != nil {
+		if err := o.ctx.PubSub.SetPublicationRowFilters(s.Name, rowFilters, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
+			return err
+		}
+		pub.RowFilters = rowFilters
 	}
 	// DU-002 restart-persistence follow-up (M0119-0004, loop #67 ledger
 	// resume point): goopg has no per-publication on-disk file namespace,
@@ -1687,10 +1765,10 @@ func (o *ddlOp) execAlterPublicationTables(s *parser.AlterPublicationTablesStmt)
 		// ADD / DROP TABLES IN SCHEMA only: the table list is unchanged.
 		return nil
 	}
-	type member struct{ qname, name string }
+	type member struct{ qname, name, filter string }
 	var listed []member
 	seen := map[string]bool{}
-	for _, t := range s.Tables {
+	for i, t := range s.Tables {
 		tbl, ok := o.ctx.Catalog.LookupTable(t, dbOid)
 		if !ok && t.Schema == "" {
 			tbl, ok = o.ctx.Catalog.LookupTable(parser.ObjectName{Schema: "public", Name: t.Name}, dbOid)
@@ -1698,9 +1776,24 @@ func (o *ddlOp) execAlterPublicationTables(s *parser.AlterPublicationTablesStmt)
 		if !ok {
 			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", qualifiedTableName(t))}
 		}
-		if q := tbl.QualifiedName(); !seen[q] {
-			seen[q] = true
-			listed = append(listed, member{q, tbl.Name})
+		filter := ""
+		if i < len(s.TableWhere) && s.TableWhere[i] != nil {
+			// AlterPublicationTables / OpenTableList: DROP takes no WHERE.
+			if s.Action == "drop" {
+				return &ExecError{Code: "42601", Message: "cannot use a WHERE clause when removing a table from a publication"}
+			}
+			q, err := o.publicationRowFilter(tbl, s.TableWhere[i])
+			if err != nil {
+				return err
+			}
+			filter = q
+		}
+		only := i < len(s.TableOnly) && s.TableOnly[i]
+		for _, m := range o.publicationMemberTables(tbl, only) {
+			if q := m.QualifiedName(); !seen[q] {
+				seen[q] = true
+				listed = append(listed, member{q, m.Name, filter})
+			}
 		}
 	}
 	current := map[string]bool{}
@@ -1739,6 +1832,30 @@ func (o *ddlOp) execAlterPublicationTables(s *parser.AlterPublicationTablesStmt)
 	if err != nil {
 		return &ExecError{Code: "42704", Message: err.Error()}
 	}
+	// Row filters: ADD gives each added table its filter; SET gives every
+	// listed table the filter it is listed with (none clears one). A SET
+	// member whose filter changed is re-journaled — AlterPublicationTables
+	// drops it and adds it back with the new qual.
+	var refiltered []string
+	if s.Action != "drop" {
+		filters := map[string]string{}
+		for _, m := range listed {
+			if s.Action == "set" && current[m.qname] && pub.RowFilters[m.qname] != m.filter {
+				refiltered = append(refiltered, m.qname)
+			}
+			if m.filter != "" || s.Action == "set" {
+				filters[m.qname] = m.filter
+			}
+		}
+		if len(filters) > 0 {
+			if err := o.ctx.PubSub.SetPublicationRowFilters(s.Name, filters, dbOid); err != nil {
+				return &ExecError{Code: "42704", Message: err.Error()}
+			}
+			if p2, ok := o.ctx.PubSub.LookupPublication(s.Name, dbOid); ok {
+				updated = p2
+			}
+		}
+	}
 	nextSet := map[string]bool{}
 	for _, q := range next {
 		nextSet[q] = true
@@ -1754,10 +1871,10 @@ func (o *ddlOp) execAlterPublicationTables(s *parser.AlterPublicationTablesStmt)
 			removed = append(removed, q)
 		}
 	}
-	if err := writePublicationMemberRowsFor(o.ctx, updated, added); err != nil {
+	deletePublicationMemberRows(o.ctx, updated.OID, append(removed, refiltered...))
+	if err := writePublicationMemberRowsFor(o.ctx, updated, append(added, refiltered...)); err != nil {
 		return fmt.Errorf("pg_publication_rel journal: %w", err)
 	}
-	deletePublicationMemberRows(o.ctx, updated.OID, removed)
 	return nil
 }
 

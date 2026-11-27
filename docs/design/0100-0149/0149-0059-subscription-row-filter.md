@@ -1,8 +1,7 @@
 # M0149\-0059 — Port subscription/t/028\_row\_filter.pl
 
-Status: in progress. TestPort\_Subscription028RowFilter is written and gated by `GOOPG_TAP_028`. The PG 18.3
-publisher → goopg subscriber pairing passes after 0059a/b. Both goopg\-publisher pairings stop at the first
-`CREATE PUBLICATION … FOR TABLE t WHERE (…)`, which is 0059c.
+Status: done. TestPort\_Subscription028RowFilter passes 3/3 in all three pairings \(all\-goopg; PG 18.3
+publisher → goopg subscriber; goopg publisher → PG 18.3 subscriber\).
 
 028 publishes tables with row filters \(`FOR TABLE t WHERE (expr)`\) and checks:
 
@@ -46,12 +45,46 @@ data.
 
 Test: TestCopyFromRoutesIntoPartitions.
 
-## Open — M0149\-0059c \(publisher row filters\)
+## Landed — M0149\-0059c \(publisher row filters\)
 
-- grammar: `FOR TABLE t WHERE (expr)` in CREATE PUBLICATION and ALTER PUBLICATION ADD / SET, with PG's
-  validation errors \(e.g. a non\-immutable function, a user\-defined operator, a column not in the replica
-  identity for UPDATE/DELETE publications\);
-- storage: pg\_publication\_rel.prqual;
-- `pg_get_publication_tables`' qual column and `pg_get_expr` over it;
-- pgoutput: evaluate the filter per change, with the UPDATE transformation, and the ALL TABLES / SCHEMA override;
-- `publish_via_partition_root` \(the root's filter\) and inheritance children.
+- **Grammar.** `TABLE [ONLY] t [*] [\(cols\)] WHERE \(expr\)` in CREATE PUBLICATION and ALTER PUBLICATION ADD / SET
+  \(gram.y OptWhereClause; the parentheses are required\). `ONLY` is now kept \(`TableOnly`\). A bare
+  `WITH \(publish_via_partition_root\)` option is def\_elem's NULL argument, which defGetBoolean reads as true.
+- **Storage.** `Publication.RowFilters` maps a member to its filter, held as the deparsed SQL text
+  \(`defaultExprToSQL`, the ruleutils\-style renderer CHECK constraints use\). The filter is validated by planning
+  `SELECT \(expr\)::bool FROM ONLY t`, so an unknown column or function fails the statement. It is journaled as
+  pg\_publication\_rel.prqual \(text, as goopg stores other pg\_node\_tree columns\) and reloaded at startup.
+  ALTER … SET re\-journals a member whose filter changed; DROP with a WHERE is PG's 42601.
+- **Inheritance.** `FOR TABLE parent` without ONLY adds every inheritance descendant with the same filter and
+  column list \(OpenTableList's recursion\). A partitioned table is not expanded: its partitions are published
+  through it.
+- **Catalog surface.** `catalog.PublicationRowFilter` is pg\_get\_publication\_tables' qual rule: no filter under FOR
+  ALL TABLES or when the publication also covers the table's schema. pg\_publication\_rel.prqual and
+  pg\_publication\_tables.rowfilter show the text. pg\_get\_publication\_tables applies filter\_partitions once any
+  listed publication publishes via its root, so a partition whose ancestor is listed is not synchronized twice.
+- **pgoutput.** `xlog.RowFilterFilter` / `PgOutput.applyRowFilter` is pgoutput\_row\_filter. The walsender's
+  `publicationFilter.RowFilter` is pgoutput\_row\_filter\_init:
+  - the filters of the subscribed publications that publish the change's action and cover the publish\-as
+    relation are OR'ed;
+  - one such publication with no filter cancels filtering for that action.
+
+  Outcomes:
+  - INSERT tests the new row, and DELETE the old \(replica\-identity\) row;
+  - an UPDATE without an old row tests the new row;
+  - an UPDATE with an old row becomes an INSERT \(only the new row matches\) or a DELETE \(only the old row
+    matches\), or is dropped when neither matches.
+
+  The filter runs before the Relation message, so a filtered\-out change sends nothing.
+- **Evaluation.** `executor.EvalPublicationRowFilter` binds the row's text values as typed literals in a VALUES
+  list and evaluates the OR of the quals. A virtual generated column is computed from its expression in an outer
+  select. A NULL result does not publish.
+
+Deviations \(ledgered\):
+
+- check\_simple\_rowfilter\_expr's restrictions and the replica\-identity check for UPDATE / DELETE
+  publications are not enforced.
+- The stored text omits PG's implicit casts \(`'x'` where PG prints `'x'::text`\).
+- Each evaluated row parses and plans the filter query.
+- The current catalog is used, not the historic snapshot.
+
+Tests: TestParsePublicationRowFilter, TestPublicationRowFilterDDL, TestEvalPublicationRowFilter.

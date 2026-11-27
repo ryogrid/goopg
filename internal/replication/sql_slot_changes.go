@@ -60,7 +60,7 @@ func (s *Handler) SQLSlotChanges(slotName string, peek bool, options []string, p
 	col := &sqlChangeCollector{}
 	pg := xlog.NewPgOutput(snap, col)
 	if pubNames := splitPublicationNames(opts["publication_names"]); len(pubNames) > 0 && s.cfg.PubSub != nil {
-		pg.SetFilter(newLivePublicationFilter(s.cfg.PubSub, pubNames, dbOidVar...))
+		pg.SetFilter(newLivePublicationFilter(s.cfg.PubSub, pubNames, dbOidVar...).withCatalog(im))
 	}
 	if v, ok := opts["messages"]; ok {
 		on, perr := parsePgoutputBool(v)

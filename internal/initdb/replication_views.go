@@ -492,18 +492,23 @@ func registerPublicationViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
 				relOID := lookupRelOID(cat, qname)
 				// prattrs is NULL without a column list; with one, the
 				// listed columns' attnums in table order (int2vector
-				// text). prqual stays NULL (no row filters). They were
+				// text). prqual is the row filter's text, NULL without
+				// one (M0149-0059c). They were
 				// "", which psql's \dRp+ (describe.c) reads as present
 				// and prints as `"public.t" () WHERE`.
 				prattrs := catalog.VirtualNull
 				if cols, ok := pub.Columns[qname]; ok {
 					prattrs = publicationAttnumsText(cat, qname, cols)
 				}
+				prqual := catalog.VirtualNull
+				if q, ok := pub.RowFilters[qname]; ok && q != "" {
+					prqual = q
+				}
 				out = append(out, []string{
 					"", // oid of the pg_publication_rel row itself
 					fmt.Sprintf("%d", pub.OID),
 					relOID,
-					catalog.VirtualNull, // prqual
+					prqual,
 					prattrs,
 				})
 			}
@@ -551,13 +556,13 @@ func registerPublicationViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
 					for _, leaf := range catalog.PublicationLeafTables(cat, t, pub.DBOid) {
 						if !listed[leaf.Schema+"."+leaf.Name] {
 							listed[leaf.Schema+"."+leaf.Name] = true
-							out = append(out, pubTableRow(pub.Name, leaf.Schema, leaf.Name))
+							out = append(out, pubTableRowFiltered(pub, leaf.Schema, leaf.Name))
 						}
 					}
 					continue
 				}
 				listed[schema+"."+name] = true
-				out = append(out, pubTableRow(pub.Name, schema, name))
+				out = append(out, pubTableRowFiltered(pub, schema, name))
 			}
 			// FOR TABLES IN SCHEMA members (pg_get_publication_tables).
 			for _, t := range catalog.PublicationSchemaTablesMode(cat, pub.Schemas, pub.DBOid, pub.PublishViaRoot) {
@@ -763,6 +768,17 @@ func pubTableRow(pubname, schema, table string) []string {
 		schema = "public"
 	}
 	return []string{pubname, schema, table, "", ""}
+}
+
+// pubTableRowFiltered is pubTableRow with the view's rowfilter column
+// (pg_get_expr(gpt.qual, gpt.relid)): the publication's row filter for the
+// table, empty without one. M0149-0059c.
+func pubTableRowFiltered(pub *catalog.Publication, schema, table string) []string {
+	row := pubTableRow(pub.Name, schema, table)
+	if q, ok := catalog.PublicationRowFilter(pub, row[1], table); ok {
+		row[4] = q
+	}
+	return row
 }
 
 func formatStringList(xs []string) string {

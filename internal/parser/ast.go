@@ -3028,6 +3028,14 @@ type CreatePublicationStmt struct {
 	// TableColumns is parallel to Tables: each table's publication column
 	// list (`FOR TABLE t (a, b)`, gram.y opt_column_list), nil when none.
 	TableColumns [][]string
+	// TableWhere is parallel to Tables: each table's row filter
+	// (`FOR TABLE t WHERE (expr)`, gram.y PublicationObjSpec's
+	// OptWhereClause), nil when none. M0149-0059c.
+	TableWhere []Expr
+	// TableOnly is parallel to Tables: true for `TABLE ONLY t`, which
+	// publishes t without its inheritance children (OpenTableList's
+	// recurse = false). M0149-0059c.
+	TableOnly []bool
 	// Schemas are the `TABLES IN SCHEMA s` items (gram.y PublicationObjSpec
 	// PUBLICATIONOBJ_TABLES_IN_SCHEMA), in order; CURRENT_SCHEMA is kept as
 	// PubCurrentSchema for the executor to resolve.
@@ -3088,6 +3096,11 @@ type AlterPublicationTablesStmt struct {
 	Name   string
 	Action string
 	Tables []ObjectName
+	// TableWhere is parallel to Tables: each table's row filter
+	// (`ADD | SET TABLE t WHERE (expr)`), nil when none. M0149-0059c.
+	TableWhere []Expr
+	// TableOnly is parallel to Tables: true for `TABLE ONLY t`.
+	TableOnly []bool
 	// Schemas are the `TABLES IN SCHEMA s` items (PubCurrentSchema for
 	// CURRENT_SCHEMA).
 	Schemas []string

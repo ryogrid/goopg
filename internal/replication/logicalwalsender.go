@@ -119,7 +119,7 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 	// snapshot, matching the v0 pre-filter behaviour. See
 	// docs/design/0008-0003-publication-subscription-ddl.md.
 	if pubNames := splitPublicationNames(args.Options["publication_names"]); len(pubNames) > 0 && s.cfg.PubSub != nil {
-		plugin.SetFilter(newLivePublicationFilter(s.cfg.PubSub, pubNames, dbOidVar...))
+		plugin.SetFilter(newLivePublicationFilter(s.cfg.PubSub, pubNames, dbOidVar...).withCatalog(im))
 	}
 
 	// pgoutput's "messages" option (parse_output_parameters,
@@ -522,6 +522,75 @@ type publicationFilter struct {
 	// publish_via_partition_root publications. M0149-0057d.
 	viaRootTables  map[string]bool
 	viaRootSchemas map[string]bool
+	// pubs are the subscribed publications, for the per-publication row
+	// filter rules (pgoutput_row_filter_init). M0149-0059c.
+	pubs []*catalog.Publication
+	// cat / dbOid evaluate the row filters (nil cat: filters are not
+	// applied).
+	cat   catalog.Catalog
+	dbOid uint32
+}
+
+// RowFilter implements xlog.RowFilterFilter (pgoutput_row_filter_init):
+// over the subscribed publications that publish rel (the publish-as
+// relation) and a change of kind, the filters are OR'ed; one such
+// publication without a filter for rel — or one that is FOR ALL TABLES or
+// publishes rel's schema — means no filter.
+func (f *publicationFilter) RowFilter(rel *xlog.RelationDef, kind xlog.ChangeKind) (xlog.RowFilterEval, bool) {
+	if rel == nil || f.cat == nil || len(f.pubs) == 0 {
+		return nil, false
+	}
+	q := relQualifiedName(rel)
+	var quals []string
+	for _, pub := range f.pubs {
+		flags := allowFlags{insert: pub.PublishInsert, update: pub.PublishUpdate, delete: pub.PublishDelete}
+		if !flags.allowsKind(kind) || !publicationCovers(pub, rel, q) {
+			continue
+		}
+		qual, ok := catalog.PublicationRowFilter(pub, rel.Schema, rel.Name)
+		if !ok {
+			return nil, false
+		}
+		quals = append(quals, qual)
+	}
+	if len(quals) == 0 {
+		return nil, false
+	}
+	cols := make([]executor.RowFilterColumn, len(rel.Columns))
+	for i, c := range rel.Columns {
+		cols[i] = executor.RowFilterColumn{Name: c.Name, Type: c.Type}
+	}
+	cat, dbOid, relOID := f.cat, f.dbOid, rel.OID
+	return func(values []*string) (bool, error) {
+		return executor.EvalPublicationRowFilter(cat, dbOid, relOID, cols, quals, values)
+	}, true
+}
+
+// publicationCovers reports whether pub publishes rel (qualified name q):
+// FOR ALL TABLES, a FOR TABLE member — rel itself or a partition ancestor —
+// or a FOR TABLES IN SCHEMA member covering rel's or an ancestor's schema.
+func publicationCovers(pub *catalog.Publication, rel *xlog.RelationDef, q string) bool {
+	if pub.AllTables {
+		return true
+	}
+	for _, t := range pub.Tables {
+		if t == q {
+			return true
+		}
+		for _, anc := range rel.AncestorNames {
+			if t == anc {
+				return true
+			}
+		}
+	}
+	for _, sch := range pub.Schemas {
+		for _, rs := range append([]string{rel.Schema}, rel.AncestorSchemas...) {
+			if strings.EqualFold(sch, rs) || (rs == "" && strings.EqualFold(sch, "public")) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // PublishAsAncestor is GetTopMostAncestorInPublication over the
@@ -732,6 +801,7 @@ func buildPublicationFilterMissing(ps *catalog.PubSub, names []string, missing f
 			}
 			continue
 		}
+		out.pubs = append(out.pubs, pub)
 		flags := allowFlags{
 			insert:   pub.PublishInsert,
 			update:   pub.PublishUpdate,
@@ -805,6 +875,19 @@ type livePublicationFilter struct {
 	gen    uint64
 	loaded bool
 	cur    *publicationFilter
+	// cat evaluates the publications' row filters (M0149-0059c).
+	cat catalog.Catalog
+}
+
+// withCatalog sets the catalog the row filters are evaluated against.
+func (f *livePublicationFilter) withCatalog(cat catalog.Catalog) *livePublicationFilter {
+	f.cat = cat
+	return f
+}
+
+// RowFilter implements xlog.RowFilterFilter.
+func (f *livePublicationFilter) RowFilter(rel *xlog.RelationDef, kind xlog.ChangeKind) (xlog.RowFilterEval, bool) {
+	return f.load().RowFilter(rel, kind)
 }
 
 func newLivePublicationFilter(ps *catalog.PubSub, names []string, dbOid ...uint32) *livePublicationFilter {
@@ -821,6 +904,10 @@ func (f *livePublicationFilter) load() *publicationFilter {
 				"detail", "The publication does not exist at this point in the WAL.",
 				"hint", "Create the publication if it does not exist.")
 		}, f.dbOid...)
+		f.cur.cat = f.cat
+		if len(f.dbOid) > 0 {
+			f.cur.dbOid = f.dbOid[0]
+		}
 	}
 	return f.cur
 }

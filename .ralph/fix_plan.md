@@ -17422,12 +17422,14 @@ verify each at HEAD when the task starts.
   - 2026\-11\-27 \(done\): Subscription.RunAsOwner \(CREATE, ALTER … SET, subrunasowner journal / reload / views\); applyTableAccess acts as the subscription owner under run\_as\_owner, else SET ROLE via catalog.MemberCanSetRole; dmlPrivilegePermittedAs gives the owner's implicit privileges to an INHERIT member \(roleHasPrivsOfOwner\); the RLS owner test uses HasPrivsOfRole. Test TestMemberCanSetRole.
   Movement: yes — tap 033 goopg-subscriber pairings fail -> pass
 
-- [ ] **M0149-0059 — port subscription/t/028_row_filter.pl**
+- [x] **M0149-0059 — port subscription/t/028_row_filter.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/028_row_filter.pl` — publication row filters.
   Likely prerequisites \(verify at start\): `PUBLICATION … WHERE` parse/validation, old/new tuple transformation on UPDATE, filtered initial COPY, `publish_via_partition_root`.
   - 2026\-11\-27: port written \(TestPort\_Subscription028RowFilter, gated by GOOPG\_TAP\_028\); the pg18\-publisher pairing passes after 0059a/b; the goopg\-publisher pairings stop at the first `CREATE PUBLICATION … WHERE` \(0059c\).
+  - 2026\-11\-27 \(done\): 0059c landed; TestPort\_Subscription028RowFilter is ungated and passes 3/3 in all three pairings; inventory 028 → port.
+  Movement: yes — tap 028 goopg-publisher pairings fail -> pass (3/3 x 3 pairings); 028 port
 - [x] **M0149-0059a — tablesync applies the publications' row filters**
   Kind: impl
   Parent: M0149-0059
@@ -17442,11 +17444,13 @@ verify each at HEAD when the task starts.
   - Path\-to\-TAP: 028 "check publish\_via\_partition\_root behavior" \(REFRESH copy into the partitioned root\) ← 0059b \(1 link\).
   - 2026\-11\-27 \(done\): CopyFromExecutor.storeRoutedRow routes each row \(routeToPartition, remapRowForPartition, leaf NOT NULL / CHECK / default\-partition / unique checks\) and writes the leaf; copyUsesMultiInsert declines the buffer for a partitioned target \(PG keeps per\-leaf buffers — page placement only\). Test TestCopyFromRoutesIntoPartitions.
   Movement: yes — tap 028 pg18-publisher "check publish_via_partition_root behavior" fail -> pass; COPY into partitioned table 0 rows -> routed
-- [ ] **M0149-0059c — publisher row filters \(`FOR TABLE t WHERE \(…\)`\)**
+- [x] **M0149-0059c — publisher row filters \(`FOR TABLE t WHERE \(…\)`\)**
   Kind: impl
   Parent: M0149-0059
   - 028 \(goopg publisher\): `CREATE PUBLICATION tap_pub_x FOR TABLE tab_rf_x WHERE (x > 10)` is a syntax error. Needs: grammar in CREATE / ALTER ADD / SET with PG's validation errors, prqual storage in pg\_publication\_rel, pg\_get\_publication\_tables' qual, pgoutput filter evaluation with the UPDATE old/new transformation, ignoring the filter under FOR ALL TABLES / TABLES IN SCHEMA, viaroot and inheritance\-child handling.
   - Path\-to\-TAP: 028 goopg\-publisher pairings ← 0059c \(1 link\).
+  - 2026\-11\-27 \(done\): parser `WHERE \(expr\)` \(CREATE, ALTER ADD / SET\), `TABLE ONLY` captured, bare `WITH \(opt\)` = true; Publication.RowFilters \(deparsed text, defaultExprToSQL\) validated by planning against the table, journaled in pg\_publication\_rel.prqual and reloaded; FOR TABLE parent recurses to inheritance children with the same filter; pg\_get\_publication\_tables qual \(catalog.PublicationRowFilter: none under ALL TABLES / the table's schema\) and filter\_partitions under viaroot; pg\_publication\_rel.prqual / pg\_publication\_tables.rowfilter; pgoutput applyRowFilter \(per\-action OR of the publications' filters, UPDATE → INSERT / DELETE transformation\) through executor.EvalPublicationRowFilter \(virtual generated columns computed\). Tests TestPublicationRowFilterDDL, TestEvalPublicationRowFilter, TestParsePublicationRowFilter.
+  Movement: yes — tap 028 goopg-publisher pairings fail -> pass
 - [ ] **M0149-0060 — port subscription/t/031_column_list.pl**
   Kind: impl
   Parent: none
