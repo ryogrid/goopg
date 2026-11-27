@@ -145,6 +145,22 @@ A restart lost every partitioned table:
 
 Test: TestPort\_PartitionedTableSurvivesRestart.
 
+## Landed — M0149\-0061m \(S2: pg\_subscription\_rel survives a restart\)
+
+The tablesync state lived only in the PubSub registry. After a subscriber restart pg\_subscription\_rel was empty,
+should\_apply\_changes\_for\_rel found no READY rel, and every incoming change was silently skipped.
+
+- PubSub now calls a journal hook, outside its lock, for each row added, advanced or dropped, and for DROP
+  SUBSCRIPTION.
+- The postmaster writes each change to the subscription database's pg\_subscription\_rel heap
+  \(`executor.JournalSubscriptionRel`\), in a transaction of its own.
+- `reloadSubscriptionRelsFromHeap` restores the rows at startup.
+
+PG instead updates the row inside the transaction that changes the state; goopg's registry is not transactional
+\(ledgered\).
+
+Test: TestSubscriptionRelHookJournalsEveryChange.
+
 ## Open
 
 - **0061c.** Subscriber AFTER ROW triggers must fire on the partitions that routed UPDATEs land in.

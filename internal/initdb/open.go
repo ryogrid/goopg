@@ -2706,6 +2706,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: pg_subscription reload: %w", err)
 	}
+	// M0149-0061m: the tablesync state, from each subscription database's
+	// pg_subscription_rel heap (written by the PubSub journal hook).
+	if err := reloadSubscriptionRelsFromHeap(mgr, pubsub, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_subscription_rel reload: %w", err)
+	}
 	if err := registerPublicationViews(cat, pubsub); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()

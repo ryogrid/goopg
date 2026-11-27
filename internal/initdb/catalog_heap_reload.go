@@ -4195,3 +4195,63 @@ func loadPartitionKeysFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 	}
 	return nil
 }
+
+// reloadSubscriptionRelsFromHeap restores the tablesync state machine
+// (PubSub subscription rels) from pg_subscription_rel (base/<db>/6102),
+// scanning each subscription database's heap once. Rows of a subscription
+// that no longer exists are ignored. M0149-0061m.
+func reloadSubscriptionRelsFromHeap(mgr *storage.Manager, pubsub *catalog.PubSub, clog *transam.CLog) error {
+	byOID := map[uint32]*catalog.Subscription{}
+	dbs := map[uint32]bool{}
+	for _, sub := range pubsub.Subscriptions() {
+		byOID[sub.OID] = sub
+		dbs[catalog.NamespaceDBOid(sub.DBOid)] = true
+	}
+	cols := executor.PGSubscriptionRelColumnsPG18()
+	for heapDBOid := range dbs {
+		rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 6102, Fork: storage.MainFork}
+		rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_subscription_rel",
+			func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+				natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+				decoded := make(executor.Row, len(cols))
+				if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+					return nil, false, derr
+				}
+				sr := catalog.SubscriptionRel{
+					SubID:  uint32(decoded[0].Int),
+					RelOID: uint32(decoded[1].Int),
+					State:  decoded[2].StringValue(),
+				}
+				if !decoded[3].IsNull() {
+					sr.LSN = parseTextLSN(decoded[3].StringValue())
+				}
+				return sr, false, nil
+			})
+		if err != nil {
+			return err
+		}
+		for _, r := range rows {
+			sr := r.(catalog.SubscriptionRel)
+			sub, ok := byOID[sr.SubID]
+			if !ok || catalog.NamespaceDBOid(sub.DBOid) != heapDBOid {
+				continue
+			}
+			pubsub.RestoreSubscriptionRel(sub.Name, sr)
+		}
+	}
+	return nil
+}
+
+// parseTextLSN parses pg_lsn's "X/Y" text form (0 on a malformed value).
+func parseTextLSN(s string) uint64 {
+	hi, lo, ok := strings.Cut(s, "/")
+	if !ok {
+		return 0
+	}
+	h, err1 := strconv.ParseUint(hi, 16, 32)
+	l, err2 := strconv.ParseUint(lo, 16, 32)
+	if err1 != nil || err2 != nil {
+		return 0
+	}
+	return h<<32 | l
+}

@@ -190,6 +190,12 @@ type PubSub struct {
 	// matches the way pg_subscription_rel is queried in
 	// practice (always filtered by srsubid).
 	subRels map[string]map[uint32]*SubscriptionRel
+
+	// subRelHook journals pg_subscription_rel changes (M0149-0061m): it
+	// is called — outside the registry lock — after every row is added,
+	// advanced or removed (sr.RelOID == 0 with deleted: every row of the
+	// subscription). nil (tests, recovery) journals nothing.
+	subRelHook func(sub Subscription, sr SubscriptionRel, deleted bool)
 	// nextOID is local to the registry. PubSub OIDs share the
 	// same numeric space upstream uses (anything ≥ FirstUserOID),
 	// but they don't collide with user-table OIDs because the
@@ -778,12 +784,23 @@ func (p *PubSub) SetSubscriptionPublications(name string, publications []string,
 // dbOid is variadic (mirrors LookupPublication); omitted defaults to
 // DefaultDBOid. M0119-0004 (DU-002 per-DB subscription scoping).
 func (p *PubSub) DropSubscription(name string, dbOid ...uint32) error {
+	var fire func()
+	defer func() {
+		if fire != nil {
+			fire()
+		}
+	}()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	oid := resolveDBOid(dbOid)
 	key := subMapKey(oid, name)
 	if _, ok := p.subscriptions[key]; !ok {
 		return ErrSubscriptionNotFound
+	}
+	if sub := p.subscriptions[key]; sub != nil {
+		if _, had := p.subRels[name]; had {
+			fire = p.subRelFire(*sub, SubscriptionRel{SubID: sub.OID}, true)
+		}
 	}
 	delete(p.subscriptions, key)
 	// subRels is still keyed by bare subName (not compound); the
@@ -953,6 +970,12 @@ var validSubRelTransitions = map[string]map[string]struct{}{
 // and ErrSubscriptionRelExists when the rel is already tracked.
 // See docs/design/0008-0004-apply-worker-and-tablesync.md.
 func (p *PubSub) AddSubscriptionRel(subName string, relOID uint32) (*SubscriptionRel, error) {
+	var fire func()
+	defer func() {
+		if fire != nil {
+			fire()
+		}
+	}()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	sub, ok := p.findSubByName(subName)
@@ -973,6 +996,7 @@ func (p *PubSub) AddSubscriptionRel(subName string, relOID uint32) (*Subscriptio
 	}
 	p.subRels[subName][relOID] = rel
 	out := *rel
+	fire = p.subRelFire(*sub, out, false)
 	return &out, nil
 }
 
@@ -983,14 +1007,24 @@ func (p *PubSub) AddSubscriptionRel(subName string, relOID uint32) (*Subscriptio
 // records the row removal only, the TRUNCATE half is ledgered).
 // Returns ErrSubscriptionRelNotFound when the row is absent.
 func (p *PubSub) DropSubscriptionRel(subName string, relOID uint32) error {
+	var fire func()
+	defer func() {
+		if fire != nil {
+			fire()
+		}
+	}()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	rels, ok := p.subRels[subName]
 	if !ok {
 		return ErrSubscriptionRelNotFound
 	}
-	if _, ok := rels[relOID]; !ok {
+	old, ok := rels[relOID]
+	if !ok {
 		return ErrSubscriptionRelNotFound
+	}
+	if sub, sok := p.findSubByName(subName); sok {
+		fire = p.subRelFire(*sub, *old, true)
 	}
 	delete(rels, relOID)
 	if len(rels) == 0 {
@@ -1010,6 +1044,12 @@ func (p *PubSub) AdvanceSubscriptionRel(subName string, relOID uint32, newState 
 	if _, ok := validSubRelStates[newState]; !ok {
 		return nil, ErrInvalidSubRelState
 	}
+	var fire func()
+	defer func() {
+		if fire != nil {
+			fire()
+		}
+	}()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	rels, ok := p.subRels[subName]
@@ -1032,7 +1072,38 @@ func (p *PubSub) AdvanceSubscriptionRel(subName string, relOID uint32, newState 
 		rel.LSN = newLSN
 	}
 	out := *rel
+	if sub, sok := p.findSubByName(subName); sok {
+		fire = p.subRelFire(*sub, out, false)
+	}
 	return &out, nil
+}
+
+// SetSubscriptionRelHook installs the pg_subscription_rel journal hook.
+func (p *PubSub) SetSubscriptionRelHook(fn func(sub Subscription, sr SubscriptionRel, deleted bool)) {
+	p.mu.Lock()
+	p.subRelHook = fn
+	p.mu.Unlock()
+}
+
+// subRelFire binds the hook call for after the lock is released.
+func (p *PubSub) subRelFire(sub Subscription, sr SubscriptionRel, deleted bool) func() {
+	hook := p.subRelHook
+	if hook == nil {
+		return nil
+	}
+	return func() { hook(sub, sr, deleted) }
+}
+
+// RestoreSubscriptionRel re-registers a journaled pg_subscription_rel row
+// at startup (no hook call). M0149-0061m.
+func (p *PubSub) RestoreSubscriptionRel(subName string, sr SubscriptionRel) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.subRels[subName] == nil {
+		p.subRels[subName] = map[uint32]*SubscriptionRel{}
+	}
+	cp := sr
+	p.subRels[subName][sr.RelOID] = &cp
 }
 
 // LookupSubscriptionRel returns a deep copy of one tablesync

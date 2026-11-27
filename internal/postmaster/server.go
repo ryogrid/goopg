@@ -551,6 +551,9 @@ func New(cfg Config) *Server {
 	// wired (PubSub + storage handles). Server.Run starts it so its
 	// lifetime matches the listener's. M0103-0002.
 	if cfg.PubSub != nil && cfg.hasStorage() {
+		// pg_subscription_rel durability (M0149-0061m): every tablesync
+		// state change is journaled to the subscription database's heap.
+		cfg.PubSub.SetSubscriptionRelHook(s.journalSubscriptionRel)
 		s.applyLauncher = replication.NewApplyLauncher(replication.ApplyLauncherConfig{
 			PubSub:  cfg.PubSub,
 			Catalog: cfg.Catalog,

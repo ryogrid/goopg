@@ -17518,6 +17518,13 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: M0149-0061
   - After 0061k all three pairings reach 629; the goopg publisher pairings then stall at 686. Path\-to\-TAP: 013 ← 0061l \(1 link\); not yet diagnosed. Supersedes 0061i.
+  - Finding \(goopg subscriber\): after the restart pg\_subscription\_rel was EMPTY — the tablesync state lived only in the PubSub registry, so after any subscriber restart should\_apply\_changes\_for\_rel found no READY rel and every change was silently skipped. Filed and fixed as 0061m.
+- [x] **M0149-0061m — pg\_subscription\_rel survives a restart \(S2: replication silently stops after a subscriber restart\)**
+  Kind: impl
+  Parent: M0149-0061
+  - Path\-to\-TAP: 013 "updating a row that was modified by a different origin" \(goopg subscriber, after the restart\) ← 0061m \(1 link\).
+  - 2026\-11\-27 \(done\): PubSub subscription\-rel journal hook \(add / advance / drop / DROP SUBSCRIPTION, fired outside the lock\); the postmaster journals each change to the subscription database's pg\_subscription\_rel heap \(executor.JournalSubscriptionRel, own transaction\); reloadSubscriptionRelsFromHeap restores the rows at startup \(RestoreSubscriptionRel\). Test TestSubscriptionRelHookJournalsEveryChange.
+  Movement: yes — tap 013 goopg-subscriber pairings: post-restart origin_differs check fail -> pass (pg18-publisher pairing now fails only at 243)
 - [ ] **M0149-0061i — 013 "updating a row that was modified by a different origin" and the later sub2 catch\-up \(goopg publisher → PG subscriber, lines 629 / 686\)**
   Kind: impl
   Parent: M0149-0061

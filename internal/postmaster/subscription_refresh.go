@@ -397,3 +397,43 @@ func tableSyncErrorMessage(err error) string {
 	}
 	return err.Error()
 }
+
+// journalSubscriptionRel is the PubSub subscription-rel hook: it writes the
+// change to pg_subscription_rel in a transaction of its own, in the
+// subscription's database (executor.JournalSubscriptionRel). PG updates the
+// row inside the transaction that changes the state (the tablesync worker's,
+// the apply worker's); goopg's registry is not transactional, so the row is
+// journaled as soon as the state changes. M0149-0061m.
+func (s *Server) journalSubscriptionRel(sub catalog.Subscription, sr catalog.SubscriptionRel, deleted bool) {
+	if s.cfg.TxnMgr == nil || s.cfg.Pool == nil {
+		return
+	}
+	tx, err := s.cfg.TxnMgr.Begin(transam.IsolationReadCommitted)
+	if err != nil {
+		return
+	}
+	snap, err := s.cfg.TxnMgr.SnapshotFor(tx)
+	if err != nil {
+		_ = s.cfg.TxnMgr.Rollback(tx)
+		return
+	}
+	ectx := executor.NewContext()
+	ectx.Pool = s.cfg.Pool
+	ectx.Catalog = s.cfg.Catalog
+	ectx.TxnMgr = s.cfg.TxnMgr
+	ectx.MultiXact = s.cfg.MultiXact
+	ectx.FSM = s.cfg.FSM
+	ectx.VM = s.cfg.VM
+	ectx.WAL = s.cfg.WAL
+	ectx.Tx = tx
+	ectx.Snap = snap
+	ectx.CurrentDatabaseOid = sub.DBOid
+	if err := executor.JournalSubscriptionRel(ectx, sr, deleted); err != nil {
+		_ = s.cfg.TxnMgr.Rollback(ectx.Tx)
+		s.cfg.Logger.Warn("pg_subscription_rel journal failed", "subscription", sub.Name, "rel_oid", sr.RelOID, "err", err)
+		return
+	}
+	if err := ectx.CommitTransaction(ectx.Tx); err != nil {
+		s.cfg.Logger.Warn("pg_subscription_rel journal commit failed", "subscription", sub.Name, "err", err)
+	}
+}
