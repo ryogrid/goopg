@@ -54,13 +54,34 @@ This mirrors ReorderBufferCheckMemoryLimit and ReorderBufferStreamTXN.
 Tests: TestDecoderStreamsLargeTransactions, TestPgOutputStreamMessages, TestPgoutputByteaTextIsHex,
 TestCopyBinaryByteaIsBytes.
 
+## Landed — M0149\-0063b \(the goopg subscriber applies streamed transactions\)
+
+- `pg_subscription.substream` is stored: `Subscription.Streaming`, with CREATE SUBSCRIPTION's default `p` \(PG 18\),
+  ALTER ... SET \(streaming\), the heap row, the restart reload and both virtual\-view builders.
+  - Both builders also hard\-coded `suborigin`; it now shows the stored value too \(0062a's missed sibling\).
+  - The launcher restarts a worker whose streaming mode changed.
+- The receiver asks for streaming as libpqrcv\_startstreaming does: `"streaming" 'on'` at proto\_version 2, or
+  `'parallel'` at 4.
+  - It reads with `xlog.DecodeMessageInStream`, which parses `S` / `E` / `c` / `A` and takes the xid off change
+    messages inside a segment.
+  - `S` and `E` track whether a segment is open. A reconnect forgets partial streams, and the publisher sends them
+    again from their first segment.
+- The apply worker spools the change messages of a segment, with the xid removed, under the stream's xid
+  \(handle\_streamed\_transaction → stream\_write\_change; PG writes a file, goopg keeps them in memory\).
+  - At stream commit it replays them in one transaction \(apply\_spooled\_messages\), and end\_lsn is the
+    applied position.
+  - A stream abort drops the spool: the whole of it for the top\-level xid, or a subtransaction's changes from its
+    first one on.
+  - Transactions sent between segments apply as usual.
+
+Every goopg subscription now asks for streaming by default, as PG 18's do. A PG 18 publisher with
+`logical_decoding_work_mem = 64kB` streams a 5000\-row transaction to a goopg subscriber
+\(`pg_stat_replication_slots.stream_txns = 1`\), and the rows match.
+
+Test: TestApplyWorkerAppliesStreamedTransactions.
+
 ## Open
 
-- **0063b.** The goopg subscriber applies streams \(streaming = on\):
-  - send `streaming 'on'` with proto\_version 2;
-  - decode `'S'`, `'E'`, `'c'` and `'A'` and the xid\-prefixed changes;
-  - buffer each streamed transaction and apply it at its stream commit;
-  - discard it at its stream abort.
 - **0063c.** Parallel apply \(streaming = parallel\):
   - a parallel apply worker per streamed transaction;
   - the DEBUG lines 015 waits for \("finished processing the STREAM COMMIT command", "applied N changes in the

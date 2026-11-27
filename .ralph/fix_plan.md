@@ -17583,10 +17583,12 @@ verify each at HEAD when the task starts.
   - Path\-to\-TAP: 015 goopg\-publisher pairing ← walsender streaming \(stream messages, streaming option, logical\_decoding\_work\_mem\) \(1 link\); 015 every pairing ← bytea text cell is raw bytes \(publisher\) / binary bytea read as text \(subscriber\) \(1 link\).
   - 2026\-11\-28 \(done\): reorder\-buffer size accounting \+ Decoder.SetStreaming / checkMemoryLimit / commitStreamed / ApplyAbortAt \(xlog stream.go\); pgoutput stream messages \+ xid prefix \+ per\-txn relation sets \(pgoutput\_stream.go\); walsender streaming option \+ proto checks; GUCs logical\_decoding\_work\_mem / debug\_logical\_replication\_streaming registered; bytea text = byteaout hex; copyBinaryToDatum bytea arm. Tests TestDecoderStreamsLargeTransactions, TestPgOutputStreamMessages, TestPgoutputByteaTextIsHex, TestCopyBinaryByteaIsBytes. Design doc 0149\-0063.
   Movement: yes — tap 015 goopg-publisher-pg18-subscriber: timeout at 227 → PASS; goopg-subscriber pairings 227 → 251
-- [ ] **M0149-0063b — goopg subscriber applies streamed transactions \(streaming = on\)**
+- [x] **M0149-0063b — goopg subscriber applies streamed transactions \(streaming = on\)**
   Kind: impl
   Parent: M0149-0063
   - Path\-to\-TAP: 015 goopg\-subscriber pairings ← receiver requests streaming \+ apply decodes S/E/c/A and xid\-prefixed changes \(1 link\). Buffer per xid, apply at stream commit, discard at stream abort.
+  - 2026\-11\-28 \(done\): Subscription.Streaming \(substream; CREATE default p, ALTER, heap row, reload, both virtual\-view builders — suborigin fixed there too\); receiver sends streaming at proto 2/4 and decodes with xlog.DecodeMessageInStream; apply worker spools segment changes per xid and replays at stream commit, discards at stream abort \(applyworker\_stream.go\). Verified live: PG 18 publisher at 64kB streams a 5000\-row txn \(stream\_txns=1\), rows match. Test TestApplyWorkerAppliesStreamedTransactions.
+  Movement: yes — tap 015 goopg-subscriber pairings: streaming = on data checks now exercised by real streams (still stop at 251, the parallel DEBUG lines of 0063c)
 - [ ] **M0149-0063c — parallel apply \(streaming = parallel\) with PG's DEBUG lines and deadlock detection**
   Kind: impl
   Parent: M0149-0063

@@ -58,6 +58,20 @@ type DecodedMessage struct {
 	TruncateRels   []uint32
 	TruncateOption byte
 
+	// Stream fields (DecodeMessageInStream; M0149-0063b). XID carries the
+	// stream's xid for 'S' / 'c' / 'A' and the (sub)transaction xid of a
+	// change message inside a stream; FirstSegment is 'S''s first_segment;
+	// SubXID, AbortLSN and AbortTime are 'A''s (the last two only under
+	// streaming = parallel).
+	FirstSegment bool
+	SubXID       storage.TransactionID
+	AbortLSN     uint64
+	AbortTime    uint64
+	// Raw, for a change message read inside a stream, is the message
+	// without its xid — what a subscriber spools until the stream commits
+	// (handle_streamed_transaction → stream_write_change).
+	Raw []byte
+
 	// Message fields — populated for kind == 'M'. MessageTransactional is
 	// bit zero of the protocol flags byte. MessageLSN is independent of a
 	// transaction's commit LSN: non-transactional messages are delivered at
@@ -465,4 +479,111 @@ func (r *reader) cstring() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("%w: unterminated C string at offset %d", ErrTruncatedMessage, r.off)
+}
+
+// Stream message kinds (logicalrep_write_stream_*).
+const (
+	pgoStreamStartKind  = 'S'
+	pgoStreamStopKind   = 'E'
+	pgoStreamCommitKind = 'c'
+	pgoStreamAbortKind  = 'A'
+)
+
+// IsStreamedChangeKind reports whether a message kind carries an xid after
+// its kind byte when sent inside a stream segment (logicalrep_write_insert
+// and its siblings with a valid xid).
+func IsStreamedChangeKind(kind byte) bool {
+	switch kind {
+	case pgoRelation, pgoType, pgoInsert, pgoUpdate, pgoDelete, pgoTruncate, pgoMessage:
+		return true
+	}
+	return false
+}
+
+// DecodeMessageInStream is DecodeMessage for a stream-capable (protocol
+// >= 2) subscription: it parses the stream messages — 'S' xid
+// first_segment, 'E', 'c' xid flags commit_lsn end_lsn commit_time, 'A' xid
+// subxid [abort_lsn abort_time when abortInfo] — and, when inStream, reads
+// the xid a change message carries after its kind byte into XID before
+// decoding the rest as usual (logicalrep_read_stream_*). M0149-0063b.
+func DecodeMessageInStream(payload []byte, inStream, abortInfo bool) (*DecodedMessage, error) {
+	if len(payload) < 1 {
+		return nil, fmt.Errorf("%w: empty payload", ErrTruncatedMessage)
+	}
+	kind := payload[0]
+	r := &reader{buf: payload[1:]}
+	out := &DecodedMessage{Kind: kind}
+	switch kind {
+	case pgoStreamStartKind:
+		xid, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		first, err := r.u8()
+		if err != nil {
+			return nil, err
+		}
+		out.XID, out.FirstSegment = storage.TransactionID(xid), first == 1
+		return out, nil
+	case pgoStreamStopKind:
+		return out, nil
+	case pgoStreamCommitKind:
+		xid, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := r.u8(); err != nil { // flags
+			return nil, err
+		}
+		commitLSN, err := r.u64()
+		if err != nil {
+			return nil, err
+		}
+		endLSN, err := r.u64()
+		if err != nil {
+			return nil, err
+		}
+		ts, err := r.u64()
+		if err != nil {
+			return nil, err
+		}
+		out.XID, out.CommitLSN, out.EndLSN, out.CommitTime = storage.TransactionID(xid), commitLSN, endLSN, ts
+		return out, nil
+	case pgoStreamAbortKind:
+		xid, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		subxid, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		out.XID, out.SubXID = storage.TransactionID(xid), storage.TransactionID(subxid)
+		if abortInfo {
+			if out.AbortLSN, err = r.u64(); err != nil {
+				return nil, err
+			}
+			if out.AbortTime, err = r.u64(); err != nil {
+				return nil, err
+			}
+		}
+		return out, nil
+	}
+	if inStream && IsStreamedChangeKind(kind) {
+		if len(payload) < 5 {
+			return nil, fmt.Errorf("%w: streamed %q without xid", ErrTruncatedMessage, kind)
+		}
+		xid := binary.BigEndian.Uint32(payload[1:5])
+		inner := make([]byte, 0, len(payload)-4)
+		inner = append(inner, kind)
+		inner = append(inner, payload[5:]...)
+		m, err := DecodeMessage(inner)
+		if err != nil {
+			return nil, err
+		}
+		m.XID = storage.TransactionID(xid)
+		m.Raw = inner
+		return m, nil
+	}
+	return DecodeMessage(payload)
 }

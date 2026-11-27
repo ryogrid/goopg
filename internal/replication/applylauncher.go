@@ -81,6 +81,8 @@ type launchedWorker struct {
 	// origin is the suborigin the worker started with; an ALTER
 	// SUBSCRIPTION ... SET (origin) restarts it. M0149-0062a.
 	origin string
+	// streaming is the substream the worker started with. M0149-0063b.
+	streaming string
 }
 
 // NewApplyLauncher wires the launcher to the runtime's catalog +
@@ -239,7 +241,7 @@ func (l *ApplyLauncher) reconcile(ctx context.Context) {
 
 	l.mu.Lock()
 	for name, w := range l.workers {
-		if sub, ok := enabled[name]; !ok || sub.Binary != w.binary || sub.Origin != w.origin {
+		if sub, ok := enabled[name]; !ok || sub.Binary != w.binary || sub.Origin != w.origin || sub.Streaming != w.streaming {
 			toStop = append(toStop, w)
 			delete(l.workers, name)
 		}
@@ -249,7 +251,7 @@ func (l *ApplyLauncher) reconcile(ctx context.Context) {
 			continue
 		}
 		workerCtx, cancel := context.WithCancel(ctx)
-		lw := &launchedWorker{ctx: workerCtx, cancel: cancel, done: make(chan struct{}), binary: sub.Binary, origin: sub.Origin}
+		lw := &launchedWorker{ctx: workerCtx, cancel: cancel, done: make(chan struct{}), binary: sub.Binary, origin: sub.Origin, streaming: sub.Streaming}
 		l.workers[name] = lw
 		toStart = append(toStart, sub)
 	}
@@ -359,6 +361,7 @@ func DefaultLaunchApplyWorker(ctx context.Context, cfg ApplyLauncherConfig, sub 
 		Publications:    sub.Publications,
 		Binary:          sub.Binary,
 		Origin:          sub.Origin,
+		Streaming:       sub.StreamingMode(),
 		StartLSN:        startLSN,
 		Apply:           apply,
 	})

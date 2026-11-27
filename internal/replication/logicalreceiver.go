@@ -84,6 +84,11 @@ type LogicalReceiverConfig struct {
 	// Origin is the subscription's origin ("none", or "" for "any"),
 	// sent as libpqrcv_startstreaming's "origin" option. M0149-0062a.
 	Origin string
+	// Streaming is the subscription's streaming mode ("off", "on",
+	// "parallel"): anything but off asks the publisher to stream large
+	// in-progress transactions, at proto_version 2 (4 for parallel), as
+	// libpqrcv_startstreaming / ApplyWorkerMain do. M0149-0063b.
+	Streaming string
 
 	// StartLSN is the resume position. 0 maps to the slot's
 	// current `confirmed_flush_lsn`.
@@ -134,6 +139,11 @@ type LogicalReceiverConfig struct {
 // worker's last successfully committed LSN so no row is replayed
 // twice.
 type LogicalReceiver struct {
+	// inStream is true between a STREAM START and its STREAM STOP: change
+	// messages then carry an xid (M0149-0063b). Touched only by the receive
+	// loop.
+	inStream bool
+
 	cfg LogicalReceiverConfig
 
 	// applyLSN is updated atomically by the apply pipeline on
@@ -674,7 +684,27 @@ func (r *LogicalReceiver) startStreaming() error {
 	if start == 0 {
 		start = r.cfg.StartLSN
 	}
-	cmd := buildStartLogicalReplicationCommand(r.cfg.SlotName, start, r.cfg.ProtoVersion, r.cfg.Publications)
+	proto := r.cfg.ProtoVersion
+	switch r.cfg.Streaming {
+	case "on":
+		if proto < 2 {
+			proto = 2 // LOGICALREP_PROTO_STREAM_VERSION_NUM
+		}
+	case "parallel":
+		if proto < 4 {
+			proto = 4 // LOGICALREP_PROTO_STREAM_PARALLEL_VERSION_NUM
+		}
+	}
+	// A reconnect receives every partly streamed transaction again from
+	// its first segment.
+	r.inStream = false
+	if r.cfg.Apply != nil {
+		r.cfg.Apply.ResetStreams()
+	}
+	cmd := buildStartLogicalReplicationCommand(r.cfg.SlotName, start, proto, r.cfg.Publications)
+	if r.cfg.Streaming == "on" || r.cfg.Streaming == "parallel" {
+		cmd = strings.TrimSuffix(cmd, ")") + ", \"streaming\" '" + r.cfg.Streaming + "')"
+	}
 	if r.cfg.Binary {
 		cmd = strings.TrimSuffix(cmd, ")") + ", \"binary\" 'true')"
 	}
@@ -886,9 +916,18 @@ func (r *LogicalReceiver) handleCopyData(payload []byte) error {
 		// Each 'w' payload carries one pgoutput message in
 		// logical mode. Hand the bytes to the decoder, then
 		// dispatch through the apply worker.
-		decoded, err := xlog.DecodeMessage(m.WALBytes)
+		// Stream segments (protocol >= 2): inside one, change messages carry
+		// their xid after the kind byte; stream aborts carry abort_lsn /
+		// abort_time under streaming = parallel. M0149-0063b.
+		decoded, err := xlog.DecodeMessageInStream(m.WALBytes, r.inStream, r.cfg.Streaming == "parallel")
 		if err != nil {
 			return fmt.Errorf("logicalreceiver: pgoutput decode: %w", err)
+		}
+		switch decoded.Kind {
+		case 'S':
+			r.inStream = true
+		case 'E':
+			r.inStream = false
 		}
 		switch decoded.Kind {
 		case 'B':

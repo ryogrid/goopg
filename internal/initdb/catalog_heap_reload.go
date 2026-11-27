@@ -1804,6 +1804,7 @@ func reloadSubscriptionsFromHeap(mgr *storage.Manager, pubsub *catalog.PubSub, c
 				SlotName:     decoded[14].StringValue(),
 				Publications: executor.ParseTextArrayLiteral(decoded[16].StringValue()),
 				Origin:       reloadSubOrigin(decoded),
+				Streaming:    decoded[7].StringValue(),
 			}, false, nil
 		})
 	if err != nil {

@@ -630,12 +630,12 @@ func registerSubscriptionViews(cat *catalog.InMemory, ps *catalog.PubSub) error 
 				fmt.Sprintf("%d", sub.Owner), // subowner
 				boolText(sub.Enabled),
 				boolText(sub.Binary), // subbinary
-				"f",   // substream
+				subStreamText(sub.Streaming), // substream (M0149-0063b)
 				"d",   // subtwophasestate disabled
 				"f",   // subdisableonerr
 				"t",   // subpasswordrequired (upstream default)
 				ro,    // subrunasowner
-				"any", // suborigin (LOGICALREP_ORIGIN_ANY upstream default)
+				subOriginText(sub.Origin),    // suborigin (M0149-0062a)
 				"f",   // subfailover (upstream default)
 				sub.Conninfo,
 				sub.SlotName,
@@ -840,4 +840,22 @@ func formatTime(t time.Time) string {
 		return ""
 	}
 	return t.UTC().Format("2006-01-02 15:04:05.000-07")
+}
+
+// subStreamText is pg_subscription.substream for a registry subscription:
+// "f" when unset. M0149-0063b.
+func subStreamText(mode string) string {
+	if mode == "" {
+		return "f"
+	}
+	return mode
+}
+
+// subOriginText is pg_subscription.suborigin: "any" (LOGICALREP_ORIGIN_ANY)
+// when unset. M0149-0062a.
+func subOriginText(origin string) string {
+	if origin == "" {
+		return "any"
+	}
+	return origin
 }

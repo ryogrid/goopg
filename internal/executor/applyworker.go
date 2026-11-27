@@ -44,6 +44,13 @@ import (
 // per active subscription; not goroutine-safe. The streaming
 // driver feeds it `*wal.DecodedMessage` events one at a time.
 type ApplyWorker struct {
+	// Streamed transactions (applyworker_stream.go, M0149-0063b): inside a
+	// stream segment changes are spooled under streamXid until the stream
+	// commits.
+	inStream  bool
+	streamXid storage.TransactionID
+	streams   map[storage.TransactionID][]spooledChange
+
 	cat    catalog.Catalog
 	pool   *storage.Pool
 	txnMgr *transam.Manager
@@ -205,7 +212,19 @@ func (w *ApplyWorker) ApplyMessage(m *xlog.DecodedMessage) (uint64, error) {
 		commitLSN uint64
 		err       error
 	)
+	if w.inStream && xlog.IsStreamedChangeKind(m.Kind) {
+		// handle_streamed_transaction: a change inside a stream segment
+		// is spooled until the stream commits. M0149-0063b.
+		return 0, w.spoolStreamChange(m)
+	}
 	switch m.Kind {
+	case 'S', 'E', 'A':
+		err = w.applyStreamControl(m)
+	case 'c':
+		// apply_handle_stream_commit: the spooled changes replay as one
+		// transaction; end_lsn is the applied position. M0149-0063b.
+		commitLSN = m.EndLSN
+		err = w.applyStreamCommit(m)
 	case 'B':
 		err = w.applyBegin(m)
 	case 'R':
@@ -1224,6 +1243,7 @@ func parsePgoutputText(t catalog.Type, data []byte) (Datum, error) {
 // Driver code calls this from a defer so a Run loop that errors
 // out doesn't leak an open xid.
 func (w *ApplyWorker) SafeRollback() {
+	w.ResetStreams()
 	if w.inXact {
 		_ = w.txnMgr.Rollback(w.currentTx)
 		w.inXact = false

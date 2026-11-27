@@ -62,6 +62,10 @@ func buildPGSubscriptionRow(sub *catalog.Subscription) Row {
 		slot = NewStringDatum(sub.SlotName)
 	}
 	runAs := NewBoolDatum(sub.RunAsOwner)
+	stream := logicalRepStreamOff
+	if sub.Streaming != "" {
+		stream = sub.Streaming
+	}
 	origin := "any" // LOGICALREP_ORIGIN_ANY
 	if sub.Origin != "" {
 		origin = sub.Origin
@@ -74,7 +78,7 @@ func buildPGSubscriptionRow(sub *catalog.Subscription) Row {
 		NewIntDatum(int64(owner)),     // subowner
 		NewBoolDatum(sub.Enabled),     // subenabled
 		NewBoolDatum(sub.Binary),      // subbinary
-		NewStringDatum("f"),           // substream — LOGICALREP_STREAM_OFF
+		NewStringDatum(stream),        // substream
 		NewStringDatum("d"),           // subtwophasestate — LOGICALREP_TWOPHASE_STATE_DISABLED
 		NewBoolDatum(false),           // subdisableonerr
 		NewBoolDatum(true),            // subpasswordrequired

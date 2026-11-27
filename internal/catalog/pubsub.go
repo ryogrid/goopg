@@ -109,6 +109,11 @@ type Subscription struct {
 	// — ask the publisher only for changes with no replication origin) or
 	// "" for the default "any". M0149-0062a.
 	Origin string
+	// Streaming is pg_subscription.substream: "f" (off), "t" (on) or "p"
+	// (parallel, CREATE SUBSCRIPTION's default); "" reads as "f" (a
+	// subscription restored from a heap row written before the field
+	// existed). M0149-0063b.
+	Streaming string
 	// SlotName is pg_subscription.subslotname: "" is NULL, i.e.
 	// slot_name = NONE (no publisher-side slot — DROP SUBSCRIPTION then
 	// skips ReplicationSlotDropAtPubNode). The subscription-name default
@@ -730,6 +735,32 @@ func (p *PubSub) SetSubscriptionRunAsOwner(name string, on bool, dbOid ...uint32
 	}
 	sub.RunAsOwner = on
 	return nil
+}
+
+// SetSubscriptionStreaming sets pg_subscription.substream ("f", "t" or
+// "p"). Returns ErrSubscriptionNotFound when the subscription does not
+// exist. M0149-0063b.
+func (p *PubSub) SetSubscriptionStreaming(name, mode string, dbOid ...uint32) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	sub, ok := p.subscriptions[subMapKey(resolveDBOid(dbOid), name)]
+	if !ok {
+		return ErrSubscriptionNotFound
+	}
+	sub.Streaming = mode
+	return nil
+}
+
+// StreamingMode is substream as the walreceiver option names it: "off",
+// "on" or "parallel".
+func (s *Subscription) StreamingMode() string {
+	switch s.Streaming {
+	case "t":
+		return "on"
+	case "p":
+		return "parallel"
+	}
+	return "off"
 }
 
 // SetSubscriptionOrigin sets pg_subscription.suborigin ("none" or "any";

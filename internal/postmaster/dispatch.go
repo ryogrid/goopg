@@ -3624,12 +3624,12 @@ func subscriptionRowsForDBOid(ps *catalog.PubSub, dbOid uint32) [][]string {
 			fmt.Sprintf("%d", sub.Owner), // subowner
 			boolToText(sub.Enabled),
 			boolToText(sub.Binary), // subbinary
-			"f",   // substream
+			subStreamText(sub.Streaming), // substream (M0149-0063b)
 			"d",   // subtwophasestate disabled
 			"f",   // subdisableonerr
 			"t",   // subpasswordrequired (upstream default)
 			ro,    // subrunasowner
-			"any", // suborigin (LOGICALREP_ORIGIN_ANY upstream default)
+			subOriginText(sub.Origin),    // suborigin (M0149-0062a)
 			"f",   // subfailover (upstream default)
 			sub.Conninfo,
 			sub.SlotName,
@@ -5033,4 +5033,22 @@ func executorNoticeFrames(ctx *executor.Context) [][]libpq.ErrorField {
 		out = append(out, fields)
 	}
 	return out
+}
+
+// subStreamText is pg_subscription.substream for a registry subscription:
+// "f" when unset. M0149-0063b.
+func subStreamText(mode string) string {
+	if mode == "" {
+		return "f"
+	}
+	return mode
+}
+
+// subOriginText is pg_subscription.suborigin: "any" (LOGICALREP_ORIGIN_ANY)
+// when unset. M0149-0062a.
+func subOriginText(origin string) string {
+	if origin == "" {
+		return "any"
+	}
+	return origin
 }

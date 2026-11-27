@@ -1545,6 +1545,10 @@ func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
 			sub.Binary = true
 		}
 	}
+	// substream (WITH (streaming = ...), default parallel). M0149-0063b.
+	if serr := o.ctx.PubSub.SetSubscriptionStreaming(s.Name, opts.streaming, subDBOid); serr == nil {
+		sub.Streaming = opts.streaming
+	}
 	if opts.origin == logicalRepOriginNone {
 		// WITH (origin = none): suborigin. M0149-0062a.
 		if oerr := o.ctx.PubSub.SetSubscriptionOrigin(s.Name, opts.origin, subDBOid); oerr == nil {
@@ -2223,6 +2227,23 @@ func (o *ddlOp) execAlterSubscriptionSet(s *parser.AlterSubscriptionSetStmt) err
 			return berr
 		}
 		if serr := o.ctx.PubSub.SetSubscriptionRunAsOwner(s.Name, b, subDBOid); serr != nil {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
+		}
+		if cur, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); ok {
+			if herr := syncSubscriptionRow(o.ctx, cur.OID, cur); herr != nil {
+				return fmt.Errorf("pg_subscription heap write: %w", herr)
+			}
+		}
+	}
+	if v, ok := s.Options["streaming"]; ok {
+		// substream (AlterSubscription's SUBOPT_STREAMING): the apply
+		// worker restarts and asks the publisher with the new mode.
+		// M0149-0063b.
+		mode, merr := defGetStreamingMode("streaming", v, s.Pos())
+		if merr != nil {
+			return merr
+		}
+		if serr := o.ctx.PubSub.SetSubscriptionStreaming(s.Name, mode, subDBOid); serr != nil {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
 		}
 		if cur, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); ok {
