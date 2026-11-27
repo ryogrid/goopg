@@ -17529,10 +17529,12 @@ verify each at HEAD when the task starts.
   Kind: impl
   Parent: M0149-0061
   - Path\-to\-TAP: 013 goopg\-publisher pairings ← 0061i \(1 link\); not yet diagnosed \(origin / track\_commit\_timestamp conflict detection\).
-- [ ] **M0149-0061c — apply fires the subscriber partition's AFTER ROW triggers for routed UPDATEs**
+- [x] **M0149-0061c — apply fires the subscriber partition's AFTER ROW triggers for routed UPDATEs**
   Kind: impl
   Parent: M0149-0061
   - 013 \(goopg subscriber\): "check replica update after trigger applied on subscriber" — sub1's tab1\_2\_2 ENABLE ALWAYS AFTER trigger records nothing for UPDATEs routed into it \(apply\_handle\_tuple\_routing\). Path\-to\-TAP: 013 ← 0061c \(1 link\).
+  - 2026\-11\-27 \(done\): applyworker\_partition.go fires the leaf's row triggers — same\-leaf UPDATE fires UPDATE \(updated columns remapped to the leaf\), a cross\-partition move fires DELETE on the old leaf \+ INSERT on the new, routed DELETE fires DELETE \(applyLeafDelete\). Test TestApplyWorkerFiresLeafPartitionTriggers \(fails on HEAD\). 013 pg18\-pub → goopg\-sub pairing now PASSES end to end; the goopg\-publisher pairings still fail at 629 \(0061l\).
+  - Movement: TestPort\_Subscription013Partition pairings passing 0/3 → 1/3 \(pg18\-publisher\-goopg\-subscriber PASS\).
 - [x] **M0149-0061d — replicated TRUNCATE of a partitioned table truncates its sub\-partitions**
   Kind: impl
   Parent: M0149-0061

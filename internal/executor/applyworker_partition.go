@@ -14,8 +14,10 @@ package executor
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // applyRouteLeaf is ExecFindPartition for the apply worker: the leaf of
@@ -55,7 +57,32 @@ func (w *ApplyWorker) applyDeletePartitioned(ctx *Context, r *applyRel, keyRow R
 		return nil
 	}
 	w.checkOriginDiffers(ctx, leaf, leaf.Columns, "delete", found, nil, key)
-	return applyDeleteTuple(ctx, rel, found.ptr)
+	return w.applyLeafDelete(ctx, leaf, rel, found)
+}
+
+// applyLeafDelete is ExecSimpleRelationDelete on a leaf partition: the
+// leaf's BEFORE ROW triggers may skip the delete, its AFTER ROW triggers
+// follow it. M0149-0061c.
+func (w *ApplyWorker) applyLeafDelete(ctx *Context, leaf *catalog.Table, rel storage.RelFileNode, found *applyFoundTuple) error {
+	trigCtx := w.triggerContext(ctx)
+	if tableHasTrigger(leaf, "before", "delete", true) {
+		_, keep, err := fireTriggers(trigCtx, leaf, "before", "delete", found.row, nil)
+		if err != nil {
+			return fmt.Errorf("applyworker: BEFORE DELETE trigger on %q: %w", leaf.Name, err)
+		}
+		if !keep {
+			return nil
+		}
+	}
+	if err := applyDeleteTuple(ctx, rel, found.ptr); err != nil {
+		return err
+	}
+	if tableHasTrigger(leaf, "after", "delete", true) {
+		if err := queueAfterRowTriggers(trigCtx, leaf, "delete", found.row, nil, nil); err != nil {
+			return fmt.Errorf("applyworker: AFTER DELETE trigger on %q: %w", leaf.Name, err)
+		}
+	}
+	return nil
 }
 
 func (w *ApplyWorker) applyUpdatePartitioned(ctx *Context, r *applyRel, oldKeyRow, newRow Row, newUnchanged, newMissing []bool) error {
@@ -87,7 +114,24 @@ func (w *ApplyWorker) applyUpdatePartitioned(ctx *Context, r *applyRel, oldKeyRo
 	if err != nil {
 		return err
 	}
+	trigCtx := w.triggerContext(ctx)
 	if newLeaf == oldLeaf {
+		// ExecSimpleRelationUpdate on the leaf: its BEFORE ROW triggers
+		// may replace or skip the new row, its AFTER ROW triggers follow.
+		// M0149-0061c.
+		updCols := remoteUpdatedColumns(oldLeaf.Columns,
+			remapParentFlagsToChild(newUnchanged, r.local.Columns, oldLeaf.Columns),
+			remapParentFlagsToChild(newMissing, r.local.Columns, oldLeaf.Columns))
+		if tableHasTrigger(oldLeaf, "before", "update", true) {
+			var keep bool
+			leafRow, keep, err = fireTriggersCols(trigCtx, oldLeaf, "before", "update", found.row, leafRow, updCols)
+			if err != nil {
+				return fmt.Errorf("applyworker: BEFORE UPDATE trigger on %q: %w", oldLeaf.Name, err)
+			}
+			if !keep {
+				return nil
+			}
+		}
 		conflicts, err := applyFindConflicts(ctx, oldRel, oldLeaf, oldLeaf.Columns, leafRow, &found.ptr)
 		if err != nil {
 			return err
@@ -95,9 +139,20 @@ func (w *ApplyWorker) applyUpdatePartitioned(ctx *Context, r *applyRel, oldKeyRo
 		if len(conflicts) > 0 {
 			return applyConflictError(ctx, oldLeaf, oldLeaf.Columns, "update_exists", conflicts, leafRow)
 		}
-		return applyUpdateFound(ctx, oldRel, oldLeaf, oldLeaf.Columns, found, leafRow)
+		if err := applyUpdateFound(ctx, oldRel, oldLeaf, oldLeaf.Columns, found, leafRow); err != nil {
+			return err
+		}
+		if tableHasTrigger(oldLeaf, "after", "update", true) {
+			if err := queueAfterRowTriggers(trigCtx, oldLeaf, "update", found.row, leafRow, updCols); err != nil {
+				return fmt.Errorf("applyworker: AFTER UPDATE trigger on %q: %w", oldLeaf.Name, err)
+			}
+		}
+		return nil
 	}
-	// Cross-partition: delete from the old leaf, insert into the new one.
+	// Cross-partition (apply_handle_tuple_routing): delete from the old
+	// leaf (apply_handle_delete_internal) and insert into the new one
+	// (apply_handle_insert_internal), each firing that leaf's DELETE /
+	// INSERT row triggers. M0149-0061c.
 	if err := applyTableAccess(ctx, w, newLeaf, "insert"); err != nil {
 		return err
 	}
@@ -109,8 +164,44 @@ func (w *ApplyWorker) applyUpdatePartitioned(ctx *Context, r *applyRel, oldKeyRo
 	if len(conflicts) > 0 {
 		return applyConflictError(ctx, newLeaf, newLeaf.Columns, "update_exists", conflicts, leafRow)
 	}
-	if err := applyDeleteTuple(ctx, oldRel, found.ptr); err != nil {
+	if err := w.applyLeafDelete(ctx, oldLeaf, oldRel, found); err != nil {
 		return err
 	}
-	return applyUpdateFound(ctx, newRel, newLeaf, newLeaf.Columns, nil, leafRow)
+	if tableHasTrigger(newLeaf, "before", "insert", true) {
+		var keep bool
+		leafRow, keep, err = fireTriggers(trigCtx, newLeaf, "before", "insert", nil, leafRow)
+		if err != nil {
+			return fmt.Errorf("applyworker: BEFORE INSERT trigger on %q: %w", newLeaf.Name, err)
+		}
+		if !keep {
+			return nil
+		}
+	}
+	if err := applyUpdateFound(ctx, newRel, newLeaf, newLeaf.Columns, nil, leafRow); err != nil {
+		return err
+	}
+	if tableHasTrigger(newLeaf, "after", "insert", true) {
+		if err := queueAfterRowTriggers(trigCtx, newLeaf, "insert", nil, leafRow, nil); err != nil {
+			return fmt.Errorf("applyworker: AFTER INSERT trigger on %q: %w", newLeaf.Name, err)
+		}
+	}
+	return nil
+}
+
+// remapParentFlagsToChild carries per-column flags from a partitioned
+// parent's layout to a leaf's (matched by column name).
+func remapParentFlagsToChild(flags []bool, parent, child []catalog.Column) []bool {
+	if flags == nil {
+		return nil
+	}
+	out := make([]bool, len(child))
+	for ci, cc := range child {
+		for pi, pc := range parent {
+			if pi < len(flags) && strings.EqualFold(pc.Name, cc.Name) {
+				out[ci] = flags[pi]
+				break
+			}
+		}
+	}
+	return out
 }

@@ -161,8 +161,24 @@ PG instead updates the row inside the transaction that changes the state; goopg'
 
 Test: TestSubscriptionRelHookJournalsEveryChange.
 
+## Landed — M0149\-0061c \(row triggers on the leaf a routed change lands in\)
+
+apply\_handle\_tuple\_routing fires the row triggers of the leaf partition each change reaches. goopg did this only
+for a routed INSERT; routed UPDATEs and DELETEs fired nothing.
+
+- DELETE fires the leaf's BEFORE ROW triggers \(which may skip it\) and its AFTER ROW triggers
+  \(`applyLeafDelete`, ExecSimpleRelationDelete\).
+- An UPDATE that stays in one leaf fires that leaf's UPDATE triggers. The updated\-column set is carried into the
+  leaf's column layout \(ExecSimpleRelationUpdate\).
+- An UPDATE that moves the row to another leaf fires DELETE on the old leaf and INSERT on the new one
+  \(apply\_handle\_delete\_internal \+ apply\_handle\_insert\_internal\).
+
+The triggers run under session\_replication\_role = replica, so only REPLICA and ALWAYS triggers fire. With this
+change the pg18 publisher → goopg subscriber pairing of 013 passes in full.
+
+Test: TestApplyWorkerFiresLeafPartitionTriggers.
+
 ## Open
 
-- **0061c.** Subscriber AFTER ROW triggers must fire on the partitions that routed UPDATEs land in.
 - **0061d.** A replicated TRUNCATE of a partitioned target must reach its sub\-partitions.
 - **0061l.** The origin\_differs check in every pairing, and the sub2 catch\-up with a goopg publisher.
