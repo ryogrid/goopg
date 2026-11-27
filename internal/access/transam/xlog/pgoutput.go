@@ -103,6 +103,14 @@ type ColumnListFilter interface {
 	ColumnList(rel *RelationDef) (cols []string, ok bool)
 }
 
+// ColumnListChecker is implemented by a RelationFilter that can tell when
+// the publications covering a relation give it different column lists:
+// pgoutput_column_list_init raises an ERROR for such a relation, which ends
+// the stream. M0149-0060.
+type ColumnListChecker interface {
+	CheckColumnLists(rel *RelationDef) error
+}
+
 // PgOutput emits logical-replication messages to an io.Writer in
 // upstream pgoutput's wire format. One PgOutput per active
 // logical slot; not goroutine-safe (the `SlotDecoder` loop is
@@ -272,6 +280,13 @@ func (p *PgOutput) Change(c Change) error {
 				}
 				rel = root
 			}
+		}
+	}
+	// get_rel_sync_entry's pgoutput_column_list_init: differing column
+	// lists across the publications are an ERROR. M0149-0060.
+	if cc, ok := p.filter.(ColumnListChecker); ok {
+		if err := cc.CheckColumnLists(rel); err != nil {
+			return err
 		}
 	}
 	// Row filter (pgoutput_row_filter), before the Relation message: a

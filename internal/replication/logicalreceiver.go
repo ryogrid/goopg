@@ -519,13 +519,31 @@ func FetchPublicationTables(ctx context.Context, cfg LogicalReceiverConfig, pubs
 		return nil, err
 	}
 	out := make([]PubTable, 0, len(rows))
+	seen := map[[2]string]bool{}
 	for _, row := range rows {
 		if len(row) < 2 || row[0] == nil || row[1] == nil {
 			continue
 		}
-		out = append(out, PubTable{Schema: string(row[0]), Name: string(row[1])})
+		// The DISTINCT keeps (schema, name, attrs): a table seen twice is
+		// published with two different column lists (fetch_table_list's
+		// list_member check).
+		key := [2]string{string(row[0]), string(row[1])}
+		if seen[key] {
+			return nil, &ColumnListConflictError{Schema: key[0], Name: key[1]}
+		}
+		seen[key] = true
+		out = append(out, PubTable{Schema: key[0], Name: key[1]})
 	}
 	return out, nil
+}
+
+// ColumnListConflictError is fetch_table_list's refusal of a table that the
+// subscription's publications publish with different column lists.
+// M0149-0060.
+type ColumnListConflictError struct{ Schema, Name string }
+
+func (e *ColumnListConflictError) Error() string {
+	return fmt.Sprintf("cannot use different column lists for table \"%s.%s\" in different publications", e.Schema, e.Name)
 }
 
 // PublisherConn is an authenticated publisher connection parked at

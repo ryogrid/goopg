@@ -131,22 +131,16 @@ func TestParseAlterPublicationTables(t *testing.T) {
 	}
 }
 
-// TestParseAlterPublicationUnmodelledTableFormsStayNoop: a column list on
-// ALTER is a publication feature goopg does not model; such an ALTER
-// PUBLICATION stays the compat no-op it was, instead of a syntax error on SQL
-// PG accepts. (TABLES IN SCHEMA items are modelled since M0149-0053a, row
-// filters since M0149-0059c — TestParsePublicationRowFilter.)
-func TestParseAlterPublicationUnmodelledTableFormsStayNoop(t *testing.T) {
-	for _, sql := range []string{
-		"ALTER PUBLICATION p ADD TABLE t (a, b)",
-	} {
-		stmts, err := Parse(sql)
-		if err != nil {
-			t.Fatalf("Parse(%q): %v", sql, err)
-		}
-		if _, ok := stmts[0].(*CompatNoopStmt); !ok {
-			t.Errorf("%q: stmt type = %T, want *CompatNoopStmt", sql, stmts[0])
-		}
+// TestParseAlterPublicationColumnList: ALTER PUBLICATION ADD / SET carry a
+// table's column list (M0149-0060); it used to be a compat no-op.
+func TestParseAlterPublicationColumnList(t *testing.T) {
+	stmts, err := Parse(`ALTER PUBLICATION p ADD TABLE t (a, "B") WHERE (a > 1), u`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := stmts[0].(*AlterPublicationTablesStmt)
+	if !ok || len(st.TableColumns) != 2 || len(st.TableColumns[0]) != 2 || st.TableColumns[0][1] != "B" || st.TableColumns[1] != nil || st.TableWhere[0] == nil {
+		t.Fatalf("got %#v", stmts[0])
 	}
 }
 

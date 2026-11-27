@@ -1765,7 +1765,10 @@ func (o *ddlOp) execAlterPublicationTables(s *parser.AlterPublicationTablesStmt)
 		// ADD / DROP TABLES IN SCHEMA only: the table list is unchanged.
 		return nil
 	}
-	type member struct{ qname, name, filter string }
+	type member struct {
+		qname, name, filter string
+		cols                []string
+	}
 	var listed []member
 	seen := map[string]bool{}
 	for i, t := range s.Tables {
@@ -1789,10 +1792,25 @@ func (o *ddlOp) execAlterPublicationTables(s *parser.AlterPublicationTablesStmt)
 			filter = q
 		}
 		only := i < len(s.TableOnly) && s.TableOnly[i]
+		var colNames []string
+		if i < len(s.TableColumns) && s.TableColumns[i] != nil {
+			if s.Action == "drop" {
+				return &ExecError{Code: "42601", Message: "column list must not be specified in ALTER PUBLICATION ... DROP"}
+			}
+			colNames = s.TableColumns[i]
+		}
 		for _, m := range o.publicationMemberTables(tbl, only) {
 			if q := m.QualifiedName(); !seen[q] {
 				seen[q] = true
-				listed = append(listed, member{q, m.Name, filter})
+				var cols []string
+				if colNames != nil {
+					c, err := publicationColumnList(m, colNames)
+					if err != nil {
+						return err
+					}
+					cols = c
+				}
+				listed = append(listed, member{qname: q, name: m.Name, filter: filter, cols: cols})
 			}
 		}
 	}
@@ -1836,24 +1854,36 @@ func (o *ddlOp) execAlterPublicationTables(s *parser.AlterPublicationTablesStmt)
 	// listed table the filter it is listed with (none clears one). A SET
 	// member whose filter changed is re-journaled — AlterPublicationTables
 	// drops it and adds it back with the new qual.
+	// Column lists follow the same rule (M0149-0060).
 	var refiltered []string
 	if s.Action != "drop" {
 		filters := map[string]string{}
+		colLists := map[string][]string{}
 		for _, m := range listed {
-			if s.Action == "set" && current[m.qname] && pub.RowFilters[m.qname] != m.filter {
+			oldCols, hadCols := pub.Columns[m.qname]
+			if s.Action == "set" && current[m.qname] &&
+				(pub.RowFilters[m.qname] != m.filter || hadCols != (m.cols != nil) || strings.Join(oldCols, ",") != strings.Join(m.cols, ",")) {
 				refiltered = append(refiltered, m.qname)
 			}
 			if m.filter != "" || s.Action == "set" {
 				filters[m.qname] = m.filter
+			}
+			if m.cols != nil || s.Action == "set" {
+				colLists[m.qname] = m.cols
 			}
 		}
 		if len(filters) > 0 {
 			if err := o.ctx.PubSub.SetPublicationRowFilters(s.Name, filters, dbOid); err != nil {
 				return &ExecError{Code: "42704", Message: err.Error()}
 			}
-			if p2, ok := o.ctx.PubSub.LookupPublication(s.Name, dbOid); ok {
-				updated = p2
+		}
+		if len(colLists) > 0 {
+			if err := o.ctx.PubSub.SetPublicationColumnLists(s.Name, colLists, dbOid); err != nil {
+				return &ExecError{Code: "42704", Message: err.Error()}
 			}
+		}
+		if p2, ok := o.ctx.PubSub.LookupPublication(s.Name, dbOid); ok {
+			updated = p2
 		}
 	}
 	nextSet := map[string]bool{}
@@ -23074,7 +23104,37 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				// for a table renamed after ALTER … SET SCHEMA (deferral
 				// ledger 2026-11-03), and the namespace is unregistered only
 				// after this loop, so failing here would strand the schema.
-				for _, tbl := range tables {
+				// A partition of a dropped table goes with it even when it
+				// lives in another schema: it is an AUTO dependency of its
+				// parent (findDependentObjects), so it is dropped without a
+				// "drop cascades to" line. Deepest partitions first.
+				// M0149-0060.
+				var partitions []parser.ObjectName
+				if imp, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+					inSchema := map[string]bool{}
+					for _, tbl := range tables {
+						inSchema[strings.ToLower(tbl.String())] = true
+					}
+					var walk func(oid uint32)
+					walk = func(oid uint32) {
+						for _, c := range imp.PartitionChildren(oid, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+							if c == nil {
+								continue
+							}
+							walk(c.OID)
+							n := parser.ObjectName{Schema: c.Schema, Name: c.Name}
+							if !inSchema[strings.ToLower(n.String())] {
+								partitions = append(partitions, n)
+							}
+						}
+					}
+					for _, tbl := range tables {
+						if t, ok := o.ctx.Catalog.LookupTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
+							walk(t.OID)
+						}
+					}
+				}
+				for _, tbl := range append(partitions, tables...) {
 					t, ok := o.ctx.Catalog.LookupTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 					if !ok {
 						continue

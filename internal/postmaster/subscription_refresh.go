@@ -52,6 +52,10 @@ func (s *Server) RefreshSubscriptionOnPublisher(subName, conninfo string, dbOid 
 	}
 	pubTables, err := s.applyLauncher.FetchPublicationTables(conninfo, pubs)
 	if err != nil {
+		var cle *replication.ColumnListConflictError
+		if errors.As(err, &cle) {
+			return &executor.ExecError{Code: "0A000", Message: cle.Error()}
+		}
 		var rce *replication.RemoteCommandError
 		if errors.As(err, &rce) {
 			return &executor.ExecError{Code: "XX000",

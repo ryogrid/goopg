@@ -2481,22 +2481,9 @@ func (p *parser) parseCreatePublicationTail(pos int) (Stmt, error) {
 				if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
 					p.advance()
 				}
-				// opt_column_list: `( columnList )`.
-				var cols []string
-				if p.acceptSymbol("(") {
-					for {
-						if p.cur().Kind != TokenIdent && p.cur().Kind != TokenKeyword {
-							return nil, p.errAtCur("expected column name in publication column list")
-						}
-						cols = append(cols, p.cur().Value)
-						p.advance()
-						if !p.acceptSymbol(",") {
-							break
-						}
-					}
-					if !p.acceptSymbol(")") {
-						return nil, p.errAtCur("expected ) after publication column list")
-					}
+				cols, err := p.parsePubColumnList()
+				if err != nil {
+					return nil, err
 				}
 				where, err := p.parsePubRowFilter()
 				if err != nil {
@@ -2522,6 +2509,29 @@ func (p *parser) parseCreatePublicationTail(pos int) (Stmt, error) {
 		stmt.With = opts
 	}
 	return stmt, nil
+}
+
+// parsePubColumnList parses a publication table's optional column list,
+// gram.y's opt_column_list `( columnList )`; nil when none follows.
+func (p *parser) parsePubColumnList() ([]string, error) {
+	if !p.acceptSymbol("(") {
+		return nil, nil
+	}
+	var cols []string
+	for {
+		if p.cur().Kind != TokenIdent && p.cur().Kind != TokenKeyword && p.cur().Kind != TokenQuotedIdent {
+			return nil, p.errAtCur("expected column name in publication column list")
+		}
+		cols = append(cols, p.cur().Value)
+		p.advance()
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ) after publication column list")
+	}
+	return cols, nil
 }
 
 // parsePubRowFilter parses a publication table's optional row filter,
@@ -9050,11 +9060,9 @@ func (p *parser) parseAlter() (Stmt, error) {
 			if action != "" && p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwTable || p.cur().Keyword == KwTables) {
 				// pub_obj_list of TABLE and TABLES IN SCHEMA items; a bare
 				// item after a comma continues the previous kind
-				// (preprocess_pubobj_list). A column list `t (a, b)` is a
-				// publication feature goopg does not model on ALTER: the
-				// statement stays the compat no-op below, as before, rather
-				// than failing on syntax PG accepts. A row filter
-				// `t WHERE (...)` is modelled (M0149-0059c).
+				// (preprocess_pubobj_list). A row filter `t WHERE (...)`
+				// (M0149-0059c) and a column list `t (a, b)` (M0149-0060)
+				// are modelled.
 				stmt := &AlterPublicationTablesStmt{pos: t.Pos, Name: name, Action: action}
 				kind := ""
 				modelled := true
@@ -9084,6 +9092,10 @@ func (p *parser) parseAlter() (Stmt, error) {
 						if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
 							p.advance()
 						}
+						cols, err := p.parsePubColumnList()
+						if err != nil {
+							return nil, err
+						}
 						where, err := p.parsePubRowFilter()
 						if err != nil {
 							return nil, err
@@ -9091,6 +9103,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 						stmt.Tables = append(stmt.Tables, obj)
 						stmt.TableWhere = append(stmt.TableWhere, where)
 						stmt.TableOnly = append(stmt.TableOnly, only)
+						stmt.TableColumns = append(stmt.TableColumns, cols)
 					}
 					switch {
 					case p.cur().Kind == TokenSymbol && p.cur().Value == ",":

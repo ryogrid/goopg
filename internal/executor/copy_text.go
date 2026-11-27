@@ -474,6 +474,11 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone, by
 			// was no arm, so COPY TO of any interval column failed "kind 6
 			// cannot encode as interval" (M0146-0083).
 			return d.Format(), nil
+		case KindEnum:
+			// enum_out: the label. A user-defined enum column had no arm,
+			// so COPY TO of it — and a publisher's table sync — failed
+			// "kind 9 cannot encode as <type>" (M0149-0060).
+			return d.StringValue(), nil
 		default:
 			return "", fmt.Errorf("kind %d cannot encode as %s in COPY TEXT", d.Kind, t.Name)
 		}

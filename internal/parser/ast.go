@@ -3101,6 +3101,9 @@ type AlterPublicationTablesStmt struct {
 	TableWhere []Expr
 	// TableOnly is parallel to Tables: true for `TABLE ONLY t`.
 	TableOnly []bool
+	// TableColumns is parallel to Tables: each table's column list
+	// (`ADD | SET TABLE t (a, b)`), nil when none. M0149-0060.
+	TableColumns [][]string
 	// Schemas are the `TABLES IN SCHEMA s` items (PubCurrentSchema for
 	// CURRENT_SCHEMA).
 	Schemas []string

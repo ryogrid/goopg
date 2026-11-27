@@ -17451,11 +17451,16 @@ verify each at HEAD when the task starts.
   - Path\-to\-TAP: 028 goopg\-publisher pairings ← 0059c \(1 link\).
   - 2026\-11\-27 \(done\): parser `WHERE \(expr\)` \(CREATE, ALTER ADD / SET\), `TABLE ONLY` captured, bare `WITH \(opt\)` = true; Publication.RowFilters \(deparsed text, defaultExprToSQL\) validated by planning against the table, journaled in pg\_publication\_rel.prqual and reloaded; FOR TABLE parent recurses to inheritance children with the same filter; pg\_get\_publication\_tables qual \(catalog.PublicationRowFilter: none under ALL TABLES / the table's schema\) and filter\_partitions under viaroot; pg\_publication\_rel.prqual / pg\_publication\_tables.rowfilter; pgoutput applyRowFilter \(per\-action OR of the publications' filters, UPDATE → INSERT / DELETE transformation\) through executor.EvalPublicationRowFilter \(virtual generated columns computed\). Tests TestPublicationRowFilterDDL, TestEvalPublicationRowFilter, TestParsePublicationRowFilter.
   Movement: yes — tap 028 goopg-publisher pairings fail -> pass
-- [ ] **M0149-0060 — port subscription/t/031_column_list.pl**
+- [x] **M0149-0060 — port subscription/t/031_column_list.pl**
   Kind: impl
   Parent: none
   Upstream: `postgres/src/test/subscription/t/031_column_list.pl` — publication column lists.
   Likely prerequisites \(verify at start\): column lists in pgoutput Relation/tuple data, combining lists across publications, `pg_publication_tables.attnames`, column-subset initial sync.
+  - 2026\-11\-27 \(done\): ported as TestPort\_Subscription031ColumnList; 3/3 in all three pairings; inventory 031 → port. Path\-to\-TAP: each blocker below is 1 link from 031.
+    - goopg subscriber: DROP SCHEMA … CASCADE left a partition in another schema \(public.t\_1 of s1.t\), so re\-creating it failed; a column\-list conflict across publications surfaced only in table sync, without the schema. PG: findDependentObjects \(partitions are AUTO dependencies\), fetch\_table\_list's list\_member check before the slot is created.
+    - goopg publisher: quoted identifiers in a CREATE PUBLICATION column list were a syntax error; ALTER PUBLICATION ADD / SET with a column list was a compat no\-op; COPY TO of an enum column failed \(kind 9\); pg\_create\_logical\_replication\_slot and int2send / int4send / int8send were missing; differing column lists across publications were unioned instead of pgoutput\_column\_list\_init's ERROR.
+    - Landed: parser parsePubColumnList \(CREATE \+ ALTER, quoted names\); ALTER ADD / SET column lists \(SET clears, changed members re\-journaled, DROP with a list 42601\); SetPublicationColumnLists nil = clear; DROP SCHEMA CASCADE drops foreign\-schema partitions first; FetchPublicationTables ColumnListConflictError, checked in the pre\-slot publication check and in the refresh \(0A000\); COPY TEXT KindEnum arm; pg\_create\_logical\_replication\_slot \(+ record FROM scan for both slot creators\); intNsend; xlog.ColumnListChecker / publicationFilter.CheckColumnLists, the walsender logs the ERROR and ends the stream with 0A000. Tests TestDropSchemaCascadeDropsForeignSchemaPartitions, TestCopyTextEnumAndIntSend, TestAlterPublicationColumnLists, TestPublicationFilterColumnListConflict, TestParseAlterPublicationColumnList.
+  Movement: yes — tap 031 fail -> pass (3/3 x 3 pairings); 031 port
 - [ ] **M0149-0061 — port subscription/t/013_partition.pl**
   Kind: impl
   Parent: none

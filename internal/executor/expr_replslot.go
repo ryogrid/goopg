@@ -135,6 +135,61 @@ func evalPgCreatePhysicalReplicationSlot(x *optimizer.FuncCall, slot SlotView, c
 	return NewStringDatum(fmt.Sprintf("(%s,%s)", repSlot.Name, lsnCol)), nil
 }
 
+// evalPgCreateLogicalReplicationSlot implements
+//
+//	pg_create_logical_replication_slot(slot_name name, plugin name,
+//	    temporary boolean DEFAULT false, twophase boolean DEFAULT false,
+//	    failover boolean DEFAULT false) → record (slot_name name, lsn pg_lsn)
+//
+// (slotfuncs.c). The slot starts where CREATE_REPLICATION_SLOT ... LOGICAL
+// starts one: at the end of the last WAL record, PG's 0-based position
+// (replyCreateReplicationSlot), so pg_logical_slot_*_changes decode every
+// change made after it. pgoutput is the only output plugin goopg has.
+// M0149-0060.
+func evalPgCreateLogicalReplicationSlot(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
+	if len(x.Args) < 2 {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(),
+			Message: "pg_create_logical_replication_slot requires a slot name and a plugin"}
+	}
+	if ctx.ReplSlots == nil {
+		return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(),
+			Message: "replication slots are not configured on this server"}
+	}
+	nameD, err := evalExprSlot(x.Args[0], slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	pluginD, err := evalExprSlot(x.Args[1], slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if nameD.IsNull() || pluginD.IsNull() {
+		return NullDatum, nil // STRICT
+	}
+	temporary, err := replSlotBoolArg(x, 2, false, slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if temporary {
+		return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(),
+			Message: "temporary replication slots are not supported"}
+	}
+	if plugin := pluginD.StringValue(); plugin != "pgoutput" {
+		// LoadOutputPluginCallbacks: an output plugin goopg does not have.
+		return Datum{}, &ExecError{Code: "58P01", Pos: x.Pos(),
+			Message: fmt.Sprintf("could not access file \"%s\": No such file or directory", plugin)}
+	}
+	var startLSN uint64
+	if ctx.WAL != nil {
+		startLSN = ctx.WAL.WrittenLSN()
+	}
+	repSlot, err := ctx.ReplSlots.Create(nameD.StringValue(), xlog.SlotLogical, startLSN)
+	if err != nil {
+		return Datum{}, replSlotExecError(err, x.Pos(), "")
+	}
+	return NewStringDatum(fmt.Sprintf("(%s,%X/%X)", repSlot.Name, uint32(repSlot.RestartLSN>>32), uint32(repSlot.RestartLSN))), nil
+}
+
 // evalPgDropReplicationSlot implements
 //
 //	pg_drop_replication_slot(slot_name name) → void

@@ -321,6 +321,15 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 		<-keepaliveDone
 		return nil
 	case err := <-runErr:
+		var cle *ColumnListConflictError
+		if errors.As(err, &cle) {
+			// pgoutput's ERROR: logged as the walsender's ERROR and sent
+			// to the subscriber as 0A000. M0149-0060.
+			slog.Error(cle.Error(), "slot", args.SlotName)
+			streamCancel()
+			<-keepaliveDone
+			return s.writeStreamingError(w, errcodes.FeatureNotSupported, cle.Error())
+		}
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, xlog.ErrClosed) {
 			slog.Info("logical walsender: decoder run failed",
 				"slot", args.SlotName, "err", err)
@@ -564,6 +573,61 @@ func (f *publicationFilter) RowFilter(rel *xlog.RelationDef, kind xlog.ChangeKin
 	return func(values []*string) (bool, error) {
 		return executor.EvalPublicationRowFilter(cat, dbOid, relOID, cols, quals, values)
 	}, true
+}
+
+// CheckColumnLists implements xlog.ColumnListChecker
+// (pgoutput_column_list_init): every subscribed publication publishing rel
+// must give it the same columns — its column list, or, without one (or as
+// FOR ALL TABLES / TABLES IN SCHEMA), every published column.
+func (f *publicationFilter) CheckColumnLists(rel *xlog.RelationDef) error {
+	if rel == nil || len(f.pubs) < 2 {
+		return nil
+	}
+	q := relQualifiedName(rel)
+	first := true
+	var want string
+	for _, pub := range f.pubs {
+		if !publicationCovers(pub, rel, q) {
+			continue
+		}
+		var cols []string
+		list, has := pub.Columns[q]
+		if !has && rel.Schema == "" {
+			list, has = pub.Columns["public."+rel.Name]
+		}
+		bySchema := false
+		for _, sch := range pub.Schemas {
+			if strings.EqualFold(sch, rel.Schema) || (rel.Schema == "" && strings.EqualFold(sch, "public")) {
+				bySchema = true
+			}
+		}
+		if has && !pub.AllTables && !bySchema {
+			cols = list
+		} else {
+			stored := pub.GenColsType() == 's'
+			for _, c := range rel.Columns {
+				if c.Generated == 0 || (c.Generated == 's' && stored) {
+					cols = append(cols, c.Name)
+				}
+			}
+		}
+		key := strings.Join(cols, "\x00")
+		if first {
+			want, first = key, false
+		} else if key != want {
+			schema := rel.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			return &ColumnListConflictError{Schema: schema, Name: rel.Name}
+		}
+	}
+	return nil
+}
+
+// CheckColumnLists implements xlog.ColumnListChecker.
+func (f *livePublicationFilter) CheckColumnLists(rel *xlog.RelationDef) error {
+	return f.load().CheckColumnLists(rel)
 }
 
 // publicationCovers reports whether pub publishes rel (qualified name q):

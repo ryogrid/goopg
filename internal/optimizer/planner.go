@@ -7397,6 +7397,12 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		// OUT parameter (pg_proc.dat). M0149-0021.
 		return planRecordFuncScan(rv, sourceIdx, []string{"lsn", "labelfile", "spcmapfile"}, []string{"pg_lsn", "text", "text"})
 	}
+	if strings.EqualFold(tf.Name, "pg_create_logical_replication_slot") || strings.EqualFold(tf.Name, "pg_create_physical_replication_slot") {
+		// Both return one record of OUT parameters (slot_name, lsn)
+		// (pg_proc.dat); `SELECT * FROM pg_create_logical_replication_slot(…)`
+		// scans it once. M0149-0060.
+		return planRecordFuncScan(rv, sourceIdx, []string{"slot_name", "lsn"}, []string{"name", "pg_lsn"})
+	}
 	if strings.EqualFold(tf.Name, "pg_get_catalog_foreign_keys") {
 		return planPgGetCatalogForeignKeys(rv, sourceIdx)
 	}

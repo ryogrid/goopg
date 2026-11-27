@@ -18374,6 +18374,33 @@ case "pg_char_to_encoding":
 	// M-NIGHTLY AI-20260810-011258-003.
 	case "pg_create_physical_replication_slot":
 		return evalPgCreatePhysicalReplicationSlot(x, slot, ctx)
+	case "int2send", "int4send", "int8send":
+		// int2send / int4send / int8send (int.c, int8.c): the binary send
+		// form — the value in network byte order, as bytea. M0149-0060.
+		if len(x.Args) != 1 {
+			return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %s does not exist", name)}
+		}
+		v, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || v.IsNull() {
+			return NullDatum, err
+		}
+		n := v.Int
+		if v.Kind == KindString {
+			p, perr := strconv.ParseInt(strings.TrimSpace(v.StringValue()), 10, 64)
+			if perr != nil {
+				return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(), Message: fmt.Sprintf("invalid input syntax for type integer: %q", v.StringValue())}
+			}
+			n = p
+		}
+		width := map[string]int{"int2send": 2, "int4send": 4, "int8send": 8}[name]
+		buf := make([]byte, width)
+		for i := width - 1; i >= 0; i-- {
+			buf[i] = byte(n)
+			n >>= 8
+		}
+		return NewBytesDatum(buf), nil
+	case "pg_create_logical_replication_slot":
+		return evalPgCreateLogicalReplicationSlot(x, slot, ctx)
 	// pg_logical_emit_message(transactional, prefix, message[, flush]) —
 	// LogLogicalMessage. See expr_logicalmsg.go.
 	case "pg_logical_emit_message":

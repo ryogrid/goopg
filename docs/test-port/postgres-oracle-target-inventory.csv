@@ -462,7 +462,7 @@ S-026,subscription-tap,tap,postgres/src/test/subscription/t/026_stats.pl,port,ye
 ,subscription-tap,tap,postgres/src/test/subscription/t/028_row_filter.pl,port,yes,-,Ported as TestPort_Subscription028RowFilter (internal/testport/subscription_028_row_filter_test.go): three pairings (all-goopg; PG 18.3 publisher -> goopg subscriber; goopg publisher -> PG 18.3 subscriber) 3/3 each (M0149-0059),,
 ,subscription-tap,tap,postgres/src/test/subscription/t/029_on_error.pl,not-tried,no,-,,,
 ,subscription-tap,tap,postgres/src/test/subscription/t/030_origin.pl,not-tried,no,-,,,
-,subscription-tap,tap,postgres/src/test/subscription/t/031_column_list.pl,not-tried,no,-,,,
+,subscription-tap,tap,postgres/src/test/subscription/t/031_column_list.pl,port,yes,-,Ported as TestPort_Subscription031ColumnList (internal/testport/subscription_031_column_list_test.go): three pairings (all-goopg; PG 18.3 publisher -> goopg subscriber; goopg publisher -> PG 18.3 subscriber) 3/3 each (M0149-0060),,
 ,subscription-tap,tap,postgres/src/test/subscription/t/032_subscribe_use_index.pl,port,yes,-,Ported as TestPort_Subscription032SubscribeUseIndex (internal/testport/subscription_032_subscribe_use_index_test.go): three pairings (all-goopg; PG 18.3 publisher -> goopg subscriber; goopg publisher -> PG 18.3 subscriber) 3/3 each (M0149-0054),,
 ,subscription-tap,tap,postgres/src/test/subscription/t/033_run_as_table_owner.pl,port,yes,-,Ported as TestPort_Subscription033RunAsTableOwner (internal/testport/subscription_033_run_as_table_owner_test.go): three pairings (all-goopg; PG 18.3 publisher -> goopg subscriber; goopg publisher -> PG 18.3 subscriber) 3/3 each (M0149-0058),,
 ,subscription-tap,tap,postgres/src/test/subscription/t/034_temporal.pl,not-tried,no,-,,,

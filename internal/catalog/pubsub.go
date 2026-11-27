@@ -448,7 +448,8 @@ func (p *PubSub) SetPublicationSchemas(name string, schemas []string, dbOid ...u
 }
 
 // SetPublicationColumnLists sets the column lists of a publication's member
-// tables (FOR TABLE t (cols)); a table not in cols publishes every column.
+// tables (FOR TABLE t (cols)); a table not in cols keeps its list, and one
+// mapped to nil loses it (publishes every column).
 func (p *PubSub) SetPublicationColumnLists(name string, cols map[string][]string, dbOid ...uint32) error {
 	defer p.pubGen.Add(1)
 	p.mu.Lock()
@@ -462,6 +463,10 @@ func (p *PubSub) SetPublicationColumnLists(name string, cols map[string][]string
 		next[t] = c
 	}
 	for t, c := range cols {
+		if c == nil {
+			delete(next, t) // the table loses its list (ALTER ... SET TABLE t)
+			continue
+		}
 		next[t] = append([]string(nil), c...)
 	}
 	pub.Columns = next

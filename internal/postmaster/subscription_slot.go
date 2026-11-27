@@ -66,6 +66,19 @@ func (s *Server) subscriptionSlotHooks() (create, drop func(subName, conninfo, s
 		var rce *replication.RemoteCommandError
 		switch {
 		case err == nil:
+			// fetch_table_list runs before the slot is created
+			// (CreateSubscription, AlterSubscription_refresh): a table the
+			// publications publish with different column lists fails the
+			// command before anything is created on the publisher.
+			// M0149-0060.
+			if len(pubs) > 0 {
+				if _, ferr := s.applyLauncher.FetchPublicationTables(conninfo, pubs); ferr != nil {
+					var cle *replication.ColumnListConflictError
+					if errors.As(ferr, &cle) {
+						return nil, &executor.ExecError{Code: "0A000", Message: cle.Error()}
+					}
+				}
+			}
 			return missing, nil
 		case errors.As(err, &rce):
 			return nil, &executor.ExecError{Code: "XX000",
